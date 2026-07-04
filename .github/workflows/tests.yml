@@ -1,0 +1,177 @@
+name: tests
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'monitor/**'
+      - 'config/**'
+      - '.github/workflows/tests.yml'
+  push:
+    branches: [main, dev]
+    paths:
+      - 'monitor/**'
+      - 'config/**'
+      - '.github/workflows/tests.yml'
+  workflow_dispatch:
+
+# Cancel queued runs on the same ref when a new push lands; an
+# in-progress run keeps going so its pass/fail signal is preserved.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  watcher-tests:
+    name: monitor/watcher unit suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: install runtime deps (jq + tmux + zsh)
+        # ubuntu-latest ships bash + curl + openssl + jq + gh by default;
+        # tmux is needed because several tests install a real tmux shim
+        # on PATH for `command -v tmux` to succeed (see test-lib.sh and
+        # test-full-state-suppression.sh). zsh is needed so the zsh spawn-shell
+        # half of test-spawn-pathfront.sh actually runs (it auto-skips when zsh
+        # is absent, which on a bare runner would silently drop that coverage).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq tmux zsh
+
+      - name: syntax check (bash -n) on every shell file under monitor/
+        # Catches accidental syntax breakage cheaply before we spend
+        # minutes running the suite.
+        run: |
+          set -e
+          shopt -s globstar nullglob
+          fail=0
+          for f in monitor/**/*.sh; do
+            if ! bash -n "$f" 2>/tmp/syntax.err; then
+              echo "::error file=$f::bash -n syntax error"
+              sed 's|^|  |' /tmp/syntax.err
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: run unit suite
+        # The runner auto-skips:
+        #   - slow tests (require SLOW_TESTS=1)
+        #   - integration tests under test-integration/ (require RUN_INTEGRATION=1)
+        # Per docs/contributing/tests.md "CI" section: the v1 gate is the
+        # fast unit suite only. Slow + integration coverage is a follow-up.
+        id: unit_suite
+        run: |
+          set -uo pipefail
+          mapfile -t tests < <(find monitor/watcher -maxdepth 1 -name 'test-*.sh' -type f | sort)
+          if (( ${#tests[@]} == 0 )); then
+            echo "::error::no tests selected — refusing to report green on an empty run"
+            exit 1
+          fi
+          echo "Discovered ${#tests[@]} tests."
+          echo
+          # --keep-logs: persist every test's first-run stdout/stderr
+          # into the failure-artifact tree. The collect step's serial
+          # re-run often PASSES a test that flaked under --jobs
+          # parallelism, so without these logs the original failing
+          # assertion is unrecoverable from CI.
+          bash monitor/watcher/run-tests.sh --jobs 2 \
+              --keep-logs "${RUNNER_TEMP}/test-failure-artifacts/first-run-logs" \
+              "${tests[@]}"
+
+      - name: collect failure artifacts
+        # On failure, re-run each failing test serially with `bash -x`
+        # plus full stderr/stdout capture into a per-test artifact dir.
+        # Also snapshot the env (bash/jq/gh/coreutils versions, locale,
+        # PATH) so post-mortem can attribute ubuntu-latest-only failures.
+        # The runner's own truncated tail goes through xargs and isn't
+        # always orderly — this step is the canonical diagnostic surface.
+        if: failure() && steps.unit_suite.outcome == 'failure'
+        # `set +e` is critical: GH Actions wraps every step in
+        # `bash -e`, so the first failing `bash $test_path` would
+        # abort the loop after one iteration. We capture rc manually.
+        run: |
+          set +e
+          set -uo pipefail
+          ART_DIR="${RUNNER_TEMP:-/tmp}/test-failure-artifacts"
+          mkdir -p "$ART_DIR"
+
+          # Environment snapshot — diff against a local known-good run.
+          {
+            echo "=== bash ==="
+            bash --version
+            echo
+            echo "=== jq ==="
+            jq --version
+            echo
+            echo "=== gh ==="
+            gh --version 2>&1 | head -3
+            echo
+            echo "=== tmux ==="
+            tmux -V
+            echo
+            echo "=== coreutils ==="
+            dpkg -l coreutils 2>/dev/null | tail -1
+            echo
+            echo "=== locale ==="
+            locale
+            echo
+            echo "=== uname ==="
+            uname -a
+            echo
+            echo "=== mount-relevant env ==="
+            env | LC_ALL=C sort | grep -Ev '^(GITHUB_TOKEN|SECRET_)' || true
+          } > "$ART_DIR/_env.txt" 2>&1 || true
+
+          failed_file="${NEXUS_TEST_STATE_DIR:-$HOME/.cache/nexus-test-runner}/last-failures.txt"
+          if [ ! -s "$failed_file" ]; then
+            echo "::warning::no failure list at $failed_file — nothing to dump"
+            exit 1
+          fi
+
+          echo "=== re-running failing tests with full output capture ==="
+          while IFS= read -r test_path; do
+            [ -n "$test_path" ] || continue
+            name=$(basename "$test_path")
+            slot="$ART_DIR/$name"
+            mkdir -p "$slot"
+
+            # Plain re-run: stdout + stderr both captured AND echoed.
+            echo
+            echo "::group::$name — plain re-run"
+            bash "$test_path" \
+                >"$slot/stdout.log" \
+                2>"$slot/stderr.log"
+            rc=$?
+            echo "rc=$rc" > "$slot/rc.txt"
+            echo "--- stdout ---"
+            sed 's/^/  /' "$slot/stdout.log"
+            echo "--- stderr ---"
+            sed 's/^/  /' "$slot/stderr.log"
+            echo "::endgroup::"
+
+            # `bash -x` trace re-run — captures every command for the
+            # subset where assertion logs aren't enough.
+            echo "::group::$name — bash -x trace"
+            bash -x "$test_path" >"$slot/trace-stdout.log" 2>"$slot/trace-stderr.log" || true
+            # Tail the trace so we don't spam the log with thousands of
+            # set-x lines from passing assertions — the failure is at
+            # the tail.
+            echo "--- last 120 lines of trace stderr ---"
+            tail -n 120 "$slot/trace-stderr.log" | sed 's/^/  /'
+            echo "::endgroup::"
+          done < "$failed_file"
+
+          # Re-exit nonzero so the workflow stays red.
+          exit 1
+
+      - name: upload failure artifacts
+        if: failure() && steps.unit_suite.outcome == 'failure'
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-failure-artifacts-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/test-failure-artifacts/
+          if-no-files-found: warn
+          retention-days: 7

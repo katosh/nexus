@@ -1,0 +1,101 @@
+  ─────────┘
+
+  Drift under translation grows with the shift magnitude purely from float-precision
+  loss when subtracting near-equal large numbers; the algebra is exact.
+
+  [1mCaveats.[0m[39m[49m
+  - Default [38;5;153mKERNEL_BACKEND="scanpy"[39m ([38;5;153mconfig.py:39[39m) uses [38;5;153msc.pp.neighbors[39m → pynndescent
+   (approximate kNN), which has its own RNG and can introduce trace numerical drift
+  under rescaling even though the kNN topology is preserved analytically. The [38;5;153msklearn[39m
+   backend is exact.
+  - [38;5;153mrun_palantir[39m minmax-scales the multiscale DCs again at [38;5;153mcore.py:175-180[39m before the
+   pseudotime kNN, so any residual scale on the input would be flattened anyway.
+  - The pseudotime kNN ([38;5;153m_compute_pseudotime[39m, [38;5;153mcore.py:355-356[39m) is itself
+  unweighted-Euclidean and inherits the same invariance argument.
+
+  So: yes, scale-invariant by construction, exact at the
+  kernel-and-eigendecomposition level, robust through the multiscale and downstream
+  pseudotime steps.
+
+[38;5;246m✻[39m [38;5;246mBrewed[39m [38;5;246mfor[39m [38;5;246m5m[39m [38;5;246m4s[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mI am not talking about run_palantir, I am talking about the diffusion map [39m         [49m
+[48;5;237m  [38;5;231mconstruction[39m                                                                       [49m
+
+[38;5;231m●[39m Understood — diffusion map construction in isolation, i.e. [38;5;153mcompute_kernel[39m → [38;5;153mdiffusion_maps_from_kernel[39m → [38;5;153mdetermine_multiscale_space[39m ([38;5;153msrc/palantir/utils.py:340-911[39m). That's exactly what the
+
+[38;5;231m●[39m Understood — diffusion map construction in isolation, i.e. [38;5;153mcompute_kernel[39m → [38;5;153mdiffusion_maps_from_kernel[39m → [38;5;153mdetermine_multiscale_space[39m ([38;5;153msrc/palantir/utils.py:340-911[39m). That's exactly what the
+  experiment exercised; the [38;5;153mrun_palantir[39m minmax aside was a tangent and doesn't bear on the answer.
+
+  [1mYes,[0m[39m[49m [1mthe[0m[39m[49m [1mdiffusion-map[0m[39m[49m [1mconstruction[0m[39m[49m [1mis[0m[39m[49m [1mglobally[0m[39m[49m [1mscale-invariant.[0m[39m[49m
+
+  The argument lives entirely in three lines of the kernel:
+
+  1. [38;5;153madaptive_std[i][39m = distance to the (knn/3)-th NN of cell i ([38;5;153mutils.py:413[39m sklearn; [38;5;153mutils.py:432-434[39m scanpy).
+  2. Affinity = [38;5;153mexp(-d_ij[39m [38;5;153m/[39m [38;5;153mσ_i)[39m ([38;5;153mutils.py:416-417[39m, [38;5;153m437-438[39m).
+  3. T = D⁻¹K, eigendecomposed by ARPACK ([38;5;153mutils.py:478-484[39m).
+
+  Under X → c·X: d_ij → c·d_ij and σ_i → c·σ_i, so d_ij/σ_i is invariant ⇒ K invariant ⇒ T invariant ⇒ identical eigenvalues and eigenvectors (up to sign). The multiscale rescaling φ·λ/(1−λ)
+  at [38;5;153mutils.py:905[39m uses dimensionless eigenvalues, so it inherits the invariance.
+
+  Empirics (400×20 synthetic, sklearn backend for exact kNN, [38;5;153mscratch_scale_invariance.py[39m):
+
+  ┌──────────────────────────────┬───────────────┬──────────────────┬───────────────────────┐
+  │    Transform applied to X    │   max |Δλ|    │ min |cos| per DC │ min top-10 subspace σ │
+  ├──────────────────────────────┼───────────────┼──────────────────┼───────────────────────┤
+  │ c ∈ {10⁻³, 0.5, 2, 10, 10³}  │ ≤ 2.3e-15     │ 1.000000         │ 1.000000              │
+  ├──────────────────────────────┼───────────────┼──────────────────┼───────────────────────┤
+  │ translation up to ±10⁴       │ ≤ 1.5e-8 (FP) │ 1.000000         │ —                     │
+  ├──────────────────────────────┼───────────────┼──────────────────┼───────────────────────┤
+  │ random orthogonal Q          │ 2.9e-15       │ 1.000000         │ —                     │
+  ├──────────────────────────────┼───────────────┼──────────────────┼───────────────────────┤
+  │ anisotropic c_k ∈ U[0.1, 10] │ 4.3e-2        │ 0.78             │ —                     │
+  └──────────────────────────────┴───────────────┴──────────────────┴───────────────────────┘
+
+  So invariant to global isotropic scaling, translation, and orthogonal rotation; [1mnot[0m[39m[49m invariant to anisotropic per-feature rescaling, because that distorts the Euclidean metric the
+  kNN/affinity is built on. α-normalization ([38;5;153mutils.py:442-446[39m) is a function of the already-invariant K, so any α ∈ ℝ preserves the property.
+
+  Caveat for the default backend only: [38;5;153mKERNEL_BACKEND="scanpy"[39m calls pynndescent (approximate kNN) under its own RNG — analytically the kNN topology is preserved under scaling, but the
+  approximate solver can introduce trace numerical drift. The [38;5;153msklearn[39m backend is exact and gives the bit-tight numbers above.
+
+[38;5;246m✻[39m [38;5;246mBrewed[39m [38;5;246mfor[39m [38;5;246m17s[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mso σ_i is determined per neighborhood? How?[39m
+
+[38;5;231m[49m●[39m σ_i is the distance from cell [3mi[0m[39m[49m to its [38;5;153mfloor(knn/3)[39m-th nearest neighbor — a per-cell bandwidth set by local kNN geometry.
+
+  [38;5;153mutils.py:390[39m:
+  adaptive_k = [36mint[39m(np.floor(knn / [32m3[39m))
+  With the default [38;5;153mknn=30[39m, [38;5;153madaptive_k[39m [38;5;153m=[39m [38;5;153m10[39m.
+
+  Two implementations, same result:
+
+  - [1msklearn[0m[39m[49m ([38;5;153mutils.py:404-413[39m): query [38;5;153mn_neighbors[39m [38;5;153m=[39m [38;5;153mknn+1[39m from [38;5;153mNearestNeighbors[39m, drop the self-row at index 0, take column [38;5;153madaptive_k[39m [38;5;153m-[39m [38;5;153m1[39m:
+  adaptive_std = dist[:, adaptive_k - [32m1[39m]
+  - [1mscanpy[0m[39m[49m ([38;5;153mutils.py:419-434[39m): scanpy's distance matrix already excludes self; take the [38;5;153madaptive_k[39m-th smallest entry in each row via partition:
+  adaptive_std[i] = np.partition(row, adaptive_k - [32m1[39m)[adaptive_k - [32m1[39m]
+
+  So σ_i is exactly the radius around cell [3mi[0m[39m[49m that contains its 10 nearest neighbors. Dense regions → small σ_i → narrow effective bandwidth; sparse regions → large σ_i → wider one. That
+  density-adaptive choice is what makes the kernel robust to non-uniform sampling and is the source of the global-scale invariance: σ_i and d_ij both scale with c.
+
+  The affinity itself ([38;5;153mutils.py:416-417[39m sklearn; [38;5;153m437-438[39m scanpy) is
+
+    W_ij = exp(− d_ij / σ_i)
+
+  note that's linear in distance with the row's σ only — not the textbook Gaussian d²/(2σ²) and not symmetric. Symmetry is then imposed at [38;5;153mutils.py:440[39m:
+
+    K = W + Wᵀ ⇒ K_ij = exp(− d_ij/σ_i) + exp(− d_ij/σ_j)
+
+  which is what mixes both endpoints' bandwidths into the diffusion operator.
+
+  (For contrast, the [3mMarkov-chain[0m[39m[49m construction used for terminal-state detection — [38;5;153m_construct_markov_chain[39m in [38;5;153mcore.py:555[39m — uses the more standard Gaussian form [38;5;153mexp(−d²/(2σ_i²)[39m [38;5;153m−[39m [38;5;153md²/(2σ_j²))[39m.
+   Different stage, different kernel.)
+
+[38;5;246m✻[39m [38;5;246mBaked[39m [38;5;246mfor[39m [38;5;246m32s[39m
+
+[38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [7mw[0;2m[39m[49mhy[0m[39m[49m [2mexp(-d/σ)[0m[39m[49m [2minstead[0m[39m[49m [2mof[0m[39m[49m [2mthe[0m[39m[49m [2mGaussian?[0m[39m[49m
+[38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m◉[39m [38;5;246mOpus[39m [38;5;246m4.7[39m [38;5;246m(1M[39m [38;5;246mcontext)[39m [38;5;246m│[39m [38;5;246m█▏░░░░░░░▓[39m [38;5;246m110K/1.0M[39m [38;5;246m│[39m [38;5;246m⚡99%[39m [38;5;246m│[39m [38;5;246m$2.08[39m [38;5;246m+119/-0[39m [38;5;246m🟡[39m [38;5;246mpartial[39m [38;5;246moutage[39m                     [38;5;211m✗[39m [38;5;211mAuto-update[39m [38;5;211mfailed[39m [38;5;211m·[39m [38;5;211mTry[39m [1m[38;5;211mclaude[0m[39m[49m [1m[38;5;211mdoctor[0m[38;5;211m[49m or[39m [1m[38;5;211mnpm[0m[39m[49m [1m[38;5;211mi[0m[39m[49m [1m[38;5;211m-g[0m[39m[49m [1m[38;5;211m@anthropic-ai/claude-code[0m[39m[49m
+  [38;5;246m--[39m [38;5;246mINSERT[39m [38;5;246m--[39m [38;5;211m⏵⏵[39m [38;5;211mbypass[39m [38;5;211mpermissions[39m [38;5;211mon[38;5;246m (shift+tab[39m [38;5;246mto[39m [38;5;246mcycle)[39m                                                                                           [38;5;246mnew[39m [38;5;246mtask?[39m [38;5;153m/clear[38;5;246m to[39m [38;5;246msave[39m [38;5;153m113.2k[39m [38;5;153mtokens[39m
+

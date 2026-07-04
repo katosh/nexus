@@ -1,0 +1,1571 @@
+# Nexus workspace configuration template.
+#
+# Standing up your own nexus (full walkthrough in the README's
+# "How to run" + monitor/BOT_SETUP.md):
+#   1. Clone <your-org>/nexus-code (no fork needed).
+#   2. Create your own asset+issue repo
+#      (e.g. <your-org>/<yourname>-nexus-assets), private.
+#   3. cp config/nexus.example.yml config/nexus.yml; chmod 600.
+#   4. Edit every value below to match your environment. Set
+#      github.repo to YOUR asset+issue repo from step 2 — never
+#      `<your-org>/nexus-code`.
+#   5. Create your own GitHub App (see docs below), install it on
+#      the asset+issue repo, put its RSA private key at the path
+#      in github.bot_pem_path (perms 0600).
+#   6. Create your own Pushover account + application if you want
+#      phone push; write the user key and app token to the two
+#      paths in notifications.pushover.* (perms 0600 each).
+#   7. Pick an SMTP relay you can reach without auth for
+#      notifications.email.smtp_host (<your-institution> users: mx1.<your-institution>.example).
+#
+# `~` in paths expands to $HOME. Env vars documented in each script
+# still take precedence over this file.
+
+nexus:
+  # Absolute path to the nexus workspace root (this repo's checkout).
+  root: /path/to/nexus
+
+  # Environment-module name that provides Node.js, for HPC hosts where
+  # `node` is NOT on the default PATH but is available via Lmod / Tcl
+  # environment-modules (e.g. <your-institution> <cluster>: `module load nodejs`).
+  # monitor/install-claude-local.sh consults this ONLY when node is
+  # absent: it sources the module init, `module load`s this name (then
+  # falls back to discovering the highest >=18 versioned module if the
+  # site has no default), and re-checks. Leave as the default `nodejs`
+  # for FH <cluster> and most EasyBuild sites; override only if your site's
+  # node module is named differently. Env var NEXUS_NODE_MODULE wins
+  # over this key. Has no effect on hosts where node is already on PATH.
+  # See <your-org>/<other-nexus>#41.
+  node_module: nodejs
+
+github:
+  # GitHub login of the single authorised user. Every script treats
+  # comments by this user as directives; nobody else can drive the bot.
+  # `monitor/ng pr create` also auto-requests this login as the
+  # reviewer on bot-opened PRs, so it must resolve to a real GitHub
+  # collaborator on `github.repo` — otherwise the request_reviewers
+  # POST 422s and every PR open emits a noisy warning naming the
+  # unfilled placeholder. Replace before running any `ng` write.
+  user_login: <your-github-username>
+
+  # The repo the monitor reads/writes — issues, overview body,
+  # reactions, dashboard. This is YOUR operator-specific
+  # asset+issue repo, NOT the implementation repo.
+  #
+  # In the post-cutover topology the implementation lives at
+  # `<your-org>/nexus-code` (the local clone's `origin` remote, read-only
+  # for non-maintainers) and per-operator state lives in this
+  # asset+issue repo. Convention: `<your-org>/<your-name>-nexus-assets`.
+  # Worked example: <your-org>/<your-nexus> is <operator>'s asset+issue repo.
+  repo: your-org/yourname-nexus-assets
+
+  # The repo where uploaded assets land. Defaults to `repo` if absent —
+  # leave commented unless you intentionally want assets in a separate
+  # repo from issues (rare). `monitor/upload-asset.sh` clones this to
+  # `<nexus_root>/assets/` (gitignored) and pushes new assets to its
+  # `main` branch under `assets/...`.
+  # asset_repo: your-org/yourname-nexus-assets
+
+  # Your GitHub App (one per operator). Create at
+  # https://github.com/settings/apps/new (or
+  # https://github.com/organizations/<your-org>/settings/apps/new for
+  # an org-owned App). Grant the permissions in monitor/BOT_SETUP.md's
+  # "Permission table", install on YOUR asset+issue repo (`repo` above)
+  # — NOT on <your-org>/nexus-code — then copy these three values from
+  # the App page:
+  bot_app_id: 0000000
+  bot_installation_id: 000000000
+
+  # RSA private key path (chmod 600). Download from the App's settings
+  # page after creation.
+  bot_pem_path: ~/.claude/your-bot.pem
+
+  # Where the minted installation tokens are cached between calls.
+  bot_token_cache: ~/.claude/.nexus-bot-token.json
+
+  # Git author identity for bot-side commits (currently: the wiki
+  # pushes in monitor/upload-asset.sh). GitHub's convention for App
+  # commits is "<app-slug>[bot]" + the noreply address below. Find
+  # the slug in your installed App's URL
+  # (https://github.com/apps/<slug>). Leave unset and the scripts
+  # fall back to the legacy <your-org>-bot values for
+  # backward compatibility.
+  bot_git_name: your-bot[bot]
+  bot_git_email: your-bot[bot]@users.noreply.github.com
+
+  # The bot's GitHub login *slug* (no `[bot]` suffix). Consulted by
+  # the cross-repo surface gate (`monitor.cross_repo_surface`) below:
+  # when the mode is `mention_only` (default), cross-repo emits must
+  # `@`-mention this slug in their body to surface. Empty with
+  # `mention_only` ⇒ every cross-repo event is dropped (gate degrades
+  # to `off`); the watcher logs a one-time warning at startup. Find
+  # at https://github.com/apps/<slug>. (Issue #86 had retired this
+  # value; the 2026-05-18 cross-repo filter made it load-bearing
+  # again.)
+  bot_login: your-bot
+
+  # GitHub App webhook URL. The watcher does NOT POST to this URL —
+  # GitHub does. Setting any reachable URL on the App settings makes
+  # GitHub retain every delivery in `/app/hook/deliveries`, which the
+  # watcher reads with the App JWT (see `monitor.deliveries.*`
+  # and `monitor/watcher/_deliveries.sh`). Any inert sink works:
+  # a smee.io channel, a Cloudflare Worker returning 200, eventually
+  # a self-hosted receiver. This key is documentation-only today
+  # (the watcher trusts GitHub's deliveries log and doesn't read this
+  # field); the slot exists so the URL is recorded in the same place
+  # as everything else and becomes load-bearing once HMAC verification
+  # moves into a self-hosted receiver.
+  bot_webhook_url: https://smee.io/EXAMPLE-CHANNEL
+
+  # Path to the file storing the webhook HMAC secret (matching the
+  # value pasted into the App settings page's "Webhook secret" field).
+  # The file should be `chmod 600` (or `660` for a bot-uid group).
+  # Generate with `openssl rand -hex 32` and paste the same value
+  # into the App settings. Today the watcher does NOT read this file —
+  # it trusts GitHub's deliveries log over an authenticated channel.
+  # The slot is here so secret rotation becomes a config change rather
+  # than a code change once a self-hosted receiver verifies HMAC
+  # signatures locally.
+  bot_webhook_secret_path: ~/.claude/your-bot-webhook-secret
+
+lit:
+  # Literature-research tool (`ng lit`). Content-relevance paper discovery
+  # over Semantic Scholar (S2) and ASTA, deduped against the reference
+  # library. Both keys are OPTIONAL: an unconfigured backend is skipped
+  # with a note (never a hang). With neither configured, `ng lit` prints
+  # setup references and exits. Full setup + key-acquisition walkthrough:
+  # docs/reference/literature.md.
+  #
+  # config/nexus.yml is gitignored, so inlining the keys here is safe; you
+  # may also export S2_API_KEY / ASTA_API_KEY in the environment (env wins).
+  # Semantic Scholar key (free, instant): request at
+  #   https://www.semanticscholar.org/product/api#api-key-form
+  s2_api_key: ""
+  # ASTA / Allen AI key: request via the ASTA program (see the docs page).
+  asta_api_key: ""
+  # Reference library (JSONL). Default: <nexus.root>/.bipartite/refs.jsonl.
+  # Point this at a path inside your asset repo to version the library.
+  # library_path: ~/path/to/refs.jsonl
+
+notifications:
+  # Phone push: Pushover is preferred, ntfy is the fallback. Both are
+  # optional; with neither configured, monitor/notify.sh silently
+  # no-ops (so scripts can call it unconditionally).
+  pushover:
+    # Copy the Pushover user key from pushover.net (shown on the app's
+    # main screen and on the web dashboard) into this file, one line.
+    user_key_path: ~/.claude/.nexus-pushover-user-key
+    # Create an application at https://pushover.net/apps/build, name it
+    # "Nexus Monitor" (or whatever), and paste the resulting API token
+    # on the first line of this file.
+    app_token_path: ~/.claude/.nexus-pushover-app-token
+
+  ntfy:
+    # First line of this file holds the full ntfy topic URL,
+    # e.g. https://ntfy.sh/<unguessable-topic>. The topic name is a
+    # bearer secret on ntfy.sh's public instance.
+    topic_url_path: ~/.claude/.nexus-notify-token
+
+  email:
+    # Where emergency-tier emails go (production).
+    address: you@your-institution.edu
+
+    # Optional disposable alias used only for probes. Set to null to
+    # send probes to `address` instead.
+    probe_address: null
+
+    # Outbound SMTP relay. Must accept mail from this host without
+    # auth. For <your-institution> this is mx1.<your-institution>.example:25 (reachable only
+    # from on-prem). Change for your institution.
+    smtp_host: smtp.example.org
+    smtp_port: 25
+
+monitor:
+  # Seconds between watcher snapshots.
+  interval_seconds: 60
+  # tmux window the continuous watcher pastes reports into. Default
+  # "orchestrator" matches the workspace convention: the watcher's
+  # spawn paths create the window under this name and the
+  # orchestrator's session-pin hook keeps it pinned to it. ("claude"
+  # is the retired legacy name; the watcher still tolerates stale
+  # `claude`-named windows but no longer targets them.)
+  target_window: orchestrator
+  # Canonical tmux window index the orchestrator is pinned to on
+  # full-stack recovery (<your-org>/<your-nexus>#202). bootstrap-recover.sh
+  # brings the orchestrator up FIRST (before respawning workers) and
+  # moves its window to this index so a worker respawned during recovery
+  # can never steal the supervisor's slot. With tmux `base-index 1` the
+  # workspace convention is window 1 = `services` cockpit, window 2 =
+  # `orchestrator`, workers at 3+. The pin is non-destructive: if this
+  # index is already held by a DIFFERENT window the orchestrator is left
+  # where it landed and a loud line is logged (recovery never clobbers a
+  # window). Env override: RECOVER_ORCH_WINDOW_INDEX.
+  target_window_index: 2
+  # tmux window name of the read-only svc.sh cockpit (window 1 by
+  # convention). Its pane runs svc.sh, not claude, so the idle/liveness
+  # probe exempts it from the dead-worker sweep alongside the
+  # orchestrator and registry services (<your-org>/<your-nexus>#204). Change
+  # this only if you also rename the window in entry.sh / svc.sh. Env
+  # override: MONITOR_SERVICES_WINDOW.
+  services_window: services
+  # Days before archived diffs under monitor/.state/diffs/ are pruned.
+  diff_retention_days: 7
+
+  # Idle-worker probe (see monitor/watcher/_idle_probe.sh): a worker
+  # window is "really idle" when its tmux `#{window_activity}` age
+  # crosses this threshold AND pane-state.sh reports idle /
+  # autosuggest-only / empty. Independent of the bell flag (which
+  # clears on view, so bell-clear ≠ idle). Env override:
+  # MONITOR_IDLE_THRESHOLD_SECONDS.
+  idle_threshold_seconds: 60
+
+  # Hard-close threshold for the same probe: a window idle for ≥ this
+  # many hours surfaces as `idle-too-long` and the orchestrator
+  # defaults to closing it (retention overrides — recent user
+  # engagement, loaded-kernel cost — still apply). 24h is the
+  # workspace default; raise for long-running observational workers.
+  # Env override: MONITOR_IDLE_CLOSE_HOURS.
+  idle_close_hours: 24
+
+  # Spawn grace seconds (issue #72). A newly-spawned worker window
+  # whose `spawn` action-log event is more recent than this knob
+  # skips idle-pool classification entirely. Defends against the
+  # narrow window between `tmux new-window` and `claude` actually
+  # starting, when the pane briefly hosts the launcher shell and
+  # would otherwise (a) be classified as `idle` by pane-state.sh and
+  # (b) cross the 60s threshold to surface as `no-wrap-up` despite
+  # never having had a chance to do real work. Default 120s. Set to
+  # 0 to disable. Env override:
+  # MONITOR_IDLE_POOL_SPAWN_GRACE_SECONDS.
+  idle_pool_spawn_grace_seconds: 120
+
+  # Operator-engagement grace seconds (issue #196). When the idle
+  # probe detects the operator driving a worker window — a prompt
+  # submit stamped by the worker's UserPromptSubmit hook with no
+  # machine-input stamp (paste-followup / unstick nudge / spawn)
+  # claiming it for the orchestrator — the window holds an
+  # "operator-engaged" mark for this many seconds past the last
+  # engagement observation. While
+  # the mark is fresh the window classifies as `operator-engaged`
+  # instead of `wrapped`/`no-wrap-up` (one informational row, no
+  # follow-up-paste nag, not retire-eligible) and its `idle_prompt`
+  # decisions are withheld. Conversation think-gaps are minutes, so
+  # this must sit well above `idle_threshold_seconds`. Since issue
+  # #201 the mark PERSISTS past the grace (away phase, silent) —
+  # only a newer wrap-up / spawn or window close ends the
+  # suppression; the close-reminder knob below is the away phase's
+  # surface. Default 1800 = 30 min. Env override:
+  # MONITOR_OPERATOR_ENGAGED_GRACE_SECONDS.
+  operator_engaged_grace_seconds: 1800
+
+  # Cadence of the "operator away — consider closing this window"
+  # reminder for operator-engaged windows (issue #201), and the
+  # away-time floor before the first one. An engaged window whose
+  # operator stopped driving stays fully suppressed; once the
+  # operator has been away this many seconds the watcher emits ONE
+  # `engaged-close-reminder` row per period (instead of reverting to
+  # the per-cycle idle nag). The operator returning re-seeds the
+  # episode and resets the cadence. Default 86400 = 24 h. Env
+  # override: MONITOR_OPERATOR_ENGAGED_CLOSE_REMINDER_SECONDS.
+  operator_engaged_close_reminder_seconds: 86400
+
+  # Decay TTL for the operator-engaged change-corroboration signal
+  # (<your-org>/<your-nexus>#205 follow-up). THE knob that makes the mark
+  # self-expiring and biases toward RELEASING windows. A present-mark
+  # holds only while the worker's pane has CHANGED (transcript content,
+  # per pane-state.sh's `content_hash`) within this many seconds; once
+  # the pane has been static past the TTL the mark lapses and the
+  # window returns to normal retire-eligibility — so a window is never
+  # pinned open indefinitely on a stale or false mark. The same TTL
+  # bounds seed corroboration: an operator-attributed submit not
+  # followed by observed pane change within the TTL is treated as a
+  # redraw artifact and never marks. Must span at least a couple
+  # watcher cycles (default cycle 60 s) so a normal think-pause doesn't
+  # drop a real session; sits well below operator_engaged_grace_seconds
+  # so abandoned windows release in minutes rather than the 24 h
+  # away-grace. Default 600 = 10 min. Env override:
+  # MONITOR_OPERATOR_ENGAGED_CHANGE_TTL_SECONDS.
+  operator_engaged_change_ttl_seconds: 600
+
+  # Worker-side heartbeat staleness threshold in seconds (issue #74).
+  # Each nexus-spawned worker's per-spawn Claude Code hooks write a
+  # state heartbeat to `monitor/.state/heartbeat/<window>.json` on
+  # every tool call, notification, and user-prompt submission. The
+  # watcher's `monitor/pane-state.sh` consults that file FIRST: when
+  # `last_activity` is younger than this many seconds, the
+  # heartbeat's `state` is authoritative and the ANSI-grep renderer
+  # path is bypassed. Stale or missing ⇒ fall through to renderer
+  # detection. Tune this against your `interval_seconds` and the
+  # expected hook cadence; default 30 s comfortably covers two
+  # watcher polls plus normal tool-call gaps. Set high (e.g. 3600)
+  # to trust the heartbeat aggressively, or low (e.g. 5) to keep
+  # the renderer as a near-always-on shadow check. Plumbed into
+  # `pane-state.sh` via the `--heartbeat-staleness` flag by the
+  # watcher's caller.
+  heartbeat_staleness_seconds: 30
+
+  # Staleness window (seconds) for the CROSS-HOST nexus-instance heartbeat
+  # beacon — the cross-machine companion to the same-host instance flock on
+  # monitor/.state/nexus-instance.lock. The live watcher refreshes
+  # monitor/.state/nexus-instance.heartbeat every loop iteration (≤10s
+  # cadence). A cockpit STARTING on a DIFFERENT host (the NFS state dir is
+  # shared) reads the beacon: fresher than this window ⇒ a live peer ⇒ refuse;
+  # older ⇒ the holder is dead/gone ⇒ take over. flock over NFSv3 does not
+  # reliably arbitrate between clients, so this beacon is the cross-host guard
+  # the flock cannot provide. Keep it GENEROUS vs the refresh cadence so a
+  # slow loop or a cc-update self-restart never self-evicts a live remote
+  # instance; the only cost of a larger value is a longer wait before a
+  # genuinely-dead remote holder can be taken over. Default 600 s (10 min).
+  instance_heartbeat_staleness_seconds: 600
+
+  # Periodic full-state emit cadence in seconds (issue #72 D4). Every
+  # N seconds the watcher's next emit force-includes a
+  # `--- workspace snapshot ---` section listing every tracked
+  # worker window with its current pane-state and idle-age,
+  # regardless of transitions. Transition emits in between stay
+  # narrow. Gives operators a glance-level cumulative view at
+  # predictable cadence so the diff-only emit shape can't hide
+  # workspace-wide drift. Default 600 (10 min). Set to 0 to disable
+  # the periodic floor (pre-#72 transitions-only behaviour). Env
+  # override: MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS.
+  full_state_emit_interval_seconds: 600
+
+  # Full-state identity check + timeout heartbeat (issue #104,
+  # emit-gate-recover). At each cadence tick the canonical form of
+  # the snapshot (volatile ages stripped) is compared to the last
+  # EMITTED one; unchanged → the paste is suppressed, until the
+  # safety floor expires — at which point the emit fires anyway.
+  # That floor-expiry emit IS the watcher's heartbeat on a static
+  # workspace: it proves the compose loop is alive, keeps the paste
+  # channel warm, and resets the orchestrator-liveness clock. The
+  # default is liveness-coupled: effective heartbeat =
+  # ceil(floor / full_state_emit_interval) * interval =
+  # ceil(900/600)*600 = 1200 s, and the startup dead-threshold clamp
+  # (see dead_threshold_floor_margin_seconds) must stay below
+  # stale_paste_ceiling_seconds (1800): 1200+60+60 = 1320 < 1800.
+  # Raising the floor past ~1600 s (with default cadence/ceiling)
+  # makes the clamp decline with a startup WARN — raise
+  # stale_paste_ceiling_seconds too if you deliberately want a
+  # slower heartbeat. Env override:
+  # MONITOR_FULL_STATE_SAFETY_FLOOR_SECONDS.
+  full_state:
+    safety_floor_seconds: 900
+    # Adaptive idle backoff for the full-state HEARTBEAT (emit/exemption
+    # fidelity). The safety floor above is the base cadence at which an
+    # UNCHANGED canonical still re-emits (the liveness heartbeat). This
+    # backoff STRETCHES the effective floor the longer the canonical stays
+    # continuously unchanged — each time sustained idle crosses the next
+    # power-of-two multiple of the base it doubles, capped at max_seconds
+    # (900→1800 after ~30 min idle→3600 after ~60 min, ≈1 wake/hour on a
+    # still night). It SNAPS BACK to the base the instant the canonical
+    # changes, so a genuine transition is never delayed. Set enabled=false
+    # (or max_seconds<=safety_floor_seconds) to restore the fixed-floor
+    # behaviour. Env: MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED /
+    # MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS.
+    idle_backoff_enabled: true
+    idle_backoff_max_seconds: 3600
+
+  # Claude Code update-detection (GATED self-update, detect→inform
+  # half). The `cc_version_check` watcher task compares the
+  # package.json `@anthropic-ai/claude-code` pin against the npm
+  # `latest` dist-tag on this cadence; on a newer release it writes
+  # monitor/.state/cc-update-available, which the next emit surfaces
+  # ONCE (re-nag guarded) as a `--- claude code update available ---`
+  # section pointing at skills/nexus.cc-update/GUIDE.md. The watcher
+  # NEVER bumps — an evaluator agent runs the cc-harness gate first.
+  # Fail-safe: a registry-fetch failure leaves the signal untouched
+  # and never blocks the loop. See monitor/watcher/_cc_update.sh.
+  cc_update:
+    # Detection cadence in seconds. Default 86400 (24 h). Set to 0 to
+    # disable detection entirely. Env: MONITOR_CC_UPDATE_INTERVAL_SECONDS.
+    interval_seconds: 86400
+    # Emit gate for the manual "update available" nag. DEFAULT FALSE —
+    # the orchestrator-facing `--- claude code update available ---`
+    # section is SILENT unless you set this true. Rationale: when the
+    # autonomous daily routine below (cc_auto_update, ~04:00) is enabled,
+    # it closes the gated evaluate→gate→bump loop on its own, so the
+    # manual nag is redundant noise. Detection still runs and maintains
+    # monitor/.state/cc-update-available regardless (for `cat`/intro-
+    # spection and the autonomous routine), so flipping this back to true
+    # restores the manual gate without losing any state. NOTE: this
+    # silences the *manual evaluation trigger* only — it does NOT disable
+    # any gate. If you want an automatic bump you must ALSO enable
+    # cc_auto_update.enabled below; otherwise nothing tracks cc updates
+    # for you. Env: MONITOR_CC_UPDATE_EMIT_ENABLED.
+    emit_enabled: false
+    # npm package whose `latest` dist-tag is the candidate source. The
+    # same package install-claude-local.sh installs. Env:
+    # MONITOR_CC_UPDATE_PACKAGE.
+    package: "@anthropic-ai/claude-code"
+    # Path (repo-relative) to the updater skill the emit points the
+    # orchestrator at. Env: MONITOR_CC_UPDATE_SKILL_PATH.
+    skill_path: skills/nexus.cc-update/GUIDE.md
+    # Per-fire registry fetch timeout in seconds (curl --max-time), so
+    # a hung registry can never stall the async task. Default 10. Env:
+    # MONITOR_CC_UPDATE_FETCH_TIMEOUT_SECONDS.
+    fetch_timeout_seconds: 10
+
+  # Autonomous DAILY cc-update routine (the DRIVE half closing the
+  # gated loop; see monitor/watcher/_cc_auto_update.sh). Once per
+  # calendar day at `fire_time` the watcher re-checks the registry
+  # and, on a new candidate, spawns an autonomous evaluator worker
+  # that runs the full GUIDE flow (changelog -> collision analysis ->
+  # cc-harness gate -> decision) and, ONLY on a provably-safe verdict,
+  # executes the bump + watchdog-observed orchestrator restart with no
+  # operator engagement (monitor/cc-auto-update-apply.sh). A candidate
+  # needing a nexus-code compat change is NEVER auto-bumped: the
+  # evaluator comments on an existing open `cc-compat` PR or opens one
+  # (base dev) and holds for operator approval. Gate RED or any
+  # residual uncertainty -> block, surface, no bump.
+  cc_auto_update:
+    # Master enable. DEFAULT TRUE — paired with cc_update.emit_enabled:
+    # false above, the autonomous gated routine is the STANDARD cc-update
+    # path and the manual nag it replaces is silenced (<your-org>/<operator>-
+    # nexus#229, operator decision 2026-06-16 — option (a): emit silent +
+    # auto-update on). The autonomy is bounded, not blind: a bump happens
+    # ONLY behind a cc-harness GREEN gate — monitor/cc-auto-update-apply.sh
+    # refuses any verdict whose evidence does not contain `GATE GREEN`, so
+    # a RED gate never bumps; a candidate needing a nexus-code compat
+    # change is held on a `cc-compat` PR for operator approval, never
+    # auto-bumped. NOTE the cross-operator implication of this default: a
+    # fresh install now grants the stack autonomy to self-update Claude
+    # Code at `fire_time` out of the box. To opt OUT, set this false (and,
+    # if you also want the manual "update available" nag back, set
+    # cc_update.emit_enabled: true above). Env:
+    # MONITOR_CC_AUTO_UPDATE_ENABLED.
+    enabled: true
+    # Daily fire time, HH:MM in the watcher host's local timezone.
+    # Anacron-style catch-up: a watcher that was down at fire time
+    # fires on its first due tick after coming back (same day only).
+    # Env: MONITOR_CC_AUTO_UPDATE_FIRE_TIME.
+    fire_time: "04:00"
+    # Due-window poll cadence in seconds (NOT the fire cadence — fires
+    # are capped at one per calendar day by the last-fire-date stamp).
+    # 0 disables the task. Env:
+    # MONITOR_CC_AUTO_UPDATE_CHECK_INTERVAL_SECONDS.
+    check_interval_seconds: 300
+    # Tracking issue number on the IMPLEMENTATION repo
+    # <your-org>/nexus-code (NOT this asset repo) the evaluator wraps up
+    # against on a surfaced verdict (review/compat/block). A SAFE
+    # auto-update is silent — no issue anywhere. cc-update notices must
+    # NEVER land in the operator's asset repo. Empty = no standing
+    # issue; the evaluator opens a fresh nexus-code issue if it must
+    # surface a block. Env: MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE.
+    tracking_issue: ""
+
+  # Continuous service-health watch (service-health-watch). The
+  # `service_health` watcher task runs every registered infra service's
+  # column-4 healthcheck (monitor/services.registry) on this cadence and,
+  # on an unhealthy service, attempts an immediate minimal-downtime
+  # auto-restart via `monitor/svc.sh restart <svc>` (which reuses
+  # recover_service AND stops a wedged supervisor's process group — the
+  # fix bare recover_service cannot do). Down/recovering/flapping/recovered
+  # conditions are surfaced to the orchestrator through a
+  # `--- service health ---` compose_emit section (re-nag guarded), and the
+  # orchestrator follows skills/nexus.service-recovery: restore, dispatch a
+  # root-cause worker, open an operator incident issue
+  # (`monitor/ng service-incident <svc>`). Detection keys on the REGISTRY
+  # healthcheck, never on tmux/worker heuristics; service windows stay
+  # exempt from worker-dead detection. The watcher NEVER degrades or
+  # falsifies a service to pass a check. See
+  # monitor/watcher/_service_health.sh.
+  service_health:
+    # Master enable. DEFAULT TRUE — availability is the point. Set false
+    # (or interval_seconds to 0) to fall back to supervisor-only self-heal
+    # with no continuous detection or orchestrator emit. Env:
+    # MONITOR_SERVICE_HEALTH_ENABLED.
+    enabled: true
+    # Health-check cadence in seconds. Default 120 — a wedged HTTP service
+    # is detected within one interval. Lower for tighter detection at the
+    # cost of more frequent healthcheck spawns. 0 disables the task. Env:
+    # MONITOR_SERVICE_HEALTH_INTERVAL_SECONDS.
+    interval_seconds: 120
+    # Self-heal grace window in seconds. A freshly-unhealthy service is
+    # given this long to recover ON ITS OWN — via its `*-supervised.sh`
+    # wrapper's self-heal — BEFORE the watcher takes any action. A
+    # process-crash the wrapper relaunches heals within grace and the
+    # watcher never restarts it (no double-restart, churn, or fault
+    # masking). Only a service STILL unhealthy after grace — wedged
+    # process, or dead wrapper — is acted on. This is the key "don't
+    # restart unnecessarily" knob. Default 30. Set 0 to act on the first
+    # failed check (legacy behaviour). Keep it below interval_seconds so
+    # the next tick reliably observes grace as elapsed. Env:
+    # MONITOR_SERVICE_HEALTH_GRACE_SECONDS.
+    grace_seconds: 30
+    # Default per-service restart policy for registry rows that DON'T
+    # declare one (the optional 6th column in monitor/services.registry):
+    #   auto-restart  grace -> minimal-downtime restart (flap-controlled)
+    #                 -> emit. The availability default.
+    #   emit-only     never auto-restart; after grace, emit and let the
+    #                 orchestrator decide (for services where a blind
+    #                 restart is unsafe or wants human judgment).
+    # A row's own 6th column overrides this. Default auto-restart. Env:
+    # MONITOR_SERVICE_HEALTH_DEFAULT_POLICY.
+    default_policy: auto-restart
+    # Per-service restart cooldown: after an auto-restart, the same service
+    # is not restarted again for at least this long (the next tick within
+    # the window only verifies / waits). Bounds thrash. Default 300. Env:
+    # MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS.
+    restart_cooldown_seconds: 300
+    # Flap ceiling: max auto-restart attempts within ONE incident before
+    # the watcher stops thrashing and escalates "won't-recover" (flapping)
+    # to the orchestrator. Re-arms when the service is healthy again.
+    # Default 3. Env: MONITOR_SERVICE_HEALTH_FLAP_CEILING.
+    flap_ceiling: 3
+
+  # Watcher-supervision — the MUTUAL-LIVENESS contract (no daemon).
+  #
+  # WHY. The watcher is the nexus's only always-on loop: it supervises
+  # the orchestrator AND the registered services, and it pastes the
+  # GitHub control surface. But nothing turn-independently supervised the
+  # WATCHER — it self-restarts only on version drift (a dead watcher
+  # can't restart its own crash), the orchestrator revives it only on its
+  # turn cadence, boot-recover only at a cold boot. So a watcher that
+  # crashed while the orchestrator was idle entered a self-perpetuating
+  # dead state. Inside the agent-sandbox there is no OS supervisor (no
+  # cron spool, no systemd user bus).
+  #
+  # THE FIX (operator design): the watcher already revives the
+  # orchestrator (orchestrator-liveness), so the orchestrator's own
+  # always-on agent loop is the external supervisor the watcher needs —
+  # closing the circularity by MUTUALITY, not a new process. The
+  # orchestrator arms a persistent Monitor:
+  #     Monitor({command:
+  #       'until ! /ABS/monitor/watcher-supervise-tick.sh; do sleep 15; done'})
+  # Each tick TOUCHES a supervisor heartbeat (proving it is armed) and
+  # reports watcher liveness; when the watcher dies the loop exits, waking
+  # the orchestrator to run `monitor/revive-watcher.sh` (loop-guarded;
+  # reuses `svc.sh restart watcher`). The WATCHER's only role here is to
+  # emit an `--- arm watcher supervisor ---` reminder when that heartbeat
+  # is stale/absent — nudging a freshly-(re)started orchestrator to
+  # (re)arm. Both down at once → cold-boot recovery (bootstrap-recover at
+  # SessionStart). THE restart command stays `monitor/svc.sh restart
+  # watcher` (idempotent: single-flight flock, whole-process-group reap,
+  # verify, fail loud). See monitor/README.md "Watcher supervision".
+  watcher_supervisor:
+    # Master enable. DEFAULT TRUE — gates the watcher's arm-reminder
+    # emit. Set false to silence it (e.g. an operator who deliberately
+    # runs without the supervisor Monitor). Env:
+    # MONITOR_WATCHER_SUPERVISOR_ENABLED.
+    enabled: true
+    # How old (seconds) the supervisor heartbeat may get before the
+    # watcher concludes the Monitor is NOT armed and emits the reminder.
+    # Must comfortably exceed the Monitor tick interval (~15s) so a
+    # healthy armed Monitor never trips it. Default 90. Env:
+    # MONITOR_WATCHER_SUPERVISOR_HEARTBEAT_STALE_SECONDS.
+    heartbeat_stale_seconds: 90
+    # Crash-loop guard for revive-watcher.sh: at most loop_limit revivals
+    # per loop_window_seconds. Past that it BACKS OFF (logs loud +
+    # sandbox-notifies) instead of the orchestrator reviving a watcher
+    # that crash-loops on a real fault — the operator's cue to intervene.
+    # Defaults 5 / 600. Env: MONITOR_WATCHER_SUPERVISOR_LOOP_LIMIT,
+    # MONITOR_WATCHER_SUPERVISOR_LOOP_WINDOW_SECONDS.
+    loop_limit: 5
+    loop_window_seconds: 600
+
+  # Read-only-FS (EROFS) escalation (<your-org>/nexus-code rofs-incident).
+  # When the project filesystem goes READ-ONLY the watcher dies and CANNOT
+  # be revived from inside the sandbox; revive-watcher.sh / the supervise
+  # tick detect it and raise a turn-INDEPENDENT operator alarm that does
+  # NOT touch the read-only project FS.
+  rofs_alarm:
+    # How often (seconds) the read-only alarm may RE-RING for the same
+    # sustained outage — throttle keyed in $TMPDIR (writable when the
+    # project FS is not), shared across revive-watcher + the supervise
+    # tick so they never double-ring. Also bounds how often the GitHub
+    # escalation below attempts a network call. Default 120. Env:
+    # MONITOR_ROFS_ALARM_THROTTLE_SECONDS.
+    throttle_seconds: 120
+    # ALSO escalate OUT-OF-BAND to GitHub (in addition to the terminal
+    # sandbox-notify alarm): file a single OPEN `cc-incident:` issue on
+    # github.repo with an inline diagnostic + an @-ping to user_login, and
+    # comment the same ping + a link on the nexus overview issue — so a
+    # watcher-down-on-RO-FS reaches the operator even with an unattended
+    # terminal. Network-only + RO-FS-safe (BOT token via mint-token + a
+    # direct `gh api`; no `ng`, no project-FS write, no local marker;
+    # idempotent over the network so a sustained outage raises ONE issue,
+    # not a flood). DEFAULT TRUE — the catastrophic watcher-down case is
+    # the whole point; set false to disable the GitHub half (the terminal
+    # alarm always remains). Env: MONITOR_ROFS_GITHUB_ESCALATION_ENABLED.
+    github_escalation_enabled: true
+
+  # Content-hash dedup gate (issue #190 follow-up; ring + shared
+  # strip in emit-gate-recover). After compose_emit assembles the
+  # candidate body, the watcher computes a sha256 over a canonical
+  # form (the SHARED volatile strip: header timestamp, dashboard
+  # `last updated:` line, per-window idle / away / interrupted ages,
+  # `N awaiting-input`, `--- nexus-emit-sig ...` footer) and compares
+  # it against the hashes of the last emit_dedup_ring_size
+  # successfully-pasted bodies. On a match landed within this many
+  # seconds, the paste is suppressed (the archive write still
+  # happens; a one-line `emit-dedup: suppressed ...` row goes to
+  # watcher.log). Bypassed when the body carries an `id=<N>` row
+  # under `--- eligible github comments ---` (issue #152 narrowed
+  # the bypass to that single surface). NOT consulted for full-state
+  # cadence emits — those are adjudicated by the canonical identity
+  # check + full_state.safety_floor_seconds above, whose timeout
+  # heartbeat must never be swallowed by this longer quiet window.
+  # Default 86400 (24 h). Set to 0 to disable the gate (every
+  # eligible emit pastes; no state files written). Env override:
+  # MONITOR_EMIT_DEDUP_MAX_QUIET_SECONDS.
+  emit_dedup_max_quiet_seconds: 86400
+
+  # Depth of the recent-emit hash ring the dedup gate compares
+  # against (emit-gate-recover). 1 reproduces the old single-slot
+  # behavior — which an ALTERNATING pair of body shapes (the
+  # 2026-07-06 resurface flood: parked-transition row ↔
+  # pending-decision re-nag) defeats forever. A small ring collapses
+  # any short cycle of repeating shapes; genuinely new content still
+  # hashes fresh and emits. Env override:
+  # MONITOR_EMIT_DEDUP_RING_SIZE.
+  emit_dedup_ring_size: 8
+
+  # Re-emit-until-acked for cross-repo bot-mention comments
+  # (nexus-code#236). The in-$REPO GraphQL backstop (github_poll) is
+  # already re-emit-until-acked: it re-queries the LIVE reaction state
+  # every 600 s and re-surfaces any open-issue/PR comment lacking the
+  # bot's 👀. Cross-repo comments (a `mention=<repo>` block from the
+  # deliveries webhook path — e.g. an @-mention of the bot on
+  # <your-org>/nexus-code) have NO such backstop: the deliveries path is
+  # emit-once (cursor-gated, destructively drained), so a single dropped
+  # paste loses the comment with no retry. That is how nexus-code#310/
+  # #311 slipped through. This registry persists un-acked cross-repo
+  # blocks and re-feeds them into the emit pipeline until the bot 👀-acks
+  # them.
+  #
+  # TWO-TIER reaction-gated cadence (nexus-code#360). The bot's reaction IS
+  # the re-emit state machine — there is no separate "done" flag, just the
+  # 👀/🚀 the orchestrator already places:
+  #   * NO 👀 yet (un-acknowledged)        -> FAST re-emit (reemit_noeyes_minutes,
+  #                                           under `mentions:` below). Nudge
+  #                                           quickly until the bot 👀s.
+  #   * 👀 but no 🚀 (acked / in progress) -> SLOW re-emit (reemit_norocket_hours).
+  #                                           Periodic "still on track?" check.
+  #   * 🚀 present (done)                  -> STOP (registry eviction).
+  # This makes the previously-inert 🚀 the terminal signal and the 👀 the
+  # fast-loop ack. `ng react <id> rocket` / `ng wrap-up` record `rocket:<id>`
+  # in processed-comments.txt (the STOP marker); a bare `comment:<id>` 👀
+  # demotes to the slow tier. The registry gates BOTH tiers at the source
+  # (`_reemit_pending`), composing with the body-independent backoff floor
+  # (reemit_backoff_seconds). See monitor/watcher/_reemit.sh.
+  #
+  # SCOPE. The registry only persists cross-repo blocks the bot actually
+  # PARTICIPATES in: the drained deliveries stream (which spans the App's
+  # whole install scope — every repo the App is on, including other
+  # operators' nexuses) is passed through `_filter_cross_repo_surface`
+  # (the @<bot>-mention participation gate) before registration, so
+  # genuine foreign noise the bot is not addressed in is dropped.
+  # `_reemit_register` then classifies survivors by author: operator-
+  # authored -> direct=yes (re-emits); other-user-authored but bot-
+  # involved -> direct=no retained CONTEXT (kept, never direct-emitted),
+  # so a user-relevant cross-tenant comment the bot is in is preserved
+  # rather than discarded (<your-org>/nexus-code#359 round-2). See
+  # `_filter_cross_repo_surface` in monitor/watcher/_github.sh.
+  #   reemit_enabled: master switch. Default true.
+  reemit_enabled: true
+  #   reemit_max_age_seconds: safety cap. An entry the bot never acks
+  #   (comment deleted, App uninstalled from the source repo) is evicted
+  #   and stops re-emitting once it ages past this, with a loud
+  #   reemit-gc log line. Default 259200 (3 days, matching GitHub's
+  #   webhook-delivery retention). Env: MONITOR_REEMIT_MAX_AGE_SECONDS.
+  reemit_max_age_seconds: 259200
+  #   reemit_live_recheck: on GC, query the live reactions endpoint for
+  #   entries past their re-emit cooldown and evict if the bot already
+  #   reacted (EYES/ROCKET by a non-operator login) — recovers from a
+  #   lost/truncated processed-comments cache. ≤ one API call per
+  #   un-acked comment per cooldown window. Default true. Env:
+  #   MONITOR_REEMIT_LIVE_RECHECK.
+  reemit_live_recheck: true
+  #   processed_comments_max_entries: bound on the append-only
+  #   processed-comments.txt 👀/🚀-ack cache (nexus-code#360). The cache is a
+  #   propagation-lag / cadence bridge over the LIVE reaction query that is
+  #   the real source of truth; it had NO pruning and grew one line per bot
+  #   reaction forever. `prune_archive` retains the most-recent N entries
+  #   (append-ordered, newest at the tail → keep-newest, no format change).
+  #   0 disables. Default 2000. Env: MONITOR_PROCESSED_COMMENTS_MAX_ENTRIES.
+  processed_comments_max_entries: 2000
+
+  # Change-detection snapshot bounding (nexus-code#236, silent-watcher
+  # hardening). The watcher diffs `snapshot_local` (last-snapshot.txt) each
+  # cycle to decide whether to emit. That payload must stay O(1)-ish and
+  # NOISE-FREE regardless of how many git worktrees / reports accumulate, so
+  # report/worktree churn neither DRIVES nor MASKS an emit. (The full-state
+  # DISPLAY snapshot is separate and unaffected.) On 2026-06-18 a 109-worktree
+  # / ~1240-report workspace made this snapshot take ~66s and stalled emits.
+  snapshot:
+    #   git_enabled — include the per-worktree `--- git ---` section in the
+    #   CHANGE-DETECTION snapshot. DEFAULT FALSE: every git-row transition is
+    #   already classified as pure noise by _classify_diff, so the
+    #   `git status` scan per worktree buys ZERO signal while costing
+    #   O(worktrees) NFS round-trips on the critical path. Off removes that
+    #   cost entirely. Env: MONITOR_SNAPSHOT_GIT_ENABLED.
+    git_enabled: false
+    #   reports_timeout_seconds / git_timeout_seconds — wall-clock budgets for
+    #   the reports-dir and (when enabled) git scans. On an NFS stall the scan
+    #   is killed and a STABLE sentinel + throttled WARN are emitted instead of
+    #   wedging the loop (crash-over-silence: degrade loud, never stall).
+    reports_timeout_seconds: 5
+    git_timeout_seconds: 10
+  # Wall-clock budget (s) for each SYNCHRONOUS startup-sweep heavy render
+  # (idle section, pending decisions, full-state snapshot). These run once
+  # before the main loop starts and used to block loop entry unboundedly (the
+  # 66s startup stall). Past the budget each aborts LOUDLY and continues with
+  # a partial render. Env: MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS.
+  startup_render_timeout_seconds: 20
+
+  # Worker notifications log size cap in bytes (issue #76). The
+  # default `Notification` hook (see "## Worker hooks" in
+  # skills/nexus.worker-defaults/SKILL.md) appends one JSONL row per
+  # claude-side notification event (`permission_prompt`,
+  # `idle_prompt`, `auth_success`, MCP elicitation) to
+  # `monitor/.state/worker-notifications.jsonl`. Once it crosses
+  # this size the watcher rotates it to
+  # `worker-notifications.jsonl.<epoch>` and rotated archives are
+  # pruned along the same retention window the watcher applies to
+  # its diff archive (`diff_retention_days`). Default 10485760
+  # (10 MiB). Env override: MONITOR_NOTIFICATIONS_LOG_MAX_BYTES.
+  notifications_log_max_bytes: 10485760
+
+  # Shared rotation cap for the remaining append-only .state files:
+  # watcher.log (copytruncate — the headless launcher holds its
+  # inode), functional-check.tsv, and action-log.jsonl. Rotated to
+  # <name>.<epoch> by prune_archive once a file crosses this size;
+  # archives pruned on diff_retention_days. Default 10485760
+  # (10 MiB); 0 disables. Env override: MONITOR_STATE_LOG_MAX_BYTES.
+  state_log_max_bytes: 10485760
+
+  scheduler:
+    # Rotation cap for watcher-scheduler.jsonl, the per-fire
+    # telemetry sink — the fast grower (one row per task fire at
+    # 2-5 s cadences, ~15 MB/day; observed at 310 MB live before
+    # this cap existed). Same <name>.<epoch> + retention lifecycle
+    # as state_log_max_bytes. Default 52428800 (50 MiB); 0 disables.
+    # Env override: MONITOR_SCHEDULER_LOG_MAX_BYTES.
+    log_max_bytes: 52428800
+
+    # Async hang watchdog (<your-org>/<your-nexus>#180 R4). An async
+    # scheduler task still in flight past max(4 × its interval, this
+    # floor) has its child process tree killed and re-arms on its
+    # next due tick. Closes the silent-permanent-task-death mode: a
+    # hung helper (e.g. a gh call on a black-holed connection — no
+    # client-side timeout) otherwise left the in-flight guard
+    # skipping every future fire of that task with no log line.
+    # Default 300; 0 disables. Env: MONITOR_SCHEDULER_ASYNC_TIMEOUT_FLOOR.
+    async_timeout_floor_seconds: 300
+  # Lifetime of a `window-retain` action-log event in seconds. The
+  # idle-worker probe treats a recent retain as "intentionally
+  # idle" and suppresses the row into a footer; past this TTL the
+  # retain is ignored and the worker reclassifies normally
+  # (`wrapped` / `no-wrap-up`). The retain is also consumed by any
+  # activity after `retain.ts` — TTL is the upper bound, not the
+  # only expiry. `wrapped-but-stub` and `idle-too-long` are never
+  # suppressed regardless of retain.
+  #
+  # `ng wrap-up` auto-logs a `window-retain` on every successful
+  # hand-off (unless `--no-retain` is set), so this TTL is the
+  # default window in which the orchestrator can re-engage a
+  # wrapped worker via paste-buffer follow-up instead of spawning
+  # fresh. 24 h covers a typical workday's collaboration loop;
+  # operators who prefer eager cleanup can shorten per-deployment.
+  # Default 86400 = 24 h. Env override: MONITOR_RETAIN_TTL_SECONDS.
+  retain_ttl_seconds: 86400
+
+  retain:
+    # Issue #75 claude-loop wrapper. When `true`, `monitor/spawn-worker.sh`
+    # generates a launcher that runs claude through `monitor/claude-loop.sh`
+    # — a respawn shim that re-launches `claude --continue` in the same
+    # workdir after a graceful exit, bounded by `retain_ttl_seconds`,
+    # a max-restart cap (default 10), an operator stop sentinel under
+    # `monitor/.state/loop-stop/<window>.flag`, and SIGINT/SIGTERM
+    # during back-off sleep. The motivation is that retain-by-default
+    # in `ng wrap-up` is a *suppression mark*, not a *liveness
+    # guarantee*: today's `remain-on-exit on` keeps the tmux window
+    # scroll-readable but the claude process exits, leaving the
+    # operator with a `[exited]` pane to manually relaunch before any
+    # paste-buffer follow-up lands. With the loop wrapper, the
+    # operator's next paste replays into a live `claude --continue`
+    # session.
+    #
+    # Default `false` — opt-in until shaken out. Env override:
+    # MONITOR_RETAIN_USE_LOOP_WRAPPER. Stop-sentinel writer (a
+    # SessionEnd hook that fires when the operator types `/exit`)
+    # is a separate follow-up; today the sentinel is operator-touched
+    # or signal-driven.
+    use_loop_wrapper: false
+
+  # Minimum body length (chars, excluding frontmatter) for
+  # `monitor/ng report-check` to accept a report. Guards against
+  # stub asset uploads by gating `ng wrap-up` on a substantive
+  # report. Env override: MONITOR_REPORT_MIN_CHARS.
+  report_min_chars: 500
+  # Consecutive paste-to-target failures (target window missing)
+  # before the watcher launches a fresh `claude` agent in that
+  # window. Set to a large number (e.g. 999) to disable.
+  agent_dead_threshold: 3
+
+  # Extra confirming polls after a missing-target-window observation
+  # before the watcher respawns the orchestrator. The target_window
+  # probe runs at 2 s cadence, so the default of 3 requires ~8 s of
+  # confirmed absence. 0 respawns on the very first absent reading —
+  # the pre-2026-06-02 behaviour, where a single transient misread
+  # (tmux rename race, list-windows glitch) spawned a duplicate
+  # orchestrator. Independent of this knob, the watcher re-verifies
+  # the absence immediately before every respawn launch
+  # (fresh window probe + orchestrator-process pane scan +
+  # liveness-signal check) and aborts on any sign of life.
+  agent_missing_respawn_delay: 3
+
+  # Crash-loop guard for orchestrator respawns. If more than
+  # `respawn_loop_limit` respawns happen within
+  # `respawn_loop_window_seconds`, the watcher stops respawning
+  # `claude` until the sliding window empties OR a paste-to-target
+  # succeeds (which clears the history). One sandbox-notify on the
+  # transition from ok → tripped, then quiet. Defaults: 3 respawns
+  # within 120 s. Set the limit to a large value (e.g. 999) to
+  # effectively disable the guard.
+  respawn_loop_limit: 3
+  respawn_loop_window_seconds: 120
+
+  # Slow-grind respawn guard (issue #77). Asymmetric counterpart to
+  # the burst-limit guard above: instead of rate, it counts
+  # CONSECUTIVE FAILED respawns. A 1-per-60 s drip slides under the
+  # 120 s burst window indefinitely; this counter trips after N
+  # back-to-back `tmux new-window` failures regardless of cadence.
+  # On trip: one `respawn-slow-grind-tripped` action-log event, one
+  # `sandbox-notify`, then respawn attempts pause for
+  # `respawn_slow_grind_cooldown_seconds`. After the cooldown
+  # elapses the counter re-arms automatically. Any successful
+  # paste-to-target also clears it. Set the limit to a large value
+  # (e.g. 999) to effectively disable.
+  respawn_consecutive_failure_limit: 5
+  respawn_slow_grind_cooldown_seconds: 600
+
+  # Orchestrator-liveness fresh-spawn fallback. Layered on the
+  # session-id pin (see github.user_login above and PR #147): the
+  # pin fixes *who* `claude --continue` resumes; this fallback
+  # ensures the orchestrator's absence is *detectable* and
+  # *recoverable* without operator intervention even when --continue
+  # can't help (wrong session resumed, hook misconfigured, claude
+  # wedged on the splash, etc.).
+  #
+  # Issue #164 replaced the binary `unresponsive_age > threshold`
+  # check (#157) with a hook-driven state machine. Three signals
+  # feed it (all touch files asynchronously via
+  # `(... &) >/dev/null 2>&1` so the hooks return instantly):
+  #
+  #   1. **Heartbeat** — `monitor/.state/orchestrator-heartbeat`,
+  #      touched by a `Stop` hook in
+  #      `monitor/orchestrator-settings.json` at every turn-end.
+  #      "I just finished a turn."
+  #
+  #   2. **Paste-received** —
+  #      `monitor/.state/orchestrator-paste-received`, touched
+  #      by a `UserPromptSubmit` hook the moment the input
+  #      queue picks up a watcher paste. "I see the prompt;
+  #      processing it." Distinguishes mid-tool-turn from a
+  #      wedge without depending on Claude Code's session-log
+  #      format (which the legacy jsonl-mtime fallback uses).
+  #
+  #   3. **Last-paste timestamp** —
+  #      `monitor/.state/orchestrator-last-paste.ts`, stamped on
+  #      every successful watcher paste. The moment we poked.
+  #
+  # Decision: if any of (heartbeat, paste-received, or the legacy
+  # jsonl-mtime fallback) is past the last-paste epoch, the
+  # orchestrator reacted; healthy. Otherwise the state machine
+  # waits out `paste_response_grace_seconds` (120), then gives
+  # `unstick_window_seconds` (150) for cases A-D in `_unstick.sh`
+  # to recover the wedge, then re-pastes the pending emit body
+  # once (re-submit rescue — a dropped Enter on an alive pane is
+  # rescued by a re-paste, not a respawn), and only escalates to
+  # respawn if the re-submit also produces no response or
+  # `orchestrator_dead_threshold_seconds` (300) elapses since the
+  # paste. Pure idleness produces zero pastes-without-response —
+  # idle is alive, always.
+  #
+  # When escalated the watcher invokes
+  # `monitor/watcher/spawn-fresh-orchestrator.sh` to kill the
+  # stale window, spawn a fresh claude with `--continue` (default,
+  # resumes prior context) and `--settings orchestrator-settings.json`
+  # (reloads the pin + heartbeat hooks), and paste a situation
+  # report. The `--fresh` flag on the helper opts in to cold-boot
+  # recovery for true emergencies. Cooldown bounds retry rate.
+  #
+  # Env overrides:
+  #   MONITOR_ORCHESTRATOR_FRESH_SPAWN_ENABLED  -> orchestrator_fresh_spawn_enabled
+  #   MONITOR_ORCH_PASTE_RESPONSE_GRACE_S       -> paste_response_grace_seconds
+  #   MONITOR_ORCH_UNSTICK_WINDOW_S             -> unstick_window_seconds
+  #   MONITOR_ORCH_DEAD_THRESHOLD_S             -> orchestrator_dead_threshold_seconds
+  #   MONITOR_ORCH_LIVENESS_LOG_THROTTLE_S      -> liveness_log_throttle_seconds
+  #   MONITOR_ORCHESTRATOR_FRESH_SPAWN_COOLDOWN_SECONDS -> orchestrator_fresh_spawn_cooldown_seconds
+  #   MONITOR_ORCHESTRATOR_STALE_SECONDS        -> orchestrator_stale_seconds
+  #
+  # DEPRECATED: `orchestrator_unresponsive_threshold_seconds` (and
+  # the matching `MONITOR_ORCH_UNRESPONSIVE_THRESHOLD_S` env var)
+  # is honoured for one release as a fallback default for
+  # `orchestrator_dead_threshold_seconds`. Operators with an
+  # explicit override should rename to
+  # `orchestrator_dead_threshold_seconds`. Removed in a future
+  # release.
+  orchestrator_fresh_spawn_enabled: true
+  orchestrator_fresh_spawn_cooldown_seconds: 1800
+  orchestrator_stale_seconds: 300
+  # The three state-machine knobs (paste_response_grace_seconds,
+  # unstick_window_seconds, orchestrator_dead_threshold_seconds)
+  # live under `monitor.watcher.*` further down to group with
+  # other watcher-internal tuning. Defaults: 120 / 150 / 300.
+
+  # Deliveries-polling event source. When `true`, the watcher polls
+  # `/app/hook/deliveries` (the App's webhook delivery log) every
+  # `deliveries_poll` cycle (15 s) in addition to the existing
+  # GraphQL-search path against `github.repo`.
+  #
+  # This is the NEAR-REAL-TIME channel for operator comments on
+  # `github.repo`: an in-repo `issue_comment` arrives on the webhook
+  # delivery log and surfaces as an `issue=` block within ~15 s, instead
+  # of waiting up to ~600 s for the `github_poll` GraphQL reconciliation
+  # pass (which stays enabled as the slower backstop so nothing is missed
+  # if a delivery is dropped). De-dup against `snapshot_github` is by the
+  # shared `processed-comments.txt` (`comment:<id>` keys), so a comment
+  # that arrives via both paths surfaces exactly once.
+  #
+  # Default `true` (2026-06-23). Originally `false` after the deliveries
+  # path wedged the loop 3× on 2026-06-20 (un-timed-out curls + a cursor
+  # that only advanced at the end of the walk); both failure modes are
+  # fixed by guards 1–3 in `monitor/watcher/_deliveries.sh` (bounded curls,
+  # two-phase incremental cursor, per-cycle fetch cap), so the defensive
+  # default is retired. Safe to default ON: every curl is bounded
+  # (`deliveries.connect_timeout_seconds` / `deliveries.max_time_seconds`)
+  # and a non-fatal skip can never block the loop, AND the path degrades to
+  # a clean no-op when the App has no webhook URL — `/app/hook/deliveries`
+  # 404s, the watcher logs one warning per day and emits nothing. Set
+  # `false` to opt out. Enable benefits the most when:
+  #
+  #   1. The App has a webhook URL configured (any inert sink is
+  #      fine; e.g. a smee.io channel or a Cloudflare Worker that
+  #      returns 200). GitHub records every delivery in the log
+  #      regardless of receiver outcome — the watcher reads from
+  #      the log, not from the URL. Without a webhook URL the path is
+  #      a harmless no-op (see the 404 degradation above).
+  #   2. The App is subscribed to the events the watcher folds into
+  #      its line shapes: `issue_comment`, `pull_request_review_comment`,
+  #      `pull_request_review`, `issues`, `pull_request`.
+  # Only `USER_LOGIN`-authored events surface (issue #86's universal
+  # user-author filter). Non-user mentions of the bot are an accepted
+  # loss; the operator monitors cross-instance threads manually. See
+  # `monitor/watcher/_deliveries.sh` for the line-shape vocabulary and
+  # the dedup rules between this path and `snapshot_github`.
+  #
+  # This is the channel that surfaces "the bot was @-addressed in ANY
+  # repo it is installed on, outside `github.repo`": a cross-repo
+  # `issue_comment` arrives as a `mention=<owner>/<repo> …` block, which
+  # the `cross_repo_surface: mention_only` gate (below) forwards only
+  # when the body @-mentions `github.bot_login`. The App's install scope
+  # IS the discovery surface — no per-repo enumeration. (The retired
+  # `monitor.watch_repos` proposal polled whole foreign repos
+  # unconditionally; this deliveries gate replaces it.)
+  #
+  # Deliveries flag SPLIT (the #244 follow-up) + wedge-safety / cost bounds
+  # (see the `snapshot_deliveries` header in
+  # `monitor/watcher/_deliveries.sh`). Defaults are safe; tune only if the
+  # deliveries endpoint is unusually slow or the backlog after a long
+  # outage is large.
+  #
+  #   deliveries.asset_enabled        Gate the in-`github.repo` (asset-nexus)
+  #     emit path — the `issue=`/`pr=`/`pr_review=`/`issue_new=` shapes that
+  #     surface operator comments on the asset repo within ~15 s, NO
+  #     @bot-mention required. Default `true`, preserving the fast asset
+  #     surfacing PR #343 enabled. This is the near-real-time complement to
+  #     the always-on `snapshot_github` poll (the ~600 s asset baseline,
+  #     which is untouched by this flag).
+  #   deliveries.bot_mention_enabled  Gate the cross-repo `mention=` emit
+  #     path — @bot-mentions the operator posts on INSTALLED repos other
+  #     than `github.repo`, discovered via the App WEBHOOK delivery log.
+  #     Default `true`. Note this is the webhook-based channel;
+  #     `bot_mentions_enabled` (below) is the webhook-FREE GraphQL-poll
+  #     equivalent for the same concern — running both is safe (cross-source
+  #     `id=` duplicates collapse in the dedup hop). If the App has no
+  #     webhook URL configured, the deliveries path 404s and this flag is
+  #     moot; the poll channel covers it.
+  #
+  # Both default `true`, so a config with neither key gets BOTH concerns ON.
+  # Set just one flag false to run (e.g.) fast asset surfacing without the
+  # cross-repo webhook channel.
+  #
+  #   deliveries.connect_timeout_seconds  per-curl connect timeout (5)
+  #   deliveries.max_time_seconds         per-curl total timeout (15);
+  #     EVERY deliveries curl (listing + per-delivery) is bounded, so a
+  #     hung endpoint can never block the watcher loop.
+  #   deliveries.max_fetch_per_cycle      cap on per-delivery payload
+  #     fetches per poll (25); a larger backlog drains over cycles with
+  #     the cursor advancing incrementally (no re-walk, no event loss).
+  #   deliveries.seed_on_first_run        empty-cursor behaviour. false
+  #     (default) walks the recent backlog so un-acted @bot mentions
+  #     surface on enable; true seeds to newest and processes nothing.
+  deliveries:
+    asset_enabled: true
+    bot_mention_enabled: true
+    connect_timeout_seconds: 5
+    max_time_seconds: 15
+    max_fetch_per_cycle: 25
+    seed_on_first_run: false
+
+  # Mentions-search fallback path. When `true`, the watcher runs an
+  # additional GraphQL search each cycle for issues/PRs that mention
+  # `github.user_login` (NOT `github.bot_login` — that qualifier does
+  # not index `[bot]` accounts; verified by direct probe in
+  # `reports/nexus_2026-04-30_231902_watcher-impl-A.md`). Default
+  # `false` — opt-in. Complementary to the deliveries path; safe to
+  # enable both.
+  #
+  # Scope: cross-repo activity in repos where the App is NOT installed
+  # — the gap that the deliveries path can't reach. The path:
+  #
+  #   1. Skips `github.repo` (covered by `snapshot_github`).
+  #   2. Skips repos in the App's installation list (covered by the
+  #      deliveries path when enabled). The list is cached for 24 h
+  #      at `monitor/.state/bot-installed-repos.txt`.
+  #   3. For each remaining issue/PR in the search, surfaces every
+  #      comment whose body @-mentions `github.user_login` (and the
+  #      issue body itself, if it mentions). Filters identically to
+  #      `snapshot_github`: skips items with a ROCKET reaction or a
+  #      non-self EYES reaction.
+  #
+  # Line shape: `cross_repo=<owner>/<repo> kind=<issue|pr> n=<n>
+  # id=<id> author=<login>` (with `src=body` appended for issue-body
+  # matches). Distinct from the deliveries path's `mention=` shape
+  # because the provenance differs: a `mention=` event arrived on the
+  # App's webhook (the bot is installed, can comment back); a
+  # `cross_repo=` event was discovered by search in a repo without the
+  # App (the bot CANNOT comment back without a human installing it
+  # there first). Routing logic should treat `cross_repo=` as
+  # read-only context until that install lands.
+  #
+  # Cost: one GraphQL search call per poll cycle (50 results), plus
+  # one `/installation/repositories` call per 24 h to refresh the
+  # bot-installed cache. Cursor at `monitor/.state/last-mention-cursor.txt`
+  # short-circuits the walk after the first run.
+  #
+  # See `monitor/watcher/_mentions.sh` for full details.
+  mentions_enabled: false
+
+  # Bot-mention search path — the WEBHOOK-FREE channel for @bot-mentions
+  # on INSTALLED repos. When `true`, the watcher runs an additional
+  # GraphQL search each cycle for the LITERAL bot-handle string
+  # `"@<github.bot_login>"`. Unlike `mentions_enabled` (which keys on the
+  # `mentions:<user>` qualifier and skips installed repos), free-text
+  # handle search DOES index `@<bot>` mentions, so this finds the bot
+  # being addressed on installed repos.
+  #
+  # Default `true` (2026-06-23) — "if the bot is addressed, the watcher
+  # should emit" is the out-of-the-box behaviour. Safe to default ON
+  # because the channel is wedge-safe (see WEDGE-SAFETY below) AND
+  # degrades to a clean no-op without a bot identity: when
+  # `github.bot_login` is empty, `snapshot_bot_mentions` returns before
+  # issuing any search (the empty-handle query is never sent) and the
+  # watcher logs a single startup warning. Set `false` to opt out.
+  #
+  # WHY IT EXISTS. @bot-mentions on installed non-asset repos (e.g.
+  # `<your-org>/nexus-code`) are otherwise surfaced ONLY by the deliveries
+  # WEBHOOK (`deliveries.bot_mention_enabled`) — which needs an App webhook URL and
+  # was disabled after wedging the loop. With the webhook off there was
+  # no channel, so an operator @bot question on such a repo went silent.
+  # This path is the durable, poll-based replacement: enabling it does
+  # NOT require the fragile webhook.
+  #
+  # Scope (the precise complement to the deliveries path):
+  #   1. Skips `github.repo` (covered by `snapshot_github`).
+  #   2. KEEPS only repos in the App's installation list (the inverse of
+  #      `mentions_enabled`). Surfaced as the actionable `mention=` shape
+  #      — the bot is installed there, so it CAN reply. A non-installed
+  #      hit would be a false `mention=`, so it is dropped (an empty/
+  #      unreachable installed-repo cache yields zero emits — safe).
+  #   3. For each remaining issue/PR, surfaces every comment whose body
+  #      @-mentions `github.bot_login` (and the issue body itself). Same
+  #      ROCKET / non-self-EYES suppression as `snapshot_github`; same
+  #      `cross_repo_surface: mention_only` gate; same re-emit-until-👀
+  #      registry.
+  #
+  # WEDGE-SAFETY. The single GraphQL request is a raw `curl` bounded by
+  # `mentions.connect_timeout_seconds` (5) AND `mentions.max_time_seconds`
+  # (20) — NOT `gh api graphql`, which honours neither. A hung endpoint
+  # exits within the budget and the cycle skips (non-fatal), so enabling
+  # this can never re-wedge the loop.
+  #
+  # Cost: one GraphQL search per poll cycle (measured 1 point), plus the
+  # shared 24 h `/installation/repositories` cache refresh. Cursor at
+  # `monitor/.state/last-bot-mention-cursor.txt`. Safe to enable
+  # alongside the deliveries path / `mentions_enabled` — cross-source
+  # `id=` duplicates collapse in the dedup hop.
+  #
+  # See `snapshot_bot_mentions` in `monitor/watcher/_mentions.sh`.
+  bot_mentions_enabled: true
+  mentions:
+    connect_timeout_seconds: 5
+    max_time_seconds: 20
+    # Two-tier reaction-gated re-emit cadence for cross-repo bot-mention
+    # blocks (nexus-code#360; see the `reemit_*` block above for the policy).
+    #   reemit_noeyes_minutes: FAST tier — re-emit cadence while the mention
+    #   has NO bot 👀 yet (un-acknowledged). Default 5. The body-independent
+    #   backoff floor (reemit_backoff_seconds) enforces the same floor
+    #   downstream. Env: MONITOR_REEMIT_NOEYES_MINUTES.
+    reemit_noeyes_minutes: 5
+    #   reemit_norocket_hours: SLOW tier — re-emit cadence once the bot has
+    #   👀'd but not 🚀'd (acked / in progress); the periodic "still on
+    #   track?" nudge. A 🚀 stops it entirely. Default 6.
+    #   Env: MONITOR_REEMIT_NOROCKET_HOURS.
+    reemit_norocket_hours: 6
+    #   reemit_evict_eyes_on_closed: treat a non-operator 👀 as TERMINAL
+    #   (evict, like a 🚀) when the mention's target issue/PR is CLOSED or
+    #   MERGED (<your-org>/nexus-code#384). The SLOW "still on track?" reminder
+    #   only makes sense while the target is OPEN; on a merged PR an answered,
+    #   👀-acked mention otherwise re-surfaced every slow cycle for the whole
+    #   max-age window. OPEN cross-repo work is unaffected (keeps its 6h
+    #   reminder). Adds one throttled target-state API call per 👀'd entry
+    #   that would otherwise persist; rides reemit_live_recheck (no effect when
+    #   that is false). Default true. Env: MONITOR_REEMIT_EVICT_EYES_ON_CLOSED.
+    reemit_evict_eyes_on_closed: true
+
+  # Minimum GraphQL remaining points before the watcher will issue
+  # any GraphQL search. The `github_poll` scheduler task fires every
+  # 600 s (issue #181); this knob is the reactive safety net that
+  # skips the fire when the bucket is genuinely low, leaving the
+  # webhook-driven `deliveries_poll` (App-JWT bucket; runs every
+  # 15 s) untouched. Default 200 — leaves headroom for orchestrator
+  # + worker writes while the GraphQL bucket replenishes.
+  graphql_threshold: 200
+
+  # Hard wall-clock ceiling (seconds) on EVERY `gh api` call on the
+  # async `github_poll` task (issue #367): the `snapshot_github` /
+  # `snapshot_mentions` `gh api graphql` searches, the `/rate_limit`
+  # gate probe that runs first each cycle, and the
+  # `/installation/repositories` installed-repos refresh. `gh api`
+  # honours no curl timeout flag, so each call is wrapped in `timeout`:
+  # a hung / black-holed GitHub request is killed within the budget and
+  # that call fails gracefully (logged / skipped, retried next cycle)
+  # instead of freezing the watcher scheduler indefinitely (heartbeat
+  # stall + task-fork pileup).
+  # Default 30 — generous vs the few-second healthy latency of these
+  # search queries, but far under the 600 s poll interval (three
+  # calls => 90 s worst case) and the 300 s async-watchdog floor.
+  # `_kill_after_seconds` is the SIGKILL backstop if gh ignores the
+  # SIGTERM. Env: MONITOR_GRAPHQL_TIMEOUT / MONITOR_GRAPHQL_TIMEOUT_KILL_AFTER.
+  graphql_timeout_seconds: 30
+  graphql_timeout_kill_after_seconds: 5
+
+  # `monitor.mention_eligibility` was retired in issue #86. Every
+  # comment-surfacing path is now restricted to the user-author rule
+  # via the `_filter_to_user_author` chokepoint (`USER_LOGIN`-authored
+  # content only; cross-instance bot pings are an accepted loss). Any
+  # `mention_eligibility:` line on disk is silently ignored.
+
+  # Cross-repo surface gate. After the user-author chokepoint drops
+  # everything not authored by `github.user_login`, this knob decides
+  # whether each surviving CROSS-REPO emit (`mention=` from the
+  # deliveries path, `cross_repo=` from the mentions-search path)
+  # reaches the eligible-comments stream. In-`github.repo` shapes
+  # (`issue=`, `pr=`, `pr_review=`, `issue_new=`) bypass this gate
+  # unconditionally — `github.repo` is the canonical input channel
+  # and must never require an `@`-mention.
+  #
+  # Modes:
+  #
+  #   mention_only (default; 2026-05-18)
+  #     Cross-repo emits surface only when the body contains an
+  #     explicit `@<github.bot_login>` token (case-insensitive,
+  #     word-boundary; `@<bot>foo` does NOT match). Matches the
+  #     operator-stated contract: "when I comment outside my own
+  #     nexus repo, only forward it if I mentioned the bot." Requires
+  #     `github.bot_login` to be set — empty `bot_login` degrades the
+  #     gate to `off` and logs one warning at startup.
+  #
+  #   author_only
+  #     Pre-2026-05-18 behaviour. Every user-authored cross-repo
+  #     event surfaces, mention or not. Operators who want the broad
+  #     "see everything I post anywhere the App is installed" view
+  #     opt in here.
+  #
+  #   off
+  #     Cross-repo emits never surface, even with an explicit
+  #     `@<bot>` mention. For operators who only care about activity
+  #     on `github.repo` itself.
+  #
+  # See `monitor/watcher/_github.sh`'s `_filter_cross_repo_surface`
+  # for the matching logic; `monitor/watcher/test-cross-repo-mention-filter.sh`
+  # exercises the modes against synthetic streams.
+  cross_repo_surface: mention_only
+
+  # Universal skeptic protocol (skills/nexus.skeptic) — the independent,
+  # adversarial validation pass a worker's result may require. These
+  # knobs are read by monitor/ng (wrap-up enforcement + recursion bound),
+  # monitor/skeptic-channel.sh (the worker↔skeptic await loop), and
+  # monitor/watcher/_idle_probe.sh (the await-hang exemption). Each
+  # resolves through env → config/load.sh → inline default. All optional;
+  # the defaults below match the code, so leave the block commented unless
+  # you want to override.
+  skeptic:
+    # When truthy, `ng wrap-up` refuses to complete an `auto`-mode
+    # hand-off until the worker has recorded a skeptic decision (the
+    # wrap-up gate). Default true. Env: MONITOR_SKEPTIC_ENFORCE_AUTO_DECISION.
+    enforce_auto_decision: true
+    # Minimum substantive NEW findings in a skeptic pass to warrant a
+    # further recursive pass. Floored at 1 — a 0 would recommend a
+    # second pass even on a clean run, defeating the diminishing-returns
+    # rule. Default 1. Env: MONITOR_SKEPTIC_FINDINGS_THRESHOLD.
+    findings_threshold: 1
+    # Recursion cap on the skeptic chain. Depth strictly increments and
+    # is capped, so the chain ends after at most max_depth+1 passes.
+    # Default 3. Env: MONITOR_SKEPTIC_MAX_DEPTH.
+    max_depth: 3
+    # Per-call ceiling (seconds) for `skeptic-channel.sh await`: a single
+    # blocking call is bounded by this then exits (exit 4); the worker
+    # re-enters await, which re-heartbeats. Default 900. Env:
+    # MONITOR_SKEPTIC_AWAIT_TIMEOUT_SECONDS.
+    await_timeout_seconds: 900
+    # Poll cadence (seconds) inside the await loop. Default 5. Env:
+    # MONITOR_SKEPTIC_AWAIT_INTERVAL_SECONDS.
+    await_interval_seconds: 5
+    # Idle-probe exemption window (seconds): a worker parked in `await`
+    # is not treated as hung until its pane has been static past this
+    # threshold. Default 600. Env: MONITOR_SKEPTIC_AWAIT_HANG_SECONDS.
+    await_hang_seconds: 600
+    # Orphaned-marker grace (seconds): the parked-awaiting-skeptic
+    # exemption requires an ACTUAL live skeptic (a skeptic-spawn action-log
+    # event whose window is alive, or a live `<window>-skeptic`). A fresh
+    # skeptic-pending marker with NO live skeptic is tolerated for this long
+    # (the orchestrator's spawn window); past it the marker is ORPHANED —
+    # it stops conferring the exemption and surfaces as an actionable
+    # `orphaned-skeptic-pending` class ("spawn the skeptic or clear the
+    # marker"). Default 600. Env: MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS.
+    orphan_grace_seconds: 600
+
+  # Watcher-mediated request inbox + bidirectional request/reply protocol
+  # (agent-channel RFC Part B/D). A worker — or, in Phase 2, a confined
+  # remote SSH client — files a durable request to the orchestrator via
+  # `ng request file`; the WATCHER claims it (atomic rename), surfaces it
+  # in its normal emit as a `--- requests ---` section, and re-emits until
+  # the orchestrator acks (`ng request ack`) or answers
+  # (`ng request reply`). No new writer to the orchestrator pane is
+  # introduced — requests ride the watcher's existing emit. The mechanism
+  # is the pending-decisions channel generalized to arbitrary requests,
+  # harmonized with the skeptic↔worker rename-is-the-signal convention.
+  requests:
+    # MASTER SWITCH — default OFF. While false the requests_poll watcher
+    # task is a strict no-op (no claim, no emit), so a fresh clone ships
+    # inert. Flip on after a soak. Env: MONITOR_REQUESTS_ENABLED.
+    enabled: false
+    # Re-emit cooldown (seconds) for a claimed-but-unacked request —
+    # mirrors the pending-decisions cooldown. A claimed request
+    # re-surfaces every cooldown until the orchestrator renames it off
+    # `.claimed`. Default 300. Env: MONITOR_REQUESTS_REEMIT_COOLDOWN_SECONDS.
+    reemit_cooldown_seconds: 300
+    # Per-emit cap on the `--- requests ---` section (backlog bound).
+    # Ordered by (priority, ts) with origin round-robin; the rest wait for
+    # the next emit, so the orchestrator drains at its own pace and the
+    # backlog is the on-disk file set, never an in-memory queue. Default
+    # 10. Env: MONITOR_REQUESTS_MAX_PER_EMIT.
+    max_per_emit: 10
+    # Fairness: round-robin across distinct origins before FIFO-within-
+    # origin so one chatty origin cannot starve others. Set false for
+    # strict FIFO by `<ts>`. Default true. Env: MONITOR_REQUESTS_FAIRNESS.
+    fairness: true
+    # Max age (seconds) a request may sit `.claimed` without an ack before
+    # the watcher gives up and renames it `.failed` (+ a loud log) — a
+    # never-acked request cannot re-emit forever. Default 259200 (3 days,
+    # matching the mention re-emit + GitHub webhook retention). Env:
+    # MONITOR_REQUESTS_MAX_AGE_SECONDS.
+    max_age_seconds: 259200
+    # Retention (seconds) for terminal `.done`/`.failed` request files and
+    # their per-request reply dirs before GC. Default 259200 (3 days).
+    # Env: MONITOR_REQUESTS_RETENTION_SECONDS.
+    retention_seconds: 259200
+
+  remote:
+    # ── Confined remote agent channel (agent-channel RFC Part A) ──────
+    # An OFF-BY-DEFAULT, registered SSH endpoint that lets a client on the
+    # LOCAL network (e.g. another Claude) authenticate, land a request in
+    # the Part B/D inbox, and read/fetch its own reply. The daemon runs
+    # INSIDE the sandbox, so a login inherits the kernel bwrap confinement —
+    # the sandbox IS the security boundary (§4.1/4.5); a client only ever
+    # gets what the sandbox permits, with or without a command filter.
+    #
+    # ENABLE/DISABLE is NOT a flag here — it is REGISTRATION. The service is
+    # off until `monitor/remote-up.sh` registers the `nexus-remote-ssh` row
+    # in services.registry; `monitor/remote-up.sh --down` removes it. A fresh
+    # clone ships inert (no row). The keys below are BEHAVIORAL params (how
+    # it runs), not the on/off switch — so there is ONE enable mechanism,
+    # not two. While unregistered: the supervisor exits without listening,
+    # the healthcheck treats not-running as HEALTHY (no flap), and the
+    # forced-command wrapper refuses. (RFC §4.8.)
+    #
+    # COMMAND POLICY — the in-sandbox command filter (NOT a sandbox control):
+    #   channel-only (default, safer): forced command — the client may only
+    #     file requests + read/fetch its OWN reply (+ opt-in read-only attach).
+    #   unfiltered (trust mode): the enrolled key gets a normal
+    #     SANDBOX-CONFINED login shell (arbitrary commands). The transport
+    #     stays hardened (key-only, no root/forwarding) and the sandbox still
+    #     confines; this relaxes ONLY the command filter, never the sandbox.
+    # Env: MONITOR_REMOTE_COMMAND_POLICY.
+    command_policy: channel-only
+    # Bind interface for the in-sandbox sshd. LAN/host-only — NEVER
+    # 0.0.0.0 on a public NIC (§4.3). Tighten to a Wireguard/host-only
+    # address if the LAN is untrusted. Env: MONITOR_REMOTE_BIND_ADDRESS.
+    bind_address: 127.0.0.1
+    # Port for the in-sandbox sshd (high, unprivileged). Env: MONITOR_REMOTE_PORT.
+    port: 22022
+    # Banner-read budget (integer seconds ≥1) for the remote-ssh-health.sh
+    # probe. Generous by design: a live sshd banners in ~0.03s even on a
+    # loaded host, so the HEALTHY path never waits this long — the budget
+    # only bounds how long a silent (pathological) listener can stall a
+    # FAILING check. 3s proved too tight for a CPU-starved prober on a
+    # shared node (false "NOT sshd" flaps, issue nexus-code#434).
+    # Env: MONITOR_REMOTE_HEALTH_TIMEOUT (legacy REMOTE_HEALTH_TIMEOUT
+    # still wins if set).
+    health_timeout: 10
+    # Read-only `tmux attach -r` opt-in (§4.2). Default false = request-only
+    # (the tighter posture: the client can file requests + read its own
+    # replies, but cannot observe the session). Enabling lets a remote
+    # client SEE every pane (worker output, paths) read-only — never inject.
+    # Env: MONITOR_REMOTE_ALLOW_ATTACH.
+    allow_attach: false
+    # Where the host key + authorized_keys + pending enrollment tokens live.
+    # OP-ONLY (0700), OUTSIDE the GitHub-tracked $SANDBOX_PROJECT_DIR tree so
+    # `ng upload`/`ng wrap-up` can never reach it. Env: MONITOR_REMOTE_PRINCIPALS_DIR.
+    principals_dir: ~/.claude/nexus-remote/
+    # One-time enrollment-token lifetime (§4.9). Short by design: a token
+    # authorizes adding ONE client key, is single-use, and is consumed on
+    # first enroll. Env: MONITOR_REMOTE_ENROLLMENT_TOKEN_TTL_SECONDS.
+    enrollment_token_ttl_seconds: 900
+    # Token-authenticated SELF-ENROLLMENT over SSH (§4.9.1). Default true.
+    # When on, the sshd wires an AuthorizedKeysCommand bootstrap so a client
+    # can deliver its public key THROUGH the SSH key-offer and self-enroll
+    # using its one-time token (presented over the session's stdin), with NO
+    # manual `ng remote enroll` step. The server stays PUBKEY-ONLY (no password
+    # auth): token-in-username is impossible (OpenSSH refuses a non-existent
+    # login user before the AuthorizedKeysCommand runs), so the token rides
+    # stdin. The bootstrap authorizes the offered key to a ONE-SHOT, enroll-
+    # ONLY forced command, and ONLY while an enrollment token is pending;
+    # outside that window unknown keys are denied. sshd consults the
+    # authorized_keys FILE first, so permanently-enrolled keys are unaffected,
+    # and `ng remote enroll` remains as a manual fallback. Set false to disable
+    # the bootstrap (manual enroll only). Env: MONITOR_REMOTE_SELF_ENROLL.
+    self_enroll: true
+    # Source-range pin: a `from=<cidr>` baked into every authorized_keys line
+    # (defence-in-depth — a stolen key is useless off the named network), AND
+    # the fail-closed gate for a ROUTABLE (non-loopback) bind.
+    #
+    #   * EMPTY (the shipped default) — for a LOOPBACK bind this just means "no
+    #     pin". For a ROUTABLE bind it is FAIL-CLOSED: the endpoint REFUSES to
+    #     start. This is the safe default a fresh operator inherits until they
+    #     consciously choose a range. (bind_address 0.0.0.0/:: is a DIFFERENT
+    #     axis — an all-interfaces bind is refused regardless of from_cidr.)
+    #
+    # For a routable bind, set ONE of the following (a broad subnet is the
+    # recommended set-once default — no per-client lookup; tighten only if you
+    # want to). The comment ladder, broad → narrow → any:
+    #
+    #   # broad subnet — RECOMMENDED default: set once, covers any client on
+    #   # your campus/LAN, no per-connection edit. Use YOUR network's block;
+    #   # the value below is an EXAMPLE (<your-institution> campus), not a universal
+    #   # default — substitute your own CIDR.
+    #   from_cidr: "140.107.0.0/16"
+    #
+    #   # single client — MAX security: only this one host may reach the
+    #   # pre-auth stage. Swap in the client's IP.
+    #   # from_cidr: "10.0.0.5/32"
+    #
+    #   # snail2 / bastion-proxy users: if you reach this host by ProxyJump
+    #   # through a bastion, the SOURCE IP the host sees is the BASTION's, not
+    #   # your laptop's — pin the bastion. Example (FH sn2 hop):
+    #   # from_cidr: "140.107.116.184/32"
+    #
+    #   # ANY source — conscious opt-in: exposes the SSH PRE-AUTH surface to the
+    #   # whole reachable network. Auth stays pubkey-only + forced-command +
+    #   # strong-crypto + sandbox-confined, so the worst case is a confined
+    #   # channel login; but pre-auth SSH 0-days are the class this pin defends
+    #   # against. Type it on purpose, not by accident.
+    #   # from_cidr: "0.0.0.0/0"
+    #
+    # A malformed CIDR is REFUSED (a typo must never silently degrade to
+    # no-pin). Env: MONITOR_REMOTE_FROM_CIDR.
+    from_cidr: ""
+
+  watcher:
+    # Auto-unstick stalled agent prompts. The watcher captures every
+    # non-watcher tmux pane each cycle; if a permission prompt
+    # ("Do you want to proceed?") is showing, the watcher sends
+    # Enter to accept the default-highlighted option and resume
+    # automation. Action and pre-action pane capture are recorded
+    # under monitor/.state/watcher-unstick.log and
+    # monitor/.state/unstick/ for post-hoc audit. The rate-limit
+    # prompt is also handled: every stuck non-watcher window gets
+    # an Enter + "please continue" follow-up once the limit has
+    # reset, and the orchestrator gets a separate heads-up paste.
+    # The transient API-error chip (case C — Claude Code's per-turn
+    # `"Internal server error"` wedge) is handled too: a single Enter
+    # nudges the failed turn into retry, with a per-fingerprint
+    # backoff (api_error_backoff_minutes) so a chronically broken
+    # endpoint isn't hammered. Set to false to opt out of all three
+    # branches and require manual confirmation.
+    auto_unstick: true
+
+    # Worker-blocked-question relay (case W — <your-org>/<your-nexus>
+    # issue 180). When a NON-orchestrator pane sits on a live
+    # AskUserQuestion overlay continuously for this many seconds, the
+    # watcher synthesizes a pending-decision record (kind
+    # blocked_question) so the orchestrator answers on the operator's
+    # behalf. The grace window gives a human at the pane first right
+    # of reply — answering during the grace makes the overlay vanish
+    # and nothing fires. 0 disables the relay.
+    worker_askuq_grace_seconds: 300
+
+    # Probe the Anthropic API on rate-limit detection to discover
+    # the reset timestamp via response headers
+    # (anthropic-ratelimit-unified-reset / -tokens-reset). Default
+    # off — the probe costs a few hundred input tokens + 1 output
+    # token per rate-limit incident (cached for the duration). When
+    # disabled or when the probe fails (no key, network error,
+    # missing header), the watcher falls back to the heuristic
+    # below. The API key is read from the ANTHROPIC_API_KEY
+    # environment variable only — never from this file.
+    ratelimit_probe: false
+
+    # Model used for the probe. Cheapest available Anthropic model
+    # is the recommended default; max_tokens is hard-coded to 1.
+    probe_model: claude-haiku-4-5-20251001
+
+    # Fallback wait time (in minutes) used when the probe is
+    # disabled or fails. The watcher schedules the cascade for
+    # `now + this many minutes` and waits, logging once every
+    # 5 minutes. Adjust to your subscription's typical reset cadence.
+    ratelimit_heuristic_minutes: 30
+
+    # After cascading the unstick, how many seconds to wait for the
+    # orchestrator's `ratelimit-resume-ack` action-log entry before
+    # logging `orchestrator-unresponsive`. Allows for one
+    # poll-interval round-trip plus a small margin.
+    ratelimit_ack_timeout_s: 60
+
+    # Case C (transient API-error wedge) backoff window in minutes.
+    # When Claude Code's input prompt wedges on a per-turn API failure
+    # — most commonly an `"Internal server error"` / `type=api_error`
+    # response — the watcher sends Enter to nudge the failed turn
+    # into retry. The same fingerprint (request_id + message)
+    # reappearing within this many minutes is logged as
+    # `case=C action=skip-backoff` and skipped, so a chronically
+    # broken endpoint isn't hammered. Distinct fingerprints and
+    # same-fingerprint reappearances after the window elapses re-fire
+    # the Enter. Default 30. Set to 0 to disable backoff (every
+    # detection acts).
+    api_error_backoff_minutes: 30
+
+    # Orchestrator-liveness state machine (issue #164). Replaces
+    # the binary `unresponsive_age > threshold` rule from #157
+    # with a three-knob model — see the
+    # `orchestrator_fresh_spawn_enabled` block above for the
+    # signals (hook-driven heartbeat + paste-timestamp), the
+    # decision tree, and the env-override table.
+    #
+    #   paste_response_grace_seconds — grace after a paste before
+    #     the state machine declares pasted-without-response. Even
+    #     a real wedge can't manifest inside this window (multi-
+    #     step tool turns legitimately take this long). Default
+    #     120 — raised from 60 after the 2026-05-29..31 incidents
+    #     where healthy heavy turns ran ~90-180 s and got their
+    #     orchestrator killed by unstick-window exhaustion. Also
+    #     the response window granted to the re-submit rescue.
+    #
+    #   unstick_window_seconds — once in the pasted-without-
+    #     response state, total budget for cases A-D in
+    #     `monitor/watcher/_unstick.sh` (permission Enter, rate-
+    #     limit cascade, api-error Enter, AskUQ chip-bar Escape)
+    #     to bump the heartbeat before the state machine fires the
+    #     one-shot re-submit rescue (re-paste of the pending emit
+    #     body). Default 150 — lowered from 180 alongside the
+    #     grace raise so the rescue retains a verification window
+    #     before the dead threshold.
+    #
+    #   orchestrator_dead_threshold_seconds — hard floor: respawn
+    #     if no heartbeat at all post-paste, including through the
+    #     unstick window and the re-submit rescue. Must exceed
+    #     grace + unstick_window (120 + 150 = 270 < 300) — the
+    #     watcher logs a startup WARN when this ordering is
+    #     violated, because the rescue then never fires before the
+    #     unconditional deadline. The Stop-hook heartbeat fires
+    #     reliably on every turn-end, so false-positive restarts
+    #     drop to near-zero and this floor can be much higher than
+    #     #157's 120 s.
+    #
+    #   stale_paste_ceiling_seconds — upper bound on how old a
+    #     last-paste timestamp may be and still count as wedge
+    #     evidence. Past this age the paste is treated as too old
+    #     (a quiet workspace, not a wedge) and the verdict is
+    #     healthy `paste-too-stale`. Must exceed
+    #     orchestrator_dead_threshold_seconds. Default 1800.
+    #
+    #   dead_threshold_floor_margin_seconds — margin for the
+    #     startup clamp that ENFORCES
+    #     heartbeat + interval < orchestrator_dead_threshold_seconds,
+    #     where heartbeat is the static-workspace full-state timeout
+    #     emit: ceil(full_state.safety_floor_seconds /
+    #     full_state_emit_interval_seconds) * interval
+    #     (emit-gate-recover; unchanged canonicals suppress until the
+    #     floor expires, so the floor-expiry paste is the only
+    #     guaranteed one). When the configured deadline sits at/below
+    #     that max compose_emit gap, the watcher raises the EFFECTIVE
+    #     deadline to gap + this margin so a static workspace's
+    #     heartbeat always resets the clock first — closing the
+    #     2026-06-15 false-positive respawn race at the source. With
+    #     defaults this lifts 300 -> 1200+60+60 = 1320. Declines
+    #     (with a WARN) if it would cross
+    #     stale_paste_ceiling_seconds. Default 60.
+    #
+    #   idle_pane_override_max — budget for the runtime idle-pane
+    #     guard (defense-in-depth for any residual dead-threshold
+    #     respawn). It suppresses a dead-threshold respawn at most
+    #     this many CONSECUTIVE times while pane-state reports the
+    #     orchestrator alive and idle/empty, then escalates and
+    #     honors the respawn — so a hung-but-idle pane can NOT
+    #     suppress its own respawn forever. Counter resets on any
+    #     genuine healthy verdict. 0 disables the bound (NOT
+    #     recommended). Default 5.
+    #
+    #   liveness_log_throttle_seconds — minimum spacing between
+    #     `waiting` verdict log lines while the state machine
+    #     counts down (the liveness task polls every ~5 s; without
+    #     the throttle a slow turn produced ~40 identical lines).
+    #     State entries, transitions, and re-submit / respawn
+    #     events always log. Default 30.
+    paste_response_grace_seconds: 120
+    unstick_window_seconds: 150
+    orchestrator_dead_threshold_seconds: 300
+    stale_paste_ceiling_seconds: 1800
+    dead_threshold_floor_margin_seconds: 60
+    idle_pane_override_max: 5
+    liveness_log_throttle_seconds: 30
+    # ---- silent-watcher hardening (nexus-code#236) ----
+    # Emit-FUNCTIONAL liveness is the HEARTBEAT itself — no knob. The watcher
+    # bumps its heartbeat ONLY at the end of a correct compose cycle, so a
+    # fresh heartbeat proves the loop works (even on a deliberately-silent
+    # quiet workspace — long silence with no activity is GOOD, it saves
+    # tokens) and a stale heartbeat means the loop is wedged. The existing
+    # heartbeat-age thresholds (2×interval+15 fresh / 5×interval DEAD, off
+    # interval_seconds) govern detection; tune interval_seconds, not a
+    # separate knob.
+    #   self_heal_enabled — when the watcher's OWN paste delivery to the
+    #   orchestrator fails delivery_fail_limit times consecutively (rc 3/4 —
+    #   tmux glitch / content-not-landing; NOT rc 2 target-missing, the
+    #   orchestrator-respawn path), it escalates LOUDLY and self-restarts via
+    #   the version-restart primitive, sharing its cooldown + loop guard so
+    #   recovery can never storm. false ⇒ loud alert only (the supervisor
+    #   backstop still applies). Env: MONITOR_WATCHER_SELF_HEAL_ENABLED.
+    self_heal_enabled: true
+    delivery_fail_limit: 3
+
+recover:
+  # Sanity cap on worker-agent respawns per bootstrap-recover.sh run
+  # (the workers step resumes each worker that was active in the last
+  # watcher snapshot via spawn-worker.sh --resume). Candidates beyond
+  # the cap are skipped with a loud log line — a corrupt snapshot or
+  # action log must never fan out into an unbounded claude swarm.
+  max_workers: 12

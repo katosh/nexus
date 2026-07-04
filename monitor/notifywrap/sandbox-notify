@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# monitor/notifywrap/sandbox-notify — PATH-FRONT engagement gate for the
+# terminal bell (your-org/nexus-code).
+#
+# THE PROBLEM. agent-sandbox ships a global Claude Code `Notification` hook
+# (agents/claude/settings.json: `sandbox-notify 'Needs attention'`). The claude
+# overlay MERGES that hook into every sandbox session's read-only config-dir
+# settings, so EVERY agent — the orchestrator AND every spawned background
+# worker/skeptic — fires `sandbox-notify 'Needs attention'` on EVERY
+# `Notification` event (idle_prompt "Claude is waiting for your input", and
+# permission_prompt). With many parallel background workers each ringing on
+# every turn-end-and-idle, that is a flood: ~99% of bells in the live data are
+# routine background-worker idle prompts the operator does not act on (the
+# watcher already surfaces parked / idle-without-wrap workers). Worse, each ring
+# from a hook subprocess (no controlling tty) makes `sandbox-notify` fall to its
+# Try-2 path — `tmux new-window -d -n '•bell'` — so every bell spawns a
+# transient `•bell` window that pollutes the watcher's workspace snapshot.
+#
+# THE GATE. The agent-sandbox hook lives in the read-only merged config-dir
+# settings, so the nexus cannot edit it. Instead we SHADOW `sandbox-notify` with
+# a PATH-front wrapper (the ghwrap precedent: a real executable first on PATH, so
+# it is inherited by every child an agent spawns — bash subshells, hook
+# subprocesses, `python subprocess`). The wrapper rings only for events that
+# warrant operator attention:
+#
+#   * ORCHESTRATOR (user-engaged) — NEXUS_WORKER_WINDOW is UNSET. Pass every
+#     call through: its idle/permission bells are exactly the "operator needs to
+#     act" signal.
+#   * BACKGROUND worker/skeptic — NEXUS_WORKER_WINDOW is SET (spawn-worker.sh
+#     exports it). Suppress ONLY the agent-sandbox hook default ("Needs
+#     attention"); pass EXPLICIT worker calls (blocker / ready / done — the
+#     worker floor's escalation contract) through, since those are intentional
+#     and a task-done bell is on the operator's bar.
+#
+# So a busy background worker's routine turn-end no longer bells (no `•bell`
+# window), while orchestrator-idle, orchestrator-permission, explicit
+# worker done/ready/blocker, and the watcher/cc-restart alert bells all survive.
+#
+# DISCRIMINATOR ROBUSTNESS. The suppressed message is the agent-sandbox hook's
+# fixed text. If a future agent-sandbox bumps that string this gate fails OPEN
+# (bells return — noisy, not broken); the watcher's `^•`-row drop on the
+# snapshot/standing-bells paths is the belt-and-suspenders that keeps the snapshot
+# clean regardless. Override the matched text with NEXUS_NOTIFY_SUPPRESS_MSG if
+# the upstream default changes. The genuinely-upstream fix (a SANDBOX_NOTIFY_QUIET
+# env honoured by sandbox-notify itself, and a less-intrusive Try-2 ring) is a
+# proposal to operator/agent_sandbox — see the bells report.
+#
+# RECURSION-SAFE. This wrapper is first on PATH, so resolving `sandbox-notify`
+# by name would re-invoke US. We resolve the REAL sandbox-notify (first on PATH
+# that is not this wrapper, by realpath) and exec its ABSOLUTE path.
+
+set -u
+
+# --- The agent-sandbox hook default we gate on (overridable) -----------------
+_nw_suppress_msg="${NEXUS_NOTIFY_SUPPRESS_MSG:-Needs attention}"
+
+# --- (1) Background-worker routine-idle suppression --------------------------
+# NEXUS_WORKER_WINDOW set ⟺ spawned background worker/skeptic (spawn-worker.sh).
+# Suppress ONLY the agent-sandbox hook default; let explicit messages through.
+if [ -n "${NEXUS_WORKER_WINDOW:-}" ] && [ "$*" = "$_nw_suppress_msg" ]; then
+    exit 0
+fi
+
+# --- (2) Locate this wrapper's own directory (to exclude when resolving) -----
+_nw_arg0="$0"
+case "$_nw_arg0" in
+    */*) _nw_dir=$(CDPATH= cd "$(dirname "$_nw_arg0")" 2>/dev/null && pwd || true) ;;
+    *)
+        _nw_cv=$(command -v "$_nw_arg0" 2>/dev/null || true)
+        case "$_nw_cv" in
+            */*) _nw_dir=$(CDPATH= cd "$(dirname "$_nw_cv")" 2>/dev/null && pwd || true) ;;
+            *)   _nw_dir="" ;;
+        esac
+        ;;
+esac
+
+_nw_rp() {
+    if readlink -f / >/dev/null 2>&1; then
+        readlink -f "$1" 2>/dev/null && return 0
+    fi
+    _nw_rp_d=$(CDPATH= cd "$(dirname "$1")" 2>/dev/null && pwd) || return 1
+    printf '%s/%s\n' "$_nw_rp_d" "$(basename "$1")"
+}
+
+_nw_self_rp=""
+[ -n "$_nw_dir" ] && _nw_self_rp=$(_nw_rp "$_nw_dir/sandbox-notify" 2>/dev/null || true)
+
+# --- (3) Resolve the REAL sandbox-notify: first on PATH that is not US --------
+_nw_real=""
+_nw_oldifs=$IFS
+IFS=:
+for _nw_p in $PATH; do
+    [ -n "$_nw_p" ] || continue
+    _nw_cand="$_nw_p/sandbox-notify"
+    [ -x "$_nw_cand" ] || continue
+    if [ -n "$_nw_dir" ] && [ "$_nw_p" = "$_nw_dir" ]; then continue; fi
+    if [ -n "$_nw_self_rp" ]; then
+        _nw_cand_rp=$(_nw_rp "$_nw_cand" 2>/dev/null || true)
+        [ "$_nw_cand_rp" = "$_nw_self_rp" ] && continue
+    fi
+    _nw_real="$_nw_cand"
+    break
+done
+IFS=$_nw_oldifs
+
+# --- (4) Pass through (or fail silent) ---------------------------------------
+# sandbox-notify is best-effort by design (its own no-path branch exits 0). If
+# the real one is unresolvable, do the same — a missed bell is non-fatal and a
+# hook must never spew. Otherwise hand off with an absolute path (no recursion).
+if [ -z "$_nw_real" ]; then
+    exit 0
+fi
+exec "$_nw_real" "$@"

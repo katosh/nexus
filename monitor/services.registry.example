@@ -1,0 +1,95 @@
+# Nexus infra-service registry — declarative input to
+# `monitor/bootstrap-recover.sh`.
+#
+# Copy this file to `monitor/services.registry` (operator-local,
+# gitignored) and list the long-running infra services your deployment
+# expects to be up. On a restart the orchestrator runs
+# `bootstrap-recover.sh`, which relaunches each registered service that
+# is BOTH unhealthy AND has no tmux window. Adding a new service is a
+# one-line edit here — no code change.
+#
+# FORMAT — one service per line, FOUR required fields plus an OPTIONAL
+# fifth and sixth, separated by single TABs (not spaces):
+#
+#     <name>\t<workdir>\t<launch-cmd>\t<healthcheck-cmd>[\t<logfile>[\t<policy>]]
+#
+#   name        tmux window name to host the service (also the
+#               idempotency key — a window by this name means "already
+#               running, do not relaunch").
+#   workdir     directory the launch + healthcheck run in. `~` and
+#               `$NEXUS_ROOT` are expanded. A missing workdir means the
+#               service is skipped (its project isn't checked out here).
+#   launch-cmd  shell command sent to the new tmux window. Prefer a
+#               supervised restart-loop wrapper (it survives crashes
+#               within the session; this registry survives the session
+#               itself dying).
+#   healthcheck shell command run in <workdir>; exit 0 == healthy.
+#               Keep it cheap and fast (short curl timeout / pgrep /
+#               test -f) — it runs on every recovery sweep.
+#   logfile     OPTIONAL. The service's logfile. It serves two readers:
+#               (1) the cockpit `monitor/svc.sh` tails it (dashboard
+#               picks and the `logs <name>` verb), and
+#               (2) `bootstrap-recover.sh` appends a HEADLESS launch's
+#               stdout/stderr here when it (re)starts the service. `~`
+#               and `$NEXUS_ROOT` are expanded; a relative path resolves
+#               under <workdir>. Omit it and both fall back to
+#               <workdir>/serve.log.
+#   policy      OPTIONAL. The watcher's continuous service-health task
+#               (monitor/watcher/_service_health.sh) reads this to decide
+#               WHAT it does when the healthcheck fails past the self-heal
+#               grace window. Two values:
+#                 auto-restart  (default) grace → minimal-downtime restart
+#                               (flap-controlled) → emit. Use for services
+#                               where a blind restart is safe.
+#                 emit-only     never auto-restart; after grace the watcher
+#                               escalates to the orchestrator and lets it
+#                               decide. Use where a blind restart is unsafe
+#                               or wants human judgment (e.g. a service
+#                               with side effects on relaunch, or one whose
+#                               failure usually signals a deeper problem).
+#               Omit it to inherit monitor.service_health.default_policy
+#               (auto-restart). REQUIRES the 5th <logfile> field present
+#               (give an explicit logfile, or leave it empty between two
+#               TABs) — it is the 6th positional column.
+#               NOTE: only the service-health task consumes this; bootstrap-
+#               recover / svc.sh / version-restart ignore it (they read it
+#               into a throwaway var so it can't corrupt their logfile).
+#
+# Lines beginning with `#` and blank lines are ignored. A line with
+# fewer than the four required TAB fields is skipped with a warning,
+# never fatal. 4-field rows remain valid — the 5th + 6th fields are additive.
+#
+# Validate your edits without launching anything:
+#     monitor/bootstrap-recover.sh --list      # echo parsed records
+#     monitor/bootstrap-recover.sh --dry-run    # decide + log, no launch
+#
+# ---------------------------------------------------------------------
+# EXAMPLE ENTRIES (an example operator stack). Uncomment +
+# adjust paths in your real `monitor/services.registry`. The columns
+# below are TAB-separated; if you copy them, make sure your editor
+# keeps the tabs. The trailing 5th column is the optional <logfile>; the
+# 6th is the optional <policy> (auto-restart | emit-only).
+#
+# dolimap-serve   $NEXUS_ROOT/work/myproj/website   ./serve-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8765/   $NEXUS_ROOT/work/myproj/website/serve.log
+#
+# Same service, but pinned emit-only (watcher emits + lets the orchestrator
+# decide instead of auto-restarting — the 6th column):
+# dolimap-serve   $NEXUS_ROOT/work/myproj/website   ./serve-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8765/   $NEXUS_ROOT/work/myproj/website/serve.log   emit-only
+#
+# JupyterLab services (jupyter-*) are NOT hand-written here: run
+# `monitor/jupyter-up.sh <project-dir>` and it appends/maintains the
+# row itself (and `--down` removes it). A maintained row looks like:
+# jupyter-myproj   $NEXUS_ROOT/work/myproj   /abs/path/monitor/labsh-supervised.sh   /abs/path/monitor/jupyter-health.sh   $NEXUS_ROOT/work/myproj/.jupyter/labsh-service.log
+# deploy-watch    $NEXUS_ROOT/work/myproj/website   ./deploy-watch.sh   pgrep -f deploy-watch.sh   $NEXUS_ROOT/work/myproj/website/deploy.log
+# annzarro        $NEXUS_ROOT/work/annzarro   ./run-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8766/   $NEXUS_ROOT/work/annzarro/annzarro.log
+#
+# The confined remote SSH endpoint (agent-channel RFC Part A) is NOT
+# hand-written either: run `monitor/remote-up.sh` and it appends/maintains
+# the row itself (`--down` removes it). For this service, PRESENCE OF THE ROW
+# IS THE ENABLE SIGNAL — there is no separate config flag (RFC §4.8). It is
+# pinned `emit-only` (6th column) — a network listener is never
+# blind-restarted; a wedged sshd escalates to the orchestrator via
+# `--- service health ---`. With no row the launch wrapper exits without
+# listening and the healthcheck treats not-running as healthy. A maintained
+# row looks like (TAB-separated):
+# nexus-remote-ssh   $NEXUS_ROOT   /abs/path/monitor/remote-sshd-supervised.sh   /abs/path/monitor/remote-ssh-health.sh   $NEXUS_ROOT/monitor/.state/remote-ssh.log   emit-only

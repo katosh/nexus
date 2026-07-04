@@ -1,0 +1,95 @@
+name: cc-harness
+
+# Real-binary harness: runs the REAL project-local Claude Code binary
+# against the auth-free mock backend (monitor/cc-harness/mock-backend.py)
+# and asserts monitor/pane-state.sh still classifies the live panes.
+#
+# NO real Anthropic API calls and NO network egress at model time — the
+# mock is the "model" (that is the whole point), so this job is safe to
+# run without any ANTHROPIC_* secret.
+#
+# The same scenarios run locally via:
+#   RUN_CC_HARNESS=1 monitor/watcher/run-tests.sh --filter realmodel
+#
+# History: the <your-org> org previously had a runner-dispatch billing block
+# (~5s into dispatch) that kept this workflow from getting a green runner.
+# That billing block is resolved (2026-05-29), so this workflow now runs on
+# PRs touching the harness surface.
+
+on:
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'monitor/cc-harness/**'
+      - 'monitor/pane-state.sh'
+      - 'monitor/watcher/test-integration/test-realmodel-*.sh'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/cc-harness.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: cc-harness-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  realmodel-harness:
+    name: real binary + mock backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: install runtime deps (jq + tmux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq tmux
+
+      - name: syntax check the harness shell + python
+        run: |
+          set -e
+          for f in monitor/cc-harness/*.sh \
+                   monitor/watcher/test-integration/test-realmodel-*.sh; do
+            bash -n "$f"
+          done
+          python3 -c "import ast; ast.parse(open('monitor/cc-harness/mock-backend.py').read())"
+
+      - name: safety lint — no cmdline-pattern process kills in harness
+        # A `pkill -f <pattern>` matching the shared project-local claude
+        # binary kills EVERY agent in the sandbox's one PID namespace (crash
+        # postmortem 2026-05-29). Fail the job before running anything if a
+        # cmdline-pattern kill reappears in harness code. Mirrors the gate.sh
+        # pre-flight; runs here so every PR is guarded, not just version bumps.
+        run: monitor/cc-harness/lint-no-mass-kill.sh
+
+      - name: install the project-local Claude Code binary
+        # The real binary is the subject under test. npm ci is fine on a
+        # clean CI checkout (NFS-clone npm-ci caveats do not apply here).
+        run: monitor/install-claude-local.sh
+
+      - name: run real-binary scenarios
+        # RUN_CC_HARNESS=1 enables the otherwise-self-skipping suite. No
+        # ANTHROPIC_* secret is provided — the mock backend serves every
+        # model request locally.
+        run: |
+          set -uo pipefail
+          mapfile -t tests < <(find monitor/watcher/test-integration \
+              -name 'test-realmodel-*.sh' -type f | sort)
+          if (( ${#tests[@]} == 0 )); then
+            echo "::error::no realmodel scenarios found"
+            exit 1
+          fi
+          echo "Discovered ${#tests[@]} scenario(s)."
+          RUN_CC_HARNESS=1 bash monitor/watcher/run-tests.sh "${tests[@]}"
+
+      - name: collect pane captures on failure
+        if: failure()
+        run: |
+          set +e
+          echo "=== environment ==="
+          node --version; tmux -V; jq --version
+          ./node_modules/.bin/claude --version 2>&1 | head -1

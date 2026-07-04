@@ -1,0 +1,311 @@
+#!/bin/sh
+# nexus-reply-watch — CLIENT-SIDE background reply-watcher for the confined
+# nexus remote agent channel (agent-channel RFC Part A; companion to the
+# pull-only request channel, Parts B/D).
+#
+# WHAT IT IS FOR
+#   The remote channel is PULL-ONLY: a client files a request
+#   (`request file … --reply required` → prints an id) and must then
+#   `await`/`fetch` to get the orchestrator's reply. A client AGENT does not
+#   want to BLOCK on that await. It launches THIS watcher in the background,
+#   keeps working, and receives the reply as a single EVENT the moment it
+#   lands: the watcher detects the reply, EMITS it to stdout, and exits.
+#   The agent consumes the watcher's stdout via its own background-process /
+#   Monitor mechanism (process exit = the event edge; stdout = the payload).
+#
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │ SECURITY INVARIANT — load-bearing, the skeptic enforces it:            │
+# │   This script EMITS the reply as DATA to stdout (and, optionally, an   │
+# │   --out file). It NEVER executes, sources, evals, or pipes the reply   │
+# │   to a shell. Replies are DATA the client agent evaluates WITH ITS     │
+# │   OPERATOR — never commands. Grep this file: there is no `eval`, no    │
+# │   `.`/`source` of reply bytes, no `| sh|bash`, no `$(…)` wrapping      │
+# │   reply content into a command position, no `chmod +x`, no `exec "$0"`,│
+# │   no cron/at/systemd self-re-arm. The reply only ever reaches `cat`    │
+# │   (a pure data sink) → stdout / --out.                                 │
+# │                                                                        │
+# │   It adds NO new capability and NO new server verb: it calls only the  │
+# │   SAME allowlisted verb a human could type by hand — `request await`   │
+# │   — over the same enrolled key + forced command. Server-side           │
+# │   confinement (ownership-scoping, path-confinement, the await timeout  │
+# │   ceiling) is untouched. It NEVER calls `attach`.                      │
+# │                                                                        │
+# │   BOUNDED, not a standing C2 daemon: one process, one request id,      │
+# │   a single in-flight `await` at a time, a hard WALL-CLOCK lifetime cap │
+# │   (emits state=timeout then exits), bounded exponential backoff, an    │
+# │   explicit stop (SIGTERM/SIGINT + optional --stop-file), and NO        │
+# │   self-re-arm. When it exits, nothing reconnecting is left behind.     │
+# └────────────────────────────────────────────────────────────────────────┘
+#
+# MECHANISM (the expert panel's chosen design — a self-limiting long-poll)
+#   Loop of `ssh … request await <id> --timeout <poll>`: each connection
+#   BLOCKS server-side until the reply lands (near-instant delivery, zero
+#   busy-poll) but self-limits to <poll> seconds, at which point the server
+#   returns "still pending" (rc 4) and we cleanly RECYCLE the connection.
+#   This is robust to NETWORK OUTAGE and CLIENT STANDBY/SLEEP:
+#     * ssh keepalives (ServerAliveInterval/CountMax) + ConnectTimeout +
+#       BatchMode convert a half-open socket (the classic wake-from-suspend
+#       hazard) into a prompt rc 255, so the loop RECONNECTS rather than
+#       hanging on TCP's multi-minute retransmit.
+#     * The lifetime budget is WALL-CLOCK (date +%s), not an attempt count,
+#       so a multi-hour suspend simply consumes wall time and resolves to a
+#       single clean terminal decision on wake — it never inflates a retry
+#       counter and never gives up early "because the machine slept".
+#   Serial: at most ONE connection in flight, by this loop's own design.
+#   (NB the sshd knobs bound something else — MaxSessions caps multiplexed
+#   sessions PER connection, MaxStartups throttles concurrent
+#   UNAUTHENTICATED connections; neither limits how many serial
+#   authenticated clients may connect. Seriality is our discipline, not
+#   an sshd-enforced property.)
+#
+# EMIT GRAMMAR (stdout is the event stream; stderr is operational noise)
+#   The reply is emitted as a STATUS LINE followed by a LENGTH-FRAMED body.
+#   The length prefix is the anti-spoof primitive: the consumer reads
+#   EXACTLY reply_bytes bytes and never line-scans the body, so a reply body
+#   that itself contains a line like `state=failed` can NEVER masquerade as
+#   the status line.
+#
+#     nexus-reply-watch: state=replied id=<id> reply_bytes=<N> \
+#         reply_sha256=<hex|none> note=reply-is-data ts=<utc>
+#     --- reply-body <N> ---
+#     <exactly N bytes of the reply, verbatim>
+#     --- end reply-body ---
+#
+#   THE REPLY BODY IS THE RAW REPLY BYTES by default — byte-exact with the
+#   orchestrator's `reply` payload, identical to what nexus-request emits (the
+#   #401 fetch-results contract). It is pulled via `fetch <id> results`. Pass
+#   `--envelope` to instead emit the full `.replied.md` envelope (frontmatter
+#   + `## Reply` section) that `await` prints — the PRE-CONVERGENCE form.
+#   ⚠ BEHAVIOR CHANGE: a consumer that parsed the envelope MUST now pass
+#   `--envelope`; the bare default is the raw body.
+#
+#   Terminal non-reply states carry NO body block:
+#     nexus-reply-watch: state=failed  id=<id> reason=<r> detail="…" ts=<utc>
+#     nexus-reply-watch: state=timeout id=<id> reason=budget_exhausted \
+#         waited_s=<s> ts=<utc>
+#
+#   reason ∈ { terminal_failed | confinement_reject | channel_unavailable |
+#             enroll_auth_lost | refused | usage }.
+#
+# EXIT CODES (the wrapper's own dense contract; inner ssh/await codes remapped)
+#   0   state=replied  (reply body emitted)  OR  state=acked (terminal ack,
+#                      no reply body — orchestrator acked without a body)
+#   2   state=failed   (terminal error — see reason=; agent may re-file /
+#                      re-enroll / alert its operator)
+#   3   state=timeout  (wall-clock lifetime budget exhausted, still pending)
+#   64  usage error    (bad invocation — fix the launch, not the channel)
+#
+# USAGE
+#   nexus-reply-watch <id> [--poll S] [--timeout S] [--out FILE]
+#                          [--stop-file FILE] [--ssh-host ALIAS] [--envelope]
+#
+#   --envelope   emit the full .replied.md envelope (frontmatter + ## Reply)
+#                instead of the default RAW reply body (see EMIT GRAMMAR).
+#
+#   Connection identity comes from an ssh-config Host alias (default
+#   `nexus-remote`, written once during setup) so the invocation stays short.
+#   Override the whole ssh program with the SSH env var (the hermetic-test
+#   seam) or point at an explicit endpoint with NEXUS_REMOTE_SSH_HOST /
+#   _PORT / _USER / _KEY.
+#
+# Run `nexus-reply-watch --help` for the option summary.
+
+# ---- shell options -----------------------------------------------------
+# `set -u` catches unset-var bugs. We deliberately do NOT `set -e`: the
+# remote `await` legitimately exits non-zero (4 = still pending, 255 =
+# transport) and those are control-flow, not fatal.
+set -u
+
+PROG=nexus-reply-watch
+
+# Shared client-side core (defaults, log/utc_now/first_line/sha256_of/
+# reply_state, resolve_ssh_id, deliver/compose_reply/compose_status). The
+# helper is delivered alongside this script (client-side tooling saved next to
+# the key) and sourced from the same dir. The refactor is behaviour-preserving
+# — the shipped test suite (test-nexus-reply-watch.sh) is the regression guard.
+_wl_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd 2>/dev/null) || _wl_dir=$(dirname -- "$0")
+# shellcheck source=_nexus_watch_lib.sh
+. "${NEXUS_WATCH_LIB:-$_wl_dir/_nexus_watch_lib.sh}" || {
+    printf '%s: cannot load _nexus_watch_lib.sh (expected next to this script)\n' "$PROG" >&2
+    exit 64
+}
+
+die_usage() {
+    printf '%s: %s\n' "$PROG" "$*" >&2
+    printf 'usage: %s <id> [--poll S] [--timeout S] [--out FILE] [--stop-file FILE] [--ssh-host ALIAS] [--envelope]\n' "$PROG" >&2
+    exit 64
+}
+
+usage() {
+    sed -n '2,90p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'
+    exit 0
+}
+
+# ---- arg parse ---------------------------------------------------------
+id=''
+poll=$POLL_DEFAULT
+timeout=$TIMEOUT_DEFAULT
+out=''
+stop_file=''
+envelope='false'      # default: emit the RAW reply body (the #401 contract)
+ssh_alias="${NEXUS_REMOTE_SSH_ALIAS:-$SSH_ALIAS_DEFAULT}"
+
+case "${1:-}" in
+    -h|--help) usage ;;
+    ''|-*) die_usage "first argument must be a request id" ;;
+    *) id=$1; shift ;;
+esac
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --poll)      poll=${2:-};      shift 2 || die_usage "--poll needs seconds" ;;
+        --timeout)   timeout=${2:-};   shift 2 || die_usage "--timeout needs seconds" ;;
+        --out)       out=${2:-};       shift 2 || die_usage "--out needs a path" ;;
+        --stop-file) stop_file=${2:-}; shift 2 || die_usage "--stop-file needs a path" ;;
+        --ssh-host)  ssh_alias=${2:-}; shift 2 || die_usage "--ssh-host needs an alias" ;;
+        --envelope)  envelope='true';  shift ;;
+        -h|--help)   usage ;;
+        --) shift; break ;;
+        *) die_usage "unknown flag: $1" ;;
+    esac
+done
+
+# ---- validate ----------------------------------------------------------
+# The id charset mirrors the server's (_validate_id): [A-Za-z0-9_-] makes
+# `..`, `/`, and absolute paths un-representable as an id.
+case "$id" in
+    *[!A-Za-z0-9_-]*|'') die_usage "illegal request id (must be [A-Za-z0-9_-]): $id" ;;
+esac
+case "$poll"    in ''|*[!0-9]*) die_usage "--poll must be a non-negative integer" ;; esac
+case "$timeout" in ''|*[!0-9]*) die_usage "--timeout must be a non-negative integer" ;; esac
+
+# Clamp poll into [MIN, MAX]; the server would clamp a large value anyway.
+[ "$poll" -lt "$POLL_MIN" ] && poll=$POLL_MIN
+[ "$poll" -gt "$POLL_MAX" ] && poll=$POLL_MAX
+# timeout 0 = "as long as allowed" → the hard ceiling (still bounded).
+[ "$timeout" -eq 0 ] && timeout=$TIMEOUT_MAX
+[ "$timeout" -gt "$TIMEOUT_MAX" ] && timeout=$TIMEOUT_MAX
+
+# ---- ssh identity ------------------------------------------------------
+# Default: an ssh-config Host alias (short invocation). Explicit endpoint via
+# NEXUS_REMOTE_SSH_HOST wins when set (no ssh-config block required). $SSH is
+# the hermetic-test seam (default `ssh`). resolve_ssh_id (shared lib) reads
+# $ssh_alias + the NEXUS_REMOTE_SSH_* overrides and sets $SSH / $SSH_ID.
+resolve_ssh_id
+
+# ---- idempotency sentinel (crash-restart double-emit guard) ------------
+# Written BEFORE the visible reply emit. If a prior instance crashed AFTER
+# emitting but BEFORE exiting and the agent relaunches the same id, the
+# sentinel short-circuits so the reply is never emitted twice. Survives a
+# reboot (not under /tmp) so a genuine restart still finds it.
+STATE_DIR="${NEXUS_REPLY_WATCH_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/nexus-reply-watch}"
+mkdir -p "$STATE_DIR" 2>/dev/null || STATE_DIR="${TMPDIR:-/tmp}"
+sentinel="$STATE_DIR/$id.emitted"
+
+# ---- temp files + cleanup ---------------------------------------------
+tmp=$(mktemp 2>/dev/null)    || tmp="${TMPDIR:-/tmp}/$PROG.body.$$"     # await envelope buffer
+rbody=$(mktemp 2>/dev/null)  || rbody="${TMPDIR:-/tmp}/$PROG.rbody.$$"  # raw fetch-results body
+errtmp=$(mktemp 2>/dev/null) || errtmp="${TMPDIR:-/tmp}/$PROG.err.$$"
+emittmp=$(mktemp 2>/dev/null) || emittmp="${TMPDIR:-/tmp}/$PROG.emit.$$"
+: > "$tmp"; : > "$rbody"; : > "$errtmp"; : > "$emittmp"
+
+STOPPED=0
+cleanup() { rm -f "$tmp" "$rbody" "$errtmp" "$emittmp" 2>/dev/null; }
+on_signal() { STOPPED=1; log "stop signal received — exiting cleanly (no emit)"; cleanup; exit 143; }
+trap cleanup EXIT
+trap on_signal INT TERM
+
+# Emit a fully-received reply exactly once, then exit 0. The await OUTPUT
+# ($tmp — the .replied.md envelope) DISCRIMINATES replied vs acked via its
+# frontmatter `state:`; the emitted BODY is then either the RAW reply bytes
+# (default, pulled byte-exact via `fetch <id> results` — the #401 contract,
+# identical to nexus-request) or, with --envelope, that await envelope itself.
+# (deliver / compose_reply / emit_replied / already_emitted come from the lib.)
+emit_reply_and_exit() {
+    if already_emitted; then
+        log "terminal reply for id=$id already emitted (sentinel present) — exiting without re-emit"
+        exit 0
+    fi
+    _state=$(reply_state "$tmp")
+    if [ "$_state" = replied ]; then
+        if [ "$envelope" = true ]; then
+            emit_replied "$tmp"                      # PRE-CONVERGENCE envelope form
+        else
+            # Default: pull the RAW reply body byte-exact. On a transport drop
+            # fall back to the await envelope we already hold (still DATA).
+            : > "$rbody"; : > "$errtmp"; grc=0
+            remote request fetch "$id" results </dev/null > "$rbody" 2>"$errtmp" || grc=$?
+            if [ "$grc" -eq 0 ]; then emit_replied "$rbody"; else emit_replied "$tmp"; fi
+        fi
+    else
+        # Terminal rc 0 with no `state: replied` = an ack with no reply body
+        # (the orchestrator acked instead of replying). Distinct state, still 0.
+        # The ack envelope is carried as the body (unchanged by --envelope).
+        compose_reply acked
+        mark_emitted        # SENTINEL BEFORE the visible emit (ordering is load-bearing)
+        deliver
+        exit 0
+    fi
+}
+
+# ---- the watch loop ----------------------------------------------------
+# poll_once is the tool-specific hook the shared watch_loop core drives each
+# iteration (stop-file + wall-clock budget + timeout emit live in the core).
+# nexus-reply-watch's step: a single self-limiting long-poll `request await`
+# that BLOCKS server-side until the reply lands (near-instant delivery, zero
+# busy-poll) and is the terminal DETECTOR; the rc table + backoff are shared.
+poll_once() {
+    # Bound this await chunk so it can never run past the lifetime deadline.
+    remaining=$(( deadline - now ))
+    chunk=$poll
+    [ "$chunk" -gt "$remaining" ] && chunk=$remaining
+    [ "$chunk" -lt 1 ] && chunk=1
+
+    : > "$tmp"; : > "$errtmp"; rc=0
+    # THE terminal-detecting remote call: the same `request await` a human
+    # could type. </dev/null — this poll never forwards the caller's stdin
+    # (the every-poll-closes-stdin discipline; nexus-reply-watch never streams
+    # a body). No client-supplied option reaches a shell; the reply lands in
+    # $tmp as data.
+    remote request await "$id" --timeout "$chunk" </dev/null > "$tmp" 2>"$errtmp" || rc=$?
+
+    case "$rc" in
+        0)
+            # ssh exit 0 ⟺ the channel closed cleanly ⟺ the remote `cat`
+            # completed ⟺ the reply body was fully delivered. Emit exactly once.
+            emit_reply_and_exit
+            ;;
+        4)
+            # await timed out server-side, still pending: a HEALTHY recycle,
+            # not a failure. Reset backoff and re-await immediately (the next
+            # await blocks server-side, so this is not a busy loop).
+            backoff=$BACKOFF_BASE
+            log "pending (await window elapsed); re-awaiting id=$id (deadline in $(( deadline - now ))s)"
+            return 0
+            ;;
+        2)
+            # await rc 2 is VERB-SPECIFIC: the request reached `.failed` (await
+            # prints the failure). Distinct from fetch's rc 2 (= id not found),
+            # so it is matched here, not in the shared table.
+            emit_failed terminal_failed "$(first_line "$tmp")"
+            ;;
+        *)
+            # Every verb-independent fatal code (5/10/11/12/13, and rc 1 =
+            # usage/bad-arg — STATIC, retrying loops forever) routes through
+            # the ONE shared table, which emits+exits on a fatal code.
+            classify_ssh_rc "$rc" "$errtmp"
+            # 255 (transport, incl. a wake-from-suspend half-open socket) and
+            # any unclassified code: TRANSIENT. Discard the (possibly partial)
+            # body, back off (bounded, subordinate to the deadline), re-await.
+            # The server re-serves an already-landed reply byte-identically, so
+            # recovery never double-emits.
+            _det=$(first_line "$errtmp")
+            log "transient error rc=$rc${_det:+ ($_det)}; backoff ${backoff}s then re-await (deadline in $(( deadline - now ))s)"
+            backoff_sleep
+            return 0
+            ;;
+    esac
+}
+
+log "watching id=$id via '$SSH_ID' (poll=${poll}s, lifetime=${timeout}s, out=${out:-<stdout>})"
+watch_loop

@@ -1,0 +1,150 @@
+name: Pages
+
+# Builds the docs site with the disable switch ENABLED and publishes it
+# to GitHub Pages via the modern artifact flow.
+#
+# The switch (monitor/_public-guard.sh) ships default-OFF for everyone
+# who clones this template, so a bare checkout cannot spin up autonomous
+# workers. This workflow flips it ON only when a repository Actions
+# secret is present — the secret is a dedicated run-token and its
+# PRESENCE (not its value) is the gate:
+#
+#   * Set the secret NEXUS_PAGES_ENABLE to any non-empty value. The job
+#     confirms it is present, then sets NEXUS_PUBLIC_ENABLED=1 itself for
+#     the remaining steps, the guard returns 0, and the site is built.
+#   * With the secret unset (any fork, or before the operator sets it)
+#     the run-token is empty, the job fails closed at the gate, and
+#     NEXUS_PUBLIC_ENABLED is never set — a fork cannot enable the system.
+#
+# The run-token's value is never needed in the repo and is never printed:
+# the gate tests only emptiness, GitHub masks `secrets.*` in logs, and
+# this workflow triggers only on `push` to the default branch and manual
+# dispatch — never on `pull_request`, so fork PRs cannot run it at all.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One Pages deployment at a time. Never cancel an in-progress deploy, so
+# a half-published site never lands.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+# Least privilege: read the repo, write the Pages deployment, mint the
+# OIDC token deploy-pages needs. No `contents: write`.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    name: Build docs (switch enabled)
+    runs-on: ubuntu-latest
+    env:
+      # Dedicated run-token. Presence is the gate; the value is opaque and
+      # never referenced beyond the emptiness test below. Unset -> empty.
+      NEXUS_PAGES_ENABLE: ${{ secrets.NEXUS_PAGES_ENABLE }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Gate on the enable run-token (fail closed)
+        # Never echoes the value — only tests emptiness. A fork or an
+        # unconfigured repo stops here. On success it hands the guard's
+        # public flag to subsequent steps via $GITHUB_ENV; that write is
+        # only reached after the token is confirmed present.
+        run: |
+          if [ -z "${NEXUS_PAGES_ENABLE}" ]; then
+            echo "::error::Repository secret NEXUS_PAGES_ENABLE is not set."
+            echo "Set it to any non-empty value to allow this workflow to build with the switch enabled:"
+            echo "  gh secret set NEXUS_PAGES_ENABLE --repo <owner>/<repo> --body \"\$(openssl rand -hex 16)\""
+            exit 1
+          fi
+          echo "Enable run-token is present; enabling the disable switch for this run."
+          echo "NEXUS_PUBLIC_ENABLED=1" >> "$GITHUB_ENV"
+
+      - name: Guard self-check (exercise the enabled path)
+        # Sources the real disable switch and calls it exactly as the
+        # start entry points do. Returns 0 only because the gate above set
+        # NEXUS_PUBLIC_ENABLED=1; otherwise it would print the disabled
+        # notice and exit 1.
+        run: |
+          set -euo pipefail
+          source monitor/_public-guard.sh
+          nexus_public_guard
+          echo "Guard passed: disable switch is enabled for this run."
+
+      - name: Validate shell sources (bash -n sweep)
+        # Minimal, dependency-free check that the shipped shell tree still
+        # parses — a fast fail before the full behavioural suite below.
+        run: |
+          set -e
+          shopt -s globstar nullglob
+          fail=0
+          for f in monitor/**/*.sh; do
+            if ! bash -n "$f" 2>/tmp/syntax.err; then
+              echo "::error file=$f::bash -n syntax error"
+              sed 's|^|  |' /tmp/syntax.err
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Install test runtime deps (jq + tmux + zsh)
+        # The full unit suite needs jq (state parsing), tmux (several
+        # tests install a tmux shim on PATH for `command -v tmux`), and
+        # zsh (the zsh spawn-shell half of test-spawn-pathfront.sh, which
+        # auto-skips when zsh is absent). ubuntu-latest ships bash + curl
+        # + openssl + gh already. Same install as tests.yml.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq tmux zsh
+
+      - name: Run the full watcher unit suite (gate deploy on green)
+        # The deploy CI runs the WHOLE test suite, not just the bash -n
+        # smoke above — the same suite tests.yml runs, invoked the same
+        # way. A real failure keeps this run red and the site is NOT
+        # published. Slow + integration tests auto-skip (SLOW_TESTS /
+        # RUN_INTEGRATION unset), matching tests.yml's fast-gate. Runs
+        # only after the secret-gate above enabled the switch, so a fork
+        # (no secret) never reaches this step.
+        run: |
+          set -uo pipefail
+          mapfile -t tests < <(find monitor/watcher -maxdepth 1 -name 'test-*.sh' -type f | sort)
+          if (( ${#tests[@]} == 0 )); then
+            echo "::error::no tests selected — refusing to report green on an empty run"
+            exit 1
+          fi
+          echo "Discovered ${#tests[@]} tests."
+          bash monitor/watcher/run-tests.sh --jobs 2 "${tests[@]}"
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: docs/requirements.txt
+
+      - name: Install docs dependencies
+        run: pip install -r docs/requirements.txt
+
+      - name: Build docs site (strict)
+        run: mkdocs build --strict --verbose
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

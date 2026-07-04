@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Configure a git repo for bot-only HTTPS git operations.
+#
+# What this does, all per-repo (no global git config touched):
+#   1. Sets credential.https://github.com.helper to mint a fresh
+#      installation token from monitor/mint-token.sh on every git
+#      auth challenge for github.com — bot identity, never the user's
+#      cached gh OAuth.
+#   2. Sets user.name / user.email to the App's bot identity from
+#      config/nexus.yml (github.bot_git_name / .bot_git_email), so
+#      every commit's author is the bot, not the user.
+#
+# Why per-repo: ~/.gitconfig is read-only inside the agent-sandbox,
+# and `gh auth setup-git` (a) requires write access there and (b)
+# would delegate to the user's gh OAuth token — exactly what the
+# bot-only-identity guardrail forbids.
+#
+# Usage:
+#   monitor/git-https-setup                  # configures the cwd's repo
+#   monitor/git-https-setup --repo <path>    # configures the repo at <path>
+#
+# Run after `git init` or `git clone https://github.com/...` for any
+# new repo whose origin is on github.com. Idempotent — replays cleanly.
+#
+# Requires the bot to be installed on the target remote repo before
+# pushes will succeed. Pushes to repos the bot is NOT installed on
+# fail loudly with a 403; that's the intended "technically impossible"
+# guardrail — install the bot on more repos rather than working
+# around the failure.
+
+set -euo pipefail
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+nexus_root=$(cd "$script_dir/.." && pwd)
+mint_path="$script_dir/mint-token.sh"
+cfg="$nexus_root/config/load.sh"
+
+target="${PWD}"
+if [[ ${1:-} == "--repo" ]]; then
+    [[ $# -ge 2 ]] || { echo "git-https-setup: --repo needs a path" >&2; exit 1; }
+    target="$2"
+fi
+
+[[ -d "$target/.git" ]] || git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    echo "git-https-setup: $target is not a git repo" >&2
+    exit 1
+}
+
+[[ -x "$mint_path" ]] || { echo "git-https-setup: $mint_path missing or not executable" >&2; exit 1; }
+
+bot_name=$("$cfg" github.bot_git_name)
+bot_email=$("$cfg" github.bot_git_email)
+
+# Wipe any prior credential.https://github.com.helper entries (e.g. the
+# old `gh auth git-credential` wiring). Ignore failure when the key was
+# never set.
+git -C "$target" config --local --unset-all credential.https://github.com.helper 2>/dev/null || true
+
+# Empty value first to override any inherited helper (e.g. the global
+# `credential.helper = cache` in ~/.gitconfig) — without this, git
+# queries cache before our helper and a stale empty cache entry can
+# satisfy the credential request.
+git -C "$target" config --local --add credential.https://github.com.helper ""
+
+# Bot-token helper. The shell function form means the function body
+# is parsed by git's helper invocation shell at credential-request
+# time, so $(mint-token.sh) runs once per challenge — fresh token,
+# fail-loud (mint-token.sh exits non-zero if the App's RSA key is
+# missing or the API rejects the JWT). The absolute path is baked in
+# at setup time so the helper works regardless of git's cwd at use
+# time.
+git -C "$target" config --local --add credential.https://github.com.helper \
+    "!f() { echo username=x-access-token; echo password=\$($mint_path); }; f"
+
+git -C "$target" config --local user.name  "$bot_name"
+git -C "$target" config --local user.email "$bot_email"
+
+echo "git-https-setup: $target"
+echo "  credential.https://github.com.helper -> mint-token.sh ($mint_path)"
+echo "  user.name  -> $bot_name"
+echo "  user.email -> $bot_email"

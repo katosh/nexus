@@ -1,0 +1,27 @@
+name: check-no-reports-leaked
+on:
+  pull_request:
+    paths:
+      - 'reports/**'
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: fail if PR adds reports/*.md
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          leaked=$(git diff --name-only --diff-filter=A "$base" "$head" -- 'reports/*' \
+                   | grep -v '^reports/.gitignore$' || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::PR adds files under reports/ (local-only):"
+            echo "$leaked"
+            echo
+            echo "reports/*.md are local artifacts uploaded to the asset repo via 'monitor/ng upload'."
+            echo "They MUST NOT be committed to the code repo."
+            exit 1
+          fi
+          echo "OK — no reports/ leaks."

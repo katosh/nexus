@@ -1,0 +1,101 @@
+     ?? data/analysis/drug_wavelet_replicate_effects.csv
+     [2m…[0m[39m[49m [2m+11[0m[39m[49m [2mlines[0m[39m[49m [2m(ctrl+o[0m[39m[49m [2mto[0m[39m[49m [2mexpand)[0m[39m[49m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(rm figures/wavelet_validation_chr1.png; ls figures/drug_wavelet*.png; echo '---'; ls data/analysis/drug_wavelet*.csv)
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39mfigures/drug_wavelet_main.png
+     figures/drug_wavelet_replicate_concordance.png
+     figures/drug_wavelet_validation.png
+     [2m…[0m[39m[49m [2m+6[0m[39m[49m [2mlines[0m[39m[49m [2m(ctrl+o[0m[39m[49m [2mto[0m[39m[49m [2mexpand)[0m[39m[49m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(git add scripts/_style.py scripts/15_wavelet_smooth.py scripts/16_drug_treatment_wavelet.py scripts/17_drug_wavelet_figures.py data/analysis/drug_wavelet_…)
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39mA  data/analysis/drug_wavelet_g1s1_vs_rt6f.csv
+     A  data/analysis/drug_wavelet_per_gene.csv
+     A  data/analysis/drug_wavelet_replicate_effects.csv
+     [2m…[0m[39m[49m [2m+9[0m[39m[49m [2mlines[0m[39m[49m [2m(ctrl+o[0m[39m[49m [2mto[0m[39m[49m [2mexpand)[0m[39m[49m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(git commit -m "$(cat <<'EOF'
+      Drug-treatment Repli-seq: J7 wavelet recompute with per-rep analysis…)
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39m[<operator>/drug-wavelet-recompute 330f6f2] Drug-treatment Repli-seq: J7 wavelet recompute with per-rep analysis
+      12 files changed, 2171 insertions(+)
+      create mode 100644 data/analysis/drug_wavelet_g1s1_vs_rt6f.csv
+     [2m…[0m[39m[49m [2m+11[0m[39m[49m [2mlines[0m[39m[49m [2m(ctrl+o[0m[39m[49m [2mto[0m[39m[49m [2mexpand)[0m[39m[49m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(git push -u origin <operator>/drug-wavelet-recompute 2>&1)
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39mremote:
+     remote: Create a pull request for '<operator>/drug-wavelet-recompute' on GitHub by visiting:
+     remote:      https://github.com/<your-org>/repltime-histones/pull/new/<operator>/drug-wavelet-recompute
+     [2m…[0m[39m[49m [2m+4[0m[39m[49m [2mlines[0m[39m[49m [2m(ctrl+o[0m[39m[49m [2mto[0m[39m[49m [2mexpand)[0m[39m[49m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(GH_TOKEN=$($NEXUS_ROOT/monitor/mint-token.sh) gh pr create -R <your-org>/repltime-histones --base master --head <operator>/drug-wavelet-recompu…)
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39mhttps://github.com/<your-org>/repltime-histones/pull/1
+
+[38;5;231m●[39m PR opened. Now upload figures via the bot and post on issue #81.
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(cd $NEXUS_ROOT && ./monitor/ng upload $NEXUS_ROOT/work/repltime-drug-replicates/figures/drug_wavelet_main.png 2>&1 |…)
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39mhttps://github.com/<your-org>/<your-nexus>/wiki/status-assets/drug_wavelet_main.png
+     ---
+     https://github.com/<your-org>/<your-nexus>/wiki/status-assets/drug_wavelet_validation.png
+     [2m…[0m[39m[49m [2m+2[0m[39m[49m [2mlines[0m[39m[49m [2m(ctrl+o[0m[39m[49m [2mto[0m[39m[49m [2mexpand)[0m[39m[49m
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m Shell[39m [38;5;246mcwd[39m [38;5;246mwas[39m [38;5;246mreset[39m [38;5;246mto[39m [38;5;246m$NEXUS_ROOT/work/repltime-drug-replicates[39m
+
+[38;5;114m●[39m [1mWrite[0m[39m[49m(/tmp/issue_81_comment.md)
+[38;5;246m  ⎿  [39mWrote [1m56[0m[39m[49m lines to [1m../../../../../../../../tmp/issue_81_comment.md[0m[39m[49m
+     [2m[38;5;231m    [0m[38;5;231m[49mll/1) (branch `<operator>/drug-wavelet-recompute`).avelet smoothing (per replicate).** Pushed to [[38;5;186m`<your-org>/repltime-histones#1`[38;5;231m](https://github.com/<your-org>/repltime-histones/pu[39m
+     [2m[38;5;231m  2 [0m[39m[49m
+     [2m[38;5;231m  3 [0m[38;5;231m[49m![[38;5;186mdrug_wavelet_main[38;5;231m](https://github.com/<your-org>/<your-nexus>/wiki/status-assets/drug_wavelet_main.png)[39m
+     [2m[38;5;231m  4 [0m[39m[49m
+     [2m[38;5;231m  5 [0m[38;5;231m[49m![[38;5;186mdrug_wavelet_replicate_concordance[38;5;231m](https://github.com/<your-org>/<your-nexus>/wiki/status-assets/drug_wavelet_replicate_concordance.png)[39m
+     [2m[38;5;231m  7 [0m[38;5;231m[49m## Method[39m
+     [2m[38;5;231m  8 [0m[39m[49m
+     [2m[38;5;231m  9 [0m[38;5;231m[49m- Daubechies-4 DWT, 7 levels (~128 kb scale per Thurman 2007), reflection-padded, applied per-replicate to every G1-S1 bigwig in `GSE302744_RAW.tar` (15 reps total).[39m
+     [2m[38;5;231m 10 [0m[38;5;231m[49m- Per-replicate Δrt vs NT (single deposited NT replicate, GSM9415082; the 4-NT-pool `Consensus.bw` blends 3 prior NT samples that aren't part of this batch — within-batch is t[39m
+     [2m[38;5;231m    [0m[38;5;231m[49mhe cleaner control).[39m
+     [38;5;246m… +55 lines[39m [38;5;246m(ctrl+o to[39m [38;5;246mexpand)[39m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(cd $NEXUS_ROOT && ./monitor/ng issue comment 81 --body-file /tmp/issue_81_comment.md 2>&1 | tail -5)
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39mhttps://github.com/<your-org>/<your-nexus>/issues/81#issuecomment-4401989048
+[38;5;246m  ⎿  Shell cwd was reset to $NEXUS_ROOT/work/repltime-drug-replicates[39m
+
+[38;5;231m●[39m Comment posted. Now write the final report.
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(date +%H%M%S)
+[38;5;246m  ⎿  [39m165126
+
+[38;5;114m●[39m [1mWrite[0m[39m[49m($NEXUS_ROOT/reports/repltime-histones_2026-05-07_165126_drug-wavelet-recompute.md)
+[38;5;246m  ⎿  [39mWrote [1m109[0m[39m[49m lines to [1m../../reports/repltime-histones_2026-05-07_165126_drug-wavelet-recompute.md[0m[39m[49m
+     [2m[38;5;231m 1 [0m[38;5;231m[49m# Drug-treatment Repli-seq: J7 wavelet recompute, per replicate[39m
+     [2m[38;5;231m 2 [0m[39m[49m
+     [2m[38;5;231m 3 [0m[38;5;231m[49m## Summary[39m
+     [2m[38;5;231m 4 [0m[39m[49m
+     [2m[38;5;231m 5 [0m[38;5;231m[49mRe-ran the GSE302744 drug-treatment analysis on a J7 (~128 kb) db4[39m
+     [2m[38;5;231m 6 [0m[38;5;231m[49mwavelet-smoothed signal, per replicate (n=2-3 per condition),[39m
+     [2m[38;5;231m 7 [0m[38;5;231m[49mreplacing the prior round's raw-G1-S1 + deposited-average-bigwig[39m
+     [2m[38;5;231m 8 [0m[38;5;231m[49mpath. Homogenizes the smoothing scale with the ENCODE wavelet[39m
+     [2m[38;5;231m 9 [0m[38;5;231m[49mbigwigs used elsewhere in the analysis.[39m
+     [38;5;246m… +99 lines (ctrl+o to expand)[39m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(sandbox-notify "drug-wavelet recompute: comment posted on <your-nexus>#81; PR open at <your-org>/repltime-histones#1; report at reports/repltime-histones_2026-05-0…)
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m (No output)[39m
+
+[38;5;231m●[39m Done.
+
+  [1mDrug-wavelet recompute landed:[0m[39m[49m
+  - PR: https://github.com/<your-org>/repltime-histones/pull/1 (branch [38;5;153m<operator>/drug-wavelet-recompute[39m)
+  - Comment: https://github.com/<your-org>/<your-nexus>/issues/81#issuecomment-4401989048 — leads with main + replicate-concordance figures, validation as third
+  - Report: [38;5;153mreports/repltime-histones_2026-05-07_165126_drug-wavelet-recompute.md[39m
+
+  [1mHeadline shifts vs prior round:[0m[39m[49m
+  - HIST2 [1msign-flips[0m[39m[49m to EARLIER under all drugs (replicate-concordant, p_adj=0.006). The J7 ~128 kb smoothing pulls HIST2's small ~500 kb cluster into its regional pattern, structurally
+  changing rank-percentile — the recompute is the methodologically-aligned-with-ENCODE measurement.
+  - The prior "Aph→HIST1 EARLIER" (p=8.7e-5) survives in only 2 of 4 Aph reps. Pooled-mean Aph03 keeps weak EARLIER (p_adj=0.043); Aph06 alone n.s.
+  - Method validation: J7-smoothed Curie LCL vs ENCODE GM12878 wavelet bigwig — Spearman ρ = 0.87–0.90 across most chroms; G1-S1+J7 vs full Thurman-rt+J7 r=0.77–0.91, validating the stand-in.
+
+[38;5;246m✻[39m [38;5;246mBrewed for 34m 45s[39m
+
+[38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [7mm[0;2m[39m[49merge the PR[0m[39m[49m
+[38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m◉ Opus 4.7 (1M context) │ ██░░░░░░░▓ 203K/1.0M │ ⚡100% │ $10.77 +1526/-26[39m                                   [38;5;211m✗ Auto-update failed · Try [1mclaude doctor[0m[38;5;211m[49m or [1mnpm i -g @anthropic-ai/claude-code[0m[39m[49m
+  [38;5;246m-- INSERT --[39m [38;5;211m⏵⏵ bypass permissions on[38;5;246m (shift+tab[39m [38;5;246mto cycle)[39m
+
+

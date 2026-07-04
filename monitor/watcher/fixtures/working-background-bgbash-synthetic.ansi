@@ -1,0 +1,9 @@
+[39m● Started the build pipeline. Logs are streaming to ./build.log.[0m
+
+[38;5;246m✻ Cooked for 32s · 2 background bash still running[0m
+
+[38;5;244m─[0m
+[38;5;246m❯ [7m [0m[39m[49m
+[38;5;244m─[0m
+  [38;5;246m◉ Opus 4.7 (1M context) │ █▋░░░░░░░▓ 78K/1.0M │ ⚡100% │ $4.12 +18/-3[0m
+  [38;5;246m-- INSERT -- ⏵⏵ bypass permissions on · 2 background bashes · ← for agents[0m

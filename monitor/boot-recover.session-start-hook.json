@@ -1,0 +1,19 @@
+{
+  "_comment": "SessionStart hook that fires the nexus cold-boot recovery trigger when the orchestrator session is brought back (matcher 'resume' covers `claude --resume` AND `claude --continue` — the chaperon's bring-back path at boot). Merge the `hooks` block below into your orchestrator's settings.json under $CLAUDE_CONFIG_DIR (do NOT replace an existing `hooks` object — splice SessionStart into it). Replace the absolute path with your own NEXUS_ROOT if it differs. `async: true` keeps the hook from blocking session start; boot-recover.sh additionally backgrounds the heavy recovery, so it returns within milliseconds regardless. See monitor/README.md -> 'Cold-boot recovery trigger'.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/boot-recover.sh",
+            "async": true,
+            "timeout": 30,
+            "statusMessage": "Checking nexus stack (cold-boot recovery)…"
+          }
+        ]
+      }
+    ]
+  }
+}

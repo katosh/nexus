@@ -1,0 +1,100 @@
+  └───────────────┴────────────────────────┴───────────────────────────────────────────────────────┘
+
+  [1mRecommendation:[0m[39m[49m small [38;5;153mmonitor/pane-state.sh[39m helper that emits structured [38;5;153mstate=idle|busy|user-typing|autosuggest-only active=0|1[39m, plus a 6-line guideline in CLAUDE.md "Common gotchas"
+  pointing to it. Both the orchestrator and the watcher's [38;5;153m_unstick.sh[39m can call it.
+
+  Edge cases worth coding for: user types prefix + autosuggest tail (cursor cell sits between → bright prefix wins, drop dim tail); permission overlays ([38;5;153mDo you want to proceed?[39m) hijack the
+  input region (detect first, return [38;5;153mstate=blocked[39m); wrapped autosuggest needs [38;5;153m-J[39m join.
+
+  Ready to spawn an implementation worker that lands [38;5;153mmonitor/pane-state.sh[39m + CLAUDE.md guideline + a skill section? Or want to sit on the analysis first?
+
+[38;5;246m✻[39m [38;5;246mWorked for 5m 53s[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231mdispatch an agent for that. Also validate, e.g., using watcher-startup-[39m
+[49m
+[38;5;114m●[39m [1mBash[0m[39m[49m(GH_TOKEN=$(./monitor/mint-token.sh) gh pr view 93 -R <your-org>/<your-nexus> --json state,mergedAt 2>&1 | head -3
+      echo "---worktree prep---"…)
+[38;5;246m  ⎿  [39m{
+       "mergedAt": null,
+       "state": "OPEN"
+     [2m… +2 lines (ctrl+o to expand)[0m[39m[49m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(git worktree add work/<your-nexus>-pane-state -b <operator>/pane-state-helper origin/main 2>&1 | tail -5)
+[38;5;246m  ⎿  [39mBranch '<operator>/pane-state-helper' set up to track remote branch 'main' from 'origin'.
+     Preparing work/<your-nexus>-pane-state (identifier <your-nexus>-pane-state)
+     HEAD is now at c24b7cd README: embed v5 organigram + user-interaction section (#91)
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(ln -sf $NEXUS_ROOT/config/nexus.yml work/<your-nexus>-pane-state/config/nexus.yml 2>/dev/null
+      ls -la work/<your-nexus>-pane-state/config/nex…)
+[38;5;246m  ⎿  [39mlrwxrwxrwx 1 <operator> 50 May  7 17:45 work/<your-nexus>-pane-state/config/nexus.yml -> $NEXUS_ROOT/config/nexus.yml
+
+[38;5;114m●[39m [1mWrite[0m[39m[49m(/tmp/prompt-pane-state.txt)
+[38;5;246m  ⎿  [39mWrote [1m107[0m[39m[49m lines to [1m../../../../../../tmp/prompt-pane-state.txt[0m[39m[49m
+     [2m[38;5;231m   [0m[38;5;231m[49ming worker panes.-state` worker. Implement and validate a small helper that lets the orchestrator distinguish Claude Code's autosuggest text from genuine user input when captur[39m
+     [2m[38;5;231m 2 [0m[39m[49m
+     [2m[38;5;231m 4 [0m[38;5;231m[49m## Why this matters[39m
+     [2m[38;5;231m 5 [0m[38;5;231m[49mThe orchestrator has been misreading Claude Code's input-box autosuggest (e.g. "merge the PR", "review the PR diff myself") in worker panes as user-typed instructions, and paus[39m
+     [2m[38;5;231m   [0m[38;5;231m[49ming coordination ("standing back so I don't interfere with your direct chat") when the user never typed anything. Wastes orchestrator turns and is conceptually wrong.[39m
+     [2m[38;5;231m 7 [0m[38;5;231m[49mA research agent (in-process Agent tool, prior turn) found a deterministic ANSI marker. Their conclusion verbatim:[39m
+     [2m[38;5;231m 8 [0m[39m[49m
+     [2m[38;5;231m   [0m[38;5;231m[49muggestion, immediately followed by faint/dim (`ESC[0;2m`) on the remainder. User-typed text never produces this — typed prefix renders bright (`ESC[38;5;231m`) with the cursor [39m
+     [2m[38;5;231m   [0m[38;5;231m[49mcell at the end, not the start. Empty input box renders `ESC[7m ESC[0m` (cursor on space, no dim trailer). Empirically validated against the live nexus session: 3/6 panes had a[39m
+     [2m[38;5;231m   [0m[38;5;231m[49mutosuggest, regex `\x1b\[7m.\x1b\[0;2m` partitioned them with zero false positives.[39m
+     [38;5;246m…[39m [38;5;246m+116[39m [38;5;246mlines[39m [38;5;246m(ctrl+o[39m [38;5;246mto[39m [38;5;246mexpand)[39m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(monitor/spawn-worker.sh pane-state $NEXUS_ROOT/work/<your-nexus>-pane-state /tmp/prompt-pane-state.txt 2>&1 | tail -10)
+[38;5;246m  ⎿  [39musage: monitor/spawn-worker.sh -n <window-name> -c <workdir> -p <prompt-file>
+
+       -n  tmux window name (kebab-case)
+     [2m… +7 lines (ctrl+o to expand)[0m[39m[49m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(monitor/spawn-worker.sh -n pane-state -c $NEXUS_ROOT/work/<your-nexus>-pane-state -p /tmp/prompt-pane-state.txt 2>&1 | tail -10)
+[38;5;246m  ⎿  [39mspawned: window=pane-state workdir=$NEXUS_ROOT/work/<your-nexus>-pane-state prompt=/tmp/prompt-pane-state.txt floor=injected
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(sleep 3 && tmux list-windows -F '#{window_index} #{window_name}' && echo '---pane 7 head---' && tmux capture-pane -t pane-state -p -S -10 | head -15)
+[38;5;246m  ⎿  [39m1 claude
+     2 watcher
+     3 drug-wavelet
+     [2m… +20 lines (ctrl+o to expand)[0m[39m[49m
+
+[38;5;231m●[39m pane-state worker spawned (window 7). Worker floor auto-injected; full prompt loading. It will:
+
+  1. Implement [38;5;153mmonitor/pane-state.sh[39m — single bash file, structured [38;5;153mstate=<...> active=<0|1>[39m output, regex [38;5;153m\x1b\[7m.\x1b\[0;2m[39m to detect autosuggest, mirrors [38;5;153m_unstick.sh[39m blocked patterns.
+  2. Validate against all six current windows (specifically including watcher-startup at window 6 per your direction; also drug-wavelet, palantir-qa, repltime-histones, watcher,
+  orchestrator). Paste helper output for each into the PR body so we can audit.
+  3. Add 4-6 line gotcha to [38;5;153mCLAUDE.md[39m + cross-ref in [38;5;153mskills/nexus.tmux-spawn/SKILL.md[39m.
+  4. Tests under [38;5;153mmonitor/watcher/test-pane-state.sh[39m against captured-fixture files (so tests don't need a live tmux).
+  5. Single PR on [38;5;153m<your-org>/<your-nexus>[39m against [38;5;153mmain[39m.
+
+  Worktree at [38;5;153mwork/<your-nexus>-pane-state[39m (off origin/main, watcher-isolation respected). The watcher integration ("don't count as missed-paste if user-typed text waiting") is explicitly
+  out-of-scope, flagged as a follow-up in the PR body. Bell on PR-open. Standing by.
+
+[38;5;246m✻[39m [38;5;246mWorked for 2m 4s[39m
+
+[38;5;239m[48;5;237m❯ [38;5;231m=== nexus state changed at 2026-05-07T17:47:28-07:00 (poll) ===[39m
+  [38;5;231m*If unsure how to proceed: see CLAUDE.md.*[39m
+  [38;5;231m--- $NEXUS_ROOT/monitor/.state/last-snapshot.txt    2026-05-07 17:45:17.345172000 -0700[39m
+  [38;5;231m+++ /tmp/tmp.CAcgJDxWNA/current    2026-05-07 17:47:23.485275730 -0700[39m
+  [38;5;231m@@ -384,6 +384,7 @@[39m
+  [38;5;231m claude bell=0[39m
+  [38;5;231m drug-wavelet bell=0[39m
+  [38;5;231m palantir-qa bell=0[39m
+  [38;5;231m+pane-state bell=0[39m
+  [38;5;231m repltime-histones bell=0[39m
+  [38;5;231m watcher bell=0[39m
+  [38;5;231m watcher-startup bell=0[39m
+  [38;5;231m--- dashboard ---[39m
+  [38;5;231mlast updated: 2026-05-04T20:40:13-07:00[39m
+  [38;5;231m(> 2h old; refresh via `monitor/ng dashboard put`)[39m
+  [38;5;231m--- nexus-emit-sig 2026-05-07T17:47:28-07:00 698dcc ---[39m
+[49m
+[38;5;174m·[39m [38;5;174mCogitating… [38;5;246m(5s · ↓[39m [38;5;246m5.7k tokens · [38;5;247mthinking[38;5;246m)[39m
+
+[36m●[39m [1mHow is Claude doing this session? (optional)[0m[39m[49m
+  [36m1[39m: Bad    [36m2[39m: Fine   [36m3[39m: Good   [36m0[39m: Dismiss
+
+[38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m◉[39m [38;5;246mOpus[39m [38;5;246m4.7[39m [38;5;246m(1M[39m [38;5;246mcontext)[39m [38;5;246m│[39m [38;5;246m█▎░░░░░░░▓[39m [38;5;246m123K/1.0M[39m [38;5;246m│[39m [38;5;246m⚡100%[39m [38;5;246m│[39m [38;5;246m$208.07[39m [38;5;246m+4064/-3[39m                                   [38;5;211m✗[39m [38;5;211mAuto-update[39m [38;5;211mfailed[39m [38;5;211m·[39m [38;5;211mTry[39m [1m[38;5;211mclaude[0m[39m[49m [1m[38;5;211mdoctor[0m[38;5;211m[49m or[39m [1m[38;5;211mnpm[0m[39m[49m [1m[38;5;211mi[0m[39m[49m [1m[38;5;211m-g[0m[39m[49m [1m[38;5;211m@anthropic-ai/claude-code[0m[39m[49m
+  [38;5;246m--[39m [38;5;246mINSERT[39m [38;5;246m--[39m [38;5;211m⏵⏵[39m [38;5;211mbypass[39m [38;5;211mpermissions[39m [38;5;211mon[38;5;246m (shift+tab[39m [38;5;246mto[39m [38;5;246mcycle)[39m
+

@@ -1,0 +1,12 @@
+.state/
+# Move-aside-before-install trash (monitor/_trash.sh, <your-org>/nexus-code
+# #310/#312). Already covered by .state/ above; listed explicitly so the
+# trash-dir contract is greppable. `.nexus-trash/` is the same-fs fallback
+# the helper drops beside a throwaway prefix when its parent filesystem
+# differs from .state/'s (e.g. a $TMPDIR prefix).
+.state/.trash/
+.nexus-trash/
+# Operator-local infra-service registry for bootstrap-recover.sh. Only
+# the template (services.registry.example) is tracked; the real file
+# lists deployment-specific paths/ports.
+services.registry

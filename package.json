@@ -1,0 +1,10 @@
+{
+  "name": "nexus-code-tooling",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Project-local Claude Code install for the nexus monitor. Spawn surfaces resolve $CLAUDE_BIN against node_modules/.bin/claude. NOTE: the @anthropic-ai/claude-code version below is a MAINTAINER-MANAGED VETTED FLOOR for initial setup only (fresh install / fresh clone with no operator-local pin), advanced deliberately (>=1 day stable, bundled) — NOT a per-release pin. A successful gated cc-update advances the operator-LOCAL pin (monitor/.state/cc-version-local, gitignored) without touching this file. See monitor/_cc-version.sh and skills/nexus.cc-update/GUIDE.md.",
+  "license": "ISC",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.173"
+  }
+}

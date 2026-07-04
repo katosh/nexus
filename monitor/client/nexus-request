@@ -1,0 +1,432 @@
+#!/bin/sh
+# nexus-request — CLIENT-SIDE one-call SUBMIT → BACKGROUND-WAIT → EMIT for the
+# confined nexus remote agent channel (agent-channel RFC Part A; the primary
+# request primitive, built on the request channel Parts B/D).
+#
+# WHAT IT IS FOR
+#   A client AGENT wants to make ONE tool call that files a request AND
+#   receives the reply as an EVENT — without blocking. `nexus-request`, in a
+#   SINGLE (backgroundable) invocation:
+#     1. FILES the request  (ssh … request file …), capturing the returned id.
+#     2. WAITS for the reply as the same background process — observing the
+#        server's RENAME-STATE so it detects ACTIVE PROCESSING and does NOT
+#        close too early.
+#     3. EMITS events on stdout as DATA (one line/record per event, mirroring
+#        the harness Monitor model) and exits on a terminal state.
+#   The agent fires one command, keeps working, and consumes this process's
+#   stdout (process exit = the terminal edge; stdout = the event log).
+#
+#   nexus-request = `request file` + capture id + (the nexus-reply-watch loop,
+#   EXTENDED with a `request fetch <id> status` pre-check that surfaces the
+#   `claimed` progress state). The shared poll/emit/backoff core lives in
+#   _nexus_watch_lib.sh; both tools use it (no duplication).
+#
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │ SECURITY INVARIANT — load-bearing, the skeptic enforces it:            │
+# │   EMIT, NEVER EXECUTE. This tool emits the reply as DATA (stdout /      │
+# │   --out) and NEVER evals, sources, pipes-to-shell, or $(…)-wraps the    │
+# │   reply or request bytes. A hostile reply is emitted verbatim inside a  │
+# │   length frame, never run. Grep this file + the lib: no `eval`, no      │
+# │   `.`/`source` of channel bytes, no `| sh|bash`, no `chmod +x`, no      │
+# │   `exec` of channel content, no cron/at/systemd self-re-arm.            │
+# │                                                                        │
+# │   NO CONFINEMENT WIDENING. It calls ONLY the SAME allowlisted verbs a   │
+# │   human could type by hand — `request file|await|fetch`. The `fetch     │
+# │   <id> status` pre-check is a READ-ONLY sub-mode of the already-allowed │
+# │   `fetch` verb (no new top-level verb); it is ownership-checked         │
+# │   server-side and reveals only the client's OWN request's rename-state  │
+# │   word. It NEVER calls `attach`.                                        │
+# │                                                                        │
+# │   BOUNDED + IDEMPOTENT + CLEAN EXIT. One process, one request id; a     │
+# │   single in-flight ssh session at a time (status pre-check THEN a long  │
+# │   await — sequential, never concurrent: one ssh CONNECTION at a time,   │
+# │   each carrying one session. NB the sshd knobs bound something else:    │
+# │   MaxSessions caps multiplexed sessions PER connection and MaxStartups  │
+# │   throttles concurrent UNAUTHENTICATED connections — neither limits a   │
+# │   serial authenticated client; seriality here is our own discipline); a │
+# │   hard WALL-CLOCK lifetime cap (state=timeout then exit); bounded       │
+# │   exponential backoff; exactly-once TERMINAL emit via a per-id sentinel │
+# │   (a mid-transfer reconnect never double-emits); NO self-re-arm.        │
+# └────────────────────────────────────────────────────────────────────────┘
+#
+# THE RENAME-AS-PROGRESS DESIGN (operator's refinement — central)
+#   The request lifecycle is a rename state machine
+#   (new → claimed → replied|done|failed; RFC §2.8 "the rename is the signal").
+#   The client is CONFINED and cannot `ls` the inbox, so it learns the state
+#   via `request fetch <id> status` — a read-only, ownership-checked sub-mode.
+#   Each poll cycle:
+#     * `claimed` (orchestrator actively processing) → emit a `state=processing`
+#       progress event ONCE and EXTEND the patience window (active processing is
+#       NOT a stall — do NOT time out just because it is taking a while). The
+#       extension is bounded: a fresh lifetime window from when processing began,
+#       capped at the 7-day hard ceiling.
+#     * terminal `replied` → emit `state=replied` + the reply BODY, byte-exact
+#       via the #401 `fetch <id> results` raw path, exit 0.
+#     * terminal `done`   → emit `state=acked` (no body), exit 0.
+#     * terminal `failed` → emit `state=failed reason=…`, exit 2.
+#     * `new` (queued, not yet claimed) → keep waiting via a blocking `await`.
+#   A genuinely dead request still hits the overall max-lifetime → state=timeout.
+#
+# EMIT GRAMMAR (stdout is the event stream; stderr is operational noise)
+#   PROGRESS events (non-terminal, stdout only, may repeat harmlessly):
+#     nexus-request: state=submitted  id=<id> note=request-filed ts=<utc>
+#     nexus-request: state=processing id=<id> note=orchestrator-claimed ts=<utc>
+#   TERMINAL reply (length-framed body — the consumer reads EXACTLY reply_bytes
+#   and never line-scans, so a body line like `state=failed` cannot spoof it):
+#     nexus-request: state=replied id=<id> reply_bytes=<N> reply_sha256=<hex|none> note=reply-is-data ts=<utc>
+#     --- reply-body <N> ---
+#     <exactly N bytes of the reply body, verbatim>
+#     --- end reply-body ---
+#   TERMINAL non-reply (no body block):
+#     nexus-request: state=acked   id=<id> note=orchestrator-acked-no-body ts=<utc>
+#     nexus-request: state=failed  id=<id> reason=<r> detail="…" ts=<utc>
+#     nexus-request: state=timeout id=<id> reason=budget_exhausted waited_s=<s> ts=<utc>
+#   reason ∈ { file_failed | terminal_failed | not_found | confinement_reject |
+#             channel_unavailable | enroll_auth_lost | refused }.
+#
+# EXIT CODES
+#   0   state=replied (body emitted)  OR  state=acked (terminal ack, no body)
+#   2   state=failed  (terminal error — see reason=)
+#   3   state=timeout (wall-clock lifetime budget exhausted, still pending)
+#   64  usage error   (bad invocation — fix the launch, not the channel)
+#
+# USAGE
+#   nexus-request --slug S [--kind K] [--priority normal|high]
+#                 [--reply required|optional|none]
+#                 (--message TEXT | --message-stdin | --message-file FILE)
+#                 [--no-publish] [--poll S] [--timeout S] [--out FILE]
+#                 [--stop-file FILE] [--ssh-host ALIAS] [--id-out FILE]
+#
+#   --message TEXT       inline body (ssh flattens argv → single-space joined;
+#                        use --message-stdin/-file for byte-exact fidelity)
+#   --message-stdin      read the body byte-exact from THIS process's stdin
+#   --message-file FILE  read the body byte-exact from FILE
+#   --id-out FILE        also write the bare request id to FILE (for correlation
+#                        / to resume a wait later via `nexus-reply-watch <id>`)
+#
+#   Connection identity comes from an ssh-config Host alias (default
+#   `nexus-remote`). Override the whole ssh program with SSH= (the hermetic-test
+#   seam) or the endpoint with NEXUS_REMOTE_SSH_HOST / _PORT / _USER / _KEY.
+#
+#   NB this is a SINGLE-SHOT submit+wait. To resume a wait on an already-filed
+#   id (e.g. after a full process restart), use `nexus-reply-watch <id>` — that
+#   waits WITHOUT re-filing, so no duplicate request is created.
+#
+# Run `nexus-request --help` for the option summary.
+
+# `set -u` catches unset-var bugs. We deliberately do NOT `set -e`: the remote
+# `await`/`fetch status` legitimately exit non-zero (4 = still pending, 255 =
+# transport, 3 = not-ready) and those are control-flow, not fatal.
+set -u
+
+PROG=nexus-request
+
+# Shared client-side core (defaults, log/utc_now/first_line/sha256_of/
+# reply_state, resolve_ssh_id, deliver/compose_reply/compose_status). Delivered
+# alongside this script + nexus-reply-watch (client-side tooling saved next to
+# the key), sourced from the same dir.
+_wl_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd 2>/dev/null) || _wl_dir=$(dirname -- "$0")
+# shellcheck source=_nexus_watch_lib.sh
+. "${NEXUS_WATCH_LIB:-$_wl_dir/_nexus_watch_lib.sh}" || {
+    printf '%s: cannot load _nexus_watch_lib.sh (expected next to this script)\n' "$PROG" >&2
+    exit 64
+}
+
+die_usage() {
+    printf '%s: %s\n' "$PROG" "$*" >&2
+    printf 'usage: %s --slug S [--kind K] [--priority normal|high] [--reply required|optional|none]\n' "$PROG" >&2
+    printf '               (--message TEXT | --message-stdin | --message-file FILE) [--no-publish]\n' >&2
+    printf '               [--poll S] [--timeout S] [--out FILE] [--stop-file FILE] [--ssh-host ALIAS] [--id-out FILE]\n' >&2
+    exit 64
+}
+
+usage() {
+    sed -n '2,110p' "$0" | sed 's/^#\{0,1\} \{0,1\}//'
+    exit 0
+}
+
+# ---- arg parse ---------------------------------------------------------
+slug=''
+kind='question'
+priority=''
+reply=''
+publish='true'
+msg_mode=''          # inline | stdin | file
+msg_text=''
+msg_file=''
+poll=$POLL_DEFAULT
+timeout=$TIMEOUT_DEFAULT
+out=''
+stop_file=''
+id_out=''
+ssh_alias="${NEXUS_REMOTE_SSH_ALIAS:-$SSH_ALIAS_DEFAULT}"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --slug)          slug=${2:-};      shift 2 || die_usage "--slug needs a value" ;;
+        --kind)          kind=${2:-};      shift 2 || die_usage "--kind needs a value" ;;
+        --priority)      priority=${2:-};  shift 2 || die_usage "--priority needs normal|high" ;;
+        --reply)         reply=${2:-};     shift 2 || die_usage "--reply needs a value" ;;
+        --no-publish)    publish='false';  shift ;;
+        --message)       msg_mode='inline'; msg_text=${2:-}; shift 2 || die_usage "--message needs text" ;;
+        --message-stdin) msg_mode='stdin'; shift ;;
+        --message-file)  msg_mode='file';  msg_file=${2:-}; shift 2 || die_usage "--message-file needs a path" ;;
+        --poll)          poll=${2:-};      shift 2 || die_usage "--poll needs seconds" ;;
+        --timeout)       timeout=${2:-};   shift 2 || die_usage "--timeout needs seconds" ;;
+        --out)           out=${2:-};       shift 2 || die_usage "--out needs a path" ;;
+        --stop-file)     stop_file=${2:-}; shift 2 || die_usage "--stop-file needs a path" ;;
+        --id-out)        id_out=${2:-};    shift 2 || die_usage "--id-out needs a path" ;;
+        --ssh-host)      ssh_alias=${2:-}; shift 2 || die_usage "--ssh-host needs an alias" ;;
+        -h|--help)       usage ;;
+        --) shift; break ;;
+        *) die_usage "unknown flag: $1" ;;
+    esac
+done
+
+# ---- validate ----------------------------------------------------------
+[ -n "$slug" ] || die_usage "--slug is required"
+case "$slug" in *[!A-Za-z0-9_-]*|'') die_usage "--slug must be [A-Za-z0-9_-]: $slug" ;; esac
+case "$kind" in [a-z]*) : ;; *) die_usage "--kind must be a kebab token (start lowercase): $kind" ;; esac
+case "$kind" in *[!a-z0-9-]*) die_usage "--kind must be a kebab token: $kind" ;; esac
+if [ -n "$priority" ]; then
+    case "$priority" in normal|high) ;; *) die_usage "--priority must be normal|high" ;; esac
+fi
+case "$reply" in ''|required|optional|none) ;; *) die_usage "--reply must be required|optional|none" ;; esac
+[ -n "$msg_mode" ] || die_usage "a message is required (--message TEXT | --message-stdin | --message-file FILE)"
+if [ "$msg_mode" = file ]; then
+    [ -n "$msg_file" ] && [ -f "$msg_file" ] || die_usage "--message-file: not a readable file: $msg_file"
+fi
+if [ "$msg_mode" = inline ]; then
+    # A bare '-' inline body is ambiguous server-side; require an explicit mode.
+    [ "$msg_text" = "-" ] && die_usage "ambiguous '-' body; use --message-stdin"
+    case "$msg_text" in *[![:space:]]*) : ;; *) die_usage "--message is empty" ;; esac
+fi
+case "$poll"    in ''|*[!0-9]*) die_usage "--poll must be a non-negative integer" ;; esac
+case "$timeout" in ''|*[!0-9]*) die_usage "--timeout must be a non-negative integer" ;; esac
+
+# Clamp poll into [MIN, MAX]; the server clamps a large value anyway.
+[ "$poll" -lt "$POLL_MIN" ] && poll=$POLL_MIN
+[ "$poll" -gt "$POLL_MAX" ] && poll=$POLL_MAX
+# timeout 0 = "as long as allowed" → the hard ceiling (still bounded).
+[ "$timeout" -eq 0 ] && timeout=$TIMEOUT_MAX
+[ "$timeout" -gt "$TIMEOUT_MAX" ] && timeout=$TIMEOUT_MAX
+
+# ---- ssh identity ------------------------------------------------------
+resolve_ssh_id
+
+# ---- idempotency sentinel (crash-restart double-emit guard) ------------
+# Written BEFORE the visible TERMINAL emit. If a prior instance crashed AFTER
+# emitting the terminal event but BEFORE exiting and a wait is resumed on the
+# same id, the sentinel short-circuits so the reply is never emitted twice.
+# Survives a reboot (not under /tmp).
+STATE_DIR="${NEXUS_REQUEST_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/nexus-request}"
+mkdir -p "$STATE_DIR" 2>/dev/null || STATE_DIR="${TMPDIR:-/tmp}"
+
+# ---- temp files + cleanup ---------------------------------------------
+idtmp=$(mktemp 2>/dev/null)   || idtmp="${TMPDIR:-/tmp}/$PROG.id.$$"
+tmp=$(mktemp 2>/dev/null)     || tmp="${TMPDIR:-/tmp}/$PROG.body.$$"
+tmp2=$(mktemp 2>/dev/null)    || tmp2="${TMPDIR:-/tmp}/$PROG.body2.$$"
+rbody=$(mktemp 2>/dev/null)   || rbody="${TMPDIR:-/tmp}/$PROG.rbody.$$"
+errtmp=$(mktemp 2>/dev/null)  || errtmp="${TMPDIR:-/tmp}/$PROG.err.$$"
+emittmp=$(mktemp 2>/dev/null) || emittmp="${TMPDIR:-/tmp}/$PROG.emit.$$"
+: > "$idtmp"; : > "$tmp"; : > "$tmp2"; : > "$rbody"; : > "$errtmp"; : > "$emittmp"
+
+cleanup() { rm -f "$idtmp" "$tmp" "$tmp2" "$rbody" "$errtmp" "$emittmp" 2>/dev/null; }
+on_signal() { log "stop signal received — exiting cleanly (no emit)"; cleanup; exit 143; }
+trap cleanup EXIT
+trap on_signal INT TERM
+
+# remote() (the single-ssh-session gateway with its byte-exact stdin
+# discipline) and the shared terminal emitters (emit_replied/emit_failed/
+# emit_timeout, sentinel-guarded via already_emitted/mark_emitted) live in
+# _nexus_watch_lib.sh — see there for the D1-defect rationale on stdin.
+
+# ---- progress events: stdout ONLY (non-terminal; --out holds terminal) --
+progress() {  # $1 = state; $2… = extra tokens
+    _pst=$1; shift
+    printf '%s: state=%s id=%s %s ts=%s\n' "$PROG" "$_pst" "$id" "$*" "$(utc_now)"
+}
+
+# ---- terminal emits ----------------------------------------------------
+# emit_replied/emit_failed/emit_timeout (+ the already_emitted/mark_emitted
+# sentinel primitives) are shared in _nexus_watch_lib.sh. Only the no-body ACK
+# is tool-specific here (nexus-reply-watch's acked carries the ack envelope as
+# a body; nexus-request's is a bare status line).
+emit_acked() {
+    if already_emitted; then log "terminal ack for id=$id already emitted — no re-emit"; exit 0; fi
+    compose_status acked note=orchestrator-acked-no-body
+    mark_emitted
+    deliver
+    exit 0
+}
+
+# ── STEP 1: file the request, capture the id ──────────────────────────
+# Build the request-file argv in the positional params ($@ was consumed by the
+# arg parse above, so `set --` safely rebuilds it). --message MUST be last (the
+# server treats it as the terminal flag: everything after is the body).
+set -- request file --kind "$kind" --slug "$slug"
+[ "$reply" = required ] && set -- "$@" --reply required
+[ -n "$priority" ]      && set -- "$@" --priority "$priority"
+[ "$publish" = false ]  && set -- "$@" --no-publish
+case "$msg_mode" in
+    stdin|file) set -- "$@" --message-stdin ;;
+    inline)     set -- "$@" --message "$msg_text" ;;
+esac
+
+log "filing request (slug=$slug kind=$kind reply=${reply:-optional} publish=$publish msg=$msg_mode) via '$SSH_ID'"
+frc=0
+case "$msg_mode" in
+    stdin)  remote "$@"               > "$idtmp" 2>"$errtmp" || frc=$? ;;   # our stdin = the body, forwarded byte-exact
+    file)   remote "$@" < "$msg_file" > "$idtmp" 2>"$errtmp" || frc=$? ;;   # msg_file streamed byte-exact into ssh stdin
+    inline) remote "$@" </dev/null    > "$idtmp" 2>"$errtmp" || frc=$? ;;   # body is in argv; close stdin
+esac
+# NB: `stdin`/`file` modes forward fd 0 into the ssh session (remote() no longer
+#     redirects stdin), so the body reaches the server byte-exact; `inline` closes it.
+
+id=$(awk 'NF{print;exit}' "$idtmp" 2>/dev/null)
+if [ "$frc" -ne 0 ] || [ -z "$id" ]; then
+    id="${id:-<none>}"
+    compose_status failed reason=file_failed "detail=\"$(first_line "$errtmp")\"" "file_rc=$frc"
+    deliver
+    exit 2
+fi
+case "$id" in
+    *[!A-Za-z0-9_-]*)
+        id="<malformed>"
+        compose_status failed reason=file_failed "detail=\"server returned a malformed id\""
+        deliver
+        exit 2
+        ;;
+esac
+
+sentinel="$STATE_DIR/$id.emitted"
+log "filed id=$id"
+if [ -n "$id_out" ]; then printf '%s\n' "$id" > "$id_out" 2>/dev/null || log "warning: could not write --id-out: $id_out"; fi
+progress submitted note=request-filed
+
+# ── STEP 2/3: status-prechecked wait → emit on terminal ───────────────
+# poll_once is the tool-specific hook the shared watch_loop core drives each
+# iteration (stop-file + wall-clock budget + timeout emit live in the core).
+# nexus-request's step: a rename-state PRE-CHECK (fetch <id> status) that is
+# the SOLE terminal detector — so `replied` always routes through the
+# byte-exact `fetch results` path — followed by a blocking await used purely
+# as an efficient server-side sleep.
+claimed_seen=0
+
+poll_once() {
+    # ---- (a) status pre-check: one short session; the rename-state edge ----
+    : > "$tmp"; : > "$errtmp"; src=0
+    remote request fetch "$id" status </dev/null > "$tmp" 2>"$errtmp" || src=$?
+    st=$(head -n1 "$tmp" 2>/dev/null | tr -d '[:space:]')
+
+    if [ "$src" -eq 0 ]; then
+        case "$st" in
+            replied)
+                # Pull the reply BODY byte-exact via the #401 raw path.
+                : > "$rbody"; : > "$errtmp"; grc=0
+                remote request fetch "$id" results </dev/null > "$rbody" 2>"$errtmp" || grc=$?
+                if [ "$grc" -eq 0 ]; then
+                    emit_replied "$rbody"
+                else
+                    # Fallback: the await envelope (still DATA, includes frontmatter).
+                    : > "$tmp2"
+                    remote request await "$id" --timeout 5 </dev/null > "$tmp2" 2>/dev/null || true
+                    emit_replied "$tmp2"
+                fi
+                ;;
+            done)
+                emit_acked
+                ;;
+            failed)
+                # Recover the failure detail from the await output (it prints the
+                # .failed.md), as DATA — never executed.
+                : > "$tmp2"
+                remote request await "$id" --timeout 5 </dev/null > "$tmp2" 2>/dev/null || true
+                emit_failed terminal_failed "$(first_line "$tmp2")"
+                ;;
+            claimed)
+                if [ "$claimed_seen" -eq 0 ]; then
+                    claimed_seen=1
+                    progress processing note=orchestrator-claimed
+                    # Extend patience ONCE: a fresh lifetime window from when
+                    # active processing began, capped at the hard 7-day ceiling
+                    # (still BOUNDED — a claimed-then-silent request cannot wait
+                    # past the ceiling).
+                    _ext=$(( now + timeout ))
+                    _ceil=$(( start + TIMEOUT_MAX ))
+                    [ "$_ext" -gt "$_ceil" ] && _ext=$_ceil
+                    [ "$_ext" -gt "$deadline" ] && deadline=$_ext
+                    log "orchestrator CLAIMED id=$id — active processing; patience extended (deadline in $(( deadline - now ))s)"
+                fi
+                ;;
+            new)
+                : ;;   # queued, not yet picked up — fall through to the blocking await
+            *)
+                log "unexpected status '$st' for id=$id — treating as pending" ;;
+        esac
+    else
+        # fetch status returned non-zero. rc 2 is VERB-SPECIFIC here (fetch:
+        # id not found — distinct from await's rc 2 = terminal_failed), so it
+        # is matched before the shared table. classify_ssh_rc owns every
+        # verb-independent fatal code (5/10/11/12/13, and rc 1 = usage/bad-arg
+        # which is STATIC → terminal); it emits+exits on a fatal code and
+        # returns non-zero for a transient one → back off + retry.
+        case "$src" in
+            2)  emit_failed not_found "request $id not found on server (GC'd or never landed)" ;;
+            *)
+                classify_ssh_rc "$src" "$errtmp"
+                _det=$(first_line "$errtmp")
+                log "transient status-check error rc=$src${_det:+ ($_det)}; backoff ${backoff}s (deadline in $(( deadline - now ))s)"
+                backoff_sleep
+                return 0
+                ;;
+        esac
+    fi
+
+    # ---- (b) blocking wait: one long await session until the state changes ----
+    # await BLOCKS server-side until terminal or its window elapses — near-instant
+    # delivery, no busy-poll. We do NOT emit from its output (the status pre-check
+    # above is the sole terminal detector, so `replied` always goes through the
+    # byte-exact `fetch results` path). await here is purely an efficient sleep.
+    now=$(date +%s 2>/dev/null || echo "$deadline")
+    _remaining=$(( deadline - now ))
+    [ "$_remaining" -lt 1 ] && return 0          # deadline hit → loop → timeout emit
+    chunk=$poll
+    # Before pickup, re-check status more promptly so the `processing` event is
+    # timely; once claimed, use the full poll window for the terminal wait.
+    if [ "$claimed_seen" -eq 0 ] && [ "$chunk" -gt 60 ]; then chunk=60; fi
+    [ "$chunk" -gt "$_remaining" ] && chunk=$_remaining
+    [ "$chunk" -lt 1 ] && chunk=1
+
+    : > "$errtmp"; arc=0
+    remote request await "$id" --timeout "$chunk" </dev/null > /dev/null 2>"$errtmp" || arc=$?
+    case "$arc" in
+        0|2|4)
+            # 0 = became terminal (replied/done) → next status pre-check routes it
+            # (replied via byte-exact fetch results). 2 = failed terminal → status
+            # pre-check reads state=failed. 4 = still pending → healthy recycle.
+            # (These three are VERB-SPECIFIC to await, matched before the table.)
+            backoff=$BACKOFF_BASE
+            return 0
+            ;;
+        *)
+            if [ -n "$(fatal_reason_for "$arc")" ]; then
+                # Persistent auth/channel/refused surfaced by await: loop; the
+                # status pre-check re-issues the same call and terminates
+                # deterministically (through classify_ssh_rc, the one table).
+                log "await rc=$arc (persistent) — re-checking status to classify"
+                return 0
+            fi
+            # 255 (transport, incl. wake-from-suspend half-open socket) / unknown:
+            # TRANSIENT. Back off (bounded, subordinate to the wall-clock deadline)
+            # then retry.
+            _det=$(first_line "$errtmp")
+            log "transient await error rc=$arc${_det:+ ($_det)}; backoff ${backoff}s (deadline in $(( deadline - now ))s)"
+            backoff_sleep
+            return 0
+            ;;
+    esac
+}
+
+log "waiting on id=$id (poll=${poll}s, lifetime=${timeout}s, out=${out:-<stdout>})"
+watch_loop

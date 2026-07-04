@@ -1,0 +1,43 @@
+{
+  "skipDangerousModePermissionPrompt": true,
+  "env": {
+    "DISABLE_AUTOUPDATER": "1"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          { "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/block-askuserquestion.sh" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/orchestrator-session-pin.sh" },
+          { "type": "command",
+            "command": "(mkdir -p \"$NEXUS_ROOT/monitor/.state\" && touch \"$NEXUS_ROOT/monitor/.state/orchestrator-paste-received\" &) >/dev/null 2>&1" }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command",
+            "command": "(mkdir -p \"$NEXUS_ROOT/monitor/.state\" && touch \"$NEXUS_ROOT/monitor/.state/orchestrator-heartbeat\" &) >/dev/null 2>&1" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command",
+            "command": "(mkdir -p \"$NEXUS_ROOT/monitor/.state\" && touch \"$NEXUS_ROOT/monitor/.state/orchestrator-heartbeat\" &) >/dev/null 2>&1" }
+        ]
+      }
+    ]
+  }
+}

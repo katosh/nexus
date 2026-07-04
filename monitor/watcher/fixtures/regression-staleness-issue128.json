@@ -1,0 +1,32 @@
+{
+  "data": {
+    "search": {
+      "nodes": [
+        {
+          "number": 128,
+          "comments": {
+            "nodes": [
+              {
+                "databaseId": 4560117367,
+                "author": {
+                  "login": "<operator>"
+                },
+                "body": "@<your-org>-bot please act on <operator>'s instructions. Also consider contrast statistics and visualizations to cluster and compare response groups and characterize them with rigorous measures that provide clear interpretation.",
+                "reactions": {
+                  "nodes": [
+                    {
+                      "content": "EYES",
+                      "user": {
+                        "login": "<your-org>-bot[bot]"
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

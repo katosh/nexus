@@ -1,0 +1,3 @@
+# Real config with user-specific identities (bot App IDs, paths, email
+# aliases). Only the template (nexus.example.yml) is tracked.
+nexus.yml

@@ -1,0 +1,10 @@
+[2m←[0m  [7m☐ option 1[0m  ☐ option 2  ✔ Submit  [2m→[0m
+
+How should we proceed with the migration?
+
+[7m❯ 1. Run the backfill in batches[0m
+  2. Run the backfill in one pass
+  3. Defer the migration to next sprint
+  4. Type something.
+[2m─────────────────────────────────────────────[0m
+  5. Chat about this

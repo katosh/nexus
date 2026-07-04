@@ -1,0 +1,101 @@
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m Running[39m [38;5;246min[39m [38;5;246mthe[39m [38;5;246mbackground[39m [38;5;246m(↓[39m [38;5;246mto[39m [38;5;246mmanage)[39m
+
+[38;5;231m●[39m Meanwhile, let me build the drug J7 exact-coord script.
+
+  [38;5;246mRead [1m1[0m[38;5;246m[49m file (ctrl+o to expand)[39m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(cp scripts/16_drug_treatment_wavelet.py scripts/16b_drug_wavelet_exact.py && grep -n "WIN\|TSS ± 5\|drug_wavelet_per_gene\|drug_wavelet_summary\|drug_wavelet_re…)
+[38;5;246m  ⎿  [39m11:  - Methodology homogeneity: histone TSS ± 5 kb mean is now taken on
+     22:  data/analysis/drug_wavelet_per_gene.csv     (long: gene × replicate)
+     23:  data/analysis/drug_wavelet_summary.csv      (per condition × cluster)
+     [2m… +20 lines (ctrl+o to expand)[0m[39m[49m
+
+  [38;5;246mSearched for [1m1[0m[38;5;246m[49m pattern (ctrl+o to expand)[39m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(sed -i 's|drug_wavelet_per_gene\.csv|drug_wavelet_exact_per_gene.csv|g; s|drug_wavelet_summary\.csv|drug_wavelet_exact_summary.csv|g; s|drug_wavelet_replicate_e…)
+[38;5;246m  ⎿  [39m17
+
+[38;5;211m●[39m [1mUpdate[0m[39m[49m(scripts/16b_drug_wavelet_exact.py)
+[38;5;246m  ⎿  File must be read first[39m
+
+  [38;5;246mRead [1m1[0m[38;5;246m[49m file (ctrl+o to expand)[39m
+
+[38;5;114m●[39m [1mUpdate[0m[39m[49m(scripts/16b_drug_wavelet_exact.py)
+[38;5;246m  ⎿  [39mAdded [1m12[0m[39m[49m lines, removed [1m10[0m[39m[49m lines
+     [38;5;167m[48;5;52m  1 -[38;5;231m"""GSE302744 drug-treatment Repli-seq, RECOMPUTED on J7 wavelet-smoothed                                                                                                      [39m[49m
+     [38;5;167m[48;5;52m  2 -[38;5;231mG1-S1 signal, per replicate.                                                                                                                                                  [39m[49m
+     [38;5;77m[48;5;22m  1 +[38;5;186m"""GSE302744 drug-treatment Repli-seq, J7 wavelet-smoothed[48;5;28m signal,[38;5;231m[48;5;22m                                                                                                            [39m[49m
+     [38;5;77m[48;5;22m  2 +[38;5;231mEXACT GENE-BODY coordinates (re-run of script [38;5;141m16[38;5;231m [38;5;197mwith[38;5;231m exact coords).                                                                                                          [39m[49m
+     [2m[38;5;231m  3 [0m[38;5;231m[49m [39m
+     [38;5;167m[48;5;52m  4 -[38;5;231mReplaces script 14's analysis: that script aggregated the GEO-deposited                                                                                                       [39m[49m
+     [38;5;167m[48;5;52m  5 -[38;5;231mG1-S1 *averaged* bigwigs (5 files, one per condition). This script                                                                                                            [39m[49m
+     [38;5;167m[48;5;52m  6 -[38;5;231moperates on the per-replicate G1-S1 bigwigs after applying J7 (~128 kb)                                                                                                       [39m[49m
+     [38;5;167m[48;5;52m  7 -[38;5;231mdb4 wavelet smoothing — the same smoothing scale as ENCODE wavelet-                                                                                                           [39m[49m
+     [38;5;167m[48;5;52m  8 -[38;5;231msmoothed RT bigwigs used elsewhere in the analysis.                                                                                                                           [39m[49m
+     [38;5;77m[48;5;22m  4 +[38;5;231mReplaces script [38;5;141m16[38;5;186m's TSS ± 5 kb window with each gene'[38;5;231ms exact body                                                                                                            [39m[49m
+     [38;5;77m[48;5;22m  5 +[38;5;231mcoordinates [start, end] [38;5;197mfrom[38;5;231m data/genesets/all_coding.parquet,                                                                                                               [39m[49m
+     [38;5;77m[48;5;22m  6 +[38;5;231maddressing the window-overlap critique on                                                                                                                                     [39m[49m
+     [38;5;77m[48;5;22m  7 +[38;5;231m<your-org>/<your-nexus>[38;5;242m#81 comment 4401823649.[38;5;231m                                                                                                                                   [39m[49m
+     [2m[38;5;231m [0m[39m[49m [2m[38;5;231m8[0m[39m[49m [38;5;231m [39m
+     [38;5;167m[48;5;52m 10 -[38;5;231mWhat changes vs script 14:                                                                                                                                                    [39m[49m
+     [38;5;167m[48;5;52m 11 -[38;5;231m  - Methodology homogeneity: histone TSS ± 5 kb mean is now taken on                                                                                                          [39m[49m
+     [38;5;167m[48;5;52m 12 -[38;5;231m    a wavelet-smoothed signal (no longer mixing wavelet + raw).                                                                                                               [39m[49m
+     [38;5;77m[48;5;22m  9 +[38;5;231mWhat changes vs script [38;5;141m[48;5;28m16[38;5;231m[48;5;22m:                                                                                                                                                    [39m[49m
+     [38;5;77m[48;5;22m 10 +[38;5;231m  - TSS ± [38;5;141m5[38;5;231m kb window → [start, end] gene-body interval. For histones                                                                                                         [39m[49m
+     [38;5;77m[48;5;22m 11 +[38;5;231m    (median [38;5;141m508[38;5;231m bp), the J7 [38;5;141m1[38;5;231m kb-step bigwig usually means the body                                                                                                           [39m[49m
+     [38;5;77m[48;5;22m 12 +[38;5;231m    falls within a single [38;5;141m1[38;5;231m kb [38;5;148mbin[38;5;231m → exact-body [38;5;197mis[38;5;231m a point sample of                                                                                                          [39m[49m
+     [38;5;77m[48;5;22m 13 +[38;5;231m    the smoothed signal at the gene center; the prior [38;5;141m10[38;5;231m-[38;5;148mbin[38;5;231m window                                                                                                           [39m[49m
+     [38;5;77m[48;5;22m 14 +[38;5;231m    mean [38;5;197mis[38;5;231m replaced by this single-[38;5;148mbin[38;5;231m sample.                                                                                                                               [39m[49m
+     [2m[38;5;231m 15[0m[39m[49m [38;5;231m [39m  [38;5;231m-[39m [38;5;231mReplicate-level[39m [38;5;231meffect[39m [38;5;231msizes:[39m [38;5;141m2[38;5;231m-[38;5;141m3[38;5;231m reps[39m [38;5;231mper[39m [38;5;231mdrug[39m [38;5;231mcondition,[39m [38;5;141m1[38;5;231m rep[39m
+     [2m[38;5;231m 16[0m[39m[49m [38;5;231m [39m    [38;5;231mNT[39m [38;5;231m(deposited[39m [38;5;197mas[38;5;231m GSM9415082_NT_rep1_G1-S1.bw,[39m [38;5;231mplus[39m [38;5;231mthe[39m [38;5;231mconsensus[39m
+     [2m[38;5;231m 17[0m[39m[49m [38;5;231m [39m    [38;5;231mbigwig[39m [38;5;231mthat[39m [38;5;231mpools[39m [38;5;141m4[38;5;231m NT[39m [38;5;231msamples).[39m [38;5;231mPer-replicate[39m [38;5;231mΔrt[39m [38;5;197mis[38;5;231m reported,[39m
+
+[38;5;114m●[39m [1mUpdate[0m[39m[49m(scripts/16b_drug_wavelet_exact.py)
+[38;5;246m  ⎿  [39mAdded [1m5[0m[39m[49m lines, removed [1m3[0m[39m[49m lines
+     [2m[38;5;231m 201 [0m[38;5;231m[49m     histones[[38;5;186m"histone_class"[38;5;231m] = histones[[38;5;186m"gene_name"[38;5;231m].apply(assign_class)[39m
+     [2m[38;5;231m 202 [0m[38;5;231m[49m     h_ids = [38;5;148mset[38;5;231m(histones[[38;5;186m"gene_id"[38;5;231m].tolist())[39m
+     [2m[38;5;231m 203 [0m[38;5;231m[49m [39m
+     [38;5;167m[48;5;52m 204 -[38;5;231m    pc_sorted = pc.sort_values(["chrom", "tss"]).reset_index(drop=True)                                                                                                      [39m[49m
+     [38;5;167m[48;5;52m 205 -[38;5;231m    pc_sorted["start"] = (pc_sorted["tss"] - WIN).clip(lower=0)                                                                                                              [39m[49m
+     [38;5;167m[48;5;52m 206 -[38;5;231m    pc_sorted["end"] = pc_sorted["tss"] + WIN                                                                                                                                [39m[49m
+     [38;5;77m[48;5;22m 204 +[38;5;231m    [38;5;242m# EXACT gene-body coordinates instead of TSS ± WIN[38;5;231m                                                                                                                       [39m[49m
+     [38;5;77m[48;5;22m 205 +[38;5;231m    pc_sorted = pc.sort_values([[38;5;186m"chrom"[38;5;231m, [38;5;186m"start"[38;5;231m]).reset_index(drop=[38;5;141mTrue[38;5;231m)                                                                                                    [39m[49m
+     [2m[38;5;231m 206 [0m[38;5;231m[49m     intervals_chrom = pc_sorted[[38;5;186m"chrom"[38;5;231m].tolist()[39m
+     [2m[38;5;231m 207 [0m[38;5;231m[49m     intervals_start = pc_sorted[[38;5;186m"start"[38;5;231m].tolist()[39m
+     [2m[38;5;231m 208 [0m[38;5;231m[49m     intervals_end = pc_sorted[[38;5;186m"end"[38;5;231m].tolist()[39m
+     [38;5;77m[48;5;22m 209 +[38;5;231m    [38;5;148mprint[38;5;231m([38;5;186mf"using EXACT gene-body coordinates "[38;5;231m                                                                                                                              [39m[49m
+     [38;5;77m[48;5;22m 210 +[38;5;231m          [38;5;186mf"(median histone body [38;5;231m{[38;5;148mint[38;5;231m(histones[[38;5;186m'gene_length'[38;5;231m].median())}[38;5;186m bp; "[38;5;231m                                                                                               [39m[49m
+     [38;5;77m[48;5;22m 211 +[38;5;231m          [38;5;186mf"J7 bigwig step ~1 kb)"[38;5;231m)                                                                                                                                          [39m[49m
+     [2m[38;5;231m 212[0m[39m[49m [38;5;231m [39m    [38;5;231mh_lookup[39m [38;5;231m=[39m [38;5;231mhistones.set_index([38;5;186m"gene_id"[38;5;231m)[39m
+     [2m[38;5;231m 213[0m[39m[49m [38;5;231m [39m
+     [2m[38;5;231m 214[0m[39m[49m [38;5;231m [39m    [38;5;242m#[39m [38;5;242mAggregate[39m [38;5;242mper[39m [38;5;242mreplicate[39m
+
+[38;5;231m●[39m Now check ENCODE progress and start drug.
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(tail -10 /tmp/exact_log.txt && echo "---" && pgrep -af "04b_scale" | head -3)
+[38;5;246m  ⎿  [39mfiles: 108; genes: 20176
+     gene length: median 27193 bp; min 38 bp; max 2473539 bp
+     histone gene length: median 508 bp; min 356 bp; max 37609 bp
+     [2m… +8 lines (ctrl+o to expand)[0m[39m[49m
+
+[38;5;114m●[39m [1mBash[0m[39m[49m(source .venv/bin/activate && python3 scripts/16b_drug_wavelet_exact.py 2>&1 | tee /tmp/drug_exact_log.txt | tail -5)
+[38;5;246m  ⎿  Running in the background (↓ to manage)[39m
+
+[38;5;246m●[39m [1mBash[0m[39m[49m(until [ -f data/aggregated/per_file_rtscore_exact.parquet ] && [ -f data/analysis/drug_wavelet_exact_per_gene.csv ]; do sleep 30; done && echo "BOTH DONE" && ta…)
+[38;5;246m  ⎿  Running… (49s · timeout 10m)[39m
+     [38;5;246m(ctrl+b ctrl+b (twice) to run in background)[39m
+
+[38;5;174m✢[39m [38;5;174mRe-run ENCODE 108-bigwig aggregation (exact coords)… [38;5;246m(5m 48s · ↓[39m [38;5;246m15.2k tokens)[39m
+[38;5;246m  ⎿  [38;5;174m◼ [1m[39mRe-run ENCODE 108-bigwig aggregation (exact coords)[0m[39m[49m
+     ◻ Re-run drug-J7 15-bigwig aggregation (exact coords)
+     ◻ Comparison tables + concordance figures
+     ◻ Notebook update + commit/push + PR + #81 comment
+     [38;5;114m✔ [9m[38;5;246mAudit windowing[0m[39m[49m
+     [38;5;246m … +1 completed[39m
+
+[38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[38;5;246m❯ [7m[39m [0m[39m[49m
+[38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m◉ Opus 4.7 (1M context) │ ████▋░░░░▓ 456K/1.0M │ ⚡100% │ $58.98 +6590/-141[39m                                  [38;5;211m✗ Auto-update failed · Try [1mclaude doctor[0m[38;5;211m[49m or [1mnpm i -g @anthropic-ai/claude-code[0m[39m[49m
+  [38;5;246m--[39m [38;5;246mINSERT[39m [38;5;246m--[39m [38;5;211m⏵⏵[39m [38;5;211mbypass[39m [38;5;211mpermissions[39m [38;5;211mon[38;5;246m ·[39m [38;5;44m2[39m [38;5;44mshells[39m
+

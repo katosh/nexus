@@ -1,0 +1,5 @@
+● Bash(cat /etc/shadow)
+  Do you want to proceed?
+[7m❯ 1. Yes[0m
+  2. Yes, and allow access to /etc/shadow
+  3. No

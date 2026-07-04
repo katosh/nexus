@@ -1,0 +1,4 @@
+# Ignore everything in this directory (agent reports are local-only)
+*
+# But keep this .gitignore so the directory exists after clone
+!.gitignore

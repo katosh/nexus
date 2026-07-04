@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# monitor/ghwrap/gh — PATH-FRONT bot-default `gh` wrapper (your-org/nexus-code).
+#
+# THE DELIVERY MECHANISM for the bot-default `gh` identity (PR #349, operator
+# request: comment 4795415597). This is a real EXECUTABLE named `gh`, placed
+# FIRST on PATH for nexus agent processes (worker + orchestrator). Because it
+# is an executable — not a zsh shell function — it is inherited by EVERY child
+# the agent spawns: zsh, bash subshells, `python subprocess`, Makefiles. The
+# earlier function-shim mechanism only shadowed `gh` inside zsh shells that
+# sourced it; this covers the rest.
+#
+# WINNING THE RACE. `monitor/locals-env.sh` prepends this dir process-wide, but
+# the operator's ~/.zshenv re-prepends linuxbrew (where the real gh lives) on
+# every `zsh -c`, which would bury an earlier prepend. So the wrapper dir is
+# FORCE-prepended to the FRONT of PATH AGAIN, AFTER ~/.zshenv, per-command, in
+# monitor/shellenv/.zshenv. That post-modification re-assertion is what makes a
+# PATH-front wrapper win the race (the concern that motivated the old function
+# shim) — exactly the operator's point: "There is PATH modification run after
+# that."
+#
+# RECURSION-SAFE. This wrapper is first on PATH, so a naive `command gh` would
+# re-invoke US. Instead we RESOLVE the real gh binary (first `gh` on PATH that
+# is not this wrapper, by realpath) and hand its ABSOLUTE path to the shared
+# policy logic (monitor/gh-shim.sh) via `_ghs_realgh` — no PATH lookup, no
+# recursion. All classification / token-inject / GH_IMPERSONATE / fail-loud
+# semantics live ONCE in gh-shim.sh; this file is purely the PATH-front
+# delivery + real-gh resolution.
+#
+# WATCHER / OPERATOR / GH_TOKEN safety is inherited from gh-shim.sh's `gh()`
+# (WATCHER_WINDOW + preset-GH_TOKEN short-circuits, the GH_IMPERSONATE escape
+# hatch, the empty-mint fail-loud).
+
+set -u
+
+# --- (0) Locate this wrapper's own directory (to exclude when resolving) -----
+_gw_arg0="$0"
+case "$_gw_arg0" in
+    */*) _gw_dir=$(CDPATH= cd "$(dirname "$_gw_arg0")" 2>/dev/null && pwd || true) ;;
+    *)
+        # Invoked by bare name via PATH lookup ($0 == "gh"): resolve via PATH.
+        _gw_cv=$(command -v "$_gw_arg0" 2>/dev/null || true)
+        case "$_gw_cv" in
+            */*) _gw_dir=$(CDPATH= cd "$(dirname "$_gw_cv")" 2>/dev/null && pwd || true) ;;
+            *)   _gw_dir="" ;;
+        esac
+        ;;
+esac
+
+# realpath helper: prefer `readlink -f`; fall back to dirname-cd + basename
+# (enough to compare two paths pointing at the same file).
+_gw_rp() {
+    if readlink -f / >/dev/null 2>&1; then
+        readlink -f "$1" 2>/dev/null && return 0
+    fi
+    _gw_rp_d=$(CDPATH= cd "$(dirname "$1")" 2>/dev/null && pwd) || return 1
+    printf '%s/%s\n' "$_gw_rp_d" "$(basename "$1")"
+}
+
+_gw_self_rp=""
+[ -n "$_gw_dir" ] && _gw_self_rp=$(_gw_rp "$_gw_dir/gh" 2>/dev/null || true)
+
+# --- (1) Resolve the REAL gh: first `gh` on PATH that is not THIS wrapper -----
+_gw_real=""
+_gw_oldifs=$IFS
+IFS=:
+for _gw_p in $PATH; do
+    [ -n "$_gw_p" ] || continue
+    _gw_cand="$_gw_p/gh"
+    [ -x "$_gw_cand" ] || continue
+    # Skip our own dir (path equality) and any path resolving to this wrapper.
+    if [ -n "$_gw_dir" ] && [ "$_gw_p" = "$_gw_dir" ]; then continue; fi
+    if [ -n "$_gw_self_rp" ]; then
+        _gw_cand_rp=$(_gw_rp "$_gw_cand" 2>/dev/null || true)
+        [ "$_gw_cand_rp" = "$_gw_self_rp" ] && continue
+    fi
+    _gw_real="$_gw_cand"
+    break
+done
+IFS=$_gw_oldifs
+
+if [ -z "$_gw_real" ]; then
+    printf 'gh-wrapper: could not find the real `gh` on PATH (excluding the wrapper dir %s).\n' "${_gw_dir:-<unresolved>}" >&2
+    printf 'gh-wrapper: refusing to run to avoid a recursive / unguarded gh call.\n' >&2
+    exit 127
+fi
+
+# --- (2) Inject the resolved real-gh into the shared policy logic ------------
+# Pre-define _ghs_realgh BEFORE sourcing gh-shim.sh so its guard keeps ours.
+# Absolute path → no PATH lookup → the wrapper can never re-invoke itself.
+_ghs_realgh() { "$_gw_real" "$@"; }
+
+# --- (3) Source the shared classifier + dispatch -----------------------------
+_gw_shim="${NEXUS_ROOT:-}/monitor/gh-shim.sh"
+if [ ! -r "$_gw_shim" ] && [ -n "$_gw_dir" ]; then
+    _gw_shim="$_gw_dir/../gh-shim.sh"
+fi
+if [ ! -r "$_gw_shim" ]; then
+    printf 'gh-wrapper: cannot locate gh-shim.sh (NEXUS_ROOT=%s) — refusing to run gh.\n' "${NEXUS_ROOT:-<unset>}" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+. "$_gw_shim"
+
+gh "$@"
