@@ -66,6 +66,20 @@ shopt -u patsub_replacement 2>/dev/null || true
 # to children go through th_hermetic_path below instead.
 unset -f command_not_found_handle 2>/dev/null || true
 
+# Public-template disable switch: the public-mirror tree ships a
+# monitor/_public-guard.sh whose call sites make every bring-up entry
+# point (bootstrap-recover.sh, bootstrap-install.sh, watcher/entry.sh)
+# refuse with "nexus is disabled" unless NEXUS_PUBLIC_ENABLED=1. The
+# unit suite executes those entry points against fixture-local state
+# (stubbed labsh, tmpdir registries) — the sanctioned unlock, not a
+# bypass of the guard's purpose (blocking ACCIDENTAL autonomous
+# bring-up on a fork). Without it the mirror's CI reds on any
+# helper-sourcing test that runs a guarded script for real (the
+# bootstrap-recover stanza of test-jupyter-service.sh). On a tree
+# that ships no guard the export is inert; the mirror's Pages workflow
+# separately asserts the guard still fires without this variable.
+export NEXUS_PUBLIC_ENABLED=1
+
 : "${PASS:=0}"
 : "${FAIL:=0}"
 

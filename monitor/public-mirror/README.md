@@ -64,3 +64,10 @@ and a small number of file renames (institution-specific basenames →
 neutral). `build.sh` handles the reproducible **identifier** scrub + the
 self-scrub exclusion; the structural decisions above are one-time bootstrap
 state carried forward in the tree.
+
+The unit suite stays green under the disable switch:
+`monitor/watcher/_test_helpers.sh` exports `NEXUS_PUBLIC_ENABLED=1` (inert
+on a tree that ships no guard), so hermetic tests that execute guarded entry
+points — e.g. `test-jupyter-service.sh` running `bootstrap-recover.sh` — pass
+on the mirror's CI. The mirror's Pages workflow independently asserts the
+guard still fires when that variable is unset.
