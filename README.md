@@ -47,47 +47,47 @@ one of them.
   long-running agent by an in-process bash *watcher*. The agent
   reacts 👀 on intake and 🚀 on completion, so push notifications
   on your phone tell you when work moves. Deep dive:
-  [Operating → Dashboard](https://<your-org>.github.io/nexus-code/operating/dashboard/).
+  [Operating → Dashboard](https://katosh.github.io/nexus/operating/dashboard/).
 - **Spawns one tmux window per task.** An *orchestrator* Claude
   Code session reads each watcher emit, decides whether to handle
   it in-band or delegate, and launches workers as sibling tmux
   windows via `monitor/spawn-worker.sh`. Each worker owns one
   task end-to-end; failures are contained to a single window.
   Deep dive:
-  [Operating → Spawning workers](https://<your-org>.github.io/nexus-code/operating/spawning-workers/).
+  [Operating → Spawning workers](https://katosh.github.io/nexus/operating/spawning-workers/).
 - **Posts as a bot, not as you.** Every GitHub write originates
   from a per-operator GitHub App installed on a private
   asset+issue repo. That separation is what keeps mobile push
   notifications firing — GitHub mutes self-authored notifications.
   Deep dive:
-  [Admin → GitHub App](https://<your-org>.github.io/nexus-code/admin/github-app/).
+  [Admin → GitHub App](https://katosh.github.io/nexus/admin/github-app/).
 - **Writes structured reports on every hand-off.** Workers end
   with `monitor/ng wrap-up`, which validates a five-section report
   against a schema, uploads it to the asset repo, posts the link
   as a comment on the tracking issue, rockets the trigger
   comment, and tells the orchestrator to clean up the window.
   Reports are the resumption surface after a crash. Deep dive:
-  [Operating → Reports](https://<your-org>.github.io/nexus-code/operating/reports/).
+  [Operating → Reports](https://katosh.github.io/nexus/operating/reports/).
 - **Distils orchestration patterns into reusable skills.** Files
   under `skills/nexus.*/SKILL.md` carry the safety floor every
   worker inherits (bot identity, no `--no-verify`, no force-push,
   report convention) and the orchestrator's window-cleanup
   policy. Editing one file updates every subsequent worker. Deep
   dive:
-  [Reference → Skills](https://<your-org>.github.io/nexus-code/reference/skills/).
+  [Reference → Skills](https://katosh.github.io/nexus/reference/skills/).
 - **Recovers itself from common stalls.** The watcher carries an
   auto-unstick library for permission prompts, Anthropic
   rate-limit cascades, and transient API errors. A mutual-liveness
   contract lets the orchestrator and watcher each respawn the
   other; a crash-loop guard breaks runaway respawn cycles. Deep
   dive:
-  [Reference → Watcher protocol](https://<your-org>.github.io/nexus-code/reference/watcher-protocol/).
+  [Reference → Watcher protocol](https://katosh.github.io/nexus/reference/watcher-protocol/).
 - **Updates itself on `git pull`.** The watcher is version-aware:
   it detects when a pull changed the code any component loaded at
   start and self-restarts (or restarts the affected service) on
   its own — pulling the repo is the entire update story. Deep
   dive:
-  [Operating → Upgrading](https://<your-org>.github.io/nexus-code/operating/upgrading/).
+  [Operating → Upgrading](https://katosh.github.io/nexus/operating/upgrading/).
 
 Nexus instances are designed for a single operator. Teams that
 want to collaborate typically run one nexus per operator —
@@ -99,7 +99,7 @@ cross-operator GitHub activity is advisory: if one operator's
 bot opens an issue on another's repo, that nexus does not
 auto-action it — the receiving operator reads it and decides
 whether to engage. See
-[Admin → Repos § Collaboration patterns](https://<your-org>.github.io/nexus-code/admin/repos/#collaboration-patterns).
+[Admin → Repos § Collaboration patterns](https://katosh.github.io/nexus/admin/repos/#collaboration-patterns).
 
 ## Getting started
 
@@ -137,7 +137,7 @@ Code does the heavy lifting and stops if anything fails.
 
 The full bootstrap walkthrough plus a fully-manual fallback path
 live at
-[Getting started → Install](https://<your-org>.github.io/nexus-code/getting-started/install/).
+[Getting started → Install](https://katosh.github.io/nexus/getting-started/install/).
 
 ### Run loop
 
@@ -174,7 +174,7 @@ Day to day, `monitor/svc.sh status|up|logs <name>` is the scriptable
 surface for the same stack the cockpit shows.
 
 Once it's up, you drive nexus from GitHub — see
-[Operating → Overview](https://<your-org>.github.io/nexus-code/operating/overview/).
+[Operating → Overview](https://katosh.github.io/nexus/operating/overview/).
 
 ## Repo structure
 
@@ -198,19 +198,19 @@ under `reports/`.
 
 The docs site is the source of truth. Useful entry points:
 
-- **[Getting started](https://<your-org>.github.io/nexus-code/getting-started/overview/)**
+- **[Getting started](https://katosh.github.io/nexus/getting-started/overview/)**
   — what nexus is, who it's for, prerequisites, install, the first
   session, the vocabulary.
-- **[Operating](https://<your-org>.github.io/nexus-code/operating/overview/)**
+- **[Operating](https://katosh.github.io/nexus/operating/overview/)**
   — day-to-day playbook: dashboard, workers, watcher, notifications,
   reports, troubleshooting.
-- **[Admin](https://<your-org>.github.io/nexus-code/admin/github-app/)**
+- **[Admin](https://katosh.github.io/nexus/admin/github-app/)**
   — GitHub App creation, repo topology, security model, runtime
   monitoring.
-- **[Reference](https://<your-org>.github.io/nexus-code/reference/architecture/)**
+- **[Reference](https://katosh.github.io/nexus/reference/architecture/)**
   — architecture, every config key, every `ng` verb, the watcher
   protocol, the skills catalog, the file layout.
-- **[Contributing](https://<your-org>.github.io/nexus-code/contributing/development/)**
+- **[Contributing](https://katosh.github.io/nexus/contributing/development/)**
   — local dev, the test suite, adding a skill, release flow.
 
 ## Status
@@ -227,13 +227,13 @@ release.
 
 If you're considering adopting nexus, expect to spend time wiring up
 the GitHub App and tuning notification channels. The
-[GitHub App walkthrough](https://<your-org>.github.io/nexus-code/admin/github-app/)
+[GitHub App walkthrough](https://katosh.github.io/nexus/admin/github-app/)
 is the single best predictor of a smooth setup.
 
 ## Contributing
 
 PRs welcome. See
-[Contributing → Development](https://<your-org>.github.io/nexus-code/contributing/development/)
+[Contributing → Development](https://katosh.github.io/nexus/contributing/development/)
 for branching conventions, local testing, and the bot-identity
 rules for cross-repo work. CI blocks any PR that adds files under
 `reports/` (those are local-only artefacts uploaded to the asset
@@ -250,7 +250,7 @@ Built and maintained at the
 across many parallel projects. The lab's specific HPC deployment
 notes (the `<login-node>` → `<shared-node-tool>` → shared-HPC-node pattern, the
 `<hpc-mount>` filesystem layout, the `<hpc-skills>` add-on) live in
-the [<your-lab> addendum](https://<your-org>.github.io/nexus-code/admin/site-addendum/);
+the [<your-lab> addendum](https://katosh.github.io/nexus/admin/site-addendum/);
 nothing in the main guide depends on them.
 
 The architecture is agent-agnostic; the reference orchestrator is

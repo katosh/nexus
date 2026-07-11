@@ -60,6 +60,6 @@ To finish the migration (safe to do now; one command):
 
 This watcher keeps working normally in the meantime; the notice is
 emitted once per watcher start. Full guide: docs/operating/upgrading.md
-(https://your-org.github.io/nexus-code/operating/upgrading/).
+(https://katosh.github.io/nexus/operating/upgrading/).
 NOTICE
 }
