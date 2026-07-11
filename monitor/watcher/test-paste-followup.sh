@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unit tests for monitor/paste-followup.sh (issue #201).
+# Unit tests for monitor/paste-followup.sh (issues #201, #507).
 #
 # Run: bash monitor/watcher/test-paste-followup.sh
 # Expected: ALL TESTS PASSED on stdout, exit 0.
@@ -14,6 +14,25 @@
 #   - missing window / empty message / unreadable file fail loudly
 #     with NO stamp and NO paste
 #   - stamp lands even when ng log-action fails (TSV is authoritative)
+#
+# #507 changed the exit contract: `send-keys Enter` returning 0 means tmux
+# accepted a keystroke, not that Claude Code submitted the prompt. The
+# helper now CONFIRMS the submission against the target session's own
+# transcript and reports only what it established — 0 submitted,
+# 3 unconfirmed, 4 established-NOT-submitted.
+#
+# So the happy paths below must supply a session to confirm against: a
+# heartbeat (window → session-id) plus a transcript under NEXUS_CC_HOME,
+# into which the tmux stub appends a TUI-submission record when it
+# receives the Enter. `MOCK_NO_SUBMIT=1` makes the stub swallow the Enter
+# — which is the #507 failure itself, and is asserted to exit 4.
+#
+# Deep coverage of the confirmation logic (promptSource classification,
+# the task-notification false positive, byte-offset scanning, the
+# collapsed-paste Enter retry) lives in
+# monitor/test-paste-followup-confirm.sh. This file keeps its original
+# remit — the stamp, the VI-safe sequence, the flags — plus the exit
+# codes that remit now depends on.
 
 set -uo pipefail
 
@@ -59,6 +78,15 @@ STUB_DIR="$WORK/bin"
 mkdir -p "$STUB_DIR"
 ACTIONS="$WORK/actions.log"
 
+# The session paste-followup confirms against (#507). The slug is
+# deliberately not the real `/`+`_`→`-` transform of any path: the helper
+# must find the transcript by SESSION-ID, never by rebuilding the slug.
+CC_HOME="$WORK/cc"
+SID="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+TRANSCRIPT="$CC_HOME/projects/-stub-slug/$SID.jsonl"
+mkdir -p "$(dirname "$TRANSCRIPT")"
+export MOCK_TRANSCRIPT="$TRANSCRIPT"
+
 # Recorder tmux stub. list-windows emits MOCK_TMUX_WINDOWS; every
 # other subcommand records argv and succeeds (or fails when
 # MOCK_TMUX_FAIL names it).
@@ -82,6 +110,15 @@ printf '%s\n' "$*" >> "$ACTIONS"
 if [[ -n "${MOCK_TMUX_FAIL:-}" && "$cmd" == "$MOCK_TMUX_FAIL" ]]; then
     exit 1
 fi
+# Stand in for Claude Code: an Enter that the TUI accepts records a
+# TUI-submission line in the session transcript (#507). MOCK_NO_SUBMIT=1
+# swallows it — an Enter tmux accepted that never became a submit, which
+# is precisely the defect the confirmation exists to catch.
+if [[ "$cmd" == "send-keys" && "${!#}" == "Enter" \
+      && "${MOCK_NO_SUBMIT:-0}" != "1" && -n "${MOCK_TRANSCRIPT:-}" ]]; then
+    printf '{"type":"user","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"the follow-up"}}\n' \
+        >> "$MOCK_TRANSCRIPT"
+fi
 exit 0
 STUB
 chmod +x "$STUB_DIR/tmux"
@@ -89,10 +126,36 @@ chmod +x "$STUB_DIR/tmux"
 export ACTIONS
 export PATH="$STUB_DIR:$PATH"
 
+# Seed the two surfaces the helper confirms against: the heartbeat that
+# maps window → session-id, and a transcript with some pre-existing
+# history (so a naive "does this transcript contain a submission?" check
+# would wrongly confirm on the OLD line rather than a newly appended one).
+seed_session() {
+    local window="$1"
+    mkdir -p "$RUN_STATE/heartbeat"
+    printf '{"state":"idle_prompt","last_activity":%s,"session_id":"%s","window":"%s"}\n' \
+        "$(date +%s)" "$SID" "$window" > "$RUN_STATE/heartbeat/$window.json"
+    printf '{"type":"user","promptSource":"typed","message":{"role":"user","content":"the ORIGINAL spawn prompt"}}\n' \
+        > "$TRANSCRIPT"
+    printf '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t0","content":"ok"}]}}\n' \
+        >> "$TRANSCRIPT"
+}
+
+# Confirmation env: hermetic CC home, and a short budget so a
+# deliberately-unconfirmable case costs ~2s rather than the 20s default.
+helper_env() {
+    printf '%s\n' \
+        "NEXUS_STATE_DIR=$RUN_STATE" \
+        "NEXUS_CC_HOME=$CC_HOME" \
+        "PASTE_CONFIRM_TIMEOUT_SECONDS=2" \
+        "PASTE_CONFIRM_POLL_SECONDS=0.05"
+}
+
 run_helper() {
     # Fresh per-run state dir so stamp assertions are exact.
     RUN_STATE=$(mktemp -d "$WORK/state.XXXXXX")
-    HELPER_OUT=$(NEXUS_STATE_DIR="$RUN_STATE" bash "$SCRIPT" "$@" 2>&1)
+    [[ "${SKIP_SEED:-0}" == "1" ]] || seed_session "$1"
+    HELPER_OUT=$(env $(helper_env) bash "$SCRIPT" "$@" 2>&1)
     HELPER_RC=$?
     : > /dev/null
 }
@@ -102,6 +165,8 @@ export MOCK_TMUX_WINDOWS='demo-rerun-lead'
 : > "$ACTIONS"
 run_helper demo-rerun-lead --message 'please also plot chrX' --note 'unit test'
 assert_eq "exit 0" "$HELPER_RC" "0"
+assert_contains "reports a CONFIRMED submission, never 'delivered'" "$HELPER_OUT" 'submitted'
+assert_not_contains "the pre-#507 banner is gone" "$HELPER_OUT" 'delivered to'
 assert_contains "machine-input stamp written" \
     "$(cat "$RUN_STATE/machine-input.tsv" 2>/dev/null)" $'demo-rerun-lead\t'
 assert_contains "stamp src is paste-followup" \
@@ -161,11 +226,40 @@ run_helper demo-rerun-lead --file "$WORK/msg.txt"
 assert_eq "--file exit 0" "$HELPER_RC" "0"
 : > "$ACTIONS"
 RUN_STATE=$(mktemp -d "$WORK/state.XXXXXX")
-HELPER_OUT=$(printf 'from stdin\n' | NEXUS_STATE_DIR="$RUN_STATE" bash "$SCRIPT" demo-rerun-lead 2>&1)
+seed_session demo-rerun-lead
+HELPER_OUT=$(printf 'from stdin\n' | env $(helper_env) bash "$SCRIPT" demo-rerun-lead 2>&1)
 HELPER_RC=$?
 assert_eq "stdin exit 0" "$HELPER_RC" "0"
 assert_contains "stdin path stamped" \
     "$(cat "$RUN_STATE/machine-input.tsv" 2>/dev/null)" $'demo-rerun-lead\t'
+
+# ── #507: the exit code must report only what was established ────────────
+echo '=== #507: Enter accepted, prompt never submitted → exit 4 ==='
+: > "$ACTIONS"
+export MOCK_NO_SUBMIT=1
+run_helper demo-rerun-lead --message 'a correction that must not be lost'
+assert_eq "established negative: exit 4" "$HELPER_RC" "4"
+assert_contains "names the outcome"    "$HELPER_OUT" 'pasted (NOT submitted)'
+assert_not_contains "never claims delivery"  "$HELPER_OUT" 'delivered'
+assert_not_contains "never claims submission" "$HELPER_OUT" ': submitted'
+# The watcher's paste-unconfirmed detector reads this ledger. A paste that
+# landed but did not submit must stay stamped, so the watcher agrees with
+# us rather than misattributing the pane churn to the operator.
+assert_contains "stamp retained on a NOT-submitted verdict" \
+    "$(cat "$RUN_STATE/machine-input.tsv" 2>/dev/null)" $'demo-rerun-lead\t'
+# One retry, and only one: the collapsed-paste `[Pasted text #N]` case.
+assert_eq "Enter retried exactly once" "$(grep -c 'send-keys -t @3 Enter' "$ACTIONS")" "2"
+unset MOCK_NO_SUBMIT
+
+echo '=== #507: no heartbeat ⇒ nothing to confirm against → exit 3 ==='
+: > "$ACTIONS"
+SKIP_SEED=1 run_helper demo-rerun-lead --message 'into the void'
+assert_eq "unconfirmable: exit 3" "$HELPER_RC" "3"
+assert_contains "says unconfirmed"  "$HELPER_OUT" 'submission unconfirmed'
+assert_contains "names the reason"  "$HELPER_OUT" 'no session-id'
+assert_not_contains "never claims delivery" "$HELPER_OUT" 'delivered'
+# It must not assert a NEGATIVE it did not establish either.
+assert_not_contains "not an established negative" "$HELPER_OUT" 'pasted (NOT submitted) to'
 
 echo '=== failure modes: loud, no stamp, no paste ==='
 : > "$ACTIONS"

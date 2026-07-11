@@ -48,6 +48,25 @@
 #                                  └──────── answer (direct) ───────┘
 # Channel sentinel:               (close) ──▶ DONE   →   worker await exit 10
 #
+# Round scoping (issue #469): DONE is per-CHANNEL, not per-round, and a
+# channel is reused across rounds — a worker re-wraps precisely because a
+# skeptic found defects. `ng wrap-up --skeptic-decision require` opens a
+# new round by writing a fresh pending marker; `close` ends one by writing
+# DONE and removing the marker. Therefore a DONE OLDER than the pending
+# marker belongs to a previous round, and `await` must NOT treat it as
+# terminal — doing so retires a worker that believes it was validated when
+# no second skeptic ever spawned. await compares the two mtimes and keeps
+# waiting on a stale DONE (fail closed). wrap-up also clears a prior DONE
+# when it opens a round (fail fast); either guard alone would suffice for
+# the observed bug, but await's is the one that holds if a future caller
+# writes a pending marker without resetting the channel.
+#
+# That caller already exists: spawn-worker.sh (~:1457) writes a pending
+# marker DIRECTLY when the orchestrator spawns a skeptic, with no wrap-up
+# in the loop and no DONE reset. wrap-up's guard cannot see that path;
+# only this mtime comparison closes it. Do not remove it on the grounds
+# that wrap-up "already handles" the reset.
+#
 # Race-safety: every state-producing write (ask, answer, close) builds
 # into a temp file in the same directory and `mv -f`s it into place — an
 # atomic rename on one filesystem. A reader (await / await-answer /
@@ -103,8 +122,10 @@
 #   4   await / await-answer timed out (no request / no answer in time)
 #   5   nudge skipped (worker busy / typing / unresolvable; or rate-limited)
 #   6   reconcile gave up: a worker never acked within the bound (a finding)
-#  10   await: DONE sentinel present — the skeptic closed the channel;
-#       stop looping and proceed to retire
+#  10   await: DONE sentinel present AND newer than the task's pending
+#       marker (or no marker) — the skeptic closed the channel for THIS
+#       round; stop looping and proceed to retire. A DONE older than the
+#       marker is a prior round's and is ignored (await keeps waiting).
 #
 # State dir resolution mirrors monitor/ng + paste-followup.sh:
 #   NEXUS_STATE_DIR → NEXUS_ROOT/monitor/.state → config nexus.root →
@@ -458,14 +479,37 @@ cmd_await() {
     local dir; dir=$(_channel_dir "$task")
     mkdir -p "$dir" 2>/dev/null || true
     local sentinel; sentinel=$(_done_sentinel "$task")
-    local waited=0 f acked
+    local marker;   marker=$(_pending_marker "$task")
+    local waited=0 f acked stale_warned=0
     while :; do
-        _await_heartbeat "$task" "$dir"
-        # Terminal: the skeptic closed the channel.
+        # Terminal: the skeptic closed the channel FOR THIS ROUND.
+        #
+        # `close` is the only writer of DONE, and it also removes the
+        # pending marker. `ng wrap-up --skeptic-decision require` is the
+        # only writer of the marker, and it opens a NEW round. So a DONE
+        # that is OLDER than the marker is a prior round's verdict, and
+        # accepting it retires a worker that no skeptic ever revalidated
+        # — the gate reporting success without having run (issue #469).
+        # Treat a stale DONE as absent and keep waiting: fail CLOSED.
+        #
+        # `-nt` is true when the sentinel exists and the marker does not,
+        # which is the normal terminal shape (close removed the marker),
+        # so the ordinary first-round path is unchanged. Checking before
+        # _await_heartbeat is load-bearing: the heartbeat touches the
+        # marker, and doing that first would push the marker's mtime past
+        # a just-written DONE during close's create-then-unlink window.
         if [[ -e "$sentinel" ]]; then
-            printf 'DONE\n'
-            return 10
+            if [[ "$sentinel" -nt "$marker" ]]; then
+                printf 'DONE\n'
+                return 10
+            fi
+            if (( stale_warned == 0 )); then
+                printf 'skeptic-channel: DONE for task %s is older than its pending marker — a prior round'"'"'s verdict, not this one'"'"'s. Ignoring it and waiting for a real close.\n' \
+                    "$task" >&2
+                stale_warned=1
+            fi
         fi
+        _await_heartbeat "$task" "$dir"
         # Ack every currently-open request atomically.
         acked=0
         for f in "$dir"/*.open.md; do
@@ -666,6 +710,13 @@ cmd_close() {
     # Clear the pending marker — closure means a verdict exists, so the
     # require-gate is satisfied regardless of whether the worker is still
     # in its await loop to process the DONE sentinel.
+    #
+    # ORDER IS LOAD-BEARING (issue #469): publish DONE first, unlink the
+    # marker second. await treats DONE-newer-than-marker as terminal, so
+    # this order leaves the channel terminal at every instant in between.
+    # Reversed, a crash after the unlink would leave no marker and no DONE
+    # — retire-preflight would see no pending gate and let the worker
+    # retire unvalidated. Fail closed on a partial close, not open.
     rm -f "$(_pending_marker "$task")" 2>/dev/null || true
     printf '%s\n' "$sentinel"
 }
@@ -772,9 +823,20 @@ Re-enter the await loop with \`monitor/skeptic-channel.sh await ${task}\` — it
 
     # SKEPTIC_PASTE_BIN is a test seam (hermetic suite injects a stub).
     local paste_bin="${SKEPTIC_PASTE_BIN:-$_script_dir/paste-followup.sh}"
-    if ! "$paste_bin" "$window" --message "$msg" \
-            --note "skeptic-nudge: $open pending request(s) for task $task" >/dev/null 2>&1; then
-        warn "nudge: paste-followup.sh failed for window $window (window absent? tmux down?)"
+    local paste_out paste_rc
+    # NB: no --src override. The watcher's paste-unconfirmed detector only
+    # counts ledger rows whose src is exactly `paste-followup`; relabelling
+    # this paste would quietly exempt every skeptic nudge from that check.
+    paste_out=$("$paste_bin" "$window" --message "$msg" \
+            --note "skeptic-nudge: $open pending request(s) for task $task" 2>&1)
+    paste_rc=$?
+    if (( paste_rc != 0 )); then
+        # Relay paste-followup's own verdict verbatim. It distinguishes a
+        # hard tmux failure (rc 1) from a paste that landed but never
+        # submitted (rc 4) or one it could not confirm (rc 3) — see
+        # your-org/nexus-code#507. Guessing "window absent? tmux down?" here
+        # would substitute a wrong cause for a diagnosed one.
+        warn "nudge: paste-followup.sh rc=$paste_rc for window $window — ${paste_out##*$'\n'}"
         exit 3
     fi
     date +%s > "$stamp" 2>/dev/null || true

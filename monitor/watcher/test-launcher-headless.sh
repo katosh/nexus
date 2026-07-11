@@ -108,6 +108,9 @@ build_case() {
     # (the pidfile-verify identity check). Copy it to the canonical depth.
     cp "$_real_test_dir/_lib.sh" "$WORK/monitor/watcher/_lib.sh"
 
+    # launcher.sh sources ../_log-mode.sh (nexus-code#509).
+    cp "$_real_test_dir/../_log-mode.sh" "$WORK/monitor/_log-mode.sh"
+
     LAUNCHER="$WORK/monitor/watcher/launcher.sh"
     PIDFILE="$WORK/monitor/.state/watcher.pid"
     HEARTBEAT="$WORK/monitor/.state/watcher-heartbeat"

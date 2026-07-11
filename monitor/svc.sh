@@ -207,20 +207,35 @@ watcher_log_files() {
 }
 
 # Headless-supervisor state from the per-service pidfile, reusing recovery's
-# OWN liveness primitive (_recover_service_running: pid alive AND cmdline
-# still matches the wrapper) so the cockpit and recovery never diverge on
-# "is the supervisor up?". Emits `pid:N` (alive), `stale` (pidfile present
-# but dead / recycled), or `-` (no pidfile — unmanaged or not-yet-migrated).
+# OWN primitive (_recover_supervisor_state: pid alive AND cmdline still
+# matches the wrapper) so the cockpit and recovery never diverge on "is the
+# supervisor up?".
+#
+# The optional 3rd arg is the service's CURRENT health verdict ('UP' when the
+# registry healthcheck passes). It exists so the cell never prints a word
+# that contradicts the STATUS column without saying so:
+#
+#   pid:N    a live supervisor.
+#   orphan   the pid record is dead BUT the healthcheck passes — the daemon
+#            outlived its supervisor and is running UNSUPERVISED. `stale`
+#            here read as "ignore me, cosmetic"; it is the opposite. Nothing
+#            is left to perform the wrapper self-heal that the watcher's
+#            grace window defers to.
+#   stale    the pid record is dead and the service is DOWN too. Consistent:
+#            the supervisor died and took the service with it; recovery will
+#            relaunch on the next bootstrap/health tick.
+#   -        no pidfile — unmanaged or not-yet-migrated. Nothing to contradict.
+#
+# Callers that pass no health verdict (unit tests, ad-hoc probes) keep the
+# original two-state `pid:N` / `stale` / `-` contract.
 svc_supervisor() {
-    local name="$1" launch="$2" pf pid
-    pf=$(_recover_pidfile "$name")
-    [[ -f "$pf" ]] || { printf '%s' '-'; return; }
-    if _recover_service_running "$name" "$launch"; then
-        read -r pid < "$pf" 2>/dev/null
-        printf 'pid:%s' "$pid"
-    else
-        printf 'stale'
-    fi
+    local name="$1" launch="$2" up="${3:-}" st
+    st=$(_recover_supervisor_state "$name" "$launch")
+    case "$st" in
+        alive:*) printf 'pid:%s' "${st#alive:}" ;;
+        absent)  printf '%s' '-' ;;
+        *)       [[ "$up" == UP ]] && printf 'orphan' || printf 'stale' ;;
+    esac
 }
 
 # --- external-bind detection (display only) --------------------------------
@@ -237,6 +252,7 @@ svc_supervisor() {
 SVC_FQDN=''         # cached once per process: hostname -f can hit DNS
 SVC_LISTEN=''       # ss snapshot, refreshed at most once per frame
 SVC_LISTEN_FRESH=0  # render_status resets this each frame
+ORPHAN_N=0          # healthy-but-unsupervised rows in the current frame
 
 svc_fqdn() {
     [[ -n "$SVC_FQDN" ]] || SVC_FQDN=$(hostname -f 2>/dev/null || hostname)
@@ -499,39 +515,115 @@ emit() { FRAME+="$1$EL"$'\n'; line_cost "$1"; FRAME_COST=$(( FRAME_COST + COST )
 ROW=''
 format_row() {
     local gut="$1" key="$2" name="$3" upc="$4" up="$5" supc="$6" sup="$7" detail="$8"
-    printf -v ROW '%s%-2s %-*s %s%-6s%s %s%-10s%s %s' \
+    printf -v ROW '%s%-2s %-*s %s%-8s%s %s%-10s%s %s' \
         "$gut" "$key" "$ROW_W" "$name" "$upc" "$up" "$C_0" \
         "$supc" "$sup" "$C_0" "$detail"
 }
 emit_row() { format_row "$@"; emit "$ROW"; }
 
-# Core rows: the watcher (tri-state liveness from its heartbeat — the
-# exact probe recovery uses) and the orchestrator (watcher-managed;
-# window presence + turn-end heartbeat age). Pinned above the registry
-# services because the GitHub integration hangs off them.
+# The filesystem row (your-org/nexus-code#473).
+#
+# Rendered ABOVE the per-service rows, because when the project tree is
+# read-only every row below it is noise: services report `UP` from pidfiles
+# and healthchecks that were true a moment ago and cannot be updated now,
+# and nothing that reads this table can write anything. On 2026-07-09 this
+# table cheerfully printed `UP` services while the watcher was dead and no
+# agent in the workspace could save a file.
+#
+# The probe is a FRESH create+unlink (monitor/_fs_probe.sh) — never a stat,
+# never a cached fd, both of which keep succeeding on a detached mount.
+# Sets SVC_FS_OK for the caller's exit status.
+SVC_FS_OK=1
+render_fs_row() {
+    local up upc detail
+    # `nexus_path_writable` (monitor/_fs_probe.sh, in scope via
+    # bootstrap-recover.sh -> watcher/_lib.sh) probes the nearest EXISTING
+    # ancestor, so a fresh clone whose monitor/.state has never been created
+    # reports OK rather than a spurious READ-ONLY.
+    if nexus_path_writable "$STATE_DIR"; then
+        SVC_FS_OK=1
+        up='OK'; upc="$C_G"
+        detail="$STATE_DIR writable"
+    else
+        SVC_FS_OK=0
+        up='READ-ONLY'; upc="$C_R"
+        detail="cannot write $STATE_DIR — restart the sandbox from OUTSIDE; every row below is stale"
+    fi
+    emit_row '' '' 'fs' "$upc" "$up" "$C_0" '' "$detail"
+    if (( ! SVC_FS_OK )); then
+        emit "${C_R}  the project filesystem is read-only. Nothing inside the sandbox can repair it.${C_0}"
+        emit "${C_R}  No data is lost and the filer is healthy — do not page storage-support. See skills/nexus.service-recovery.${C_0}"
+    fi
+}
+
+# Core rows: the watcher (UP/BUSY/WEDGED/DOWN trichotomy from
+# _watcher_liveness_verdict — the exact probe recovery uses — plus a
+# process-GROUP duplicate check, nexus-code#491) and the orchestrator
+# (watcher-managed; window presence + turn-end heartbeat age). Pinned
+# above the registry services because the GitHub integration hangs off
+# them.
+#
+# WATCHER_DUP_N counts live watcher process groups beyond the first
+# (plus decapitated orphan groups); `status` exits non-zero when it is
+# >0 — a status line naming ONE pid while a second watcher runs is
+# asserting a state that was never established.
+WATCHER_DUP_N=0
 render_core_rows() {
     local rc age pid up upc sup supc detail gut l
 
-    _watcher_alive "$STATE_DIR" "$INTERVAL"; rc=$?
+    local verdict state period cage page
+    verdict=$(_watcher_liveness_verdict "$STATE_DIR" "$INTERVAL"); rc=$?
+    state=$(_watcher_verdict_field "$verdict" state)
+    period=$(_watcher_verdict_field "$verdict" period_s)
+    cage=$(_watcher_verdict_field "$verdict" cycle_age)
+    page=$(_watcher_verdict_field "$verdict" progress_age)
     age=$(_watcher_heartbeat_age "$WATCHER_HB")
     pid=$(_watcher_heartbeat_field "$WATCHER_HB" pid)
-    case "$rc" in
-        0) up='UP';    upc="$C_G" ;;
-        1) up='STALE'; upc="$C_Y" ;;
-        *) up='DOWN';  upc="$C_R" ;;
+    case "$state" in
+        UP)     up='UP';     upc="$C_G" ;;
+        BUSY)   up='BUSY';   upc="$C_Y" ;;
+        WEDGED) up='WEDGED'; upc="$C_R" ;;
+        *)      up='DOWN';   upc="$C_R" ;;
     esac
     if [[ -n "$pid" ]] && _watcher_pid_is_live_watcher "$pid"; then
         sup="pid:$pid"; supc="$C_G"
     else
         sup='-'; supc="$C_DIM"
     fi
-    if (( rc == 0 )); then
-        detail="hb $(fmt_age "$age") -> $TARGET_WINDOW"
-    else
-        detail=$(_watcher_reason "$STATE_DIR" 2>/dev/null || echo 'not healthy')
-    fi
+    case "$state" in
+        UP)     detail="hb $(fmt_age "$age"), loop ~${period:-?}s -> $TARGET_WINDOW" ;;
+        BUSY)   detail="alive+advancing (progress $(fmt_age "${page:-0}") ago), loop ~${period:-?}s, cycle $(fmt_age "${cage:-0}") ago — slow, NOT down" ;;
+        WEDGED) detail="alive but NOT advancing (progress $(fmt_age "${page:-0}"), cycle $(fmt_age "${cage:-0}")) — revive: monitor/revive-watcher.sh" ;;
+        *)      detail=$(_watcher_reason "$STATE_DIR" 2>/dev/null || echo 'not healthy') ;;
+    esac
     gut=' '; [[ "$SVC_FOLLOW" == watcher ]] && gut='>'
     emit_row "$gut" '0' 'watcher' "$upc" "$up" "$supc" "$sup" "$detail"
+
+    # Duplicate / decapitated watcher GROUPS (nexus-code#491). Counted
+    # from the process table (argv identity + pgrp, never ppid==1);
+    # two live groups = double emits + racing state writes, and a
+    # leaderless group is a defunct loop nothing supervises. Either is
+    # an attention row that must never hide behind a green 'UP'.
+    WATCHER_DUP_N=0
+    local _wg _wleader _wn _live_groups=() _dead_groups=()
+    while IFS=$'\t' read -r _wg _wleader _wn; do
+        [[ "$_wg" =~ ^[0-9]+$ ]] || continue
+        if [[ "$_wleader" == live ]]; then _live_groups+=("$_wg"); else _dead_groups+=("$_wg"); fi
+    done < <(_watcher_list_live_groups "$NEXUS_ROOT")
+    if (( ${#_live_groups[@]} > 1 )); then
+        WATCHER_DUP_N=$(( ${#_live_groups[@]} - 1 ))
+        # Cross-check against the heartbeat's recorded pid so the row
+        # says which group the rest of the stack believes in.
+        local _hb_mark=''
+        [[ -n "$pid" ]] && _hb_mark=" (heartbeat names $pid)"
+        emit_row ' ' '!' 'watcher-dup' "$C_R" 'DUP' "$C_R" "${#_live_groups[@]}x" \
+            "${#_live_groups[@]} live watcher groups (pgids: ${_live_groups[*]})${_hb_mark} — reconcile: monitor/svc.sh restart watcher"
+    fi
+    if (( ${#_dead_groups[@]} > 0 )); then
+        WATCHER_DUP_N=$(( WATCHER_DUP_N + ${#_dead_groups[@]} ))
+        emit_row ' ' '!' 'watcher-orphan' "$C_R" 'DECAP' "$C_R" '-' \
+            "decapitated watcher group(s) ${_dead_groups[*]} (leader dead, loop still running) — reconcile: monitor/svc.sh restart watcher"
+    fi
 
     # Watcher-supervisor row (mutual-liveness): ARMED iff the
     # orchestrator's Monitor has touched the supervisor heartbeat within
@@ -701,16 +793,19 @@ render_status() {
         ROW_W=${#ADVERTISED_JUPYTER}
     fi
 
-    printf -v l '%s %-2s %-*s %-6s %-10s %s%s' \
+    printf -v l '%s %-2s %-*s %-8s %-10s %s%s' \
         "$C_B" '#' "$ROW_W" 'SERVICE' 'STATUS' 'SUPERVISOR' 'DETAIL' "$C_0"
     emit "$l"
 
+    # Truth first. A read-only filesystem invalidates every row below.
+    render_fs_row
     render_core_rows
 
     # Registry rows pre-render into R_* (text / physical-line cost /
     # needs-attention) so the height budget can decide what to show.
-    # Attention = failing healthcheck OR a stale supervisor pidfile —
-    # both mean an operator should look, so neither may ever hide.
+    # Attention = failing healthcheck OR a dead supervisor record (`stale`
+    # or `orphan`) — all mean an operator should look, so none may ever hide.
+    ORPHAN_N=0
     local -a R_TXT=() R_COST=() R_ATT=()
     local name workdir launch health up upc sup supc detail gut
     for (( i=1; i<=SVC_N; i++ )); do
@@ -721,23 +816,37 @@ render_status() {
         else
             up='DOWN'; upc="$C_R"
         fi
-        sup="$(svc_supervisor "$name" "$launch")"
+        # Health verdict feeds the supervisor cell so a dead pid record next
+        # to a passing healthcheck renders as `orphan`, never a bare `stale`.
+        sup="$(svc_supervisor "$name" "$launch" "$up")"
         case "$sup" in
-            pid:*) supc="$C_G" ;;
-            stale) supc="$C_R" ;;
-            *)     supc="$C_DIM" ;;
+            pid:*)  supc="$C_G" ;;
+            stale)  supc="$C_R" ;;
+            orphan)
+                # The supervisor's liveness is part of service health, not a
+                # footnote to it. A daemon that outlived its wrapper is one
+                # crash away from a terminal outage: nothing will restart it.
+                # Reporting that as a plain green `UP` is what let
+                # nexus-remote-ssh sit unsupervised for ~19h and then die
+                # (your-org/your-nexus#265). Degrade the STATUS cell itself.
+                supc="$C_Y"; up='DEGRADED'; upc="$C_Y"
+                ORPHAN_N=$(( ORPHAN_N + 1 ))
+                ;;
+            *)      supc="$C_DIM" ;;
         esac
-        # A labsh JupyterLab service that is UP shows its reachable,
+        # A labsh JupyterLab service that is SERVING shows its reachable,
         # tokened URL; everything else falls back to the healthcheck-
-        # derived endpoint.
+        # derived endpoint. Keyed on the raw healthcheck, not the possibly
+        # degraded STATUS word — a DEGRADED service is still serving, and
+        # withholding its URL would help nobody.
         detail=''
-        [[ "$up" == UP ]] && detail=$(svc_jupyter_url "$workdir")
+        [[ "$up" == UP || "$up" == DEGRADED ]] && detail=$(svc_jupyter_url "$workdir")
         [[ -n "$detail" ]] || detail=$(svc_endpoint "$health")
         gut=' '; [[ "$SVC_FOLLOW" == "$name" ]] && gut='>'
         format_row "$gut" "$i" "$name" "$upc" "$up" "$supc" "$sup" "$detail"
         R_TXT[$i]="$ROW"
         line_cost "$ROW"; R_COST[$i]=$COST
-        if [[ "$up" != UP || "$sup" == stale ]]; then
+        if [[ "$up" != UP || "$sup" == stale || "$sup" == orphan ]]; then
             R_ATT[$i]=1
         else
             R_ATT[$i]=0
@@ -766,6 +875,15 @@ render_status() {
         build_footer 1 "$advertise_jupyter"   # reclaim the hint lines
         render_paged_rows \
             $(( TERM_ROWS - PROMPT_RESERVE - FRAME_COST - FOOT_COST - 1 ))
+    fi
+
+    # Never render DEGRADED/orphan without saying what it means. One line,
+    # only when at least one service is in that state — the word alone would
+    # read as cosmetic, which is exactly the misreading that let an
+    # unsupervised daemon sit unnoticed for ~19h and then die.
+    if (( ORPHAN_N > 0 )); then
+        emit "$(printf '%s ! %d service(s) DEGRADED/orphan: still serving, but the supervisor is DEAD — nothing will restart them. Reconcile: monitor/svc.sh restart <name>%s' \
+            "$C_Y" "$ORPHAN_N" "$C_0")"
     fi
 
     for l in "${FOOT[@]}"; do emit "$l"; done
@@ -998,9 +1116,22 @@ _orchestrator_redirect() {
     die "the orchestrator is watcher-managed — run 'svc.sh up' (or 'svc.sh start watcher') and the watcher spawns/revives it"
 }
 
+# Exits NON-ZERO when the project filesystem is read-only. A status command
+# that returns success while nothing can be written is the same class of lie
+# as a health probe that reports healthy during an outage: scripts gate on
+# the exit code, and today they all sailed straight through the outage.
 cmd_status() {
     load_services
     render_status
+    (( SVC_FS_OK )) || return 1
+    # Non-zero on duplicate / decapitated watcher groups (nexus-code#491)
+    # so scripts and supervisors can KEY on the anomaly instead of
+    # parsing the table. 6 is distinct from every launcher/revive code.
+    if (( WATCHER_DUP_N > 0 )); then
+        echo "svc.sh: WATCHER SINGLETON VIOLATION — see the watcher-dup/watcher-orphan row(s) above (exit 6)" >&2
+        return 6
+    fi
+    return 0
 }
 
 cmd_up() {
@@ -1048,7 +1179,18 @@ _stop_service() {
     pf=$(_recover_pidfile "$name")
     if ! _recover_service_running "$name" "$launch"; then
         echo "[svc] $name: no live supervisor — nothing to stop" >&2
-        [[ -f "$pf" ]] && { rm -f "$pf"; echo "[svc] $name: removed stale pidfile" >&2; }
+        # Removing the record does NOT stop an orphaned daemon: the supervisor
+        # is what we track, and it is already gone. Say so loudly, or `stop`
+        # reads as "service stopped" while the daemon keeps serving,
+        # unsupervised and now unrecorded.
+        if [[ -f "$pf" ]]; then
+            rm -f "$pf"
+            echo "[svc] $name: removed stale pidfile" >&2
+            if _recover_service_healthy "$workdir" "$health"; then
+                echo "[svc] $name: WARNING — the healthcheck STILL PASSES: an orphaned daemon is serving without a supervisor, and its pid record is now gone." >&2
+                echo "[svc] $name:           'stop' removed the record, not the daemon. Use 'svc.sh restart $name' to reconcile (it will bounce the daemon)." >&2
+            fi
+        fi
         return 0
     fi
     read -r pid < "$pf" 2>/dev/null
@@ -1094,19 +1236,38 @@ _stop_watcher() {
         return 0
     fi
     # Group kill (the watcher is a setsid session leader, pid==pgid) so no
-    # child/orphan survives — matches launcher.sh --replace's reap.
-    echo "[svc] watcher: stopping process group $pid (TERM, KILL after 5s)" >&2
-    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.5
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-        sleep 0.2
+    # child/orphan survives — and the death test is GROUP emptiness, not
+    # leader exit (nexus-code#491): a leader-only wait "succeeds" while
+    # the orphaned subshell chain keeps running the loop (decapitation).
+    echo "[svc] watcher: stopping process group $pid (TERM, KILL after 5s, verify group empty)" >&2
+    # Root passed so the reap re-verifies argv identity at kill time
+    # (skeptic finding 1 on PR#503: the pid is not the identity). The
+    # pid was _watcher_pid_is_live_watcher-verified just above, so an
+    # rc-2 refusal here means the scan and the pid check disagree —
+    # fall back to a leader-verified direct group kill rather than
+    # leaving a confirmed watcher running after 'stop'.
+    local _reap_rc=0
+    _watcher_reap_group "$pid" 5 "$NEXUS_ROOT" || _reap_rc=$?
+    if (( _reap_rc == 2 )); then
+        echo "[svc] watcher: group scan could not re-verify $pid (pid check says live watcher) — direct leader-group kill" >&2
+        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            _watcher_group_alive "$pid" || break
+            sleep 0.5
+        done
+        if _watcher_group_alive "$pid"; then
+            kill -KILL -- "-$pid" 2>/dev/null || true
+            sleep 0.5
+        fi
+        if _watcher_group_alive "$pid"; then _reap_rc=1; else _reap_rc=0; fi
+    fi
+    if (( _reap_rc == 1 )); then
+        echo "[svc] watcher: WARNING — group $pid still has members after SIGKILL; inspect: ps -eo pid,ppid,pgid,args | awk -v g=$pid '\$3==g'" >&2
+        rm -f "$WATCHER_PIDFILE"
+        return 1
     fi
     rm -f "$WATCHER_PIDFILE"
-    echo "[svc] watcher: stopped (NOTE: GitHub integration + orchestrator revival are down until 'svc.sh start watcher')" >&2
+    echo "[svc] watcher: stopped (group empty; NOTE: GitHub integration + orchestrator revival are down until 'svc.sh start watcher')" >&2
 }
 
 # THE idempotent watcher restart (operator-facing + the revive command
@@ -1129,9 +1290,24 @@ _restart_watcher() {
     _watcher_alive "$STATE_DIR" "$INTERVAL"
     local alive_rc=$?
     local pid; pid=$(cat "$WATCHER_PIDFILE" 2>/dev/null)
-    if (( alive_rc == 0 )) || _watcher_pid_is_live_watcher "$pid"; then
-        echo "[svc] watcher: restart OK — exactly one live watcher (pid=${pid:-?})" >&2
-        return 0
+    if (( alive_rc == 0 || alive_rc == 4 )) || _watcher_pid_is_live_watcher "$pid"; then
+        # The singleton claim is CHECKED, not asserted (nexus-code#491):
+        # count live watcher process GROUPS for this root. Exactly one
+        # is the contract; anything else fails loud with the pgids so
+        # the operator can reconcile by recorded pid — never pkill -f.
+        local _wg _wleader _wn _groups=()
+        while IFS=$'\t' read -r _wg _wleader _wn; do
+            [[ "$_wg" =~ ^[0-9]+$ ]] && _groups+=("$_wg($_wleader)")
+        done < <(_watcher_list_live_groups "$NEXUS_ROOT")
+        if (( ${#_groups[@]} == 1 )) || (( ${#_groups[@]} == 0 )); then
+            # 0 groups can only mean /proc scanning is unavailable —
+            # the pid/liveness checks above already passed.
+            echo "[svc] watcher: restart OK — exactly one live watcher group (pid=${pid:-?})" >&2
+            return 0
+        fi
+        echo "[svc] watcher: restart FAILED SINGLETON CHECK — ${#_groups[@]} watcher groups live after restart: ${_groups[*]}" >&2
+        echo "[svc] watcher:   reconcile: rerun 'svc.sh restart watcher' (reaps every group by pgid), or kill the stray group by recorded pgid" >&2
+        return 6
     fi
     echo "[svc] watcher: restart FAILED — no live watcher after launcher (rc=$rc, liveness bucket=$alive_rc); check $WATCHER_LOG" >&2
     return 1
@@ -1148,6 +1324,26 @@ cmd_stop() {
         "${SVC_LAUNCH[$REG_I]}" "${SVC_HEALTH[$REG_I]}"
 }
 
+# Evidence that SOMEONE deliberately restarted this service, and who. The
+# service-health watch reads this to ATTRIBUTE a recovery instead of inferring
+# one: "healthcheck went green and the watcher didn't restart it" does NOT
+# imply a self-heal — an orchestrator or operator running `svc.sh restart`
+# satisfies the same predicate, and calling that a "transient blip, no action
+# needed" buries a real outage someone had to fix (your-org/your-nexus#265).
+#
+# Actor: the watcher stamps SVC_RESTART_ACTOR=watcher when it calls us; any
+# other caller is an operator/orchestrator intervention. Best-effort — a
+# failure to record must never block the restart itself.
+_record_restart_marker() {
+    local name="$1" dir="$STATE_DIR/service-health"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    { printf 'actor=%s\n' "${SVC_RESTART_ACTOR:-operator}"
+      printf 'at=%s\n'    "$(date +%s 2>/dev/null || echo 0)"
+      printf 'iso=%s\n'   "$(date -Is 2>/dev/null || date)"
+    } > "$dir/$name.restart" 2>/dev/null || true
+    return 0
+}
+
 cmd_restart() {
     local name="$1"
     case "$name" in
@@ -1155,6 +1351,7 @@ cmd_restart() {
         watcher) _restart_watcher; return ;;
         orchestrator|"$TARGET_WINDOW") _orchestrator_redirect ;;
     esac
+    _record_restart_marker "$name"
     cmd_stop "$name" || true
     cmd_start "$name"
 }

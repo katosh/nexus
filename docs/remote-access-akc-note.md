@@ -7,7 +7,7 @@ it exists at all is a load-bearing design constraint for the confined remote age
 channel (agent-channel RFC Part A, §4.9.1). It is recorded here so the constraint
 survives the script's deletion.
 
-Operator runbook for the channel: `skills/nexus.remote-access/SKILL.md`
+Operator runbook for the channel: `skills/nexus.remote-access/SKILL.md` (in the repo, not the docs site)
 and its companion `RUNBOOK.md`. Full spec: [`docs/agent-channel-rfc.md`](agent-channel-rfc.md) §4.9.1.
 
 ## What an `AuthorizedKeysCommand` would have done

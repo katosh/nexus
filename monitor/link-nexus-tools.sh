@@ -97,6 +97,7 @@ mkdir -p "$_bindir" 2>/dev/null || { warn "cannot create $_bindir"; exit 1; }
 
 linked=0
 skipped=0
+failed=0
 for spec in "${_link_specs[@]}"; do
     read -r name rel abs <<<"$spec"
     link="$_bindir/$name"
@@ -118,6 +119,7 @@ for spec in "${_link_specs[@]}"; do
         linked=$((linked+1))
     else
         warn "failed to link $link -> $rel"
+        failed=$((failed+1))
     fi
 done
 
@@ -125,5 +127,16 @@ if (( skipped > 0 )); then
     note "linked $linked tool(s) into $_bindir (skipped $skipped)"
 else
     note "linked $linked tool(s) into $_bindir"
+fi
+
+# A failed `ln` means the toolchain this script promises is NOT on PATH by
+# name. Returning 0 there tells every caller "provisioned" when nothing was —
+# the same defect class as the read-only-mount outage of 2026-07-09, where four
+# `failed to link` warnings scrolled past inside a --quiet call and the exit
+# status said success. Fail LOUD: the caller decides whether to abort, but it
+# must be able to see that the promise was not kept.
+if (( failed > 0 )); then
+    warn "$failed link(s) FAILED — nexus tools are not on PATH by name"
+    exit 1
 fi
 exit 0

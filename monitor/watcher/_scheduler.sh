@@ -38,6 +38,14 @@ if [[ -n "${_NEXUS_SCHEDULER_LOADED:-}" ]]; then
     return 0
 fi
 _NEXUS_SCHEDULER_LOADED=1
+
+# `_ensure_service_log` (nexus-code#484/#509): the scheduler JSONL log
+# must never be created group-writable by a bare `>>`.
+_scheduler_module_dir="${BASH_SOURCE[0]%/*}"
+[[ "$_scheduler_module_dir" == "${BASH_SOURCE[0]}" ]] && _scheduler_module_dir=.
+# shellcheck source=../_log-mode.sh
+source "$_scheduler_module_dir/../_log-mode.sh"
+unset _scheduler_module_dir
 # Legacy guard so tests written against the Phase-0 scaffold's
 # `_NEXUS_SCHEDULER_SCAFFOLD_LOADED` sentinel can still detect a
 # successful source. Both names refer to the same module.
@@ -66,6 +74,7 @@ declare -gA TASK_ENABLED       # name → 1 (active) | 0 (suspended)
 declare -gA TASK_ASYNC         # name → 1 (async) | 0 (sync, default)
 declare -gA TASK_BG_PID        # name → pid of in-flight async run; 0 = none
 declare -gA TASK_BG_STARTED    # name → epoch the async run launched (ms-precision unavailable)
+declare -gA TASK_TIMEOUT_STREAK # name → consecutive watchdog kills (adaptive budget, #491)
 
 # Names that fired during the most recent `_scheduler_tick` call.
 # Reset at the top of every tick. Read by callers (and tests) that
@@ -169,6 +178,7 @@ _schedule_task() {
     : "${TASK_LAST_ELAPSED[$name]:=0}"
     : "${TASK_BG_PID[$name]:=0}"
     : "${TASK_BG_STARTED[$name]:=0}"
+    : "${TASK_TIMEOUT_STREAK[$name]:=0}"
 }
 
 # _schedule_override <name> <override_interval> <duration_seconds>
@@ -348,6 +358,7 @@ _scheduler_log_fire() {
     [[ -n "${MONITOR_SCHEDULER_LOG:-}" ]] || return 0
     local ts
     ts=$(date -Is 2>/dev/null) || ts="-"
+    _ensure_service_log "$MONITOR_SCHEDULER_LOG"
     printf '{"ts":"%s","task":"%s","rc":%d,"elapsed_ms":%d,"next_fire":%d,"phase":"%s"}\n' \
         "$ts" "$name" "$rc" "$elapsed_ms" "$next_fire" "$phase" \
         >> "$MONITOR_SCHEDULER_LOG" 2>/dev/null || true
@@ -404,6 +415,12 @@ _scheduler_fire_async() {
     # this, a failing async helper's diagnostics vanished entirely
     # (your-org/your-nexus#180 R4 diagnosability gap).
     (
+        # Host-provided subshell init (declared-if-present): main.sh
+        # closes inherited lock fds here so no async task chain can pin
+        # the instance flock past the leader's death (nexus-code#491).
+        if declare -F _scheduler_subshell_init >/dev/null 2>&1; then
+            _scheduler_subshell_init
+        fi
         "${TASK_FN[$name]}" > "$tmp_file" 2> "$err_file"
         local _fire_rc=$?
         mv "$tmp_file" "$out_file" 2>/dev/null || rm -f "$tmp_file" 2>/dev/null
@@ -488,6 +505,9 @@ _scheduler_reap_async() {
     TASK_LAST_ELAPSED[$name]=$elapsed_ms
     TASK_BG_PID[$name]=0
     TASK_BG_STARTED[$name]=0
+    # A COMPLETED run (any rc) resets the watchdog-kill streak: the
+    # adaptive budget only grows while the task never finishes (#491).
+    TASK_TIMEOUT_STREAK[$name]=0
     _scheduler_log_fire "$name" "$rc" "$elapsed_ms" "${TASK_NEXT_FIRE[$name]:-0}" "async-done"
     # Replay the helper's stderr into the watcher log at EVERY reap
     # (issue #203 follow-up / observability gap). Async helpers log
@@ -521,6 +541,18 @@ _scheduler_reap_async() {
 # Per-task watchdog budget in seconds; 0 = watchdog disabled. See the
 # MONITOR_SCHEDULER_ASYNC_TIMEOUT_FLOOR block above for the rationale
 # behind max(4 × interval, floor).
+#
+# ADAPTIVE under sustained overrun (nexus-code#491): each consecutive
+# watchdog kill DOUBLES the next run's budget, capped at
+# 2^MONITOR_SCHEDULER_ASYNC_TIMEOUT_BACKOFF_CAP × base (default cap 2,
+# i.e. up to 4× base); any completed run resets the streak. Rationale:
+# on 2026-07-09 (15 workers) compose_emit legitimately needed >300 s,
+# so the fixed budget killed — on EVERY fire — the one task that
+# stamped the watcher's proof-of-cycle, and the whole stack read a
+# working watcher as dead. A task that is merely SLOW under load must
+# eventually be allowed to finish (degrade); a task that is genuinely
+# HUNG still dies, at most (2^cap)× later, and the loud WARN fires on
+# every kill either way.
 _scheduler_async_timeout_budget() {
     local name="$1"
     local floor="${MONITOR_SCHEDULER_ASYNC_TIMEOUT_FLOOR:-300}"
@@ -532,11 +564,14 @@ _scheduler_async_timeout_budget() {
     local interval="${TASK_INTERVAL[$name]:-60}"
     [[ "$interval" =~ ^[0-9]+$ ]] || interval=60
     local by_interval=$(( interval * 4 ))
-    if (( by_interval > floor )); then
-        printf '%s\n' "$by_interval"
-    else
-        printf '%s\n' "$floor"
-    fi
+    local budget=$floor
+    (( by_interval > budget )) && budget=$by_interval
+    local streak="${TASK_TIMEOUT_STREAK[$name]:-0}"
+    local cap="${MONITOR_SCHEDULER_ASYNC_TIMEOUT_BACKOFF_CAP:-2}"
+    [[ "$streak" =~ ^[0-9]+$ ]] || streak=0
+    [[ "$cap" =~ ^[0-9]+$ ]] || cap=2
+    (( streak > cap )) && streak=$cap
+    printf '%s\n' $(( budget << streak ))
 }
 
 # _scheduler_check_async_timeout <name> <now>
@@ -573,9 +608,16 @@ _scheduler_check_async_timeout() {
     TASK_BG_STARTED[$name]=0
     TASK_LAST_RC[$name]=124
     TASK_LAST_ELAPSED[$name]=$(( age * 1000 ))
+    # Grow the adaptive budget for the NEXT run (#491): a slow-under-load
+    # task must eventually be allowed to finish instead of being killed
+    # at the same mark forever (which starved the cycle stamp and made a
+    # working watcher read as dead on 2026-07-09).
+    local _streak="${TASK_TIMEOUT_STREAK[$name]:-0}"
+    [[ "$_streak" =~ ^[0-9]+$ ]] || _streak=0
+    TASK_TIMEOUT_STREAK[$name]=$(( _streak + 1 ))
     _scheduler_log_fire "$name" 124 $(( age * 1000 )) "${TASK_NEXT_FIRE[$name]:-0}" "async-timeout"
     if declare -F log >/dev/null 2>&1; then
-        log "WARN scheduler: async task '$name' exceeded its ${budget}s watchdog budget (in-flight ${age}s); killed pid=$pid and its children. Task re-arms on its next due tick."
+        log "WARN scheduler: async task '$name' exceeded its ${budget}s watchdog budget (in-flight ${age}s); killed pid=$pid and its children. Task re-arms on its next due tick with budget $(_scheduler_async_timeout_budget "$name")s (consecutive kills: ${TASK_TIMEOUT_STREAK[$name]})."
     fi
     return 0
 }
@@ -780,6 +822,7 @@ _scheduler_reset_for_tests() {
     TASK_ASYNC=()
     TASK_BG_PID=()
     TASK_BG_STARTED=()
+    TASK_TIMEOUT_STREAK=()
     _SCHEDULER_FIRED_THIS_TICK=()
     _scheduler_shutdown_requested=0
 }

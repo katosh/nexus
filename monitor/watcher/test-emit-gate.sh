@@ -27,6 +27,12 @@ set -uo pipefail
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 _main_sh="$_test_dir/main.sh"
 
+# Sourced for th_hermetic_path / th_assert_path_resolves_cnf (the
+# fork-bomb precondition guard, your-org/nexus-code#479); the inline
+# assert helpers below stay for self-containment and shadow the
+# helper-file versions.
+. "$_test_dir/_test_helpers.sh"
+
 PASS=0
 FAIL=0
 
@@ -162,10 +168,22 @@ JSON
 # Drop tmux + jq are required (jq is normal-system; we keep). Drop
 # tmux so paste_with_retry returns rc=1 quickly. Keep jq, find, awk,
 # coreutils available.
+#
+# th_hermetic_path keeps command_not_found.py resolvable on the
+# synthetic PATH. Composing it from absolute system dirs used to drop
+# /app/bin — the precondition for Lmod's command_not_found_handle fork
+# chain that exhausted pid_max on 2026-07-08 (your-org/nexus-code#457,
+# fixed per #479). The assertion below is the both-directions
+# regression: it FAILS on the bare composition and PASSES on the
+# guarded one (vacuous off-sandbox, where the handler cannot arm).
 PATH_NO_TMUX="$mock_bin"
 for d in /usr/local/bin /usr/bin /bin; do
     [[ -d "$d" ]] && PATH_NO_TMUX="${PATH_NO_TMUX}:${d}"
 done
+PATH_NO_TMUX=$(th_hermetic_path "$PATH_NO_TMUX" "$WORK")
+th_assert_path_resolves_cnf \
+    "synthetic PATH keeps command_not_found.py resolvable (fork-bomb precondition, your-org/nexus-code#479)" \
+    "$PATH_NO_TMUX"
 
 # Common env for every main.sh --once invocation. AGENT_MISSING_RESPAWN_DELAY
 # is large so the no-tmux poll-level "target absent" check (rc=1) doesn't

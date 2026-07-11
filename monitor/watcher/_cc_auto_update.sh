@@ -71,6 +71,15 @@ if [[ -n "${_NEXUS_CC_AUTO_UPDATE_LOADED:-}" ]]; then
 fi
 _NEXUS_CC_AUTO_UPDATE_LOADED=1
 
+# `_ensure_service_log` (your-org/nexus-code#484/#509): every log this
+# module appends to is created 0640, never group-writable. Pure-bash
+# path derivation (no dirname — see nexus-code#513's portability aside).
+_cc_auto_module_dir="${BASH_SOURCE[0]%/*}"
+[[ "$_cc_auto_module_dir" == "${BASH_SOURCE[0]}" ]] && _cc_auto_module_dir=.
+# shellcheck source=../_log-mode.sh
+source "$_cc_auto_module_dir/../_log-mode.sh"
+unset _cc_auto_module_dir
+
 # Evaluator window name. Fixed so the window-alive guard and
 # spawn-worker's collision check both key off one canonical name.
 : "${CC_AUTO_WINDOW:=cc-auto-update}"
@@ -212,6 +221,77 @@ _cc_auto_render_prompt() {
     printf '%s\n' "$body" > "$out"
 }
 
+# ---- restart hold (your-org/nexus-code#513) ------------------------------
+# A deliberately-refused orchestrator restart must be REPRESENTABLE, or it
+# cannot stay refused: the reconcile's fire predicate is the version split
+# itself, and its single-flight guard is a `kill -0` on the detached
+# restart's pid — so correctly SIGTERMing an unwanted restart is exactly
+# what re-arms the next one, every cooldown period, forever (the
+# 2026-07-10 live incident: abort at 04:08, auto-refire at 04:09:55).
+#
+# The hold is a durable key=value marker at
+# `$auto_dir/restart-hold`, checked by the RUNNING watcher on every
+# reconcile pass — unlike `monitor.cc_auto_update.enabled`, whose env var
+# is resolved once at watcher startup (main.sh registration) and is
+# therefore INERT as a hold on a live watcher. Fields:
+#   reason=<free text>       required — why the restart is held
+#   ts=<ISO>                 when the hold was written
+#   expires=<epoch>          optional TTL — inactive once now >= expires
+#   until_version=<X.Y.Z>    optional — holds candidates <= this version;
+#                            a NEWER effective version re-arms (the same
+#                            model as the daily guard's awaiting-operator
+#                            skip: a hold is per-candidate, not forever)
+# Written by cc-auto-update-apply.sh's `hold` verb (operator/agent) and
+# by a SIGTERM'd detached restart (abort-on-purpose). Released by the
+# `unhold` verb or by its own expiry terms.
+
+# _cc_auto_write_restart_hold <auto_dir> <reason> [expires_epoch] [until_version]
+#
+# Write the hold marker atomically (tmp+rename) and append the audit
+# row. rc 0 on success; non-zero when the marker cannot be written —
+# callers that abort a restart MUST treat that as loud, not silent.
+_cc_auto_write_restart_hold() {
+    local dir="${1:?auto_dir required}" reason="${2:?reason required}"
+    local expires="${3:-}" until_version="${4:-}"
+    mkdir -p "$dir" 2>/dev/null || return 1
+    local tmp="$dir/restart-hold.tmp.$$"
+    {
+        printf 'reason=%s\n' "$reason"
+        printf 'ts=%s\n' "$(date -Is 2>/dev/null || echo unknown)"
+        if [[ -n "$expires" ]];       then printf 'expires=%s\n' "$expires"; fi
+        if [[ -n "$until_version" ]]; then printf 'until_version=%s\n' "$until_version"; fi
+    } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+    mv -f "$tmp" "$dir/restart-hold" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+    _cc_auto_log_decision "$dir" "${until_version:--}" "restart-hold-set" \
+        "reason=$reason${expires:+ expires=$expires}"
+    return 0
+}
+
+# _cc_auto_restart_hold_active <auto_dir> <effective_version> [now_epoch]
+#
+# rc 0 iff a hold marker exists AND none of its expiry terms have lapsed:
+#   - `expires` set and now >= expires            → inactive (TTL lapsed)
+#   - `until_version` set and effective is NEWER  → inactive (re-armed)
+# Pure read; an expired marker is left in place as evidence (the next
+# `hold`/`unhold` overwrites/removes it).
+_cc_auto_restart_hold_active() {
+    local dir="${1:?auto_dir required}" effective="${2:?effective required}"
+    local now="${3:-$(_cc_auto_clock)}"
+    local f="$dir/restart-hold"
+    [[ -f "$f" ]] || return 1
+    local expires until_version
+    expires=$(_cc_update_field "$f" expires 2>/dev/null || true)
+    if [[ "$expires" =~ ^[0-9]+$ ]] && (( now >= expires )); then
+        return 1
+    fi
+    until_version=$(_cc_update_field "$f" until_version 2>/dev/null || true)
+    if [[ -n "$until_version" ]] \
+       && [[ "$(_cc_update_compare "$until_version" "$effective")" == "newer" ]]; then
+        return 1
+    fi
+    return 0
+}
+
 # _cc_auto_reconcile_pending_restart <nexus_root> <state_dir> <package> [now_epoch]
 #
 # RESTART-PENDING RECONCILIATION — fires INDEPENDENTLY of the registry
@@ -240,6 +320,9 @@ _cc_auto_render_prompt() {
 #     or AHEAD of it (older: an operator-hand-rolled prerelease);
 #   - there is no valid session pin or no readable running version
 #     (a kill then would cold-spawn / be blind);
+#   - an operator/agent RESTART-HOLD is active (nexus-code#513) — a
+#     deliberately-refused restart stays refused until the hold expires,
+#     a newer version re-arms it, or `apply.sh unhold` releases it;
 #   - a reconcile/restart is already IN FLIGHT — a live detached restart
 #     pid, the armed marker, or a live watchdog window (the running
 #     version stays old until the respawn stamps the new one, so without
@@ -300,6 +383,28 @@ _cc_auto_reconcile_pending_restart() {
     #    or any I/O below.
     [[ "$(_cc_update_compare "$running" "$effective")" == "newer" ]] || return 0
 
+    # 4b. OPERATOR HOLD (your-org/nexus-code#513). A refused restart must
+    #     STAY refused: the split just confirmed above is itself the fire
+    #     predicate, so without a durable hold, aborting an unwanted
+    #     restart re-arms the next one on every post-cooldown tick,
+    #     forever — doing nothing selects decapitation by default. This
+    #     check runs on the LIVE watcher every tick (the enabled flag
+    #     cannot: it is read once at startup). Logged once per hold
+    #     write, not per tick — the ack stamp mirrors the hold's mtime.
+    if _cc_auto_restart_hold_active "$auto_dir" "$effective" "$now"; then
+        local hold_f="$auto_dir/restart-hold" ack="$auto_dir/reconcile-held.acked"
+        if [[ ! -f "$ack" || "$hold_f" -nt "$ack" ]]; then
+            local hreason
+            hreason=$(_cc_update_field "$hold_f" reason 2>/dev/null || echo '?')
+            _cc_auto_log_decision "$auto_dir" "$effective" "reconcile-held" \
+                "running=$running reason=$hreason"
+            declare -F log >/dev/null 2>&1 \
+                && log "cc-auto-update: version-split (running=$running installed=$effective) NOT reconciled — restart-hold active ($hreason). Release: monitor/cc-auto-update-apply.sh unhold"
+            touch -r "$hold_f" "$ack" 2>/dev/null || true
+        fi
+        return 0
+    fi
+
     # 5. Single-flight: never stack a second hand-off on an in-flight one.
     #    The detached `restart-orchestrator` records its PID first thing; a
     #    live pid, the armed marker, or a live watchdog window all mean a
@@ -340,6 +445,9 @@ _cc_auto_reconcile_pending_restart() {
 
     local apply_cmd="${CC_AUTO_APPLY_CMD:-$nexus_root/monitor/cc-auto-update-apply.sh}"
     local detached_log="$auto_dir/detached-restart.log"
+    # Explicit mode at creation (your-org/nexus-code#484/#509) — both
+    # branches below open this log with a bare `>>`.
+    _ensure_service_log "$detached_log"
     if [[ "${CC_AUTO_RECONCILE_INLINE:-0}" == "1" ]]; then
         # Test seam (mirrors cmd_safe's CC_AUTO_RESTART_INLINE): run the
         # hand-off synchronously so a test asserts the chain deterministically.

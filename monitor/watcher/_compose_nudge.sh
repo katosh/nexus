@@ -56,6 +56,7 @@ _NEXUS_COMPOSE_NUDGE_LOADED=1
 # restart (intentional — see "State persistence" above).
 _compose_nudge_last_queue_mtime=0
 _compose_nudge_last_github_mtime=0
+_compose_nudge_last_requests_mtime=0
 
 # Return mtime in epoch seconds; 0 when the file is absent or stat fails.
 _compose_nudge_mtime() {
@@ -71,15 +72,26 @@ _compose_nudge_size() {
     stat -c %s "$f" 2>/dev/null || printf '0\n'
 }
 
-# _compose_emit_nudge_check <queue_file> <gh_out_file>
+# _compose_emit_nudge_check <queue_file> <gh_out_file> [<requests_out_file>]
 #
 # Returns 0 if a nudge fired (force-fire + override applied); 1 if not.
 # Idempotent: a second call with unchanged mtimes is a no-op. The
 # last-seen mtime advances regardless of size so a sequence of
 # empty github_poll fires only consults the size guard once each.
+#
+# The third source (your-org/nexus-code#483, skeptic follow-up) is the
+# requests_poll staging file: without it nothing pulls compose_emit
+# forward for a newly filed request, and a `reply: required` remote ask
+# waits out the full compose cadence. Under stamp-on-paste the stage
+# stays non-empty (rewritten every requests_poll fire, same content)
+# until a paste succeeds, so this nudge re-fires each 10 s tick while a
+# request is undelivered — deliberately: the first successful compose
+# pastes, delivery-stamps, and truncates the stage, and the nudge goes
+# quiet. A sustained re-nudge therefore only happens while pastes are
+# actually failing, where compose churn is the cheapest of the problems.
 _compose_emit_nudge_check() {
-    local queue_file="$1" gh_out_file="$2"
-    local queue_mtime queue_size gh_mtime gh_size
+    local queue_file="$1" gh_out_file="$2" requests_out_file="${3:-}"
+    local queue_mtime queue_size gh_mtime gh_size req_mtime req_size
     queue_mtime=$(_compose_nudge_mtime "$queue_file")
     queue_size=$(_compose_nudge_size  "$queue_file")
     gh_mtime=$(_compose_nudge_mtime "$gh_out_file")
@@ -95,6 +107,15 @@ _compose_emit_nudge_check() {
     if (( gh_mtime > _compose_nudge_last_github_mtime )); then
         _compose_nudge_last_github_mtime=$gh_mtime
         (( gh_size > 0 )) && should_nudge=1
+    fi
+
+    if [[ -n "$requests_out_file" ]]; then
+        req_mtime=$(_compose_nudge_mtime "$requests_out_file")
+        req_size=$(_compose_nudge_size  "$requests_out_file")
+        if (( req_mtime > _compose_nudge_last_requests_mtime )); then
+            _compose_nudge_last_requests_mtime=$req_mtime
+            (( req_size > 0 )) && should_nudge=1
+        fi
     fi
 
     (( should_nudge == 1 )) || return 1
@@ -114,4 +135,5 @@ _compose_emit_nudge_check() {
 _compose_nudge_reset_for_tests() {
     _compose_nudge_last_queue_mtime=0
     _compose_nudge_last_github_mtime=0
+    _compose_nudge_last_requests_mtime=0
 }

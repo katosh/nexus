@@ -172,7 +172,10 @@ cd "$(config/load.sh nexus.root)"/monitor
 
 ./watcher/main.sh --once                         # one poll cycle, attended foreground, exit
 MONITOR_INTERVAL=10 ./watcher/main.sh            # snappier polling, attended foreground
-./watcher/launcher.sh --target orchestrator      # spawn the usual headless watcher
+./watcher/launcher.sh                            # spawn the usual headless watcher
+                                                 # (--target defaults to config
+                                                 #  monitor.target_window; pass it
+                                                 #  only to override)
 ./watcher/launcher.sh --replace                  # kill the recorded watcher first, then spawn
 ./svc.sh restart watcher                         # same as --replace, via the service CLI
 ```

@@ -69,6 +69,13 @@ _cfg="$_nexus_root/config/load.sh"
 # shellcheck source=_lib.sh
 source "$_script_dir/_lib.sh"
 
+# Explicit log mode at creation (your-org/nexus-code#484/#509): the
+# `>>"$LOGFILE"` spawn redirects below create watcher.log under the
+# ambient umask (0660 on group-shared trees) — a log any group member
+# could rewrite with nothing recording that they did.
+# shellcheck source=../_log-mode.sh
+source "$_monitor_dir/_log-mode.sh"
+
 # Async-respawn primitives. We need `_respawn_async_cancel` so a
 # `--replace` (an INTENTIONAL watcher replacement) can cancel any
 # in-flight respawn subshell the replaced watcher backgrounded — those
@@ -87,10 +94,32 @@ ENSURE=0
 INSTANCE_STATUS=0
 IACCEPT_NO_SANDBOX=0
 
+# An EMPTY --target / --window must FAIL LOUD, never silently override the
+# config-resolved defaults above (nexus-code#459).
+#
+# `--target) TARGET="${2:-}"` accepted an empty argument, so a runbook line that
+# interpolates an UNSET variable — `launcher.sh --target "$TARGET_WINDOW"` —
+# expands to `--target ''` in any shell without `set -u` and the empty string
+# WINS over `monitor.target_window`. The watcher then launches with no
+# coordinator window to paste into: a nexus that looks healthy and reaches
+# nobody. Because the resolved default is the correct value in every such case,
+# refusing is strictly safer than accepting, and refusing LOUDLY is the only
+# thing that tells the caller their variable was empty.
+#
+# Guard the flag, not just the one runbook that got it wrong: the flag is the
+# copy-pasteable surface, and this file cannot see its callers.
+_require_arg() { # flag value
+    [[ -n "${2:-}" ]] && return 0
+    echo "launcher.sh: $1 requires a non-empty value (got an empty argument —" \
+         "an unset variable in the caller?). Omit $1 to use the configured" \
+         "default. Resolved defaults: --target '$TARGET' --window '$WINDOW'." >&2
+    exit 2
+}
+
 while (( $# > 0 )); do
     case "$1" in
-        --target)  TARGET="${2:-}"; shift 2 ;;
-        --window)  WINDOW="${2:-}"; shift 2 ;;
+        --target)  _require_arg --target "${2:-}"; TARGET="$2"; shift 2 ;;
+        --window)  _require_arg --window "${2:-}"; WINDOW="$2"; shift 2 ;;
         --force)   FORCE=1; shift ;;
         --replace) REPLACE=1; shift ;;
         --i-accept-no-sandbox) IACCEPT_NO_SANDBOX=1; shift ;;
@@ -176,16 +205,47 @@ _RESTART_LOCK_FD=""
 # main.sh's acquire_instance_lock. mkdir -p above makes the open
 # effectively never fail; the `if !` degrades gracefully if it somehow does.
 if exec {_RESTART_LOCK_FD}<>"$RESTART_LOCK"; then
-    # Block bounded; on timeout we proceed (the instance lock backstops
-    # uniqueness) rather than deadlock recovery. The held fd IS the lock —
-    # left open until this process exits (closed in the watcher child, below).
+    # Block bounded; on timeout REFUSE (fail closed, nexus-code#491). The
+    # old behaviour — "proceed, the instance lock backstops uniqueness" —
+    # was one of the windows through which the 2026-07-09 duplicate
+    # watchers arrived: under load (exactly when restart storms fire and
+    # launchers run long) two launchers could both be past the lock, and
+    # the instance flock only closes the race minutes later, after the
+    # spawned main.sh finishes its config sourcing. A refused launcher is
+    # retryable and loud; a duplicate watcher is silent double-writes.
     if ! flock -w "${WATCHER_RESTART_LOCK_WAIT:-45}" "$_RESTART_LOCK_FD"; then
-        echo "launcher.sh: WARN could not acquire restart lock ($RESTART_LOCK) within ${WATCHER_RESTART_LOCK_WAIT:-45}s; proceeding (instance lock is the uniqueness backstop)" >&2
+        echo "launcher.sh: REFUSING — could not acquire the single-flight restart lock ($RESTART_LOCK) within ${WATCHER_RESTART_LOCK_WAIT:-45}s: another (re)start is in flight." >&2
+        echo "  Retry after it finishes; a concurrent second spawn risks duplicate watchers (double emits, racing state writes)." >&2
+        exit 5
     fi
 else
     _RESTART_LOCK_FD=""
     echo "launcher.sh: WARN could not open restart lock $RESTART_LOCK; proceeding without single-flight serialization" >&2
 fi
+
+# Durable spawn attribution (nexus-code#491). During the 2026-07-09
+# duplicate-watcher incident the second spawner was UNATTRIBUTABLE:
+# launcher runs from orchestrator-side surfaces log only to their
+# caller's stderr. Every consequential launcher decision now also
+# appends one line to a shared audit log, stamped with the caller
+# (WATCHER_LAUNCH_CALLER when the caller sets it, else the parent's
+# argv). Best-effort — auditing never blocks a (re)start.
+SPAWN_AUDIT_LOG="$_nexus_root/monitor/.state/watcher-spawns.log"
+_launch_caller() {
+    if [[ -n "${WATCHER_LAUNCH_CALLER:-}" ]]; then
+        printf '%s' "$WATCHER_LAUNCH_CALLER"
+    else
+        tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null | head -c 120 || printf 'ppid=%s' "$PPID"
+    fi
+}
+_launch_audit() {
+    if [[ -f "$SPAWN_AUDIT_LOG" ]] && (( $(stat -c%s "$SPAWN_AUDIT_LOG" 2>/dev/null || echo 0) > 1048576 )); then
+        mv -f "$SPAWN_AUDIT_LOG" "$SPAWN_AUDIT_LOG.1" 2>/dev/null || true
+    fi
+    printf '%s launcher[%d] caller=[%s] %s\n' \
+        "$(date -Is 2>/dev/null || echo '?')" "$$" "$(_launch_caller)" "$*" \
+        >> "$SPAWN_AUDIT_LOG" 2>/dev/null || true
+}
 
 # Defense-in-depth against the bootstrap race (issue #43). Even with
 # bootstrap.sh's flock, an orphan watcher process can exist without a
@@ -233,6 +293,35 @@ if [[ -f "$PIDFILE" ]]; then
             echo "  (pass --replace to kill it first, or kill it explicitly: kill $existing_pid; rm $PIDFILE)" >&2
             exit 1
         fi
+        # --replace on a READ-ONLY project FS is a DECAPITATION.
+        #
+        # An already-open fd survives its mount being detached: the
+        # incumbent watcher holds `watcher.log` open and keeps working, at
+        # full fidelity, straight through a read-only remount. Its
+        # successor does not — it must resolve every path afresh, and dies
+        # in the `>>"$LOGFILE"` redirection below before `main.sh` runs a
+        # single line. So a `--replace` here kills the ONLY functioning
+        # watcher and puts nothing in its place: exactly what happened on
+        # 2026-06-29 and again on 2026-07-09 (both incidents open with
+        # `version_check` -> `--replace` -> SIGTERM -> EROFS -> "did not
+        # publish a live pidfile", then silence until a human noticed).
+        #
+        # A FRESH probe (never a cached fd — see monitor/_fs_probe.sh)
+        # decides. Read-only ⇒ refuse to replace, leave the incumbent
+        # running, escalate once over a channel that needs no filesystem
+        # write, and exit non-zero. Degrading beats decapitating.
+        if ! _nexus_dir_writable "$_nexus_root/monitor/.state"; then
+            echo "launcher.sh: --replace REFUSED: the project FS is READ-ONLY ($_nexus_root/monitor/.state)." >&2
+            echo "  The running watcher (pid=$existing_pid) still works on its already-open fds; its replacement could not start." >&2
+            echo "  Leaving the incumbent alive. Restart the sandbox from OUTSIDE to restore the writable bind." >&2
+            _nexus_critical_alarm "watcher-rofs" "${MONITOR_ROFS_ALARM_THROTTLE_SECONDS:-120}" \
+                "$(_nexus_rofs_alarm_text "$_nexus_root/monitor/.state" "launcher.sh --replace")" \
+                && _nexus_github_incident_escalate "$_nexus_root" \
+                       "$_nexus_root/monitor/.state" "launcher.sh --replace" \
+                       "incumbent watcher pid=$existing_pid left ALIVE (replace refused)" || true
+            exit 5
+        fi
+
         # --replace: terminate the running watcher before spawning.
         # Graceful first (SIGTERM, up to 5s) so its EXIT/INT/TERM
         # trap in main.sh can release_pidfile + release_lock and
@@ -254,23 +343,34 @@ if [[ -f "$PIDFILE" ]]; then
         # operator hit. The orchestrator is NOT in this group (it lives in
         # the tmux server's tree), so a group kill never touches it. Fall
         # back to the bare pid if the group signal is rejected.
-        echo "launcher.sh: --replace: sending SIGTERM to watcher process group $existing_pid" >&2
+        # The death test is GROUP emptiness, not leader exit
+        # (nexus-code#491): main.sh forks a subshell chain, and a
+        # leader-only wait "succeeds" while orphaned children keep
+        # running the loop (decapitation, observed live 2026-07-09
+        # 17:45 — a leader dead 6 minutes with its chain still forking
+        # tac/jq). TERM the group, wait for EVERY member to be gone,
+        # escalate to KILL, and VERIFY emptiness before spawning.
+        echo "launcher.sh: --replace: sending SIGTERM to watcher process group $existing_pid (waiting for the WHOLE group)" >&2
         kill -TERM -- "-$existing_pid" 2>/dev/null \
             || kill -TERM "$existing_pid" 2>/dev/null || true
         for _i in 1 2 3 4 5 6 7 8 9 10; do
-            kill -0 "$existing_pid" 2>/dev/null || break
+            _watcher_group_alive "$existing_pid" || kill -0 "$existing_pid" 2>/dev/null || break
             sleep 0.5
         done
-        if kill -0 "$existing_pid" 2>/dev/null; then
-            echo "launcher.sh: --replace: watcher $existing_pid did not exit within 5s, sending SIGKILL to the process group" >&2
+        if _watcher_group_alive "$existing_pid" || kill -0 "$existing_pid" 2>/dev/null; then
+            echo "launcher.sh: --replace: watcher group $existing_pid did not empty within 5s, sending SIGKILL to the process group" >&2
             kill -9 -- "-$existing_pid" 2>/dev/null \
                 || kill -9 "$existing_pid" 2>/dev/null || true
-            # Give the kernel a brief moment to reap, then force-
-            # remove the pid file (the trap won't fire on SIGKILL).
-            sleep 0.2
+            sleep 0.5
+            if _watcher_group_alive "$existing_pid"; then
+                echo "launcher.sh: FATAL: watcher group $existing_pid has survivors after SIGKILL; REFUSING to spawn alongside them" >&2
+                _launch_audit "refuse-unkillable pgid=$existing_pid"
+                exit 6
+            fi
+            # The trap won't fire on SIGKILL; force-remove the pidfile.
             rm -f "$PIDFILE"
         else
-            echo "launcher.sh: --replace: watcher $existing_pid exited gracefully" >&2
+            echo "launcher.sh: --replace: watcher $existing_pid exited gracefully (group empty)" >&2
             # The trap should have removed PIDFILE; guard anyway.
             rm -f "$PIDFILE"
         fi
@@ -294,12 +394,117 @@ if [[ -f "$PIDFILE" ]]; then
     else
         # Stale PID file (dead pid, garbage content, or a recycled PID
         # now owned by a non-watcher process). Remove it so a future
-        # operator reading the state dir isn't misled. --replace
-        # doesn't change this path — there's no live watcher to wait
-        # on, so we don't pay the grace window. We also do NOT signal
+        # operator reading the state dir isn't misled. We do NOT signal
         # the recycled PID's current owner: it isn't ours to kill.
+        #
+        # BUT a dead recorded pid does NOT mean a dead watcher TREE
+        # (nexus-code#491 decapitation): the leader's orphaned subshell
+        # chain keeps the pgid alive and keeps running the loop.
+        #
+        # IDENTITY BEFORE SIGNAL (skeptic finding 1 on PR#503): the pid
+        # is NOT the identity. A recycled pid can name ANY setsid
+        # leader's group — a worker pane, a registry service, another
+        # agent's job — and an unverified group kill here TERMed an
+        # innocent `setsid sleep` group in the skeptic's repro.
+        # _watcher_reap_group is therefore called WITH the nexus root:
+        # it signals the group ONLY if it still contains an
+        # argv-verified watcher member for this root, and REFUSES
+        # (rc 2) otherwise — leaving a recycled pid's owner untouched.
+        # A refused group with no argv member is by definition not a
+        # watcher loop; verified decapitated trees are also reaped by
+        # the group-scan gate below.
+        if [[ "$existing_pid" =~ ^[0-9]+$ ]] && _watcher_group_alive "$existing_pid"; then
+            _reap_rc=0
+            _watcher_reap_group "$existing_pid" 5 "$_nexus_root" || _reap_rc=$?
+            case "$_reap_rc" in
+                0)
+                    echo "launcher.sh: recorded watcher pid $existing_pid was dead but its argv-verified group still had members (decapitated orphan loop) — reaped" >&2
+                    _launch_audit "reap-decapitated pgid=$existing_pid"
+                    ;;
+                2)
+                    echo "launcher.sh: recorded pid $existing_pid is dead and group $existing_pid has live members but NO argv-verified watcher among them (recycled pid / foreign group) — NOT ours to kill; leaving it untouched" >&2
+                    _launch_audit "refuse-unverified-group pgid=$existing_pid"
+                    ;;
+                *)
+                    echo "launcher.sh: FATAL: decapitated group $existing_pid has survivors after SIGKILL; REFUSING to spawn alongside them" >&2
+                    _launch_audit "refuse-unkillable pgid=$existing_pid"
+                    exit 6
+                    ;;
+            esac
+        fi
         rm -f "$PIDFILE"
     fi
+fi
+
+# PROCESS-GROUP singleton gate (nexus-code#491). The pidfile guard above
+# is blind (a) between a spawn and its — possibly minutes-late, under
+# load — pidfile publish, and (b) to DECAPITATED trees: main.sh's
+# orphaned subshell chain keeps running the loop after the recorded
+# leader dies (observed live 2026-07-09 17:45). Enumerate every process
+# GROUP containing argv-identified watcher members for THIS nexus root
+# (_watcher_list_live_groups; argv identity + pgrp, never ppid==1 —
+# orphans reparent to init and inherit argv).
+#
+#   decapitated group (leader dead)  reaped in EVERY mode — a
+#                                    leaderless loop is defunct: it
+#                                    heartbeats for a dead pid, races
+#                                    state writes, and can never be
+#                                    supervised. Reap by pgid, verify
+#                                    empty, refuse on survivors.
+#   live-leader group + --ensure     idempotent no-op success
+#   live-leader group + bare         refuse (same contract as pidfile)
+#   live-leader group + --replace    reap by pgid (TERM, wait for the
+#                                    WHOLE group, KILL, verify empty);
+#                                    REFUSE to spawn on survivors —
+#                                    never spawn alongside a watcher
+#                                    that may still be exiting.
+_live_leader_groups=()
+while IFS=$'\t' read -r _wg _wleader _wn; do
+    [[ "$_wg" =~ ^[0-9]+$ ]] || continue
+    if [[ "$_wleader" == dead ]]; then
+        echo "launcher.sh: decapitated watcher group $_wg (leader dead, $_wn orphaned member(s) still looping) — reaping before any spawn" >&2
+        _launch_audit "reap-decapitated pgid=$_wg members=$_wn"
+        # Root passed: the reap re-verifies argv identity at kill time
+        # (rc 2 = the group's watcher members vanished since the scan —
+        # nothing left that is ours to kill; benign).
+        _reap_rc=0
+        _watcher_reap_group "$_wg" "${WATCHER_REPLACE_KILL_WAIT:-10}" "$_nexus_root" || _reap_rc=$?
+        if (( _reap_rc == 1 )); then
+            echo "launcher.sh: FATAL: decapitated group $_wg has survivors after SIGKILL; REFUSING to spawn alongside them" >&2
+            _launch_audit "refuse-unkillable pgid=$_wg"
+            exit 6
+        fi
+    else
+        _live_leader_groups+=("$_wg")
+    fi
+done < <(_watcher_list_live_groups "$_nexus_root")
+
+if (( ${#_live_leader_groups[@]} > 0 )); then
+    if (( ENSURE == 1 )); then
+        echo "launcher.sh: live watcher group(s) ${_live_leader_groups[*]} found for $_nexus_root — --ensure no-op (idempotent)"
+        _launch_audit "ensure-noop live=${_live_leader_groups[*]}"
+        exit 0
+    fi
+    if (( REPLACE == 0 )); then
+        echo "launcher.sh: live watcher group(s) ${_live_leader_groups[*]} exist for $_nexus_root (found via process table; pidfile may lag); refusing to spawn" >&2
+        echo "  (pass --replace to kill them first)" >&2
+        _launch_audit "refuse-bare live=${_live_leader_groups[*]}"
+        exit 1
+    fi
+    echo "launcher.sh: --replace: reaping ${#_live_leader_groups[@]} live watcher group(s) not covered by the pidfile: ${_live_leader_groups[*]}" >&2
+    for _wg in "${_live_leader_groups[@]}"; do
+        # Root passed: identity re-verified at kill time (rc 2 = gone
+        # between scan and kill — benign).
+        _reap_rc=0
+        _watcher_reap_group "$_wg" "${WATCHER_REPLACE_KILL_WAIT:-10}" "$_nexus_root" || _reap_rc=$?
+        if (( _reap_rc == 1 )); then
+            echo "launcher.sh: FATAL: watcher group $_wg has survivors after SIGKILL; REFUSING to spawn alongside them" >&2
+            _launch_audit "refuse-unkillable pgid=$_wg"
+            exit 6
+        fi
+    done
+    _launch_audit "replace-reaped groups=${_live_leader_groups[*]}"
+    rm -f "$PIDFILE" 2>/dev/null || true
 fi
 
 # Self-install Claude Code if absent. The orchestrator + every spawned
@@ -428,12 +633,42 @@ fi
 
 LOGFILE="$_nexus_root/monitor/.state/watcher.log"
 mkdir -p "$_nexus_root/monitor/.state" 2>/dev/null || true
+
+# The redirection `>>"$LOGFILE"` below is a FRESH open(), performed by the
+# forked child before it execs main.sh. On a read-only project FS that
+# open fails with EROFS, bash aborts the command, and main.sh NEVER RUNS —
+# no probe, no degraded mode, no escalation, no log line explaining why.
+# That single unguarded redirect is what turned two transient remounts
+# into total, silent, multi-hour watcher outages. (The incumbent, holding
+# this same path on an fd opened before the remount, went on logging
+# perfectly — which is exactly why the outages were so confusing.)
+#
+# So: probe the state dir with a fresh create+unlink, and if it is not
+# writable, redirect the successor's output to a log on a mount that IS
+# writable. The watcher then starts, discovers the read-only FS itself,
+# and degrades loudly instead of dying silently. `${TMPDIR:-/tmp}` is the
+# same independent mount `_nexus_critical_alarm` throttles on.
+if ! _nexus_dir_writable "$_nexus_root/monitor/.state"; then
+    _degraded_log="${TMPDIR:-/tmp}/nexus-watcher-degraded.log"
+    echo "launcher.sh: project FS is READ-ONLY — cannot open $LOGFILE for append." >&2
+    echo "launcher.sh: redirecting watcher output to $_degraded_log so the watcher can START and report the condition instead of dying in its own redirect." >&2
+    LOGFILE="$_degraded_log"
+    _ensure_service_log "$LOGFILE"
+    NEXUS_FS_DEGRADED=1
+    export NEXUS_FS_DEGRADED
+fi
 # Rotate on spawn past ~10MB (one prior generation kept): the windowed
 # watcher had bounded pane scrollback; an append-forever file doesn't.
 if [[ -f "$LOGFILE" ]] && (( $(stat -c%s "$LOGFILE" 2>/dev/null || echo 0) > 10485760 )); then
     mv -f "$LOGFILE" "$LOGFILE.1" 2>/dev/null || true
 fi
 command -v setsid >/dev/null 2>&1 || { echo "launcher.sh: setsid required for headless launch" >&2; exit 2; }
+# Restore the soft RLIMIT_NPROC to the hard limit (fork-storm class,
+# your-org/nexus-code#487). Worker shells run under a soft nproc ceiling
+# from spawn-worker.sh; the watcher must never inherit it — a capped
+# watcher starves during exactly the storms it exists to survive. The
+# worker ceiling is soft-only, so this raise is always permitted.
+ulimit -Su "$(ulimit -Hu)" 2>/dev/null || true
 # CRITICAL: close the single-flight restart-lock fd IN THE SPAWNED WATCHER
 # (`{_RESTART_LOCK_FD}>&-`). Without this the long-lived watcher INHERITS
 # the open fd and thus HOLDS the restart lock for its entire lifetime, so
@@ -451,6 +686,11 @@ command -v setsid >/dev/null 2>&1 || { echo "launcher.sh: setsid required for he
 # your-org/nexus-code #292 regression). Since the redirect can't be made
 # conditional via expansion, branch on whether the fd is set and emit the
 # brace-form `{_RESTART_LOCK_FD}>&-` literally (bash ≥ 4.1).
+# Create/repair the log with an explicit 0640 mode immediately before
+# the redirect that would otherwise create it under the ambient umask
+# (nexus-code#509) — after the rotation above, which can leave the path
+# absent.
+_ensure_service_log "$LOGFILE"
 if [[ -n "$_RESTART_LOCK_FD" ]]; then
     setsid env WATCHER_WINDOW=headless \
         "$_script_dir/main.sh" --target "$TARGET" </dev/null >>"$LOGFILE" 2>&1 {_RESTART_LOCK_FD}>&- &
@@ -458,6 +698,7 @@ else
     setsid env WATCHER_WINDOW=headless \
         "$_script_dir/main.sh" --target "$TARGET" </dev/null >>"$LOGFILE" 2>&1 &
 fi
+_spawn_child_pid=$!
 
 # Verify the spawn took: main.sh writes its pidfile before any heavy
 # setup. 15s budget — 5s false-negatived in the field (2026-06-09: a
@@ -478,8 +719,49 @@ for _i in $(seq 1 60); do
     sleep 0.25
 done
 if [[ -z "$spawned" ]]; then
-    echo "launcher.sh: watcher did not publish a live pidfile within 15s — check $LOGFILE" >&2
-    exit 3
+    # A watcher on a read-only FS CANNOT publish a pidfile — that write is
+    # the very thing that is failing. Absence of the pidfile is then not
+    # evidence of a failed spawn, and treating it as one is how a degraded
+    # but perfectly useful watcher gets reported as dead (and, worse, how a
+    # caller is tempted to "retry" the launch forever). Fall back to the
+    # ground truth we still have: is the child we just forked alive?
+    if [[ "${NEXUS_FS_DEGRADED:-0}" == "1" ]] \
+       && [[ -n "${_spawn_child_pid:-}" ]] && kill -0 "$_spawn_child_pid" 2>/dev/null; then
+        echo "launcher.sh: watcher started in READ-ONLY DEGRADED mode (pid=$_spawn_child_pid); no pidfile is possible on a read-only FS. Log: $LOGFILE" >&2
+        echo "launcher.sh: restart the sandbox from OUTSIDE to restore the writable bind; the watcher will resume normal operation on its own." >&2
+        exit 0
+    fi
+    # Slow-publish fallback (nexus-code#491). Under load (exactly when
+    # restart storms fire) main.sh's early pidfile publish can lag past
+    # any fixed budget; reporting FAILURE for a spawn that is coming up
+    # invites the caller to retry — the retry raced the slow starter and
+    # produced the 2026-07-09 duplicate. Consult the process table: a
+    # single live watcher for this root IS the success we were waiting
+    # to confirm.
+    mapfile -t _post_watchers < <(_watcher_list_live_pids "$_nexus_root")
+    if (( ${#_post_watchers[@]} == 1 )); then
+        spawned="${_post_watchers[0]}"
+        echo "launcher.sh: WARN pidfile not published within 15s, but exactly one live watcher (pid=$spawned) is up — slow start under load, treating as success" >&2
+    elif (( ${#_post_watchers[@]} > 1 )); then
+        echo "launcher.sh: FATAL: ${#_post_watchers[@]} live watchers after spawn (${_post_watchers[*]}) — DUPLICATE; reconcile with: $_nexus_root/monitor/svc.sh restart watcher" >&2
+        _launch_audit "post-spawn-duplicate pids=${_post_watchers[*]}"
+        exit 6
+    else
+        echo "launcher.sh: watcher did not publish a live pidfile within 15s and no live watcher process found — check $LOGFILE" >&2
+        _launch_audit "spawn-failed (no pidfile, no process)"
+        exit 3
+    fi
 fi
 
+# The singleton claim is CHECKED, not asserted (nexus-code#491): count
+# the live top-level watchers for this root after the spawn. Anything
+# other than exactly one is a loud, distinct failure.
+mapfile -t _post_watchers < <(_watcher_list_live_pids "$_nexus_root")
+if (( ${#_post_watchers[@]} > 1 )); then
+    echo "launcher.sh: FATAL: ${#_post_watchers[@]} live watchers after spawn (${_post_watchers[*]}) — DUPLICATE; reconcile with: $_nexus_root/monitor/svc.sh restart watcher" >&2
+    _launch_audit "post-spawn-duplicate pids=${_post_watchers[*]}"
+    exit 6
+fi
+
+_launch_audit "spawned pid=$spawned target=$TARGET replace=$REPLACE ensure=$ENSURE"
 echo "launcher.sh: spawned headless pid=$spawned target='$TARGET' log='$LOGFILE'"

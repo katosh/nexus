@@ -120,13 +120,37 @@ _compose_emit_stable_hash() {
 # operator-attention signal that we must never silently drop, even on
 # an identical-hash repeat.
 #
-# ONE surface, narrowed in issue #152: eligible github comments — any
-# `id=<digits>` row inside the `--- eligible github comments ---`
-# section. These are already deduped at the source
-# (`_gh_filter_dedup_pipeline` marks each comment id seen), so by the
-# time one reaches here it is genuinely new and never floods; the
-# bypass guarantees an operator comment surfaces even in the unlikely
-# event its body hashes identically to a prior emit.
+# TWO surfaces, each cooldown- or dedup-gated AT ITS SOURCE (the #152
+# lesson: only source-gated signal may bypass — see below):
+#
+#   1. Eligible github comments — any `id=<digits>` row inside the
+#      `--- eligible github comments ---` section. Deduped at the source
+#      (`_gh_filter_dedup_pipeline` marks each comment id seen), so by
+#      the time one reaches here it is genuinely new and never floods;
+#      the bypass guarantees an operator comment surfaces even in the
+#      unlikely event its body hashes identically to a prior emit.
+#
+#   2. Request-inbox rows — any `request=<id>` row inside the
+#      `--- requests ---` section (your-org/nexus-code#483). A request is
+#      a worker/remote-client → orchestrator ask, `reply: required` ones
+#      by definition operator-attention; suppressing one on an
+#      identical-hash match was exactly the 2026-07-02T01:44:10 incident
+#      (a `poll-requests` body suppressed after its cooldown had already
+#      been stamped — recorded surfaced, never delivered). The bypass is
+#      BOUNDED at the source, not here: a request row only renders when
+#      DUE (never-delivered, or its per-id cooldown — default 300s,
+#      stamped by requests_commit_emitted ONLY on a successful paste —
+#      has elapsed), per-emit volume is capped by
+#      MONITOR_REQUESTS_MAX_PER_EMIT, and an unacked request goes
+#      `.failed` at max-age (default 3 days). Worst case is therefore one
+#      paste per request per cooldown until ack or max-age — the designed
+#      re-emit-until-acked cadence, not a flood. This does NOT
+#      reintroduce the #152 resurface flood: that flood came from an
+#      UNGATED source (a parked worker re-firing the same decision every
+#      ~5s poll) whose bypass short-circuited the only gate it had;
+#      requests are due-gated at the source with the stamp tied to
+#      delivery, so a pasted body silences its own source for a full
+#      cooldown.
 #
 # Pending decisions and awaiting-input USED to bypass here too, but
 # that unconditional override was the resurface-flood root cause
@@ -144,15 +168,16 @@ _compose_emit_stable_hash() {
 # from the hash entirely — it is always shadowed by a pending-decision
 # row (the `Notification` hook writes both, see worker-settings.json),
 # so dropping its volatile counter loses no signal the operator wants.
-# Returns 1 when no eligible-comments signal applies (dedup may
-# proceed).
+# Returns 1 when neither surface applies (dedup may proceed).
 _compose_emit_should_bypass_dedup() {
     local body_file="$1"
     [[ -f "$body_file" ]] || return 1
     if awk '
-        /^--- eligible github comments ---$/ { in_sec = 1; next }
-        /^--- / { in_sec = 0 }
-        in_sec && /id=[0-9]+/ { found = 1; exit }
+        /^--- eligible github comments ---$/ { sec = "gh"; next }
+        /^--- requests ---$/                 { sec = "req"; next }
+        /^--- /                              { sec = "" }
+        sec == "gh"  && /id=[0-9]+/  { found = 1; exit }
+        sec == "req" && /^request=/  { found = 1; exit }
         END { exit (found ? 0 : 1) }
     ' "$body_file"; then
         return 0

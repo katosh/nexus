@@ -28,6 +28,13 @@
 #         4 state dir READ-ONLY (escalated out-of-band, did NOT revive —
 #           a read-only project FS is unrecoverable from inside the
 #           sandbox; restart the sandbox to restore the writable bind),
+#         5 REFUSED (nexus-code#491): the probe said DOWN but a watcher
+#           process for this NEXUS_ROOT is demonstrably alive AND
+#           advancing — killing it would be the false-positive restart
+#           that caused the 2026-07-09 storm. NOTHING was done; the
+#           caller must not treat this as a revival. Inspect with
+#           `monitor/svc.sh status` (expect BUSY) and only restart
+#           manually with fresh evidence of a genuine wedge.
 #         non-zero = restart command failed.
 # Env overrides (tests): NEXUS_STATE_DIR, MONITOR_INTERVAL,
 #   REVIVE_SVC_BIN, MONITOR_WATCHER_SUPERVISOR_LOOP_LIMIT/_WINDOW_SECONDS.
@@ -72,26 +79,29 @@ fi
 # Already alive? (race: the watcher came back on its own between the
 # Monitor firing and this running.) No-op success.
 _watcher_alive "$STATE_DIR" "$INTERVAL"
-if (( $? <= 1 )); then
+alive_rc=$?
+if (( alive_rc <= 1 )); then
     _log "watcher already alive — nothing to revive"
     exit 0
 fi
 
 reason=$(_watcher_reason "$STATE_DIR" 2>/dev/null || echo 'not alive')
 
-# Read-only-filesystem short-circuit (your-org/nexus-code rofs-incident).
-# A revive is IMPOSSIBLE when the project FS is read-only: svc.sh restart
-# cannot write the pidfile / log / lock, so it fails — and the supervisor
-# would re-fire this revive on EVERY DOWN tick, silently retry-failing for
-# as long as the FS stays read-only (the ~25-min silent outage this guards).
-# Detect it up front, raise a turn-INDEPENDENT operator alarm over a channel
-# that does NOT touch the read-only project FS, and exit with a DISTINCT code
-# so the orchestrator stops the futile retry loop. A read-only project bind
-# is unrecoverable in-namespace; the only fix is a full sandbox restart.
+# Read-only-filesystem short-circuit (your-org/nexus-code rofs-incident)
+# — checked FIRST, before the alive+progressing refusal below: on a
+# read-only FS the watcher may well be alive in #482's degraded mode
+# (progress advancing, heartbeat unwritable), but "the FS is read-only,
+# restart the sandbox from OUTSIDE" is the more actionable verdict, and
+# the throttled alarm + out-of-band escalation must fire regardless of
+# what the process table says. A revive is IMPOSSIBLE here: svc.sh
+# restart cannot write the pidfile / log / lock — and the supervisor
+# would re-fire this revive on EVERY DOWN tick, silently retry-failing
+# for as long as the FS stays read-only (the ~25-min silent outage this
+# guards). Distinct exit 4 so the orchestrator stops the futile loop.
 if ! _nexus_dir_writable "$STATE_DIR"; then
     _log "watcher DOWN ($reason) AND state dir is READ-ONLY ($STATE_DIR) — revive is impossible from inside the sandbox. Restore the writable bind with a FULL SANDBOX RESTART. See skills/nexus.service-recovery."
     if _nexus_critical_alarm "watcher-rofs" "${MONITOR_ROFS_ALARM_THROTTLE_SECONDS:-120}" \
-        "nexus project FS READ-ONLY (cannot write $STATE_DIR). Watcher is DOWN and cannot be revived from inside the sandbox — restart the sandbox to restore the writable mount. See skills/nexus.service-recovery."; then
+        "$(_nexus_rofs_alarm_text "$STATE_DIR" "revive-watcher.sh")"; then
         # The alarm just RANG (not throttled) — also escalate OUT-OF-BAND to
         # GitHub: file/locate the incident issue + ping the operator there and
         # on the nexus overview. Network-only + RO-FS-safe; gating on the
@@ -100,6 +110,45 @@ if ! _nexus_dir_writable "$STATE_DIR"; then
         _nexus_github_incident_escalate "$NEXUS_ROOT" "$STATE_DIR" "revive-watcher.sh" "$reason" || true
     fi
     exit 4
+fi
+
+# REFUSE to kill a live, progressing watcher (nexus-code#491). The
+# probe's verdict above is a CLAIM; before anything gets killed, verify
+# it against the two facts that matter: is a watcher PROCESS for this
+# NEXUS_ROOT alive (process-table truth, not the pidfile), and has it
+# demonstrated forward progress recently (progress/cycle/log advance
+# within the measured-period-derived wedge cutoff)? If both hold, the
+# verdict was wrong — the 2026-07-09 class, where `svc.sh status`
+# printed `DOWN pid:4786 heartbeat stale (age=444s)` for a watcher that
+# was alive with its log advancing 138s earlier — and restarting it
+# would CAUSE the outage it claims to fix. Decline LOUDLY with a
+# distinct exit code so the caller knows nothing was done.
+#
+# A WEDGED verdict (alive_rc=4) proceeds: progress has already been
+# established as stalled past the generous cutoffs, and a restart is
+# the correct remedy. A genuinely dead watcher (no live process) also
+# proceeds — this guard can never create the false negative of
+# refusing to revive a dead watcher.
+if (( alive_rc == 2 || alive_rc == 3 )); then
+    _live_pids=$(_watcher_list_live_pids "$NEXUS_ROOT")
+    if [[ -n "$_live_pids" ]]; then
+        # Progress folds the group's fork-freshness in (pgid = the live
+        # leader): forking children is a stronger liveness signal than
+        # the heartbeat or the log.
+        _progress_age=$(_watcher_progress_age "$STATE_DIR" "$(head -n1 <<<"$_live_pids")")
+        _wedge_cutoff=$(_watcher_wedge_cutoff "$INTERVAL" "$(_watcher_cycle_period "$STATE_DIR")")
+        if (( _progress_age <= _wedge_cutoff )); then
+            _log "REFUSING to revive: probe says DOWN ($reason) but watcher pid(s) $(tr '\n' ' ' <<<"$_live_pids")are ALIVE and ADVANCING (progress ${_progress_age}s ago, wedge cutoff ${_wedge_cutoff}s)."
+            _log "  Killing a live, progressing watcher is the 2026-07-09 false-positive storm. NOTHING was done (exit 5)."
+            _log "  Inspect: $NEXUS_ROOT/monitor/svc.sh status (expect BUSY). Manual restart only with fresh wedge evidence."
+            command -v sandbox-notify >/dev/null 2>&1 && \
+                sandbox-notify "revive-watcher REFUSED: watcher alive+advancing but probe said DOWN — probe/thresholds need attention" >/dev/null 2>&1 || true
+            exit 5
+        fi
+        _log "watcher process(es) $(tr '\n' ' ' <<<"$_live_pids")alive but NOT advancing (progress ${_progress_age}s > cutoff ${_wedge_cutoff}s) — wedged, proceeding to restart"
+    fi
+elif (( alive_rc == 4 )); then
+    _log "watcher WEDGED (alive, no forward progress past cutoff) — proceeding to restart"
 fi
 
 # Crash-loop guard: cap revivals per window so a watcher crash-looping on

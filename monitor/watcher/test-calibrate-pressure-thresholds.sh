@@ -144,14 +144,16 @@ assert_contains 'self-check: prelude has awaiting-input' "$sample" 'awaiting-inp
 # widened it to 8 (added `N orphan-async`); the stall-detection work
 # widened it to 9 (added `N interrupted`); the worker-lifecycle fix
 # widened it to 10 (added `N parked-skeptic`, excluding parked-awaiting-
-# skeptic workers from the busy residue). Anything fewer means a future
-# axis was dropped or the generator misfired; either way the test below
-# would silently degrade.
+# skeptic workers from the busy residue); your-org/nexus-code#455 refine
+# widened it to 11 (added `N idle-children` for idle-with-live-children
+# workers). Anything fewer means a future axis was dropped or the
+# generator misfired; either way the test below would silently degrade.
 seg_count=$(awk -F'|' '{print NF}' <<<"$sample")
-assert_eq 'self-check: prelude has 10 segments' "$seg_count" '10'
+assert_eq 'self-check: prelude has 11 segments' "$seg_count" '11'
 assert_contains 'self-check: prelude has orphan-async'   "$sample" 'orphan-async'
 assert_contains 'self-check: prelude has interrupted'    "$sample" 'interrupted'
 assert_contains 'self-check: prelude has parked-skeptic' "$sample" 'parked-skeptic'
+assert_contains 'self-check: prelude has idle-children'  "$sample" 'idle-children'
 
 # ---- Test 1: empty archive ----
 echo

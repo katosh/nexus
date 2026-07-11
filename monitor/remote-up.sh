@@ -132,6 +132,13 @@ cmd_up() {
     # routable bind is a first-class in-sandbox path, but sensitive — it must
     # carry a from_cidr pin and never be a wildcard (see _remote_bind_guard).
     _remote_bind_guard || die "unsafe bind configuration — fix config/nexus.yml and re-run (nothing was enabled)"
+    # Fail-closed CREDENTIAL-STORAGE gate: the host key, authorized_keys and
+    # enrollment tokens may only ever live under $HOME/.claude (0700, single-uid,
+    # survives a sandbox restart) — never in the group-shared project tree.
+    # Harden the modes we own first, so a legacy dir self-heals rather than
+    # bricking; the LOCATION rule is never auto-"fixed".
+    _remote_principals_harden
+    _remote_principals_guard || die "unsafe credential storage — fix principals_dir and re-run (nothing was enabled)"
     command -v sshd >/dev/null 2>&1 || [[ -x /usr/sbin/sshd ]] \
         || say "WARNING: no sshd on PATH — the listener cannot come up until the sandbox image ships sshd (RFC §4.6/A1). Registering + host-key anyway; health will report unhealthy."
     if _remote_bind_is_loopback "$(_remote_bind_address)"; then

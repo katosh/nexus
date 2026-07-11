@@ -109,6 +109,14 @@ STUB
 # first `add` — i.e. strictly AFTER the manager has already snapshotted its
 # batch — so the test can deterministically exercise the after-snapshot
 # late-arrival path that Test A only hits non-deterministically.
+#
+# Push fault injection (your-org/nexus-code#… fail-loud + verify-before-return):
+#   NEXUS_TEST_PUSH_FAIL=1     count the push then exit NON-zero — the remote
+#                             rejects; exercises the fail-loud retry ceiling.
+#   NEXUS_TEST_PUSH_SWALLOW=1  count the push then exit 0 WITHOUT pushing — the
+#                             commit stays local, SHA never reaches the remote;
+#                             exercises verify-before-return (a push that
+#                             *reports* success but didn't land, the #261 shape).
 STUB_DIR="$WORK/bin"
 mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/git" <<STUB
@@ -125,7 +133,11 @@ if (( _is_add )) && [[ -n "\${NEXUS_TEST_INJECT_REQ_DST:-}" ]] \\
     : > "\$NEXUS_TEST_INJECT_SENTINEL"
 fi
 (( _is_seturl )) && exit 0
-(( _is_push )) && printf 'x' >> "$PUSH_COUNT_FILE"
+if (( _is_push )); then
+    printf 'x' >> "$PUSH_COUNT_FILE"
+    [[ -n "\${NEXUS_TEST_PUSH_FAIL:-}" ]] && { echo "stub: simulated push failure" >&2; exit 1; }
+    [[ -n "\${NEXUS_TEST_PUSH_SWALLOW:-}" ]] && exit 0
+fi
 exec "$REAL_GIT" "\$@"
 STUB
 chmod +x "$STUB_DIR/git"
@@ -357,6 +369,61 @@ assert_eq "late marker drained by next election (file on remote)" \
     "$("$REAL_GIT" --git-dir="$BARE" cat-file -e "${final_shaE}:assets/late/lateE.txt" 2>/dev/null && echo 1 || echo 0)" "1"
 assert_eq "late marker cleared after next election" \
     "$(find "$STAGING" -name 'req.lateE.req' | wc -l | tr -d ' ')" "0"
+
+# =========================================================================
+echo '=== Test F: push failure → fail LOUD, no URL on stdout, marker left staged ==='
+# A push the remote rejects must NOT yield a URL. The script retries to the
+# ceiling, then exits non-zero with NOTHING on stdout — the caller (ng wrap-up,
+# a figure-posting worker) treats a non-zero upload as failure, so a broken
+# embed never lands in a GitHub comment. The staged marker+blob survive for a
+# later (recovered) drain.
+setup_fake_nexus
+STAGING="$FAKE_NEXUS/assets.staging"
+payload="$WORK/figF.png"; printf 'fig-F-bytes\n' > "$payload"
+_out_tmp=$(mktemp); _err_tmp=$(mktemp)
+env -u NEXUS_ASSET_REPO -u NEXUS_CONFIG -u NEXUS_ROOT \
+    NEXUS_TEST_PUSH_FAIL=1 NEXUS_UPLOAD_PUSH_RETRIES=2 \
+    PATH="$STUB_DIR:$PATH" \
+    "$FAKE_NEXUS/monitor/upload-asset.sh" "$payload" --repo-path "faults/figF.png" \
+    >"$_out_tmp" 2>"$_err_tmp"
+rcF=$?
+stdoutF=$(<"$_out_tmp"); rm -f "$_out_tmp" "$_err_tmp"
+assert_eq "push-failure upload exits non-zero" "$([ "$rcF" -ne 0 ] && echo 1 || echo 0)" "1"
+assert_eq "push-failure emits NO URL on stdout" "$stdoutF" ""
+# The file must not be on the remote (nothing landed).
+final_shaF=$("$REAL_GIT" --git-dir="$BARE" rev-parse main)
+assert_eq "nothing landed on remote after push failure" \
+    "$("$REAL_GIT" --git-dir="$BARE" cat-file -e "${final_shaF}:assets/faults/figF.png" 2>/dev/null && echo 1 || echo 0)" "0"
+# Marker + blob survive for a recovered drain (no result file written).
+assert_eq "marker left staged after push failure" \
+    "$(find "$STAGING" -name '*.req' | wc -l | tr -d ' ')" "1"
+assert_eq "no result URL file written after push failure" \
+    "$(find "$STAGING" -name '*.url' | wc -l | tr -d ' ')" "0"
+
+# =========================================================================
+echo '=== Test G: verify-before-return catches a push that reported success but did not land ==='
+# The #261 shape: `git push` returns 0 yet the commit is absent from the remote
+# (swallowed by contention / a lying transport). Without a runtime check the
+# script would pin that local-only SHA and emit a dangling URL. verify-before-
+# return re-reads the remote tip, finds the SHA is NOT an ancestor, and fails
+# LOUD instead — no URL, marker preserved.
+setup_fake_nexus
+STAGING="$FAKE_NEXUS/assets.staging"
+payload="$WORK/figG.png"; printf 'fig-G-bytes\n' > "$payload"
+_out_tmp=$(mktemp); _err_tmp=$(mktemp)
+env -u NEXUS_ASSET_REPO -u NEXUS_CONFIG -u NEXUS_ROOT \
+    NEXUS_TEST_PUSH_SWALLOW=1 \
+    PATH="$STUB_DIR:$PATH" \
+    "$FAKE_NEXUS/monitor/upload-asset.sh" "$payload" --repo-path "faults/figG.png" \
+    >"$_out_tmp" 2>"$_err_tmp"
+rcG=$?
+stdoutG=$(<"$_out_tmp"); stderrG=$(<"$_err_tmp"); rm -f "$_out_tmp" "$_err_tmp"
+assert_eq "swallowed-push upload exits non-zero" "$([ "$rcG" -ne 0 ] && echo 1 || echo 0)" "1"
+assert_eq "swallowed-push emits NO URL on stdout (no dangling embed)" "$stdoutG" ""
+assert_eq "failure names verify-before-return" \
+    "$(printf '%s' "$stderrG" | grep -c 'verify-before-return FAILED')" "1"
+assert_eq "swallowed-push wrote no result URL file" \
+    "$(find "$STAGING" -name '*.url' | wc -l | tr -d ' ')" "0"
 
 # =========================================================================
 echo

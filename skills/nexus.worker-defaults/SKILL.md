@@ -95,12 +95,31 @@ a hook or your task prompt points you there.
   clone) is stated in your task prompt (ask if unstated);
   secondary clones edit and test freely and land canonical
   writes via PR.
-- **GitHub writes post as the bot automatically** — a PATH-front
-  `gh` shim rewrites identity, so a bare `gh …` (or `monitor/ng
-  <verb>`) is already correct. Never `--no-verify`, never
+- **GitHub writes: mint the bot token EXPLICITLY, then verify the
+  author.** `GH_TOKEN=$("$NEXUS_ROOT"/monitor/mint-token.sh) gh
+  <write> …`, or `monitor/ng <verb>` (which mints internally). Do
+  NOT rely on the PATH-front `gh` shim — it is defence in depth,
+  not the mechanism (it has been observed broken on a live clone:
+  five operator-authored writes in one day, `#497`). After each
+  write, assert its identity in one command:
+  `"$NEXUS_ROOT"/monitor/assert-bot-author.sh <url-of-your-write>`
+  — an operator-authored write SUCCEEDS but GitHub mutes
+  self-notifications, so the thread silently goes dark; the
+  assertion is the only loud failure. Never `--no-verify`, never
   force-push; fix the root cause. `git commit` / `git push` use
   your identity, everything else the bot's.
 - **`sandbox-notify "<msg>"`** on blocker / ready / done.
+- **Never invoke `pip` in ANY form — `uv pip` only.** That means
+  bare `pip`, `pip3`, AND `python -m pip`, every verb (`install`,
+  `download`, …). The sandbox's wrapped pip fork-storms without
+  bound and took the node down twice in two days
+  (<your-org>/nexus-code`#487`); a PATH-front shim now refuses bare
+  `pip`/`pip3` and a worker RLIMIT_NPROC ceiling bounds the blast
+  radius — this text is the explanation, those hooks are the
+  enforcement. PyPI name trap: dandelion's package is
+  `sc-dandelion`, not `dandelion`. Same rule generalized: bound
+  any command whose process tree can grow without a named bound
+  (`ulimit -u`, hard `timeout`, capped `--jobs`) before you run it.
 - **Own your async work.** If you `sbatch` / `srun --no-block` /
   `nohup &` a job, you OWN the wake — don't end your turn with a
   job in flight and no resume mechanism armed. A hook spells out

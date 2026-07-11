@@ -608,6 +608,107 @@ assert_file "await heartbeat preserves an existing pending marker" "$hb_marker"
 rm -f "$hb_marker"
 
 # ============================================================
+echo '=== #469: skeptic gate must not fail OPEN on a re-wrap (stale DONE) ==='
+# ============================================================
+# A channel is reused across rounds. Round 1's `close` leaves a DONE
+# sentinel; a later `ng wrap-up --skeptic-decision require` opens round 2
+# by writing a fresh pending marker. If the stale DONE survives, the
+# worker's next `await` returns exit 10 instantly and it retires believing
+# an independent skeptic validated it — when none ever spawned.
+#
+# BOTH DIRECTIONS. Every assertion below FAILS on pre-fix source:
+#   - guard 2 (await): pre-fix returns 10 on a stale DONE.
+#   - guard 1 (wrap-up): pre-fix leaves the stale DONE in place.
+# Reproduce the pre-fix failures with:
+#   git stash push monitor/skeptic-channel.sh monitor/ng \
+#     && bash monitor/watcher/test-skeptic-channel.sh; git stash pop
+
+# Helpers: age a file into the past so the mtime ordering is unambiguous
+# regardless of the filesystem's timestamp granularity.
+age_file() { touch -d "@$(( $(date +%s) - ${2:-60} ))" "$1"; }
+
+STASK="w469-restale"
+sdir="$NEXUS_STATE_DIR/skeptic/$STASK"
+smark="$NEXUS_STATE_DIR/skeptic/pending/$STASK"
+mkdir -p "$sdir" "$NEXUS_STATE_DIR/skeptic/pending"
+
+# --- guard 2: await refuses a DONE older than the pending marker ---
+# Round 1 closed 60s ago; round 2's require-gate marker is fresh.
+#
+# The marker is written DIRECTLY here, not through `ng wrap-up`. That is
+# deliberate: it is the exact shape spawn-worker.sh (~:1457) produces when
+# the orchestrator spawns a skeptic itself — a fresh pending marker, no
+# wrap-up, no DONE reset. Guard 1 cannot see that path. This section is
+# therefore the ONLY coverage of it, and it is why guard 2 is not
+# redundant with guard 1.
+printf 'round-1 verdict\n' > "$sdir/DONE"; age_file "$sdir/DONE" 60
+printf '1' > "$smark"                                   # fresh: mtime = now
+out=$("$CHAN" await "$STASK" --once 2>&1); rc=$?
+[[ "$rc" != 10 ]] && ok "stale DONE + newer marker -> await does NOT exit 10 (gate stays closed)" \
+                  || bad "stale DONE + newer marker -> await does NOT exit 10 (gate stays closed)" \
+                         "got rc=10: pre-fix behaviour, the worker would retire unvalidated"
+assert_eq "stale DONE -> await returns 4 (re-enter, nothing pending)" "$rc" "4"
+assert_contains "stale DONE -> await says so on stderr" "$out" "older than its pending marker"
+
+# The blocking (non---once) path must also refuse it, not exit 10 at once.
+out=$("$CHAN" await "$STASK" --timeout 1 --interval 1 2>&1); rc=$?
+assert_eq "stale DONE -> blocking await times out (4), never 10" "$rc" "4"
+
+# The marker must survive: the worker is still gated for retire-preflight.
+assert_file "stale DONE -> pending marker survives await" "$smark"
+
+# --- guard 2, other direction: a GENUINE round-2 close does release ---
+# `close` writes a fresh DONE and removes the marker; await must exit 10.
+"$CHAN" close "$STASK" >/dev/null
+assert_nofile "round-2 close clears the pending marker" "$smark"
+out=$("$CHAN" await "$STASK" --once); rc=$?
+assert_eq "round-2 close -> await exits 10 (terminal)" "$rc" "10"
+assert_contains "round-2 close -> await prints DONE" "$out" "DONE"
+
+# --- no regression: first-round DONE with NO marker is still terminal ---
+# `-nt` is true when the sentinel exists and the marker does not, so the
+# ordinary single-round path is untouched.
+NTASK="w469-firstround"
+mkdir -p "$NEXUS_STATE_DIR/skeptic/$NTASK"
+"$CHAN" close "$NTASK" >/dev/null
+rm -f "$NEXUS_STATE_DIR/skeptic/pending/$NTASK"
+"$CHAN" await "$NTASK" --once >/dev/null; rc=$?
+assert_eq "first-round DONE, no marker -> await still exits 10" "$rc" "10"
+
+# --- and a DONE NEWER than a leftover marker is terminal (fail-safe) ---
+# If close published DONE but its marker unlink lost, the round is still
+# over. Terminal, not a hang.
+LTASK="w469-leftover"
+mkdir -p "$NEXUS_STATE_DIR/skeptic/$LTASK"
+"$CHAN" close "$LTASK" >/dev/null                       # DONE = now, unlinks marker
+printf '1' > "$NEXUS_STATE_DIR/skeptic/pending/$LTASK"  # simulate a lost unlink
+age_file "$NEXUS_STATE_DIR/skeptic/pending/$LTASK" 60   # ...predating the close
+"$CHAN" await "$LTASK" --once >/dev/null; rc=$?
+assert_eq "DONE newer than a leftover marker -> terminal (10), not a hang" "$rc" "10"
+
+# --- guard 1: wrap-up --skeptic-decision require CLEARS a prior DONE ---
+# `_wrapup_skeptic_step` is sourced from ng above. A require decision opens
+# a new round, so the previous round's sentinel must not survive it.
+RTASK=w469-rewrap
+mk_prov "$RTASK" require 0 false ""
+mkdir -p "$NEXUS_STATE_DIR/skeptic/$RTASK"
+printf 'round-1 verdict\n' > "$NEXUS_STATE_DIR/skeptic/$RTASK/DONE"
+age_file "$NEXUS_STATE_DIR/skeptic/$RTASK/DONE" 60
+_wrapup_skeptic_step 469 "$RTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+assert_nofile "wrap-up require -> clears the prior round's DONE" "$NEXUS_STATE_DIR/skeptic/$RTASK/DONE"
+assert_file   "wrap-up require -> writes a fresh pending marker" "$PEND/$RTASK"
+# End-to-end: after the re-wrap the worker's await must BLOCK, not retire.
+"$CHAN" await "$RTASK" --once >/dev/null 2>&1; rc=$?
+assert_eq "re-wrap -> await no longer terminal (gate held)" "$rc" "4"
+
+# --- no regression: a first-round require on a virgin channel still works ---
+VTASK=w469-virgin
+mk_prov "$VTASK" require 0 false ""
+_wrapup_skeptic_step 469 "$VTASK" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+assert_file   "first-round require -> pending marker set" "$PEND/$VTASK"
+assert_nofile "first-round require -> no DONE conjured" "$NEXUS_STATE_DIR/skeptic/$VTASK/DONE"
+
+# ============================================================
 echo
 if (( FAIL == 0 )); then
     printf 'ALL TESTS PASSED (%d assertions)\n' "$PASS"

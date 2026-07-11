@@ -37,6 +37,11 @@ if [ -n "${NEXUS_ROOT:-}" ]; then
     # (full mode); fall back to $NEXUS_ROOT/locals defensively.
     _nx_locals="${NEXUS_LOCALS:-$NEXUS_ROOT/locals}"
     [ -d "$_nx_locals/bin" ] && path=("$_nx_locals/bin" $path)
+    # Fork-storm pip guard (monitor/pipwrap) — refuses the self-re-exec'ing
+    # sandbox /app/bin/pip (your-org/nexus-code#487); same force-front
+    # rationale as ghwrap. Fronted before notifywrap/ghwrap so those keep
+    # the very-front slots.
+    [ -x "$NEXUS_ROOT/monitor/pipwrap/pip" ] && path=("$NEXUS_ROOT/monitor/pipwrap" $path)
     # Engagement-gated sandbox-notify wrapper (monitor/notifywrap) — same
     # force-front rationale as ghwrap; keeps the bell gate on PATH front after
     # ~/.zshenv re-prepends linuxbrew. See monitor/notifywrap/sandbox-notify.

@@ -54,6 +54,18 @@
 # Force it off; bash 4.x doesn't know the option and silently no-ops.
 shopt -u patsub_replacement 2>/dev/null || true
 
+# Disarm Lmod's command_not_found_handle in the sourcing test shell
+# (your-org/nexus-code#457/#479/#480). On the sandbox hosts BASH_ENV
+# reaches Lmod's init, which arms a handler that shells out to
+# `command_not_found.py` via PATH; bash forks a child before invoking
+# it, so a test shell that narrows PATH past the dir holding that
+# script turns any missing command into an unbounded fork chain (the
+# 2026-07-08 pid_max exhaustion). Tests never rely on the handler —
+# a missing command should be a plain rc=127. This guards the SOURCING
+# shell only; bash children each re-arm from BASH_ENV, so PATHs handed
+# to children go through th_hermetic_path below instead.
+unset -f command_not_found_handle 2>/dev/null || true
+
 : "${PASS:=0}"
 : "${FAIL:=0}"
 
@@ -121,6 +133,64 @@ assert_no_file() {
         PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — file unexpectedly present: %s\n' "$label" "$path" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
+
+# --- fork-bomb precondition guard (your-org/nexus-code#479 / #457) -----
+#
+# Lmod's init (/app/lmod/lmod/init/bash, reached via BASH_ENV on the
+# sandbox hosts) arms a `command_not_found_handle` that runs
+# `command_not_found.py "$1"` — resolved via PATH, and the ONLY copy
+# lives in /app/bin. Bash forks a child before invoking the handler,
+# so when command_not_found.py is ITSELF unresolvable the handler
+# re-fires inside the forked child, which forks again: an unbounded
+# parent→child chain, each level blocked in wait(), that exhausted the
+# node's pid_max on 2026-07-08 (#457). It is a conjunction — the armed
+# handler is harmless while command_not_found.py resolves; a test that
+# composes a synthetic PATH from absolute dirs supplies the missing
+# half. Every PATH handed to a spawned child must therefore go through
+# this helper.
+#
+# th_hermetic_path <base-path> <scratch-dir>
+#
+# Echo <base-path>, augmented so command_not_found.py stays resolvable:
+# if it resolves on the AMBIENT PATH but not on <base-path>, append a
+# private dir under <scratch-dir> holding ONLY a symlink to it. The
+# fork-recursion primitive is defused without leaking any other host
+# tool into the hermetic PATH. Off-sandbox (CI: no Lmod, no
+# command_not_found.py) the base path is returned unchanged.
+th_hermetic_path() {
+    local base="$1" scratch="$2" cnf dir
+    cnf=$(command -v command_not_found.py 2>/dev/null) \
+        || { printf '%s' "$base"; return 0; }
+    if PATH="$base" command -v command_not_found.py >/dev/null 2>&1; then
+        printf '%s' "$base"; return 0
+    fi
+    dir="$scratch/th-cnf-bin"
+    mkdir -p "$dir"
+    ln -sf "$cnf" "$dir/command_not_found.py"
+    printf '%s:%s' "$base" "$dir"
+}
+
+# th_assert_path_resolves_cnf <label> <path-string>
+#
+# Regression assertion for the same class: on hosts where
+# command_not_found.py resolves ambiently, the given PATH must keep it
+# resolvable (fails on a bare absolute-dir composition, passes once the
+# construction goes through th_hermetic_path). Vacuously passes
+# off-sandbox, where the mechanism cannot arm at all.
+th_assert_path_resolves_cnf() {
+    local label="$1" p="$2"
+    if ! command -v command_not_found.py >/dev/null 2>&1; then
+        printf '  PASS: %s (vacuous: no command_not_found.py on this host)\n' "$label"
+        PASS=$(( PASS + 1 )); return 0
+    fi
+    if PATH="$p" command -v command_not_found.py >/dev/null 2>&1; then
+        printf '  PASS: %s\n' "$label"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %s — command_not_found.py unresolvable on: %s\n' "$label" "$p" >&2
         FAIL=$(( FAIL + 1 ))
     fi
 }

@@ -222,6 +222,9 @@ ensure_root_kernels() {
         echo "# Re-registers new project venvs into the root session. Safe to edit/delete."
         printf 'exec %q %q\n' "$CRAWL_BIN" "$PROJECT_DIR"
     } > "$PROJECT_DIR/.jupyter/labsh-service.periodic"
+    # Explicit mode at creation (your-org/nexus-code#484). `_ensure_service_log`
+    # arrives with the bootstrap-recover.sh source above.
+    _ensure_service_log "$PROJECT_DIR/.jupyter/labsh-periodic.log"
     ( "$CRAWL_BIN" "$PROJECT_DIR" >> "$PROJECT_DIR/.jupyter/labsh-periodic.log" 2>&1 & )
     say "kernel crawl launched (async; log: $PROJECT_DIR/.jupyter/labsh-periodic.log)"
 }

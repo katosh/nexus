@@ -65,7 +65,15 @@ jobs:
         id: unit_suite
         run: |
           set -uo pipefail
-          mapfile -t tests < <(find monitor/watcher -maxdepth 1 -name 'test-*.sh' -type f | sort)
+          # Both directories. `monitor/` holds the suites for the NON-watcher
+          # scripts — test-retire-preflight.sh, test-interactive-sessions.sh,
+          # and the #507/#484 regression suites. This step discovered only
+          # monitor/watcher/ and handed the result to run-tests.sh as EXPLICIT
+          # paths, which override the runner's own glob — so those four ran
+          # nowhere, and green here meant "the tests I happened to look for
+          # passed" (<your-org>/nexus-code#484). `-maxdepth 1` applies per root,
+          # so `monitor` contributes only its direct children, not watcher's.
+          mapfile -t tests < <(find monitor monitor/watcher -maxdepth 1 -name 'test-*.sh' -type f | sort)
           if (( ${#tests[@]} == 0 )); then
             echo "::error::no tests selected — refusing to report green on an empty run"
             exit 1

@@ -102,6 +102,10 @@ constant, and reaction) is diagrammed in
 | `parked-awaiting-skeptic` | `<window> parked-awaiting-skeptic (idle <age>; skeptic reviewing — exempt from idle/close until verdict; see skills/nexus.skeptic)` | **Do NOT close** (`#285`). The worker wrapped up in `require` / auto-`require` mode and is blocked in `monitor/skeptic-channel.sh await`, legitimately waiting for the reviewing skeptic — a live `skeptic-pending` marker (`monitor/.state/skeptic/pending/<window>`, mtime refreshed each poll within `monitor.skeptic.await_hang_seconds`, default 600 s) drives this row. The marker clears only when the skeptic returns a verdict, at which point the window becomes retire-eligible and the next idle cycle reclassifies it `wrapped`. `retire-preflight.sh` independently blocks the kill while the marker is live (Hard gate 0, check 1b), so even a stale snapshot cannot strand the review. A *stale* marker (the `await` died, or the worker never entered the loop) lapses the exemption and the window resurfaces under normal idle classification. One informational row per park; not an action item. Protocol: [`skills/nexus.skeptic`](../nexus.skeptic/SKILL.md). |
 | `paste-unconfirmed` | `<window> paste-unconfirmed (paste <age>s ago; no UserPromptSubmit fired — the nudge silently failed; re-paste via monitor/paste-followup.sh)` | A `paste-followup` older than `monitor.paste_confirm_grace_seconds` (default 180; env `MONITOR_PASTE_CONFIRM_GRACE_SECONDS`) never fired the worker's `UserPromptSubmit` hook even though the window's hooks are demonstrably live (heartbeat present) — the Enter was swallowed (VI mode, an overlay, a redraw race) and the worker never received the prompt. **Re-paste via `monitor/paste-followup.sh`**; a confirmed re-paste clears the row. Never suppressed by `window-retain`; `idle-too-long` still overrides it. `--no-enter` pastes and hook-less windows are exempt by design. |
 | `engaged-close-reminder` | `<window> operator-engaged but operator away <age> (src=<seed>) — consider closing this window; reminder re-fires once per period until the operator returns or it closes` | The away phase's only surface (issue #201): fires once the operator has stopped driving for `monitor.operator_engaged_close_reminder_seconds` (default 86400 = 24 h; env `MONITOR_OPERATOR_ENGAGED_CLOSE_REMINDER_SECONDS`), then at most once per period. **Still do NOT auto-close** — the window belongs to the operator; relay the reminder (overview routing one-liner or dashboard) so the operator decides. The operator returning re-marks the window engaged and resets the cadence. |
+| `idle-awaiting-job` | `<window> idle-awaiting-job (idle <age>; <n> child(ren) … — exempt under long-timeout backoff)` | **Do NOT close.** (<your-org>/nexus-code#455 refine, case a.) The worker is idle but the AUTHORITATIVE process tree shows ≥1 live background-shell child whose CPU has frozen — the signature of a blocking wait on a long job (e.g. `sbatch --wait` on a Slurm job). It is exempt from reap under an exponentially-backing-off long timeout. Informational, one row per episode; not an action item. It flips to `idle-children-clarify` when the next backoff nudge is due, and surfaces as a retire candidate (`idle-too-long`) at the **absolute** hard ceiling (`monitor.background_children_grace_ceiling_seconds`, default 48 h) — which no health declaration and no CPU-advancing child can postpone. |
+| `idle-children-clarify` | `<window> idle-children-clarify (idle <age>; … — paste the worker-health clarification prompt; …)` | **Paste the Background-child clarification template (below).** (Case a.) A clarification nudge is due: the child CPU has stayed frozen past the current backoff step, or the worker declared `stuck`/`done`. The worker answers via `monitor/worker-health.sh` → `monitor/.state/worker-health/<window>.json`; the watcher reads it next cycle to **extend** the grace (a declared-runtime job still running), **reap** (stuck / done-with-leftover-children), or keep asking on the backing-off schedule. Never auto-close — ask first. |
+| `wrapped-with-children` | `<window> wrapped-with-children (idle <age>; … — inconsistency: …)` | **Inconsistency — clarify or close, do NOT auto-reap.** (Case b.) The worker ran `ng wrap-up`, has **no skeptic pending**, but STILL has ≥1 live background-shell child: either leftover/stale children, or a premature wrap while a job runs (strongest when the child CPU is still advancing). Paste the Background-child clarification template (below); the worker answers via `monitor/worker-health.sh`. If it declares `done` the children are leftover and the window is safe to close; if `running` it wrapped prematurely (extend or close); if `stuck` it needs help. **Not** emitted for a skeptic-parked worker — see `parked-awaiting-skeptic`. |
+| `parked-awaiting-skeptic` | `<window> parked-awaiting-skeptic (… skeptic reviewing — exempt from idle/close)` | **Do NOT close.** Wrapped-with-children is the *expected* shape here, not an inconsistency: `ng wrap-up` is what writes the skeptic-pending marker, and the worker then holds its `skeptic-channel await` re-check loop in a background shell. The park is authoritative on the marker `monitor/.state/skeptic/pending/<window>`, not on the pane. A STALE marker (the await loop died past the hang threshold) lapses the exemption and the window resurfaces as `wrapped-with-children`, so the park can never mute a window forever. |
 | Suppressed (footer) | `(N retained windows suppressed: <w1> (<reason1>), <w2> (<reason2>), …)` | None — the orchestrator already decided to retain these. The footer is auditability so retention remains visible without re-triaging. |
 
 The watcher dedupes against its prior cycle's idle set on
@@ -760,6 +764,40 @@ capturing what was attempted and why the work blocked,
 then end the turn — the orchestrator will close the window.
 ```
 
+**Background-child clarification** (`idle-children-clarify` /
+`wrapped-with-children`, <your-org>/nexus-code#455 refine): the
+worker is idle (or wrapped) but still has ≥1 live background-shell
+child. Ask it to declare the job's health + expected runtime via
+the health FILE — the watcher reads the file, not the pane text, so
+a prose reply in the pane does nothing.
+
+```
+You are idle but still have a live background child process (a job
+you launched with run_in_background / & disown). The watcher can't
+tell whether you are legitimately waiting on a long job (e.g. a
+Slurm job) or the child is stale/leftover. Tell it by running ONE
+of these — do NOT just answer in the chat, the watcher reads the
+FILE:
+
+  # still waiting on a live job — declare the remaining runtime so
+  # the watcher stays quiet until it should reasonably be done:
+  monitor/worker-health.sh --health running --kind slurm \
+      --job-id <id> --runtime <seconds> --note "<what it is>"
+
+  # the job finished; the child is leftover and this window is done:
+  monitor/worker-health.sh --health done --note "<context>"
+
+  # your wait is wedged and you need help:
+  monitor/worker-health.sh --health stuck --note "<what is stuck>"
+
+Then continue waiting (running) or end your turn (done/stuck).
+```
+
+Paste it the same way as the others (`monitor/paste-followup.sh
+<window> --file <template>`). For a `wrapped-with-children` window
+the same template applies — a `done` answer confirms the children
+are leftover and the window is safe to close.
+
 ## Mechanism
 
 For each window cleared by triggers + retention + pre-close.
@@ -1073,7 +1111,8 @@ monitor:
   do restart manually, **don't rely on `tmux kill-window -t
   watcher` to terminate the process** — `main.sh` detaches from
   the pane and survives as a PPID=1 orphan (issue #106). Use
-  `monitor/watcher/launcher.sh --replace --target orchestrator`,
+  `monitor/watcher/launcher.sh --replace` (`--target` defaults to
+  config `monitor.target_window` — never hard-code it),
   which SIGTERMs the recorded pid (escalates to SIGKILL after
   5s) and respawns; or `kill $(cat monitor/.state/watcher.pid)`
   manually before invoking the launcher.

@@ -4,9 +4,15 @@
 # so the autonomous routine and manual evaluators run the SAME audited
 # loop instead of re-adapting the skill's inline listing each time).
 #
-# Usage: NEXUS_ROOT=<abs-path> [WATCHDOG_DEADLINE_SECONDS=180] \
+# Usage: NEXUS_ROOT=<abs-path> [CC_AUTO_TARGET_WINDOW=<name>] \
+#            [WATCHDOG_DEADLINE_SECONDS=180] \
 #            monitor/cc-restart-watchdog-loop.sh
 #        (or pass the root as $1)
+#
+# The coordinator window this loop watches is resolved exactly as
+# cc-auto-update-apply.sh resolves its TARGET_WINDOW. apply.sh also passes the
+# window it already resolved via CC_AUTO_TARGET_WINDOW (rendered into the
+# watchdog prompt), so the two can never disagree.
 #
 # Contract (see skills/nexus.cc-update/GUIDE.md "The restart watchdog"):
 #   - records the baseline (candidate, orchestrator pid, watcher pid,
@@ -33,11 +39,28 @@ NEXUS_ROOT="${NEXUS_ROOT:-${1:-}}"
     exit 2
 }
 STATE="${NEXUS_STATE_DIR:-$NEXUS_ROOT/monitor/.state}"
-TARGET="${CC_AUTO_TARGET_WINDOW:-orchestrator}"
+# Resolve the coordinator window NAME exactly as cc-auto-update-apply.sh's
+# TARGET_WINDOW does: CC_AUTO_TARGET_WINDOW → MONITOR_TARGET env → config
+# `monitor.target_window` → literal `orchestrator`. The config leg is
+# load-bearing: #428 added it to apply.sh but left this sibling hard-coded, so
+# on a nexus that sets `monitor.target_window: claude` the baseline's
+# `tmux list-panes -t orchestrator` found nothing, the loop died before writing
+# the armed marker, and apply.sh aborted the whole restart at
+# `watchdog-never-armed` after burning its 600s ARM_WAIT (#459). The bug is
+# invisible to any nexus whose window happens to be named `orchestrator`.
+TARGET="${CC_AUTO_TARGET_WINDOW:-${MONITOR_TARGET:-$("$NEXUS_ROOT/config/load.sh" monitor.target_window orchestrator 2>/dev/null || echo orchestrator)}}"
 SLUG=$(printf '%s' "$NEXUS_ROOT" | sed 's|[^a-zA-Z0-9]|-|g')
 PROJECTS_DIR="${CC_AUTO_PROJECTS_DIR:-$HOME/.claude/projects}"
 DEADLINE=$(( $(date +%s) + ${WATCHDOG_DEADLINE_SECONDS:-180} ))
 LOG="$STATE/restart-watchdog.log"
+
+# `_ensure_service_log` (your-org/nexus-code#484): `tee -a` creates the
+# log under the ambient umask (0660 — group-writable) exactly as a bare
+# `>>` would. Set the mode once, here, before the first note() lands.
+# shellcheck source=_log-mode.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_log-mode.sh"
+mkdir -p "$STATE" 2>/dev/null || true
+_ensure_service_log "$LOG"
 
 note() { printf '%s %s\n' "$(date -Is)" "$*" | tee -a "$LOG"; }
 fail() {

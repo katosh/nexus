@@ -60,6 +60,13 @@ esac
 if printf '%s' "$_cmd" | grep -Eq 'gh ([^|;&]*\b)?(pr (create|edit|merge|comment|close|reopen|ready|review)|issue (create|edit|comment|close|reopen|lock|delete)|release (create|edit|delete|upload)|api [^|;&]*(graphql|--input|--field|--raw-field|-F |-f |(-X|--method)[= ]*(POST|PATCH|PUT|DELETE)))'; then
     mkdir -p "$_state_dir" 2>/dev/null || true
     _ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown-ts)
+    # Explicit mode at creation (your-org/nexus-code#484). An audit trail of
+    # bot-identity bypasses that any group member can rewrite is not a trail.
+    # Guarded source: a hook must never wedge claude's turn.
+    # shellcheck source=../_log-mode.sh
+    . "$(cd "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/_log-mode.sh" 2>/dev/null || true
+    command -v _ensure_service_log >/dev/null 2>&1 \
+        && _ensure_service_log "$_state_dir/gh-bypass-warnings.log" || true
     printf '%s\twindow=%s\tcmd=%s\n' "$_ts" \
         "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" "$_cmd" \
         >> "$_state_dir/gh-bypass-warnings.log" 2>/dev/null || true

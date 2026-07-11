@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# monitor/pipwrap/pip — PATH-FRONT guard against the sandbox /app/bin/pip
+# fork storm (fork-storm class, your-org/nexus-code#487).
+#
+# On 2026-07-09 16:41 a worker ran `pip download …`; the agent-sandbox
+# wrapper at /app/bin/pip re-execs itself without bound, and 10,242 pip
+# processes exhausted the node's pid_max — the watcher died and nine of
+# twelve workers with it. The `uv pip` alternative was already documented
+# in the workspace CLAUDE.md and was ignored, so documentation is the
+# wrong layer: this shim makes the hazardous binary UNREACHABLE for agent
+# shells instead.
+#
+# Delivery is the monitor/ghwrap/gh mechanism: a real executable named
+# `pip`, PATH-fronted by monitor/locals-env.sh (full mode only — the
+# operator's interactive shells use PATH-ONLY mode and never see it) and
+# force-fronted per-command by monitor/shellenv/{.zshenv,bash_env.sh}.
+# Because it is an executable, every child an agent spawns (bash
+# subshells, python subprocess, Makefiles) hits it too.
+#
+# REFUSE, don't rewrite. `pip download` (today's trigger) has no `uv pip`
+# equivalent, and the two arg surfaces diverge in many small ways; a
+# silent rewrite would fail differently and teach nothing, while a loud
+# refusal names the fix and the reason in one line. Escape hatches, in
+# resolution order:
+#   * a pip that is NOT the hazardous sandbox wrapper — e.g. an activated
+#     venv's own bin/pip, or any pip outside NEXUS_PIP_HAZARD_PREFIX
+#     (default /app/) — is exec'd untouched: the shim blocks exactly the
+#     storm primitive, nothing else;
+#   * WATCHER_WINDOW set (watcher / service parity with ghwrap): pass
+#     through;
+#   * PIP_UNWRAPPED=1: deliberate, visible opt-in to the real resolution
+#     (mirrors GH_IMPERSONATE's loud-escape pattern).
+#
+# `pip3` is a symlink to this file and behaves identically (resolution
+# looks the invoked name up, so `pip3` finds the real `pip3`).
+
+set -u
+
+# --- locate this wrapper's own dir (to exclude from resolution) -----------
+_pw_name=$(basename "$0")
+_pw_arg0="$0"
+case "$_pw_arg0" in
+    */*) _pw_dir=$(CDPATH= cd "$(dirname "$_pw_arg0")" 2>/dev/null && pwd || true) ;;
+    *)
+        _pw_cv=$(command -v "$_pw_arg0" 2>/dev/null || true)
+        case "$_pw_cv" in
+            */*) _pw_dir=$(CDPATH= cd "$(dirname "$_pw_cv")" 2>/dev/null && pwd || true) ;;
+            *)   _pw_dir="" ;;
+        esac
+        ;;
+esac
+
+# --- resolve the real binary: first PATH hit that is not in our dir -------
+_pw_real=""
+_pw_ifs="$IFS"; IFS=:
+for _pw_d in ${PATH:-}; do
+    [ -n "$_pw_d" ] || continue
+    [ "$_pw_d" = "$_pw_dir" ] && continue
+    if [ -x "$_pw_d/$_pw_name" ] && [ ! -d "$_pw_d/$_pw_name" ]; then
+        _pw_real="$_pw_d/$_pw_name"
+        break
+    fi
+done
+IFS="$_pw_ifs"
+
+if [ -z "$_pw_real" ]; then
+    echo "pip shim: no real '$_pw_name' found on PATH (and the sandbox one would be refused anyway) — use 'uv pip' (your-org/nexus-code#487)." >&2
+    exit 127
+fi
+
+# --- passthrough conditions ------------------------------------------------
+# 1. Not the hazardous sandbox wrapper (venv pip, system pip elsewhere).
+_pw_hazard="${NEXUS_PIP_HAZARD_PREFIX:-/app/}"
+case "$_pw_real" in
+    "$_pw_hazard"*) : ;;                      # hazardous — fall through
+    *) exec "$_pw_real" "$@" ;;
+esac
+# 2. Watcher / service environments (parity with ghwrap's inertness rule).
+if [ -n "${WATCHER_WINDOW:-}" ]; then
+    exec "$_pw_real" "$@"
+fi
+# 3. Deliberate, loud opt-in.
+if [ "${PIP_UNWRAPPED:-}" = "1" ]; then
+    echo "pip shim: PIP_UNWRAPPED=1 — running $_pw_real (bound your process tree; see your-org/nexus-code#487)" >&2
+    exec "$_pw_real" "$@"
+fi
+
+# --- refuse loudly ----------------------------------------------------------
+cat >&2 <<MSG
+pip: refusing to run $_pw_real — the sandbox-wrapped pip re-execs itself
+without bound and has taken this node down (10,242 pip processes,
+2026-07-09; your-org/nexus-code#487). Use 'uv pip $*' instead (venv-aware,
+finishes in seconds). If you truly need the real pip: PIP_UNWRAPPED=1 pip $*
+MSG
+exit 1

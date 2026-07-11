@@ -371,6 +371,29 @@ rm -f /tmp/followup-TASKNAME.txt
 # Short messages: monitor/paste-followup.sh 'TASKNAME' --message '...'
 ```
 
+**Check the exit code — the banner is not the evidence (issue `#507`).**
+`tmux send-keys … Enter` returning 0 means tmux accepted a keystroke, not
+that Claude Code submitted the prompt. The helper used to print
+`delivered` on that basis alone; on 2026-07-09 a 4,136-char correction
+printed `delivered`, never submitted, and the target spent twenty minutes
+working against the very story the correction existed to retract. The
+helper now polls the target session's own transcript (and its
+`UserPromptSubmit` hook stamp), retries the Enter once — a paste Claude
+Code collapsed into a `[Pasted text #N +N lines]` placeholder can need a
+second one — and reports only what it established:
+
+| rc | meaning | what you do |
+|---|---|---|
+| `0` | `submitted` — a TUI submission record appeared | nothing; the worker has it |
+| `1` | hard failure (window absent, tmux error, empty message) | fix the call; `spawn-worker.sh --resume` if the window is gone |
+| `3` | `submission unconfirmed` — unverifiable, or a turn was in flight so the text is plausibly **queued** behind it | **re-check** before relying on the worker having read it; re-paste once the pane is idle |
+| `4` | `pasted (NOT submitted)` — established negative: the session stayed inert, the text sits in the input box | **re-paste**; the worker has not seen it |
+
+Never read a non-zero rc as delivery. `--no-enter` exits `0` and says so
+explicitly — it never claims a submission it did not intend. Do **not**
+try to confirm a paste by grepping the pane: Claude Code collapses long
+pastes into a placeholder, so the content never enters the scrollback.
+
 **Why the helper is mandatory (issue #201).** Every paste fires the
 worker's `UserPromptSubmit` hook, and the watcher attributes each
 stamped submit to either the operator or the orchestrator. The

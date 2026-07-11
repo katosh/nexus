@@ -110,6 +110,11 @@ build_case() {
     # nexus#202) — copy it so the engaged-capture is real, not the
     # degraded active-only fallback.
     cp "$_real_test_dir/_idle_probe.sh" "$ROOT/monitor/watcher/_idle_probe.sh"
+    # bootstrap-recover.sh sources ../_log-mode.sh for `_ensure_service_log`
+    # (your-org/nexus-code#484). Without it the staged tree would run the
+    # launcher with the helper UNDEFINED — service logs silently created
+    # group-writable again, and the suite green anyway. Stage the real one.
+    cp "$_real_test_dir/../_log-mode.sh" "$ROOT/monitor/_log-mode.sh"
     RECOVER="$ROOT/monitor/bootstrap-recover.sh"
     REG="$ROOT/monitor/services.registry"
     BIN="$ROOT/bin"

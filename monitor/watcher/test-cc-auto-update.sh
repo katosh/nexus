@@ -70,9 +70,30 @@
 #         Step-5b bug repro) → fail loud, NO kill, NO wait, rc 23.
 #    20c. target window unresolvable to a tmux index → fail loud before
 #         any pane-state poll, NO kill, rc 23.
-#    20d. `state=empty` valid transient verdict → treated as not-idle and
-#         FORCE-restarted at the cap (rc 0, kill), NOT fail-loud (rc 23) —
-#         the load-bearing empty-token vs unreadable-probe distinction.
+#    20d. `state=empty` valid transient verdict → keeps WAITING (not
+#         abort-23 mid-wait), but an ALL-empty wait never positively
+#         resolved the pane, so the cap REFUSES the force and aborts
+#         loud (rc 23, no kill) — nexus-code#514 item 3.
+#    20d2. busy once then empty → resolved_seen latched → cap forces
+#         (rc 0), the operator decision preserved for resolved panes.
+#    E1.  Monitor-handle working-background (no bg_cpu=) is a TURN
+#         BOUNDARY → clean, non-forced restart (nexus-code#514: a
+#         Monitor-holding orchestrator can never emit literal `idle`).
+#    E2.  shell-driven working-background (bg_cpu= present) is NOT
+#         eligible (live fire-and-forget child) → waits, forces at cap.
+#   restart hold (nexus-code#513)
+#    H1.  active hold suppresses the reconcile; audit row once per hold.
+#    H2.  TTL-expired hold no longer suppresses.
+#    H3.  until_version holds its candidate; newer effective re-arms.
+#    H4.  hold / hold-status / unhold verb round-trip, audited.
+#    H5.  detached restart honours a pre-existing hold (rc 25, no kill).
+#    H6.  SIGTERM'd detached restart WRITES the hold (abort stays aborted).
+#   deployment gate (nexus-code#512)
+#    G1.  open restart-path PR → defer (rc 30, nothing mutated).
+#    G2.  PR probe failure → defer (fail-safe), distinct detail.
+#    G3.  live agent windows > max → defer; infra windows exempt.
+#    G3b. windows ≤ max → proceeds, count recorded in the apply record.
+#    G4.  duplicate watcher groups post-restart → invariant rc 31, no 5b.
 #    20e. INDEX re-resolved every poll (not cached): orchestrator moves
 #         3→2 mid-wait, probe follows the new index then kills (rc 0) —
 #         the renumber-windows hardening.
@@ -493,6 +514,11 @@ EOF
 }
 
 # Common env for an apply invocation rooted at $1.
+# CC_AUTO_GATE_PR_CMD=true → the deployment gate's PR probe (nexus-code
+# #512) reports "no open restart-path PRs" (rc 0, no output); the gate's
+# own behaviours are exercised explicitly in the G-cases below.
+# CC_AUTO_INVARIANT_TRIES=1 bounds the post-restart invariant's settle
+# loop so a fixture never waits out the production 5×2s window.
 apply_env() {
     local root="$1"
     echo NEXUS_ROOT="$root" \
@@ -503,6 +529,8 @@ apply_env() {
         CC_AUTO_CLAUDE_BIN="$root/claude" \
         CC_AUTO_TMUX="$root/tmux" \
         CC_AUTO_PROJECTS_DIR="$root/projects" \
+        CC_AUTO_GATE_PR_CMD=true \
+        CC_AUTO_INVARIANT_TRIES=1 \
         CC_AUTO_IDLE_WAIT_SECONDS=2 CC_AUTO_IDLE_POLL_SECONDS=1 \
         CC_AUTO_ARM_WAIT_SECONDS=2 CC_AUTO_ARM_POLL_SECONDS=1
 }
@@ -715,22 +743,83 @@ else
     fail "unresolvable-window handling wrong (rc=$rc)"
 fi
 
-# 20d. `state=empty` is a VALID verdict (renderer transient, claude
-#      alive — "re-poll next cycle"), distinct from an UNREADABLE probe.
-#      It must be treated as a normal non-idle wait and FORCE-restart at
-#      the cap (rc 0, kill), NOT fail-loud (rc 23). Load-bearing
-#      distinction: empty → keep waiting → force; unreadable → abort.
+# 20d. `state=empty` is a VALID not-idle verdict (renderer transient,
+#      claude alive — "re-poll next cycle"), distinct from an UNREADABLE
+#      probe — it keeps WAITING, never aborts mid-wait. But a wait that
+#      saw NOTHING but empty never positively resolved the pane (no
+#      busy, no turn boundary), so the cap REFUSES to force-kill and
+#      aborts loud instead (rc 23, no kill) — nexus-code#514 item 3
+#      (pre-#514 this force-killed: 7/7 recorded fires, all
+#      "last state=empty"). The reconcile retries after its cooldown.
 ROOT="$WORK/a20d"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\necho "state=empty active=1 window=2 name=orchestrator"\n' > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
     --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
 rc=$?
+if (( rc == 23 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+   && grep -q "never-resolved-empty-at-cap" "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
+    pass "ALL-empty wait → cap refuses the force (rc 23, no kill) — never-resolved guard"
+else
+    fail "all-empty cap handling wrong (rc=$rc, want 23 + no kill)"
+fi
+
+# 20d2. empty is still a plain WAIT verdict when the pane resolved at
+#       least once: busy on the first poll, empty ever after → the cap
+#       force-fires (rc 0, kill, outcome forced) exactly as for a
+#       busy-forever pane. Pins the resolved_seen latch.
+ROOT="$WORK/a20d2"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+cat > "$ROOT/pane-state" <<EOF
+#!/usr/bin/env bash
+ctr="$ROOT/probe.ctr"
+n=\$(cat "\$ctr" 2>/dev/null || echo 0); echo \$(( n + 1 )) > "\$ctr"
+if (( n == 0 )); then echo "state=busy active=1 window=2 name=orchestrator"
+else echo "state=empty active=1 window=2 name=orchestrator"; fi
+EOF
+chmod +x "$ROOT/pane-state"
+env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+rc=$?
 if (( rc == 0 )) && grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
    && grep -q $'\tsafe-bumped-restart-forced\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
-    pass "state=empty token → not-idle, force-restarts at cap (rc 0), NOT abort-23"
+    pass "busy-once-then-empty → resolved_seen latched, cap force-fires (rc 0)"
 else
-    fail "empty-token handling wrong (rc=$rc, expected forced rc 0 not 23)"
+    fail "resolved_seen latch wrong (rc=$rc, want forced rc 0)"
+fi
+
+# E1 (nexus-code#514). Monitor-handle `working-background` (no bg_cpu=
+#     field) IS a turn boundary: the orchestrator permanently holds the
+#     watcher-supervisor Monitor handle, so pane-state can NEVER emit a
+#     literal `idle` for it — this is the state every clean restart must
+#     key on. Expect a CLEAN (non-forced) restart on the FIRST poll.
+ROOT="$WORK/ae1"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+printf '#!/usr/bin/env bash\necho "state=working-background active=1 window=2 name=orchestrator"\n' > "$ROOT/pane-state"
+chmod +x "$ROOT/pane-state"
+env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+rc=$?
+if (( rc == 0 )) && grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+   && grep -q $'\tsafe-bumped-restarted\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv" \
+   && ! grep -q $'\tsafe-bumped-restart-forced\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
+    pass "Monitor-handle working-background → turn boundary, CLEAN restart (rc 0, not forced)"
+else
+    fail "Monitor-handle eligibility wrong (rc=$rc)"
+fi
+
+# E2 (nexus-code#514). SHELL-driven `working-background` (bg_cpu= on the
+#     emit line) has a live fire-and-forget child the kill would destroy
+#     → NOT eligible; waits to the cap, then forces (positively resolved).
+ROOT="$WORK/ae2"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+printf '#!/usr/bin/env bash\necho "state=working-background active=1 window=2 name=orchestrator bg_shells=1 bg_reliable=1 bg_cpu=42 bg_oldest_start=1"\n' > "$ROOT/pane-state"
+chmod +x "$ROOT/pane-state"
+env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+rc=$?
+if (( rc == 0 )) && grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+   && grep -q $'\tsafe-bumped-restart-forced\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
+    pass "shell-driven working-background (bg_cpu=) → NOT eligible, waits, forces at cap"
+else
+    fail "shell-driven working-background handling wrong (rc=$rc)"
 fi
 
 # 20e. INDEX is re-resolved every poll, not cached. Skeptic edge: with
@@ -832,6 +921,210 @@ if (( rc == 21 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
     pass "pin goes stale DURING the wait → fire-time re-check aborts (rc 21, no kill)"
 else
     fail "fire-time pin re-validation wrong (rc=$rc): $(grep safe-bumped-restart-aborted "$ROOT/monitor/.state/cc-auto-update/decisions.tsv" | tail -1)"
+fi
+
+# ===== restart hold (nexus-code#513) =======================================
+
+echo "== restart hold =="
+
+# H1. an active hold suppresses the reconcile fire — and the audit row is
+#     written ONCE per hold, not per tick (the ack-stamp dedup).
+ROOT="$WORK/h1"; make_reconcile_root "$ROOT" "2.1.186" "2.1.195" "2.1.186"
+auto="$ROOT/monitor/.state/cc-auto-update"; mkdir -p "$auto"
+_cc_auto_write_restart_hold "$auto" "operator says no" "" ""
+reconcile "$ROOT"
+reconcile "$ROOT"
+held_rows=$(grep -c $'\treconcile-held\t' "$auto/decisions.tsv" 2>/dev/null || true)
+if [[ ! -e "$ROOT/apply.log" ]] && (( held_rows == 1 )); then
+    pass "active hold suppresses the reconcile; 'reconcile-held' logged once, not per tick"
+else
+    fail "hold suppression wrong (apply=$( [[ -e $ROOT/apply.log ]] && echo fired || echo no ), held_rows=$held_rows)"
+fi
+# ... and a REWRITTEN hold re-logs once (fresh mtime beats the ack).
+sleep 1
+_cc_auto_write_restart_hold "$auto" "operator says no again" "" ""
+reconcile "$ROOT"
+held_rows=$(grep -c $'\treconcile-held\t' "$auto/decisions.tsv" 2>/dev/null || true)
+(( held_rows == 2 )) \
+    && pass "a rewritten hold re-logs exactly once" \
+    || fail "rewritten-hold logging wrong (held_rows=$held_rows)"
+
+# H2. an EXPIRED (TTL lapsed) hold does not suppress — the fire proceeds.
+ROOT="$WORK/h2"; make_reconcile_root "$ROOT" "2.1.186" "2.1.195" "2.1.186"
+auto="$ROOT/monitor/.state/cc-auto-update"; mkdir -p "$auto"
+_cc_auto_write_restart_hold "$auto" "stale hold" "$(( $(date +%s) - 10 ))" ""
+reconcile "$ROOT"
+[[ -f "$ROOT/apply.log" ]] && grep -q "restart-orchestrator --candidate 2.1.195" "$ROOT/apply.log" \
+    && pass "TTL-expired hold no longer suppresses (fire proceeds)" \
+    || fail "expired hold still suppressed the reconcile"
+
+# H3. until_version semantics: holds candidates <= the named version; a
+#     NEWER effective re-arms (mirrors the daily awaiting-operator model).
+ROOT="$WORK/h3"; make_reconcile_root "$ROOT" "2.1.186" "2.1.195" "2.1.186"
+auto="$ROOT/monitor/.state/cc-auto-update"; mkdir -p "$auto"
+_cc_auto_write_restart_hold "$auto" "hold this candidate" "" "2.1.195"
+reconcile "$ROOT"
+h3a_ok=0; [[ ! -e "$ROOT/apply.log" ]] && h3a_ok=1
+printf '%s\n' "2.1.196" > "$ROOT/monitor/.state/cc-version-local"   # newer candidate arrives
+rm -f "$auto/reconcile.last"                                         # clear the cooldown, isolate the hold
+reconcile "$ROOT"
+if (( h3a_ok )) && [[ -f "$ROOT/apply.log" ]] \
+   && grep -q "restart-orchestrator --candidate 2.1.196" "$ROOT/apply.log"; then
+    pass "until_version holds its candidate; a newer effective re-arms"
+else
+    fail "until_version semantics wrong (held=$h3a_ok, apply=$(cat "$ROOT/apply.log" 2>/dev/null))"
+fi
+
+# H4. hold / hold-status / unhold verbs round-trip.
+ROOT="$WORK/h4"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env NEXUS_ROOT="$ROOT" bash "$APPLY" hold --reason "operator pause" --until-version 2.1.160 >/dev/null 2>&1
+hs_rc=0; env NEXUS_ROOT="$ROOT" bash "$APPLY" hold-status >/dev/null 2>&1 || hs_rc=$?
+env NEXUS_ROOT="$ROOT" bash "$APPLY" unhold >/dev/null 2>&1
+hs2_rc=0; env NEXUS_ROOT="$ROOT" bash "$APPLY" hold-status >/dev/null 2>&1 || hs2_rc=$?
+auto="$ROOT/monitor/.state/cc-auto-update"
+if (( hs_rc == 0 )) && (( hs2_rc == 1 )) && [[ ! -f "$auto/restart-hold" ]] \
+   && grep -q $'\trestart-hold-set\t' "$auto/decisions.tsv" \
+   && grep -q $'\trestart-hold-released\t' "$auto/decisions.tsv"; then
+    pass "hold → active (rc 0), unhold → released (rc 1), both audited"
+else
+    fail "hold-verb round-trip wrong (active_rc=$hs_rc after_unhold_rc=$hs2_rc)"
+fi
+
+# H5. the detached restart honours an existing hold: no wait, no kill,
+#     rc 25, outcome safe-bumped-restart-held.
+ROOT="$WORK/h5"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+auto="$ROOT/monitor/.state/cc-auto-update"; mkdir -p "$auto"
+_cc_auto_write_restart_hold "$auto" "do not restart" "" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+rc=$?
+if (( rc == 25 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+   && grep -q $'\tsafe-bumped-restart-held\t' "$auto/decisions.tsv"; then
+    pass "detached restart honours the hold (rc 25, no kill)"
+else
+    fail "hold pre-flight wrong (rc=$rc)"
+fi
+
+# H6. SIGTERMing the detached restart WRITES the hold (abort-on-purpose
+#     must stay aborted — pre-#513 the dead pid re-armed the reconcile's
+#     single-flight guard and the abort CAUSED the refire).
+ROOT="$WORK/h6"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+auto="$ROOT/monitor/.state/cc-auto-update"
+printf '#!/usr/bin/env bash\necho "state=busy active=1 window=2 name=orchestrator"\n' > "$ROOT/pane-state"
+chmod +x "$ROOT/pane-state"
+env $(apply_env "$ROOT") CC_AUTO_IDLE_WAIT_SECONDS=60 bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1 &
+h6_pid=$!
+sleep 2
+kill -TERM "$h6_pid" 2>/dev/null
+wait "$h6_pid" 2>/dev/null; rc=$?
+if (( rc == 25 )) && [[ -f "$auto/restart-hold" ]] \
+   && grep -q '^until_version=2\.1\.160$' "$auto/restart-hold" \
+   && grep -q "sigterm-hold-written" "$auto/decisions.tsv" \
+   && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log"; then
+    pass "SIGTERM'd detached restart writes the hold (until_version=candidate, rc 25, no kill)"
+else
+    fail "SIGTERM-hold wrong (rc=$rc, hold=$( [[ -f $auto/restart-hold ]] && echo yes || echo no ))"
+fi
+
+# ===== deployment gate (nexus-code#512) ====================================
+
+echo "== deployment gate =="
+
+# G1. an open PR touching the watcher restart path DEFERS the apply:
+#     rc 30, NOTHING mutated (no pin, no install), outcome safe-deferred
+#     with the PR pinned in the detail.
+ROOT="$WORK/g1"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+printf '#!/usr/bin/env bash\nprintf "503\\tmonitor/watcher/launcher.sh\\n503\\tmonitor/README.md\\n"\n' > "$ROOT/gate-prs"
+chmod +x "$ROOT/gate-prs"
+env $(apply_env "$ROOT") CC_AUTO_GATE_PR_CMD="$ROOT/gate-prs" bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+rc=$?
+auto="$ROOT/monitor/.state/cc-auto-update"
+if (( rc == 30 )) && [[ ! -f "$ROOT/monitor/.state/cc-version-local" ]] \
+   && ! grep -q '^install$' "$ROOT/calls.log" \
+   && grep -q "deferred-pending-PR503" "$auto/decisions.tsv"; then
+    pass "open restart-path PR → apply deferred (rc 30, nothing mutated, PR recorded)"
+else
+    fail "PR-gate defer wrong (rc=$rc): $(grep safe-deferred "$auto/decisions.tsv" 2>/dev/null | tail -1)"
+fi
+
+# G2. the PR probe FAILING is not a pass — cannot establish the restart
+#     path is unclaimed → defer (fail-safe), distinct detail.
+ROOT="$WORK/g2"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") CC_AUTO_GATE_PR_CMD=false bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+rc=$?
+auto="$ROOT/monitor/.state/cc-auto-update"
+if (( rc == 30 )) && [[ ! -f "$ROOT/monitor/.state/cc-version-local" ]] \
+   && grep -q "restart-path-pr-query-failed" "$auto/decisions.tsv"; then
+    pass "PR probe failure → defer, never treated as 'no PRs' (fail-safe)"
+else
+    fail "PR-probe-failure handling wrong (rc=$rc)"
+fi
+
+# G3 + G3b. live-window gate: 3 agent windows (infra names exempted)
+#     defer at max=2 and pass at max=3; the count lands in the audit row.
+make_gate_tmux() {  # $1=root — tmux stub serving BOTH list-windows formats
+    cat > "$1/tmux" <<EOF
+#!/usr/bin/env bash
+echo "tmux \$*" >> "$1/calls.log"
+case "\$1" in
+  list-windows)
+    case "\$*" in
+      *'#{window_name}|#{window_index}'*) echo "orchestrator|2" ;;
+      *'#{window_name}'*)
+        printf '%s\n' orchestrator services cc-auto-update cc-restart-watchdog w1 w2 w3 ;;
+    esac
+    exit 0 ;;
+esac
+exit 0
+EOF
+    chmod +x "$1/tmux"
+}
+ROOT="$WORK/g3"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
+env $(apply_env "$ROOT") CC_AUTO_TMUX="$ROOT/tmux" CC_AUTO_MAX_LIVE_WINDOWS=2 \
+    bash "$APPLY" safe --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+rc=$?
+auto="$ROOT/monitor/.state/cc-auto-update"
+if (( rc == 30 )) && [[ ! -f "$ROOT/monitor/.state/cc-version-local" ]] \
+   && grep -q "live-windows=3>max=2" "$auto/decisions.tsv"; then
+    pass "window gate: 3 agents > max 2 → defer (infra windows exempted from the count)"
+else
+    fail "window-gate defer wrong (rc=$rc): $(grep safe-deferred "$auto/decisions.tsv" 2>/dev/null | tail -1)"
+fi
+ROOT="$WORK/g3b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
+env $(apply_env "$ROOT") CC_AUTO_TMUX="$ROOT/tmux" CC_AUTO_MAX_LIVE_WINDOWS=3 \
+    CC_AUTO_RESTART_INLINE=1 \
+    bash "$APPLY" safe --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+rc=$?
+auto="$ROOT/monitor/.state/cc-auto-update"
+if (( rc == 0 )) && grep -q "live_windows=3" "$auto/decisions.tsv" \
+   && [[ "$(cat "$ROOT/monitor/.state/cc-version-local" 2>/dev/null)" == "2.1.160" ]]; then
+    pass "window gate: 3 agents ≤ max 3 → proceeds; count recorded in the apply record"
+else
+    fail "window-gate pass wrong (rc=$rc)"
+fi
+
+# G4. post-restart invariant: TWO live watcher groups for this root after
+#     the restart → rc 31, orchestrator restart NOT handed off (no kill).
+ROOT="$WORK/g4"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+mkdir -p "$ROOT/monitor/watcher"
+printf '#!/usr/bin/env bash\nsleep 30\n' > "$ROOT/monitor/watcher/main.sh"
+chmod +x "$ROOT/monitor/watcher/main.sh"
+setsid bash "$ROOT/monitor/watcher/main.sh" & g4_p1=$!
+setsid bash "$ROOT/monitor/watcher/main.sh" & g4_p2=$!
+sleep 1
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+rc=$?
+kill "$g4_p1" "$g4_p2" 2>/dev/null; wait "$g4_p1" "$g4_p2" 2>/dev/null
+auto="$ROOT/monitor/.state/cc-auto-update"
+if (( rc == 31 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
+   && grep -q $'\tsafe-bumped-restart-invariant-violated\t' "$auto/decisions.tsv"; then
+    pass "duplicate watcher groups post-restart → invariant violation (rc 31, no Step 5b)"
+else
+    fail "post-restart invariant wrong (rc=$rc)"
 fi
 
 # ===== apply: compat-pr branch =============================================

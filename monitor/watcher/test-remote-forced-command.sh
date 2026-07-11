@@ -113,6 +113,46 @@ nid2=$(fc alice 'request file --kind question --reply none --slug reply-none --m
 fc alice 'request file --reply maybe --slug reply-bad --message please' >/dev/null 2>&1
 assert_rc "--reply maybe (bogus) refused rc12" "$?" "12"
 
+echo "== 1d. bounded stdin body: REMOTE_BODY_MAX_BYTES ceiling (#483 Part 2) =="
+# Oversize body → refused rc12 BEFORE any request file exists (closes the
+# authenticated-client disk-fill hole: stdin used to stream unbounded into
+# the inbox).
+pre_count=$(find "$REQ" -maxdepth 1 -name '*.new.md' 2>/dev/null | wc -l)
+REMOTE_BODY_MAX_BYTES=64 fc alice 'request file --kind report --slug too-big --message-stdin' \
+    "$(head -c 200 /dev/zero | tr '\0' 'x')" >/dev/null 2>&1
+assert_rc "oversize stdin body refused rc12" "$?" "12"
+post_count=$(find "$REQ" -maxdepth 1 -name '*.new.md' 2>/dev/null | wc -l)
+assert_eq "no request file created for a refused oversize body" "$post_count" "$pre_count"
+# Under the ceiling → accepted (the fc harness herestring adds 1 newline).
+okid=$(REMOTE_BODY_MAX_BYTES=64 fc alice 'request file --kind report --slug at-cap --message-stdin' \
+    "$(head -c 40 /dev/zero | tr '\0' 'y')")
+assert_rc "under-ceiling stdin body accepted rc0" "$?" "0"
+assert_file_exists "under-ceiling request written" "$REQ/$okid.new.md"
+# No staged .body.* temp lingers in the principals dir (unlink-after-open;
+# EXIT trap covers the refuse path).
+lingering=$(find "$MONITOR_REMOTE_PRINCIPALS_DIR" -maxdepth 1 -name '.body.*' 2>/dev/null | wc -l)
+assert_eq "no staged body temp lingers in the principals dir" "$lingering" "0"
+
+echo "== 1e. --checksum echoes sha256+bytes of the RECEIVED body before the id =="
+payload='verify me byte-exact'
+# The fc harness delivers the payload via a herestring, which appends one
+# newline — the checksum covers the bytes RECEIVED, so expect payload+\n.
+want_sha=$(printf '%s\n' "$payload" | sha256sum | awk '{print $1}')
+want_bytes=$(printf '%s\n' "$payload" | wc -c)
+out=$(fc alice 'request file --kind report --slug checked --checksum --message-stdin' "$payload")
+assert_rc "checksum file rc0" "$?" "0"
+first_line=$(printf '%s\n' "$out" | head -1)
+assert_eq "first output line is the received-body checksum" \
+    "$first_line" "sha256=$want_sha bytes=$want_bytes"
+cid=$(printf '%s\n' "$out" | tail -1)
+assert_file_exists "checksummed request written (id on last line)" "$REQ/$cid.new.md"
+cbody=$("$RC" show "$cid")
+assert_contains "checksummed body captured verbatim" "$cbody" "$payload"
+# --checksum with an inline --message is refused (argv is whitespace-joined;
+# there is no byte-exact client-side reference to verify against).
+fc alice 'request file --slug bad-ck --checksum --message hello there' >/dev/null 2>&1
+assert_rc "--checksum with inline --message refused rc12" "$?" "12"
+
 echo "== 2. SSH_ORIGINAL_COMMAND injection is inert =="
 # (a) metachars in a message are literal text, never executed.
 rm -f "$WORK/SENTINEL"

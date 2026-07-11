@@ -1545,6 +1545,18 @@ _wrapup_skeptic_step() {
     local next=$((depth + 1))
     case "$effective" in
         required|required-escalated)
+            # Open a NEW skeptic round: clear the previous round's DONE
+            # sentinel BEFORE writing the pending marker. A completed round
+            # leaves $STATE_DIR/skeptic/<task>/DONE behind; left in place, the
+            # worker's very next `skeptic-channel.sh await` returns exit 10
+            # instantly and it retires believing it was validated when no
+            # skeptic ever spawned — the gate fails OPEN exactly on the
+            # re-validation rounds, which exist because something was already
+            # found wrong (issue #469). await independently refuses a DONE
+            # older than the marker; this is the fail-fast half of that pair.
+            if [[ -n "$sw_safe" ]]; then
+                rm -f "$STATE_DIR/skeptic/${sw_safe}/DONE" 2>/dev/null || true
+            fi
             [[ -n "$sw_safe" ]] && printf '%s' "$next" > "$pending_dir/${sw_safe}" 2>/dev/null || true
             ( cmd_log_action monitor --event skeptic-request \
                 --extra "target-window=$source_window" \
@@ -2159,8 +2171,22 @@ cmd_fetch_asset() {
     # User PAT, NOT bot installation token. We deliberately read it
     # via `gh auth token` instead of forwarding $GH_TOKEN — bot tokens
     # 404 on this domain, and that's the entire reason this verb exists.
-    local user_pat
-    user_pat=$(gh auth token 2>/dev/null) || true
+    #
+    # locals-env.sh scopes GH_CONFIG_DIR to a credential-free dir (fail-closed
+    # identity), so name the operator's config dir explicitly rather than
+    # relying on gh-shim.sh being on PATH — this verb must keep working even
+    # when the PATH-front wrapper is not reached.
+    local user_pat opcfg=""
+    if [[ -n "${NEXUS_OPERATOR_GH_CONFIG_DIR:-}" ]]; then
+        opcfg="$NEXUS_OPERATOR_GH_CONFIG_DIR"
+    elif [[ -n "${NEXUS_GH_CONFIG_SCOPED:-}" ]]; then
+        opcfg="${XDG_CONFIG_HOME:-${HOME:-}/.config}/gh"
+    fi
+    if [[ -n "$opcfg" ]]; then
+        user_pat=$(GH_CONFIG_DIR="$opcfg" gh auth token 2>/dev/null) || true
+    else
+        user_pat=$(gh auth token 2>/dev/null) || true
+    fi
     [[ -n "$user_pat" ]] || {
         echo "ng fetch-asset: gh auth token returned empty; user PAT required (run: gh auth login)" >&2
         exit 2
@@ -3960,6 +3986,8 @@ cmd_retire_preflight() { _facade retire-preflight.sh "$@"; }
 cmd_pane_state()       { _facade pane-state.sh       "$@"; }
 # worker: pre-flight that a deliverable path is writable before compute
 cmd_write_probe()      { _facade write-probe.sh      "$@"; }
+# maintenance: roll pre-buffer reports into monthly reports/YYYY-MM/ dirs
+cmd_reports_roll()     { _facade reports-roll.sh     "$@"; }
 # worker: self-declare an async external wait (slurm/CI/long curl)
 cmd_declare_wait()     { _facade declare-wait.sh     "$@"; }
 # worker: mark an async launch deliberately fire-and-forget
@@ -4006,6 +4034,7 @@ Task lifecycle & reports:
   wrap-up-check <window>         verify a window wrapped up cleanly
   report-init <slug>             write a frontmatter'd report skeleton
   report-check <path>            validate a report's required sections
+  reports-roll [--dry-run]       archive pre-buffer reports into reports/YYYY-MM/
   log-action <agent> --event …   append an action-log event
   fetch-asset <url>              fetch a user-attachments asset locally
 
@@ -4062,6 +4091,7 @@ main() {
         wrap-up)        cmd_wrap_up       "$@" ;;
         report-init)    cmd_report_init   "$@" ;;
         report-check)   cmd_report_check  "$@" ;;
+        reports-roll)   cmd_reports_roll  "$@" ;;
         fetch-asset)    cmd_fetch_asset   "$@" ;;
         dashboard)      cmd_dashboard     "$@" ;;
         watcher-status) cmd_watcher_status "$@" ;;

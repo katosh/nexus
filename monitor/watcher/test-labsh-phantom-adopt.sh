@@ -34,6 +34,19 @@
 # monitor/labsh-supervised.sh at pre-fix dev and re-running REDs both the
 # dead-pid and pid-reuse subtests (no healthy server ever comes up), and the
 # fix GREENs them.
+#
+# Flake hardening (your-org/nexus-code#478): this test lost a CI run by
+# asserting states it never established — elapsed wall-clock taken as proof
+# an event had occurred. Every assertion now either polls the condition
+# itself to a generous deadline (wait_for / wait_for_log; LABSH_TEST_DEADLINE
+# overrides) or is causally ordered after one that did. The fixture pids are
+# unforgeable under PID-space wrap: the "alive non-server" pid is this test
+# shell's own $$ (a sibling test's stale-pid cleanup can never reap it
+# mid-test, unlike the previous `sleep 300`), and the "verifiably dead" pid
+# is /proc/sys/kernel/pid_max (a value the kernel never allocates), not a
+# spawned-then-reaped pid that a wrap can resurrect. Seed ports are probed
+# free at runtime, never hardcoded. LABSH_TEST_START_GRACE widens the
+# supervisor's grace window to reproduce the slow-runner path deterministically.
 
 set -uo pipefail
 
@@ -170,6 +183,16 @@ chmod +x "$STUBS/labsh"
 export PATH="$STUBS:$PATH"
 
 # --- helpers ----------------------------------------------------------------
+# Generous shared deadline for every poll. Costs wall-clock only on real
+# failure; a load-delayed supervisor is waited out, not sampled early (#478).
+# Scaled with the grace seam: the supervisor's START_GRACE poll loop runs
+# 2×grace iterations, each paying python3 startups in the stub (~1.5 s
+# loaded), so the phantom branch fires at roughly 3×grace — a fixed
+# deadline that ignores the seam would undershoot exactly when the seam is
+# used to simulate a slow runner. (LABSH_SVC_START_GRACE is exported a few
+# lines below; default 4 → deadline 62 s.)
+DL="${LABSH_TEST_DEADLINE:-$(( ${LABSH_TEST_START_GRACE:-4} * 8 + 30 ))}"
+
 wait_for() {  # wait_for <label> <deadline-s> -- cmd...
     local label="$1" deadline="$2"; shift 3
     local t=0
@@ -178,6 +201,25 @@ wait_for() {  # wait_for <label> <deadline-s> -- cmd...
         sleep 0.25; t=$(( t + 1 ))
     done
     printf '  FAIL: %s (deadline %ss)\n' "$label" "$deadline" >&2; FAIL=$(( FAIL + 1 )); return 1
+}
+
+wait_for_log() {  # wait_for_log <label> <deadline-s> <file> <needle>
+    local label="$1" deadline="$2" file="$3" needle="$4"
+    local t=0
+    while (( t < deadline * 4 )); do
+        grep -qF -- "$needle" "$file" 2>/dev/null \
+            && { printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 )); return 0; }
+        sleep 0.25; t=$(( t + 1 ))
+    done
+    printf '  FAIL: %s — %q absent from %s after %ss\n' "$label" "$needle" "$file" "$deadline" >&2
+    FAIL=$(( FAIL + 1 )); return 1
+}
+
+free_port() {  # print a currently-free localhost port (probed, not hardcoded)
+    python3 - <<'EOF'
+import socket
+s = socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1]); s.close()
+EOF
 }
 
 seed_record() {  # seed_record <project> <pid> <port> [<token>]
@@ -189,14 +231,22 @@ seed_record() {  # seed_record <project> <pid> <port> [<token>]
     printf '%s' "$tok" > "$p/.jupyter/token"          # so a phantom's health probe uses a real token
 }
 
-dead_pid() {  # print a pid that is guaranteed dead (spawned then reaped)
-    bash -c 'exit 0' & local d=$!
-    wait "$d" 2>/dev/null
-    printf '%s' "$d"
+# A pid that is guaranteed dead AND unforgeable: /proc/sys/kernel/pid_max
+# itself is never allocated by the kernel, so unlike a spawned-then-reaped
+# pid it can never be resurrected by a PID-space wrap under parallel suite
+# load (#478 — the wrap turned "dead" seeds live and flipped T1's premise).
+impossible_pid() {
+    local m
+    m=$(cat /proc/sys/kernel/pid_max 2>/dev/null)
+    [[ "$m" =~ ^[0-9]+$ ]] || m=4194304
+    printf '%s' "$m"
 }
 
 # Fast start grace so the phantom-adopt window closes in a few seconds.
-export LABSH_SVC_INTERVAL=1 LABSH_SVC_FAILS=2 LABSH_SVC_START_GRACE=4
+# LABSH_TEST_START_GRACE is a test seam: widening it reproduces the
+# loaded-runner slow path deterministically (the #478 falsifiability runs).
+export LABSH_SVC_INTERVAL=1 LABSH_SVC_FAILS=2 \
+       LABSH_SVC_START_GRACE="${LABSH_TEST_START_GRACE:-4}"
 
 # ============================================================================
 echo '=== T1: stale DEAD-pid record is pruned before start → real healthy server ==='
@@ -205,15 +255,19 @@ echo '=== T1: stale DEAD-pid record is pruned before start → real healthy serv
 # launches a fresh server. Pre-fix (no prune) the stub refuses on the record
 # and the phantom is adopted — nothing healthy ever comes up.
 T1="$WORK/t1"; mkdir -p "$T1/.jupyter"
-DPID=$(dead_pid)
-seed_record "$T1" "$DPID" 9731
+DPID=$(impossible_pid)
+seed_record "$T1" "$DPID" "$(free_port)"
 assert_eq "seeded pid is verifiably dead" "$(kill -0 "$DPID" 2>/dev/null; echo $?)" "1"
 "$SUP" "$T1" >"$T1/sup.log" 2>&1 &
 T1SUP=$!; SPAWNED_PIDS+=("$T1SUP")
-wait_for "T1 server becomes healthy" 20 -- "$HEALTH" "$T1"
+# Poll the log line FIRST: the prune strictly precedes the start that makes
+# health pass, so a one-shot sample after health is only safe when health
+# arrived via that path — poll each condition on its own instead (#478).
+wait_for_log "T1 log records the prune" "$DL" "$T1/sup.log" \
+    "pruned stale runtime record for dead pid $DPID"
+wait_for "T1 server becomes healthy" "$DL" -- "$HEALTH" "$T1"
 assert_no_file "T1 dead-pid record pruned" "$T1/.jupyter/share/jupyter/runtime/jpserver-$DPID.json"
 assert_eq "T1 exactly one real start" "$(cat "$T1/.jupyter/stub-start-count" 2>/dev/null)" "1"
-assert_contains "T1 log records the prune" "$(cat "$T1/sup.log")" "pruned stale runtime record for dead pid $DPID"
 kill -KILL "$T1SUP" 2>/dev/null
 
 # ============================================================================
@@ -224,22 +278,35 @@ echo '=== T2: pid-reuse phantom (alive non-server pid) → detect, prune, retry,
 # phantom-adopt detector must, after START_GRACE of unhealth, prune the
 # non-serving record and retry the start once.
 T2="$WORK/t2"; mkdir -p "$T2/.jupyter"
-sleep 300 & ALIVEPID=$!; SPAWNED_PIDS+=("$ALIVEPID")   # alive, but not a server
-# Point the record at a definitely-dead port so record_is_serving fails fast.
-seed_record "$T2" "$ALIVEPID" 9799
+# The alive-but-not-a-server pid is THIS TEST SHELL ($$): alive for exactly
+# the test's lifetime, never a server, and — unlike the previous
+# `sleep 300 &` — impossible for a sibling test's stale-pid cleanup to reap
+# after a PID-space wrap (#478: the reaped sleeper let the pre-start
+# dead-prune fire, the phantom path never ran, and the log assertions
+# sampled `got 0 want 1`). If a supervisor regression ever kills the
+# recorded pid, the test dies loudly — still a red, and a truthful one.
+ALIVEPID=$$
+# Point the record at a probed-free (hence dead) port so record_is_serving
+# fails fast; hardcoded ports collide with real services under load.
+seed_record "$T2" "$ALIVEPID" "$(free_port)"
 assert_eq "T2 seeded pid is alive (kill -0 passes)" "$(kill -0 "$ALIVEPID" 2>/dev/null; echo $?)" "0"
 "$SUP" "$T2" >"$T2/sup.log" 2>&1 &
 T2SUP=$!; SPAWNED_PIDS+=("$T2SUP")
-wait_for "T2 server becomes healthy after phantom self-heal" 30 -- "$HEALTH" "$T2"
+# Poll each log condition in causal order (phantom-adopt detection → the
+# single retry → a healthy server), each to the shared generous deadline —
+# never a one-shot sample at a load-dependent instant (#478).
+wait_for_log "T2 log shows phantom-adopt heal" "$DL" "$T2/sup.log" "phantom-adopt:"
+wait_for_log "T2 log shows the retry" "$DL" "$T2/sup.log" "retrying start once"
+wait_for "T2 server becomes healthy after phantom self-heal" "$DL" -- "$HEALTH" "$T2"
 assert_no_file "T2 phantom record pruned" "$T2/.jupyter/share/jupyter/runtime/jpserver-$ALIVEPID.json"
 assert_eq "T2 alive non-server process was NOT killed (only its record removed)" \
     "$(kill -0 "$ALIVEPID" 2>/dev/null; echo $?)" "0"
-assert_contains "T2 log shows phantom-adopt heal" "$(cat "$T2/sup.log")" "phantom-adopt:"
-assert_contains "T2 log shows the retry" "$(cat "$T2/sup.log")" "retrying start once"
+# Loop guard: asserted only after the retry line appeared AND the server is
+# healthy (the retry cycle completed), so it can no longer flake low; a
+# pathological spin before health would still be caught as count > 1.
 assert_eq "T2 phantom retry happened AT MOST once (loop guard)" \
     "$(grep -c 'retrying start once' "$T2/sup.log")" "1"
 kill -KILL "$T2SUP" 2>/dev/null
-kill -KILL "$ALIVEPID" 2>/dev/null
 
 # ============================================================================
 echo '=== T3: non-degrading — a genuinely healthy already-running server is adopted, record kept ==='
@@ -262,7 +329,11 @@ printf '{"pid": %s, "url": "http://127.0.0.1:%s/", "port": %s, "token": "%s", "s
 wait_for "T3 pre-existing server is healthy" 10 -- "$HEALTH" "$T3"
 "$SUP" "$T3" >"$T3/sup.log" 2>&1 &
 T3SUP=$!; SPAWNED_PIDS+=("$T3SUP")
-sleep 3   # give the supervisor time to (not) start anything
+# Absence assertions need a window; polling cannot prove a negative. Anchor
+# the window AFTER the supervisor demonstrably started (its first log line),
+# so a load-delayed startup can no longer eat the observation time (#478).
+wait_for_log "T3 supervisor came up" "$DL" "$T3/sup.log" "supervisor up:"
+sleep 3   # observation window: time for the bring-up probe to (not) start anything
 assert_no_file "T3 no labsh start was issued (healthy server adopted)" "$T3/.jupyter/stub-start-count"
 assert_file_exists "T3 live server's record left untouched" \
     "$T3/.jupyter/share/jupyter/runtime/jpserver-$T3SRV.json"

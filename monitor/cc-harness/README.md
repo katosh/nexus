@@ -168,7 +168,10 @@ If **green**:
    `npm ci` is stricter about the lock — see issue history). Commit the
    pin + lock.
 3. Restart the watcher so it loads the new binary
-   (`tmux kill-window -t watcher && monitor/watcher/launcher.sh --target orchestrator`).
+   (`monitor/svc.sh restart watcher`). Do NOT `tmux kill-window -t watcher`:
+   the watcher is headless and `main.sh` survives the pane as a PPID=1
+   orphan (issue `#106`); and never hard-code the coordinator window —
+   `launcher.sh` resolves it from config `monitor.target_window`.
 
 If **red**: do not promote; inspect which scenario failed — a renderer
 regression means `pane-state.sh` needs a matching detector update (and a

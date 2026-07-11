@@ -29,6 +29,10 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 INSTALL="$_test_dir/../install-hpc-skills.sh"
 REAL_GIT=$(command -v git) || { echo "FATAL: real git not found"; exit 1; }
 
+# th_hermetic_path only (fork-bomb precondition guard, #479); inline
+# assert helpers below shadow the helper-file versions.
+. "$_test_dir/_test_helpers.sh"
+
 PASS=0
 FAIL=0
 assert_eq() {
@@ -87,7 +91,10 @@ chmod +x "$FAIL_STUBS/git"
 
 run_install() {
     local home="$1" bin="$2"; shift 2
-    LAST_STDOUT=$(HOME="$home" NEXUS_INSTALL_LOCK_DIR="$LOCKDIR" PATH="$bin:/usr/bin:/bin" \
+    # Synthetic PATH goes through th_hermetic_path so it can never drop
+    # command_not_found.py (fork-bomb precondition, #479 / #457).
+    local safe_path; safe_path=$(th_hermetic_path "$bin:/usr/bin:/bin" "$WORK")
+    LAST_STDOUT=$(HOME="$home" NEXUS_INSTALL_LOCK_DIR="$LOCKDIR" PATH="$safe_path" \
         bash "$INSTALL" "$@" 2>"$WORK/last.err")
     LAST_RC=$?
     LAST_STDERR=$(cat "$WORK/last.err")
@@ -167,7 +174,7 @@ echo '=== concurrency: two simultaneous installs → one clone, both exit 0 ==='
 HOME5="$WORK/home5"; mkdir -p "$HOME5"
 ( run_install "$HOME5" "$STUBS"; echo $? > "$WORK/c1.rc" ) &
 p1=$!
-( HOME="$HOME5" NEXUS_INSTALL_LOCK_DIR="$LOCKDIR" PATH="$STUBS:/usr/bin:/bin" bash "$INSTALL" >/dev/null 2>&1; echo $? > "$WORK/c2.rc" ) &
+( HOME="$HOME5" NEXUS_INSTALL_LOCK_DIR="$LOCKDIR" PATH="$(th_hermetic_path "$STUBS:/usr/bin:/bin" "$WORK")" bash "$INSTALL" >/dev/null 2>&1; echo $? > "$WORK/c2.rc" ) &
 p2=$!
 wait $p1; wait $p2
 assert_eq "both exit 0" "$(cat "$WORK/c1.rc")/$(cat "$WORK/c2.rc")" "0/0"

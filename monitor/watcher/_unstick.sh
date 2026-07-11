@@ -244,9 +244,18 @@
 #      the question remains unanswered; the emit-level content-hash
 #      dedup keeps the re-surface from flooding (issue #152 lesson).
 
+# `_ensure_service_log` (nexus-code#484/#509): the unstick log must
+# never be created group-writable by a bare `>>`.
+_unstick_module_dir="${BASH_SOURCE[0]%/*}"
+[[ "$_unstick_module_dir" == "${BASH_SOURCE[0]}" ]] && _unstick_module_dir=.
+# shellcheck source=../_log-mode.sh
+source "$_unstick_module_dir/../_log-mode.sh"
+unset _unstick_module_dir
+
 unstick_log() {
     local msg
     msg="[$(date -Is)] $*"
+    _ensure_service_log "$UNSTICK_LOG"
     printf '%s\n' "$msg" >> "$UNSTICK_LOG" 2>/dev/null || true
 }
 

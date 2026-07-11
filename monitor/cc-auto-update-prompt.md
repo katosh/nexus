@@ -69,14 +69,60 @@ standing directive, stricter than the GUIDE's interactive table):
           --surfaces-clear
 
   Pass `--surfaces-clear` ONLY as a truthful attestation that the
-  changelog review cleared the non-gate surfaces. The script performs
-  GUIDE Step 5 (local pin + install + watcher restart) and Step 5b
-  (waits for orchestrator idle, spawns the restart watchdog, waits for
-  its armed marker, kills the orchestrator window so the watcher
-  resumes the pinned session on the new binary). Exit 0 = done. Exits
-  20/21/22 = the bump landed but the orchestrator restart was
-  deferred/aborted — report the version-split loudly (notify + issue
-  comment) so it gets retried; do NOT improvise your own kill.
+  changelog review cleared the non-gate surfaces. The script runs GUIDE
+  Step 5 in the foreground (local pin + install + binary verify +
+  watcher restart), then hands GUIDE Step 5b — wait for orchestrator
+  idle, spawn the restart watchdog, wait for its armed marker, kill the
+  orchestrator window so the watcher resumes the pinned session on the
+  new binary — to a DETACHED `restart-orchestrator` process, and returns
+  promptly. (Step 5b used to run in the foreground; the harness SIGTERMed
+  it mid-idle-wait at its hard 600 s Bash-tool ceiling, every day.)
+
+  So `safe`'s exit code reports on the BUMP, never on the restart:
+
+  - **Exit 0** — either the bump landed and the restart is now in flight
+    in the detached process (NOT yet done), or the candidate was already
+    the effective version and nothing ran at all.
+  - **Exit 21** — the bump landed, but the restart was not even handed
+    off: the session pin is absent/malformed, or the pinned transcript is
+    missing, so a kill would cold-spawn and lose the orchestrator's
+    context. The workspace is version-split — report it loudly (notify +
+    issue comment) so it gets retried.
+  - **Exit 6** — **also a version-split, and the worst one.** The pin was
+    bumped, the install succeeded, and the new binary verified; only the
+    *watcher restart* failed. Nothing is rolled back: the new binary is
+    live for future spawns while the watcher and the orchestrator both
+    keep running the old one. Report it as loudly as exit 21, and retry
+    `monitor/svc.sh restart watcher`.
+  - **Exits 2/3/4/5/7** — the bump was refused or failed before the
+    watcher was ever touched, and the pin does not stand: untouched for
+    2 (usage), 3 (gate refused), 7 (another apply holds the lock), and
+    for 4 when the pin write itself failed; rolled back for 4 after a
+    failed install and 5 after a failed binary verify. Nothing to retry
+    but the cause.
+  - **Exit 30** — DEFERRED by the deployment gate (nexus-code`#512`):
+    an open PR touches the watcher restart path, or too many agent
+    windows are mid-flight. NOTHING was applied. This is a **complete,
+    successful result** — record it in your report and stop; the next
+    daily fire retries once conditions clear. Do NOT retry, override,
+    or improvise around the gate.
+  - **Exit 31** — the bump landed and the watcher restarted, but the
+    post-restart invariant failed (old-group survivors or duplicate
+    watcher groups). The orchestrator restart was NOT handed off.
+    Surface loudly (notify + issue comment); an operator must inspect
+    before anything else restarts.
+
+  Never improvise your own kill. The detached restart's outcome
+  (`safe-bumped-restarted`, `-restart-forced`, `-restart-aborted`,
+  `-restart-noop`, `-restart-held`) is recorded in the audit rows and
+  `last-eval` — its exit code is observed by nothing, so do not wait on
+  one. Its log is `{{STATE_DIR}}/cc-auto-update/detached-restart.log`.
+  If you (or an operator) must stop an in-flight or pending restart,
+  do NOT just SIGTERM it and walk away — the version split re-fires the
+  reconcile every cooldown. Write the durable hold instead (a SIGTERM'd
+  detached restart now also writes it for you):
+  `{{NEXUS_ROOT}}/monitor/cc-auto-update-apply.sh hold --reason "…"`
+  (release: `… unhold`).
 
 - **NEEDS-REVIEW shading** (gate GREEN but the changelog flags
   2c/2d/2e, or a minor/major jump): do the GUIDE's targeted manual

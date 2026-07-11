@@ -7,6 +7,36 @@
 # `case` (the same discipline as the `gh` write-verb wrapper) that refuses
 # anything outside it — never falling through to a shell.
 #
+# ── Why an SSH forced command, and not an MCP server ──────────────────
+# (Design decision record — full analysis + independent skeptic
+# validation: your-org/nexus-code#483.) Reachability was never the
+# differentiator — inbound LAN TCP works here; this sshd itself proves
+# it — AUTHENTICATION was. An HTTP MCP server would trade pubkey +
+# per-key forced command + `from=` pin + single-use TTL-bounded
+# enrollment for, realistically, a static bearer token: the MCP spec
+# (rev 2025-11-25) makes authorization OPTIONAL, and its full OAuth 2.1
+# + RFC 9728 resource-server story requires an authorization server
+# nobody here operates. MCP-over-SSH-stdio would keep this key-based
+# auth but graft a JSON-RPC serve loop onto THIS dispatch point — more
+# surface exactly where the allowlist discipline matters most — and a
+# correct one still needs the durable on-disk request ids anyway (an
+# MCP session dies with its connection; the rename state machine does
+# not). And no MCP variant reaches the hop that actually loses
+# information: the orchestrator is a live interactive session whose
+# only unsolicited-input surface is its tmux pane (`claude mcp serve`
+# exists, but it spawns a FRESH process exposing its own tools — no MCP
+# surface injects a turn into an already-running session). File
+# transport likewise rides the existing verbs: a request/reply body is
+# already an arbitrary byte-exact payload (`--message-stdin` in,
+# `fetch <id> results` out), bounded + checksummable below; a separate
+# file verb or sftp-server subsystem was rejected because sftp-server
+# cannot be path-confined without a root chroot (this sshd runs
+# unprivileged) and a parallel file namespace adds surface without
+# removing a failure mode. If a client harness ever demands native MCP
+# tools, the migration path is an `mcp` verb HERE, dispatching a stdio
+# serve loop over these same verbs — additive, same key, same
+# confinement, no new listener.
+#
 # ── How it is wired ───────────────────────────────────────────────────
 # Each authorized client gets ONE authorized_keys line of the form
 #
@@ -28,9 +58,15 @@
 #
 # ── The allowlist (the ONLY things a request-only principal may do) ────
 #   request file  --kind K [--reply required|optional|none] [--priority normal|high]
-#                 [--no-publish] --slug S (--message TEXT… | --message-stdin)
+#                 [--no-publish] [--checksum] --slug S
+#                 (--message TEXT… | --message-stdin)
 #       → ng request file  with `--origin remote-<principal>` FORCED.
 #         Echoes the stable id (the client's correlation handle).
+#         `--message-stdin` bodies are byte-exact but server-bounded
+#         (REMOTE_BODY_MAX_BYTES, default 1 MiB, staged in the 0700
+#         principals dir); `--checksum` (stdin mode only) echoes
+#         `sha256=… bytes=…` of the received body before the id so the
+#         client can verify integrity and detect partial transfers.
 #   request await <id> [--timeout S]
 #       → ng request await <id> --principal remote-<principal> (ownership-scoped).
 #   request fetch <id> progress|results|status
@@ -102,6 +138,9 @@ _rc_log() {
     local lf; lf=$(_rc_logfile)
     local dir; dir=$(dirname "$lf")
     mkdir -p "$dir" 2>/dev/null || return 0
+    # Explicit mode at creation (your-org/nexus-code#484). This is the
+    # remote-channel audit trail; group-writable, it proves nothing.
+    _ensure_service_log "$lf"
     printf '%s principal=%s %s\n' "$(_remote_now)" "${PRINCIPAL:-?}" "$*" >> "$lf" 2>/dev/null || true
 }
 _remote_now() { date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "?"; }
@@ -122,7 +161,7 @@ refuse() {
 
 # request file …  →  ng request file --origin remote-<principal> …
 _do_file() {
-    local kind="" slug="" priority="" reply="" publish="" msg_mode=""
+    local kind="" slug="" priority="" reply="" publish="" msg_mode="" want_checksum=0
     local -a msg_words=()
     while (( $# > 0 )); do
         case "$1" in
@@ -131,6 +170,7 @@ _do_file() {
             --priority) priority="${2:-}"; shift 2 || refuse 12 "--priority needs a value" ;;
             --reply)    reply="${2:-}";    shift 2 || refuse 12 "--reply needs a value" ;;
             --no-publish) publish="false"; shift ;;
+            --checksum) want_checksum=1;   shift ;;
             --message-stdin) msg_mode="stdin"; shift ;;
             --message)
                 # Terminal flag: everything after --message is the message
@@ -176,7 +216,6 @@ _do_file() {
     [[ -n "$reply"    ]] && args+=(--reply "$reply")
     [[ "$publish" == "false" ]] && args+=(--no-publish)
 
-    _rc_log "request file slug=$slug kind=$kind reply=${reply:-none} publish=${publish:-true} msg=${msg_mode:-none}"
     case "$msg_mode" in
         stdin)
             # Stream the client's stdin as the body (byte-exact). The body
@@ -186,16 +225,64 @@ _do_file() {
             # stdin (the bug that left 3 of 4 --message-stdin requests with an
             # empty "-" body). A lone `-` hits _chan_read_body's stdin branch
             # (`cat`), so the client's piped body is captured verbatim.
+            #
+            # BOUNDED + VERIFIABLE (your-org/nexus-code#483 Part 2 — the
+            # "file transport" the channel actually needs). This stdin body
+            # IS the channel's byte-exact payload path; what it lacked was a
+            # ceiling and an integrity check:
+            #   * Ceiling: stdin was previously streamed UNBOUNDED into the
+            #     inbox — an authenticated client could disk-fill the
+            #     project tree. Buffer to a 0700 principals-dir temp file
+            #     (never /tmp, never the group-shared tree) and refuse past
+            #     REMOTE_BODY_MAX_BYTES (default 1 MiB) BEFORE any request
+            #     file exists. Partial transfers (connection drop mid-body)
+            #     surface as a checksum mismatch on the client, not a
+            #     silently truncated request.
+            #   * Integrity (opt-in `--checksum`): echo `sha256=… bytes=…`
+            #     of the bytes actually received, BEFORE the id line, so the
+            #     client can compare against its local `sha256sum` and
+            #     re-file on mismatch. Opt-in so existing clients' id-parse
+            #     of stdout is untouched. This is exactly the check that
+            #     would have caught the `--message -` empty-body bug above.
             args+=(-)
+            local cap tmp nbytes pdir
+            cap="${REMOTE_BODY_MAX_BYTES:-1048576}"
+            [[ "$cap" =~ ^[0-9]+$ && "$cap" -gt 0 ]] || cap=1048576
+            pdir=$(_remote_principals_dir)
+            # In live operation the principals dir always exists (it holds
+            # authorized_keys + the audit log, 0700-guarded by #476/#481);
+            # create defensively with the same mode for fixtures.
+            [[ -d "$pdir" ]] || { mkdir -p "$pdir" && chmod 700 "$pdir"; } 2>/dev/null
+            tmp=$(mktemp "$pdir/.body.XXXXXX" 2>/dev/null) \
+                || refuse 12 "request file: cannot stage the body"
+            # shellcheck disable=SC2064  # expand $tmp now, by design
+            trap "rm -f '$tmp'" EXIT
+            head -c "$(( cap + 1 ))" > "$tmp"
+            nbytes=$(wc -c < "$tmp")
+            if (( nbytes > cap )); then
+                refuse 12 "request file: body exceeds ${cap} bytes (REMOTE_BODY_MAX_BYTES)"
+            fi
+            _rc_log "request file slug=$slug kind=$kind reply=${reply:-none} publish=${publish:-true} msg=stdin bytes=$nbytes checksum=$want_checksum"
+            if (( want_checksum )); then
+                printf 'sha256=%s bytes=%s\n' \
+                    "$(sha256sum < "$tmp" | awk '{print $1}')" "$nbytes"
+            fi
+            # Re-point stdin at the staged file, then unlink it — the open
+            # fd survives the unlink, so nothing lingers on disk even
+            # though exec never returns here.
+            exec 0<"$tmp"
+            rm -f "$tmp"
             exec "$NG" "${args[@]}"
             ;;
         inline)
+            (( want_checksum )) && refuse 12 "request file: --checksum requires --message-stdin (an inline body is whitespace-joined from argv, so there is no byte-exact client-side reference to verify against)"
             local msg="${msg_words[*]}"
             [[ -n "${msg//[[:space:]]/}" ]] || refuse 12 "request file: --message is empty"
             # A bare '-' body is ambiguous (ng would read stdin) and, with no
             # stdin attached, hangs the session — refuse it; use --message-stdin.
             [[ "$msg" == "-" ]] && refuse 12 "request file: ambiguous '-' body; use --message-stdin"
             args+=(--message "$msg")
+            _rc_log "request file slug=$slug kind=$kind reply=${reply:-none} publish=${publish:-true} msg=inline"
             exec "$NG" "${args[@]}"
             ;;
         *)

@@ -23,7 +23,8 @@ Two hard rules (each fixed an actual past watchdog mistake):
    and writes the armed marker itself; the apply script kills the
    orchestrator only after the marker appears):
 
-       NEXUS_ROOT={{NEXUS_ROOT}} WATCHDOG_DEADLINE_SECONDS=180 \
+       NEXUS_ROOT={{NEXUS_ROOT}} CC_AUTO_TARGET_WINDOW='{{TARGET_WINDOW}}' \
+           WATCHDOG_DEADLINE_SECONDS=180 \
            {{NEXUS_ROOT}}/monitor/cc-restart-watchdog-loop.sh
 
    It logs to `{{STATE_DIR}}/restart-watchdog.log` and verifies:

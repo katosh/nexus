@@ -160,8 +160,9 @@ watcher-affecting change lands on `main`, the orchestrator
 version-aware watcher detects its source-set drift and
 self-restarts on its own (`monitor/watcher/_version_restart.sh`,
 issue `#186`). A manual `monitor/svc.sh restart watcher`
-(equivalently `monitor/watcher/launcher.sh --replace --target
-orchestrator`) is only needed when the auto-restart is disabled
+(equivalently `monitor/watcher/launcher.sh --replace` — `--target`
+defaults to config `monitor.target_window`; never hard-code it)
+is only needed when the auto-restart is disabled
 (`monitor.version_restart.enabled: false`) or the running
 watcher predates the version-aware module. The watcher runs
 headless (no tmux window); its log is

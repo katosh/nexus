@@ -184,9 +184,14 @@ crawl() {
             fi
         fi
         say "registering $base -> $name"
+        # `9>&-` denies the crawl lock fd to register's whole subtree
+        # (flock-fd class your-org/nexus-code#494): register shells out
+        # to uv/ipykernel, and any child that outlived the crawl would
+        # inherit fd 9 and hold the lock — silently turning every future
+        # crawl into "another crawl holds … — exiting".
         if ( cd "$WORKROOT" && "${reg_env[@]}" labsh kernel register \
                 --project "$d" --name "$name" \
-                --display-name "Python ($base)" "${reg_ld[@]}" ) >&2; then
+                --display-name "Python ($base)" "${reg_ld[@]}" ) >&2 9>&-; then
             registered=$(( registered + 1 ))
         else
             say "FAILED to register $base (see above) — continuing"
@@ -213,6 +218,9 @@ crawl() {
 }
 
 if command -v flock >/dev/null 2>&1; then
+    # flock-fd: fd 9 is closed at the one child that outlives a say()
+    # (`labsh kernel register … 9>&-` above); everything else the crawl
+    # spawns is foreground and dies with it. See your-org/nexus-code#494.
     exec 9>>"$LOCK_FILE"
     flock -n 9 || { say "another crawl holds $LOCK_FILE — exiting"; exit 0; }
 fi

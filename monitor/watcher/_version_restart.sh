@@ -88,6 +88,11 @@ _NEXUS_VERSION_RESTART_LOADED=1
 # reports the defining file, but an eager copy is cheaper and clearer).
 _VERSION_MODULE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+# `_ensure_service_log` (nexus-code#484/#509): the self-restart's
+# `>>"$logfile"` redirect must never create watcher.log group-writable.
+# shellcheck source=../_log-mode.sh
+source "$_VERSION_MODULE_DIR/../_log-mode.sh"
+
 # Log through the host's `log` when one is defined (the watcher's
 # stderr logger), else fall back to plain stderr so the module stays
 # usable from bootstrap-recover.sh / tests without ceremony.
@@ -384,10 +389,30 @@ _version_self_guard_ok() {
 _version_restart_self() {
     local state_dir="${1:?}" launcher="${2:?}" target="${3:-orchestrator}" logfile="${4:-/dev/null}"
     [[ -x "$launcher" ]] || { _version_log "self-restart: launcher not executable: $launcher"; return 1; }
+    # `mkdir -p` first: on a HEALTHY fresh install the version dir may simply
+    # not exist yet, and the probe below treats a missing dir as unwritable.
+    # On a read-only FS this mkdir is the no-op it has always been.
     mkdir -p "$state_dir" 2>/dev/null || true
+    # NEVER self-restart onto a read-only project FS. This process holds
+    # working fds; a successor must open every path afresh and would die in
+    # its own log redirect. Both read-only incidents (2026-06-29, 2026-07-09)
+    # open with this self-restart firing and end with no watcher at all.
+    # A FRESH probe (never a cached fd) is the gate. launcher.sh refuses the
+    # --replace as well; refusing here means we never even fork it.
+    if declare -F _nexus_dir_writable >/dev/null 2>&1 \
+       && ! _nexus_dir_writable "$state_dir"; then
+        _version_log "self-restart SUPPRESSED: project FS is READ-ONLY ($state_dir). Replacing this watcher would kill the only working one — its successor could not open a single file. Staying up; the fs-guard escalates."
+        return 1
+    fi
     printf '%s\n' "$(date +%s)" >> "$state_dir/self-restart-history.txt" 2>/dev/null || true
     _version_stamp_cooldown "$state_dir" watcher
-    setsid "$launcher" --replace --target "$target" </dev/null >>"$logfile" 2>&1 &
+    # Caller attribution for the launcher's spawn audit log
+    # (nexus-code#491): callers may pre-set WATCHER_LAUNCH_CALLER
+    # (e.g. the self-heal path passes its reason); default to naming
+    # this path so a version-drift restart is attributable too.
+    _ensure_service_log "$logfile"
+    setsid env WATCHER_LAUNCH_CALLER="${WATCHER_LAUNCH_CALLER:-version-restart-self}" \
+        "$launcher" --replace --target "$target" </dev/null >>"$logfile" 2>&1 &
     disown 2>/dev/null || true
     return 0
 }
@@ -680,8 +705,26 @@ _version_check_tick() {
                     else
                         _version_stamp_cooldown "$state_dir" "$comp"
                         _version_log "$comp launch script drifted (stable ${settle}s); svc.sh restart $name"
-                        if NEXUS_ROOT="$nexus_root" NEXUS_SERVICES_REGISTRY="$registry" \
-                           "$svc_bin" restart "$name" >/dev/null 2>&1; then
+                        # Close the instance-lock fd IN the svc.sh child so the
+                        # long-lived service it (re)spawns can't INHERIT the
+                        # flock and hold it past the watcher's death — the
+                        # FD-inheritance leak behind the 2026-07-07 outage
+                        # (jupyter kept nexus-instance.lock open on a leaked fd,
+                        # so --instance-status read live-local and every revive
+                        # refused). Mirrors launcher.sh's {_RESTART_LOCK_FD}>&-.
+                        # The brace-close MUST be a LITERAL redirect word, so
+                        # branch on the fd being held (empty on a WARN-degraded
+                        # start, or when this module runs outside the watcher,
+                        # e.g. under test — where the plain call is correct).
+                        svc_rc=0
+                        if [[ -n "${INSTANCE_LOCK_FD:-}" ]]; then
+                            NEXUS_ROOT="$nexus_root" NEXUS_SERVICES_REGISTRY="$registry" \
+                               "$svc_bin" restart "$name" >/dev/null 2>&1 {INSTANCE_LOCK_FD}>&- || svc_rc=$?
+                        else
+                            NEXUS_ROOT="$nexus_root" NEXUS_SERVICES_REGISTRY="$registry" \
+                               "$svc_bin" restart "$name" >/dev/null 2>&1 || svc_rc=$?
+                        fi
+                        if (( svc_rc == 0 )); then
                             # The launch path stamped the new running
                             # version; record again defensively in case
                             # an older bootstrap-recover.sh (mid-deploy

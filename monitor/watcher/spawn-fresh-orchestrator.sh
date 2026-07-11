@@ -81,6 +81,11 @@ _script_dir=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 _monitor_dir=$(cd "$_script_dir/.." && pwd)
 _nexus_root_default=$(cd "$_monitor_dir/.." && pwd)
 
+# `_ensure_service_log` (nexus-code#484/#509): log() below appends to
+# watcher.log — never create it group-writable.
+# shellcheck source=../_log-mode.sh
+source "$_monitor_dir/_log-mode.sh"
+
 NEXUS_ROOT="${NEXUS_ROOT:-$_nexus_root_default}"
 TARGET=""
 REASON=""
@@ -179,6 +184,7 @@ log() {
     local msg
     msg="[$(date -Is)] spawn-fresh-orchestrator: $*"
     echo "$msg" >&2
+    _ensure_service_log "$LOGFILE"
     printf '%s\n' "$msg" >> "$LOGFILE" 2>/dev/null || true
 }
 

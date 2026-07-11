@@ -1,0 +1,33 @@
+# mapping.example.tsv — TEMPLATE for the public-mirror scrub dictionary.
+#
+# Copy this to `mapping.tsv` and replace the ALL-CAPS placeholders with your
+# own internal identifiers. `mapping.tsv` is git-excluded from the public
+# mirror output (add an `exclude` line for it, as shown) so the dictionary of
+# internal strings never ships publicly — only the replacement vocabulary and
+# the transform logic do.
+#
+# Line types (TAB-separated), applied in file order (put longer sources first):
+#   map <TAB> SOURCE <TAB> BARE_REPLACEMENT <TAB> ANGLE_REPLACEMENT
+#   deny <TAB> REGEX     (leak gate fails on any case-insensitive match)
+#   keep <TAB> REGEX     (exempts a line that also matches a deny)
+#   exclude <TAB> PATH   (drop from the public mirror output)
+#
+# ---- map (ordered longest-first) ----
+map	YOUR_ORG/YOUR_CODE_REPO	your-org/nexus-code	<your-org>/nexus-code
+map	YOUR_ORG/YOUR_ASSET_REPO	your-org/your-nexus	<your-org>/<your-nexus>
+map	YOUR_BOT_LOGIN	your-org-bot	<your-org>-bot
+map	YOUR_ORG	your-org	<your-org>
+map	YOUR_INSTITUTION	your-institution	<your-institution>
+map	YOUR_CLUSTER	cluster	<cluster>
+map	YOUR_LAB	your-lab	<your-lab>
+map	/your/private/path/root	$NEXUS_ROOT	$NEXUS_ROOT
+# ---- deny (leak gate patterns; case-insensitive) ----
+deny	YOUR_ORG
+deny	YOUR_INSTITUTION
+deny	YOUR_BOT_LOGIN
+deny	/your/private/path
+deny	YOUR_OPERATOR_NAME
+# ---- keep (real public assets you WANT to keep referenced) ----
+keep	YOUR_PUBLIC_HANDLE/your-public-repo
+# ---- exclude (dropped from the public mirror output) ----
+exclude	monitor/public-mirror/mapping.tsv

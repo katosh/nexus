@@ -52,6 +52,8 @@ cp "$_real_dir/_lib.sh"            "$WD/_lib.sh"
 cp "$_real_dir/_respawn_async.sh"  "$WD/_respawn_async.sh"
 cp "$_real_dir/../watcher-supervise-tick.sh" "$MON/watcher-supervise-tick.sh"
 cp "$_real_dir/../revive-watcher.sh"         "$MON/revive-watcher.sh"
+# launcher.sh sources ../_log-mode.sh (nexus-code#509).
+cp "$_real_dir/../_log-mode.sh"              "$MON/_log-mode.sh"
 chmod +x "$WD/launcher.sh" "$MON/watcher-supervise-tick.sh" "$MON/revive-watcher.sh"
 
 # Stub main.sh — faithful single-instance contract (see test-version-restart-self).

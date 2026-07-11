@@ -233,6 +233,23 @@ else
     fail "gate pin-ahead: base=$base rc=$rc verdict='$verdict'"
 fi
 
+# ---- pin-writer portability (nexus-code#513 aside) -----------------------
+# Sourced from a zsh agent shell, `dirname` resolved to command-not-found
+# and cc_version_write_local_pin silently no-op'd — leaving the
+# load-bearing pin unwritten while returning a printed error nobody read.
+# The writer now derives the directory by parameter expansion; pin that
+# by shadowing dirname with a hard failure and writing anyway.
+dirname() { echo "dirname MUST NOT be called" >&2; return 127; }
+DROOT="$WORK/dirless"; mkdir -p "$DROOT"
+if cc_version_write_local_pin "9.9.9" "$DROOT" 2>"$WORK/dirless.err" \
+   && [[ "$(cc_version_read_local_pin "$DROOT")" == "9.9.9" ]] \
+   && [[ ! -s "$WORK/dirless.err" ]]; then
+    pass "pin writer succeeds with dirname unavailable (no external dep on the write path)"
+else
+    fail "pin writer still depends on dirname: $(cat "$WORK/dirless.err" 2>/dev/null)"
+fi
+unset -f dirname
+
 # ---- summary ------------------------------------------------------------
 
 echo

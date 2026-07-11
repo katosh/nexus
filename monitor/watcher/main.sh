@@ -239,6 +239,19 @@ _cfg="$_monitor_dir/../config/load.sh"
 # shellcheck source=_lib.sh
 source "$_script_dir/_lib.sh"
 
+# Explicit log mode at creation (your-org/nexus-code#484/#509):
+# `_ensure_service_log` keeps watcher.log / watcher-alerts.log and
+# friends 0640, never group-writable. Sourced early so every log-append
+# helper defined below can call it.
+# shellcheck source=../_log-mode.sh
+source "$_monitor_dir/_log-mode.sh"
+
+# Read-only-filesystem guard (#473): the per-cycle fresh-open() probe, the
+# fire-once escalation, and the degraded-mode state machine. Must follow
+# _lib.sh — it calls that file's probe + escalation helpers at run time.
+# shellcheck source=_fs_guard.sh
+source "$_script_dir/_fs_guard.sh"
+
 # Robust tmux window targeting (#323): resolve_window_id re-resolves a
 # window NAME → its current @id, so paste_to_target's worker-wake leg
 # (over-limit) targets a dotted worker name by @id instead of letting
@@ -391,6 +404,11 @@ unset _self_pane_info _self_win_id _self_win_name
 STATE_DIR="${NEXUS_ROOT}/monitor/.state"
 DIFF_DIR="${STATE_DIR}/diffs"
 HEARTBEAT="${STATE_DIR}/watcher-heartbeat"
+# Liveness/progress split (nexus-code#491) — see _lib.sh "Liveness vs.
+# progress". PROGRESS is bumped by the main loop + stage boundaries;
+# CYCLE at each complete compose cycle, carrying the measured period.
+PROGRESS_FILE="${STATE_DIR}/watcher-progress"
+CYCLE_FILE="${STATE_DIR}/watcher-cycle"
 LOCKFILE="${STATE_DIR}/watcher.lock"
 # State-dir-scoped singleton lock (issue: multi-instance-guard). Keyed
 # on the inode under the SHARED monitor/.state/, held via an open fd for
@@ -597,6 +615,25 @@ VERSION_STATE_DIR="${STATE_DIR}/version"
 # history the `ng service-incident` generator reads, and the emit re-nag
 # guards. See monitor/watcher/_service_health.sh.
 SERVICE_HEALTH_STATE_DIR="${STATE_DIR}/service-health"
+# Automatic reports-archive roll (your-org/nexus-code#447; roller is
+# monitor/reports-roll.sh, #444/#446). The watcher runs the idempotent,
+# ≥1-month-buffered roller on startup + once per day-boundary.
+#   reports-roll-last-day — the YYYY-MM-DD stamp of the last run; a tick
+#     whose date matches is a cheap no-op (date compare, no scan), so the
+#     roll runs at most once per calendar day (plus the startup fire).
+#   reports-roll-notice — one-shot audit breadcrumb written ONLY when a run
+#     actually moves ≥1 file; surfaced once by compose_emit's
+#     `--- reports archived ---` section (consumed on read, self-clearing),
+#     so a quiet run stays silent. REPORTS_ROLL_MIN_AGE_SECONDS arms the
+#     roller's opt-in mid-write guard on this automated path.
+REPORTS_ROLL_LAST_DAY_FILE="${STATE_DIR}/reports-roll-last-day"
+REPORTS_ROLL_NOTICE_FILE="${STATE_DIR}/reports-roll-notice"
+# MONITOR_REPORTS_ROLL_{ENABLED,INTERVAL_SECONDS,MIN_AGE_SECONDS} are derived
+# from config in _config.sh; belt-and-suspenders defaults so a stripped-down
+# invocation (e.g. a unit test sourcing main.sh without _config) still works.
+: "${MONITOR_REPORTS_ROLL_ENABLED:=true}"
+: "${MONITOR_REPORTS_ROLL_INTERVAL_SECONDS:=3600}"
+: "${MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS:=300}"
 # Watcher-supervision (your-org/your-nexus, mutual-liveness design).
 # The ORCHESTRATOR arms a persistent Monitor (watcher-supervise-tick.sh)
 # that revives a crashed watcher; that Monitor TOUCHES this heartbeat each
@@ -800,6 +837,125 @@ bump_heartbeat() {
     printf 'pid=%d\nts=%s\ntarget=%s\n' "$$" "$(date -Is)" "$TARGET" > "$HEARTBEAT"
 }
 
+# ---- liveness ticker + progress/cycle signals (nexus-code#491) -------------
+# The heartbeat above is now a PURE liveness signal: a background ticker
+# beats it at a fixed cadence so no amount of loop workload can starve
+# it (at >=12 workers the compose cycle exceeded every constant
+# threshold and a healthy watcher was GUARANTEED to be reported DOWN;
+# the compose watchdog even killed the only task that bumped it, so
+# under load the heartbeat could never beat again). Forward progress
+# and functional proof live in their own files — see _lib.sh.
+
+# Cadence of the liveness ticker. Deliberately far below the fresh
+# cutoff (2*interval+15) so a single missed beat never flips a verdict.
+HEARTBEAT_TICK_SECONDS="${MONITOR_HEARTBEAT_TICK_SECONDS:-$("$_cfg" monitor.watcher.heartbeat_tick_seconds 20)}"
+[[ "$HEARTBEAT_TICK_SECONDS" =~ ^[0-9]+$ ]] && (( HEARTBEAT_TICK_SECONDS >= 1 )) || HEARTBEAT_TICK_SECONDS=20
+
+_HEARTBEAT_TICKER_PID=0
+# Start (or restart, if the child died) the liveness ticker. Called
+# once after the instance lock is held — a doomed second watcher must
+# never beat the real one's heartbeat — and re-checked every loop
+# iteration so a crashed ticker self-heals within one tick.
+#
+# The ticker runs OUTSIDE our process group/session (setsid re-exec),
+# for two reasons (nexus-code#491):
+#   - its own periodic sleep/date forks must never pollute the
+#     "youngest group member" fork-freshness signal that separates a
+#     BUSY watcher from a WEDGED one;
+#   - it holds NO inherited lock fds (closed on the spawn line), so it
+#     can never pin the instance flock past our death (the #451/#468/
+#     #471 fd-leak class).
+# Group kills therefore do not reap it — its `kill -0 <our pid>` watch
+# exits it within one tick of our death instead, and the heartbeat's
+# pid field (us, dead by then) makes any final beat inert.
+_start_heartbeat_ticker() {
+    if (( _HEARTBEAT_TICKER_PID > 0 )) && kill -0 "$_HEARTBEAT_TICKER_PID" 2>/dev/null; then
+        return 0
+    fi
+    if [[ -n "${INSTANCE_LOCK_FD:-}" ]]; then
+        setsid bash -c 'source "$1" && _watcher_heartbeat_ticker_loop "$2" "$3" "$4" "$5"' \
+            _ "$_script_dir/_lib.sh" "$HEARTBEAT" "$$" "$HEARTBEAT_TICK_SECONDS" "$TARGET" \
+            </dev/null {INSTANCE_LOCK_FD}>&- &
+    else
+        setsid bash -c 'source "$1" && _watcher_heartbeat_ticker_loop "$2" "$3" "$4" "$5"' \
+            _ "$_script_dir/_lib.sh" "$HEARTBEAT" "$$" "$HEARTBEAT_TICK_SECONDS" "$TARGET" \
+            </dev/null &
+    fi
+    _HEARTBEAT_TICKER_PID=$!
+}
+
+# _close_inherited_locks lives in _lib.sh (nexus-code#491): production
+# text, single definition, exercised directly by the tests instead of
+# a fixture re-definition (skeptic M4 on PR#503).
+#
+# Hook consulted by _scheduler_fire_async at the top of every async
+# task subshell (declared-if-present contract; unit tests that source
+# the scheduler standalone simply have no hook).
+_scheduler_subshell_init() { _close_inherited_locks; }
+
+_stop_heartbeat_ticker() {
+    (( _HEARTBEAT_TICKER_PID > 0 )) && kill "$_HEARTBEAT_TICKER_PID" 2>/dev/null || true
+    _HEARTBEAT_TICKER_PID=0
+}
+
+# Forward-progress stamp. Cheap (one tiny atomic write); called from
+# the parent loop every iteration and at stage boundaries inside the
+# startup sweep and compose_emit ($BASHPID keeps subshell tmp names
+# unique; $$ stays the main watcher pid in subshells, which is what
+# the probes validate). Best-effort — progress accounting must never
+# break the loop it measures.
+_progress_bump() {
+    local stage="${1:-}"
+    printf 'pid=%d\nepoch=%s\nts=%s\nstage=%s\n' \
+        "$$" "$(date +%s)" "$(date -Is)" "$stage" \
+        > "$PROGRESS_FILE.tmp.$BASHPID" 2>/dev/null \
+        && mv -f "$PROGRESS_FILE.tmp.$BASHPID" "$PROGRESS_FILE" 2>/dev/null || true
+}
+
+# Threshold (x INTERVAL) past which a measured cycle period is warned
+# about — the loop period may exceed the OLD liveness thresholds now
+# without consequence, but it must never do so SILENTLY.
+MONITOR_LOOP_PERIOD_WARN_MULT="${MONITOR_LOOP_PERIOD_WARN_MULT:-3}"
+[[ "$MONITOR_LOOP_PERIOD_WARN_MULT" =~ ^[0-9]+$ ]] || MONITOR_LOOP_PERIOD_WARN_MULT=3
+
+# Completed-cycle stamp + measured loop period. Single-writer (the
+# scheduler's in-flight guard serializes compose fires; startup calls
+# it once before the scheduler starts). period_s = gap since the
+# previous stamp; ema_s = 4-sample smoothing that survives restarts
+# (the file persists in the state dir, so the wedge/cycle cutoffs stay
+# load-calibrated across a respawn).
+_cycle_bump() {
+    local now prev ema period
+    now=$(date +%s)
+    prev=$(_watcher_heartbeat_field "$CYCLE_FILE" epoch); [[ "$prev" =~ ^[0-9]+$ ]] || prev=0
+    ema=$(_watcher_heartbeat_field "$CYCLE_FILE" ema_s);  [[ "$ema" =~ ^[0-9]+$ ]] || ema=0
+    period=0
+    (( prev > 0 && now > prev )) && period=$(( now - prev ))
+    if (( period > 0 )); then
+        if (( ema == 0 )); then ema=$period; else ema=$(( (ema * 3 + period) / 4 )); fi
+    fi
+    printf 'pid=%d\nepoch=%d\nts=%s\nperiod_s=%d\nema_s=%d\n' \
+        "$$" "$now" "$(date -Is)" "$period" "$ema" \
+        > "$CYCLE_FILE.tmp.$BASHPID" 2>/dev/null \
+        && mv -f "$CYCLE_FILE.tmp.$BASHPID" "$CYCLE_FILE" 2>/dev/null || true
+    if (( period > INTERVAL * MONITOR_LOOP_PERIOD_WARN_MULT )); then
+        log "WARN loop period ${period}s exceeds ${MONITOR_LOOP_PERIOD_WARN_MULT}x interval (${INTERVAL}s) — the sweep is overloaded (workers scale per-cycle cost). Liveness is unaffected (ticker); the wedge cutoff auto-scales to $(_watcher_wedge_cutoff "$INTERVAL" "$ema")s. Sections already degrade via budgets; consider raising monitor.interval_seconds or reducing worker count if this persists."
+    fi
+}
+
+# Startup re-anchor: reset the cycle clock to NOW (so a successor is
+# never judged by its predecessor's last cycle age) while PRESERVING
+# the learned ema (so the cutoffs stay calibrated to the observed
+# load through a restart).
+_cycle_reset() {
+    local ema
+    ema=$(_watcher_heartbeat_field "$CYCLE_FILE" ema_s); [[ "$ema" =~ ^[0-9]+$ ]] || ema=0
+    printf 'pid=%d\nepoch=%d\nts=%s\nperiod_s=%d\nema_s=%d\n' \
+        "$$" "$(date +%s)" "$(date -Is)" 0 "$ema" \
+        > "$CYCLE_FILE.tmp.$BASHPID" 2>/dev/null \
+        && mv -f "$CYCLE_FILE.tmp.$BASHPID" "$CYCLE_FILE" 2>/dev/null || true
+}
+
 # ---- self-heal (nexus-code#236) -------------------------------------------
 # Stability-first: the watcher should not stall in the first place; if
 # delivery genuinely breaks, fail LOUD; restart only as the cooldown-guarded
@@ -812,6 +968,7 @@ bump_heartbeat() {
 _watcher_alert() {
     local msg="$1"
     local iso; iso=$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    _ensure_service_log "${STATE_DIR}/watcher-alerts.log"
     printf '[%s] ALERT %s\n' "$iso" "$msg" >> "${STATE_DIR}/watcher-alerts.log" 2>/dev/null || true
     log "ALERT $msg"
     if command -v sandbox-notify >/dev/null 2>&1; then
@@ -886,6 +1043,19 @@ _watcher_self_heal_restart() {
         printf 'restarted_by=%s\n' "watcher-self-heal"
     } > "$WATCHER_REVIVED_MARKER" 2>/dev/null || true
     _watcher_alert "SELF-HEAL RESTART ($reason) — relaunching via launcher --replace to restore emit delivery."
+    # The remedy must not destroy its own evidence (skeptic finding 2b
+    # on PR#503): this function usually runs inside an ASYNC scheduler
+    # task whose stdout is flushed to watcher.log only on completion —
+    # and the restart below kills the host before that flush, so the
+    # `log` line above dies with it (the 17:39:35 restart looked
+    # unattributed for twenty minutes; only watcher-alerts.log kept
+    # it). Append the trigger DIRECTLY to the logfile, an independent
+    # unbuffered sink, BEFORE signalling anything.
+    if [[ -n "${LOGFILE:-}" && "${LOGFILE}" != /dev/null ]]; then
+        printf '[%s] ALERT SELF-HEAL RESTART (%s) — recorded pre-signal (async stdout dies with the host)\n' \
+            "$(date -Is 2>/dev/null || echo '?')" "$reason" >> "$LOGFILE" 2>/dev/null || true
+    fi
+    WATCHER_LAUNCH_CALLER="watcher-self-heal: $reason" \
     _version_restart_self "$VERSION_STATE_DIR" "$_script_dir/launcher.sh" "${TARGET:-orchestrator}" \
         "${LOGFILE:-/dev/null}" \
         || log "self-heal restart launch FAILED ($reason); cooldown stamped, slow retry after cooldown"
@@ -906,7 +1076,7 @@ _run_bounded() {
     local budget="$1" outfile="$2"; shift 2
     [[ "$budget" =~ ^[0-9]+$ ]] || budget=20
     : > "$outfile" 2>/dev/null || true
-    ( "$@" > "$outfile" 2>/dev/null ) &
+    ( _close_inherited_locks; "$@" > "$outfile" 2>/dev/null ) &
     local pid=$! waited=0
     while kill -0 "$pid" 2>/dev/null && (( waited < budget )); do
         sleep 1
@@ -1368,6 +1538,7 @@ _cap_emit_sections() {
             exempt["--- component drift (restart needed) ---"]= 1
             exempt["--- service health ---"]                  = 1
             exempt["--- claude code update available ---"]    = 1
+            exempt["--- reports archived ---"]                = 1
             exempt["--- eligible github comments ---"]        = 1
             exempt["--- standing bells ---"]                  = 1
             exempt["--- pending decisions ---"]               = 1
@@ -1410,7 +1581,7 @@ compose_report() {
 }
 
 _compose_report_body() {
-    local reason="$1" local_diff="$2" github_list="$3" bell_lines="$4" idle_lines="${5:-}" full_state_lines="${6:-}" pending_decisions="${7:-}" install_failure_lines="${8:-}" cc_update_lines="${9:-}" hosting_migration_lines="${10:-}" version_drift_lines="${11:-}" service_health_lines="${12:-}" watcher_revived_lines="${13:-}" supervisor_arm_lines="${14:-}" requests_lines="${15:-}"
+    local reason="$1" local_diff="$2" github_list="$3" bell_lines="$4" idle_lines="${5:-}" full_state_lines="${6:-}" pending_decisions="${7:-}" install_failure_lines="${8:-}" cc_update_lines="${9:-}" hosting_migration_lines="${10:-}" version_drift_lines="${11:-}" service_health_lines="${12:-}" watcher_revived_lines="${13:-}" supervisor_arm_lines="${14:-}" requests_lines="${15:-}" reports_roll_lines="${16:-}"
     echo "=== nexus state changed at $(date -Is) (${reason}) ==="
     echo "*If unsure how to proceed: see CLAUDE.md.*"
     # One-line workspace prelude. Always printed — gives the operator
@@ -1490,6 +1661,16 @@ _compose_report_body() {
         # candidate (see _cc_update_emit_section's re-nag guard).
         echo '--- claude code update available ---'
         printf '%s\n' "$cc_update_lines"
+    fi
+    if [[ -n "$reports_roll_lines" ]]; then
+        # The auto-roll (your-org/nexus-code#447) moved aged reports into
+        # monthly reports/YYYY-MM/ buckets. One-shot audit breadcrumb: written
+        # ONLY on a run that actually moved ≥1 file, surfaced once, then
+        # consumed (self-clearing → no flap). Purely informational — no
+        # operator action needed; the ≥1-month buffer guarantees nothing
+        # recent/in-flight was touched.
+        echo '--- reports archived ---'
+        printf '%s\n' "$reports_roll_lines"
     fi
     if [[ -n "$local_diff" ]]; then
         # Change-detection diff vs the baseline snapshot (tmux/reports/git
@@ -1827,6 +2008,12 @@ respawn_agent() {
             ;;
     esac
 
+    # The replaced session took its pasted-but-unread requests with it:
+    # reset the delivery stamps so every still-claimed request is due
+    # again and surfaces to the fresh orchestrator within one poll
+    # (#489 skeptic C2).
+    requests_reset_delivery_state
+
     # Action-log entry the respawn. Never block the watcher on this.
     if [[ -x "$_monitor_dir/ng" ]]; then
         "$_monitor_dir/ng" log-action watcher \
@@ -1870,6 +2057,47 @@ archive_emit() {
     out="${DIFF_DIR}/${ts}_${shortid}${suffix}.md"
     cp "$body_file" "$out"
     printf '%s' "$out"
+}
+
+# Newest emit archive by NAME (stat-free). Prints the absolute path of the
+# most-recent archive in <dir>, or nothing when the dir is empty/absent.
+#
+# your-org/nexus-code#<this> (sibling of #402/#403): the orchestrator-liveness
+# "resubmit" rescue picked the newest archive with
+#   find "$DIFF_DIR" -printf '%T@ %p\n' | sort -rn | head -n1
+# which stat()s EVERY file just to select ONE. On the ~17k-file 7-day plateau
+# that took ~9-14 min on the NFS state dir, and — because orchestrator_liveness
+# runs in the SYNC phase every 5 s (no --async) — it stalled the scheduler
+# heartbeat past the staleness threshold → supervisor "watcher DOWN" → the
+# 2026-07-07 outage. Exactly the wedge class #403 fixed for prune_archive; this
+# path was missed.
+#
+# archive_emit names files `%Y-%m-%d_%H-%M-%S_<id>[_tag].md` — a lexically
+# sortable UTC timestamp prefix — so the lexically-GREATEST name is the newest
+# emit. Bash pathname expansion reads the directory and returns names
+# collation-sorted with NO per-file stat; LC_ALL=C forces byte order so the
+# sortable-ts names come out chronological regardless of locale (mirrors
+# _prune_diffs_bounded). The last glob element is therefore the newest — O(1)
+# after the single readdir, no sort pipeline, no stat storm.
+#
+# Tag suffixes (`_full-state`, `_resurface`) sort AFTER a bare `<id>.md` at the
+# same `<ts>_<id>` prefix, but each emit writes exactly ONE archive with a
+# fresh random <id>, so no two files ever share a `<ts>_<id>` prefix — the max
+# is always a single real emit body. A tagged newest emit is itself a valid
+# body to re-paste (full-state/resurface archives are real pasted emits), so
+# returning it is correct.
+_newest_emit_archive() {
+    local dir="${1:?dir required}"
+    [[ -d "$dir" ]] || return 0
+    local LC_ALL=C
+    local _restore_nullglob files
+    _restore_nullglob=$(shopt -p nullglob)
+    shopt -s nullglob
+    files=( "$dir"/*.md )
+    eval "$_restore_nullglob"
+    local n=${#files[@]}
+    (( n > 0 )) || return 0
+    printf '%s' "${files[n-1]}"
 }
 
 # Size-capped rotation for an append-only .state file (issue 180 R2).
@@ -2200,7 +2428,7 @@ export _OVER_LIMIT_LOG_FN _OVER_LIMIT_PASTE_FN
 # ---- main loop -----------------------------------------------------------
 
 tmp_dir=$(mktemp -d)
-trap 'release_pidfile; release_lock; release_instance_lock; rm -rf "${tmp_dir}"' EXIT
+trap '_stop_heartbeat_ticker; release_pidfile; release_lock; release_instance_lock; rm -rf "${tmp_dir}"' EXIT
 # Startup-window signal semantics (issue #405 post-review, B1). Bash
 # RESUMES execution after a non-exiting signal trap, so hanging the
 # release chain directly on INT/TERM let a signal landing in the
@@ -2260,6 +2488,7 @@ _ensure_watcher_tmp_dir() {
     [[ "$last" =~ ^[0-9]+$ ]] || last=0
     if (( now - last >= 600 )); then
         local iso; iso=$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+        _ensure_service_log "$alerts"
         printf '[%s] WARN watcher scratch dir %s was missing (likely /tmp reaper on a long-lived process) — recreated; emit path self-healed. Consider a tmp reaper exclusion or a longer retention for the watcher uid.\n' \
             "$iso" "$tmp_dir" >> "$alerts" 2>/dev/null || true
         printf '%s\n' "$now" > "$marker" 2>/dev/null || true
@@ -2274,6 +2503,18 @@ _ensure_watcher_tmp_dir() {
 acquire_instance_lock
 acquire_lock
 bump_heartbeat
+# Liveness/progress split (nexus-code#491): re-anchor the cycle clock
+# (preserving the learned period ema), stamp first progress, and start
+# the constant-cadence liveness ticker — AFTER the instance lock, so a
+# doomed second watcher never beats the real one's heartbeat. From here
+# on the heartbeat stays fresh through arbitrarily long sweeps; the
+# 13.5-minute startup sweep measured at 15 workers can no longer read
+# as a dead watcher.
+_cycle_reset
+_progress_bump startup
+if (( ONCE == 0 )); then
+    _start_heartbeat_ticker
+fi
 # Persist the target so `ng watcher-status` can report it even on
 # crashes before the first emit.
 printf '%s\n' "$TARGET" > "$TARGET_FILE"
@@ -2450,6 +2691,7 @@ gh_now=$(
 )
 gh_lines=$(printf '%s' "$gh_now" | awk 'NF>0 && $1 !~ /^[[:space:]]*body:/ {n++} END {print n+0}')
 log "snapshot-github done (eligible_lines=${gh_lines})"
+_progress_bump startup:github-done
 bell_now=$(list_bell_windows)
 log "local-snapshot start"
 # Bound the SYNCHRONOUS startup renders (nexus-code#236). Each probes worker
@@ -2494,6 +2736,7 @@ startup_worker_n=$(_idle_list_worker_windows 2>/dev/null \
     | awk 'NF>0 && $1!="" {n++} END {print n+0}')
 startup_report_n=$(find "${NEXUS_ROOT}/reports" -maxdepth 1 -type f -name '*.md' 2>/dev/null | wc -l | tr -d ' ')
 log "local-snapshot done (workers=${startup_worker_n} reports=${startup_report_n})"
+_progress_bump startup:local-done
 
 # Local-claude install-failure surfacing. The watcher's launcher.sh
 # attempts `monitor/install-claude-local.sh` if the project-local
@@ -2577,6 +2820,12 @@ fi
 supervisor_arm_now=$(_supervisor_arm_emit_section "$WATCHER_SUPERVISOR_HEARTBEAT" \
     "${MONITOR_WATCHER_SUPERVISOR_HEARTBEAT_STALE_SECONDS:-90}" "$NEXUS_ROOT" 2>/dev/null || true)
 [[ -n "$supervisor_arm_now" ]] && log "startup-sweep: arm-watcher-supervisor reminder surfaced"
+# Auto-roll audit breadcrumb (your-org/nexus-code#447). The roll TASK fires
+# on the first scheduler tick (after this sweep), so normally no notice exists
+# yet here — but read+consume any notice a crash left un-surfaced between its
+# write and the compose that would have shown it. One-shot, self-clearing.
+reports_roll_now=$(_reports_roll_emit_section "$REPORTS_ROLL_NOTICE_FILE" 2>/dev/null || true)
+[[ -n "$reports_roll_now" ]] && log "startup-sweep: reports auto-roll breadcrumb surfaced"
 # Legacy-hosting migration notice (issue 182). The launcher's headless
 # spawns carry WATCHER_WINDOW=headless; anything else means this
 # watcher was started the pre-cutover way (window-hosted entry.sh,
@@ -2598,6 +2847,7 @@ if [[ -n "$startup_full_state" ]]; then
     # and can take several seconds per dozen windows; log before so
     # the pane shows motion (issue #162).
     log "startup-sweep canonical-check"
+    _progress_bump startup:canonical-check
     startup_canonical_prelude=$(MONITOR_PRELUDE_DRY_RUN=1 render_idle_prelude 2>/dev/null || true)
     # Canonical form = the SHARED volatile strip (_emit_dedup.sh).
     # The old inline `sed 's/idle Ns/idle/'` only knew one age token;
@@ -2612,12 +2862,14 @@ fi
 # reminder rides on emits triggered by real signal; it never forces a
 # quiet-workspace emit. watcher_revived_now IS in the gate (a one-shot
 # self-failure report worth an emit on its own).
-if [[ -n "$gh_now" || -n "$bell_now" || -n "$idle_now" || -n "$pending_now" || -n "$requests_now" || -n "$startup_full_state" || -n "$install_failure_now" || -n "$cc_update_now" || -n "$hosting_migration_now" || -n "$version_drift_now" || -n "$service_health_now" || -n "$watcher_revived_now" ]]; then
+if [[ -n "$gh_now" || -n "$bell_now" || -n "$idle_now" || -n "$pending_now" || -n "$requests_now" || -n "$startup_full_state" || -n "$install_failure_now" || -n "$cc_update_now" || -n "$hosting_migration_now" || -n "$version_drift_now" || -n "$service_health_now" || -n "$watcher_revived_now" || -n "$reports_roll_now" ]]; then
     EMIT_SIG_NONCE=$(head -c 4 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' | head -c 6)
     # compose_report itself calls render_idle_prelude a second time;
     # bracket it explicitly so the pane shows progress (issue #162).
     log "startup-sweep composing emit"
-    compose_report "startup-sweep" "" "$gh_now" "$bell_now" "$idle_now" "$startup_full_state" "$pending_now" "$install_failure_now" "$cc_update_now" "$hosting_migration_now" "$version_drift_now" "$service_health_now" "$watcher_revived_now" "$supervisor_arm_now" "$requests_now" > "$emit_body"
+    _progress_bump startup:composing-emit
+    compose_report "startup-sweep" "" "$gh_now" "$bell_now" "$idle_now" "$startup_full_state" "$pending_now" "$install_failure_now" "$cc_update_now" "$hosting_migration_now" "$version_drift_now" "$service_health_now" "$watcher_revived_now" "$supervisor_arm_now" "$requests_now" "$reports_roll_now" > "$emit_body"
+    _progress_bump startup:emit-composed
     cp "$emit_body" "$LAST_CHANGE"
     archive_path=$(archive_emit "$emit_body")
     log "startup-sweep archive=${archive_path}"
@@ -2637,6 +2889,12 @@ if [[ -n "$gh_now" || -n "$bell_now" || -n "$idle_now" || -n "$pending_now" || -
         # hash. The startup sweep is itself never gated — the
         # operator always sees the workspace on watcher restart.
         _compose_emit_record_emit "$emit_body"
+        # Delivery-stamp the request ids this paste actually carried
+        # (stamp-on-paste, your-org/nexus-code#483): the startup render
+        # above deliberately wrote no cooldown rows, so a suppressed or
+        # failed startup paste leaves every request due for the
+        # steady-state loop.
+        requests_commit_emitted "$emit_body"
         _respawn_loop_reset "$RESPAWN_HISTORY"
         rm -f "$RESPAWN_TRIPPED"
         # Successful paste = orchestrator reachable on both axes:
@@ -2670,11 +2928,13 @@ if [[ -n "$gh_now" || -n "$bell_now" || -n "$idle_now" || -n "$pending_now" || -
         snapshot_local > "${BASELINE}" 2>/dev/null || true
     fi
 fi
-# Bump the proof-of-working-loop heartbeat now the startup sweep (a full
-# correct cycle: snapshot → emit-decision → paste) has completed
-# (nexus-code#236). After this the only heartbeat bumps are at the end of each
-# steady-state compose cycle — so the heartbeat goes stale the moment the loop
-# wedges, while a quiet (no-emit) workspace keeps it fresh every cycle.
+# The startup sweep (a full correct cycle: snapshot → emit-decision →
+# paste) has completed. Stamp the CYCLE signal — its first measured
+# period is the sweep's real wall-clock cost, seeding the load-aware
+# wedge/cycle cutoffs — plus progress, and bump the heartbeat (a belt
+# alongside the #491 ticker; on --once runs it is the only bump).
+_cycle_bump
+_progress_bump startup:done
 bump_heartbeat
 
 
@@ -2951,7 +3211,11 @@ _v2_task_orchestrator_liveness() {
                 mkdir -p "$(dirname "$ORCH_FRESH_SPAWN_COOLDOWN_FILE")" 2>/dev/null || true
                 touch -c "$ORCH_FRESH_SPAWN_COOLDOWN_FILE" 2>/dev/null || \
                     : > "$ORCH_FRESH_SPAWN_COOLDOWN_FILE"
+                _ensure_service_log "$LOGFILE"
                 (
+                    # Disowned fork that can outlive us — it must never
+                    # pin the instance flock (skeptic finding 5, PR#503).
+                    _close_inherited_locks
                     if NEXUS_ROOT="$NEXUS_ROOT" \
                        STATE_DIR="$STATE_DIR" \
                        bash "$_script_dir/spawn-fresh-orchestrator.sh" \
@@ -2959,6 +3223,10 @@ _v2_task_orchestrator_liveness() {
                             --reason "$liveness_verdict" \
                             --previous-sid "$prev_sid" >>"$LOGFILE" 2>&1; then
                         log "orchestrator fresh-spawn (forked) succeeded: target=$TARGET prev_sid=${prev_sid:-none}"
+                        # Same reset as respawn_agent (#489 skeptic C2):
+                        # the fresh session must see the live request
+                        # set, not the dead session's delivery clocks.
+                        requests_reset_delivery_state
                     else
                         log "orchestrator fresh-spawn (forked) returned non-zero (cooldown stamped regardless)"
                     fi
@@ -2975,36 +3243,12 @@ _v2_task_orchestrator_liveness() {
             ;;
         resubmit*)
             # One-shot re-paste rescue (orchestrator-liveness
-            # resilience). The unstick budget is exhausted but the
-            # absolute deadline hasn't passed: before killing an
-            # orchestrator that may merely have lost a paste (dropped
-            # Enter, un-submitted input buffer), re-deliver the most
-            # recent emit body and let the next cycles re-evaluate.
-            #
-            # Stamp the marker BEFORE pasting so the attempt is
-            # counted even if the paste itself fails — the
-            # dead-threshold remains the backstop either way, and an
-            # un-stamped failure would retry the paste every 5 s tick.
-            mkdir -p "$(dirname "$ORCH_RESUBMIT_MARKER_FILE")" 2>/dev/null || true
-            : > "$ORCH_RESUBMIT_MARKER_FILE" 2>/dev/null || true
-            touch -c "$ORCH_RESUBMIT_MARKER_FILE" 2>/dev/null || true
-            local resubmit_body resubmit_rc
-            resubmit_body=$(find "$DIFF_DIR" -maxdepth 1 -type f -name '*.md' \
-                -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)
-            if [[ -n "$resubmit_body" && -f "$resubmit_body" ]]; then
-                # Reuse the standard paste path (VI-mode `i BSpace`
-                # insert-mode force + content verification), but with
-                # the liveness stamp suppressed: the re-paste must not
-                # advance the last-paste clock it is racing against.
-                if paste_with_retry "$TARGET" "$resubmit_body" no-liveness-stamp; then
-                    log "orchestrator-liveness: re-submitted archive=$(basename "$resubmit_body") to $TARGET ($liveness_verdict)"
-                else
-                    resubmit_rc=$?
-                    log "orchestrator-liveness: re-submit paste failed rc=$resubmit_rc archive=$(basename "$resubmit_body") ($liveness_verdict)"
-                fi
-            else
-                log "orchestrator-liveness: re-submit requested but no emit archive found in $DIFF_DIR ($liveness_verdict)"
-            fi
+            # resilience). Body extracted to _orch_resubmit_rescue in
+            # _orchestrator_liveness.sh (#489 skeptic C1: the branch
+            # mutates request-delivery state and needs regression
+            # coverage, which main.sh-inline code cannot get).
+            _orch_resubmit_rescue "$TARGET" "$DIFF_DIR" \
+                "$ORCH_RESUBMIT_MARKER_FILE" "$liveness_verdict"
             ;;
         waiting*|blocked-by-cooldown*|healthy*)
             # Logging handled by the throttle above.
@@ -3244,6 +3488,81 @@ _v2_task_service_health() {
     return 0
 }
 
+# ---- automatic reports-archive roll (your-org/nexus-code#447) -------------
+# Runs the idempotent, ≥1-month-buffered roller (monitor/reports-roll.sh,
+# #444/#446) on the FIRST scheduler tick after startup (the scheduler seeds a
+# fresh task's next_fire=0) and, thereafter, at most once per calendar day.
+# The day-stamp gate keeps every other tick a cheap no-op — a `date` compare
+# and a file read, NO reports-dir scan — so we never reintroduce #443's
+# per-loop cost. The roll itself is idempotent and buffer-protected: it can
+# only ever move reports strictly older than the previous month, so a
+# recent / in-flight report is never touched no matter the current state.
+#
+# Emit hygiene: SILENT when nothing moves. Only a run that actually rolls
+# ≥1 file writes the one-shot notice file, which compose_emit surfaces once
+# (and consumes) as `--- reports archived ---`, routed through the normal
+# change-or-timeout gate and pulled forward with `_schedule_fire_now`.
+_v2_task_reports_roll() {
+    local today last
+    today=$(date +%Y-%m-%d)
+    last=$(cat "$REPORTS_ROLL_LAST_DAY_FILE" 2>/dev/null || true)
+    [[ "$today" == "$last" ]] && return 0   # already rolled today → cheap skip
+
+    local roller="$_script_dir/../reports-roll.sh"
+    if [[ ! -x "$roller" ]]; then
+        log "reports-roll: roller not found/executable at $roller; skipping"
+        return 0
+    fi
+
+    local out rc=0
+    out=$(NEXUS_ROOT="$NEXUS_ROOT" \
+          REPORTS_ROLL_MIN_AGE_SECONDS="$MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS" \
+          "$roller" --now --quiet 2>&1) || rc=$?
+    if (( rc != 0 )); then
+        # Never wedge the scheduler on a roller error; retry next day-boundary.
+        # Deliberately do NOT stamp the day, so the next tick re-attempts.
+        log "reports-roll: roller exited rc=$rc; will retry next tick. Output: ${out}"
+        return 0
+    fi
+
+    # Stamp today regardless of whether anything moved — we DID run today.
+    printf '%s\n' "$today" > "${REPORTS_ROLL_LAST_DAY_FILE}.tmp.$$" 2>/dev/null \
+        && mv -f "${REPORTS_ROLL_LAST_DAY_FILE}.tmp.$$" "$REPORTS_ROLL_LAST_DAY_FILE" 2>/dev/null \
+        || rm -f "${REPORTS_ROLL_LAST_DAY_FILE}.tmp.$$" 2>/dev/null
+
+    local rolled
+    rolled=$(printf '%s' "$out" | grep -oE 'rolled [0-9]+' | head -1 | grep -oE '[0-9]+' || true)
+    rolled=${rolled:-0}
+    if (( rolled > 0 )); then
+        # One-shot audit breadcrumb, written to a DURABLE notice file.
+        # compose_emit's _reports_roll_emit_section surfaces it once, then
+        # consumes it (self-clearing → no flap). We do NOT force-fire
+        # compose_emit here: this task runs in a `( … ) &` async subshell, so a
+        # `_schedule_fire_now` would mutate subshell-local scheduler state and
+        # be lost. The durable-file + own-cadence pickup is the same pattern
+        # deliveries_poll uses, and the roll also changes snapshot_local's
+        # reports section, which the scheduler's post-tick hook already uses to
+        # pull compose_emit forward — so the breadcrumb surfaces promptly.
+        printf 'Auto-archived aged reports into monthly reports/YYYY-MM/ buckets.\n%s\n' \
+            "$out" > "${REPORTS_ROLL_NOTICE_FILE}.tmp.$$" 2>/dev/null \
+            && mv -f "${REPORTS_ROLL_NOTICE_FILE}.tmp.$$" "$REPORTS_ROLL_NOTICE_FILE" 2>/dev/null \
+            || rm -f "${REPORTS_ROLL_NOTICE_FILE}.tmp.$$" 2>/dev/null
+        log "reports-roll: ${out}"
+    fi
+    return 0
+}
+
+# _reports_roll_emit_section <notice_file>
+# One-shot: if a roll notice is pending, print it and CONSUME it (delete),
+# so it surfaces exactly once and a subsequent quiet cycle re-adds nothing.
+# Same self-clearing shape as the watcher-revived one-shot.
+_reports_roll_emit_section() {
+    local notice="${1:-}"
+    [[ -n "$notice" && -s "$notice" ]] || return 0
+    cat "$notice" 2>/dev/null || return 0
+    rm -f "$notice" 2>/dev/null || true
+}
+
 # ---- compose_emit task (--async, cadence = MONITOR_INTERVAL) -
 # Reads staged outputs from
 # `monitor/.state/scheduler-staging/<name>.out`, computes
@@ -3271,10 +3590,13 @@ _v2_task_compose_emit() {
         return 0
     fi
 
+    _progress_bump compose:start
+
     # Seed BASELINE on first ever run.
     if [[ ! -f "$BASELINE" ]]; then
         cp "$current_tmp" "$BASELINE" 2>/dev/null || true
         rm -f "$current_tmp" 2>/dev/null || true
+        _cycle_bump
         bump_heartbeat   # healthy cycle (snapshot built, baseline seeded)
         return 0
     fi
@@ -3293,6 +3615,7 @@ _v2_task_compose_emit() {
             && mv "${BASELINE}.tmp.$$" "$BASELINE" 2>/dev/null || true
         log "snapshot baseline format upgraded ('${_base_tag:0:48}' -> '${_cur_tag:0:48}'); reseeded silently (no spurious reformat emit)"
         rm -f "$current_tmp" 2>/dev/null || true
+        _cycle_bump
         bump_heartbeat   # healthy cycle (snapshot built, baseline reseeded)
         return 0
     fi
@@ -3540,6 +3863,14 @@ _v2_task_compose_emit() {
     local service_health_now=""
     service_health_now=$(_service_health_emit_section "$SERVICE_HEALTH_STATE_DIR" "$NEXUS_ROOT" 2>/dev/null || true)
 
+    # Auto-roll audit breadcrumb (your-org/nexus-code#447). One-shot: present
+    # ONLY on the cycle right after a roll that actually moved ≥1 file (the
+    # roll task fires compose_emit forward), consumed on read so it surfaces
+    # exactly once — a genuine trigger (worth an emit on an otherwise-quiet
+    # workspace), never a standing/periodic one.
+    local reports_roll_now=""
+    reports_roll_now=$(_reports_roll_emit_section "$REPORTS_ROLL_NOTICE_FILE" 2>/dev/null || true)
+
     # Arm-watcher-supervisor reminder (mutual-liveness). A STANDING
     # condition reflecting the live supervisor-heartbeat freshness:
     # non-empty once the heartbeat is stale (> stale_seconds, default 90)
@@ -3559,9 +3890,9 @@ _v2_task_compose_emit() {
     # arm-reminder rides on emits caused by real signal / the periodic
     # full-state cadence; it must never force a quiet-workspace emit.
     if [[ -n "$local_diff" || -n "$gh_now" || -n "$bell_now" || -n "$idle_now" \
-          || -n "$pending_now" || -n "$requests_now" || -n "$cc_update_now" || -n "$version_drift_now" || -n "$service_health_now" || $full_state_due -eq 1 ]]; then
+          || -n "$pending_now" || -n "$requests_now" || -n "$cc_update_now" || -n "$version_drift_now" || -n "$service_health_now" || -n "$reports_roll_now" || $full_state_due -eq 1 ]]; then
         if (( signal_from_diff == 1 )) \
-           || [[ -n "$gh_now" || -n "$bell_now" || -n "$idle_now" || -n "$pending_now" || -n "$requests_now" || -n "$cc_update_now" || -n "$version_drift_now" || -n "$service_health_now" ]] \
+           || [[ -n "$gh_now" || -n "$bell_now" || -n "$idle_now" || -n "$pending_now" || -n "$requests_now" || -n "$cc_update_now" || -n "$version_drift_now" || -n "$service_health_now" || -n "$reports_roll_now" ]] \
            || (( full_state_due == 1 )); then
             local resurface_only=0 reason archive_tag
             if [[ -z "$local_diff" && -z "$bell_now" ]]; then
@@ -3612,9 +3943,18 @@ _v2_task_compose_emit() {
                 reason="poll-requests"
                 archive_tag="requests"
             fi
+            # Same forensic labelling for an auto-roll-driven emit: the
+            # reports-archived breadcrumb is a genuinely new one-shot event.
+            if [[ -n "$reports_roll_now" && -z "$local_diff" && -z "$gh_now" \
+                  && -z "$bell_now" && -z "$idle_now" && -z "$pending_now" \
+                  && -z "$cc_update_now" && -z "$version_drift_now" \
+                  && -z "$service_health_now" && -z "$requests_now" && $full_state_due -ne 1 ]]; then
+                reason="poll-reports-roll"
+                archive_tag="reports-roll"
+            fi
             local EMIT_SIG_NONCE
             EMIT_SIG_NONCE=$(head -c 4 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' | head -c 6)
-            compose_report "$reason" "$local_diff" "$gh_now" "$bell_now" "$idle_now" "$full_state_lines" "$pending_now" "" "$cc_update_now" "" "$version_drift_now" "$service_health_now" "" "$supervisor_arm_now" "$requests_now" > "$emit_body"
+            compose_report "$reason" "$local_diff" "$gh_now" "$bell_now" "$idle_now" "$full_state_lines" "$pending_now" "" "$cc_update_now" "" "$version_drift_now" "$service_health_now" "" "$supervisor_arm_now" "$requests_now" "$reports_roll_now" > "$emit_body"
             cp "$emit_body" "$LAST_CHANGE"
             local archive_path
             archive_path=$(archive_emit "$emit_body" "$archive_tag")
@@ -3647,6 +3987,25 @@ _v2_task_compose_emit() {
                 log "pasted to ${TARGET}"
                 _emit_delivery_ok
                 _compose_emit_record_emit "$emit_body"
+                # Delivery-stamp the request ids this paste actually
+                # carried (stamp-on-paste, your-org/nexus-code#483) —
+                # same post-paste-only discipline as the emit-dedup
+                # record above: a suppressed or failed paste writes no
+                # cooldown, so the request stays due and re-surfaces
+                # next cycle instead of aging silently. Then consume the
+                # requests stage file: it now describes a delivered set,
+                # and a fast follow-up compose (the 5s engage override)
+                # would otherwise re-read it and — request bodies bypass
+                # the dedup gate — re-paste a duplicate inside the ≤10s
+                # window before the next requests_poll tick regenerates
+                # it from the claimed files + fresh stamps. Worst case
+                # for the truncation itself is wiping a render that
+                # landed in the same instant, which the next tick
+                # re-renders from source ≤10s later — nothing is lost.
+                if [[ -n "$requests_now" ]]; then
+                    requests_commit_emitted "$emit_body"
+                    : > "$stage_dir/requests_poll.out" 2>/dev/null || true
+                fi
                 _respawn_loop_reset "$RESPAWN_HISTORY"
                 rm -f "$RESPAWN_TRIPPED"
                 _respawn_consec_reset "$RESPAWN_CONSEC_COUNTER"
@@ -3693,23 +4052,30 @@ _v2_task_compose_emit() {
     fi
 
     rm -f "$current_tmp" 2>/dev/null || true
-    # Proof-of-working-loop heartbeat (nexus-code#236). Reaching here means a
-    # HEALTHY cycle completed — staged a snapshot, ran the emit-decision tree,
-    # and pasted / suppressed / found-nothing (ALL healthy outcomes; a quiet
-    # "found-nothing" cycle is exactly the token-efficient silence we WANT, and
-    # it still proves the loop works). A wedged cycle (reaped scratch dir,
-    # missing snapshot, a hang the watchdog killed) returns earlier and does
-    # NOT bump, so the heartbeat goes stale and the supervisor restarts a
-    # malfunctioning-but-alive watcher — independent of whether an emit was due.
+    # Proof-of-working-cycle stamp (nexus-code#236, re-homed by #491).
+    # Reaching here means a HEALTHY cycle completed — staged a snapshot, ran
+    # the emit-decision tree, and pasted / suppressed / found-nothing (ALL
+    # healthy outcomes; a quiet "found-nothing" cycle is exactly the
+    # token-efficient silence we WANT, and it still proves the loop works).
+    # A wedged cycle (reaped scratch dir, missing snapshot, a hang the
+    # watchdog killed) returns earlier and does NOT stamp, so the CYCLE
+    # signal goes stale past _watcher_cycle_cutoff and the watcher reads
+    # WEDGED — while the liveness heartbeat (ticker) keeps proving the
+    # process itself is alive. _cycle_bump also records the measured loop
+    # period that calibrates those cutoffs. bump_heartbeat stays as a belt
+    # for ticker-degraded runs and --once.
+    _cycle_bump
     bump_heartbeat
     return 0
 }
 
 # ---- task registration --------------------------------------
-# NB: NO `heartbeat` task (nexus-code#236). The heartbeat is bumped at the end
-# of each correct compose cycle (see _v2_task_compose_emit) so a fresh
-# heartbeat PROVES the loop works and a wedged loop goes stale — an always-
-# ticks heartbeat would mask exactly the silent stall this hardening targets.
+# NB: still NO `heartbeat` scheduler task. The liveness heartbeat is a
+# background ticker (nexus-code#491) whose cadence cannot depend on this
+# scheduler; the functional proof #236 wanted lives in the CYCLE signal
+# (_cycle_bump at each correct compose-cycle end), and the silent-stall
+# class is caught by the progress/cycle cutoffs (_watcher_wedged), not
+# by starving the liveness signal.
 _schedule_task over_limit_wakes        5            _v2_task_over_limit_wakes       --class cheap
 _schedule_task target_window           2            _v2_task_target_window_probe    --class cheap
 _schedule_task orchestrator_liveness   5            _v2_task_orchestrator_liveness  --class cheap
@@ -3729,6 +4095,19 @@ _schedule_task over_limit_scan         60           _v2_task_over_limit_scan    
 _schedule_task deliveries_poll         15           _v2_task_deliveries_poll        --class medium    --async
 _schedule_task github_poll             600          _v2_task_github_poll            --class expensive --async
 _schedule_task full_state_snap         600          _v2_task_full_state_snap        --class expensive --async
+# Automatic reports-archive roll (your-org/nexus-code#447). Fires on the
+# first tick (next_fire seeds to 0 → startup migration/self-heal) and then
+# hourly by default; the day-stamp gate inside the task makes every tick but
+# the first-of-day a cheap no-op (date compare, no scan). --async because the
+# once-per-day roll touches the NFS reports dir. ON by default; disabled via
+# monitor.reports_roll.enabled=false or interval_seconds=0.
+if [[ "$MONITOR_REPORTS_ROLL_ENABLED" == "true" || "$MONITOR_REPORTS_ROLL_ENABLED" == "1" ]] \
+   && (( MONITOR_REPORTS_ROLL_INTERVAL_SECONDS > 0 )); then
+    _schedule_task reports_roll        "$MONITOR_REPORTS_ROLL_INTERVAL_SECONDS" \
+                                       _v2_task_reports_roll           --class medium    --async
+else
+    log "reports-roll: auto-roll disabled (monitor.reports_roll.enabled=${MONITOR_REPORTS_ROLL_ENABLED}, interval=${MONITOR_REPORTS_ROLL_INTERVAL_SECONDS}); manual 'ng reports-roll' still available"
+fi
 # Functional-check signal (other-nexus-lessons L1). 600 s cadence: same
 # cost class as github_poll (one or two `gh api reactions` calls per
 # fire on a typical workspace); deeper-than-pid wedge detection. Set
@@ -3749,6 +4128,17 @@ fi
 # OFF by default — an operator turns it on deliberately
 # (monitor.cc_auto_update.enabled: true). The interval is the
 # due-window poll cadence; the once-per-day gate lives in the task.
+#
+# REGISTRATION-TIME ONLY (nexus-code#513): MONITOR_CC_AUTO_UPDATE_ENABLED
+# is resolved ONCE, at watcher startup (_config.sh), and consumed here to
+# decide whether the task is scheduled AT ALL. Toggling the config on a
+# RUNNING watcher is INERT — the already-scheduled task keeps ticking and
+# its restart reconcile keeps firing. It therefore CANNOT serve as an
+# emergency stop for an unwanted orchestrator restart (it nearly got
+# applied as one twice on 2026-07-10, and would have done nothing until
+# the very watcher restart the hold existed to avoid). The tick-checked
+# off switch is the restart-hold marker:
+#     monitor/cc-auto-update-apply.sh hold --reason "…" [--until-version X]
 if [[ "$MONITOR_CC_AUTO_UPDATE_ENABLED" == "true" ]] \
    && (( MONITOR_CC_AUTO_UPDATE_CHECK_INTERVAL_SECONDS > 0 )); then
     _schedule_task cc_auto_update      "$MONITOR_CC_AUTO_UPDATE_CHECK_INTERVAL_SECONDS" \
@@ -3800,6 +4190,7 @@ _scheduler_post_tick_hook() {
     _compose_emit_nudge_check \
         "${STATE_DIR}/deliveries-queue.lines" \
         "${V2_STAGE_DIR}/github_poll.out" \
+        "${V2_STAGE_DIR}/requests_poll.out" \
         >/dev/null 2>&1 || true
 }
 
@@ -3833,7 +4224,30 @@ if (( ONCE == 1 )); then
 fi
 
 while true; do
+    # Probe FIRST, every cycle, with a fresh open(). On a read-only project
+    # FS the whole scheduler is suspended — every task it runs writes to the
+    # project tree, so running them would only produce a storm of EROFS and
+    # a heartbeat that cannot be bumped. We keep looping (a live watcher is
+    # what notices recovery, and what answers "what is wrong" for everyone
+    # else) and re-probe on a short cadence until the mount comes back.
+    if ! _fs_guard_tick; then
+        # Validate the interval: a non-numeric value would make `sleep` error
+        # out instantly and turn the degraded loop into a busy-spin — burning
+        # a core during an outage, when the machine is already unhappy.
+        _fs_poll="${MONITOR_FS_DEGRADED_POLL_SECONDS:-15}"
+        [[ "$_fs_poll" =~ ^[0-9]+$ ]] && (( _fs_poll > 0 )) || _fs_poll=15
+        sleep "$_fs_poll"
+        continue
+    fi
+
     _scheduler_tick; sched_rc=$?
+    # Forward-progress stamp + liveness-ticker self-heal (nexus-code#491).
+    # The stamp is what separates a BUSY loop from a WEDGED one: it stops
+    # advancing exactly when this loop stops executing. The ticker check
+    # respawns a crashed ticker within one iteration (~10s), so a ticker
+    # death can never mature into a stale-heartbeat false DOWN.
+    _progress_bump loop-tick
+    _start_heartbeat_ticker
     # Refresh the cross-host instance beacon once per loop iteration (the
     # scheduler caps its sleep at ~10s, so this fires well within the
     # staleness window), but SELF-FENCE first (D4): if the beacon on disk now

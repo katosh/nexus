@@ -1034,6 +1034,214 @@ else
 fi
 
 echo
+echo "=== real-footer shell phrasing + bg_cpu scoping (your-org/nexus-code#445) ==="
+# The pre-#445 regex looked for the word "background" and never matched
+# the real Claude Code v2.1.204 status line `· N shell[s], N monitor ·`,
+# so a worker idling between turns with a live background shell was
+# false-classified `idle` → spurious idle-without-wrap-up nag.
+
+# (10) Real status-line `1 shell, 1 monitor` (no spinner "still
+#      running") → working-background. This is the exact form the old
+#      regex missed. Footer fallback (no heartbeat).
+real_foot="$FIX_DIR/working-background-shell-realfooter.ansi"
+if [[ -f "$real_foot" ]]; then
+    out=$("$HELPER" --fixture "$real_foot" \
+                    --window 9 --name paperbench --active 0 \
+                    --heartbeat-file "$async_tmp/missing.json" \
+                    --now "$ASYNC_NOW" --bg-cpu 1200 2>&1)
+    got=$(awk -F'[ =]' '{print $2}' <<<"$out")
+    if [[ "$got" == "working-background" ]]; then
+        printf '  PASS: real "1 shell, 1 monitor" footer → working-background\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: real-footer shell — got=%s want=working-background (full: %s)\n' "$got" "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+    # (10b) shell-driven working-background CARRIES bg_cpu (grace-capped).
+    if grep -qF 'bg_cpu=1200' <<<"$out"; then
+        printf '  PASS: shell-driven working-background carries bg_cpu\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: shell-driven missing bg_cpu (full: %s)\n' "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+fi
+
+# (10c) Monitor-handle working-background carries NO bg_cpu (it is
+#       self-waking and must never be subjected to the shell
+#       orphan-grace). Heartbeat monitor_handles=1, bg=0.
+write_async_hb idle_prompt 5 1 0 - '[]'
+out=$("$HELPER" --fixture "$idle_fixture" \
+                --window 9 --name montest --active 0 \
+                --heartbeat-file "$async_hb" \
+                --now "$ASYNC_NOW" --bg-cpu 9999 2>&1)
+got=$(awk -F'[ =]' '{print $2}' <<<"$out")
+if [[ "$got" == "working-background" ]] && ! grep -qF 'bg_cpu=' <<<"$out"; then
+    printf '  PASS: monitor-handle working-background omits bg_cpu\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: monitor-handle bg_cpu scoping — got=%s (full: %s)\n' "$got" "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# (10d) shell-count from heartbeat (background_bash_count=3) → shell
+#       driver → bg_cpu present.
+write_async_hb idle_prompt 5 0 3 - '[]'
+out=$("$HELPER" --fixture "$idle_fixture" \
+                --window 9 --name bgtest --active 0 \
+                --heartbeat-file "$async_hb" \
+                --now "$ASYNC_NOW" --bg-cpu 555 2>&1)
+if grep -qF 'state=working-background' <<<"$out" && grep -qF 'bg_cpu=555' <<<"$out"; then
+    printf '  PASS: heartbeat background_bash_count → shell-driven bg_cpu\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: heartbeat bg-count bg_cpu — (full: %s)\n' "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+echo
+echo "=== process-tree as the authoritative background-shell signal (your-org/nexus-code#455) ==="
+# The status-line `N shell` footer is presentation: a user can customise
+# the status bar, it changes across CC versions, and a regex can match
+# unrelated pane text. #455 makes the kernel PROCESS TREE (claude's live
+# background-shell child subtrees) the primary + authoritative signal,
+# demoting the footer regex to a fallback for when /proc can't be read.
+# `--bg-shells N` injects a RELIABLE process-tree reading (count=N) so the
+# fixtures can exercise the authoritative path.
+
+# (11a) UP override — a live background shell the status bar does NOT show
+#       (customised/changed footer). Clean idle fixture (no footer shell
+#       token, no heartbeat) + a reliable process-tree count of 2 →
+#       working-background. The footer regex would have missed this
+#       (the #445-class false-idle, now caught by process truth).
+out=$("$HELPER" --fixture "$idle_fixture" \
+                --window 9 --name pt-up --active 0 \
+                --heartbeat-file "$async_tmp/missing.json" \
+                --now "$ASYNC_NOW" --bg-shells 2 --bg-cpu 4242 2>&1)
+got=$(awk -F'[ =]' '{print $2}' <<<"$out")
+if [[ "$got" == "working-background" ]] && grep -qF 'bg_cpu=4242' <<<"$out"; then
+    printf '  PASS: process-tree count>0 with silent footer → working-background + bg_cpu\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: process-tree UP override — got=%s (full: %s)\n' "$got" "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# (11b) DOWN override — a spurious footer `· 2 shells ·` (coincidental
+#       text / customised status bar) with NO live background shell.
+#       A reliable process-tree count of 0 must OVERRIDE the footer down
+#       to `idle`. This is the false-positive the operator flagged:
+#       "the regex may match other output in the window".
+spurious_foot="$FIX_DIR/working-background-spurious-shell-footer-synthetic.ansi"
+if [[ -f "$spurious_foot" ]]; then
+    # (11b-i) Fallback path (no reliable tree reading): the footer regex
+    #         still fires → working-background. Confirms the fragile
+    #         fallback is intact for /proc-restricted environments AND
+    #         demonstrates the fragility the process tree corrects.
+    out=$("$HELPER" --fixture "$spurious_foot" \
+                    --window 9 --name pt-fallback --active 0 \
+                    --heartbeat-file "$async_tmp/missing.json" \
+                    --now "$ASYNC_NOW" 2>&1)
+    got=$(awk -F'[ =]' '{print $2}' <<<"$out")
+    if [[ "$got" == "working-background" ]]; then
+        printf '  PASS: spurious footer, no tree reading → working-background (fallback intact)\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: footer fallback — got=%s (full: %s)\n' "$got" "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+    # (11b-ii) Authoritative path (reliable tree count=0): overrides the
+    #          spurious footer down to idle.
+    out=$("$HELPER" --fixture "$spurious_foot" \
+                    --window 9 --name pt-down --active 0 \
+                    --heartbeat-file "$async_tmp/missing.json" \
+                    --now "$ASYNC_NOW" --bg-shells 0 2>&1)
+    got=$(awk -F'[ =]' '{print $2}' <<<"$out")
+    if [[ "$got" == "idle" ]]; then
+        printf '  PASS: reliable process-tree count=0 overrides spurious footer → idle\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: process-tree DOWN override — got=%s want=idle (full: %s)\n' "$got" "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+fi
+
+# (11c) Monitor is NOT visible to the process tree — a reliable tree
+#       count of 0 must NOT suppress a live Monitor handle (heartbeat
+#       monitor_handles=1). Still working-background, and (Monitor-driven)
+#       carries NO bg_cpu.
+write_async_hb idle_prompt 5 1 0 - '[]'
+out=$("$HELPER" --fixture "$idle_fixture" \
+                --window 9 --name pt-mon --active 0 \
+                --heartbeat-file "$async_hb" \
+                --now "$ASYNC_NOW" --bg-shells 0 2>&1)
+got=$(awk -F'[ =]' '{print $2}' <<<"$out")
+if [[ "$got" == "working-background" ]] && ! grep -qF 'bg_cpu=' <<<"$out"; then
+    printf '  PASS: tree count=0 does not suppress Monitor handle → working-background, no bg_cpu\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: Monitor-not-in-tree — got=%s (full: %s)\n' "$got" "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+echo
+echo "=== bg_shells + bg_reliable emit fields (your-org/nexus-code#455 refine) ==="
+# A shell-driven working-background line must ALSO carry bg_shells=<count>
+# and bg_reliable=<0|1> so the watcher's idle probe can key its
+# idle-with-children backoff + wrap-up-with-children inconsistency detector.
+
+# (12a) Authoritative shell-driven reading → bg_shells=<count> bg_reliable=1.
+out=$("$HELPER" --fixture "$idle_fixture" \
+                --window 9 --name bgfields-rel --active 0 \
+                --heartbeat-file "$async_tmp/missing.json" \
+                --now "$ASYNC_NOW" --bg-shells 3 --bg-cpu 777 2>&1)
+if grep -qF 'state=working-background' <<<"$out" \
+   && grep -qF 'bg_shells=3' <<<"$out" \
+   && grep -qF 'bg_reliable=1' <<<"$out" \
+   && grep -qF 'bg_cpu=777' <<<"$out"; then
+    printf '  PASS: authoritative shell-driven → bg_shells + bg_reliable=1 + bg_cpu\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: bg_shells/bg_reliable emit — (full: %s)\n' "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# (12b) Fallback path (footer-driven, unreliable tree) → the shell-driven
+#       line still carries bg_reliable=0 so the probe keeps legacy behaviour.
+real_foot="$FIX_DIR/working-background-shell-realfooter.ansi"
+if [[ -f "$real_foot" ]]; then
+    out=$("$HELPER" --fixture "$real_foot" \
+                    --window 9 --name bgfields-fallback --active 0 \
+                    --heartbeat-file "$async_tmp/missing.json" \
+                    --now "$ASYNC_NOW" --bg-cpu 1200 2>&1)
+    if grep -qF 'state=working-background' <<<"$out" \
+       && grep -qF 'bg_reliable=0' <<<"$out"; then
+        printf '  PASS: footer-fallback shell-driven → bg_reliable=0\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: footer-fallback bg_reliable — (full: %s)\n' "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+fi
+
+# (12c) Monitor-handle working-background carries NEITHER bg_shells nor
+#       bg_reliable (it is not shell-driven).
+write_async_hb idle_prompt 5 1 0 - '[]'
+out=$("$HELPER" --fixture "$idle_fixture" \
+                --window 9 --name bgfields-mon --active 0 \
+                --heartbeat-file "$async_hb" \
+                --now "$ASYNC_NOW" --bg-shells 0 2>&1)
+if grep -qF 'state=working-background' <<<"$out" \
+   && ! grep -qF 'bg_shells=' <<<"$out" \
+   && ! grep -qF 'bg_reliable=' <<<"$out"; then
+    printf '  PASS: Monitor-handle working-background omits bg_shells/bg_reliable\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: Monitor-handle bg-fields scoping — (full: %s)\n' "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+echo
 echo "=== bogus-index fail-loud (issue #140) ==="
 # Real-tmux tests: a non-existent window index must emit a clear
 # stderr error, exit 3, and produce no stdout (so a grep-style probe
@@ -1137,6 +1345,68 @@ TMUXSHIM
     trap - EXIT
 else
     printf '  SKIP: tmux unavailable — bogus-index fail-loud tests skipped\n'
+fi
+
+echo "=== autosuggest ghost is not evidence of an empty child set (#455 follow-up) ==="
+# An autosuggest ghost is a RENDERING of the input row; it says nothing about
+# the process tree. The renderer ladder used to emit `autosuggest-only` WITHOUT
+# ever walking the tree, so a worker holding a live background shell that drew a
+# ghost on one poll read as plain-idle. The watcher then took that as an
+# authoritative "no children" and silently reset its absolute ceiling.
+#
+# All three fixtures below are REAL captures from live worker windows.
+
+# (14a) Ghost + LIVE background child → working-background. Deliberately uses
+#       ONLY the pre-existing flags, so that when this test is run against the
+#       pre-fix tree it fails on the SEMANTICS (it emits `autosuggest-only`)
+#       rather than on an unknown-flag usage error. Both directions matter, so
+#       14b asserts the converse.
+for gf in autosuggest-why-win4 autosuggest-review-win6 autosuggest-merge-win3; do
+    gfx="$FIX_DIR/$gf.ansi"
+    [[ -f "$gfx" ]] || continue
+    out=$("$HELPER" --fixture "$gfx" --window 9 --name ghost-live --active 0 \
+                    --heartbeat-file "$async_tmp/missing.json" --now "$ASYNC_NOW" \
+                    --bg-shells 1 --bg-cpu 500 2>&1)
+    if grep -qF 'state=working-background' <<<"$out" \
+       && grep -qF 'bg_shells=1' <<<"$out"; then
+        printf '  PASS: ghost + live child → working-background (%s)\n' "$gf"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: ghost + live child should not read idle (%s) — %s\n' "$gf" "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
+
+# (14b) Ghost with NO background child → still `autosuggest-only`. The promotion
+#       must be driven by the tree, not by the ghost: no false busy-flagging of a
+#       genuinely idle, ready-to-paste pane.
+for gf in autosuggest-why-win4 autosuggest-review-win6 autosuggest-merge-win3; do
+    gfx="$FIX_DIR/$gf.ansi"
+    [[ -f "$gfx" ]] || continue
+    out=$("$HELPER" --fixture "$gfx" --window 9 --name ghost-idle --active 0 \
+                    --heartbeat-file "$async_tmp/missing.json" --now "$ASYNC_NOW" 2>&1)
+    if grep -qF 'state=autosuggest-only' <<<"$out"; then
+        printf '  PASS: ghost, no children → autosuggest-only (%s)\n' "$gf"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: childless ghost must stay autosuggest-only (%s) — %s\n' "$gf" "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
+
+echo "=== bg_oldest_start: the derived episode start (#455 follow-up) ==="
+# (15) The shell-driven working-background line carries the oldest background
+#      shell's start epoch, so the probe can DERIVE the episode age instead of
+#      storing a resettable clock.
+out=$("$HELPER" --fixture "$idle_fixture" --window 9 --name bgold --active 0 \
+                --heartbeat-file "$async_tmp/missing.json" --now "$ASYNC_NOW" \
+                --bg-shells 2 --bg-cpu 10 --bg-oldest-start 1699999999 2>&1)
+if grep -qF 'bg_oldest_start=1699999999' <<<"$out"; then
+    printf '  PASS: working-background carries bg_oldest_start\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: bg_oldest_start not emitted — %s\n' "$out" >&2
+    FAIL=$(( FAIL + 1 ))
 fi
 
 echo

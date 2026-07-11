@@ -357,7 +357,10 @@ The orchestrator does not spawn its own successor; it deletes itself
 and lets the watcher's standard absent-target recovery do the rest:
 
 ```bash
-tmux kill-window -t orchestrator    # the orchestrator's own, final act
+# Resolve the coordinator window from config — it is NOT always named
+# `orchestrator` (nexus-code#459); a hard-coded name kills nothing.
+TARGET_WINDOW=$("$NEXUS_ROOT/config/load.sh" monitor.target_window orchestrator)
+tmux kill-window -t "$TARGET_WINDOW"    # the orchestrator's own, final act
 ```
 
 **Do NOT run this yet** — the pre-flight and the restart watchdog
@@ -461,13 +464,14 @@ The kill-last ordering is strict:
 spawn watchdog worker → it records baseline + starts its watch loop
                       → it writes the armed marker
 orchestrator waits for the marker
-                      → tmux kill-window -t orchestrator
+                      → tmux kill-window -t <monitor.target_window>
 ```
 
 The watchdog's mandate (the job list for its spawn prompt):
 
 1. **Record the baseline**: candidate version, orchestrator pane pid,
-   pinned session id + that jsonl's size, watcher pane pid.
+   pinned session id + that jsonl's size, watcher pid (from
+   `monitor/.state/watcher.pid` — the watcher is headless, it has no pane).
 2. **Start the watch loop, then signal armed** (write
    `monitor/.state/restart-watchdog-armed`). The orchestrator
    self-kills ONLY after seeing the marker.
@@ -482,7 +486,7 @@ The watchdog's mandate (the job list for its spawn prompt):
    old-binary records for ~30s after the baseline snapshot, and a
    one-shot grep racing the resume would see only those and spuriously
    fail (the 2026-06-03 cc-2.1.161 false negative). (c) the watcher
-   pane pid unchanged — it survived (the 2026-06-02 incident killed
+   pid still alive — it survived (the 2026-06-02 incident killed
    the watcher during a respawn stand-down).
 4. **On loop success**: `sandbox-notify` a one-liner, remove the armed
    marker, write the report (`ng report-init`), stand down.
@@ -492,7 +496,9 @@ The watchdog's mandate (the job list for its spawn prompt):
      (re-verify abort? crash-loop / slow-grind tripped?); address the
      cause, or run `monitor/watcher/spawn-fresh-orchestrator.sh`.
    - *watcher died* — relaunch it immediately
-     (`monitor/watcher/launcher.sh --target orchestrator`); the
+     (`monitor/watcher/launcher.sh` — `--target` defaults to config
+     `monitor.target_window`; never hard-code it, and never hand it an
+     unset variable: an empty `--target` is refused, exit 2); the
      workspace must never sit unmonitored.
    - *duplicate orchestrator windows* — execute the stand-down
      protocol from the watcher's recovery prompt against the
@@ -511,88 +517,34 @@ The watchdog's mandate (the job list for its spawn prompt):
 6. **Never exit leaving the workspace agent-less** without a loud
    notification. Report LAST, then stand down.
 
-The deterministic watch loop the watchdog runs (ready to adapt; the
-watchdog writes it to `/tmp/restart-watchdog.sh` and runs it as one
-long-running command, logging to
-`monitor/.state/restart-watchdog.log`):
+The deterministic watch loop the watchdog runs is **shipped as a repo
+file** — `monitor/cc-restart-watchdog-loop.sh`. Run it, do not re-adapt
+an inline copy: a hand-adapted listing is exactly how the hard-coded
+`orchestrator` window name in `<your-org>/nexus-code#459` survived, and how
+a stale `tmux list-panes -t watcher` baseline outlives the watcher going
+headless. The loop resolves the coordinator window itself (config
+`monitor.target_window`), reads the watcher pid from
+`monitor/.state/watcher.pid`, and logs to
+`monitor/.state/restart-watchdog.log`:
 
 ```bash
-#!/usr/bin/env bash
-set -uo pipefail
-NEXUS_ROOT="/abs/path/to/nexus"                  # ← adapt
-STATE="$NEXUS_ROOT/monitor/.state"
-SLUG="${NEXUS_ROOT//[^a-zA-Z0-9-]/-}"            # claude project-dir slug
-DEADLINE=$(( $(date +%s) + 180 ))
-
-note() { printf '%s %s\n' "$(date -Is)" "$*"; }
-fail() {
-    note "FAIL: $*"
-    command -v sandbox-notify >/dev/null 2>&1 \
-        && sandbox-notify "cc-update self-restart FAILED: $*"
-    date -Is > "$STATE/restart-watchdog-failed"
-    exit 1
-}
-
-# 1. baseline
-candidate=$("$NEXUS_ROOT/node_modules/.bin/claude" --version \
-    | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-orch_pid=$(tmux list-panes -t orchestrator -F '#{pane_pid}' | head -1)
-watcher_pid=$(tmux list-panes -t watcher -F '#{pane_pid}' | head -1)
-sid=$(tr -d '[:space:]' < "$STATE/orchestrator-session-id")
-jsonl="$HOME/.claude/projects/$SLUG/$sid.jsonl"
-base_size=$(stat -c%s "$jsonl") || fail "pinned jsonl missing — pin stale, ABORT (do not self-kill)"
-note "armed: candidate=$candidate orch_pid=$orch_pid watcher_pid=$watcher_pid sid=$sid jsonl=$base_size bytes"
-
-# 2. armed — the orchestrator may self-kill once this file exists
-date -Is > "$STATE/restart-watchdog-armed"
-
-# 3. wait: old pane dies, then a new orchestrator window appears
-while kill -0 "$orch_pid" 2>/dev/null; do
-    (( $(date +%s) > DEADLINE )) && fail "orchestrator never self-killed"
-    sleep 2
-done
-note "old orchestrator pid $orch_pid gone; waiting for the watcher respawn"
-while :; do
-    (( $(date +%s) > DEADLINE )) && fail "no respawn before deadline — read $STATE/watcher.log (re-verify abort? crash-loop?); manual recovery: monitor/watcher/spawn-fresh-orchestrator.sh"
-    new_pid=$(tmux list-panes -t orchestrator -F '#{pane_pid}' 2>/dev/null | head -1)
-    [[ -n "${new_pid:-}" && "$new_pid" != "$orch_pid" ]] && break
-    sleep 2
-done
-note "new orchestrator pane pid $new_pid"
-
-# 4. verify
-n=$(tmux list-windows -F '#{window_name}' | grep -cx orchestrator)
-(( n == 1 )) || fail "$n orchestrator windows — duplicate respawn (PR 214 class)"
-tmux list-windows -F '#{window_name}' | grep -qi standdown \
-    && fail "stand-down window present — duplicate respawn occurred"
-kill -0 "$watcher_pid" 2>/dev/null \
-    || fail "watcher died — relaunch: monitor/watcher/launcher.sh --target orchestrator"
-[[ "$(tr -d '[:space:]' < "$STATE/orchestrator-session-id")" == "$sid" ]] \
-    || fail "session pin changed — cold spawn, context LOST; point the new orchestrator at the latest reports/"
-# Grow-gate + new-binary check collapsed into ONE race-free poll: wait for a
-# FRESH record (past the baseline byte offset) stamped with the candidate
-# version. A single such record proves BOTH a context-preserving resume (the
-# jsonl grew with new content, not a cold spawn) AND the new binary.
-# This MUST poll to the deadline — never a one-shot grep. The dying
-# orchestrator keeps writing OLD-binary records in the ~30s between the
-# baseline snapshot and its self-kill; those land past base_size, so they
-# satisfy a raw size-grow gate on their own and a one-shot version grep would
-# run against them — seeing only old-version records — and spuriously fail
-# (the 2026-06-03 cc-2.1.161 false negative). Polling waits the trailing
-# old-binary writes out until the resumed process stamps the candidate.
-while :; do
-    (( $(date +%s) > DEADLINE )) && fail "no fresh jsonl record stamped version=$candidate before deadline — cold spawn, wedged resume, or resumed on the OLD binary"
-    tail -c +$(( base_size + 1 )) "$jsonl" 2>/dev/null \
-        | grep -qF "\"version\":\"$candidate\"" && break
-    sleep 2
-done
-
-note "SUCCESS: sid=$sid resumed on $candidate; single window; watcher alive"
-command -v sandbox-notify >/dev/null 2>&1 \
-    && sandbox-notify "cc-update self-restart verified: orchestrator on $candidate"
-rm -f "$STATE/restart-watchdog-armed"
-exit 0
+NEXUS_ROOT=/abs/path/to/nexus WATCHDOG_DEADLINE_SECONDS=180 \
+    /abs/path/to/nexus/monitor/cc-restart-watchdog-loop.sh
 ```
+
+It records the baseline, writes the armed marker itself, waits for the
+old pane to die and the respawn to appear, then verifies: exactly ONE
+coordinator window, no stand-down window, the watcher pid alive, the
+session pin unchanged, and a FRESH jsonl record (past the baseline byte
+offset) stamped `"version":"<candidate>"` — polled to the deadline,
+never one-shot (the dying orchestrator keeps writing old-binary records
+for ~30 s; the 2026-06-03 cc-2.1.161 false negative). Exit 0 = verified
+(armed marker removed); exit 1 = failure (failure marker written).
+
+When the autonomous routine drives the bump, `cc-auto-update-apply.sh`
+renders the loop invocation into the watchdog's spawn prompt with
+`CC_AUTO_TARGET_WINDOW` already resolved, so the agent never re-derives
+it.
 
 Why not just this script, detached, with no agent around it? A script
 can detect and notify, but it cannot react: every failure path above
@@ -648,6 +600,24 @@ inner mechanism, not a substitute for it.
   carries the "autonomous routine is ENABLED" note, do NOT also spawn a
   manual evaluator; check
   `monitor/.state/cc-auto-update/decisions.tsv` instead.
+- **Deployment gate (nexus-code#512):** the gate above vets the BINARY;
+  `apply.sh safe` additionally vets the ACT of deploying it, before any
+  state mutation: it defers (exit 30, nothing applied, retried at the
+  next daily fire) while an open nexus-code PR touches the watcher
+  restart path or while more than
+  `monitor.cc_auto_update.max_live_windows` agent windows are
+  mid-flight, records `behind_main=N` clone staleness in every apply
+  record, and verifies the post-restart invariant (0 old-group
+  survivors, exactly one watcher group; violation = exit 31, no
+  Step 5b). A deferred safe-to-bump is a complete result.
+- **Holding a restart (nexus-code#513):** to stop a pending or in-flight
+  orchestrator restart, write the durable hold —
+  `monitor/cc-auto-update-apply.sh hold --reason "…" [--until-version
+  X.Y.Z | --ttl-seconds N]` (release: `unhold`; inspect:
+  `hold-status`). The running watcher's reconcile honours it every
+  tick, and a SIGTERM'd detached restart writes it automatically.
+  Flipping `monitor.cc_auto_update.enabled` is NOT a hold — it is read
+  once at watcher startup and is inert on a running watcher.
 - **Disable detection:** `monitor.cc_update.interval_seconds: 0` in
   `config/nexus.yml` (or `MONITOR_CC_UPDATE_INTERVAL_SECONDS=0`).
 - **Fail-safe:** registry-unreachable never blocks the watcher and never

@@ -24,6 +24,10 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 _repo_root=$(cd "$_test_dir/../.." && pwd)
 WRAP="$_repo_root/monitor/ghwrap/gh"
 
+# th_hermetic_path only (fork-bomb precondition guard, #479); the
+# ok/bad helpers below are this test's own assertion style.
+. "$_test_dir/_test_helpers.sh"
+
 PASS=0; FAIL=0
 ok()  { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
 bad() { printf '  FAIL: %s — %s\n' "$1" "$2" >&2; FAIL=$(( FAIL + 1 )); }
@@ -58,7 +62,10 @@ ln -s "$_repo_root/monitor/gh-shim.sh" "$NEXUS_ROOT/monitor/gh-shim.sh"
 WRAPDIR="$_repo_root/monitor/ghwrap"
 # Production-shaped PATH: wrapper dir FIRST, then the real-gh dir. This is the
 # recursion trap — a naive `command gh` from inside the wrapper would loop.
-BASEPATH="$WRAPDIR:$REALDIR:/usr/bin:/bin"
+# th_hermetic_path keeps command_not_found.py resolvable (fork-bomb
+# precondition, #479 / #457); the appended dir holds only that one
+# symlink, so gh resolution order is untouched.
+BASEPATH=$(th_hermetic_path "$WRAPDIR:$REALDIR:/usr/bin:/bin" "$WORK")
 
 run() { # run <env-assignment...> ; uses GHA[] for gh args; echoes "<rc>|<stdout>"
     (

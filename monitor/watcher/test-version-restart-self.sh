@@ -51,6 +51,8 @@ mkdir -p "$WD" "$STATE" "$VDIR" "$ROOT/config" "$BIN"
 cp "$_real_dir/launcher.sh"         "$WD/launcher.sh"
 cp "$_real_dir/_lib.sh"             "$WD/_lib.sh"
 cp "$_real_dir/_version_restart.sh" "$WD/_version_restart.sh"
+# launcher.sh + _version_restart.sh source ../_log-mode.sh (nexus-code#509).
+cp "$_real_dir/../_log-mode.sh"     "$ROOT/monitor/_log-mode.sh"
 chmod +x "$WD/launcher.sh"
 
 # Stub main.sh v1 — honours the real pidfile contract (publish before

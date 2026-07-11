@@ -428,6 +428,34 @@ FLOOR_FILE="$NEXUS_ROOT/skills/nexus.worker-defaults/SKILL.md"
 # shellcheck disable=SC1091
 . "$NEXUS_ROOT/monitor/_claude-bin.sh"
 
+# --- worker RLIMIT_NPROC ceiling (fork-storm class, your-org/nexus-code#487)
+# Two node-downs in two days (2026-07-08 Lmod command_not_found_handle,
+# #457; 2026-07-09 the sandbox /app/bin/pip wrapper) came from unbounded
+# self-re-exec loops inside ONE worker exhausting the node's pid_max
+# (36864). Every generated launcher below therefore lowers the worker's
+# SOFT RLIMIT_NPROC so a runaway chain hits fork:EAGAIN at the ceiling and
+# degrades that worker, not the box. The limit is checked against the real
+# uid's TOTAL **task (thread)** count — NOT its process count (#506; a
+# single node/claude process holds up to ~1000 threads, ~7-9x the process
+# figure, so any ceiling reasoned in processes under-budgets). It must
+# clear every legitimate concurrent burst: probed fork floors on the
+# shared node — an empirical measure of exactly the quantity the kernel
+# compares, since the probe IS a fork attempt — ranged ~500-1700 TASKS
+# under a full parallel test campaign with twelve live workers, with
+# transient node-thread spikes above that; the suite's own peak
+# concurrency adds "low hundreds" (run-tests.sh nproc guard). 8192 is
+# ~4x the worst legitimate observation and 22% of pid_max (which also
+# counts tasks, so the two bounds are in the same currency). SOFT only —
+# the hard limit stays untouched, so the watcher/service launchers (which
+# a worker may legitimately restart) can raise soft back to hard at their
+# own entry and never inherit the ceiling. Override or disable (0) via
+# NEXUS_WORKER_NPROC_LIMIT.
+WORKER_NPROC_LIMIT="${NEXUS_WORKER_NPROC_LIMIT:-8192}"
+NPROC_ULIMIT_LINE=""
+if [ "$WORKER_NPROC_LIMIT" -gt 0 ] 2>/dev/null; then
+    NPROC_ULIMIT_LINE="ulimit -Su $WORKER_NPROC_LIMIT 2>/dev/null || true"
+fi
+
 # Robust tmux window targeting (issue #323): resolve_window_id /
 # resolve_window_index re-resolve a window NAME → its current @id/index
 # fresh at each use (the @id is per-server-lifetime, so the NAME is the
@@ -1003,6 +1031,9 @@ export NEXUS_WORKER_WINDOW="$WINDOW_NAME"
 # \`uv\`/\`python\`/nexus tools resolve by name and nothing writes to \$HOME.
 # Guarded: a missing env file is a silent no-op, never a launcher failure.
 [ -f "\$NEXUS_ROOT/monitor/locals-env.sh" ] && . "\$NEXUS_ROOT/monitor/locals-env.sh" || true
+# Soft nproc ceiling: a fork storm degrades this worker, not the node
+# (fork-storm class, your-org/nexus-code#487 — rationale in spawn-worker.sh).
+$NPROC_ULIMIT_LINE
 # Pin worker cwd (issue #95) — claude --resume must also run from the
 # session's project dir or Claude Code won't find the transcript.
 cd "$WORKDIR" || exit 1
@@ -1301,6 +1332,9 @@ export NEXUS_WORKER_WINDOW="$WINDOW_NAME"
 # \`uv\`/\`python\`/nexus tools resolve by name and nothing writes to \$HOME.
 # Guarded: a missing env file is a silent no-op, never a launcher failure.
 [ -f "\$NEXUS_ROOT/monitor/locals-env.sh" ] && . "\$NEXUS_ROOT/monitor/locals-env.sh" || true
+# Soft nproc ceiling: a fork storm degrades this worker, not the node
+# (fork-storm class, your-org/nexus-code#487 — rationale in spawn-worker.sh).
+$NPROC_ULIMIT_LINE
 # Pin worker cwd to the worktree (issue #95). tmux's -c "$WORKDIR"
 # on new-window sets the pane's start dir, but a redundant cd here
 # survives launcher reuse and any pre-claude wrappers that might
@@ -1328,6 +1362,9 @@ export NEXUS_WORKER_WINDOW="$WINDOW_NAME"
 # \`uv\`/\`python\`/nexus tools resolve by name and nothing writes to \$HOME.
 # Guarded: a missing env file is a silent no-op, never a launcher failure.
 [ -f "\$NEXUS_ROOT/monitor/locals-env.sh" ] && . "\$NEXUS_ROOT/monitor/locals-env.sh" || true
+# Soft nproc ceiling: a fork storm degrades this worker, not the node
+# (fork-storm class, your-org/nexus-code#487 — rationale in spawn-worker.sh).
+$NPROC_ULIMIT_LINE
 # Pin worker cwd to the worktree (issue #95). See the loop-wrapped
 # branch above for the full rationale.
 cd "$WORKDIR" || exit 1

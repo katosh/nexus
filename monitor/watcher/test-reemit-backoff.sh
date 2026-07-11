@@ -11,7 +11,7 @@
 # same comment id presents two different SHAs within seconds — defeating
 # `_filter_emit_cooldown`'s (id, body-SHA) drop, which deliberately bypasses
 # on a body change. The id 4802521686 emitted 10:49:49 with the pre-edit
-# body and again 10:51:50 with the `@Connorr0`-edited body, 124 s apart.
+# body and again 10:51:50 with the `@otheruser`-edited body, 124 s apart.
 #
 # `_filter_reemit_backoff` caps a mention id's re-emit cadence to once per
 # `MONITOR_REEMIT_BACKOFF_SECONDS` REGARDLESS of body, so the orchestrator
@@ -70,10 +70,10 @@ fn_def=$(awk '
 [[ -n "$fn_def" ]] || { echo "setup: could not extract _gh_filter_dedup_pipeline" >&2; exit 1; }
 eval "$fn_def"
 
-# The nexus-code#358 shape — same id, two bodies (pre-edit / @Connorr0 edit).
+# The nexus-code#358 shape — same id, two bodies (pre-edit / @otheruser edit).
 CR_ID="4802521686"
 CR_V1=$'mention=your-org/nexus-code kind=issue n=358 id=4802521686 author=operator\n  body: @your-org-bot please investigate and also comment in the new PR #359'
-CR_V2=$'mention=your-org/nexus-code kind=issue n=358 id=4802521686 author=operator\n  body: @Connorr0 @your-org-bot please investigate and also comment in the new PR #359'
+CR_V2=$'mention=your-org/nexus-code kind=issue n=358 id=4802521686 author=operator\n  body: @otheruser @your-org-bot please investigate and also comment in the new PR #359'
 INREPO_ID="555000111"
 INREPO_V1=$'issue=236 id=555000111 author=operator\n  body: in-repo first body'
 INREPO_V2=$'issue=236 id=555000111 author=operator\n  body: in-repo EDITED body'
@@ -97,7 +97,7 @@ assert_not_contains "edited-body re-emit suppressed within window" "$out2" "id=$
 
 echo '=== 2-MUTATION: real SHA-bypass — edited body double-emits through the cooldown ALONE (RED), backoff CLOSES it (GREEN) ==='
 # Genuinely exercise the root cause with the SHA cooldown ENABLED (300 s):
-# emit V1 first (stamps emit-history with SHA1), then the @Connorr0-edited V2
+# emit V1 first (stamps emit-history with SHA1), then the @otheruser-edited V2
 # (SHA2). SHA2 != SHA1, so `_filter_emit_cooldown`'s deliberate edit-bypass
 # lets V2 through within the window — the nexus-code#358 double-emit. Then the
 # SAME two bodies through `_filter_reemit_backoff` (id-keyed): V2 is suppressed.

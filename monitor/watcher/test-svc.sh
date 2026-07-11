@@ -18,7 +18,8 @@
 #      binds beyond loopback (stubbed ss/hostname), untouched for
 #      loopback-only binds and down services.
 #   4. svc_supervisor — '-' (no pidfile), pid:N (live + cmdline match),
-#      stale (dead pid).
+#      stale (dead pid), orphan (dead pid but the healthcheck passes);
+#      _recover_supervisor_state's absent/stale/alive split.
 #   5. `status` verb — pinned watcher + orchestrator rows, registry
 #      rows, plain output (no ANSI escapes) when piped, exit 0.
 #   6. `start` — down service relaunched headless (marker + pidfile);
@@ -52,6 +53,11 @@
 #      `+N more UP — page X/Y` indicator, hidden-unhealthy goes loud,
 #      URL wraps are priced into the budget, SVC_PAGE clamps, and the
 #      non-TTY `status` verb stays unbudgeted (full table, no paging).
+#  16. DEGRADED/orphan rendering — a service whose recorded supervisor pid
+#      is dead while its healthcheck still passes is NEVER reported as a
+#      healthy `UP`: STATUS degrades to `DEGRADED`, SUPERVISOR reads
+#      `orphan`, and a legend explains it + names the reconcile action. A
+#      DOWN service with the same dead record keeps the honest `stale`.
 #
 # Run: bash monitor/watcher/test-svc.sh
 # Expected: ALL TESTS PASSED, exit 0.
@@ -62,6 +68,10 @@ _real_test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REAL_SVC="$_real_test_dir/../svc.sh"
 REAL_RECOVER="$_real_test_dir/../bootstrap-recover.sh"
 REAL_LIB="$_real_test_dir/_lib.sh"
+# The canonical fresh-open() writability probe (your-org/nexus-code#473).
+# svc.sh's `fs` row reaches it through _lib.sh; copy it into the fixture so
+# the tests exercise the REAL module, not _lib.sh's partial-tree fallback.
+REAL_FS_PROBE="$_real_test_dir/../_fs_probe.sh"
 
 PASS=0
 FAIL=0
@@ -80,6 +90,7 @@ build_case() {
     cp "$REAL_SVC" "$ROOT/monitor/svc.sh"
     cp "$REAL_RECOVER" "$ROOT/monitor/bootstrap-recover.sh"
     cp "$REAL_LIB" "$ROOT/monitor/watcher/_lib.sh"
+    cp "$REAL_FS_PROBE" "$ROOT/monitor/_fs_probe.sh"
     chmod +x "$ROOT/monitor/svc.sh" "$ROOT/monitor/bootstrap-recover.sh"
     SVC="$ROOT/monitor/svc.sh"
     REG="$ROOT/monitor/services.registry"
@@ -292,6 +303,29 @@ sup=$(svc_supervisor sleeper 'sleep 300')
 [[ "$sup" == 'stale' ]] \
     && pass "supervisor: dead pid -> stale" \
     || fail "supervisor stale: [$sup]"
+# Health-aware cell: the SAME dead record must read `orphan` when the
+# healthcheck passes (the daemon outlived its supervisor) and `stale` only
+# when the service is DOWN too — never a word that contradicts STATUS.
+sup=$(svc_supervisor sleeper 'sleep 300' UP)
+[[ "$sup" == 'orphan' ]] \
+    && pass "supervisor: dead pid + healthy -> orphan" \
+    || fail "supervisor orphan: [$sup]"
+sup=$(svc_supervisor sleeper 'sleep 300' DOWN)
+[[ "$sup" == 'stale' ]] \
+    && pass "supervisor: dead pid + DOWN -> stale" \
+    || fail "supervisor stale/down: [$sup]"
+# An absent record is never an orphan, whatever the health verdict says.
+[[ "$(svc_supervisor ghost 'echo x' UP)" == '-' ]] \
+    && pass "supervisor: no pidfile stays '-' even when healthy" \
+    || fail "supervisor absent/UP: $(svc_supervisor ghost 'echo x' UP)"
+# The underlying primitive distinguishes absent from stale — the split the
+# watcher's inconsistency detector depends on.
+[[ "$(_recover_supervisor_state ghost 'echo x')" == 'absent' ]] \
+    && pass "primitive: no pidfile -> absent" \
+    || fail "primitive absent: $(_recover_supervisor_state ghost 'echo x')"
+[[ "$(_recover_supervisor_state sleeper 'sleep 300')" == stale:* ]] \
+    && pass "primitive: dead pid -> stale:<pid>" \
+    || fail "primitive stale: $(_recover_supervisor_state sleeper 'sleep 300')"
 # The sleeper is dead and reaped; clear the var so cleanup_case can't
 # re-signal a recycled PID.
 HELPER_PID=""
@@ -530,7 +564,7 @@ grep -q 'jupyter-up.sh --root' "$ROOT/out" \
 #     any user-installed labsh. The row must still render (display-only,
 #     never executes labsh) and the hint must point at the installer.
 rm -f "$BIN/labsh"
-PATH="$BIN:/usr/bin:/bin" NEXUS_ROOT="$ROOT" \
+PATH="$(th_hermetic_path "$BIN:/usr/bin:/bin" "$ROOT")" NEXUS_ROOT="$ROOT" \
     bash "$SVC" status >"$ROOT/out" 2>"$ROOT/err"
 rc=$?
 [[ $rc == 0 ]] && grep -qE '^ -  jupyterlab +DOWN' "$ROOT/out" \
@@ -901,6 +935,94 @@ run_svc
     && pass "legit first cockpit proceeds (piped render-once, rc=0)" \
     || fail "legit cockpit refused: rc=$RC err=$(head -3 "$ROOT/err")"
 
+cleanup_case
+
+# --- Case 16: a dead pid record NEVER renders as bare `stale` beside UP -----
+# The nexus-remote-ssh shape: the daemon outlives its supervisor, so the
+# healthcheck stays green while the pidfile rots. `UP stale` is a
+# self-contradicting cell; the cockpit must say `orphan` and explain it.
+echo '=== case 16: healthy + dead pid record renders `orphan`, not `stale` ==='
+build_case orphan
+PATH="$BIN:$PATH"
+export NEXUS_ROOT="$ROOT"
+mkdir -p "$ROOT/wd"
+{
+    reg_line svcorph "$ROOT/wd" 'echo noop' 'true'    # healthy
+    reg_line svcdead "$ROOT/wd" 'echo noop' 'false'   # unhealthy
+} > "$REG"
+# One reaped PID, recorded for both. Provably not a live `echo noop`.
+bash -c 'exit 0' & GHOST=$!; wait "$GHOST" 2>/dev/null
+echo "$GHOST" > "$ROOT/monitor/.state/services/svcorph.pid"
+echo "$GHOST" > "$ROOT/monitor/.state/services/svcdead.pid"
+
+run_svc status
+[[ $RC == 0 ]] && pass "orphan: status verb still exits 0" || fail "status rc=$RC"
+grep -qE 'svcorph +DEGRADED +orphan' "$ROOT/out" \
+    && pass "orphan: healthy + dead pid record renders DEGRADED/orphan" \
+    || fail "orphan cell: $(grep svcorph "$ROOT/out")"
+# The load-bearing assertion: a supervisor-less daemon must NEVER be reported
+# as a plain healthy UP — that display masked a dying service for ~19h.
+grep -qE 'svcorph +UP ' "$ROOT/out" \
+    && fail "orphan: still reports a supervisor-less service as healthy UP" \
+    || pass "orphan: a supervisor-less service is never reported plain UP"
+grep -qE 'svcdead +DOWN +stale' "$ROOT/out" \
+    && pass "orphan: DOWN + dead record keeps the honest 'stale'" \
+    || fail "stale cell: $(grep svcdead "$ROOT/out")"
+grep -q 'DEGRADED/orphan' "$ROOT/out" \
+    && pass "orphan: the word is never shown without a legend" \
+    || fail "no orphan legend: $(tail -5 "$ROOT/out")"
+grep -q 'supervisor is DEAD' "$ROOT/out" \
+    && pass "orphan: legend states the supervisor is dead" \
+    || fail "legend does not explain orphan"
+grep -q 'svc.sh restart <name>' "$ROOT/out" \
+    && pass "orphan: legend names the reconcile action" \
+    || fail "legend has no action"
+unset NEXUS_ROOT
+cleanup_case
+
+# --- Case 17: `stop` on an orphan must NOT read as an all-clear -------------
+# Deleting a stale pidfile does not stop an orphaned daemon and is not
+# supervision. `stop` removed the RECORD, not the process; if it says nothing,
+# the operator believes the service is stopped while it keeps serving,
+# unsupervised and now unrecorded (skeptic finding B on PR #460).
+echo '=== case 17: stop on an orphan warns loudly; the daemon is still serving ==='
+build_case stoporphan
+PATH="$BIN:$PATH"
+export NEXUS_ROOT="$ROOT"
+mkdir -p "$ROOT/wd"
+reg_line svcorph "$ROOT/wd" 'echo noop' 'true' > "$REG"      # healthcheck always passes
+bash -c 'exit 0' & GHOST=$!; wait "$GHOST" 2>/dev/null
+echo "$GHOST" > "$ROOT/monitor/.state/services/svcorph.pid"   # dead record => orphan
+
+run_svc stop svcorph
+[[ $RC == 0 ]] && pass "stop-orphan: exits 0" || fail "stop rc=$RC"
+grep -q 'no live supervisor' "$ROOT/err" \
+    && pass "stop-orphan: reports there was no supervisor to stop" \
+    || fail "no supervisor line: $(cat "$ROOT/err")"
+[[ ! -f "$ROOT/monitor/.state/services/svcorph.pid" ]] \
+    && pass "stop-orphan: the stale record is removed" \
+    || fail "pidfile survived"
+# The load-bearing assertion: a still-passing healthcheck after `stop` means an
+# orphaned daemon is serving. Silence here is the false all-clear.
+grep -q 'WARNING' "$ROOT/err" \
+    && pass "stop-orphan: WARNS that the daemon is still serving" \
+    || fail "stop-orphan: silent all-clear! err=$(cat "$ROOT/err")"
+grep -q 'removed the record, not the daemon' "$ROOT/err" \
+    && pass "stop-orphan: says the record was removed, not the daemon" \
+    || fail "no record-vs-daemon warning"
+grep -q "svc.sh restart svcorph" "$ROOT/err" \
+    && pass "stop-orphan: names the reconcile action" \
+    || fail "no reconcile guidance"
+
+# A genuinely-down service with a dead record must stay quiet: nothing survives,
+# so there is nothing to warn about.
+reg_line svcdown "$ROOT/wd" 'echo noop' 'false' > "$REG"
+echo "$GHOST" > "$ROOT/monitor/.state/services/svcdown.pid"
+run_svc stop svcdown
+grep -q 'WARNING' "$ROOT/err" \
+    && fail "stop-orphan: warned about a genuinely DOWN service" \
+    || pass "stop-orphan: a truly down service triggers no orphan warning"
+unset NEXUS_ROOT
 cleanup_case
 
 # --- summary ---------------------------------------------------------------------

@@ -129,6 +129,40 @@ recovery procedure everywhere. **Leave that opening in** when you
 file — it is the audience-first lead, deliberately ahead of the
 machine facts.
 
+## The project filesystem went read-only
+
+First: run `monitor/svc.sh status` and read the **top** row. `fs
+READ-ONLY` (exit 1) means the project tree cannot be written and
+**every row below it is stale** — services report `UP` from
+pidfiles nobody can update. Do not chase them.
+
+There is **nothing to fix from inside**. The sandbox mount
+namespace is kernel-enforced; the remedy is a restart from
+OUTSIDE (detach the inner tmux with `Ctrl-a` `d`, then
+`agent-sandbox tmux new-session ./watcher --continue`). **Never**
+remount, re-bind, or `unshare` around it, and never advise an
+operator to.
+
+It is **not** a storage outage. The signature is a mount that is
+`ro` while its superblock is still `rw`, with the project's
+read-write bind missing from `/proc/self/mountinfo`. The filer is
+healthy and has free space — check before anyone pages storage-support.
+
+The watcher does not die on this any more (<your-org>/nexus-code#473).
+It enters read-only **degraded mode**: it suspends project-tree
+writes, keeps its loop alive, refuses to self-restart (a
+`--replace` would kill the one working watcher — its successor
+cannot even open its own log), and escalates **once** via
+`sandbox-notify` + a `cc-incident:` GitHub issue. On recovery it
+appends the incident to `monitor/.state/fs-incidents.jsonl` and
+comments the resolution on that issue. If you are diagnosing a
+past outage, read that file first.
+
+Two incidents so far, 2026-06-29 and 2026-07-09, both opening
+seconds after a `launcher.sh --replace` self-restart. The
+association is strong; the **root cause is not established**. Do
+not present it as one.
+
 Below the human lead it carries the five required sections —
 **Failure report** (what went down, when, the failing
 healthcheck, user-facing impact), **Immediate response** (the
@@ -217,13 +251,30 @@ Monitor({command: 'until ! <NEXUS_ROOT>/monitor/watcher-supervise-tick.sh; do sl
 ```
 
 Each tick touches the supervisor heartbeat (clearing the watcher's
-reminder) and reports watcher liveness. When the Monitor **fires** (its
-until-loop exits → the watcher is DOWN), run the revive, then **re-arm**:
+reminder) and reports watcher liveness — the UP/BUSY/WEDGED/DOWN
+trichotomy (nexus-code#491): **BUSY (alive + advancing, loop slower
+than nominal) never fires the Monitor and never warrants a restart** —
+under load the measured loop period legitimately reaches many minutes;
+note the period from `monitor/svc.sh status` and move on. Only WEDGED
+(alive but nothing advancing past the measured-period cutoffs) and
+DOWN (process gone) exit the until-loop. When the Monitor **fires**,
+run the revive, then **re-arm**:
 
 ```
 <NEXUS_ROOT>/monitor/revive-watcher.sh      # loop-guarded; reuses `svc.sh restart watcher`
 # then re-arm the Monitor (same command as above)
 ```
+
+`revive-watcher.sh` independently re-verifies process liveness and
+forward progress before killing anything. Its exit codes: 0 =
+revived / already-alive no-op; 3 = crash-loop guard tripped; 4 =
+read-only state dir; **5 = REFUSED — the probe said DOWN but a watcher
+is demonstrably alive and advancing; NOTHING was done.** On a 5,
+do not retry in a loop: check `monitor/svc.sh status` (expect BUSY)
+and treat the firing verdict as the anomaly. `svc.sh status` also
+detects duplicate / decapitated watcher process groups (exit 6) —
+reconcile with `svc.sh restart watcher`, which reaps every group by
+pgid and verifies exactly one remains.
 
 `revive-watcher.sh` writes a `watcher-revived` marker the revived
 watcher surfaces as `--- watcher revived (was down) ---` on its first
@@ -234,7 +285,8 @@ revive guard trips (a watcher crash-looping on a real fault), it backs
 off + `sandbox-notify`s — investigate (`monitor/svc.sh logs watcher`)
 rather than re-arming blindly. Watcher + orchestrator down at once is
 the cold-boot case (`boot-recover.sh` at SessionStart). Full design:
-`monitor/README.md` "Watcher supervision — the MUTUAL-LIVENESS contract".
+`monitor/README.md` "Mutual-liveness contract" (incl. the #491
+liveness/progress split and interim guidance for pre-fix trees).
 
 ## Boundaries
 

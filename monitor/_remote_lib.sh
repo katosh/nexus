@@ -26,6 +26,13 @@
 _remote_lib_dir="${_remote_lib_dir:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 _REMOTE_CFG="$_remote_lib_dir/../config/load.sh"
 
+# `_ensure_service_log` (your-org/nexus-code#484) — set a log's mode where it
+# is CREATED. `_remote_rotate_service_log` below still chmods 640, but only
+# for logs that grow past the size cap and survive to be rotated; that is
+# defence in depth, not the mechanism. Side-effect-free on source.
+# shellcheck source=_log-mode.sh
+source "$_remote_lib_dir/_log-mode.sh"
+
 # Shared keyed-field primitive: the enrollment token records are bare `key=value`
 # files, read here via `_kv_get` (#405 P2). Guarded/side-effect-free source.
 # shellcheck source=_fm_lib.sh
@@ -334,7 +341,12 @@ USAGE — you are the CONTROLLER; you pull, the channel answers:
   # published reply this returns the same bytes as await; no-publish returns
   # the materialized results.md).
   ssh -i ~/.ssh/nexus-remote -p $port $user@$endpoint request fetch <id> results
-  # Byte-exact body: append  --message-stdin < body.txt  instead of --message.
+  # Byte-exact body (this is the channel's file transport): append
+  #   --message-stdin < payload   instead of --message. The body may be any
+  # bytes (data, a patch, a log). Server-bounded (default 1 MiB); add
+  # --checksum to have the server echo  sha256=… bytes=…  of what it
+  # received BEFORE the id line — compare with your local sha256sum and
+  # re-file on mismatch (a mismatch means a truncated/partial transfer).
 
 NO CLIENT ACK NEEDED — you only READ. There is deliberately no \`request ack\`
 verb, and you never need one. The orchestrator acknowledges your request on ITS
@@ -426,6 +438,232 @@ _remote_principals_dir() {
     # config/load.sh already expands a leading ~; expand again defensively.
     case "$d" in "~"|"~/"*) d="$HOME/${d#\~/}";; esac
     printf '%s' "$d"
+}
+
+# ── principals_dir location + mode guard (fail-closed) ────────────────
+# WHY THIS EXISTS, and why the rule is `$HOME/.claude` specifically:
+#
+#   * $SANDBOX_PROJECT_DIR (the nexus tree) is GROUP-SHARED lab storage
+#     (drwxrws--- on /shared) — every member of the lab unix group can read
+#     it, and it is a git worktree whose files reach `ng upload`. It is a
+#     categorically wrong home for a host private key or authorized_keys.
+#   * $HOME/.claude is 0700, single-uid, and is one of the two writable
+#     mounts that SURVIVE a sandbox restart (a restart destroys /tmp and can
+#     freeze the project tree). Credential durability and credential secrecy
+#     both point at the same directory.
+#
+# `monitor.remote.principals_dir` / MONITOR_REMOTE_PRINCIPALS_DIR remain
+# overridable (hermetic tests set HOME and follow the rule), but an override
+# that lands OUTSIDE $HOME/.claude, or a directory that is not owner-only,
+# now REFUSES to start the endpoint. Convention became enforcement.
+
+# Physical (symlink-resolved) path of $1. Resolves the deepest existing
+# ancestor and re-appends the not-yet-created tail, so it works before
+# `mkdir -p`. Both sides of the containment test go through this, so a
+# symlinked $HOME/.claude cannot be used to smuggle the dir into shared
+# storage. Returns non-zero if no ancestor exists.
+_remote_realpath() {
+    local p="${1:-}" tail="" cur up base
+    [[ -n "$p" ]] || return 1
+    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+    cur="$p"
+    while [[ ! -d "$cur" ]]; do
+        tail="/${cur##*/}$tail"
+        up="${cur%/*}"; [[ -z "$up" ]] && up=/
+        [[ "$up" == "$cur" ]] && return 1
+        cur="$up"
+    done
+    base=$(cd "$cur" 2>/dev/null && pwd -P) || return 1
+    [[ "$base" == / ]] && base=""
+    printf '%s%s' "$base" "$tail"
+}
+
+# The ONE allowed root. Not configurable — that is the point.
+_remote_principals_allowed_root() { printf '%s/.claude' "$HOME"; }
+
+# Octal mode of $1 (portable-ish: GNU stat, then BSD stat).
+_remote_mode_of() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || return 1
+}
+_remote_owner_of() {
+    stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null || return 1
+}
+
+# Files whose CONTENTS are secret: no group/other bits at all (mode & 077 == 0).
+# banner.txt and *.pub are non-secret and exempt from the read rule (they still
+# may never be group/other WRITABLE).
+_remote_is_secret_file() {
+    case "${1##*/}" in
+        ssh_host_ed25519_key|authorized_keys|self-enroll.log|forced-command.log) return 0 ;;
+        .authorized_keys.lock) return 0 ;;
+        *.token) return 0 ;;
+        *.token.consumed.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Idempotently tighten the modes WE own. Called before the guard by the
+# creating paths, so a legacy dir self-heals instead of bricking the service.
+# It only ever RESTRICTS, only touches the known file set, and never moves or
+# creates anything — it cannot mask a wrong LOCATION, which the guard refuses
+# unconditionally.
+_remote_principals_harden() {
+    local d; d=$(_remote_principals_dir)
+    [[ -d "$d" ]] || return 0
+    chmod 700 "$d" 2>/dev/null || true
+    [[ -d "$d/enroll" ]] && chmod 700 "$d/enroll" 2>/dev/null
+    local f
+    for f in "$d"/* "$d"/.* "$d"/enroll/*; do
+        [[ -f "$f" ]] || continue
+        if _remote_is_secret_file "$f"; then chmod 600 "$f" 2>/dev/null || true
+        else chmod go-w "$f" 2>/dev/null || true; fi
+    done
+    return 0
+}
+
+# FAIL-CLOSED. Exit 0 = safe to start. Non-zero + a loud stderr refusal
+# otherwise. Never mutates. Never a warning that scrolls past.
+_remote_principals_guard() {
+    local d root pd proot mode owner me f fmode
+    d=$(_remote_principals_dir)
+    root=$(_remote_principals_allowed_root)
+
+    if [[ -z "${HOME:-}" ]]; then
+        printf 'remote: REFUSING to start — $HOME is unset, so the credential root cannot be resolved.\n' >&2
+        return 1
+    fi
+    if ! proot=$(_remote_realpath "$root"); then
+        printf 'remote: REFUSING to start — the credential root %s does not exist.\n' "$root" >&2
+        printf '  Create it (mkdir -p %s) — credentials live there because it is 0700, single-uid,\n' "$root" >&2
+        printf '  and survives a sandbox restart. The project tree is group-shared lab storage.\n' >&2
+        return 1
+    fi
+    if ! pd=$(_remote_realpath "$d"); then
+        printf 'remote: REFUSING to start — principals_dir %s has no existing parent.\n' "$d" >&2
+        return 1
+    fi
+
+    # (1) LOCATION — the load-bearing rule. Boundary-safe: `$root` itself or a
+    # descendant, never a sibling with a shared prefix (…/.claude-evil).
+    if [[ "$pd" != "$proot" && "$pd" != "$proot"/* ]]; then
+        printf 'remote: REFUSING to start — principals_dir resolves OUTSIDE the credential root.\n' >&2
+        printf '    principals_dir: %s\n' "$pd" >&2
+        printf '    required root:  %s (or a subdirectory)\n' "$proot" >&2
+        printf '  Host keys, authorized_keys and enrollment tokens must never live in the\n' >&2
+        printf '  group-shared project tree. Unset monitor.remote.principals_dir /\n' >&2
+        printf '  MONITOR_REMOTE_PRINCIPALS_DIR to use the default (%s/nexus-remote).\n' "$proot" >&2
+        return 1
+    fi
+
+    # A not-yet-created dir is fine (gen-host-key makes it 0700); nothing to check.
+    [[ -d "$pd" ]] || return 0
+
+    # (2) OWNERSHIP — on shared storage, a dir you do not own is not yours to trust.
+    #
+    # TESTING SEAM: the ownership DECISION is what matters, not the syscall. A
+    # foreign-owned dir cannot be forged in-sandbox (it needs a second uid), so
+    # test-remote-principals-guard.sh overrides `_remote_owner_of` to inject a
+    # foreign uid and asserts the refusal fires; a separate case asserts the
+    # unstubbed `_remote_owner_of` really does read st_uid. Keep this indirection
+    # — inlining `stat` here would make the refusal untestable.
+    #
+    # Fail CLOSED on an unresolvable uid. An empty `me` or `owner` used to fall
+    # through to the mode check and START the service: "we could not tell who owns
+    # the credential dir" must never read as "it is fine".
+    me=$(id -u 2>/dev/null || printf '')
+    owner=$(_remote_owner_of "$pd" || printf '')
+    if [[ -z "$me" || -z "$owner" ]]; then
+        printf 'remote: REFUSING to start — cannot determine ownership of principals_dir %s\n' "$pd" >&2
+        printf '  (uid of caller=%s, owner of dir=%s). Refusing rather than trusting an unknown owner.\n' \
+            "${me:-<unknown>}" "${owner:-<unknown>}" >&2
+        return 1
+    fi
+    if [[ "$owner" != "$me" ]]; then
+        printf 'remote: REFUSING to start — principals_dir %s is owned by uid %s, not by uid %s.\n' "$pd" "$owner" "$me" >&2
+        printf '  Credential material must be owned by the sandbox uid on group-shared storage.\n' >&2
+        return 1
+    fi
+
+    # (3) DIRECTORY MODE — exactly 0700. Anything looser exposes the key material
+    # to the lab group on /shared.
+    mode=$(_remote_mode_of "$pd" || printf '')
+    if [[ "$mode" != "700" ]]; then
+        printf 'remote: REFUSING to start — principals_dir %s has mode %s, must be 700.\n' "$pd" "${mode:-<unknown>}" >&2
+        printf '  Fix: chmod 700 %s\n' "$pd" >&2
+        return 1
+    fi
+    if [[ -d "$pd/enroll" ]]; then
+        mode=$(_remote_mode_of "$pd/enroll" || printf '')
+        if [[ "$mode" != "700" ]]; then
+            printf 'remote: REFUSING to start — %s/enroll has mode %s, must be 700.\n' "$pd" "${mode:-<unknown>}" >&2
+            return 1
+        fi
+    fi
+
+    # (4) FILE MODES — secrets owner-only; nothing group/other WRITABLE. Applies
+    # to every file present, including ones we do not know about: an unexpected
+    # group-writable file in the credential dir is a refusal, not a shrug.
+    for f in "$pd"/* "$pd"/.* "$pd"/enroll/*; do
+        [[ -f "$f" ]] || continue
+        fmode=$(_remote_mode_of "$f" || printf '')
+        [[ "$fmode" =~ ^[0-7]{3,4}$ ]] || continue
+        local go="${fmode: -2}"
+        if _remote_is_secret_file "$f"; then
+            if [[ "$go" != "00" ]]; then
+                printf 'remote: REFUSING to start — secret file %s has mode %s (group/other bits set).\n' "$f" "$fmode" >&2
+                printf '  Fix: chmod 600 %s\n' "$f" >&2
+                return 1
+            fi
+        else
+            local gbit="${fmode: -2:1}" obit="${fmode: -1}"
+            if (( (gbit & 2) != 0 || (obit & 2) != 0 )); then
+                printf 'remote: REFUSING to start — %s is group/other WRITABLE (mode %s).\n' "$f" "$fmode" >&2
+                printf '  Fix: chmod go-w %s\n' "$f" >&2
+                return 1
+            fi
+        fi
+    done
+    return 0
+}
+
+# ── service log (the one remote artifact that lives in the shared tree) ──
+# It is the services.registry log column, tailed by svc.sh and the watcher, so
+# it stays in $NEXUS_ROOT/monitor/.state/. That is SAFE BY CONTENT, not by
+# accident: the supervisor and sshd(LogLevel=VERBOSE) emit connection IPs and
+# key FINGERPRINTS, both explicitly non-secret (§4.10). No token, private key,
+# or key blob is ever written to it — test-remote-service-log.sh asserts it.
+_remote_service_log() {
+    local root="${NEXUS_ROOT:-$(cd "$_remote_lib_dir/.." && pwd)}"
+    printf '%s/monitor/.state/remote-ssh.log' "$root"
+}
+_remote_service_log_max_bytes() {
+    _remote_cfg monitor.remote.service_log_max_bytes MONITOR_REMOTE_SERVICE_LOG_MAX_BYTES 8388608
+}
+_remote_service_log_keep_lines() {
+    _remote_cfg monitor.remote.service_log_keep_lines MONITOR_REMOTE_SERVICE_LOG_KEEP_LINES 2000
+}
+
+# Rotate IN PLACE (truncate + rewrite the tail), never rename: svc.sh holds an
+# O_APPEND fd on this inode, so a rename would orphan the writer while a
+# truncate simply resets its append offset. Bounded, idempotent, best-effort.
+_remote_rotate_service_log() {
+    local lf; lf="$(_remote_service_log)"
+    [[ -f "$lf" ]] || return 0
+    local max keep size tmp
+    max=$(_remote_service_log_max_bytes); keep=$(_remote_service_log_keep_lines)
+    [[ "$max" =~ ^[0-9]+$ && "$keep" =~ ^[0-9]+$ ]] || return 0
+    (( max > 0 )) || return 0
+    size=$(stat -c '%s' "$lf" 2>/dev/null || stat -f '%z' "$lf" 2>/dev/null) || return 0
+    (( size > max )) || return 0
+    tmp=$(mktemp "$lf.rot.XXXXXX" 2>/dev/null) || return 0
+    if tail -n "$keep" "$lf" > "$tmp" 2>/dev/null; then
+        printf '[%s] remote-sshd: log rotated in place (was %s bytes; kept last %s lines)\n' \
+            "$(date -Is 2>/dev/null || date)" "$size" "$keep" >> "$tmp"
+        cat "$tmp" > "$lf" 2>/dev/null || true      # truncate+rewrite: inode preserved
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    chmod 640 "$lf" 2>/dev/null || true
+    return 0
 }
 
 # Truthiness for the attach opt-in. Same vocabulary as

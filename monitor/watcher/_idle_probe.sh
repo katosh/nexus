@@ -2011,6 +2011,459 @@ _idle_skeptic_orphaned() {
     (( now - req > grace ))
 }
 
+# ---- background-compute orphan-grace (your-org/nexus-code#445) -----------
+#
+# A SHELL-driven `working-background` verdict (pane-state.sh emits it
+# with a `bg_cpu=<jiffies>` field) normally suppresses the idle probe —
+# a worker running background compute (Palantir polling a job in a
+# `run_in_background` shell, an `& disown` job) must NEVER be false-
+# flagged `idle … WITHOUT wrap-up`. But a background shell is fire-and-
+# forget: claude is not woken when it finishes, so a HUNG or
+# doing-nothing shell would otherwise exempt the window forever. The
+# cap: track the background subtree's CPU jiffies across cycles; while
+# they advance the worker is genuinely computing (exempt), but once
+# they FREEZE for the orphan grace the shell is doing nothing and the
+# window falls back to normal idle classification (reapable). Mirrors
+# the skeptic orphan-grace (`_idle_skeptic_orphaned`) and the #205
+# pane-change stamp: stamp a token, advance the epoch only on change,
+# let stasis age it out. A Monitor-handle working-background carries NO
+# `bg_cpu` field (it is self-waking) and is never subjected to this cap.
+
+# Orphan grace: how long a background shell's CPU may stay frozen
+# before its `working-background` exemption lapses. Generous by design
+# — the CPU-delta test means a live compute worker (any progress) never
+# ages out regardless of this value, so the grace only bounds a truly
+# frozen shell. Env > config > default 3600s.
+_bg_orphan_grace_seconds() {
+    local g="${MONITOR_BACKGROUND_ORPHAN_GRACE_SECONDS:-}"
+    if [[ -z "$g" && -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/config/load.sh" ]]; then
+        g=$("$NEXUS_ROOT/config/load.sh" monitor.background_orphan_grace_seconds 3600 2>/dev/null || echo 3600)
+    fi
+    [[ "$g" =~ ^[0-9]+$ ]] || g=3600
+    printf '%s' "$g"
+}
+
+# Per-window background-CPU progress stamp: `<bg_cpu>\t<last_progress_epoch>`.
+_bg_progress_path() {
+    printf '%s/background-progress/%s' "${STATE_DIR:-.}" "$1"
+}
+
+# Record this cycle's bg_cpu for `window` at `now`, advancing
+# `last_progress_epoch` to `now` iff the jiffy count DIFFERS from the
+# stored one (or first sight — a freshly-observed background job starts
+# corroborated). A repeated (identical) count leaves the epoch frozen —
+# that frozen epoch is what lets a stalled shell age out. Echoes the
+# resolved `last_progress_epoch`. Forgiving: any failure echoes `now`
+# (treat as progressing — bias toward NOT reaping a live worker).
+_bg_progress_check() {
+    local window="$1" bg_cpu="$2" now="$3" path tmp prev_cpu prev_epoch new_epoch
+    [[ -n "$window" && "$bg_cpu" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]] || { printf '%s' "$now"; return 0; }
+    path=$(_bg_progress_path "$window")
+    prev_cpu=""; prev_epoch=0
+    if [[ -f "$path" ]]; then
+        IFS=$'\t' read -r prev_cpu prev_epoch < "$path" 2>/dev/null
+        [[ "$prev_epoch" =~ ^[0-9]+$ ]] || prev_epoch=0
+    fi
+    if [[ "$bg_cpu" == "$prev_cpu" ]]; then
+        new_epoch="$prev_epoch"
+        (( new_epoch > 0 )) || new_epoch="$now"
+    else
+        new_epoch="$now"
+    fi
+    mkdir -p "$(dirname "$path")" 2>/dev/null || { printf '%s' "$new_epoch"; return 0; }
+    tmp="${path}.$$.tmp"
+    if printf '%s\t%s\n' "$bg_cpu" "$new_epoch" > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+    printf '%s' "$new_epoch"
+}
+
+# Drop `window`'s background-progress stamp (disappearance prune). A
+# reused window-name then starts fresh (first-sight = corroborated).
+_bg_progress_drop() {
+    local window="$1"
+    [[ -n "$window" ]] || return 1
+    rm -f "$(_bg_progress_path "$window")" 2>/dev/null || true
+}
+
+# ---- idle-with-children long timeout + clarification protocol -----------
+# your-org/nexus-code#455 refine.
+#
+# The #445/#455 detector already tells us when an otherwise-idle worker
+# still has ≥1 live background-shell child (state=working-background,
+# bg_shells>=1, bg_reliable=1). Two refinements ride on that signal:
+#
+#   (a) A worker legitimately WAITING on a background job (a Slurm job
+#       polled by a shell, a blocking `sbatch --wait`, a long compute)
+#       must get a LONG, EXPONENTIALLY-BACKING-OFF grace before any
+#       nudge — never reaped just because its child's CPU froze (a
+#       blocking wait shows no CPU). The flat #445 orphan-grace reaped
+#       such a worker after one hour; a Slurm job can run for many.
+#       Instead we escalate a clarification request on a backing-off
+#       schedule and only surface as reapable at a bounded hard ceiling.
+#
+#   (b) A worker that has already WRAPPED UP but STILL has live child
+#       processes is in an inconsistent state (leftover/stale children,
+#       or a premature wrap while a job runs). Surface it distinctly —
+#       EXCEPT when a skeptic is pending, which is case (c).
+#
+#   (c) A worker parked in `skeptic-channel await` reaches (b)'s exact
+#       shape BY DESIGN: `ng wrap-up` writes the skeptic-pending marker,
+#       then the worker holds its re-check loop in a background shell.
+#       That is `parked-awaiting-skeptic`, not an inconsistency. The
+#       marker ($STATE_DIR/skeptic/pending/<window>) is authoritative;
+#       when it goes stale the park lapses and (b) resurfaces.
+#
+# In all cases the orchestrator can inject a clarification prompt (the
+# existing paste/nudge channel) instructing the worker to answer via a
+# file — `monitor/worker-health.sh` writes
+# `$STATE_DIR/worker-health/<window>.json`; the watcher reads it here to
+# extend the grace (declared runtime), reap (stuck/done), or keep asking.
+#
+# DESIGN PRIORITY (your-org/nexus-code#455 follow-up — this INVERTS the
+# priority PR #455 originally shipped with, which was "never false-idle a
+# live worker"). The operator's ordering is:
+#
+#   1. Never let a worker linger forever. We would rather misclassify a
+#      live worker as a retire CANDIDATE than have it stick around
+#      indefinitely. Every exemption is therefore bounded by an absolute
+#      ceiling that neither a worker-health declaration nor a
+#      CPU-advancing child can postpone.
+#   2. Inconsistent states are SURFACED for the orchestrator to
+#      investigate — never silently suppressed, never auto-killed.
+#
+# The safety valve is unchanged and lives elsewhere: this probe only ever
+# PROPOSES a class. `monitor/retire-preflight.sh` is the gate that decides
+# an actual kill, and it independently refuses (safe=0) on a live worker,
+# a pending skeptic, or an engaged operator. Detectors propose; preflight
+# disposes.
+
+# Backoff schedule constants (env- and config-overridable).
+_bg_children_grace_base_seconds() {
+    local v="${MONITOR_BG_CHILDREN_GRACE_BASE_SECONDS:-}"
+    if [[ -z "$v" && -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/config/load.sh" ]]; then
+        v=$("$NEXUS_ROOT/config/load.sh" monitor.background_children_grace_base_seconds 3600 2>/dev/null || echo 3600)
+    fi
+    [[ "$v" =~ ^[0-9]+$ ]] || v=3600
+    printf '%s' "$v"
+}
+_bg_children_backoff_mult() {
+    local v="${MONITOR_BG_CHILDREN_BACKOFF_MULT:-}"
+    if [[ -z "$v" && -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/config/load.sh" ]]; then
+        v=$("$NEXUS_ROOT/config/load.sh" monitor.background_children_backoff_multiplier 2 2>/dev/null || echo 2)
+    fi
+    [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 )) || v=2
+    printf '%s' "$v"
+}
+_bg_children_interval_cap_seconds() {
+    local v="${MONITOR_BG_CHILDREN_INTERVAL_CAP_SECONDS:-}"
+    if [[ -z "$v" && -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/config/load.sh" ]]; then
+        v=$("$NEXUS_ROOT/config/load.sh" monitor.background_children_interval_cap_seconds 21600 2>/dev/null || echo 21600)
+    fi
+    [[ "$v" =~ ^[0-9]+$ ]] || v=21600
+    printf '%s' "$v"
+}
+_bg_children_grace_ceiling_seconds() {
+    local v="${MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS:-}"
+    if [[ -z "$v" && -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/config/load.sh" ]]; then
+        v=$("$NEXUS_ROOT/config/load.sh" monitor.background_children_grace_ceiling_seconds 172800 2>/dev/null || echo 172800)
+    fi
+    [[ "$v" =~ ^[0-9]+$ ]] || v=172800
+    printf '%s' "$v"
+}
+_worker_health_slack_seconds() {
+    local v="${MONITOR_WORKER_HEALTH_SLACK_SECONDS:-}"
+    if [[ -z "$v" && -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/config/load.sh" ]]; then
+        v=$("$NEXUS_ROOT/config/load.sh" monitor.worker_health_slack_seconds 600 2>/dev/null || echo 600)
+    fi
+    [[ "$v" =~ ^[0-9]+$ ]] || v=600
+    printf '%s' "$v"
+}
+
+# Per-window backoff state: `<child_sig>\t<level>\t<last_escalation_epoch>`.
+_bg_backoff_path() { printf '%s/bg-backoff/%s' "${STATE_DIR:-.}" "$1"; }
+
+# Read the backoff row; echoes `<sig>\t<level>\t<last_esc>`. `sig` is `-`
+# (a sentinel, never a real child count) when the state file is
+# absent/malformed — a bare empty first field does NOT round-trip through
+# `read` because a leading tab is IFS whitespace and gets stripped.
+_bg_backoff_read() {
+    local window="$1" path sig level last
+    path=$(_bg_backoff_path "$window")
+    sig="-"; level=0; last=0
+    if [[ -f "$path" ]]; then
+        IFS=$'\t' read -r sig level last < "$path" 2>/dev/null
+        [[ -n "$sig" ]] || sig="-"
+        [[ "$level" =~ ^[0-9]+$ ]] || level=0
+        [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    fi
+    printf '%s\t%s\t%s' "$sig" "$level" "$last"
+}
+_bg_backoff_write() {
+    # No-op in read-only mode so a count-only probe pass never advances the
+    # edge-triggered backoff level (see _bg_children_decide).
+    [[ -z "${MONITOR_IDLE_PROBE_READONLY:-}" ]] || return 0
+    local window="$1" sig="$2" level="$3" last="$4" path tmp
+    path=$(_bg_backoff_path "$window")
+    mkdir -p "$(dirname "$path")" 2>/dev/null || return 0
+    tmp="${path}.$$.tmp"
+    if printf '%s\t%s\t%s\n' "$sig" "$level" "$last" > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+}
+_bg_backoff_drop() {
+    local window="$1"
+    [[ -n "$window" ]] || return 1
+    rm -f "$(_bg_backoff_path "$window")" 2>/dev/null || true
+}
+
+# The with-children EPISODE age is DERIVED, never stored (your-org/nexus-code#455
+# follow-up, round-2 skeptic finding). `pane-state.sh` reads the start epoch of
+# the oldest background-shell root straight off the process tree and emits it as
+# `bg_oldest_start=`; the probe subtracts it from `now`.
+#
+# The first cut of this stored the episode start in a `bg-firstseen` state file
+# and inferred "the episode ended" from the pane state. That shape cannot be
+# made correct. Keying the file on the child COUNT let ordinary churn reset the
+# ceiling; keying the reset on the pane state traded that for a worse vector,
+# because `autosuggest-only` is emitted from the renderer ladder BEFORE the
+# process tree is ever walked (`pane-state.sh`, the `_finalize_idle_verdict`
+# bypass) — so a single dim autosuggest ghost silently deleted the clock. And
+# no assignment of authority to pane states fixes both that and the
+# busy-boundary inheritance case: they pull in opposite directions.
+#
+# Deriving the age removes the entire class. It is immune to child-count churn,
+# to a child exiting, to any pane rendering, and to a watcher restart. There is
+# no state file to migrate, leak, or go stale.
+
+# Worker-health clarification file, written by monitor/worker-health.sh.
+_worker_health_path() { printf '%s/worker-health/%s.json' "${STATE_DIR:-.}" "$1"; }
+_worker_health_drop() {
+    local window="$1"
+    [[ -n "$window" ]] || return 1
+    rm -f "$(_worker_health_path "$window")" 2>/dev/null || true
+}
+
+# Read + validate the worker-health file for `window`. On a well-formed
+# file echoes `<health>\t<expected_runtime_s>\t<written_at>\t<job_kind>\t<job_id>`
+# and returns 0; returns 1 (no output) when absent/unparseable. `written_at`
+# falls back to the file mtime when the field is missing. `health` is
+# normalised to one of running|done|stuck (else treated as absent).
+_worker_health_read() {
+    local window="$1" path health expected written kind id
+    path=$(_worker_health_path "$window")
+    [[ -f "$path" && -r "$path" ]] || return 1
+    if command -v jq >/dev/null 2>&1; then
+        local row
+        row=$(jq -r '[(.health // ""),
+                      (.expected_runtime_s // 0),
+                      (.written_at // 0),
+                      (.job_kind // ""),
+                      (.job_id // "")] | @tsv' "$path" 2>/dev/null) || return 1
+        [[ -n "$row" ]] || return 1
+        IFS=$'\t' read -r health expected written kind id <<<"$row"
+    else
+        # jq-less fallback: crude field extraction.
+        local content
+        content=$(<"$path") || return 1
+        health=$(printf '%s' "$content" | sed -n 's/.*"health"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p')
+        expected=$(printf '%s' "$content" | sed -n 's/.*"expected_runtime_s"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+        written=$(printf '%s' "$content" | sed -n 's/.*"written_at"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')
+        kind=$(printf '%s' "$content" | sed -n 's/.*"job_kind"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        id=$(printf '%s' "$content" | sed -n 's/.*"job_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    fi
+    [[ "$expected" =~ ^[0-9]+$ ]] || expected=0
+    if ! [[ "$written" =~ ^[0-9]+$ ]] || (( written == 0 )); then
+        written=$(stat -c %Y "$path" 2>/dev/null || echo 0)
+        [[ "$written" =~ ^[0-9]+$ ]] || written=0
+    fi
+    case "$health" in
+        running|done|stuck) : ;;
+        *) health="" ;;
+    esac
+    printf '%s\t%s\t%s\t%s\t%s' "$health" "$expected" "$written" "$kind" "$id"
+}
+
+# Is this window's most-recent lifecycle event a wrap-up (i.e. wrapped and
+# NOT superseded by a newer machine/operator re-task submit)? Used by the
+# case-(b) inconsistency detector. Returns 0 (wrapped) / 1 (not wrapped).
+_bg_window_is_wrapped() {
+    local window="$1" wrap_epoch msub_epoch
+    _idle_window_wrap_up_report "$window" >/dev/null 2>&1 || return 1
+    wrap_epoch=$(_openg_wrap_epoch "$window")
+    [[ "$wrap_epoch" =~ ^[0-9]+$ ]] && (( wrap_epoch > 0 )) || return 1
+    msub_epoch=$(_openg_machine_submit_epoch "$window")
+    if [[ "$msub_epoch" =~ ^[0-9]+$ ]] && (( msub_epoch > wrap_epoch )); then
+        return 1   # re-tasked after wrap-up → not a wrapped state
+    fi
+    return 0
+}
+
+# Case (a): decide what an idle-with-live-children worker (NOT wrapped)
+# should surface this cycle. Reads/writes the backoff state and honours a
+# worker-health declaration. Args:
+#   window now stall_start_epoch child_count oldest_child_start_epoch
+# Consults the worker-health file directly. Prints `<class>\t<detail>`.
+# Classes: idle-awaiting-job | idle-children-clarify | idle-too-long.
+#
+# The hard ceiling is ABSOLUTE (your-org/nexus-code#455 follow-up). It is
+# tested before the worker-health override and against `bound_age` — the max of
+# the CPU-freeze age and the with-children EPISODE age (derived from the oldest
+# live background shell's start time) — so neither a `running` declaration, nor
+# a child that burns a jiffy per poll, nor background shells coming and going,
+# nor an `autosuggest-only` render can suppress the window past the ceiling.
+# Past it the window surfaces as a retire CANDIDATE; retire-preflight remains
+# the gate that decides an actual kill.
+_bg_children_decide() {
+    local window="$1" now="$2" stall_start="$3" child_count="$4" oldest_start="${5:-0}"
+    # Read-only mode (MONITOR_IDLE_PROBE_READONLY): the prelude/full-state/
+    # canonical paths call list_really_idle_workers purely to COUNT, and both
+    # they and the authoritative transition emit (render_idle_section) run per
+    # cycle. The backoff level-advance is edge-triggered, so if a count-only
+    # call committed the escalation first, the authoritative call would see it
+    # already advanced and emit `idle-awaiting-job` instead of the due
+    # `idle-children-clarify` — the nudge would be lost. In read-only mode we
+    # compute the class from current state but persist NOTHING (no level
+    # advance, no health-file prune), so only the authoritative emit mutates.
+    local ro="${MONITOR_IDLE_PROBE_READONLY:-}"
+    local sig level last row
+    row=$(_bg_backoff_read "$window")
+    IFS=$'\t' read -r sig level last <<<"$row"
+    [[ "$level" =~ ^[0-9]+$ ]] || level=0
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    if [[ "$sig" != "-" && "$sig" != "$child_count" ]]; then
+        # The child set CHANGED across cycles → a new job started. Reset the
+        # backoff and invalidate the now-stale per-job health declaration (a
+        # new job earns a new grace and a fresh declaration). `-` is the
+        # no-prior-state sentinel, never a real count, so it is NOT a change.
+        [[ -n "$ro" ]] || _worker_health_drop "$window"
+        level=0; last="$stall_start"
+    elif (( last == 0 )); then
+        # First sight (no prior backoff state). Initialise the clock to the
+        # stall start — but do NOT drop the health file: a worker may have
+        # answered the clarification before we ever wrote backoff state.
+        level=0; last="$stall_start"
+    fi
+    sig="$child_count"
+    [[ "$last" =~ ^[0-9]+$ ]] && (( last > 0 )) || last="$now"
+
+    local base mult cap ceiling slack stall_age child_age bound_age
+    base=$(_bg_children_grace_base_seconds)
+    mult=$(_bg_children_backoff_mult)
+    cap=$(_bg_children_interval_cap_seconds)
+    ceiling=$(_bg_children_grace_ceiling_seconds)
+    slack=$(_worker_health_slack_seconds)
+    stall_age=$(( now - stall_start ))
+    (( stall_age >= 0 )) || stall_age=0
+    # `child_age` is the with-children EPISODE age, derived from the oldest
+    # live background-shell's start time. Nothing but that shell exiting can
+    # move it: not the child count, not the pane rendering, not a restart.
+    child_age=0
+    if [[ "$oldest_start" =~ ^[0-9]+$ ]] && (( oldest_start > 0 )) && (( now > oldest_start )); then
+        child_age=$(( now - oldest_start ))
+    fi
+    bound_age="$stall_age"
+    (( child_age > bound_age )) && bound_age="$child_age"
+
+    # ABSOLUTE hard ceiling — tested BEFORE the worker-health override and
+    # against `bound_age`, so no declaration and no CPU-advancing child can
+    # hold the window exempt indefinitely. Past the ceiling the window becomes
+    # a retire CANDIDATE (the orchestrator's retire-preflight still gates the
+    # kill, and a live declaration is echoed so the investigation has context).
+    if (( bound_age >= ceiling )); then
+        _bg_backoff_write "$window" "$sig" "$level" "$last"
+        local ceil_note="no health decl"
+        local c_health c_expected c_written c_kind c_id c_row
+        if c_row=$(_worker_health_read "$window"); then
+            IFS=$'\t' read -r c_health c_expected c_written c_kind c_id <<<"$c_row"
+            [[ -n "$c_health" ]] && ceil_note="worker declared ${c_health}${c_kind:+ (${c_kind}${c_id:+ $c_id})}"
+        fi
+        printf 'idle-too-long\t%d child(ren) idle %ds past the %ds ceiling; %s — retire candidate (investigate, then retire-preflight)' \
+            "$child_count" "$bound_age" "$ceiling" "$ceil_note"
+        return 0
+    fi
+
+    # Worker-health override. A `running` declaration extends the exemption up
+    # to — but never past — the ceiling: the deadline is clamped so a worker
+    # cannot declare (or repeatedly re-declare) its way out of ever surfacing.
+    local h_health h_expected h_written h_kind h_id health_row
+    if health_row=$(_worker_health_read "$window"); then
+        IFS=$'\t' read -r h_health h_expected h_written h_kind h_id <<<"$health_row"
+        case "$h_health" in
+            running)
+                local deadline=$(( h_written + h_expected + slack ))
+                local ceil_deadline=$(( now + ceiling - bound_age ))
+                local clamp_note=""
+                if (( deadline > ceil_deadline )); then
+                    deadline="$ceil_deadline"
+                    clamp_note=", clamped to ceiling"
+                fi
+                if (( now < deadline )); then
+                    _bg_backoff_write "$window" "$sig" "$level" "$last"
+                    printf 'idle-awaiting-job\t%d child(ren); declared %s%s ~%ds (running, %ds left%s)' \
+                        "$child_count" "${h_kind:-job}" "${h_id:+ $h_id}" "$h_expected" \
+                        "$(( deadline - now ))" "$clamp_note"
+                    return 0
+                fi
+                # Declared runtime elapsed → resume nudging (fall through).
+                ;;
+            stuck)
+                _bg_backoff_write "$window" "$sig" "$level" "$last"
+                printf 'idle-children-clarify\t%d child(ren); worker reports STUCK — resume or close' \
+                    "$child_count"
+                return 0
+                ;;
+            done)
+                _bg_backoff_write "$window" "$sig" "$level" "$last"
+                printf 'idle-children-clarify\t%d child(ren); worker reports job DONE — leftover children, safe to close' \
+                    "$child_count"
+                return 0
+                ;;
+        esac
+    fi
+
+    # Exponential-backoff nudge schedule. interval(level) = base * mult^level,
+    # capped. A nudge is due when the last escalation is interval-old.
+    local interval="$base" i
+    for (( i = 0; i < level; i++ )); do
+        interval=$(( interval * mult ))
+        (( interval >= cap )) && { interval="$cap"; break; }
+    done
+    (( interval <= cap )) || interval="$cap"
+
+    if (( now - last >= interval )); then
+        level=$(( level + 1 ))
+        _bg_backoff_write "$window" "$sig" "$level" "$now"
+        printf 'idle-children-clarify\t%d child(ren) idle %ds waiting on a background job (nudge L%d) — ask the worker to declare runtime/health via monitor/worker-health.sh' \
+            "$child_count" "$bound_age" "$level"
+        return 0
+    fi
+
+    _bg_backoff_write "$window" "$sig" "$level" "$last"
+    printf 'idle-awaiting-job\t%d child(ren) idle %ds; long-timeout backoff active (next check ~%ds, ceiling in %ds)' \
+        "$child_count" "$bound_age" "$(( last + interval - now ))" "$(( ceiling - bound_age ))"
+    return 0
+}
+
+# Case (b): compose the wrapped-with-children detail (health-aware).
+_bg_wrapped_children_detail() {
+    local window="$1" child_count="$2"
+    local h_health h_expected h_written h_kind h_id health_row
+    if health_row=$(_worker_health_read "$window"); then
+        IFS=$'\t' read -r h_health h_expected h_written h_kind h_id <<<"$health_row"
+        case "$h_health" in
+            running) printf '%d live child(ren) after wrap-up; worker declares job still RUNNING (wrapped prematurely) — extend or close' "$child_count"; return 0 ;;
+            done)    printf '%d live child(ren) after wrap-up; worker declares job DONE — leftover, safe to close' "$child_count"; return 0 ;;
+            stuck)   printf '%d live child(ren) after wrap-up; worker reports STUCK — resume or close' "$child_count"; return 0 ;;
+        esac
+    fi
+    printf '%d live child process(es) after wrap-up — ask for clarification (monitor/worker-health.sh) or close' "$child_count"
+}
+
 list_really_idle_workers() {
     local threshold="${MONITOR_IDLE_THRESHOLD_SECONDS:-60}"
     local close_hours="${MONITOR_IDLE_CLOSE_HOURS:-24}"
@@ -2081,6 +2534,9 @@ list_really_idle_workers() {
             _user_prompt_stamp_drop "$stale"
             _openg_change_drop "$stale"
             _machine_submit_stamp_drop "$stale"
+            _bg_progress_drop "$stale"
+            _bg_backoff_drop "$stale"
+            _worker_health_drop "$stale"
         done < <(comm -23 \
                     <(printf '%s\n' "$prev_set") \
                     <(printf '%s\n' "$current_set"))
@@ -2118,7 +2574,7 @@ list_really_idle_workers() {
         # and orphan_kinds on the idle-orphan-async branch without
         # spawning a second subprocess.
         local probe_target="${window_index:-$name}"
-        local pane_orphan_kinds="" pane_content_hash=""
+        local pane_orphan_kinds="" pane_content_hash="" pane_bg_cpu=""
         pane_line=$(_idle_pane_state_line "$probe_target")
         if [[ -z "$pane_line" ]]; then
             pane_state=unknown
@@ -2130,6 +2586,116 @@ list_really_idle_workers() {
             pane_reset_at=$(_idle_pane_line_field "$pane_line" reset_at)
             pane_orphan_kinds=$(_idle_pane_line_field "$pane_line" orphan_kinds)
             pane_content_hash=$(_idle_pane_line_field "$pane_line" content_hash)
+            pane_bg_cpu=$(_idle_pane_line_field "$pane_line" bg_cpu)
+        fi
+
+        # Background-compute orphan-grace (your-org/nexus-code#445).
+        # A SHELL-driven `working-background` carries `bg_cpu=<jiffies>`.
+        # Stamp its progress EVERY cycle (before the engagement stamp and
+        # age gate, both of which the exemption otherwise short-circuits)
+        # and decide whether the shell is genuinely computing or has gone
+        # stalled/orphaned. bg_stalled=1 only when we have a real CPU
+        # reading that has FROZEN past the grace — absent/blank bg_cpu (a
+        # Monitor-handle working-background, or any non-shell state) never
+        # stalls, preserving the existing exemption. A live compute worker
+        # (any CPU delta) resets the clock and is never flagged.
+        local bg_stalled=0 bg_progress_epoch=0
+        if [[ "$pane_state" == "working-background" && "$pane_bg_cpu" =~ ^[0-9]+$ ]]; then
+            local bg_grace
+            bg_progress_epoch=$(_bg_progress_check "$name" "$pane_bg_cpu" "$now")
+            bg_grace=$(_bg_orphan_grace_seconds)
+            if [[ "$bg_progress_epoch" =~ ^[0-9]+$ ]] \
+               && (( now - bg_progress_epoch > bg_grace )); then
+                bg_stalled=1
+            fi
+        fi
+
+        # Idle-with-children long timeout + inconsistency detection
+        # (your-org/nexus-code#455 refine). Engage ONLY when the process
+        # tree reading was AUTHORITATIVE (bg_reliable=1) and it saw ≥1 live
+        # background-shell child; the footer-fallback path (bg_reliable=0)
+        # keeps the legacy #445 flat-grace behaviour via bg_stalled above.
+        #
+        #   has_live_children=1 → this idle worker still has a child process.
+        #   bg_wrapped=1        → it has ALSO wrapped up (case b: inconsistency).
+        #   bg_surface=1        → we WILL surface a row (case b always; case a
+        #                         once its child's CPU has frozen ≥ base). A
+        #                         CPU-advancing / recently-active child stays
+        #                         silently exempt (today's behaviour preserved),
+        #                         so bg_surface stays 0 and the engagement stamp
+        #                         below fires as before.
+        local pane_bg_shells pane_bg_reliable
+        pane_bg_shells=$(_idle_pane_line_field "$pane_line" bg_shells)
+        pane_bg_reliable=$(_idle_pane_line_field "$pane_line" bg_reliable)
+        [[ "$pane_bg_shells" =~ ^[0-9]+$ ]] || pane_bg_shells=0
+        [[ "$pane_bg_reliable" =~ ^[0-9]+$ ]] || pane_bg_reliable=0
+        local has_live_children=0 bg_wrapped=0 bg_surface=0
+        local bg_child_class="" bg_child_detail=""
+        if [[ "$pane_state" == "working-background" ]] \
+           && (( pane_bg_reliable == 1 )) && (( pane_bg_shells >= 1 )); then
+            has_live_children=1
+            # Episode age, DERIVED from the process tree (no state file).
+            # A missing/zero `bg_oldest_start` means "unknown" — treat the
+            # episode as brand new rather than instantly past the ceiling.
+            local bg_oldest_start bg_child_age bg_ceiling
+            bg_oldest_start=$(_idle_pane_line_field "$pane_line" bg_oldest_start)
+            [[ "$bg_oldest_start" =~ ^[0-9]+$ ]] || bg_oldest_start=0
+            bg_child_age=0
+            if (( bg_oldest_start > 0 )) && (( now > bg_oldest_start )); then
+                bg_child_age=$(( now - bg_oldest_start ))
+            fi
+            bg_ceiling=$(_bg_children_grace_ceiling_seconds)
+            if _bg_window_is_wrapped "$name"; then
+                # A wrapped worker with live children is NOT automatically an
+                # inconsistency — a skeptic-gated worker reaches exactly this
+                # shape by design. `ng wrap-up` is what WRITES the skeptic-
+                # pending marker, and the worker then holds its
+                # `skeptic-channel await` re-check loop in a background shell.
+                # So consult the authoritative park signal FIRST, mirroring the
+                # ordering render_full_state_snapshot already uses.
+                if _idle_skeptic_parked "$name" "$now" "$live_windows"; then
+                    # Expected, named state — the PR #285 exemption.
+                    bg_surface=1
+                    bg_child_class="parked-awaiting-skeptic"
+                    bg_child_detail="skeptic reviewing; exempt from idle/close (${pane_bg_shells} await child(ren))"
+                elif _idle_skeptic_orphaned "$name" "$now" "$live_windows"; then
+                    # Fresh marker, no live skeptic past grace — a stuck park,
+                    # actionable in its own right rather than mislabelled.
+                    bg_surface=1
+                    bg_child_class="orphaned-skeptic-pending"
+                    bg_child_detail="skeptic-pending marker but no live skeptic past grace — spawn the skeptic or clear the marker"
+                else
+                    # Case (b): wrapped, no skeptic pending, children still
+                    # live. Surface always, regardless of CPU (a wrapped worker
+                    # whose child is still computing is the strongest form of
+                    # the inconsistency). A STALE marker fails both checks
+                    # above and lands here, so a died-mid-await worker still
+                    # surfaces rather than staying muted forever.
+                    bg_wrapped=1; bg_surface=1
+                    bg_child_class="wrapped-with-children"
+                    bg_child_detail=$(_bg_wrapped_children_detail "$name" "$pane_bg_shells")
+                fi
+            else
+                # Case (a): idle worker waiting on a background job. Surface
+                # once its child's CPU has frozen for ≥ base seconds (a
+                # blocking wait on a Slurm job shows no CPU delta) — OR once
+                # the child set has simply existed past the ABSOLUTE ceiling,
+                # which a CPU-advancing child cannot reset. The latter is the
+                # bound that stops a quiet polling loop from holding the window
+                # exempt forever (inverted priority, #455 follow-up).
+                local bg_stall_start bg_stall_age bg_base
+                bg_stall_start="$bg_progress_epoch"
+                [[ "$bg_stall_start" =~ ^[0-9]+$ ]] && (( bg_stall_start > 0 )) || bg_stall_start="$now"
+                bg_stall_age=$(( now - bg_stall_start ))
+                bg_base=$(_bg_children_grace_base_seconds)
+                if (( bg_stall_age >= bg_base )) || (( bg_child_age >= bg_ceiling )); then
+                    bg_surface=1
+                    local bg_decision
+                    bg_decision=$(_bg_children_decide "$name" "$now" "$bg_stall_start" "$pane_bg_shells" "$bg_oldest_start")
+                    bg_child_class="${bg_decision%%$'\t'*}"
+                    bg_child_detail="${bg_decision#*$'\t'}"
+                fi
+            fi
         fi
 
         # Engagement-log stamp comes BEFORE the age gate. A worker
@@ -2143,9 +2709,25 @@ list_really_idle_workers() {
         # ongoing work even though the renderer shows no busy
         # spinner. Stamping engagement here keeps a retained worker
         # from being closed mid-monitor.
+        # A STALLED background shell (your-org/nexus-code#445) is NOT
+        # engagement — stamping it would reset the idle-age anchor and
+        # keep the window below the idle threshold forever, defeating
+        # the orphan cap. Withhold the stamp so its age grows and it
+        # reaches classification.
         case "$pane_state" in
-            busy|user-typing|working-background|working-self-paced)
+            busy|user-typing|working-self-paced)
                 _engagement_log_stamp "$name" "$now" ;;
+            working-background)
+                if (( has_live_children == 1 )); then
+                    # Withhold the stamp only when we're about to surface a
+                    # row (case b, or a frozen case-a child): its age must
+                    # grow to cross the idle threshold and reach the
+                    # classification below. Otherwise stamp as engagement
+                    # (advancing / within-base child → silent exempt).
+                    (( bg_surface == 1 )) || _engagement_log_stamp "$name" "$now"
+                else
+                    (( bg_stalled == 1 )) || _engagement_log_stamp "$name" "$now"
+                fi ;;
         esac
 
         # Operator-engaged bookkeeping (issues #196, #201). Runs on
@@ -2275,14 +2857,47 @@ list_really_idle_workers() {
                     continue
                 fi
                 ;;
+            working-background)
+                # Idle-with-children long timeout + inconsistency detection
+                # (your-org/nexus-code#455 refine). When the authoritative
+                # process tree saw a live child and we resolved a row to
+                # surface (case b: wrapped-with-children; or case a: a
+                # frozen child past base → the backoff decision — one of
+                # idle-awaiting-job / idle-children-clarify / idle-too-long),
+                # emit it directly and skip the wrap-up classification below.
+                # This mirrors the idle-orphan-async short-circuit: a
+                # working-state row is emitted in place rather than deferred
+                # to the interrupted/skeptic/no-wrap-up cascade.
+                #
+                # Because this short-circuits BEFORE the parked-awaiting-
+                # skeptic check further down, `bg_child_class` is resolved
+                # skeptic-aware at its assignment site above — a worker parked
+                # in `skeptic-channel await` DOES reach here (the await loop is
+                # a real background child), so it must already carry the
+                # `parked-awaiting-skeptic` class rather than be mislabelled a
+                # wrapped-with-children inconsistency (#455 follow-up).
+                if (( has_live_children == 1 )) && (( bg_surface == 1 )); then
+                    printf '%s\t%s\t%s\t%s\n' \
+                        "$name" "$bg_child_class" "$age" "$bg_child_detail"
+                    continue
+                fi
+                # Background-compute orphan-grace (your-org/nexus-code#445).
+                # A shell whose CPU is still advancing is genuinely
+                # computing → exempt (engagement stamped above kept its
+                # age below threshold, so it normally never even reaches
+                # here; the explicit continue is the belt-and-suspenders
+                # guard). A shell whose CPU has FROZEN past the grace is
+                # orphaned — its engagement stamp was withheld above so
+                # its age crossed the threshold; fall through to normal
+                # idle classification so it becomes reapable.
+                (( bg_stalled == 1 )) || continue
+                ;;
             *)
-                # busy / user-typing / working-background /
-                # working-self-paced / unknown — not idle enough
-                # to surface. Engagement-log was already stamped
-                # above (for busy / user-typing /
-                # working-background / working-self-paced);
-                # `unknown` just means pane-state couldn't run,
-                # treat as skip.
+                # busy / user-typing / working-self-paced / unknown —
+                # not idle enough to surface. Engagement-log was already
+                # stamped above (for busy / user-typing /
+                # working-self-paced); `unknown` just means pane-state
+                # couldn't run, treat as skip.
                 continue
                 ;;
         esac
@@ -2708,7 +3323,11 @@ render_idle_prelude() {
     # again here is read-only with respect to the engagement-log.
     # We rely on the probe being deterministic when invoked twice in
     # the same cycle (no time-dependent side-effects beyond stamping).
-    idle_set=$(list_really_idle_workers 2>/dev/null)
+    # Read-only: the prelude only COUNTS. The authoritative transition emit
+    # (render_idle_section) is the sole cycle-mutator of the idle-with-children
+    # backoff state; a count-only pass here must not advance the edge-triggered
+    # level and steal a clarification nudge (your-org/nexus-code#455 refine).
+    idle_set=$(MONITOR_IDLE_PROBE_READONLY=1 list_really_idle_workers 2>/dev/null)
     local n_idle n_retained n_idle_too_long n_pane_absent n_over_limit n_orphan_async
     # `orphaned-skeptic-pending` (emit/exemption fidelity) folds into the
     # idle tally so it is excluded from the `busy` residue (like the parked
@@ -2745,10 +3364,20 @@ render_idle_prelude() {
     # it from busy so "busy" means genuinely-working.
     local n_parked
     n_parked=$(printf '%s\n' "$idle_set" | awk -F'\t' '$2=="parked-awaiting-skeptic" {n++} END {print n+0}')
+    # idle-with-children (your-org/nexus-code#455 refine): workers idle but
+    # holding ≥1 live background child. `idle-awaiting-job` is the exempt
+    # long-timeout state; `idle-children-clarify` and `wrapped-with-children`
+    # are actionable (inject a clarification prompt / resolve the
+    # inconsistency). All three are idle-not-busy — give them a distinct axis
+    # and exclude from the busy residue.
+    local n_bg_children
+    n_bg_children=$(printf '%s\n' "$idle_set" | awk -F'\t' '
+        $2=="idle-awaiting-job" || $2=="idle-children-clarify" || $2=="wrapped-with-children" {n++}
+        END {print n+0}')
     # Busy ≈ workers not appearing in the idle set. Approximation:
     # spawn-grace skips and `empty`-skip windows count as busy here,
     # which matches the operator's mental model ("not idle = working").
-    local n_idle_total=$(( n_idle + n_retained + n_idle_too_long + n_pane_absent + n_over_limit + n_orphan_async + n_interrupted + n_parked ))
+    local n_idle_total=$(( n_idle + n_retained + n_idle_too_long + n_pane_absent + n_over_limit + n_orphan_async + n_interrupted + n_parked + n_bg_children ))
     local n_busy=$(( total_workers - n_idle_total ))
     (( n_busy < 0 )) && n_busy=0
 
@@ -2786,8 +3415,8 @@ render_idle_prelude() {
         printf '%s' "$now" > "$stamp_path" 2>/dev/null || true
     fi
 
-    printf '%d busy | %d idle | %d retained | %d idle-too-long | %d pane-absent | %d over-limit | %d orphan-async | %d interrupted | %d parked-skeptic | %d awaiting-input\n' \
-        "$n_busy" "$n_idle" "$n_retained" "$n_idle_too_long" "$n_pane_absent" "$n_over_limit" "$n_orphan_async" "$n_interrupted" "$n_parked" "$n_awaiting"
+    printf '%d busy | %d idle | %d retained | %d idle-too-long | %d pane-absent | %d over-limit | %d orphan-async | %d interrupted | %d parked-skeptic | %d idle-children | %d awaiting-input\n' \
+        "$n_busy" "$n_idle" "$n_retained" "$n_idle_too_long" "$n_pane_absent" "$n_over_limit" "$n_orphan_async" "$n_interrupted" "$n_parked" "$n_bg_children" "$n_awaiting"
 }
 
 # Render every currently-tracked worker window's full classification
@@ -2834,6 +3463,27 @@ render_full_state_snapshot() {
             printf '  - %s orphaned-skeptic-pending (state=%s; skeptic-pending marker but no live skeptic — spawn or clear)\n' \
                 "$name" "$pane_state"
             continue
+        fi
+        # Idle-with-children (your-org/nexus-code#455 refine): re-show the
+        # wrap-up-with-children inconsistency and the long-wait state at the
+        # full-state cadence so the operator sees them even after the
+        # per-transition row has deduped out.
+        if [[ "$pane_state" == "working-background" ]]; then
+            local snap_bg_shells snap_bg_reliable
+            snap_bg_shells=$(_idle_pane_line_field "$pane_line" bg_shells)
+            snap_bg_reliable=$(_idle_pane_line_field "$pane_line" bg_reliable)
+            [[ "$snap_bg_shells" =~ ^[0-9]+$ ]] || snap_bg_shells=0
+            [[ "$snap_bg_reliable" =~ ^[0-9]+$ ]] || snap_bg_reliable=0
+            if (( snap_bg_reliable == 1 )) && (( snap_bg_shells >= 1 )); then
+                if _bg_window_is_wrapped "$name"; then
+                    printf '  - %s wrapped-with-children (%d live child(ren) after wrap-up — inconsistency; clarify or close)\n' \
+                        "$name" "$snap_bg_shells"
+                else
+                    printf '  - %s idle-awaiting-job (state=working-background; %d live background child(ren) — long-timeout backoff)\n' \
+                        "$name" "$snap_bg_shells"
+                fi
+                continue
+            fi
         fi
         case "$pane_state" in
             busy|user-typing|working-background|working-self-paced)
@@ -2939,6 +3589,35 @@ render_idle_section() {
             # retires normally). Left unhandled it exempted the window from
             # idle/close forever (the bug this fixes).
             printf "  - %s orphaned-skeptic-pending (idle %s; skeptic-pending marker but NO live skeptic — spawn the skeptic per skills/nexus.skeptic, or clear monitor/.state/skeptic/pending/%s)\n", $1, fmt_age($3), $1
+        }
+        $2 == "idle-awaiting-job" {
+            # your-org/nexus-code#455 refine, case (a): idle worker with a
+            # live background child (a Slurm job / long compute it is waiting
+            # on). Exempt from reap under the exponential-backoff long
+            # timeout. Informational — surfaces once per episode; NOT an
+            # action item.
+            detail = ($4 == "" ? "waiting on a background job" : $4)
+            printf "  - %s idle-awaiting-job (idle %s; %s — exempt under long-timeout backoff)\n", $1, fmt_age($3), detail
+        }
+        $2 == "idle-children-clarify" {
+            # your-org/nexus-code#455 refine, case (a): a clarification nudge
+            # is due (the child CPU has been frozen past the current
+            # backoff step, or the worker declared stuck/done). INJECT a
+            # clarification prompt asking the worker to declare the job
+            # expected runtime + health via monitor/worker-health.sh; the
+            # watcher reads monitor/.state/worker-health/<window>.json next
+            # cycle to extend the grace, reap, or keep asking.
+            detail = ($4 == "" ? "waiting on a background job" : $4)
+            printf "  - %s idle-children-clarify (idle %s; %s — paste the worker-health clarification prompt; see skills/nexus.window-cleanup)\n", $1, fmt_age($3), detail
+        }
+        $2 == "wrapped-with-children" {
+            # your-org/nexus-code#455 refine, case (b): the worker wrapped up
+            # but STILL has live child processes — an inconsistency (leftover
+            # children, or a premature wrap while a job runs). Ask for
+            # clarification (worker-health.sh) or close; default is ASK, not
+            # auto-reap.
+            detail = ($4 == "" ? "live children after wrap-up" : $4)
+            printf "  - %s wrapped-with-children (idle %s; %s — inconsistency: paste the worker-health clarification prompt or close; see skills/nexus.window-cleanup)\n", $1, fmt_age($3), detail
         }
         $2 == "idle-too-long" {
             printf "  - %s idle-too-long %s (exceeds close threshold; consider close)\n", $1, fmt_age($3)

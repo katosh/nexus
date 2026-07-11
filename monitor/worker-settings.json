@@ -9,7 +9,7 @@
         "matcher": "Bash|Write|Edit|NotebookEdit",
         "hooks": [
           { "type": "command",
-            "command": "mkdir -p $NEXUS_ROOT/monitor/.state/pending-tool && jq -c '{tool:.tool_name, input_summary:(.tool_input | tostring | .[0:200]), ts:now}' > $NEXUS_ROOT/monitor/.state/pending-tool/$NEXUS_WORKER_WINDOW.json" }
+            "command": "$NEXUS_ROOT/monitor/hooks/pending-tool-record.sh" }
         ]
       },
       {
@@ -28,7 +28,7 @@
           { "type": "command",
             "command": "$NEXUS_ROOT/monitor/worker-heartbeat.sh busy" },
           { "type": "command",
-            "command": "rm -f $NEXUS_ROOT/monitor/.state/pending-tool/$NEXUS_WORKER_WINDOW.json" }
+            "command": "$NEXUS_ROOT/monitor/hooks/pending-tool-record.sh --clear" }
         ]
       },
       {

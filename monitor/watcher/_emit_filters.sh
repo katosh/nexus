@@ -305,7 +305,7 @@ _emit_cooldown_flush() {
 #     different SHAs for one id within seconds — defeating the SHA cooldown
 #     and double-emitting the same mention before the orchestrator can 👀-ack
 #     it (your-org/nexus-code#358: id 4802521686 emitted 10:49:49 with the
-#     pre-edit body and again 10:51:50 with the `@Connorr0`-edited body,
+#     pre-edit body and again 10:51:50 with the `@otheruser`-edited body,
 #     124 s apart).
 #
 # This filter caps the re-emit cadence of a mention id to at most once per

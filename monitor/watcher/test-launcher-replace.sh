@@ -61,6 +61,8 @@ build_case() {
     # --replace orphan-cancel guard).
     cp "$_real_test_dir/_lib.sh" "$WORK/monitor/watcher/_lib.sh"
     cp "$_real_test_dir/_respawn_async.sh" "$WORK/monitor/watcher/_respawn_async.sh"
+    # launcher.sh sources ../_log-mode.sh (nexus-code#509).
+    cp "$_real_test_dir/../_log-mode.sh" "$WORK/monitor/_log-mode.sh"
     LAUNCHER="$WORK/monitor/watcher/launcher.sh"
     PIDFILE="$WORK/monitor/.state/watcher.pid"
     BIN="$WORK/bin"

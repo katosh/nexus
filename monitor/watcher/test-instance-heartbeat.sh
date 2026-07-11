@@ -168,6 +168,8 @@ mkdir -p "$WORK/monitor/watcher" "$WORK/monitor/.state" "$WORK/bin" "$WORK/confi
 cp "$REAL_LAUNCHER" "$WORK/monitor/watcher/launcher.sh"
 cp "$_real_test_dir/_lib.sh" "$WORK/monitor/watcher/_lib.sh"
 cp "$_real_test_dir/_respawn_async.sh" "$WORK/monitor/watcher/_respawn_async.sh"
+# launcher.sh sources ../_log-mode.sh (nexus-code#509).
+cp "$_real_test_dir/../_log-mode.sh" "$WORK/monitor/_log-mode.sh"
 chmod +x "$WORK/monitor/watcher/launcher.sh"
 cat > "$WORK/monitor/watcher/main.sh" <<EOF
 #!/usr/bin/env bash

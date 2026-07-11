@@ -54,6 +54,10 @@ set -uo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 HEALTH="$SCRIPT_DIR/jupyter-health.sh"
 
+# `_ensure_service_log` (your-org/nexus-code#484). Side-effect-free on source.
+# shellcheck source=_log-mode.sh
+source "$SCRIPT_DIR/_log-mode.sh"
+
 # Join the nexus-wide persistent uv toolchain. The registry launches this
 # wrapper HEADLESS via bootstrap-recover's setsid path, with a bare env that
 # sources neither ~/.bashrc nor locals-env.sh — so without this, uvx falls
@@ -68,6 +72,31 @@ HEALTH="$SCRIPT_DIR/jupyter-health.sh"
 # NEXUS_ROOT from its own path, so our cwd (the project dir) is irrelevant.
 [[ -f "$SCRIPT_DIR/locals-env.sh" ]] && . "$SCRIPT_DIR/locals-env.sh"
 
+# ── in-UI Extension Manager + baseline labextensions (LABSH_WITH) ──────────
+# JupyterLab 4's Extension Manager (the puzzle-piece panel) shells out to `pip`
+# in the SERVER env to install extensions; a uvx-built server env has no pip, so
+# the panel is disabled out of the box. labsh's server-env build honours two
+# levers (katosh/labsh: `pip` in its baseline + the LABSH_WITH seam):
+#   * `pip` in labsh's baseline WITH_ARGS → the Extension Manager UI works.
+#   * LABSH_WITH → extra `--with` packages baked into the build. We use it to
+#     pre-install the code-formatter stack so it is available out of the box.
+# labsh adds these to its OWN `uvx --from jupyterlab … jupyter-lab` call, so the
+# mechanism is immune to nexus PATH ordering (the BASH_ENV/ZDOTDIR force-front
+# that re-asserts locals/bin can't defeat an argument labsh itself supplies).
+#
+# Requires a labsh that carries the pip-baseline + LABSH_WITH seam. On an older
+# labsh that predates it, this export is simply ignored (harmless, forward-
+# compatible) and the packages appear once the live labsh is updated.
+#
+# AI assistant: the Claude Code CLI is reachable from the Lab **Terminal** (it
+# is on the inherited PATH) — the no-API-key in-Lab Claude assistant. jupyter-ai
+# is intentionally NOT in the default list: its current (v3) release hijacks core
+# JupyterLab 4.6 plugins with an incompatible RTC stack. To opt in to the
+# graphical chat, append a pinned 2.x and provide a key, e.g.
+#   LABSH_WITH="jupyterlab-code-formatter black isort jupyter-ai>=2.31,<3 langchain-anthropic"
+# plus ANTHROPIC_API_KEY in the service environment (never commit a key).
+export LABSH_WITH="${LABSH_WITH:-jupyterlab-code-formatter black isort}"
+
 PROJECT_DIR="${1:-$PWD}"
 PROJECT_DIR=$(cd "$PROJECT_DIR" 2>/dev/null && pwd) || {
     echo "[$(date -Is)] labsh-svc: FATAL: project dir not found: ${1:-$PWD}" >&2
@@ -79,20 +108,30 @@ ENV_FILE=".jupyter/labsh-service.env"
 OPTS_FILE=".jupyter/labsh-service.opts"
 PERIODIC_FILE=".jupyter/labsh-service.periodic"
 PERIODIC_LOG=".jupyter/labsh-periodic.log"
+# Where `labsh start` records the pid of the backgrounded `uvx … jupyter-lab`
+# build (labsh's own BG_PID_FILE = <project>/.jupyter/labsh.bg.pid). We read
+# it in reap_stale_builds to kill a build that never bound.
+BG_PID_FILE=".jupyter/labsh.bg.pid"
 INTERVAL="${LABSH_SVC_INTERVAL:-15}"
 MAX_FAILS="${LABSH_SVC_FAILS:-3}"
 PORT_BASE="${LABSH_SVC_PORT_BASE:-9700}"
 PERIODIC_EVERY="${LABSH_SVC_PERIODIC_EVERY:-40}"
 # Seconds to wait for the server to become HEALTHY after `labsh start`
 # (NOT merely to expose a URL — see start_server). This window must cover a
-# *cold* uvx build (CPython download + wheel install) on the very first start
-# after a cache wipe, PLUS the post-launch interval where jupyter-lab imports
-# its extensions off the NFS uv cache and binds the port before /api/status
-# answers — else start_server reports failure and the watchdog bounces the
-# in-progress bring-up — the kill-loop. With the persistent cache (sourced
-# above) a warm build is seconds; the generous default only matters when the
-# cache or the page cache is genuinely cold. Old hard-coded value was 20s.
-START_GRACE="${LABSH_SVC_START_GRACE:-300}"
+# *cold* ephemeral `uvx` build on the first start after a version drift or a
+# cache/page-cache wipe: uv re-resolves the unpinned jupyterlab set (a network
+# index revalidation, ~40s) and then MATERIALISES ~96 packages / thousands of
+# files into a fresh env on the NFS-backed uv cache. Even with UV_LINK_MODE=
+# hardlink (locals-env.sh — no data copy, metadata only) that materialisation
+# is minutes of NFS metadata ops on a loaded node; once the env lands in
+# uv/cache/environments-v2 the NEXT boot reuses it in seconds. This grace must
+# outlast that ONE-TIME rebuild so the watchdog can't bounce an in-progress
+# bring-up (the kill-loop that fed incident #33). 900s (15 min) covers a slow
+# loaded-node rebuild with margin; steady-state warm boots finish in seconds
+# and never approach it. Pair with monitor.service_health.restart_cooldown_
+# seconds (config/nexus.yml) ≥ this so the WATCHER can't interrupt either.
+# Old value was 300s — too short for the reflink→copy fallback that caused #33.
+START_GRACE="${LABSH_SVC_START_GRACE:-900}"
 
 log() { echo "[$(date -Is)] labsh-svc: $*"; }
 
@@ -250,6 +289,99 @@ reap_port_orphan() {
     done < <(ss -ltnpH 2>/dev/null | awk -v p=":$port\$" '$4 ~ p')
 }
 
+# Reap an unfinished labsh *build* left holding the persistent NFS uv lock.
+# labsh backgrounds `uvx --from jupyterlab … jupyter-lab` and records its pid
+# in .jupyter/labsh.bg.pid, but that uvx reparents to init the instant
+# `labsh start` returns — so `labsh stop`, which only shuts down a *bound*
+# jupyter server, never reaps a build that was TERM'd or bounced BEFORE it
+# bound the port (a restart-storm mid-cold-boot, or our own MAX_FAILS
+# bounce). Such an orphan keeps an exclusive lock on the uv cache/tool tree
+# under locals/uv; the NEXT uvx then blocks silently on that lock, writes
+# NOTHING to labsh.bg.log, and never binds within START_GRACE — orphans pile
+# up and the service flaps forever (incident your-org/other-nexus#33). So
+# before every (re)start, kill our own not-yet-bound build(s) that are PAST
+# THEIR BUDGET.
+#
+# The original predicate (#450) claimed to be "surgical: only OUR uid, only a
+# cmdline that is a uvx/jupyter-lab on OUR preferred port". It was not. It
+# matched on argv substrings, so it selected any process whose command line
+# merely MENTIONED `jupyter-lab` — including other agents' shells — and its
+# bg.pid branch accepted a bare `*uvx*` with no port and no age, so a recycled
+# pid landing on an unrelated `uv tool uvx …` (the zotero MCP server, here)
+# was killed too. It also had no age gate at all, so a build that started
+# seconds ago was indistinguishable from a genuine orphan. It decided a build
+# was stale without ever establishing that it was (nexus-code#467).
+#
+# It never fired in practice — zero occurrences of its log lines across a month
+# of labsh-service.log — so this was a latent hazard, not the cause of any
+# incident. It is fixed as such.
+#
+# Now: reap only on POSITIVE EVIDENCE (uid + /proc/<pid>/exe + our port + age
+# past budget), and fail closed on anything unestablished. See
+# `_labsh_build_age` below for the enumerated live counter-examples. The
+# original intent of #450 — clearing a true orphan that holds the uv lock — is
+# preserved: an orphan past the budget is still reaped. start_server only ever
+# runs while the service is already unhealthy (no live healthy server on this
+# port to hit). Reversible: `git revert` drops only this reaper. Best-effort;
+# missing tools are not fatal.
+# How long one of OUR cold builds may run before it counts as an orphan.
+# Mirrors the watcher's monitor.service_health.cold_build_ceiling_seconds
+# (default 1800) so the two layers agree on when a build stops being in-flight.
+# Must exceed START_GRACE (900) or the supervisor's own MAX_FAILS bounce would
+# reap builds that are still legitimately materialising.
+COLD_BUILD_BUDGET="${LABSH_COLD_BUILD_BUDGET:-1800}"
+
+# The shared evidence predicate. Sourced, not reimplemented: the watcher's
+# `_sh_labsh_build_in_progress` asks the SAME question with opposite polarity,
+# and the two must never drift. If it is missing we fail closed by reaping
+# nothing at all — a delayed reap is survivable, a wrong kill is not.
+_LABSH_EVIDENCE="$SCRIPT_DIR/_labsh_build_evidence.sh"
+# shellcheck source=_labsh_build_evidence.sh
+[[ -r "$_LABSH_EVIDENCE" ]] && source "$_LABSH_EVIDENCE"
+
+_REAP_KILLED=0
+_reap_if_stale() {
+    local pid="$1" port="$2" src="$3" age
+    declare -F labsh_build_is_ours >/dev/null || return 1   # helper absent → reap nothing
+    labsh_build_is_ours "$pid" "$PROJECT_DIR" "$port" || return 1   # not ours → silent
+    age=$(labsh_build_age "$pid") || return 1
+    if (( age < COLD_BUILD_BUDGET )); then
+        log "NOT reaping pid $pid ($src): our labsh build for port $port, but only ${age}s old (< ${COLD_BUILD_BUDGET}s budget) — a build in flight, not an orphan"
+        return 1
+    fi
+    log "reaping stale labsh build (pid $pid, ${age}s >= ${COLD_BUILD_BUDGET}s budget, $src) before start — releases the uv lock"
+    kill "$pid" 2>/dev/null && _REAP_KILLED=1
+    return 0
+}
+
+reap_stale_builds() {
+    local port="$1" pid
+    _REAP_KILLED=0
+    if ! declare -F labsh_build_is_ours >/dev/null; then
+        log "WARNING: $_LABSH_EVIDENCE unavailable — skipping the stale-build reap entirely (fail closed)"
+        return 0
+    fi
+
+    # (1) the pid labsh recorded for the last background build. Still gated:
+    # a recorded pid can be RECYCLED onto an unrelated process.
+    pid=$(cat "$BG_PID_FILE" 2>/dev/null)
+    [[ -n "$pid" ]] && _reap_if_stale "$pid" "$port" "$BG_PID_FILE" || true
+
+    # (2) builds for THIS service from prior supervisor generations whose
+    # bg.pid we no longer hold. `labsh_build_scan` is a /proc scan under the
+    # same identity gates — never `pgrep -f`, which matches the full argv and
+    # so selects any process that merely MENTIONS jupyter-lab.
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        _reap_if_stale "$pid" "$port" "/proc scan" || true
+    done < <(labsh_build_scan "$PROJECT_DIR" "$port")
+
+    # Give the kernel a moment to release the flock the dead build held, so
+    # the fresh uvx below doesn't briefly queue behind a dying process.
+    (( _REAP_KILLED )) && sleep 1
+    return 0
+}
+
 # ── labsh phantom-adopt self-heal (jupyterlab outage 2026-07-01) ─────────────
 # labsh's start-guard decides "a server is already running" by scanning
 # $JUPYTER_DATA_DIR/runtime/jpserver-*.json and adopting the first record whose
@@ -362,6 +494,7 @@ _start_cycle() {
     port=$(sed -n 's/^PORT=//p' "$ENV_FILE" 2>/dev/null | head -1)
     [[ "$port" =~ ^[0-9]+$ ]] || port=$(default_port)
     reap_port_orphan "$port"
+    reap_stale_builds "$port"       # kill unfinished builds holding the uv lock (#33)
     read_opts
     # Self-heal a wiped labsh binary BEFORE starting (incident #103): if the
     # persistent shim dangles because the ephemeral-HOME lib target is gone,
@@ -445,6 +578,8 @@ run_periodic() {
         log "periodic hook still running (pid $PERIODIC_PID) — skipping this round"
         return 0
     fi
+    # Explicit mode at creation (your-org/nexus-code#484).
+    _ensure_service_log "$PERIODIC_LOG"
     bash "$PERIODIC_FILE" >> "$PERIODIC_LOG" 2>&1 &
     PERIODIC_PID=$!
     log "periodic hook launched (pid $PERIODIC_PID, log $PROJECT_DIR/$PERIODIC_LOG)"

@@ -2,7 +2,8 @@
 # GitHub-snapshot helpers for the nexus watcher.
 #
 # Loaded by monitor/watcher/main.sh and by monitor/watcher/test-*.sh.
-# Side-effect-free: only function definitions, no top-level state.
+# Side-effect-free: only function definitions, no top-level state
+# (plus one pure-function source: _log-mode.sh, nexus-code#509).
 # The caller is responsible for setting these globals before any
 # function is invoked:
 #
@@ -121,6 +122,14 @@
 #   1 — skip GraphQL polling
 #
 # stdout: nothing.
+# `_ensure_service_log` (nexus-code#484/#509): the alerts-log append
+# below must never create the file group-writable.
+_github_module_dir="${BASH_SOURCE[0]%/*}"
+[[ "$_github_module_dir" == "${BASH_SOURCE[0]}" ]] && _github_module_dir=.
+# shellcheck source=../_log-mode.sh
+source "$_github_module_dir/../_log-mode.sh"
+unset _github_module_dir
+
 _graphql_polling_gate() {
     local threshold="${GRAPHQL_THRESHOLD:-200}"
     [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=200
@@ -189,6 +198,7 @@ _graphql_gate_alert() {
         return 0
     fi
     local iso; iso=$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    _ensure_service_log "${STATE_DIR}/watcher-alerts.log"
     printf '[%s] WARN graphql_gate %s %s\n' "$iso" "$kind" "$detail" \
         >> "${STATE_DIR}/watcher-alerts.log" 2>/dev/null || true
     printf '%s\n' "$now" > "$marker" 2>/dev/null || true

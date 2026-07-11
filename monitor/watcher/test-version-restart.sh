@@ -60,6 +60,8 @@ mkdir -p "$WD" "$STATE/services" "$VDIR" "$ROOT/config" "$ROOT/work/svc"
 cp "$_real_dir/_version_restart.sh" "$WD/_version_restart.sh"
 cp "$_real_dir/_lib.sh"             "$WD/_lib.sh"
 cp "$_real_dir/../bootstrap-recover.sh" "$MON/bootstrap-recover.sh"
+# _version_restart.sh sources ../_log-mode.sh (nexus-code#509).
+cp "$_real_dir/../_log-mode.sh"     "$MON/_log-mode.sh"
 chmod +x "$MON/bootstrap-recover.sh"
 
 # Fixture main.sh — two sourced modules plus a ../-relative one, all

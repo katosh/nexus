@@ -483,10 +483,105 @@ The watcher and the monitor agent each check the other is alive;
 the configured user on GitHub (`github.user_login` in
 `config/nexus.yml`) is the external tie-breaker if they disagree.
 
+### Watcher liveness: UP / BUSY / WEDGED / DOWN (nexus-code#491)
+
+Liveness and workload are SEPARATE signals — reading one as the
+other is how healthy watchers got killed at ≥12 workers. Three
+state files, one verdict function (`_watcher_liveness_verdict`,
+single-sourced in `watcher/_lib.sh`, rendered identically by
+`svc.sh`, `watcher-supervise-tick.sh`, `revive-watcher.sh`):
+
+- `watcher-heartbeat` — **liveness**. A background ticker
+  (`monitor.watcher.heartbeat_tick_seconds`, default 20 s, setsid
+  outside the watcher's process group) beats it at a constant
+  cadence: fresh = the process exists and is scheduled, no matter
+  how long the loop's current sweep takes.
+- `watcher-progress` — **forward progress**. Bumped by the main
+  loop every iteration and at stage boundaries. The verdict also
+  counts the youngest FORK in the watcher's process group — a loop
+  mid-multi-minute stage forks helpers continuously, which is a
+  stronger progress signal than the heartbeat or the log.
+- `watcher-cycle` — **functional proof + measured loop period**.
+  Bumped at each complete compose cycle with `period_s`/`ema_s`.
+  The wedge cutoffs derive from this measured period (generous
+  multiples, floored: `monitor` env knobs
+  `MONITOR_WATCHER_WEDGE_MULTIPLIER`×period floored at
+  `MONITOR_WATCHER_WEDGE_FLOOR_SECONDS`, defaults 4×/900 s; cycle
+  stall at 6×/1800 s), so the threshold scales with load instead
+  of being a constant the workload silently exceeds. Loop periods
+  above `MONITOR_LOOP_PERIOD_WARN_MULT`×interval (default 3×) log
+  a loud WARN — slow is allowed, silent-slow is not. Expected
+  period grows roughly linearly with worker count (~7 min at 13
+  workers, 13.5 min startup sweep at 15 workers, measured
+  2026-07-09); section budgets already degrade renders to partial
+  output, and the async watchdog budget now doubles (capped ×4)
+  after consecutive timeout kills so a slow-under-load task
+  eventually completes instead of being killed at the same mark
+  forever.
+
+Verdicts: **UP** (advancing, nominal cadence) · **BUSY** (alive +
+advancing, loop slower than nominal — healthy under load; the
+DETAIL column reports the measured period) · **WEDGED** (alive but
+nothing advanced past the cutoffs — restart-worthy, still caught)
+· **DOWN** (process gone / heartbeat dead — established facts
+only). **An orchestrator seeing BUSY does NOTHING** — no restart,
+no revive; note the measured loop period and move on. WEDGED and
+DOWN wake the supervisor path; `revive-watcher.sh` independently
+re-verifies progress before killing anything and exits 5
+(refusal, nothing done) if the watcher is alive and advancing.
+
+**Deliberate trade — wedge MTTD.** Pre-#491, the heartbeat-age
+detectors caught a genuine wedge in ~5 min (300–420 s) — and killed
+healthy watchers under load with the same trigger. Post-#491 a
+genuine wedge is caught at the measured-period-derived cutoffs:
+~15 min cold (900 s floor) up to ~28–42 min at a 7-min loop period
+(4×/6× multiples). Slower detection of the rare real wedge is the
+price of never killing the common healthy-but-busy watcher; tune
+`MONITOR_WATCHER_WEDGE_*` / `MONITOR_WATCHER_CYCLE_STALL_*` if your
+deployment prefers a different point on that curve.
+
+**Supervising by hand (interim or ad-hoc)?** The supervisor's
+heartbeat *touch* is how the watcher (and the cockpit's
+`watcher-sup` row) learns a supervisor exists. A substitute that
+supervises correctly but touches nothing — a `kill -0` loop, an
+ad-hoc Monitor — is invisible: `watcher-sup UNARMED` will read as
+true because it IS true. If you supervise by hand, also touch
+`monitor/.state/watcher-supervisor-heartbeat` each pass, or accept
+that the cockpit is right to call you absent.
+
+**Singleton semantics.** Watcher counting is by process GROUP
+(argv identity + pgrp — never `ppid==1`: orphaned subshells
+reparent to init with inherited argv). The death test is group
+EMPTINESS (`kill -0 -- -<pgid>`), never leader exit — killing the
+leader decapitates the tree and leaves the loop running. A
+leaderless (decapitated) group is a defunct loop: the launcher
+reaps it by pgid — verified empty — before any spawn; `svc.sh
+status` reports `DUP`/`DECAP` rows and exits 6; `svc.sh restart
+watcher` verifies the post-restart group count is exactly one.
+Fork chokepoints close the instance-lock fd so no descendant can
+pin the flock past the leader's death (the #451/#468/#471 fd-leak
+class). Every launcher decision is attributed in
+`monitor/.state/watcher-spawns.log`.
+
+**Interim guidance (pre-#491 deployments).** Every
+heartbeat-derived verdict is untrustworthy at ≥12 workers:
+`svc.sh` may report `DOWN`/`UNARMED` for a healthy loaded
+watcher. Supervise by process liveness (`until ! kill -0
+<watcher-pid>`) — **and touch
+`monitor/.state/watcher-supervisor-heartbeat` each pass, or the
+cockpit is right to call you absent**: the tick's heartbeat touch
+is how the watcher and the `watcher-sup` row learn a supervisor
+exists, and a substitute that supervises correctly but touches
+nothing reads (truthfully) as UNARMED. Do NOT run
+`revive-watcher.sh` on a stale-heartbeat verdict alone, and
+confirm death by group emptiness (`kill -0 -- -<pgid>`), never by
+leader pid.
+
 - **Agent → watcher.** Every turn the agent runs
-  `monitor/watcher/bootstrap.sh`. If
-  `monitor/.state/watcher-heartbeat` is stale (> 2× poll interval)
-  or missing, the script writes a
+  `monitor/watcher/bootstrap.sh`. If the watcher is established
+  DEAD (process gone — buckets 2/3; an aging heartbeat or a
+  live-but-wedged loop is NOT dead and is left to the supervisor
+  path), the script writes a
   `reports/nexus_*_watcher-incident.md` evidence package and
   respawns via the launcher. The agent reads the report and
   decides: benign respawn (log via `monitor/ng log-action`) or
@@ -604,7 +699,8 @@ the configured user on GitHub (`github.user_login` in
 - **Verification.** `monitor/ng watcher-status` is one-shot
   (heartbeat age, pid, target, lock, tmux presence, diff count).
   Exit code: 0=fresh, 1=stale (<5× interval), 2=very-stale
-  (≥5× interval), 3=no heartbeat. Scripts branch on the bucket;
+  (≥5× interval), 3=no heartbeat, 4=WEDGED (alive but no forward
+  progress past the measured-period cutoffs). Scripts branch on the bucket;
   humans read the stdout block.
 
 ## How decisions flow (issue #129)
@@ -764,7 +860,8 @@ rate-limited (default 120 s between nudges) so a polling skeptic can't
 spam the pane.
 
 **Parked-awaiting-skeptic (watcher exemption).** A worker parked in
-`await` reads `busy` (the await tool's spinner) and is additionally
+`await` reads `busy` (the await tool's spinner) or `working-background`
+(when the re-check loop runs in a background shell), and is additionally
 exempted by the watcher: each `await` poll refreshes the worker's
 `skeptic-pending` marker mtime, and the idle probe (`_idle_probe.sh`)
 classifies a worker with a **live** marker (within
@@ -772,7 +869,16 @@ classifies a worker with a **live** marker (within
 `parked-awaiting-skeptic` — exempt from `idle-too-long`/`no-wrap-up` and
 surfaced as its own snapshot row. A stale marker lapses the exemption so
 a genuine hang resurfaces (the hang-vs-wait boundary). This reuses the
-existing marker (no new pane-state). The watcher auto-respawns only the
+existing marker (no new pane-state).
+
+The marker — not the pane — is authoritative. A skeptic-gated worker that
+holds its `await` re-check loop in a **background shell** is *wrapped with
+live children* by construction (`ng wrap-up` writes the marker; the `await`
+loop is the child), so the `wrapped-with-children` inconsistency check must,
+and does, consult the park signal first (`_idle_probe.sh`, case (c)).
+Otherwise such a worker would be flagged inconsistent the moment it wrapped.
+(A *foreground* `await` — what `ng wrap-up` prints — renders the pane `busy`
+and never reaches the background-children path, so it was never affected.) The watcher auto-respawns only the
 orchestrator; worker windows are flagged, never auto-respawned on
 staleness, so this exemption plus retire-preflight's marker gate is the
 complete worker-side hardening.
@@ -1848,7 +1954,9 @@ a single recovery attempt via the `.state/boot-recover.stamp` window.
 cd "$(config/load.sh nexus.root)"/monitor
 ./watcher/main.sh --once                  # run one poll cycle and exit
 MONITOR_INTERVAL=10 ./watcher/main.sh     # snappier polling (attended foreground)
-./watcher/launcher.sh --target orchestrator     # spawn the usual headless watcher
+./watcher/launcher.sh                     # spawn the usual headless watcher
+                                          # (--target defaults to config
+                                          #  monitor.target_window)
 ```
 
 The latest emit body is cached at `monitor/.state/last-change.txt`

@@ -205,6 +205,11 @@ _cfg="$NEXUS_ROOT/config/load.sh"
 # shellcheck source=watcher/_lib.sh
 source "$_script_dir/watcher/_lib.sh"
 
+# `_ensure_service_log` — set the service log's mode where the file is
+# CREATED (your-org/nexus-code#484). Side-effect-free on source.
+# shellcheck source=_log-mode.sh
+source "$_script_dir/_log-mode.sh"
+
 # Version-stamp helpers (issue #186). `_recover_launch_service` records
 # the launch script's source hash at every launch so the watcher's
 # version_check task can detect a later on-disk drift and restart the
@@ -331,31 +336,54 @@ _recover_window_exists() {
 # Path of a service's headless-supervisor pidfile.
 _recover_pidfile() { printf '%s/services/%s.pid' "$STATE_DIR" "$1"; }
 
-# Is the service's headless supervisor still alive? True iff the pidfile
-# names a live PID whose cmdline still mentions the launch wrapper. The
-# cmdline guard mirrors `_watcher_pid_is_live_watcher` (the 2026-06-07
+# Resolve a service's headless-supervisor record into one of three words:
+#
+#   alive:<pid>  the pidfile names a live PID whose cmdline still mentions
+#                the launch wrapper — a real supervisor is running.
+#   stale:<pid>  the pidfile is PRESENT but its PID is dead, unreadable, or
+#                was recycled into an unrelated process. The RECORD outlived
+#                the process it describes.
+#   absent       no pidfile at all — unmanaged, legacy-tmux-hosted, or not
+#                yet migrated to the headless path. Nothing was ever
+#                recorded, so there is nothing to contradict.
+#
+# The `stale` vs `absent` split is the whole point: only a PRESENT-but-dead
+# record PROVES a supervisor died. That is what makes the
+# healthy-but-unsupervised inconsistency detectable (a green healthcheck
+# next to a dead supervisor record) without false-positiving every
+# never-had-a-pidfile service. Callers wanting a plain boolean use
+# _recover_service_running below, which is defined in terms of this.
+#
+# The cmdline guard mirrors `_watcher_pid_is_live_watcher` (the 2026-06-07
 # stale-lock lesson): after a reboot a recycled PID could otherwise be
 # mistaken for a running supervisor, wedging a dead service permanently
 # "leave it alone". If /proc is unreadable we fall back to the liveness
 # check alone. The pidfile is per-service-name, which is what lets two
 # services that share a wrapper script (e.g. `serve-supervised.sh`) be
 # told apart — a bare `pgrep` on the wrapper could not.
-_recover_service_running() {
+_recover_supervisor_state() {
     local name="$1" launch="$2"
     local pf; pf=$(_recover_pidfile "$name")
-    [[ -f "$pf" ]] || return 1
+    [[ -f "$pf" ]] || { printf 'absent'; return 0; }
     local pid; read -r pid < "$pf" 2>/dev/null
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    kill -0 "$pid" 2>/dev/null || return 1
+    [[ "$pid" =~ ^[0-9]+$ ]] || { printf 'stale:%s' "${pid:-?}"; return 0; }
+    kill -0 "$pid" 2>/dev/null || { printf 'stale:%s' "$pid"; return 0; }
     local cmdline_file="/proc/$pid/cmdline"
     if [[ -r "$cmdline_file" ]]; then
         local cmdline tok
         cmdline=$(tr '\0' ' ' < "$cmdline_file" 2>/dev/null)
         tok=${launch%% *}     # first token of the launch cmd
         tok=${tok##*/}        # → its basename, e.g. serve-supervised.sh
-        [[ -n "$tok" && "$cmdline" == *"$tok"* ]] || return 1
+        [[ -n "$tok" && "$cmdline" == *"$tok"* ]] || { printf 'stale:%s' "$pid"; return 0; }
     fi
-    return 0
+    printf 'alive:%s' "$pid"
+}
+
+# Is the service's headless supervisor still alive? Thin boolean over
+# _recover_supervisor_state — `absent` and `stale:*` are both "not running".
+_recover_service_running() {
+    local st; st=$(_recover_supervisor_state "$1" "$2")
+    [[ "$st" == alive:* ]]
 }
 
 # Launch a service HEADLESS — detached, no tmux window. `setsid` puts the
@@ -373,7 +401,20 @@ _recover_launch_service() {
     local pf lf inner
     pf=$(_recover_pidfile "$name")
     lf="${logfile:-$workdir/serve.log}"
-    printf -v inner 'echo $$ > %q; cd %q && exec %s' "$pf" "$workdir" "$launch"
+    # The leading ulimit restores the soft RLIMIT_NPROC to the hard limit
+    # (fork-storm class, your-org/nexus-code#487): a worker legitimately
+    # running recovery would otherwise leak its own soft nproc ceiling
+    # (spawn-worker.sh) into the long-lived service supervisor. The worker
+    # ceiling is soft-only, so the raise is always permitted.
+    printf -v inner 'ulimit -Su "$(ulimit -Hu)" 2>/dev/null || true; echo $$ > %q; cd %q && exec %s' "$pf" "$workdir" "$launch"
+    # Create the log with an explicit mode BEFORE the redirect opens it.
+    # A bare `>>` would create it under the ambient umask (007 here) —
+    # 0660, group-writable, in a group-shared tree — and a group-writable
+    # log cannot be trusted as evidence (your-org/nexus-code#484). This is
+    # the create-by-redirect site for every registry service, so the one
+    # call covers the whole fleet. Best-effort by contract: it never fails
+    # a launch, and never touches a log owned by another uid (nginx, labsh).
+    _ensure_service_log "$lf"
     setsid bash -c "$inner" </dev/null >>"$lf" 2>&1 &
     # Stamp the launch script's source hash as this service's running
     # version (issue #186) — the comparison anchor for the watcher's
@@ -437,6 +478,16 @@ recover_watcher() {
     fi
     local reason
     reason=$(_watcher_reason "$STATE_DIR" 2>/dev/null || echo "not healthy (bucket=$rc)")
+    # Alive states are not recovery's business (nexus-code#491):
+    # bucket 1 = BUSY/aging (leave it alone), bucket 4 = WEDGED (the
+    # supervisor Monitor + revive-watcher own the kill decision — a
+    # cold-boot recovery must never kill a live process). Recovery
+    # relaunches only when the watcher is established DEAD; the
+    # launcher then also reaps any decapitated orphan group first.
+    if (( rc == 1 || rc == 4 )); then
+        log "watcher: $reason — alive; not relaunching from recovery"
+        return 0
+    fi
     log "watcher: $reason — relaunching"
     if (( DRY_RUN == 1 )); then
         log "watcher: would run $LAUNCHER_BIN"

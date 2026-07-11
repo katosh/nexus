@@ -68,6 +68,12 @@ ENROLL="$_script_dir/remote-enroll.sh"
 # rootless self-enroll). Best-effort; never fatal.
 prune_enroll() { [[ -x "$ENROLL" ]] && "$ENROLL" prune-enroll >/dev/null 2>&1 || true; }
 
+# Delete expired/corrupt/stranded enrollment-token RECORDS. Pure hygiene —
+# expiry is already enforced fail-closed at redeem and `prune_enroll` already
+# drops the matching authorized_keys line. Runs AFTER prune_enroll so the line
+# is removed before its backing record disappears. Best-effort; never fatal.
+gc_tokens() { [[ -x "$ENROLL" ]] && "$ENROLL" gc-tokens >/dev/null 2>&1 || true; }
+
 log() { echo "[$(date -Is 2>/dev/null || date)] remote-sshd: $*"; }
 
 # ── off-by-default gate (registration is the enable signal) ───────────
@@ -212,14 +218,19 @@ validate_auth_keys() {
         log "command policy: unfiltered — keys grant a sandbox-confined shell (no forced-command requirement)"
         return 0
     fi
-    local line bad=0
+    # NEVER echo the line's bytes. This log is the services.registry log column
+    # in the GROUP-SHARED project tree; a command=-less line is precisely the
+    # case whose first 40 chars are a raw `ssh-ed25519 AAAA…` key blob. Report
+    # the line NUMBER — enough to fix, nothing to leak.
+    local line bad=0 lineno=0
     while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno+1))
         [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
         case "$line" in
             command=\"*) ;;  # good: forced command present
-            *) log "FATAL: channel-only policy but an authorized_keys line lacks a forced command (would grant a shell): ${line:0:40}…"; bad=1 ;;
+            *) log "FATAL: channel-only policy but authorized_keys line $lineno lacks a forced command (would grant a shell)"; bad=1 ;;
         esac
-        case "$line" in *restrict*) ;; *) log "WARNING: authorized_keys line without 'restrict' hardening: ${line:0:40}…" ;; esac
+        case "$line" in *restrict*) ;; *) log "WARNING: authorized_keys line $lineno without 'restrict' hardening" ;; esac
     done < "$AUTH_KEYS"
     (( bad == 0 ))
 }
@@ -255,6 +266,19 @@ while true; do
         delay=$(( delay * 2 )); (( delay > RESTART_DELAY_MAX )) && delay="$RESTART_DELAY_MAX"
         continue
     fi
+    # HIGH gate (defense-in-depth; remote-up.sh checks this too): never serve a
+    # credential store that sits outside $HOME/.claude, is not owner-only, or
+    # holds a group/other-readable secret. Harden the modes we own, then refuse
+    # on anything left — a wrong LOCATION is never auto-corrected.
+    _remote_principals_harden
+    guard_err=$(_remote_principals_guard 2>&1); guard_rc=$?
+    if (( guard_rc != 0 )); then
+        [[ -n "$guard_err" ]] && while IFS= read -r l; do log "$l"; done <<<"$guard_err"
+        log "refusing to launch sshd: unsafe credential storage. Fix principals_dir, then it relaunches."
+        sleep "$delay" & wait $! 2>/dev/null
+        delay=$(( delay * 2 )); (( delay > RESTART_DELAY_MAX )) && delay="$RESTART_DELAY_MAX"
+        continue
+    fi
     # HIGH gate: never launch against an authorized_keys that contains a
     # shell-granting (command=-less) line. Surface as unhealthy, don't serve.
     if ! validate_auth_keys; then
@@ -265,6 +289,8 @@ while true; do
     fi
     write_banner            # refresh in case command_policy changed
     prune_enroll            # drop enroll lines whose token has expired/consumed
+    gc_tokens               # then delete the inert expired token records
+    _remote_rotate_service_log   # this log is 100% scan noise at LogLevel=VERBOSE
     build_sshd_args
     log "exec: $SSHD ${SSHD_ARGS[*]}"
     "$SSHD" "${SSHD_ARGS[@]}" &
@@ -275,6 +301,8 @@ while true; do
     while kill -0 "$SSHD_CHILD" 2>/dev/null; do
         sleep "$GATE_RECHECK" & wait $! 2>/dev/null
         prune_enroll        # expire stale enroll lines while sshd stays up
+        gc_tokens           # …and reap their inert records
+        _remote_rotate_service_log
         if ! _remote_registered; then
             log "service '$REMOTE_SERVICE_NAME' deregistered mid-run — stopping sshd, exiting 0."
             kill -TERM "$SSHD_CHILD" 2>/dev/null

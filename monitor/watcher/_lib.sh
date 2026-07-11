@@ -756,6 +756,153 @@ _nexus_instance_preflight() {
     return 1
 }
 
+# ---------------------------------------------------------------------------
+# Liveness vs. progress (nexus-code#491)
+#
+# The heartbeat used to be bumped ONLY at the end of a complete compose
+# cycle (#236), which made it a WORKLOAD signal: the cycle's duration
+# scales with worker count while every liveness threshold was a
+# constant, so at >=12 workers a perfectly healthy watcher was
+# GUARANTEED to be reported DOWN — and every remedy keyed on that
+# verdict killed it mid-loop (the 2026-07-09 restart storm). The
+# signals are now decoupled:
+#
+#   watcher-heartbeat  LIVENESS. Bumped by a background ticker inside
+#                      the watcher process at a fixed cadence
+#                      (monitor.watcher.heartbeat_tick_seconds) that is
+#                      workload-independent BY CONSTRUCTION. Fresh =
+#                      the process exists and is being scheduled.
+#   watcher-progress   FORWARD PROGRESS. Bumped by the main scheduler
+#                      loop every iteration and at startup-sweep /
+#                      compose stage boundaries. Stalls when the loop
+#                      is genuinely wedged (deadlock, hang).
+#   watcher-cycle      FUNCTIONAL PROOF. Bumped at the end of each
+#                      complete compose cycle (the old heartbeat
+#                      semantics), carrying the MEASURED loop period
+#                      (period_s + ema_s). Stalls when the loop runs
+#                      but the emit path never completes (the
+#                      2026-06-18 class).
+#
+# Old watchers (pre-#491) write none of the new files; every probe
+# below degrades to the historical heartbeat-age semantics when the
+# new signals are absent, and additionally accepts watcher.log /
+# watcher-scheduler.jsonl mtime advance as progress so a live pre-fix
+# watcher under load reads BUSY, never DOWN.
+
+# _watcher_progress_age <state_dir> [<pgid>]
+# Seconds since the watcher last demonstrated forward progress: the
+# freshest of watcher-progress, watcher-cycle, the scheduler telemetry
+# JSONL, watcher.log — and, when a pgid is supplied, the youngest
+# member fork in the watcher's process group ("forking children" is a
+# stronger liveness signal than either the heartbeat or the log,
+# nexus-code#491: the live watcher observed at 17:45 had no log line
+# for ~350s yet forked fresh tac/jq continuously). Prints a very
+# large number when no progress signal exists at all.
+_watcher_progress_age() {
+    local sd="${1:?state_dir required}" pgid="${2:-}" now best=-1 f m a
+    now=$(date +%s)
+    for f in "$sd/watcher-progress" "$sd/watcher-cycle" \
+             "${MONITOR_SCHEDULER_LOG:-$sd/watcher-scheduler.jsonl}" \
+             "$sd/watcher.log"; do
+        [[ -f "$f" ]] || continue
+        m=$(date +%s -r "$f" 2>/dev/null) || continue
+        [[ "$m" =~ ^[0-9]+$ ]] || continue
+        a=$(( now - m )); (( a < 0 )) && a=0
+        (( best < 0 || a < best )) && best=$a
+    done
+    if [[ "$pgid" =~ ^[0-9]+$ ]]; then
+        a=$(_watcher_youngest_member_age "$pgid")
+        (( a < 999999999 )) && (( best < 0 || a < best )) && best=$a
+    fi
+    (( best < 0 )) && best=999999999
+    printf '%d' "$best"
+}
+
+# _watcher_cycle_period <state_dir>
+# The measured compose-cycle period (smoothed ema_s, falling back to
+# the last raw period_s) from watcher-cycle. Prints 0 when unknown.
+_watcher_cycle_period() {
+    local sd="${1:?state_dir required}" f="$1/watcher-cycle" p
+    p=$(_watcher_heartbeat_field "$f" ema_s)
+    [[ "$p" =~ ^[0-9]+$ ]] || p=$(_watcher_heartbeat_field "$f" period_s)
+    [[ "$p" =~ ^[0-9]+$ ]] || p=0
+    printf '%d' "$p"
+}
+
+# _watcher_wedge_cutoff <interval> [<period>]
+# Progress-stall threshold: a GENEROUS multiple of the measured loop
+# period (so the threshold scales with load instead of being a
+# constant the workload can silently exceed), floored so a fresh boot
+# with no period yet is never trigger-happy.
+#   max(MONITOR_WATCHER_WEDGE_MULTIPLIER x max(period, interval),
+#       MONITOR_WATCHER_WEDGE_FLOOR_SECONDS)          (defaults 4x / 900)
+_watcher_wedge_cutoff() {
+    local interval="${1:-60}" period="${2:-0}"
+    local mult="${MONITOR_WATCHER_WEDGE_MULTIPLIER:-4}"
+    local floor="${MONITOR_WATCHER_WEDGE_FLOOR_SECONDS:-900}"
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=60
+    [[ "$period" =~ ^[0-9]+$ ]] || period=0
+    [[ "$mult" =~ ^[0-9]+$ ]] || mult=4
+    [[ "$floor" =~ ^[0-9]+$ ]] || floor=900
+    local base=$interval
+    (( period > base )) && base=$period
+    local cutoff=$(( mult * base ))
+    (( cutoff < floor )) && cutoff=$floor
+    printf '%d' "$cutoff"
+}
+
+# _watcher_cycle_cutoff <interval> [<period>]
+# Functional-stall threshold for the cycle signal — even more generous
+# than the wedge cutoff (the compose watchdog may kill + re-arm slow
+# cycles several times under load before one completes), but bounded:
+# a loop that ticks forever without EVER completing a cycle is the
+# invisible 2026-06-18 wedge and must still be caught.
+#   max(MONITOR_WATCHER_CYCLE_STALL_MULTIPLIER x max(period, interval),
+#       MONITOR_WATCHER_CYCLE_STALL_FLOOR_SECONDS)    (defaults 6x / 1800)
+_watcher_cycle_cutoff() {
+    local interval="${1:-60}" period="${2:-0}"
+    local mult="${MONITOR_WATCHER_CYCLE_STALL_MULTIPLIER:-6}"
+    local floor="${MONITOR_WATCHER_CYCLE_STALL_FLOOR_SECONDS:-1800}"
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=60
+    [[ "$period" =~ ^[0-9]+$ ]] || period=0
+    [[ "$mult" =~ ^[0-9]+$ ]] || mult=6
+    [[ "$floor" =~ ^[0-9]+$ ]] || floor=1800
+    local base=$interval
+    (( period > base )) && base=$period
+    local cutoff=$(( mult * base ))
+    (( cutoff < floor )) && cutoff=$floor
+    printf '%d' "$cutoff"
+}
+
+# _watcher_wedged <state_dir> <interval>
+# Return 0 iff the watcher process should be considered WEDGED: a
+# progress signal exists but has stalled past the wedge cutoff, or a
+# cycle record exists but no cycle has completed within the cycle
+# cutoff. Callers must have already established the process is alive —
+# this predicate only judges advancement. Return 1 = advancing (or no
+# signal to judge — old watcher: never claim a state that was not
+# established).
+_watcher_wedged() {
+    local sd="${1:?state_dir required}" interval="${2:-60}"
+    local period page cutoff pgid
+    period=$(_watcher_cycle_period "$sd")
+    # The heartbeat pid is the group leader (setsid) — fold the
+    # group's fork-freshness into the progress signal.
+    pgid=$(_watcher_heartbeat_field "$sd/watcher-heartbeat" pid)
+    page=$(_watcher_progress_age "$sd" "$pgid")
+    cutoff=$(_watcher_wedge_cutoff "$interval" "$period")
+    if (( page < 999999999 )) && (( page > cutoff )); then
+        return 0
+    fi
+    if [[ -f "$sd/watcher-cycle" ]]; then
+        local cage ccutoff
+        cage=$(_watcher_heartbeat_age "$sd/watcher-cycle")
+        ccutoff=$(_watcher_cycle_cutoff "$interval" "$period")
+        (( cage > ccutoff )) && return 0
+    fi
+    return 1
+}
+
 # _watcher_alive <state_dir> <interval_seconds> [<dead_cutoff_seconds>]
 #
 # Liveness bucket for the watcher. Checks, in priority order:
@@ -765,6 +912,16 @@ _nexus_instance_preflight() {
 #        age <= 2*interval + 15            -> return 0  (fresh)
 #        age <= max(5*interval, dead_cutoff) -> return 1  (stale-but-alive)
 #        otherwise                         -> return 2  (very stale / DEAD)
+#   4. alive (bucket 0/1) but progress/cycle stalled past the measured-
+#      period-derived cutoffs (_watcher_wedged)      -> return 4 (WEDGED)
+#
+# Bucket 4 (nexus-code#491) means: the process exists and its liveness
+# ticker beats, but NOTHING has advanced for a generous multiple of the
+# observed loop period — the genuinely-wedged case. It is distinct from
+# DEAD (2) so callers can report it honestly; recovery paths treat it
+# as restart-worthy. A merely SLOW loop (progress advancing, cycle
+# completing late) stays in bucket 0/1 — see _watcher_liveness_verdict
+# for the operator-facing UP/BUSY/WEDGED/DOWN rendering.
 #
 # The optional 3rd arg RAISES the DEAD threshold above 5*interval (it never
 # lowers it); see the body for why the continuous supervisor passes a cutoff
@@ -827,21 +984,347 @@ _watcher_alive() {
     if [[ "$dead_cutoff" =~ ^[0-9]+$ ]] && (( dead_cutoff > very_cutoff )); then
         very_cutoff=$dead_cutoff
     fi
+    local bucket
     if (( age <= fresh_cutoff )); then
-        return 0
+        bucket=0
     elif (( age <= very_cutoff )); then
-        return 1
+        bucket=1
     else
         return 2
     fi
+    # Alive per pid + heartbeat — but is anything ADVANCING? A stalled
+    # progress/cycle signal past the measured-period-derived cutoffs is
+    # the genuinely-wedged case (nexus-code#491): the liveness ticker
+    # beats for a loop that no longer moves. Distinct bucket so callers
+    # never conflate it with DEAD or with merely-slow.
+    if _watcher_wedged "$state_dir" "$interval"; then
+        return 4
+    fi
+    return $bucket
 }
 
-# NOTE (nexus-code#236): liveness needs no separate emit-functional probe.
-# The watcher bumps its heartbeat ONLY at the end of a correct compose cycle
-# (see main.sh bump_heartbeat / _v2_task_compose_emit), so `_watcher_alive`'s
-# heartbeat-age buckets above ALREADY mean "a full cycle completed recently":
-# fresh ⇒ the loop works (even on a deliberately-silent quiet workspace),
-# stale ⇒ the loop is wedged. The heartbeat IS the functional signal.
+# NOTE (nexus-code#491, revising #236): the heartbeat is now a PURE
+# liveness signal (background ticker, workload-independent cadence).
+# The functional "a full cycle completed recently" proof lives in
+# watcher-cycle; the loop-is-moving proof lives in watcher-progress.
+# `_watcher_alive` folds a stalled progress/cycle signal into bucket 4
+# (WEDGED) so the silent-stall class #236 targeted is still caught —
+# without the workload-as-liveness conflation that guaranteed false
+# DOWN verdicts at >=12 workers.
+
+# _watcher_liveness_verdict <state_dir> <interval_seconds> [<dead_cutoff_seconds>]
+#
+# THE operator-facing trichotomy (nexus-code#491), single-sourced so
+# svc.sh, watcher-supervise-tick.sh, revive-watcher.sh, and ng render
+# identical semantics. Prints key=value lines:
+#
+#   state=UP|BUSY|WEDGED|DOWN   the verdict word
+#   rc=<n>                      the underlying _watcher_alive bucket
+#   pid=<n>                     heartbeat pid ('' if none)
+#   hb_age=<s> progress_age=<s> cycle_age=<s>
+#   period_s=<s>                measured loop period (0 = unknown)
+#   wedge_cutoff=<s>            active progress-stall threshold
+#   reason=<text>               one-line human phrasing
+#
+# Verdict rules:
+#   DOWN    process gone / no heartbeat / heartbeat dead-stale
+#           (buckets 2,3). Reserved for ESTABLISHED facts.
+#   WEDGED  alive but nothing advanced past the cutoffs (bucket 4).
+#   BUSY    alive + advancing, but slower than nominal: heartbeat aging
+#           (bucket 1) or the last completed cycle is older than the
+#           fresh window or the measured period exceeds 2x interval.
+#           A BUSY watcher is HEALTHY under load — do not restart it.
+#   UP      alive, advancing, cycle cadence nominal.
+#
+# Exit code mirrors the verdict: 0=UP 1=BUSY 4=WEDGED 2=DOWN.
+_watcher_liveness_verdict() {
+    local state_dir="${1:?state_dir required}" interval="${2:-60}" dead_cutoff="${3:-}"
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=60
+    local rc=0
+    _watcher_alive "$state_dir" "$interval" "$dead_cutoff" || rc=$?
+    local hb="$state_dir/watcher-heartbeat"
+    local hb_age page cage period cutoff pid state reason
+    hb_age=$(_watcher_heartbeat_age "$hb")
+    pid=$(_watcher_heartbeat_field "$hb" pid)
+    page=$(_watcher_progress_age "$state_dir" "$pid")
+    cage=$(_watcher_heartbeat_age "$state_dir/watcher-cycle")
+    period=$(_watcher_cycle_period "$state_dir")
+    cutoff=$(_watcher_wedge_cutoff "$interval" "$period")
+    local fresh_cutoff=$(( interval * 2 + 15 ))
+    case "$rc" in
+        2|3)
+            # The bucket says DOWN — but DOWN is reserved for ESTABLISHED
+            # facts. A live watcher pid that is demonstrably ADVANCING
+            # (progress/log/fork within the wedge cutoff) with a stale or
+            # missing heartbeat is a ticker-degraded or pre-#491 watcher
+            # under load — BUSY, not DOWN (the 2026-07-09 live system:
+            # `DOWN pid:18665 heartbeat stale (age=326s)` while forking
+            # children continuously; both claims false).
+            if [[ -n "$pid" ]] && _watcher_pid_is_live_watcher "$pid" \
+               && (( page <= cutoff )); then
+                state=BUSY
+                reason="heartbeat degraded (age ${hb_age}s) but pid=${pid} alive + advancing (progress ${page}s ago) — BUSY, not down"
+            else
+                state=DOWN
+                reason=$(_watcher_reason "$state_dir" 2>/dev/null || echo 'not alive')
+            fi
+            ;;
+        4)
+            state=WEDGED
+            reason="alive (pid=${pid:-?}) but nothing advanced: progress ${page}s / cycle ${cage}s (cutoff ${cutoff}s, measured period ${period}s)"
+            ;;
+        *)
+            local busy=0
+            (( rc == 1 )) && busy=1
+            [[ -f "$state_dir/watcher-cycle" ]] && (( cage > fresh_cutoff )) && busy=1
+            (( period > interval * 2 )) && busy=1
+            if (( busy )); then
+                state=BUSY
+                reason="alive + advancing (progress ${page}s ago), loop period ~${period}s (cycle ${cage}s ago) — slow under load, NOT down"
+            else
+                state=UP
+                reason="healthy (hb ${hb_age}s, cycle ${cage}s, period ~${period}s)"
+            fi
+            ;;
+    esac
+    printf 'state=%s\nrc=%d\npid=%s\nhb_age=%s\nprogress_age=%s\ncycle_age=%s\nperiod_s=%s\nwedge_cutoff=%s\nreason=%s\n' \
+        "$state" "$rc" "$pid" "$hb_age" "$page" "$cage" "$period" "$cutoff" "$reason"
+    case "$state" in
+        UP) return 0 ;; BUSY) return 1 ;; WEDGED) return 4 ;; *) return 2 ;;
+    esac
+}
+
+# _watcher_verdict_field <verdict_text> <key>
+# Extract one key=value field from _watcher_liveness_verdict output.
+_watcher_verdict_field() {
+    local text="$1" key="$2"
+    awk -F= -v k="$key" '$1==k {sub("^"k"=",""); print; exit}' <<<"$text" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Process-shape truth for the singleton guarantee (nexus-code#491)
+#
+# Two field-measured facts shape these helpers:
+#
+#   1. DECAPITATION: main.sh forks a subshell chain (scheduler async
+#      tasks, _run_bounded children). Killing — or losing — the group
+#      LEADER pid leaves that chain running the loop, reparented to
+#      init, argv unchanged (observed live 2026-07-09 17:45: leader
+#      30063 dead 6 minutes while its orphans kept forking tac/jq).
+#      So `ppid==1` is a FALSE top-level test, a leader-pid wait is a
+#      FALSE death test, and any singleton count must count process
+#      GROUPS, not pids.
+#   2. FD INHERITANCE: flock binds to the open file description, which
+#      every fork() inherits — 17 processes were observed holding the
+#      instance lock. A lock every descendant holds neither releases
+#      on leader death nor distinguishes one tree from two (the
+#      #451/#468/#471 fd-leak class, here load-bearing). The fork
+#      chokepoints therefore close the lock fds (main.sh
+#      _close_inherited_locks); these helpers never treat the flock
+#      as a duplicate detector.
+#
+# A "watcher group" = a process group containing >=1 live process
+# whose argv PROGRAM SLOT (argv[0]/argv[1] — same identity rule as
+# _watcher_pid_is_live_watcher, immune to argv-quoting workers) is
+# <nexus_root>/monitor/watcher/main.sh. The launcher setsid-spawns
+# main.sh, so a healthy watcher is one group whose leader (pgid) is
+# alive; a leaderless group is a decapitated orphan loop that must be
+# reaped, never adopted.
+#
+# /proc-only (Linux); on hosts without /proc these print nothing —
+# callers must treat empty as "no information", not "no watcher"
+# (they all keep the pidfile checks).
+
+# _watcher_list_live_groups <nexus_root>
+# One line per live watcher group: "<pgid>\t<live|dead>\t<n>" where
+# the middle column is the LEADER's state and <n> the number of
+# argv-matching members observed.
+_watcher_list_live_groups() {
+    local nexus_root="${1:?nexus_root required}"
+    local main_path="$nexus_root/monitor/watcher/main.sh"
+    [[ -d /proc ]] || return 0
+    local d pid arg stat rest pgrp
+    local -A group_n=()
+    for d in /proc/[0-9]*; do
+        pid="${d#/proc/}"
+        [[ -r "$d/cmdline" ]] || continue
+        local -a argv=()
+        while IFS= read -r -d '' arg; do
+            argv+=("$arg")
+            (( ${#argv[@]} >= 2 )) && break
+        done < "$d/cmdline" 2>/dev/null
+        case "${argv[0]:-}" in
+            "$main_path") : ;;
+            *) [[ "${argv[1]:-}" == "$main_path" ]] || continue ;;
+        esac
+        # pgrp = field 5 of /proc/<pid>/stat — 3rd after the
+        # parenthesised comm (which may contain spaces/parens; strip
+        # through the LAST ')').
+        stat=$(cat "$d/stat" 2>/dev/null) || continue
+        [[ -n "$stat" ]] || continue
+        rest="${stat##*) }"
+        read -r _ _ pgrp _ <<<"$rest"
+        [[ "$pgrp" =~ ^[0-9]+$ ]] || continue
+        group_n[$pgrp]=$(( ${group_n[$pgrp]:-0} + 1 ))
+    done
+    local g leader
+    for g in "${!group_n[@]}"; do
+        if kill -0 "$g" 2>/dev/null; then leader=live; else leader=dead; fi
+        printf '%s\t%s\t%s\n' "$g" "$leader" "${group_n[$g]}"
+    done
+    return 0
+}
+
+# _watcher_list_live_pids <nexus_root>
+# Leaders of live-LEADER watcher groups, one pid per line. Decapitated
+# (leaderless) groups are deliberately excluded — they are defunct
+# loops to reap, not watchers to protect.
+_watcher_list_live_pids() {
+    local nexus_root="${1:?nexus_root required}"
+    local line pgid leader n
+    while IFS=$'\t' read -r pgid leader n; do
+        [[ "$leader" == live ]] && printf '%s\n' "$pgid"
+    done < <(_watcher_list_live_groups "$nexus_root")
+    return 0
+}
+
+# _watcher_group_alive <pgid>
+# Return 0 iff the process GROUP has at least one live member (signal
+# 0 to -pgid). This — not a leader-pid kill -0 — is the death test.
+_watcher_group_alive() {
+    local pgid="${1:?pgid required}"
+    [[ "$pgid" =~ ^[0-9]+$ ]] && (( pgid > 1 )) || return 1
+    kill -0 -- "-$pgid" 2>/dev/null
+}
+
+# _watcher_reap_group <pgid> [<term_wait_s>] [<nexus_root>]
+#
+# Kill an entire watcher process group BY PGID (never a pattern kill)
+# and verify it is EMPTY afterwards: TERM the group, wait up to
+# <term_wait_s> (default 10) for every member to exit, escalate to
+# KILL, wait again (5s), then assert emptiness. Return 0 = group
+# empty; 1 = members survived (caller must fail loud and must NOT
+# spawn alongside them); 2 = REFUSED, nothing signalled (identity not
+# established). Refuses pgid<=1.
+#
+# SELF-GUARDING (skeptic finding on PR#503): a group kill is the most
+# destructive primitive in this repo, and the pid is NOT the identity
+# — a recorded pid recycled to any setsid leader (a worker pane, a
+# registry service, another agent's job) names an innocent group.
+# When <nexus_root> is supplied, the group is signalled ONLY if it
+# still contains an argv-verified watcher member for that root (per
+# _watcher_list_live_groups); otherwise the reap REFUSES with rc 2
+# and touches nothing. Every production caller passes the root; only
+# fixtures that own their pgid may omit it.
+_watcher_reap_group() {
+    local pgid="${1:?pgid required}" term_wait="${2:-10}" nexus_root="${3:-}"
+    [[ "$pgid" =~ ^[0-9]+$ ]] && (( pgid > 1 )) || return 1
+    [[ "$term_wait" =~ ^[0-9]+$ ]] || term_wait=10
+    _watcher_group_alive "$pgid" || return 0
+    if [[ -n "$nexus_root" ]]; then
+        if ! _watcher_list_live_groups "$nexus_root" \
+             | awk -F'\t' -v g="$pgid" '$1==g{found=1} END{exit !found}'; then
+            return 2
+        fi
+    fi
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    local i
+    for (( i = 0; i < term_wait * 2; i++ )); do
+        _watcher_group_alive "$pgid" || return 0
+        sleep 0.5
+    done
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        _watcher_group_alive "$pgid" || return 0
+        sleep 0.5
+    done
+    return 1
+}
+
+# _close_inherited_locks
+#
+# Close lock fds a forked subshell must NOT inherit (nexus-code#491,
+# the #451/#468/#471 fd-leak class made load-bearing): flock binds to
+# the open file description, so every fork() that keeps the fd holds
+# the instance lock — 17 holders were observed live, which (a) kept
+# the lock pinned after the leader died and (b) made it useless for
+# duplicate detection. Called first thing inside the long-lived fork
+# chokepoints (scheduler async fires via _scheduler_subshell_init,
+# _run_bounded children, async respawns, the orchestrator fresh-spawn
+# fork). Lives HERE — not in main.sh — so tests exercise the
+# PRODUCTION text instead of a fixture re-definition (skeptic M4).
+# Reads the caller's INSTANCE_LOCK_FD; a fork inherits shell vars, so
+# no export is needed. No-op when unset.
+_close_inherited_locks() {
+    if [[ -n "${INSTANCE_LOCK_FD:-}" ]]; then
+        eval "exec ${INSTANCE_LOCK_FD}>&-" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# _watcher_youngest_member_age <pgid>
+# Seconds since the YOUNGEST member of the group was forked — the
+# "forking children" liveness signal (nexus-code#491): a loop that is
+# mid-multi-minute stage still forks helpers continuously, while a
+# genuinely wedged loop stops forking. Sweeps /proc for pgrp members
+# and converts starttime (clock ticks since boot) via btime + CLK_TCK.
+# Prints a very large number when the group is empty or /proc is
+# unavailable. NOTE: the heartbeat ticker runs OUTSIDE the watcher's
+# group (setsid, see main.sh) precisely so its own sleep/date forks
+# can never pollute this signal.
+_watcher_youngest_member_age() {
+    local pgid="${1:?pgid required}"
+    [[ "$pgid" =~ ^[0-9]+$ ]] && [[ -r /proc/stat ]] || { printf '999999999'; return 0; }
+    local btime hz now d stat rest best=-1
+    btime=$(awk '/^btime /{print $2; exit}' /proc/stat 2>/dev/null)
+    [[ "$btime" =~ ^[0-9]+$ ]] || { printf '999999999'; return 0; }
+    hz=$(getconf CLK_TCK 2>/dev/null)
+    [[ "$hz" =~ ^[0-9]+$ ]] && (( hz > 0 )) || hz=100
+    now=$(date +%s)
+    for d in /proc/[0-9]*; do
+        stat=$(cat "$d/stat" 2>/dev/null) || continue
+        [[ -n "$stat" ]] || continue
+        rest="${stat##*) }"
+        # rest fields: 1=state 2=ppid 3=pgrp 4=session ... 20=starttime
+        # shellcheck disable=SC2086
+        set -- $rest
+        [[ "${3:-}" == "$pgid" ]] || continue
+        [[ "${20:-}" =~ ^[0-9]+$ ]] || continue
+        local age=$(( now - (btime + ${20} / hz) ))
+        (( age < 0 )) && age=0
+        (( best < 0 || age < best )) && best=$age
+    done
+    (( best < 0 )) && best=999999999
+    printf '%d' "$best"
+}
+
+# _watcher_heartbeat_ticker_loop <hb_file> <watch_pid> <tick_seconds> [<target>]
+#
+# The LIVENESS ticker body (nexus-code#491). Beats the heartbeat file
+# every <tick_seconds> for as long as <watch_pid> (the main watcher)
+# is alive, then exits — a fresh heartbeat can never outlive the
+# process it vouches for by more than one tick, and _watcher_alive's
+# pid-identity check trumps age anyway. Cadence is a CONSTANT: the
+# whole point is that no amount of loop workload can starve it.
+# Atomic tmp+mv writes; every failure is swallowed (a liveness ticker
+# must never kill its host on a transient write error).
+#
+# Run backgrounded from main.sh AFTER the instance lock is held (a
+# doomed second watcher must never beat the real one's heartbeat).
+# Unit-testable standalone: the fixture passes any sleeping pid.
+_watcher_heartbeat_ticker_loop() {
+    local hb="${1:?heartbeat file required}" watch_pid="${2:?watch pid required}"
+    local tick="${3:-20}" target="${4:-}"
+    [[ "$tick" =~ ^[0-9]+$ ]] && (( tick >= 1 )) || tick=20
+    local tmp="$hb.tick.$BASHPID"
+    while kill -0 "$watch_pid" 2>/dev/null; do
+        printf 'pid=%d\nts=%s\ntarget=%s\n' "$watch_pid" "$(date -Is)" "$target" \
+            > "$tmp" 2>/dev/null && mv -f "$tmp" "$hb" 2>/dev/null || true
+        sleep "$tick"
+    done
+    rm -f "$tmp" 2>/dev/null
+    return 0
+}
 
 # _supervisor_monitor_command [nexus_root]
 #
@@ -880,27 +1363,160 @@ _supervisor_down_recovery_message() {
 
 # _nexus_dir_writable <dir>
 #
-# Ground-truth writability probe: attempt an atomic create+remove of a
-# temp file in <dir>. Returns 0 if writable, 1 if NOT — read-only mount
-# (EROFS), EACCES, or ENOSPC alike. Deliberately errno-agnostic: the
-# condition we guard is "cannot write watcher state", whatever the cause.
-# Mirrors write-probe.sh::dir_is_writable so the deliverable-target probe
-# and this state-dir probe stay in lock-step.
+# Ground-truth writability probe: 0 if <dir> accepts a new file right now,
+# 1 if NOT — read-only mount (EROFS), EACCES, or ENOSPC alike. Errno-
+# agnostic: the condition we guard is "cannot write watcher state",
+# whatever the cause.
 #
-# Guards the rofs-incident (your-org/nexus-code): an NFS-server flap
-# dropped the project's writable bind from the tmux-server's MS_SLAVE
-# mount namespace, so monitor/.state went read-only while the operator's
-# out-of-namespace shell stayed writable. Every watcher revive/restart
-# then silently retry-failed for ~25 min because nothing detected the
-# read-only FS or escalated out-of-band.
-_nexus_dir_writable() {
-    local dir="${1:?dir required}"
-    [[ -d "$dir" ]] || return 1
-    local t="$dir/.nexus-state-probe.$$.${RANDOM:-0}"
-    if ( : > "$t" ) 2>/dev/null; then
-        rm -f "$t" 2>/dev/null
-        return 0
+# The implementation now lives in ONE place, monitor/_fs_probe.sh, shared
+# with svc.sh, write-probe.sh and the launcher. The property that matters
+# — a FRESH open() on every call, never a cached fd — is subtle enough
+# that three independent copies of it would eventually drift, and a probe
+# that drifts to a held fd reports HEALTHY during a total outage. See that
+# file's header, and test-fs-guard.sh T2 which pins the property.
+#
+# Guards the rofs incidents (2026-06-29, 2026-07-09): the project's
+# writable bind vanished from the sandbox mount namespace, so monitor/.state
+# went read-only while the operator's out-of-namespace shell stayed
+# writable. The incumbent watcher, holding its log fd, kept running; the
+# successor died in a fresh open() of the same log.
+if [[ -z "${_NEXUS_FS_PROBE_SOURCED:-}" ]] \
+   && [[ -r "${BASH_SOURCE[0]%/*}/../_fs_probe.sh" ]]; then
+    # shellcheck source=monitor/_fs_probe.sh
+    source "${BASH_SOURCE[0]%/*}/../_fs_probe.sh"
+    _NEXUS_FS_PROBE_SOURCED=1
+fi
+
+# Fallback for a partial tree (some test fixtures copy _lib.sh without the
+# rest of monitor/). It must define the WHOLE probe API, not just
+# _nexus_dir_writable: svc.sh calls nexus_path_writable, and an undefined
+# function there would return 127 and be read as "filesystem is read-only" —
+# a false alarm produced by the alarm system itself. Same semantics, same
+# fresh open().
+if ! declare -F nexus_dir_writable >/dev/null 2>&1; then
+    nexus_dir_writable() {
+        local dir="${1:?dir required}"
+        [[ -d "$dir" ]] || return 1
+        _NEXUS_FS_PROBE_SEQ=$(( ${_NEXUS_FS_PROBE_SEQ:-0} + 1 ))
+        local t="$dir/.nexus-state-probe.$$.${RANDOM:-0}.${_NEXUS_FS_PROBE_SEQ}"
+        if ( : > "$t" ) 2>/dev/null; then
+            rm -f "$t" 2>/dev/null
+            return 0
+        fi
+        return 1
+    }
+    nexus_nearest_existing_dir() {
+        local p="${1:?path required}"
+        while [[ -n "$p" && "$p" != "/" && ! -e "$p" ]]; do
+            p="${p%/*}"; [[ -z "$p" ]] && p="/"
+        done
+        if [[ -e "$p" && ! -d "$p" ]]; then p="${p%/*}"; [[ -z "$p" ]] && p="/"; fi
+        printf '%s' "$p"
+    }
+    nexus_path_writable() {
+        nexus_dir_writable "$(nexus_nearest_existing_dir "${1:?path required}")"
+    }
+fi
+
+# Historical name, kept for every existing caller. ONE implementation.
+_nexus_dir_writable() { nexus_dir_writable "$@"; }
+
+# _nexus_fs_evidence <path> [project_dir]
+#
+# Gather the observable facts that distinguish "the sandbox lost its
+# read-write bind" from "the filer is down". READ-ONLY by construction:
+# it reads /proc/self/mountinfo and runs df — both succeed on a read-only
+# mount, which is the whole point, since this runs during the outage.
+#
+# Prints `key=value` lines (never fails, never writes):
+#   mount_point / mount_opts / super_opts   the mount covering <path>
+#   rw_bind                                 present | ABSENT
+#   fs_avail / fs_source                    filer capacity + export
+#
+# The discriminating signature of both incidents: the covering mount is
+# `ro` while its SUPERBLOCK is `rw` (the filer is exporting read-write and
+# is perfectly healthy), and the read-write bind for the project dir has
+# vanished from this namespace. A genuine filer outage looks nothing like
+# this — there the superblock goes `ro` too, or the mount disappears
+# entirely and df hangs or errors.
+_nexus_fs_evidence() {
+    local path="${1:-/}" project="${2:-${SANDBOX_PROJECT_DIR:-}}"
+    local mi=/proc/self/mountinfo
+    local best='' best_len=0 best_opts='' best_super=''
+    local id parent devno root mp opts rest fstype super line
+
+    if [[ -r "$mi" ]]; then
+        while IFS= read -r line; do
+            # mountinfo: id parent maj:min root mountpoint opts [tags...] - fstype source super
+            read -r id parent devno root mp opts rest <<<"$line" || continue
+            [[ -n "$mp" ]] || continue
+            # Longest mountpoint that is a prefix of <path> covers it.
+            if [[ "$path" == "$mp" || "$path" == "$mp"/* || "$mp" == "/" ]]; then
+                if (( ${#mp} >= best_len )); then
+                    best_len=${#mp}; best="$mp"; best_opts="$opts"
+                    super="${line##* }"; best_super="$super"
+                fi
+            fi
+        done < "$mi"
     fi
+
+    printf 'mount_point=%s\n' "${best:-unknown}"
+    printf 'mount_opts=%s\n'  "${best_opts:-unknown}"
+    printf 'super_opts=%s\n'  "${best_super:-unknown}"
+
+    # The read-write bind for the project dir: present as its own mount?
+    local rw_bind='unknown'
+    if [[ -n "$project" && -r "$mi" ]]; then
+        rw_bind=ABSENT
+        # NOTE: no `IFS=` prefix here — this read must split into fields.
+        while read -r id parent devno root mp opts rest; do
+            if [[ "$mp" == "$project" ]]; then
+                case ",$opts," in
+                    *,rw,*) rw_bind=present ;;
+                    *)      rw_bind="present-but-$( printf '%s' "$opts" | cut -d, -f1 )" ;;
+                esac
+                break
+            fi
+        done < "$mi"
+    fi
+    printf 'rw_bind=%s\n' "$rw_bind"
+    printf 'project_dir=%s\n' "${project:-unset}"
+
+    # Filer capacity — proves this is not an ENOSPC / storage outage.
+    local dfline
+    if dfline=$(df -Ph "$path" 2>/dev/null | tail -1); then
+        printf 'fs_source=%s\n' "$(printf '%s' "$dfline" | awk '{print $1}')"
+        printf 'fs_avail=%s\n'  "$(printf '%s' "$dfline" | awk '{print $4" avail of "$2" ("$5" used)"}')"
+    else
+        printf 'fs_source=unknown\nfs_avail=unknown\n'
+    fi
+}
+
+# _nexus_fs_evidence_field <evidence> <key> — pluck one value.
+_nexus_fs_evidence_field() {
+    local ev="${1:-}" key="${2:?key required}"
+    printf '%s\n' "$ev" | sed -n "s/^${key}=//p" | head -1
+}
+
+# _nexus_rofs_signature_matches <mount_opts> <rw_bind>
+#
+# Does the observed evidence match the DETACHED-BIND signature of the two
+# known incidents — the covering mount `ro` while its superblock is `rw`,
+# and/or the project's read-write bind gone from this namespace?
+#
+# This gate exists because the probe is deliberately errno-agnostic: EROFS,
+# EACCES (a chmod accident) and ENOSPC (a genuinely full filer) all trip it.
+# Only the detached-bind case justifies "the storage is fine, do not page
+# storage-support". Asserting that diagnosis for the other classes would be the very
+# thing this whole change exists to prevent — a confident statement that
+# happens to be false. When the evidence does not match, we say so and hand
+# the reader the table instead of a conclusion.
+#
+# Returns 0 on a match, 1 otherwise (including unknown/unreadable evidence).
+_nexus_rofs_signature_matches() {
+    local mount_opts="${1:-}" rw_bind="${2:-}"
+    [[ "$rw_bind" == "ABSENT" ]] && return 0
+    [[ "${mount_opts%%,*}" == "ro" ]] && return 0
     return 1
 }
 
@@ -945,6 +1561,96 @@ _nexus_critical_alarm() {
     return 0
 }
 
+# _nexus_fs_incident_record <state_dir> <onset_epoch> <onset_bound_epoch> \
+#                           <recovered_epoch> <channels> <context>
+#
+# Leave a DURABLE trace once the filesystem comes back. The 2026-06-29
+# incident went unrecorded in `reports/` for ten days and the 2026-07-09
+# recurrence was diagnosed from scratch, because nothing that observed the
+# outage outlived it: the alarm was in memory, the escalation was on the
+# network, and the process died with the incident.
+#
+# Called on the recovery edge (probe fails -> probe succeeds), when writes
+# work again. Appends ONE json line to <state_dir>/fs-incidents.jsonl.
+# Best-effort: a failed append never propagates (we may be racing a second
+# outage), but it is logged by the caller.
+#
+#   onset_epoch        first cycle whose probe FAILED (upper bound on onset)
+#   onset_bound_epoch  last cycle whose probe SUCCEEDED (lower bound)
+#   recovered_epoch    first cycle whose probe succeeded again
+#   channels           comma-separated escalation channels actually used
+_nexus_fs_incident_record() {
+    local state_dir="${1:?}" onset="${2:-0}" bound="${3:-0}" recovered="${4:-0}"
+    local channels="${5:-none}" context="${6:-watcher}"
+    local dur=$(( recovered - onset ))
+    (( dur < 0 )) && dur=0
+    local f="$state_dir/fs-incidents.jsonl"
+    local iso_on iso_rec
+    iso_on=$(date -Is -d "@$onset" 2>/dev/null || echo unknown)
+    iso_rec=$(date -Is -d "@$recovered" 2>/dev/null || echo unknown)
+    printf '{"event":"fs-readonly-incident","context":"%s","onset_after":%s,"onset_before":%s,"onset_iso":"%s","recovered":%s,"recovered_iso":"%s","duration_seconds":%s,"escalation_channels":"%s","host":"%s"}\n' \
+        "$context" "$bound" "$onset" "$iso_on" "$recovered" "$iso_rec" "$dur" \
+        "$channels" "$(hostname 2>/dev/null || echo unknown)" \
+        >> "$f" 2>/dev/null || return 1
+    return 0
+}
+
+# _nexus_fs_incident_close_comment <nexus_root> <duration_s> <channels> <context>
+#
+# Close the loop on the OPEN incident issue once the FS is back: post a
+# recovery comment so the durable GitHub record states the outage ended,
+# how long it lasted, and how the operator heard about it. Best-effort and
+# network-only; no side effects on failure. Returns 0 if a comment landed.
+_nexus_fs_incident_close_comment() {
+    local nexus_root="${1:?}" dur="${2:-0}" channels="${3:-none}" context="${4:-watcher}"
+    local cfg="$nexus_root/config/load.sh" repo tok mint num
+    repo="${MONITOR_REPO:-}"
+    [[ -n "$repo" || ! -x "$cfg" ]] || repo=$("$cfg" github.repo 2>/dev/null)
+    [[ -n "$repo" ]] || return 1
+    command -v gh >/dev/null 2>&1 || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    mint="${NEXUS_MINT_TOKEN_BIN:-$nexus_root/monitor/mint-token.sh}"
+    [[ -e "$mint" ]] || return 1
+    tok=$(NEXUS_ROOT="$nexus_root" bash "$mint" 2>/dev/null) || return 1
+    [[ -n "$tok" ]] || return 1
+    num=$(GH_TOKEN="$tok" gh api "/repos/$repo/issues?state=open&per_page=100" 2>/dev/null \
+        | jq -r '[.[] | select(.pull_request == null)
+                      | select((.title // "") | startswith("cc-incident: watcher down"))
+                      | .number] | first // empty' 2>/dev/null)
+    [[ -n "$num" ]] || return 1
+    GH_TOKEN="$tok" gh api -X POST "/repos/$repo/issues/$num/comments" \
+        -f "body=✅ **Recovered.** The project filesystem is writable again after **${dur}s**; \`$context\` resumed normal operation and the incident is recorded durably in \`monitor/.state/fs-incidents.jsonl\`. Escalation reached the operator via: \`$channels\`. Closing this issue is safe once the restart has been confirmed." \
+        >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# _nexus_rofs_alarm_text <state_dir> [context]
+#
+# The canonical ONE-LINE operator alarm for a read-only project FS, used
+# for sandbox-notify and stderr. Leads with the REMEDY (an alarm read at a
+# glance, on a phone, must say what to do before it says what happened),
+# names the condition, and pre-empts the two wrong reactions: "my data is
+# gone" and "the filer is down, page storage-support". Contains the literal token
+# READ-ONLY, which callers and tests key on.
+_nexus_rofs_alarm_text() {
+    local state_dir="${1:-?}" context="${2:-watcher}"
+    # Same honesty gate as the issue body: only claim "the filer is healthy"
+    # when the evidence actually shows the detached-bind signature. An
+    # ENOSPC or a permissions accident trips the same probe, and telling an
+    # operator not to page storage-support would then be exactly wrong.
+    local ev mount_opts rw_bind verdict
+    ev=$(_nexus_fs_evidence "$state_dir" "${SANDBOX_PROJECT_DIR:-}" 2>/dev/null || true)
+    mount_opts=$(_nexus_fs_evidence_field "$ev" mount_opts)
+    rw_bind=$(_nexus_fs_evidence_field "$ev" rw_bind)
+    if _nexus_rofs_signature_matches "$mount_opts" "$rw_bind"; then
+        verdict='No data is lost and the filer is healthy; do not page storage-support.'
+    else
+        verdict='No data is lost. The evidence does NOT match the usual detached-bind signature — check free space and the superblock before ruling out a real storage problem.'
+    fi
+    printf 'RESTART THE SANDBOX from outside — the nexus project FS is READ-ONLY (cannot write %s). Nothing running inside can repair it. %s Detected by %s. See skills/nexus.service-recovery.' \
+        "$state_dir" "$verdict" "$context"
+}
+
 # _nexus_incident_issue_body <operator_login> <nexus_root> <context> <state_dir> <reason>
 #
 # Compose the INLINE Markdown body for the watcher-down-on-read-only-FS
@@ -972,19 +1678,68 @@ _nexus_critical_alarm() {
 _nexus_incident_issue_body() {
     local login="${1:?operator login required}" nexus_root="${2:-<nexus-root>}"
     local context="${3:-watcher supervisor}" state_dir="${4:-?}" reason="${5:-watcher down}"
-    local ts host
+    local ts host ev mount_opts super_opts rw_bind fs_avail fs_source mount_point
     ts=$(date -Is 2>/dev/null || echo unknown)
     host=$(hostname 2>/dev/null || echo unknown)
+
+    # Read-only evidence gathering — safe on a read-only mount by design.
+    ev=$(_nexus_fs_evidence "$state_dir" "${SANDBOX_PROJECT_DIR:-$nexus_root}" 2>/dev/null || true)
+    mount_point=$(_nexus_fs_evidence_field "$ev" mount_point); : "${mount_point:=unknown}"
+    mount_opts=$(_nexus_fs_evidence_field "$ev" mount_opts);   : "${mount_opts:=unknown}"
+    super_opts=$(_nexus_fs_evidence_field "$ev" super_opts);   : "${super_opts:=unknown}"
+    rw_bind=$(_nexus_fs_evidence_field "$ev" rw_bind);         : "${rw_bind:=unknown}"
+    fs_avail=$(_nexus_fs_evidence_field "$ev" fs_avail);       : "${fs_avail:=unknown}"
+    fs_source=$(_nexus_fs_evidence_field "$ev" fs_source);     : "${fs_source:=unknown}"
+    # Only the leading flag of the super options matters for the headline.
+    local super_head="${super_opts%%,*}"
+    local mount_head="${mount_opts%%,*}"
+
+    # Interpret the evidence ONLY when it matches the known signature. The
+    # probe trips on EROFS, EACCES and ENOSPC alike; "the storage is fine"
+    # is true for exactly one of those. See _nexus_rofs_signature_matches.
+    local diagnosis storage_section
+    if _nexus_rofs_signature_matches "$mount_opts" "$rw_bind"; then
+        diagnosis="That combination means the *mount* was taken away from us; the *storage* is fine."
+        storage_section=$(cat <<STORAGE
+### This is NOT a storage outage — please do not page storage-support
+
+The filer is healthy and is still exporting this filesystem read-write:
+
+| check | observed |
+|---|---|
+| superblock | \`$super_opts\` |
+| capacity | $fs_avail |
+| export | \`$fs_source\` |
+
+A real filer problem looks different: the superblock itself goes read-only, or the mount disappears and \`df\` hangs. Neither is happening here.
+STORAGE
+)
+    else
+        diagnosis="**This does not match the known signature.** In the two recorded incidents the covering mount was \`ro\` over an \`rw\` superblock with the read-write bind gone. That is not what is observed here, so do **not** assume a detached bind — read the table below before concluding anything."
+        storage_section=$(cat <<STORAGE
+### This may or may not be a storage problem — check before concluding
+
+The write failed, but the evidence does **not** show the detached-bind signature. The probe is deliberately errno-agnostic: a read-only mount, a permissions accident, and a **full filesystem** all trip it. Read these values before deciding whom to call:
+
+| check | observed |
+|---|---|
+| superblock | \`$super_opts\` |
+| capacity | $fs_avail |
+| export | \`$fs_source\` |
+
+If the **capacity** is exhausted, or the **superblock** itself is \`ro\`, this *is* a storage problem and storage-support should be contacted. If both look healthy, suspect permissions on the path itself. A sandbox restart may not help.
+STORAGE
+)
+    fi
+
     cat <<EOF
-@$login — ⚠️ **Your automated workspace monitor stopped and needs you to restart it.** This is safe to fix and takes about a minute — no technical knowledge required.
+@$login — ⚠️ **The workspace's storage has gone read-only. It has to be restarted from OUTSIDE the sandbox; nothing running inside can repair it.** This is safe to fix, it takes about a minute, and no technical knowledge required.
 
-**What happened, in plain terms:** the background process that keeps this workspace's agents running (the *watcher*) shut down because the workspace's storage went **read-only** — it can still *read* files but can no longer *save* anything. It cannot repair this from the inside, so nothing will run until you restart it.
-
-### What to do
+### Do this
 
 1. **Find the workspace terminal.** Look at the bottom status bar. If it reads **\`[sandbox]\`**, you are in the right (inner) window.
 2. **Close that inner sandbox window:** press and hold **\`Ctrl\`**, tap **\`a\`**, let go — then tap **\`d\`**.
-   - That detaches and closes the inner sandbox (the one with the stuck read-only storage).
+   - That detaches and closes the inner sandbox, discarding its stuck mount namespace.
    - ⚠️ Do **NOT** use **\`Ctrl\`+\`b\`** then **\`d\`** — that is the *outer* terminal and will not fix anything.
 3. **Restart the workspace.** You are now back at the outer shell. Paste this one line and press **Enter**:
    \`\`\`
@@ -992,9 +1747,26 @@ _nexus_incident_issue_body() {
    \`\`\`
    (\`--continue\` resumes your previous session where it left off.)
 
-That's it — the workspace will come back up on its own within about a minute.
+The workspace comes back on its own within about a minute.
 
-If the storage is *still* read-only after restarting, the underlying network filesystem (NFS) may still be settling — wait a few minutes and retry; if it persists, contact your HPC/system administrator.
+### The evidence, in one line
+
+\`$mount_point\` is mounted **\`$mount_head\`** while its superblock is **\`$super_head\`**, and the read-write bind for \`${SANDBOX_PROJECT_DIR:-$nexus_root}\` is **$rw_bind** from this mount namespace.
+
+$diagnosis
+
+### Nothing is lost or corrupted
+
+- Every byte on \`/fh\` is intact. The filesystem is read-only, not damaged — no write ever half-landed.
+- The git repo, the \`work/\` clones, \`reports/\` and \`monitor/.state/\` all survive the restart untouched.
+- \`~/.claude\` and \`/tmp\` are on different mounts and are still writable, which is how this message reached you.
+
+$storage_section
+
+### What the restart will cost
+
+- **Running agent (worker) sessions are ephemeral** and will not survive; so are the prompt files under the scratchpad. Work already committed, pushed, or written to \`reports/\` is safe.
+- The durable record of this incident is **this issue** — it is written to GitHub precisely because nothing could be written to disk.
 
 ---
 
@@ -1006,12 +1778,18 @@ If the storage is *still* read-only after restarting, the underlying network fil
 | detected by | $context |
 | timestamp | $ts |
 | host | \`$host\` |
-| read-only path | \`$state_dir\` |
+| unwritable path | \`$state_dir\` |
+| covering mount | \`$mount_point\` |
+| mount options | \`$mount_opts\` |
+| superblock options | \`$super_opts\` |
+| project rw bind | $rw_bind |
 | watcher state | $reason |
 
-A read-only project FS is **unrecoverable in-namespace**: every write to \`monitor/.state\` fails (EROFS), so the watcher cannot record, retry, or even log to disk, and \`revive-watcher.sh\` exits 4 rather than looping on a futile \`svc.sh restart\`. The terminal \`sandbox-notify\` alarm has also fired (throttled).
+A read-only project FS is **unrecoverable in-namespace**: every write to \`monitor/.state\` fails (EROFS), so the watcher cannot record, retry, or log to disk, and \`revive-watcher.sh\` exits 4 rather than looping on a futile \`svc.sh restart\`. The terminal \`sandbox-notify\` alarm has also fired (throttled).
 
-**Root-cause class:** an NFS-server flap drops the project's writable bind from the tmux-server's \`MS_SLAVE\` mount namespace, so \`monitor/.state\` goes read-only inside the sandbox while an out-of-namespace shell stays writable. The detach-and-relaunch above gives the watcher a fresh mount namespace with the writable bind restored. See \`skills/nexus.service-recovery\`.
+**Why a restart is the only remedy:** the sandbox's mount namespace is kernel-enforced and cannot be repaired from inside it — by design. Detaching the inner sandbox discards that namespace; relaunching builds a fresh one with the read-write bind in place. Do not attempt to remount, re-bind, or \`unshare\` your way out of this: it is not possible from inside, and it is not something to work around.
+
+**Root cause: NOT established.** What is known: an already-open file descriptor keeps working after its mount is detached, so the *incumbent* watcher logs normally straight through the outage while any *successor* — which must resolve paths afresh — dies instantly. Both observed incidents (2026-06-29, 2026-07-09) began within seconds of a \`launcher.sh --replace\` self-restart. That association is strong, but its direction is unproven; do not treat it as a diagnosis. See \`skills/nexus.service-recovery\`.
 
 </details>
 
@@ -1559,6 +2337,19 @@ _watcher_reason() {
     pid=$(_watcher_heartbeat_field "$hb" pid)
     if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
         echo "watcher pid=${pid} DEAD (heartbeat age=${age}s)"
+        return 0
+    fi
+    # Alive pid + stale-ish heartbeat: say what the PROGRESS signals say
+    # before anyone reads "stale" as "dead" (nexus-code#491). A wedge and
+    # a busy loop are different states and must read differently.
+    local page
+    page=$(_watcher_progress_age "$state_dir" "$pid")
+    if _watcher_wedged "$state_dir" "${MONITOR_INTERVAL:-60}"; then
+        echo "watcher pid=${pid:-?} alive but WEDGED: no forward progress for ${page}s (heartbeat age=${age}s)"
+        return 0
+    fi
+    if (( page < 999999999 )); then
+        echo "heartbeat stale (age=${age}s) but progress ${page}s ago — likely BUSY/ticker-degraded, not dead"
         return 0
     fi
     echo "heartbeat stale (age=${age}s)"

@@ -47,8 +47,10 @@ mkdir -p "$F/config" "$F/monitor/watcher" "$F/.bin" "$F/reports" "$F/work"
 # drift-proof: a new `source` line is covered automatically.
 cp "$SRC/monitor/watcher/main.sh"   "$F/monitor/watcher/main.sh"
 cp "$SRC"/monitor/watcher/_*.sh     "$F/monitor/watcher/"
-# main.sh also sources ../_cc-version.sh (one level up from watcher/).
+# main.sh also sources ../_cc-version.sh (one level up from watcher/),
+# and main.sh + several modules source ../_log-mode.sh (nexus-code#509).
 cp "$SRC/monitor/_cc-version.sh"    "$F/monitor/_cc-version.sh"
+cp "$SRC/monitor/_log-mode.sh"      "$F/monitor/_log-mode.sh"
 chmod +x "$F/monitor/watcher/main.sh"
 
 # Tiny config loader. Returns deterministic values for keys we

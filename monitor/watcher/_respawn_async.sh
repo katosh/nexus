@@ -194,6 +194,12 @@ _respawn_async_launch() {
     # complete with the stale rc.
     rm -f "$dir/rc" "$dir/pid" "$dir/start" 2>/dev/null
     (
+        # Close inherited lock fds (nexus-code#491, #451/#468/#471
+        # fd-leak class): this subshell is disowned and can outlive the
+        # watcher — it must never pin the instance flock.
+        if declare -F _close_inherited_locks >/dev/null 2>&1; then
+            _close_inherited_locks
+        fi
         respawn_agent "$target"
         printf '%s\n' "$?" > "$dir/rc"
     ) &

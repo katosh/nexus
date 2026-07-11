@@ -74,6 +74,10 @@ _script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 _nexus_root_default=$(cd "$_script_dir/.." 2>/dev/null && pwd || echo "$_script_dir/..")
 NEXUS_ROOT="${NEXUS_ROOT:-$_nexus_root_default}"
 
+# `_ensure_service_log` (your-org/nexus-code#484). Side-effect-free on source.
+# shellcheck source=_log-mode.sh
+source "$_script_dir/_log-mode.sh"
+
 STATE_DIR="${NEXUS_STATE_DIR:-$NEXUS_ROOT/monitor/.state}"
 BOOT_RECOVER_BIN="${BOOT_RECOVER_BIN:-$_script_dir/bootstrap-recover.sh}"
 DEBOUNCE="${BOOT_RECOVER_DEBOUNCE_SECONDS:-300}"
@@ -124,6 +128,9 @@ _recovery_needed() {
 
 _run_recovery() {
     mkdir -p "$STATE_DIR" 2>/dev/null || true
+    # Explicit mode at creation — a bare `>>` leaves boot-recover.log
+    # group-writable under the ambient umask (your-org/nexus-code#484).
+    _ensure_service_log "$LOG"
     if (( SYNC == 1 )); then
         "$BOOT_RECOVER_BIN" >>"$LOG" 2>&1
         return $?

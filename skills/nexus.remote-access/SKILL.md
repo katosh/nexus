@@ -47,6 +47,19 @@ this skill is the full operator runbook behind it.
   supervisor exits without listening, the healthcheck treats
   not-running as healthy (no flap), and the forced-command wrapper
   refuses. ONE enable mechanism, not two.
+- **Credentials live under `~/.claude`, and the service REFUSES to start if they
+  don't.** The host key, `authorized_keys` and the enrollment-token records sit
+  in `~/.claude/nexus-remote/` (`0700`, single-uid). Two independent reasons,
+  both load-bearing: the nexus project tree is **group-shared lab storage**
+  (`drwxrws---` on `/shared`) and a git worktree whose files reach `ng upload`;
+  and `~/.claude` is one of the writable mounts that **survives a sandbox
+  restart**, which destroys `/tmp` and can freeze the project tree. This is
+  enforced, not conventional: `_remote_principals_guard` fails closed on a
+  `principals_dir` outside `~/.claude` (symlinks resolved), on a mode looser
+  than `0700`, on a foreign owner, or on a group/other-readable secret — the
+  supervisor and `remote-up.sh` both refuse to launch. Do **not** "helpfully"
+  relocate `principals_dir` into `monitor/.state/`. Details:
+  [`REFERENCE.md`](REFERENCE.md) §"Credential storage".
 - **Always encrypted + authenticated — independent of where it binds.**
   The transport is SSH no matter the bind address: connection encryption,
   an ed25519 **host key** the client pins, **public-key-only** client auth
@@ -160,6 +173,68 @@ monitor:
 > listener comes up once the sandbox provides `sshd`. The
 > nexus-code half (wrapper, supervisor, health, secret flow) is
 > complete and tested regardless.
+
+## Why SSH and not MCP
+
+Six months from now a bespoke SSH forced-command protocol next to a
+standard one will look like nobody considered the standard one. It was
+considered, adversarially: full analysis in `<your-org>/nexus-code#483`,
+independently attacked by a skeptic pass (verdict `check` — the
+recommendation survived; three supporting claims were corrected in the
+issue's corrections comment, which supersedes the body). The argument
+at its strongest, including the parts that cut against us:
+
+- **Reachability was never the differentiator.** Inbound HTTP is NOT
+  firewall-blocked here — this very sshd serves an off-host LAN client,
+  and an HTTP listener on the same interface would be exactly as
+  reachable. The sandbox is no obstacle either (shared netns, like
+  every other registered service). Anyone re-litigating this decision
+  should discard "MCP won't be reachable" immediately; it is false.
+- **Authentication is the differentiator.** MCP (rev 2025-11-25) makes
+  authorization OPTIONAL. Over HTTP the spec's story is an OAuth 2.1
+  resource server + RFC 9728 protected-resource metadata + an
+  authorization server that MUST implement OAuth 2.1 — infrastructure
+  nobody here operates, and standing it up for one confined channel is
+  disproportionate. The realistic degeneration (a judgment about this
+  deployment, not a technical necessity — and a fully spec-conformant
+  build, since authorization is optional) is a static bearer token in
+  a config file: credential on the wire every request, hand-rotated,
+  no per-principal binding, no source pin. That is strictly weaker
+  than what the channel has — pubkey (credential never on the wire) +
+  server-pinned per-key forced command + `from=` CIDR pin + single-use
+  TTL-bounded enrollment with hash-at-rest tokens (`#476`/`#481`).
+- **The defect MCP was supposed to fix lived on a hop MCP cannot
+  reach.** The lost-request incident class was the watcher→orchestrator
+  hop (render-time cooldown stamping + a stage-file overwrite race —
+  both fixed at the source, see `#483` and its corrections comment),
+  not the client↔nexus wire, which already has typed request/response
+  (`request file` returns the durable id; `await`/`fetch` observe the
+  authoritative rename state). Precision matters here: Claude Code CAN
+  act as an MCP server (`claude mcp serve`, stdio), but that spawns a
+  fresh process exposing its own tools — no MCP surface injects a turn
+  into an already-running interactive session, and the orchestrator is
+  exactly such a session. Its only unsolicited-input surface is its
+  tmux pane, so every MCP variant terminates in the same paste.
+- **File transport rides the existing verbs.** A request/reply body is
+  already an arbitrary byte-exact payload (`--message-stdin` in,
+  `fetch <id> results` out), now server-bounded (`REMOTE_BODY_MAX_BYTES`,
+  default 1 MiB) with an opt-in `--checksum` integrity echo. A separate
+  file verb or `sftp-server` dispatch was rejected: `sftp-server`
+  cannot be path-confined without a root chroot (this sshd runs
+  unprivileged), and a parallel file namespace adds allowlist surface
+  without removing a failure mode the hardened body path hasn't.
+- **The migration path is recorded, contingent, and cheap.** If a
+  client harness ever demands native MCP tools: add an `mcp` verb to
+  the forced-command allowlist dispatching a stdio JSON-RPC serve loop
+  over the same four verbs (`request_file`/`request_await`/
+  `request_fetch`/`status`), client-side one `.mcp.json` entry whose
+  `command` is the pinned `ssh` invocation. Same key, same confinement,
+  no new listener, no new credential — MCP-over-SSH-stdio is the one
+  cell of the design space where the spec itself says to use
+  environment credentials instead of OAuth. Until a client actually
+  needs typed tool discovery, it buys nothing: done right it is a
+  veneer over the durable on-disk request ids (an MCP session dies
+  with its connection; the rename state machine does not).
 
 ## Companion files (this skill, split by audience)
 

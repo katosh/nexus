@@ -148,7 +148,14 @@ cc_version_write_local_pin() {
     local nexus_root="${2:-${NEXUS_ROOT:-}}"
     local path dir
     path=$(cc_version_local_pin_path "$nexus_root")
-    dir=$(dirname "$path")
+    # Parameter expansion, NOT `dirname`: sourced from a zsh agent shell,
+    # `dirname` resolved to command-not-found here and the LOAD-BEARING
+    # pin write silently no-op'd (nexus-code#513's 2026-07-10 workaround
+    # failed exactly this way). No external commands on this path.
+    case "$path" in
+        */*) dir="${path%/*}" ;;
+        *)   dir="." ;;
+    esac
     mkdir -p "$dir" 2>/dev/null || {
         printf 'cc_version_write_local_pin: cannot create %s\n' "$dir" >&2
         return 1

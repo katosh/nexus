@@ -295,6 +295,53 @@ else
 fi
 
 # ============================================================
+# (7) requests_poll.out as a third nudge source (`#483` follow-up)
+# ============================================================
+#
+# Without this source nothing pulls compose_emit forward for a newly
+# filed request — a `reply: required` remote ask waits out the full
+# 60 s compose cadence (and pre-#483, usually missed it entirely via
+# the stage-overwrite race). Same mtime+size semantics as github_poll:
+# empty rewrite → no nudge; non-empty → nudge. Two-arg calls (all the
+# tests above) stay valid — the third source is optional.
+
+echo
+echo '=== (7) requests_poll.out: empty vs non-empty; back-compat ==='
+_compose_nudge_reset_for_tests
+_scheduler_reset_for_tests
+NEXUS_TEST_NOW=6000
+_schedule_task compose_emit 60 dummy_compose_emit --class medium
+TASK_NEXT_FIRE[compose_emit]=6060
+req_out_file="$WORK/requests_poll.out"
+
+# Empty requests render (nothing due) — atomically rewritten every 10 s
+# fire, mtime advances, size 0 → no nudge.
+: > "$req_out_file"
+stamp_mtime "$req_out_file" 6001
+_compose_emit_nudge_check "/does/not/exist" "/does/not/exist" "$req_out_file"
+req_empty_rc=$?
+assert_eq "empty requests_poll.out → no nudge" "$req_empty_rc" "1"
+assert_eq "next_fire unchanged" "${TASK_NEXT_FIRE[compose_emit]}" "6060"
+
+# A due request renders → non-empty stage → nudge.
+printf 'request=20260709T000000Z-w-ask origin=w kind=question priority=high\n    summary: please\n    file=/x.claimed.md\n' > "$req_out_file"
+stamp_mtime "$req_out_file" 6002
+_compose_emit_nudge_check "/does/not/exist" "/does/not/exist" "$req_out_file"
+req_rc=$?
+assert_eq "non-empty requests_poll.out → nudge" "$req_rc" "0"
+assert_eq "next_fire forced to 0" "${TASK_NEXT_FIRE[compose_emit]}" "0"
+
+# Post-paste truncation (main.sh consumes the stage after a delivered
+# request body): mtime advances, size 0 → nudge goes quiet.
+TASK_NEXT_FIRE[compose_emit]=6070
+: > "$req_out_file"
+stamp_mtime "$req_out_file" 6003
+_compose_emit_nudge_check "/does/not/exist" "/does/not/exist" "$req_out_file"
+req_trunc_rc=$?
+assert_eq "post-paste truncated stage → no nudge" "$req_trunc_rc" "1"
+assert_eq "next_fire unchanged after truncation" "${TASK_NEXT_FIRE[compose_emit]}" "6070"
+
+# ============================================================
 # summary
 # ============================================================
 

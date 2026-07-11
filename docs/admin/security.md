@@ -246,7 +246,9 @@ second.
 
     ```bash
     monitor/svc.sh stop watcher
-    tmux kill-window -t orchestrator
+    # The coordinator window is NOT always named `orchestrator` — resolve it,
+    # or the kill silently hits nothing and the session keeps running.
+    tmux kill-window -t "$(config/load.sh monitor.target_window orchestrator)"
     ```
 
 4. **Audit the action log** for the suspect window:

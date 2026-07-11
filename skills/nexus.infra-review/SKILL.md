@@ -92,12 +92,21 @@ as in-scope and start a fresh resolved index in the same PR (see PR
 
 ## Bulk extract (Read tool's per-call cap forces this)
 
-`reports/` typically holds 150-200 markdown files; reading each
-individually exhausts the Read tool budget fast. Bulk-extract once,
-then read chunks of the extract:
+`reports/` holds hundreds of markdown files; reading each individually
+exhausts the Read tool budget fast. Bulk-extract once, then read chunks
+of the extract.
+
+**Recurse into the monthly archive.** As of #444 the reports dir is
+time-partitioned: only the current + previous month stay FLAT in
+`reports/`; older months are rolled into `reports/YYYY-MM/` buckets (by
+`monitor/ng reports-roll`). This meta-review reads the ENTIRE historical
+corpus, so it MUST descend into the buckets — a flat `reports/*.md` glob
+would silently miss every archived month. Use `find` (or
+`shopt -s globstar; reports/**/*.md`):
 
 ```bash
-grep -l '^## Infrastructure Issues' reports/*.md > /tmp/_infra-files.txt
+find reports -type f -name '*.md' -print0 \
+  | xargs -0 grep -l '^## Infrastructure Issues' > /tmp/_infra-files.txt
 
 awk '
   /^## Infrastructure Issues/ { in_block=1; print "<<< " FILENAME " >>>"; print; next }

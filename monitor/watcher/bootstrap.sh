@@ -196,10 +196,13 @@ EOF
 # --- (1) liveness probe ---------------------------------------------------
 #
 # Delegates the heartbeat / pid-identity check to _watcher_alive in
-# _lib.sh (the watcher is headless — no window check). Bucket 0 =
-# fresh + alive; anything else means the watcher is not healthy and we
-# respawn. The human-readable reason (for the log + incident report)
-# comes from _watcher_reason.
+# _lib.sh (the watcher is headless — no window check). Respawn ONLY on
+# established death (buckets 2/3, nexus-code#491): bucket 1 is a busy
+# loop with an aging heartbeat and bucket 4 a live-but-wedged loop —
+# both ALIVE; killing/racing them from the per-turn bootstrap is how
+# healthy watchers died on 2026-07-09. The supervisor Monitor +
+# revive-watcher own the wedged case. The human-readable reason (for
+# the log + incident report) comes from _watcher_reason.
 
 _watcher_alive "$STATE_DIR" "$INTERVAL"
 alive_rc=$?
@@ -208,6 +211,8 @@ incident_reason=""
 case $alive_rc in
     0)  age=$(_watcher_heartbeat_age "$HEARTBEAT")
         log "heartbeat OK (${age}s)" ;;
+    1)  log "watcher heartbeat aging but alive — BUSY, not respawning ($(_watcher_reason "$STATE_DIR"))" ;;
+    4)  log "watcher WEDGED (alive, not advancing) — supervisor/revive owns this; not respawning from bootstrap ($(_watcher_reason "$STATE_DIR"))" ;;
     *)  incident_reason=$(_watcher_reason "$STATE_DIR")
         log "$incident_reason"
         respawn_needed=1 ;;
@@ -220,7 +225,18 @@ if (( respawn_needed == 1 )); then
     report_path=$(write_incident_report "$incident_reason")
     log "incident report: $report_path"
     log "respawning via launcher.sh"
-    if "$LAUNCHER_BIN" >&2; then
+    # Close the bootstrap lock fd in the launcher's whole subtree
+    # (`{lock_fd}>&-`, flock-fd class your-org/nexus-code#494): the
+    # launcher setsid-spawns the LONG-LIVED watcher, and flock(2) binds
+    # to the open file description — an inherited fd means the watcher
+    # holds the bootstrap lock for its lifetime, so the next bootstrap
+    # against a WEDGED watcher (alive process, stale heartbeat — the
+    # exact case this script exists to recover) exits "another agent is
+    # bootstrapping" without replacing it. The parent keeps the fd (the
+    # lock guards this check+spawn window); only the child is denied it.
+    # Same close-at-spawn idiom as #451 (instance lock) / #471 (asset
+    # lock): bash cannot set FD_CLOEXEC on an exec-opened fd.
+    if "$LAUNCHER_BIN" >&2 {lock_fd}>&-; then
         log "launcher exited OK"
     else
         log "launcher exited nonzero (rc=$?)"

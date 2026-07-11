@@ -23,6 +23,14 @@
 #   block           rule 5: record + notify; NEVER bumps.
 #   record-outcome  audit-trail writer for outcomes this script cannot
 #                   observe (e.g. the evaluator opened a compat PR).
+#   hold            write the durable restart-hold marker (nexus-code#513):
+#                   the RUNNING watcher's reconcile honours it every tick,
+#                   so a refused orchestrator restart STAYS refused.
+#                   --reason required; --ttl-seconds / --until-version
+#                   bound it. (The config `enabled` flag is read once at
+#                   watcher startup and is NOT a hold.)
+#   unhold          release the hold.
+#   hold-status     print the hold and whether it is active (rc 0/1).
 #
 # Fail-safe contract: any guard failure, any step failure, any
 # uncertainty → the pin is NOT advanced (or is rolled back), the
@@ -43,6 +51,15 @@
 #       stale/absent — a kill would cold-spawn and lose the conversation
 #       context, so we do not even detach the restart). Foreground
 #       pre-flight; the bump itself stands.
+#   30  safe: DEFERRED by the deployment gate (nexus-code#512) — an open
+#       PR touches the watcher restart path, or too many live agent
+#       windows. NOTHING was applied; the safe-to-bump verdict is
+#       recorded and the next daily fire retries. A recorded, unapplied
+#       safe-to-bump is a complete result.
+#   31  safe: bumped + watcher restarted, but the POST-RESTART INVARIANT
+#       was violated (survivors of the old watcher group, or duplicate
+#       watcher groups). The orchestrator restart is NOT handed off into
+#       a duplicated-watcher world; operator inspection required.
 #
 # `safe` no longer BLOCKS on the orchestrator idle-wait: after the bump
 # (pin + install + watcher restart, all synchronous) it hands the
@@ -58,21 +75,29 @@
 # kill. Its own exit codes (recorded as audit rows + notify; the disowned
 # caller's rc is not observed):
 #   0   restart triggered — orchestrator killed for a context-preserving
-#       respawn. state=idle → outcome safe-bumped-restarted; idle-cap
-#       reached while busy → safe-bumped-restart-FORCED (operator
-#       decision: restart a busy orchestrator anyway — the pinned session
-#       resumes from its transcript, so a mid-turn kill only re-runs the
-#       interrupted turn, repeating some tokens, never losing work).
+#       respawn. Turn-boundary verdict (idle / autosuggest-only /
+#       Monitor-handle working-background / working-self-paced /
+#       idle-orphan-async — see _restart_eligible, nexus-code#514) →
+#       outcome safe-bumped-restarted; idle-cap reached while POSITIVELY
+#       busy → safe-bumped-restart-FORCED (operator decision: restart a
+#       busy orchestrator anyway — the pinned session resumes from its
+#       transcript, so a mid-turn kill only re-runs the interrupted turn,
+#       repeating some tokens, never losing work).
 #   21  ABORT — session pin went stale/absent (or transcript missing)
 #       before the kill; a kill now would cold-spawn. No kill.
 #   22  ABORT — watchdog template missing / spawn failed / never armed.
 #       No kill (never kill the orchestrator unwatched).
 #   23  ABORT — orchestrator window unresolved, or pane-state UNREADABLE
-#       (no parseable verdict). A confirmed-idle OR the force-on-cap gate
-#       is required; an unreadable probe is neither, so fail loud. No kill.
-#       (state=empty is a VALID verdict — claude alive, renderer blip —
-#       and is treated as not-idle, NOT unreadable: it keeps waiting and
-#       force-restarts at the cap.)
+#       (no parseable verdict), or the wait hit its cap having seen
+#       NOTHING but `state=empty` (the classifier never positively
+#       resolved the pane — force-killing on a verdict that was never
+#       established would kill an unknown; nexus-code#514). No kill.
+#       (state=empty remains a VALID not-idle verdict — claude alive,
+#       renderer blip — it keeps waiting; only an ALL-empty wait refuses
+#       the force at the cap.)
+#   25  ABORT — restart-hold active (nexus-code#513), or this detached
+#       restart was SIGTERMed and wrote the hold itself so the reconcile
+#       does not auto-refire the abort. No kill. Release: `unhold`.
 #   24  NO-OP — the orchestrator already respawned onto the candidate on
 #       its own (a candidate-stamped record exists in the pinned
 #       transcript, e.g. the version-aware watcher self-restart). Killing
@@ -122,6 +147,9 @@ source "$_self_dir/_cc-version.sh"
 source "$_self_dir/watcher/_cc_update.sh"
 # shellcheck source=watcher/_cc_auto_update.sh
 source "$_self_dir/watcher/_cc_auto_update.sh"
+# `_ensure_service_log` (your-org/nexus-code#484).
+# shellcheck source=_log-mode.sh
+source "$_self_dir/_log-mode.sh"
 
 PACKAGE="${MONITOR_CC_UPDATE_PACKAGE:-@anthropic-ai/claude-code}"
 COMPAT_REPO="${CC_AUTO_COMPAT_REPO:-your-org/nexus-code}"
@@ -136,6 +164,23 @@ COMPAT_REPO="${CC_AUTO_COMPAT_REPO:-your-org/nexus-code}"
 # restart's env, so consulting the config here is what makes it match.
 TARGET_WINDOW="${CC_AUTO_TARGET_WINDOW:-${MONITOR_TARGET:-$("$NEXUS_ROOT/config/load.sh" monitor.target_window orchestrator 2>/dev/null || echo orchestrator)}}"
 WATCHDOG_WINDOW="${CC_AUTO_WATCHDOG_WINDOW:-cc-restart-watchdog}"
+
+# ---- deployment-gate knobs (your-org/nexus-code#512) ----------------------
+# The release gate asks "is this Claude Code binary safe?"; the deployment
+# gate asks "is this nexus in a state where restarting the watcher is safe
+# RIGHT NOW?" — the question the 2026-07-10 incident showed nobody asking.
+# Live agent windows above this threshold defer the apply (0 disables the
+# window gate; the count is still logged in the apply record either way).
+GATE_MAX_LIVE_WINDOWS="${CC_AUTO_MAX_LIVE_WINDOWS:-$("$NEXUS_ROOT/config/load.sh" monitor.cc_auto_update.max_live_windows 8 2>/dev/null || echo 8)}"
+# Window names that are infrastructure, not agents-at-risk (CSV; the
+# orchestrator TARGET_WINDOW, the evaluator window and the restart
+# watchdog are always exempt on top of these).
+GATE_WINDOW_EXEMPT="${CC_AUTO_GATE_WINDOW_EXEMPT:-services}"
+# Repo whose open PRs are checked for restart-path collisions, and the
+# restart-path file set (CSV). An open PR touching any of these means the
+# restart mechanics are KNOWN to be under repair — defer the apply.
+GATE_REPO="${CC_AUTO_GATE_REPO:-${CC_AUTO_COMPAT_REPO:-your-org/nexus-code}}"
+GATE_RESTART_PATHS="${CC_AUTO_GATE_RESTART_PATHS:-monitor/watcher/launcher.sh,monitor/watcher/main.sh,monitor/revive-watcher.sh,monitor/svc.sh,monitor/watcher/_version_restart.sh}"
 
 INSTALL_CMD="${CC_AUTO_INSTALL_CMD:-$NEXUS_ROOT/monitor/install-claude-local.sh}"
 SPAWN_CMD="${CC_AUTO_SPAWN_CMD:-$NEXUS_ROOT/monitor/spawn-worker.sh}"
@@ -159,6 +204,9 @@ note() {
     ts=$(date -Is 2>/dev/null || echo unknown)
     printf '%s %s\n' "$ts" "$*"
     mkdir -p "$AUTO_DIR" 2>/dev/null || true
+    # Explicit mode at creation (your-org/nexus-code#484). Idempotent, and
+    # cheap enough to sit on the log path: two syscalls once the file exists.
+    _ensure_service_log "$APPLY_LOG"
     printf '%s %s\n' "$ts" "$*" >> "$APPLY_LOG" 2>/dev/null || true
 }
 
@@ -213,6 +261,43 @@ _resolve_target_index() {
         | awk -F'|' -v n="$name" '$1 == n { print $2; exit }'
 }
 
+# _restart_eligible <state> <raw_probe_line> — rc 0 iff the verdict is a
+# TURN BOUNDARY, i.e. safe to kill for a context-preserving respawn.
+#
+# pane-state.sh can never emit a literal `idle` for an orchestrator that
+# holds a Monitor handle (your-org/nexus-code#514): its refinement
+# promotes an idle base verdict to `working-background` whenever mon>0,
+# and the orchestrator permanently holds one (the watcher supervisor).
+# Keying strictly on `idle` made the interlock structurally
+# unsatisfiable — 7/7 recorded fires force-killed mid-turn at the cap.
+#
+# Every state below is a refinement of an IDLE BASE VERDICT (empty input
+# row, no spinner — the turn has ended); what varies is only the pending
+# WAKE mechanism, which any restart loses and the respawn + watcher
+# nudge restore:
+#   idle                nothing pending at all
+#   autosuggest-only    idle; the input row is drawing a ghost
+#   working-self-paced  between turns; a self-scheduled wakeup pends
+#   idle-orphan-async   between turns; an EXTERNAL job (slurm, CI)
+#                       pends — the job itself survives the kill
+#   working-background  between turns — eligible ONLY in its
+#                       Monitor-handle flavour (self-waking, no live
+#                       child). The SHELL-driven flavour carries
+#                       `bg_cpu=` on the emit line and has an in-flight
+#                       fire-and-forget child process the kill would
+#                       destroy: NOT eligible, keep waiting.
+_restart_eligible() {
+    local st="$1" raw="$2"
+    case "$st" in
+        idle|autosuggest-only|working-self-paced|idle-orphan-async)
+            return 0 ;;
+        working-background)
+            [[ "$raw" != *"bg_cpu="* ]]
+            return $? ;;
+    esac
+    return 1
+}
+
 # _check_gate_evidence <file> <candidate> — rc 0 iff the file exists, is
 # fresh, names a GREEN gate, and mentions the candidate.
 _check_gate_evidence() {
@@ -233,6 +318,166 @@ _check_gate_evidence() {
     if ! grep -qF "$candidate" "$file"; then
         note "REFUSED: gate evidence does not mention candidate $candidate — wrong gate run?"
         return 1
+    fi
+    return 0
+}
+
+# ---- deployment gate (your-org/nexus-code#512) -----------------------------
+
+# _gate_default_pr_probe — print "number<TAB>path" lines, one per file of
+# every open PR on $GATE_REPO. rc non-zero on any query failure (mint,
+# network, gh) — the caller treats that as "cannot establish the restart
+# path is unclaimed" and DEFERS, per the fail-safe contract. Overridable
+# via CC_AUTO_GATE_PR_CMD (tests; also lets an operator wire a cache).
+_gate_default_pr_probe() {
+    local token
+    token=$("$MINT_CMD") || return 1
+    [[ -n "$token" ]] || return 1
+    GH_TOKEN="$token" "$GH_CMD" pr list --repo "$GATE_REPO" --state open \
+        --json number,files \
+        --jq '.[] | .number as $n | .files[].path | "\($n)\t\(.)"'
+}
+
+# _gate_live_agent_windows — print the live tmux window names that count
+# as agents-at-risk (everything except the orchestrator, this routine's
+# own evaluator + watchdog windows, and the GATE_WINDOW_EXEMPT set).
+_gate_live_agent_windows() {
+    local names w e keep
+    names=$("$TMUX_CMD" list-windows -F '#{window_name}' 2>/dev/null) || return 0
+    while IFS= read -r w; do
+        [[ -n "$w" ]] || continue
+        keep=1
+        for e in "$TARGET_WINDOW" "$WATCHDOG_WINDOW" "$CC_AUTO_WINDOW"; do
+            [[ "$w" == "$e" ]] && { keep=0; break; }
+        done
+        if (( keep )); then
+            local IFS=','
+            for e in $GATE_WINDOW_EXEMPT; do
+                [[ "$w" == "$e" ]] && { keep=0; break; }
+            done
+        fi
+        (( keep )) && printf '%s\n' "$w"
+    done <<<"$names"
+    return 0
+}
+
+# _deployment_gate <candidate> — rc 0: proceed. rc 1: DEFER the apply
+# (nothing bumped; the caller records + exits 30). Every deferral is a
+# complete result — the verdict stands recorded and the next daily fire
+# retries once conditions clear.
+#
+# Also records clone staleness vs origin/main (nexus-code#511's actual
+# gap): `decisions.tsv` used to read `target-window-unresolved=…` as if
+# it were a code bug while the live clone was 114 commits behind the fix.
+# One `behind_main=N` field collapses that whole misdiagnosis class.
+# Staleness is WARN-only, deliberately: a stale clone runs the stale
+# apply.sh regardless, so a defer here could never have protected the
+# incident tree — surfacing is what was missing.
+_deployment_gate() {
+    local candidate="$1"
+
+    # 1. Clone staleness (warn + record, never defer).
+    local behind="unknown"
+    if [[ -d "$NEXUS_ROOT/.git" ]] && command -v git >/dev/null 2>&1; then
+        timeout 10 git -C "$NEXUS_ROOT" fetch --quiet origin main >/dev/null 2>&1 || true
+        behind=$(git -C "$NEXUS_ROOT" rev-list --count HEAD..origin/main 2>/dev/null) || behind="unknown"
+    fi
+    if [[ "$behind" =~ ^[0-9]+$ ]] && (( behind > 0 )); then
+        note "WARN deployment-gate: this clone is $behind commits behind origin/main — the apply.sh executing right now may predate merged fixes. Deploy: git -C $NEXUS_ROOT pull --ff-only origin main"
+        notify "cc-auto-update: clone is $behind commits behind origin/main — merged fixes are not deployed"
+    fi
+
+    # 2. Open PRs touching the watcher restart path. The restart being
+    #    under repair is EXACTLY when an autonomous restart must not fire
+    #    (2026-07-10: the evaluator restarted the watcher while PR #503 —
+    #    open precisely because that restart path decapitates — sat
+    #    unmerged with 15 agents mid-flight).
+    local pr_lines
+    if ! pr_lines=$("${CC_AUTO_GATE_PR_CMD:-_gate_default_pr_probe}" 2>/dev/null); then
+        note "DEFER: deployment-gate could not query open PRs on $GATE_REPO — cannot establish the restart path is unclaimed; deferring the apply (retried at the next daily fire)"
+        record_outcome "$candidate" "safe-deferred" "restart-path-pr-query-failed behind_main=$behind"
+        return 1
+    fi
+    local hits="" prn path gp
+    while IFS=$'\t' read -r prn path; do
+        [[ -n "$prn" && -n "$path" ]] || continue
+        local IFS=','
+        for gp in $GATE_RESTART_PATHS; do
+            if [[ "$path" == "$gp" ]]; then
+                case " $hits " in *" PR$prn "*) ;; *) hits="${hits:+$hits }PR$prn" ;; esac
+            fi
+        done
+    done <<<"$pr_lines"
+    if [[ -n "$hits" ]]; then
+        note "DEFER: open PR(s) touch the watcher restart path ($hits on $GATE_REPO) — the restart mechanics are under repair; deferring the apply. A recorded, unapplied safe-to-bump is a complete result."
+        record_outcome "$candidate" "safe-deferred" "deferred-pending-${hits// /,} behind_main=$behind"
+        notify "cc-auto-update: $candidate is safe but the apply is DEFERRED — $hits touches the watcher restart path"
+        return 1
+    fi
+
+    # 3. Live agent windows. Restarting the watcher under N mid-flight
+    #    agents is a different risk from restarting an idle nexus; the
+    #    threshold is explicit and the count is always in the record.
+    local windows count
+    windows=$(_gate_live_agent_windows)
+    count=$(awk 'NF { n++ } END { print n+0 }' <<<"$windows")
+    note "deployment-gate: live agent windows=$count (max=$GATE_MAX_LIVE_WINDOWS) behind_main=$behind restart-path PRs: none"
+    _cc_auto_log_decision "$AUTO_DIR" "$candidate" "deployment-gate" \
+        "live_windows=$count behind_main=$behind restart_path_prs=none"
+    if (( GATE_MAX_LIVE_WINDOWS > 0 )) && (( count > GATE_MAX_LIVE_WINDOWS )); then
+        note "DEFER: $count live agent windows > max $GATE_MAX_LIVE_WINDOWS ($(tr '\n' ' ' <<<"$windows")) — deferring the apply to a quieter fire"
+        record_outcome "$candidate" "safe-deferred" "live-windows=$count>max=$GATE_MAX_LIVE_WINDOWS behind_main=$behind"
+        notify "cc-auto-update: $candidate is safe but the apply is DEFERRED — $count agent windows in flight (max $GATE_MAX_LIVE_WINDOWS)"
+        return 1
+    fi
+    return 0
+}
+
+# _watcher_restart_invariant <old_pid> <old_pgid> — post-restart invariant
+# (nexus-code#512 item 3): survivors of the OLD watcher's process group
+# must be 0, and at most one live watcher group may exist for this root.
+# "The restart happened to be clean" is not evidence that it is safe —
+# emit the invariant and fail LOUD when violated, instead of discovering
+# a duplicate-emit storm later. Read-only (ps); never kills anything.
+# rc 0 = holds (or unobservable — WARNed, not failed); rc 1 = violated.
+_watcher_restart_invariant() {
+    local old_pid="$1" old_pgid="$2"
+    command -v ps >/dev/null 2>&1 || {
+        note "WARN restart-invariant: ps unavailable — invariant unobservable"
+        return 0
+    }
+    # Give TERM'd stragglers of the old group a bounded settle window
+    # (tries tunable for tests via CC_AUTO_INVARIANT_TRIES).
+    local tries=0 survivors=0 ps_out
+    local max_tries="${CC_AUTO_INVARIANT_TRIES:-5}"
+    while :; do
+        ps_out=$(ps -eo pgid=,pid=,args= 2>/dev/null || true)
+        survivors=0
+        if [[ "$old_pgid" =~ ^[0-9]+$ ]]; then
+            survivors=$(awk -v g="$old_pgid" '$1 == g { n++ } END { print n+0 }' <<<"$ps_out")
+        fi
+        (( survivors == 0 )) && break
+        (( tries >= max_tries )) && break
+        tries=$(( tries + 1 ))
+        sleep 2
+    done
+    # Distinct live watcher groups for THIS root — absolute-path match on
+    # the args column (never a suffix: /tmp test fixtures stay invisible).
+    local groups
+    groups=$(awk -v p="$NEXUS_ROOT/monitor/watcher/main.sh" \
+        'index($0, p) { print $1 }' <<<"$ps_out" | sort -u | grep -c . || true)
+    [[ "$groups" =~ ^[0-9]+$ ]] || groups=0
+    if (( survivors > 0 )) || (( groups > 1 )); then
+        note "restart-invariant VIOLATED: old-pgid(${old_pgid:-?}) survivors=$survivors, live watcher groups=$groups (want 0 and exactly 1) — two watchers racing monitor/.state is the #491/#503 decapitation class"
+        return 1
+    fi
+    if (( groups == 0 )); then
+        # The launcher's own post-spawn verification owns "did it come
+        # up"; an empty match here is a fixture/probe limitation, not a
+        # duplicate hazard — WARN, do not fail.
+        note "WARN restart-invariant: no live watcher group matched $NEXUS_ROOT/monitor/watcher/main.sh (unobservable in this environment); survivors=0 held"
+    else
+        note "restart-invariant holds: old-group survivors=0, exactly one live watcher group"
     fi
     return 0
 }
@@ -276,6 +521,14 @@ cmd_safe() {
         exit 7
     fi
     trap 'rmdir "$AUTO_DIR/apply.lock" 2>/dev/null || true' EXIT
+
+    # ---- deployment gate (nexus-code#512): is restarting SAFE right now?
+    # Runs before any state mutation, so a deferral leaves nothing
+    # half-applied. Distinct from the release gate above: that one vetted
+    # the BINARY; this one vets the ACT of deploying it.
+    if ! _deployment_gate "$candidate"; then
+        exit 30
+    fi
 
     # ---- GUIDE Step 5: pin bump + local install + watcher restart ----
     # Snapshot prior pin for rollback.
@@ -322,7 +575,12 @@ cmd_safe() {
     # Watcher restart so FUTURE spawns (and the Step-5b respawn) load
     # the new binary. Ordering per GUIDE: this MUST precede the
     # orchestrator kill so the watcher serving the recovery runs
-    # current code.
+    # current code. Snapshot the OLD watcher's identity first — the
+    # post-restart invariant below needs it.
+    local old_wpid="" old_wpgid=""
+    old_wpid=$(tr -d '[:space:]' < "$STATE_DIR/watcher.pid" 2>/dev/null || true)
+    [[ "$old_wpid" =~ ^[0-9]+$ ]] \
+        && old_wpgid=$(ps -o pgid= -p "$old_wpid" 2>/dev/null | tr -d '[:space:]')
     local watcher_rc=0
     if [[ -n "${CC_AUTO_WATCHER_RESTART_CMD:-}" ]]; then
         # shellcheck disable=SC2086 — operator/test override is a command line
@@ -337,6 +595,17 @@ cmd_safe() {
         exit 6
     fi
     note "safe: watcher restarted onto $candidate"
+
+    # Post-restart invariant (nexus-code#512): do not TREAT a restart as
+    # clean — OBSERVE that it was. A violation means two watcher trees
+    # may be racing monitor/.state; handing the orchestrator restart off
+    # into that world would compound it.
+    if ! _watcher_restart_invariant "$old_wpid" "$old_wpgid"; then
+        record_outcome "$candidate" "safe-bumped-restart-invariant-violated" \
+            "old_pid=${old_wpid:-?} old_pgid=${old_wpgid:-?}"
+        notify "cc-auto-update: $candidate applied but the watcher restart VIOLATED the post-restart invariant (old-group survivors or duplicate groups) — inspect before anything else restarts"
+        exit 31
+    fi
 
     # ---- GUIDE Step 5b: orchestrator restart under watchdog ----------
     # Pre-flight: the session pin is the whole seamlessness story. A
@@ -376,6 +645,9 @@ cmd_safe() {
     # also lets the operator raise the idle cap freely so a natural idle
     # is caught first (minimizing token-repeat) without risking timeout.
     local detached_log="$AUTO_DIR/detached-restart.log"
+    # Explicit mode at creation (your-org/nexus-code#484) — both branches
+    # below open this log with a bare `>>`.
+    _ensure_service_log "$detached_log"
     if [[ "${CC_AUTO_RESTART_INLINE:-0}" == "1" ]]; then
         # Test seam: run the restart synchronously in a subshell. `trap -
         # EXIT` clears the inherited apply.lock-cleanup trap so the
@@ -425,6 +697,35 @@ cmd_restart_orchestrator() {
     mkdir -p "$AUTO_DIR" 2>/dev/null || true
     printf '%s\n' "$BASHPID" > "$STATE_DIR/restart-orchestrator.pid" 2>/dev/null || true
 
+    # A SIGTERM to this detached process is a DELIBERATE abort — it is
+    # setsid-disowned, so nothing routine signals it. Pre-#513, dying
+    # silently was indistinguishable from a crash, and the dead pid is
+    # precisely what re-opens the reconcile's single-flight guard: the
+    # abort CAUSED the refire (2026-07-10: SIGTERM at 04:08, auto-refire
+    # at 04:09:55, and again every cooldown until a pin revert). Write
+    # the durable hold for THIS candidate before dying — "stopped on
+    # purpose" stays stopped; a NEWER candidate re-arms (until_version).
+    _restart_abort_to_hold() {
+        if _cc_auto_write_restart_hold "$AUTO_DIR" \
+                "sigterm-detached-restart pid=$BASHPID" "" "$candidate"; then
+            note "SIGTERM: detached restart deliberately aborted — restart-hold written (until_version=$candidate); the reconcile will NOT re-fire for this candidate. Release: $SELF_PATH unhold"
+        else
+            note "SIGTERM: detached restart aborted but the restart-hold could NOT be written — the reconcile WILL re-fire after its cooldown; write the hold manually ($SELF_PATH hold --reason …)"
+        fi
+        record_outcome "$candidate" "safe-bumped-restart-aborted" "sigterm-hold-written"
+        notify "cc-auto-update: detached orchestrator restart SIGTERMed — hold set for $candidate (release: unhold)"
+        exit 25
+    }
+    trap '_restart_abort_to_hold' TERM
+
+    # Hold pre-flight (nexus-code#513): a held restart does not wait,
+    # does not arm, does not kill.
+    if _cc_auto_restart_hold_active "$AUTO_DIR" "$candidate"; then
+        note "ABORT restart: restart-hold active ($(_cc_update_field "$AUTO_DIR/restart-hold" reason 2>/dev/null || echo '?')) — not waiting, not killing. Bump itself is complete. Release: $SELF_PATH unhold"
+        record_outcome "$candidate" "safe-bumped-restart-held" "hold-pre-wait"
+        exit 25
+    fi
+
     local pin_file="$STATE_DIR/orchestrator-session-id"
     local jsonl="$PROJECTS_DIR/$(_slug "$NEXUS_ROOT")/$sid.jsonl"
 
@@ -466,13 +767,18 @@ cmd_restart_orchestrator() {
         exit 24
     fi
 
-    # Wait for the orchestrator to be IDLE: killing mid-turn discards the
-    # in-flight turn's tokens. monitor/pane-state.sh is the only sanctioned
-    # classifier (autosuggest renders identically to typed input) — and it
-    # is INDEX-keyed, so resolve the window NAME → index. A name that
-    # resolves to no live tmux window is a hard error: we cannot read the
-    # idle state, and a kill without a readable state would risk killing a
-    # window that isn't the orchestrator. Fail loud (23), do NOT kill blind.
+    # Wait for the orchestrator to reach a TURN BOUNDARY: killing
+    # mid-turn discards the in-flight turn's tokens. monitor/pane-state.sh
+    # is the only sanctioned classifier (autosuggest renders identically
+    # to typed input) — and it is INDEX-keyed, so resolve the window NAME
+    # → index. A name that resolves to no live tmux window is a hard
+    # error: we cannot read the idle state, and a kill without a readable
+    # state would risk killing a window that isn't the orchestrator. Fail
+    # loud (23), do NOT kill blind.
+    #
+    # The gate accepts every turn-boundary verdict, not just the literal
+    # `idle` — which a Monitor-holding orchestrator can NEVER produce
+    # (nexus-code#514; see _restart_eligible above).
     #
     # On reaching the IDLE_WAIT cap we do NOT defer (the old exit-20 bug:
     # during active drives the orchestrator was never idle, so the restart
@@ -480,8 +786,13 @@ cmd_restart_orchestrator() {
     # the operator decision we FORCE-restart instead: the pinned session
     # resumes from its transcript, so a mid-turn kill only re-runs the
     # interrupted turn (some repeated token generation), never lost work.
-    # Force applies ONLY to the readable-but-busy case with a valid pin —
-    # the aborts above/below stay aborts.
+    # Force applies ONLY when the classifier POSITIVELY resolved the pane
+    # at least once during the wait (busy, user-typing, a shell-driven
+    # working-background, …). A wait that saw NOTHING but `state=empty`
+    # never established what the pane is doing — force-killing on a
+    # verdict that never resolved would kill an unknown, so it aborts
+    # loud (23) instead and the reconcile retries after its cooldown
+    # (nexus-code#514 item 3). The aborts above/below stay aborts.
     #
     # Re-resolve the index INSIDE the loop, every poll — do NOT cache it
     # across the (up to IDLE_WAIT-long) wait. The index is only stable
@@ -495,7 +806,7 @@ cmd_restart_orchestrator() {
     # <name>`'s own lowest-index resolution, so the read pane and the
     # killed pane stay the same window; persistent duplicate orchestrators
     # are in any case reaped by the watcher's _respawn.sh dedup.)
-    local waited=0 st="" raw="" target_idx="" forced=0
+    local waited=0 st="" raw="" target_idx="" forced=0 resolved_seen=0
     while :; do
         target_idx=$(_resolve_target_index "$TARGET_WINDOW")
         if [[ -z "$target_idx" ]]; then
@@ -520,9 +831,16 @@ cmd_restart_orchestrator() {
             notify "cc-auto-update: orchestrator restart aborted ($candidate) — idle-state unreadable (idx=$target_idx); workspace is version-split"
             exit 23
         fi
-        [[ "$st" == "idle" ]] && break
+        [[ "$st" != "empty" ]] && resolved_seen=1
+        _restart_eligible "$st" "$raw" && break
         if (( waited >= IDLE_WAIT )); then
-            note "FORCE restart: orchestrator never idle within ${IDLE_WAIT}s (last state=$st) — restarting anyway per operator decision. The pinned session resumes from its transcript, so the mid-turn kill only re-runs the interrupted turn (repeated tokens), not lost work."
+            if (( resolved_seen == 0 )); then
+                note "ABORT restart: state=empty for the ENTIRE ${IDLE_WAIT}s wait — the classifier never positively resolved this pane to busy OR to a turn boundary. Refusing to force-kill on a verdict that was never established; the reconcile retries after its cooldown, and a turn boundary now satisfies the eligibility gate. Bump itself is complete."
+                record_outcome "$candidate" "safe-bumped-restart-aborted" "never-resolved-empty-at-cap idx=$target_idx"
+                notify "cc-auto-update: orchestrator restart aborted ($candidate) — pane never positively resolved within ${IDLE_WAIT}s; will retry"
+                exit 23
+            fi
+            note "FORCE restart: orchestrator not at a turn boundary within ${IDLE_WAIT}s (last state=$st) — restarting anyway per operator decision. The pinned session resumes from its transcript, so the mid-turn kill only re-runs the interrupted turn (repeated tokens), not lost work."
             forced=1
             break
         fi
@@ -532,7 +850,7 @@ cmd_restart_orchestrator() {
     if (( forced )); then
         note "restart: idle-wait cap (${IDLE_WAIT}s) reached, orchestrator busy — FORCE-restarting (window index $target_idx); arming the restart watchdog"
     else
-        note "restart: orchestrator idle (window index $target_idx) — arming the restart watchdog"
+        note "restart: orchestrator at a turn boundary (state=$st, window index $target_idx) — arming the restart watchdog"
     fi
 
     # Fire-time pre-flight #2 (after the up-to-IDLE_WAIT wait, BEFORE we
@@ -550,6 +868,14 @@ cmd_restart_orchestrator() {
         note "NO-OP restart: orchestrator came up on $candidate on its own during the wait — NOT killing."
         record_outcome "$candidate" "safe-bumped-restart-noop" "already-on-candidate-at-fire sid=$sid"
         exit 24
+    fi
+    # A hold can arrive DURING the (up to IDLE_WAIT-long) wait — an
+    # operator writing it is precisely how "do not kill what you are
+    # about to kill" is said to a detached process (nexus-code#513).
+    if _cc_auto_restart_hold_active "$AUTO_DIR" "$candidate"; then
+        note "ABORT restart: restart-hold arrived during the wait — NOT killing. Bump itself is complete. Release: $SELF_PATH unhold"
+        record_outcome "$candidate" "safe-bumped-restart-held" "hold-at-fire"
+        exit 25
     fi
 
     # Watchdog worker (REQUIRED by GUIDE Step 5b — a script can detect,
@@ -708,6 +1034,69 @@ cmd_block() {
     exit 0
 }
 
+# ---- verbs: hold / unhold / hold-status (your-org/nexus-code#513) ----------
+# The durable, tick-checked representation of "this restart is
+# deliberately held". The RUNNING watcher's reconcile honours it every
+# pass, and the detached restart re-checks it before the kill — unlike
+# `monitor.cc_auto_update.enabled`, which is read ONCE at watcher startup
+# and is inert on a live watcher. Shell-portable by design: the
+# 2026-07-10 workaround (hand-sourcing _cc-version.sh for a pin revert)
+# silently no-op'd under zsh.
+
+cmd_hold() {
+    local reason="" ttl="" until_version=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --reason)        reason="$2"; shift 2 ;;
+            --ttl-seconds)   ttl="$2"; shift 2 ;;
+            --until-version) until_version="$2"; shift 2 ;;
+            *) note "hold: unknown arg $1"; exit 2 ;;
+        esac
+    done
+    [[ -n "$reason" ]] || { note "hold: --reason required (the hold is read by humans and audit rows)"; exit 2; }
+    local expires=""
+    if [[ -n "$ttl" ]]; then
+        [[ "$ttl" =~ ^[0-9]+$ ]] || { note "hold: --ttl-seconds must be an integer"; exit 2; }
+        expires=$(( $(date +%s) + ttl ))
+    fi
+    if ! _cc_auto_write_restart_hold "$AUTO_DIR" "$reason" "$expires" "$until_version"; then
+        note "hold: FAILED to write $AUTO_DIR/restart-hold"
+        exit 1
+    fi
+    note "hold: restart-hold set (reason=$reason${expires:+ expires=$(date -d "@$expires" -Is 2>/dev/null || echo "$expires")}${until_version:+ until_version=$until_version}). The reconcile will log 'reconcile-held' once and stay silent; release with: $SELF_PATH unhold"
+    notify "cc-auto-update: orchestrator restart HELD ($reason)"
+    exit 0
+}
+
+cmd_unhold() {
+    if [[ ! -f "$AUTO_DIR/restart-hold" ]]; then
+        note "unhold: no restart-hold present — nothing to release"
+        exit 0
+    fi
+    rm -f "$AUTO_DIR/restart-hold" "$AUTO_DIR/reconcile-held.acked" 2>/dev/null || true
+    _cc_auto_log_decision "$AUTO_DIR" "-" "restart-hold-released" "by=unhold"
+    note "unhold: restart-hold released — the reconcile may fire again after its cooldown"
+    notify "cc-auto-update: restart-hold released"
+    exit 0
+}
+
+cmd_hold_status() {
+    local f="$AUTO_DIR/restart-hold"
+    if [[ ! -f "$f" ]]; then
+        printf 'no hold\n'
+        exit 1
+    fi
+    cat "$f"
+    local effective
+    effective=$(cc_version_effective "$NEXUS_ROOT/package.json" "$PACKAGE" "$NEXUS_ROOT" 2>/dev/null || true)
+    if [[ -n "$effective" ]] && _cc_auto_restart_hold_active "$AUTO_DIR" "$effective"; then
+        printf 'status=ACTIVE (effective=%s)\n' "$effective"
+        exit 0
+    fi
+    printf 'status=EXPIRED/inactive (effective=%s)\n' "${effective:-unresolvable}"
+    exit 1
+}
+
 # ---- verb: record-outcome ---------------------------------------------------
 
 cmd_record_outcome() {
@@ -733,5 +1122,8 @@ case "$verb" in
     compat-pr)            cmd_compat_pr "$@" ;;
     block)                cmd_block "$@" ;;
     record-outcome)       cmd_record_outcome "$@" ;;
+    hold)                 cmd_hold "$@" ;;
+    unhold)               cmd_unhold "$@" ;;
+    hold-status)          cmd_hold_status "$@" ;;
     *)                    usage ;;
 esac

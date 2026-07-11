@@ -129,14 +129,26 @@ key="MOCK_PANE_STATE_${win//[^a-zA-Z0-9_]/_}"
 reset_key="MOCK_PANE_RESET_AT_${win//[^a-zA-Z0-9_]/_}"
 orphan_key="MOCK_ORPHAN_KINDS_${win//[^a-zA-Z0-9_]/_}"
 hash_key="MOCK_CONTENT_HASH_${win//[^a-zA-Z0-9_]/_}"
+bgcpu_key="MOCK_BG_CPU_${win//[^a-zA-Z0-9_]/_}"
+bgshells_key="MOCK_BG_SHELLS_${win//[^a-zA-Z0-9_]/_}"
+bgrel_key="MOCK_BG_RELIABLE_${win//[^a-zA-Z0-9_]/_}"
+bgold_key="MOCK_BG_OLDEST_START_${win//[^a-zA-Z0-9_]/_}"
 state="${!key:-busy}"
 reset_at="${!reset_key:-}"
 orphan_kinds="${!orphan_key:-}"
 content_hash="${!hash_key:-}"
+bg_cpu="${!bgcpu_key:-}"
+bg_shells="${!bgshells_key:-}"
+bg_reliable="${!bgrel_key:-}"
+bg_oldest_start="${!bgold_key:-}"
 extras=""
 [[ -n "$reset_at" ]]      && extras+=" reset_at=$reset_at"
 [[ -n "$orphan_kinds" ]]  && extras+=" orphan_kinds=$orphan_kinds"
 [[ -n "$content_hash" ]]  && extras+=" content_hash=$content_hash"
+[[ -n "$bg_shells" ]]     && extras+=" bg_shells=$bg_shells"
+[[ -n "$bg_reliable" ]]   && extras+=" bg_reliable=$bg_reliable"
+[[ -n "$bg_cpu" ]]        && extras+=" bg_cpu=$bg_cpu"
+[[ -n "$bg_oldest_start" ]] && extras+=" bg_oldest_start=$bg_oldest_start"
 printf 'state=%s%s\n' "$state" "$extras"
 exit 0
 STUB
@@ -712,6 +724,559 @@ assert_not_contains "working-background suppressed from idle pool" "$out" \
     "wbgw"
 assert_not_contains "working-self-paced suppressed from idle pool" "$out" \
     "wspw"
+
+# ---- background-compute orphan-grace (your-org/nexus-code#445) -----------
+#
+# A SHELL-driven working-background carries bg_cpu=<jiffies>. While the
+# jiffies advance the worker is genuinely computing (exempt); once they
+# FREEZE past the orphan grace the shell is orphaned and the window
+# falls back to normal idle classification (reapable). A Monitor-handle
+# working-background carries NO bg_cpu and is never capped.
+echo '=== background-compute orphan-grace (#445) ==='
+export MONITOR_BACKGROUND_ORPHAN_GRACE_SECONDS=60
+
+# (a) Live compute: bg_cpu ADVANCED vs a stored (old-epoch) sample →
+#     the progress clock resets → still exempt (suppressed), even though
+#     the stored progress epoch was well past the grace. Proves a live
+#     compute worker is NEVER false-flagged idle.
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'wbglive|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+mkdir -p "$STATE_DIR/background-progress"
+printf '%s\t%s\n' 900 "$(( NOW - 3600 ))" > "$STATE_DIR/background-progress/wbglive"
+export MOCK_PANE_STATE_wbglive=working-background
+export MOCK_BG_CPU_wbglive=1000   # 1000 != stored 900 → progress
+run_probe_capture out rc 'list_really_idle_workers'
+assert_not_contains "advancing bg_cpu → live compute stays exempt" "$out" \
+    "wbglive"
+
+# (b) Orphaned shell: bg_cpu FROZEN (== stored) with the stored epoch
+#     past the grace → stalled → falls back to normal classification →
+#     surfaces as no-wrap-up (reapable). This is the truly-orphaned
+#     background shell the cap exists to reap.
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"
+unset MOCK_PANE_STATE_wbglive MOCK_BG_CPU_wbglive
+export MOCK_TMUX_WINDOWS="$(printf 'wbgorph|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+mkdir -p "$STATE_DIR/background-progress"
+printf '%s\t%s\n' 500 "$(( NOW - 3600 ))" > "$STATE_DIR/background-progress/wbgorph"
+export MOCK_PANE_STATE_wbgorph=working-background
+export MOCK_BG_CPU_wbgorph=500    # 500 == stored → frozen past grace
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "frozen bg_cpu past grace → reapable (no-wrap-up)" "$out" \
+    $'wbgorph\tno-wrap-up'
+
+# (c) Frozen bg_cpu but WITHIN grace → still exempt (a normal
+#     think-pause between poll iterations must not reap a live worker).
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"
+unset MOCK_PANE_STATE_wbgorph MOCK_BG_CPU_wbgorph
+export MOCK_TMUX_WINDOWS="$(printf 'wbgfresh|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+mkdir -p "$STATE_DIR/background-progress"
+printf '%s\t%s\n' 700 "$(( NOW - 10 ))" > "$STATE_DIR/background-progress/wbgfresh"
+export MOCK_PANE_STATE_wbgfresh=working-background
+export MOCK_BG_CPU_wbgfresh=700   # frozen, but stored epoch only 10s old
+run_probe_capture out rc 'list_really_idle_workers'
+assert_not_contains "frozen bg_cpu within grace → still exempt" "$out" \
+    "wbgfresh"
+
+# (d) working-background WITHOUT bg_cpu (Monitor-handle) is never capped
+#     even with a stale progress file present — absence of bg_cpu means
+#     "uncapped". Guards against a Monitor await being reaped.
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"
+unset MOCK_PANE_STATE_wbgfresh MOCK_BG_CPU_wbgfresh
+export MOCK_TMUX_WINDOWS="$(printf 'wbgmon|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+mkdir -p "$STATE_DIR/background-progress"
+printf '%s\t%s\n' 0 "$(( NOW - 3600 ))" > "$STATE_DIR/background-progress/wbgmon"
+export MOCK_PANE_STATE_wbgmon=working-background   # no MOCK_BG_CPU_wbgmon
+run_probe_capture out rc 'list_really_idle_workers'
+assert_not_contains "monitor-handle working-background never capped" "$out" \
+    "wbgmon"
+unset MOCK_PANE_STATE_wbgmon MONITOR_BACKGROUND_ORPHAN_GRACE_SECONDS
+
+# ---- idle-with-children long timeout + inconsistency (#455 refine) --------
+#
+# An AUTHORITATIVE working-background reading (bg_reliable=1, bg_shells>=1)
+# whose child CPU has FROZEN past base earns an exponentially-backing-off
+# long timeout instead of the flat #445 orphan reap. A wrapped worker that
+# still has a live child surfaces as the wrapped-with-children inconsistency.
+# The worker-health file overrides the grace decision.
+echo '=== idle-with-children backoff + inconsistency (#455 refine) ==='
+# Small, fast constants so the test does not need multi-hour epochs.
+export MONITOR_BG_CHILDREN_GRACE_BASE_SECONDS=60
+export MONITOR_BG_CHILDREN_INTERVAL_CAP_SECONDS=240
+export MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS=3600
+export MONITOR_WORKER_HEALTH_SLACK_SECONDS=10
+
+# Seed a frozen-child working-background window. Helper: pre-stamp the
+# background-progress file so the child CPU reads as frozen `age` seconds.
+# Uses LIVE `date +%s` (not the script-start NOW): the probe reads live time,
+# and the suite can take minutes to reach this section, so a fixed NOW would
+# inflate the effective stall age and make within/past-base asserts flaky.
+seed_frozen_child() {
+    local win="$1" age="$2" cpu="${3:-500}" n
+    n=$(date +%s)
+    mkdir -p "$STATE_DIR/background-progress"
+    printf '%s\t%s\n' "$cpu" "$(( n - age ))" > "$STATE_DIR/background-progress/$win"
+}
+clear_bg_state() {
+    rm -f "$STATE_DIR"/bg-backoff/* "$STATE_DIR"/worker-health/* \
+          "$STATE_DIR"/background-progress/* "$STATE_DIR"/bg-firstseen/* 2>/dev/null || true
+}
+
+# (a1) Frozen child WITHIN base → silently exempt (no surface, no reap).
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgc1|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgc1 30 500
+export MOCK_PANE_STATE_bgc1=working-background
+export MOCK_BG_SHELLS_bgc1=1 MOCK_BG_RELIABLE_bgc1=1 MOCK_BG_CPU_bgc1=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_not_contains "frozen child within base → silent exempt" "$out" "bgc1"
+
+# (a2) Frozen child PAST base, no health decl → first clarification nudge.
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"; clear_bg_state
+unset MOCK_PANE_STATE_bgc1 MOCK_BG_SHELLS_bgc1 MOCK_BG_RELIABLE_bgc1 MOCK_BG_CPU_bgc1
+export MOCK_TMUX_WINDOWS="$(printf 'bgc2|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgc2 120 500
+export MOCK_PANE_STATE_bgc2=working-background
+export MOCK_BG_SHELLS_bgc2=1 MOCK_BG_RELIABLE_bgc2=1 MOCK_BG_CPU_bgc2=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "frozen past base → idle-children-clarify" "$out" \
+    $'bgc2\tidle-children-clarify'
+assert_contains "clarify detail points at worker-health.sh" "$out" \
+    "worker-health.sh"
+
+# (a3) After the first nudge, a fresh cycle before the next interval →
+#      idle-awaiting-job (exempt, informational).
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"; clear_bg_state
+unset MOCK_PANE_STATE_bgc2 MOCK_BG_SHELLS_bgc2 MOCK_BG_RELIABLE_bgc2 MOCK_BG_CPU_bgc2
+export MOCK_TMUX_WINDOWS="$(printf 'bgc3|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgc3 120 500
+mkdir -p "$STATE_DIR/bg-backoff"
+# sig=1 matches child_count; level=1; last escalation 5s ago (< interval 120).
+# Live now so the elapsed-since-last stays below the interval under drift.
+printf '%s\t%s\t%s\n' 1 1 "$(( $(date +%s) - 5 ))" > "$STATE_DIR/bg-backoff/bgc3"
+export MOCK_PANE_STATE_bgc3=working-background
+export MOCK_BG_SHELLS_bgc3=1 MOCK_BG_RELIABLE_bgc3=1 MOCK_BG_CPU_bgc3=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "between nudges → idle-awaiting-job" "$out" \
+    $'bgc3\tidle-awaiting-job'
+
+# (a4) health=running with a live deadline → idle-awaiting-job (extend).
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"; clear_bg_state
+unset MOCK_PANE_STATE_bgc3 MOCK_BG_SHELLS_bgc3 MOCK_BG_RELIABLE_bgc3 MOCK_BG_CPU_bgc3
+export MOCK_TMUX_WINDOWS="$(printf 'bgc4|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgc4 120 500
+mkdir -p "$STATE_DIR/worker-health"
+cat > "$STATE_DIR/worker-health/bgc4.json" <<EOF
+{"window":"bgc4","job_kind":"slurm","job_id":"52527284","expected_runtime_s":100000,"health":"running","note":"DE sweep","written_at":$NOW}
+EOF
+export MOCK_PANE_STATE_bgc4=working-background
+export MOCK_BG_SHELLS_bgc4=1 MOCK_BG_RELIABLE_bgc4=1 MOCK_BG_CPU_bgc4=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "health=running within deadline → idle-awaiting-job" "$out" \
+    $'bgc4\tidle-awaiting-job'
+assert_contains "awaiting-job detail cites declared runtime" "$out" "running"
+
+# (a5) health=running but declared runtime elapsed → resume nudging.
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"; clear_bg_state
+unset MOCK_PANE_STATE_bgc4 MOCK_BG_SHELLS_bgc4 MOCK_BG_RELIABLE_bgc4 MOCK_BG_CPU_bgc4
+export MOCK_TMUX_WINDOWS="$(printf 'bgc5|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgc5 120 500
+mkdir -p "$STATE_DIR/worker-health"
+cat > "$STATE_DIR/worker-health/bgc5.json" <<EOF
+{"window":"bgc5","job_kind":"slurm","expected_runtime_s":30,"health":"running","written_at":$(( NOW - 3600 ))}
+EOF
+export MOCK_PANE_STATE_bgc5=working-background
+export MOCK_BG_SHELLS_bgc5=1 MOCK_BG_RELIABLE_bgc5=1 MOCK_BG_CPU_bgc5=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "declared runtime elapsed → resume clarify" "$out" \
+    $'bgc5\tidle-children-clarify'
+
+# (a6) health=stuck → idle-children-clarify (stuck).
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"; clear_bg_state
+unset MOCK_PANE_STATE_bgc5 MOCK_BG_SHELLS_bgc5 MOCK_BG_RELIABLE_bgc5 MOCK_BG_CPU_bgc5
+export MOCK_TMUX_WINDOWS="$(printf 'bgc6|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgc6 120 500
+mkdir -p "$STATE_DIR/worker-health"
+cat > "$STATE_DIR/worker-health/bgc6.json" <<EOF
+{"window":"bgc6","health":"stuck","note":"sbatch --wait never returned","written_at":$NOW}
+EOF
+export MOCK_PANE_STATE_bgc6=working-background
+export MOCK_BG_SHELLS_bgc6=1 MOCK_BG_RELIABLE_bgc6=1 MOCK_BG_CPU_bgc6=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "health=stuck → clarify" "$out" $'bgc6\tidle-children-clarify'
+assert_contains "stuck detail says STUCK" "$out" "STUCK"
+
+# (a7) health=done → idle-children-clarify (leftover children).
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"; clear_bg_state
+unset MOCK_PANE_STATE_bgc6 MOCK_BG_SHELLS_bgc6 MOCK_BG_RELIABLE_bgc6 MOCK_BG_CPU_bgc6
+export MOCK_TMUX_WINDOWS="$(printf 'bgc7|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgc7 120 500
+mkdir -p "$STATE_DIR/worker-health"
+cat > "$STATE_DIR/worker-health/bgc7.json" <<EOF
+{"window":"bgc7","health":"done","written_at":$NOW}
+EOF
+export MOCK_PANE_STATE_bgc7=working-background
+export MOCK_BG_SHELLS_bgc7=1 MOCK_BG_RELIABLE_bgc7=1 MOCK_BG_CPU_bgc7=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "health=done → clarify" "$out" $'bgc7\tidle-children-clarify'
+assert_contains "done detail says DONE/leftover" "$out" "DONE"
+
+# (a8) Frozen child past the HARD CEILING, no health → idle-too-long (reap).
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"; clear_bg_state
+unset MOCK_PANE_STATE_bgc7 MOCK_BG_SHELLS_bgc7 MOCK_BG_RELIABLE_bgc7 MOCK_BG_CPU_bgc7
+export MOCK_TMUX_WINDOWS="$(printf 'bgc8|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgc8 4000 500   # 4000 > ceiling 3600
+export MOCK_PANE_STATE_bgc8=working-background
+export MOCK_BG_SHELLS_bgc8=1 MOCK_BG_RELIABLE_bgc8=1 MOCK_BG_CPU_bgc8=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "frozen past ceiling → idle-too-long (reapable)" "$out" \
+    $'bgc8\tidle-too-long'
+
+# (a9) Unreliable reading (footer fallback, bg_reliable=0) → NOT the new
+#      classes; legacy #445 flat-grace path governs (here: within legacy
+#      grace → exempt).
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"; clear_bg_state
+unset MOCK_PANE_STATE_bgc8 MOCK_BG_SHELLS_bgc8 MOCK_BG_RELIABLE_bgc8 MOCK_BG_CPU_bgc8
+export MONITOR_BACKGROUND_ORPHAN_GRACE_SECONDS=100000
+export MOCK_TMUX_WINDOWS="$(printf 'bgc9|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgc9 4000 500
+export MOCK_PANE_STATE_bgc9=working-background
+export MOCK_BG_SHELLS_bgc9=1 MOCK_BG_RELIABLE_bgc9=0 MOCK_BG_CPU_bgc9=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_not_contains "unreliable reading → no new #455-refine classes" "$out" \
+    "idle-children-clarify"
+assert_not_contains "unreliable reading → no idle-awaiting-job" "$out" \
+    "idle-awaiting-job"
+unset MONITOR_BACKGROUND_ORPHAN_GRACE_SECONDS
+
+# (a10) READ-ONLY mode must NOT advance the backoff level or drop state —
+#       the prelude counts without stealing the section's clarify nudge.
+rm -f "$STATE_DIR/idle-state.tsv"; : > "$LOG"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgcro|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgcro 120 500
+export MOCK_PANE_STATE_bgcro=working-background
+export MOCK_BG_SHELLS_bgcro=1 MOCK_BG_RELIABLE_bgcro=1 MOCK_BG_CPU_bgcro=500
+# Read-only pass: still classifies as clarify (nudge due) but writes nothing.
+run_probe_capture out rc 'MONITOR_IDLE_PROBE_READONLY=1 list_really_idle_workers'
+assert_contains "readonly pass still classifies clarify" "$out" \
+    $'bgcro\tidle-children-clarify'
+assert_eq "readonly pass wrote NO backoff state" \
+    "$( [[ -f "$STATE_DIR/bg-backoff/bgcro" ]] && echo present || echo absent )" \
+    "absent"
+# Authoritative pass then commits the escalation.
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "authoritative pass classifies clarify" "$out" \
+    $'bgcro\tidle-children-clarify'
+assert_eq "authoritative pass wrote backoff state" \
+    "$( [[ -f "$STATE_DIR/bg-backoff/bgcro" ]] && echo present || echo absent )" \
+    "present"
+unset MOCK_PANE_STATE_bgcro MOCK_BG_SHELLS_bgcro MOCK_BG_RELIABLE_bgcro MOCK_BG_CPU_bgcro
+
+# (b1) Wrapped worker WITH a live child → wrapped-with-children inconsistency.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+unset MOCK_PANE_STATE_bgc9 MOCK_BG_SHELLS_bgc9 MOCK_BG_RELIABLE_bgc9 MOCK_BG_CPU_bgc9
+LOG="$STATE_DIR/action-log.jsonl"
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"7","window":"bgw1","report":"bgw1_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgw1|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgw1 30 500   # even a NON-frozen child would surface; use recent
+export MOCK_PANE_STATE_bgw1=working-background
+export MOCK_BG_SHELLS_bgw1=1 MOCK_BG_RELIABLE_bgw1=1 MOCK_BG_CPU_bgw1=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "wrapped + live child → wrapped-with-children" "$out" \
+    $'bgw1\twrapped-with-children'
+
+# (b2) wrapped-with-children fires even when the child CPU is ADVANCING
+#      (the strongest inconsistency — wrapped while a job actively runs).
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+unset MOCK_PANE_STATE_bgw1 MOCK_BG_SHELLS_bgw1 MOCK_BG_RELIABLE_bgw1 MOCK_BG_CPU_bgw1
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"8","window":"bgw2","report":"bgw2_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgw2|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+mkdir -p "$STATE_DIR/background-progress"
+printf '%s\t%s\n' 400 "$(( NOW - 3600 ))" > "$STATE_DIR/background-progress/bgw2"
+export MOCK_PANE_STATE_bgw2=working-background
+export MOCK_BG_SHELLS_bgw2=1 MOCK_BG_RELIABLE_bgw2=1 MOCK_BG_CPU_bgw2=999  # advancing
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "wrapped + advancing child → still wrapped-with-children" "$out" \
+    $'bgw2\twrapped-with-children'
+
+# (b3) A wrap-up SUPERSEDED by a newer machine submit (re-tasked) is NOT a
+#      wrapped state → case (a), not wrapped-with-children.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+unset MOCK_PANE_STATE_bgw2 MOCK_BG_SHELLS_bgw2 MOCK_BG_RELIABLE_bgw2 MOCK_BG_CPU_bgw2
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"9","window":"bgw3","report":"bgw3_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+mkdir -p "$STATE_DIR/machine-submit"
+echo "$NOW" > "$STATE_DIR/machine-submit/bgw3"   # re-tasked after wrap-up
+export MOCK_TMUX_WINDOWS="$(printf 'bgw3|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgw3 120 500
+export MOCK_PANE_STATE_bgw3=working-background
+export MOCK_BG_SHELLS_bgw3=1 MOCK_BG_RELIABLE_bgw3=1 MOCK_BG_CPU_bgw3=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_not_contains "re-tasked wrap → NOT wrapped-with-children" "$out" \
+    "wrapped-with-children"
+assert_contains "re-tasked wrap → case (a) clarify instead" "$out" \
+    $'bgw3\tidle-children-clarify'
+rm -f "$STATE_DIR/machine-submit/bgw3"
+unset MOCK_PANE_STATE_bgw3 MOCK_BG_SHELLS_bgw3 MOCK_BG_RELIABLE_bgw3 MOCK_BG_CPU_bgw3
+
+# (b4) A skeptic-PARKED worker is wrapped-with-children BY DESIGN: `ng wrap-up`
+#      is what writes the skeptic-pending marker, and the worker then holds its
+#      `skeptic-channel await` re-check loop in a background shell. That is the
+#      expected `parked-awaiting-skeptic` state, NOT an inconsistency.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"10","window":"bgw4","report":"bgw4_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgw4|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgw4 120 500
+mkdir -p "$STATE_DIR/skeptic/pending"
+echo 1 > "$STATE_DIR/skeptic/pending/bgw4"   # fresh marker → live park
+export MOCK_PANE_STATE_bgw4=working-background
+export MOCK_BG_SHELLS_bgw4=1 MOCK_BG_RELIABLE_bgw4=1 MOCK_BG_CPU_bgw4=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_not_contains "skeptic-parked + child → NOT wrapped-with-children" "$out" \
+    "wrapped-with-children"
+assert_contains "skeptic-parked + child → parked-awaiting-skeptic" "$out" \
+    $'bgw4\tparked-awaiting-skeptic'
+rm -f "$STATE_DIR/skeptic/pending/bgw4"
+unset MOCK_PANE_STATE_bgw4 MOCK_BG_SHELLS_bgw4 MOCK_BG_RELIABLE_bgw4 MOCK_BG_CPU_bgw4
+
+# (b5) Same shape, but the marker is STALE (the await loop died past the hang
+#      threshold) → the park lapses and the inconsistency surfaces again. This
+#      is what keeps the exemption from becoming an indefinite mute.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"11","window":"bgw5","report":"bgw5_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgw5|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgw5 120 500
+mkdir -p "$STATE_DIR/skeptic/pending"
+echo 1 > "$STATE_DIR/skeptic/pending/bgw5"
+touch -d '@1' "$STATE_DIR/skeptic/pending/bgw5" 2>/dev/null \
+    || touch -t 197001010000 "$STATE_DIR/skeptic/pending/bgw5"
+export MOCK_PANE_STATE_bgw5=working-background
+export MOCK_BG_SHELLS_bgw5=1 MOCK_BG_RELIABLE_bgw5=1 MOCK_BG_CPU_bgw5=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "stale skeptic marker → wrapped-with-children resurfaces" "$out" \
+    $'bgw5\twrapped-with-children'
+rm -f "$STATE_DIR/skeptic/pending/bgw5"
+unset MOCK_PANE_STATE_bgw5 MOCK_BG_SHELLS_bgw5 MOCK_BG_RELIABLE_bgw5 MOCK_BG_CPU_bgw5
+: > "$LOG"
+
+# ---- inverted priority: the exemption is BOUNDED (#455 follow-up) ---------
+#
+# "We'd rather misclassify and consider retiring a worker rather than having
+# it stick around forever." Every with-children exemption must therefore be
+# bounded by the hard ceiling: neither a `running` health declaration nor a
+# CPU-advancing child may suppress the window indefinitely. Past the ceiling
+# the window surfaces as a retire CANDIDATE — retire-preflight still gates the
+# kill.
+echo '=== bounded exemption: ceiling dominates health decl + CPU advance ==='
+
+# (c1) health=running with a declared runtime that would outlast the ceiling →
+#      the deadline is CLAMPED; past the ceiling the window surfaces
+#      idle-too-long instead of being extended forever.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgcap1|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgcap1 4000 500        # frozen 4000s > ceiling 3600
+mkdir -p "$STATE_DIR/worker-health"
+cat > "$STATE_DIR/worker-health/bgcap1.json" <<EOF
+{"window":"bgcap1","job_kind":"slurm","job_id":"52527999","expected_runtime_s":999999999,"health":"running","written_at":$(date +%s)}
+EOF
+export MOCK_PANE_STATE_bgcap1=working-background
+export MOCK_BG_SHELLS_bgcap1=1 MOCK_BG_RELIABLE_bgcap1=1 MOCK_BG_CPU_bgcap1=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "running decl past ceiling → idle-too-long (retire candidate)" "$out" \
+    $'bgcap1\tidle-too-long'
+assert_contains "ceiling row echoes the declaration for investigation" "$out" \
+    "worker declared running"
+unset MOCK_PANE_STATE_bgcap1 MOCK_BG_SHELLS_bgcap1 MOCK_BG_RELIABLE_bgcap1 MOCK_BG_CPU_bgcap1
+
+# (c2) health=running, within the ceiling, but the declared deadline exceeds
+#      it → still exempt this cycle, and the row says the deadline was clamped.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgcap2|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgcap2 120 500         # 120s ≪ ceiling 3600
+mkdir -p "$STATE_DIR/worker-health"
+cat > "$STATE_DIR/worker-health/bgcap2.json" <<EOF
+{"window":"bgcap2","job_kind":"slurm","expected_runtime_s":999999999,"health":"running","written_at":$(date +%s)}
+EOF
+export MOCK_PANE_STATE_bgcap2=working-background
+export MOCK_BG_SHELLS_bgcap2=1 MOCK_BG_RELIABLE_bgcap2=1 MOCK_BG_CPU_bgcap2=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "running decl within ceiling → still exempt" "$out" \
+    $'bgcap2\tidle-awaiting-job'
+assert_contains "over-long declaration is clamped to the ceiling" "$out" \
+    "clamped to ceiling"
+unset MOCK_PANE_STATE_bgcap2 MOCK_BG_SHELLS_bgcap2 MOCK_BG_RELIABLE_bgcap2 MOCK_BG_CPU_bgcap2
+
+# (c2b) A modest declaration that fits INSIDE the ceiling is honoured as-is —
+#       no clamp note, deadline is the worker's own.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgcap2b|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgcap2b 120 500
+mkdir -p "$STATE_DIR/worker-health"
+cat > "$STATE_DIR/worker-health/bgcap2b.json" <<EOF
+{"window":"bgcap2b","job_kind":"slurm","expected_runtime_s":600,"health":"running","written_at":$(date +%s)}
+EOF
+export MOCK_PANE_STATE_bgcap2b=working-background
+export MOCK_BG_SHELLS_bgcap2b=1 MOCK_BG_RELIABLE_bgcap2b=1 MOCK_BG_CPU_bgcap2b=500
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "in-ceiling declaration honoured → idle-awaiting-job" "$out" \
+    $'bgcap2b\tidle-awaiting-job'
+assert_not_contains "in-ceiling declaration is NOT clamped" "$out" "clamped to ceiling"
+unset MOCK_PANE_STATE_bgcap2b MOCK_BG_SHELLS_bgcap2b MOCK_BG_RELIABLE_bgcap2b MOCK_BG_CPU_bgcap2b
+
+# (c3) A CPU-ADVANCING child (a quiet polling loop) can never freeze, so the
+#      CPU-freeze clock resets every cycle. The EPISODE age, derived from the
+#      oldest live background shell's start time, cannot be reset that way:
+#      past the ceiling it surfaces as a retire candidate. This is the case
+#      the old "never false-idle a live worker" priority suppressed forever.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgcap3|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgcap3 0 500          # CPU advancing → freeze clock resets
+export MOCK_PANE_STATE_bgcap3=working-background
+export MOCK_BG_SHELLS_bgcap3=1 MOCK_BG_RELIABLE_bgcap3=1 MOCK_BG_CPU_bgcap3=999
+export MOCK_BG_OLDEST_START_bgcap3=$(( $(date +%s) - 4000 ))   # episode > ceiling
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "advancing child past ceiling → idle-too-long (bounded)" "$out" \
+    $'bgcap3\tidle-too-long'
+unset MOCK_PANE_STATE_bgcap3 MOCK_BG_SHELLS_bgcap3 MOCK_BG_RELIABLE_bgcap3 \
+      MOCK_BG_CPU_bgcap3 MOCK_BG_OLDEST_START_bgcap3
+
+# (c4) …but an advancing child WITHIN the ceiling stays silently exempt: the
+#      bound is a ceiling, not a new nag. No regression for live compute.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgcap4|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgcap4 0 500
+export MOCK_PANE_STATE_bgcap4=working-background
+export MOCK_BG_SHELLS_bgcap4=1 MOCK_BG_RELIABLE_bgcap4=1 MOCK_BG_CPU_bgcap4=999
+export MOCK_BG_OLDEST_START_bgcap4=$(( $(date +%s) - 100 ))
+run_probe_capture out rc 'list_really_idle_workers'
+assert_not_contains "advancing child within ceiling → still silent exempt" "$out" \
+    "bgcap4"
+unset MOCK_PANE_STATE_bgcap4 MOCK_BG_SHELLS_bgcap4 MOCK_BG_RELIABLE_bgcap4 \
+      MOCK_BG_CPU_bgcap4 MOCK_BG_OLDEST_START_bgcap4
+
+# (c5) CHURN in the child COUNT must NOT reset the ceiling. Background shells
+#      come and go routinely; an earlier cut keyed the episode clock on the
+#      count, so any fluctuation reset it and the worker could linger forever.
+#      The age is now derived from the OLDEST live shell, so the count is
+#      irrelevant: 1 → 3 → 1 → 5 children all still hit the ceiling.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgcap5|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgcap5 0 500
+export MOCK_PANE_STATE_bgcap5=working-background
+export MOCK_BG_RELIABLE_bgcap5=1 MOCK_BG_CPU_bgcap5=999
+export MOCK_BG_OLDEST_START_bgcap5=$(( $(date +%s) - 4000 ))
+for _n in 1 3 1 5; do
+    rm -f "$STATE_DIR/idle-state.tsv"
+    export MOCK_BG_SHELLS_bgcap5="$_n"
+    run_probe_capture out rc 'list_really_idle_workers'
+    assert_contains "child-count churn (n=$_n) does NOT reset the ceiling" "$out" \
+        $'bgcap5\tidle-too-long'
+done
+unset MOCK_PANE_STATE_bgcap5 MOCK_BG_SHELLS_bgcap5 MOCK_BG_RELIABLE_bgcap5 \
+      MOCK_BG_CPU_bgcap5 MOCK_BG_OLDEST_START_bgcap5
+
+# (c7) A NEW job (a fresh background shell) starts a fresh episode: its
+#      oldest-start is recent, so it is silently exempt rather than inheriting
+#      the previous job's age and surfacing as an instant false retire-candidate.
+#      This holds regardless of what the pane rendered in between — there is no
+#      stored clock to inherit.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgcap7|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgcap7 0 500
+export MOCK_PANE_STATE_bgcap7=working-background
+export MOCK_BG_SHELLS_bgcap7=1 MOCK_BG_RELIABLE_bgcap7=1 MOCK_BG_CPU_bgcap7=999
+export MOCK_BG_OLDEST_START_bgcap7=$(date +%s)   # brand-new shell
+run_probe_capture out rc 'list_really_idle_workers'
+assert_not_contains "new job does not inherit the old episode's age" "$out" \
+    $'bgcap7\tidle-too-long'
+unset MOCK_PANE_STATE_bgcap7 MOCK_BG_SHELLS_bgcap7 MOCK_BG_RELIABLE_bgcap7 \
+      MOCK_BG_CPU_bgcap7 MOCK_BG_OLDEST_START_bgcap7
+
+# (c8) GHOST-CYCLE REGRESSION (round-2 skeptic finding). `autosuggest-only` is
+#      emitted from pane-state's renderer ladder BEFORE the process tree is
+#      walked, so it carries no child information at all. An earlier cut treated
+#      it as an authoritative "no children" reading and deleted the stored
+#      episode clock — silently, before the idle-age gate, emitting no row. One
+#      dim autosuggest ghost per ~60 poll cycles was enough to suppress a window
+#      forever. With the age DERIVED from the process tree there is nothing to
+#      delete: a ghost cycle passes through and the next working-background
+#      cycle still reports the full episode age.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgghost|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgghost 0 500
+GHOST_START=$(( $(date +%s) - 4000 ))   # episode well past the 3600s ceiling
+# cycle 1: working-background, past ceiling → surfaces.
+export MOCK_PANE_STATE_bgghost=working-background
+export MOCK_BG_SHELLS_bgghost=1 MOCK_BG_RELIABLE_bgghost=1 MOCK_BG_CPU_bgghost=999
+export MOCK_BG_OLDEST_START_bgghost="$GHOST_START"
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "pre-ghost cycle surfaces at the ceiling" "$out" \
+    $'bgghost\tidle-too-long'
+# cycle 2: the GHOST — a dim autosuggest render, same live child underneath.
+rm -f "$STATE_DIR/idle-state.tsv"
+export MOCK_PANE_STATE_bgghost=autosuggest-only
+unset MOCK_BG_SHELLS_bgghost MOCK_BG_RELIABLE_bgghost MOCK_BG_OLDEST_START_bgghost
+run_probe_capture out rc 'list_really_idle_workers'
+# cycle 3: back to working-background, SAME shell → episode age intact.
+rm -f "$STATE_DIR/idle-state.tsv"
+export MOCK_PANE_STATE_bgghost=working-background
+export MOCK_BG_SHELLS_bgghost=1 MOCK_BG_RELIABLE_bgghost=1 MOCK_BG_CPU_bgghost=999
+export MOCK_BG_OLDEST_START_bgghost="$GHOST_START"
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "ghost cycle does NOT reset the episode age" "$out" \
+    $'bgghost\tidle-too-long'
+unset MOCK_PANE_STATE_bgghost MOCK_BG_SHELLS_bgghost MOCK_BG_RELIABLE_bgghost \
+      MOCK_BG_CPU_bgghost MOCK_BG_OLDEST_START_bgghost
+
+# (c9) The episode age is DERIVED — no `bg-firstseen` state file is created by
+#      any of the above. Nothing to migrate, leak, or go stale.
+assert_eq "no bg-firstseen state dir is ever created" \
+    "$( [[ -d "$STATE_DIR/bg-firstseen" ]] && echo present || echo absent )" \
+    "absent"
+
+# (c6) An unknown/absent `bg_oldest_start` (a footer-fallback or an unreadable
+#      /proc) means UNKNOWN, never "past the ceiling": the window must not be
+#      surfaced as a retire candidate on missing evidence.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+export MOCK_TMUX_WINDOWS="$(printf 'bgcapunk|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgcapunk 0 500
+export MOCK_PANE_STATE_bgcapunk=working-background
+export MOCK_BG_SHELLS_bgcapunk=1 MOCK_BG_RELIABLE_bgcapunk=1 MOCK_BG_CPU_bgcapunk=999
+run_probe_capture out rc 'list_really_idle_workers'   # no MOCK_BG_OLDEST_START
+assert_not_contains "missing bg_oldest_start → not a retire candidate" "$out" \
+    $'bgcapunk\tidle-too-long'
+unset MOCK_PANE_STATE_bgcapunk MOCK_BG_SHELLS_bgcapunk MOCK_BG_RELIABLE_bgcapunk \
+      MOCK_BG_CPU_bgcapunk
+
+unset MONITOR_BG_CHILDREN_GRACE_BASE_SECONDS MONITOR_BG_CHILDREN_INTERVAL_CAP_SECONDS \
+      MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS MONITOR_WORKER_HEALTH_SLACK_SECONDS
+: > "$LOG"
 
 echo '=== render_idle_section renders the orphan-async advisory ==='
 rm -f "$STATE_DIR/idle-state.tsv"

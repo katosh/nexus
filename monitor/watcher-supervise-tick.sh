@@ -24,11 +24,20 @@
 # the circularity by MUTUALITY — no third always-on process. Both down at
 # once falls to cold-boot recovery (bootstrap-recover at SessionStart).
 #
-# Liveness uses the exact `_watcher_alive` probe recovery + the cockpit
-# use: bucket 0/1 (fresh / merely-stale-but-pid-alive) = alive; bucket
-# >=2 (dead pid / no heartbeat) = DOWN. We do NOT fire on a merely-stale
-# watcher — it is still running; the watcher's own machinery handles a
-# wedge. Only genuine death wakes the orchestrator.
+# Liveness uses `_watcher_liveness_verdict` (the exact probe recovery +
+# the cockpit use). WHAT THIS TICK ACTUALLY DOES (nexus-code#491 —
+# the previous header claimed "we do NOT fire on a merely-stale
+# watcher; only genuine death wakes the orchestrator", which was FALSE
+# and cost an operator four hours of an unarmed supervisor: pre-#491
+# the tick fired on heartbeat age > DEAD_CUTOFF (~420 s at defaults)
+# even for a live, argv-verified pid — measured, not read):
+#   UP / BUSY (alive + advancing, however slow)  -> exit 0, no fire
+#   WEDGED (alive, progress/cycle stalled past the measured-period
+#           cutoffs)                             -> fire
+#   DOWN (process gone / heartbeat dead with nothing advancing)
+#                                                -> fire
+# A slow loop under load can no longer trip this tick; a genuinely
+# dead or wedged watcher still does.
 #
 # Idempotent + side-effect-light: the only write is the heartbeat touch.
 # Env overrides (tests): NEXUS_STATE_DIR, MONITOR_INTERVAL.
@@ -85,7 +94,7 @@ fi
 # it even if the orchestrator's own revive loop is itself wedged on EROFS.
 if (( ! _hb_written )) && ! _nexus_dir_writable "$STATE_DIR"; then
     if _nexus_critical_alarm "watcher-rofs" "${MONITOR_ROFS_ALARM_THROTTLE_SECONDS:-120}" \
-        "nexus project FS READ-ONLY (cannot write $STATE_DIR). Watcher supervisor cannot maintain state and revive will fail — restart the sandbox to restore the writable mount. See skills/nexus.service-recovery."; then
+        "$(_nexus_rofs_alarm_text "$STATE_DIR" "watcher-supervise-tick.sh")"; then
         # Alarm rang (not throttled) — also escalate to GitHub out-of-band:
         # incident issue + nexus-overview comment, both pinging the operator,
         # so a watcher-down-on-RO-FS reaches them even with an unattended
@@ -98,19 +107,36 @@ fi
 
 # (2) Report watcher liveness via exit code.
 #
-# The heartbeat is now bumped ONLY at the end of a correct compose cycle
-# (nexus-code#236), so _watcher_alive's heartbeat-age buckets ALREADY mean
-# "the loop completed a cycle recently": a fresh heartbeat proves the loop
-# works (even on a deliberately-silent quiet workspace), and a stale heartbeat
-# means the loop is wedged. No separate emit-functional probe is needed — the
-# heartbeat IS the functional signal. We pass DEAD_CUTOFF (above the watcher's
-# own async hang-watchdog budget) so a SINGLE transient stall is killed + healed
-# by the watcher itself before the supervisor would restart it; only a
-# PERSISTENT wedge (heartbeat stale past DEAD_CUTOFF) trips DOWN.
-_watcher_alive "$STATE_DIR" "$INTERVAL" "$DEAD_CUTOFF"
+# Liveness/progress split (nexus-code#491): the heartbeat is a PURE
+# liveness signal (background ticker, workload-independent cadence), so
+# its age buckets mean "the process exists and is scheduled" — a BUSY
+# loop under heavy load keeps it fresh, and the false-DOWN class that
+# killed healthy watchers on 2026-07-09 is structurally closed. The
+# functional/wedge detection lives in the progress + cycle signals:
+# _watcher_alive returns 4 (WEDGED) when nothing has advanced for a
+# generous multiple of the MEASURED loop period. We still pass
+# DEAD_CUTOFF (above the watcher's own async hang-watchdog budget) for
+# the residual heartbeat-age path (ticker-degraded / pre-#491 watcher)
+# so a single transient stall self-heals before the supervisor fires.
+#
+#   rc 0/1  alive (UP or BUSY/aging)  -> exit 0, Monitor loop continues
+#   rc 4    WEDGED (alive, no progress past the cutoffs) -> wake: a
+#           persistent wedge must still be caught. revive-watcher.sh
+#           re-verifies progress before killing anything.
+#   rc 2/3  DOWN (process gone / no heartbeat) -> wake.
+_verdict=$(_watcher_liveness_verdict "$STATE_DIR" "$INTERVAL" "$DEAD_CUTOFF")
 rc=$?
 if (( rc <= 1 )); then
-    exit 0   # alive (fresh or stale-but-pid-alive) — Monitor loop continues
+    exit 0   # UP or BUSY (alive + advancing) — Monitor loop continues
+fi
+if (( rc == 4 )); then
+    {
+        echo "--- watcher WEDGED (alive, not advancing) ---"
+        printf '%s\n' "$_verdict"
+        echo "The watcher process is alive but nothing has advanced past the measured-period-derived cutoffs."
+        echo "Run: $_nexus_root/monitor/revive-watcher.sh   (it independently re-verifies progress before killing)"
+    } >&2
+    exit 1
 fi
 # DOWN — print the FULL recovery (lands in the Monitor's exit report) and
 # exit non-zero so `until ! tick` exits and wakes the orchestrator. The

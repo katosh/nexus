@@ -101,14 +101,50 @@ if ! command -v _ghs_realgh >/dev/null 2>&1; then
     _ghs_realgh() { command gh "$@"; }
 fi
 
+# Real gh, run with the OPERATOR's credentials deliberately restored.
+#
+# locals-env.sh scopes GH_CONFIG_DIR to a credential-free dir so that a gh
+# reached WITHOUT this shim cannot authenticate at all (fail-closed). The paths
+# that legitimately need the operator's own identity — `gh auth …` (whose whole
+# job is to hand out the user PAT, e.g. `ng fetch-asset`), reads, and the
+# audited GH_IMPERSONATE opt-in — opt back in HERE, explicitly and visibly.
+#
+# Where the operator's real gh credentials live. locals-env.sh records this
+# only when GH_CONFIG_DIR or XDG_CONFIG_HOME was explicitly set (it may not name
+# a home path — it is home-independent by contract). When it did NOT record one
+# but DID scope GH_CONFIG_DIR, fall back to gh's own default here. This is the
+# right home for that fallback: it is exactly the location gh consults.
+#
+# Prints nothing when locals-env.sh never ran (standalone source, a fork, a unit
+# test) — the caller then degrades to a plain call, behaviour identical to
+# before the scoping existed.
+_ghs_opdir() {
+    if [ -n "${NEXUS_OPERATOR_GH_CONFIG_DIR:-}" ]; then
+        printf '%s' "$NEXUS_OPERATOR_GH_CONFIG_DIR"
+    elif [ -n "${NEXUS_GH_CONFIG_SCOPED:-}" ]; then
+        printf '%s' "${XDG_CONFIG_HOME:-${HOME:-}/.config}/gh"
+    fi
+}
+
+_ghs_opcfg() {
+    _ghs_dir=$(_ghs_opdir)
+    if [ -n "$_ghs_dir" ]; then
+        GH_CONFIG_DIR="$_ghs_dir" _ghs_realgh "$@"
+    else
+        _ghs_realgh "$@"
+    fi
+}
+
 gh() {
     # (0) Watcher safety, defence-in-depth. The watcher runs bash and DOES
     #     pick up the PATH-front wrapper, but it spawns WATCHER_WINDOW=headless,
     #     so this branch passes its deterministic, self-tokened calls through
     #     to the real gh untouched. (Also covers a ZDOTDIR leak into a zsh
     #     subshell spawned in watcher context, e.g. an orchestrator restart.)
+    #     Its own GH_TOKEN still wins over any config dir; restoring the
+    #     operator config only keeps its unauthenticated reads working.
     if [ -n "${WATCHER_WINDOW:-}" ]; then
-        _ghs_realgh "$@"; return $?
+        _ghs_opcfg "$@"; return $?
     fi
 
     # (1) An explicit GH_TOKEN means the caller already chose the identity
@@ -150,13 +186,24 @@ gh() {
         if [ -n "$_ghs_root" ]; then
             _ghs_log="$_ghs_root/monitor/.state/impersonate.log"
             mkdir -p "$_ghs_root/monitor/.state" 2>/dev/null || true
+            # Explicit mode at creation (your-org/nexus-code#484). This is an
+            # AUDIT log — a group-writable impersonation trail is one anybody
+            # in the unix group can rewrite, which is precisely what an audit
+            # trail must not be. `_log-mode.sh` is POSIX sh for this caller.
+            # Sourcing is guarded: a missing helper must never break `gh`.
+            if ! command -v _ensure_service_log >/dev/null 2>&1; then
+                # shellcheck source=_log-mode.sh
+                . "$_ghs_root/monitor/_log-mode.sh" 2>/dev/null || true
+            fi
+            command -v _ensure_service_log >/dev/null 2>&1 \
+                && _ensure_service_log "$_ghs_log" || true
             printf '%s\tpid=%s\twindow=%s\treason=%s\targv=gh %s\n' \
                 "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown-ts)" \
                 "$$" "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" \
                 "$GH_IMPERSONATE_REASON" "$*" >> "$_ghs_log" 2>/dev/null || true
         fi
         printf 'gh-shim: impersonating the operator (reason: %s)\n' "$GH_IMPERSONATE_REASON" >&2
-        _ghs_realgh "$@"; return $?
+        _ghs_opcfg "$@"; return $?
     fi
 
     # (3) Classify the verb. Find the command GROUP (first token matching a
@@ -261,9 +308,11 @@ gh() {
             ;;
     esac
 
-    # (4) Reads, `gh auth …`, and everything unrecognised pass through.
+    # (4) Reads, `gh auth …`, and everything unrecognised pass through — with
+    #     the operator's config dir restored, since locals-env.sh scoped the
+    #     ambient one away. Writes never reach here.
     if [ "$_ghs_write" = 0 ]; then
-        _ghs_realgh "$@"; return $?
+        _ghs_opcfg "$@"; return $?
     fi
 
     # (5) WRITE → inject the bot token. Single-source via mint-token.sh

@@ -5,7 +5,38 @@
 # Output (single line, key=value, machine-parseable):
 #   state=<idle|busy|user-typing|autosuggest-only|empty|blocked|absent|over-limit|
 #          working-background|working-self-paced|idle-orphan-async> \
-#     active=<0|1> window=<idx> name=<windowname> [reset_at=<token>] [orphan_kinds=<csv>]
+#     active=<0|1> window=<idx> name=<windowname> [reset_at=<token>] \
+#     [orphan_kinds=<csv>] [bg_shells=<count> bg_reliable=<0|1> bg_cpu=<jiffies>]
+#
+# A background SHELL is detected from the kernel PROCESS TREE — claude's
+# live background-shell child subtrees (your-org/nexus-code#445, made the
+# authoritative signal in #455). The status-line `N shell` footer regex is
+# only a fallback for when the process tree can't be read (no pane_pid,
+# /proc-restricted): it is presentation, so a user-customised/changed
+# status bar or a coincidental text match must never be the primary
+# detector. A Monitor handle lives inside claude's node process (not a
+# child), so it is still read from the footer/heartbeat.
+#
+# `bg_cpu` is appended only when state=working-background AND the driver
+# is a background SHELL (a `run_in_background` job / `& disown`), not a
+# Monitor handle (your-org/nexus-code#445). It carries the aggregate
+# CPU jiffies (utime+stime) of the background-shell subtrees under
+# claude. The watcher's `_idle_probe.sh` diffs it across cycles: while
+# it advances the worker is genuinely computing (exempt from the
+# idle-without-wrap-up nag), but once it freezes past the orphan grace
+# the shell is doing nothing and the window falls back to normal idle
+# classification. A Monitor-handle working-background carries NO bg_cpu
+# (it is self-waking) and is never capped.
+#
+# `bg_shells` and `bg_reliable` accompany `bg_cpu` on a shell-driven
+# working-background line (your-org/nexus-code#455 refine). `bg_shells` is
+# the count of live background-shell child subtrees under claude;
+# `bg_reliable` is 1 iff the process-tree walk was authoritative (pgrep +
+# /proc readable + a claude node found). The idle probe uses `bg_shells>=1`
+# with `bg_reliable=1` to key its idle-with-children exponential-backoff
+# long timeout and its wrap-up-with-remaining-children inconsistency
+# detector; when `bg_reliable=0` it must not make reap decisions on the
+# count and keeps the legacy #445 flat-grace behaviour.
 #
 # `reset_at` is appended only when state=over-limit, and carries the
 # extracted reset-time string (spaces collapsed to `_`, parens stripped,
@@ -102,16 +133,26 @@
 #      violation, surface to operator).
 #   4. None of the above → plain `idle`.
 #
-# Signal sources, in fallback order:
-#   - Heartbeat fields (`monitor_handles`, `background_bash_count`,
-#     `scheduled_wakeup_at`, `external_waits`) when the heartbeat is
-#     fresh. Authoritative.
-#   - Pane-footer parse (`N monitor[s] still running`,
-#     `N background bash …`) for monitor_handles /
-#     background_bash_count when the heartbeat is stale or missing.
-#     The footer reflects claude's most-recent tool-call state so
-#     it's a load-bearing fallback.
-#   - `external_waits` has NO renderer fallback. A worker that
+# Signal sources, by signal:
+#   - background_bash_count (the `bg` signal): the PROCESS TREE is the
+#     primary + authoritative source (your-org/nexus-code#455) — claude's
+#     live background-shell child subtrees, counted by
+#     _pane_background_shells. When that reading is reliable it overrides
+#     the footer both up and down. The footer/heartbeat is a FALLBACK for
+#     when the tree can't be read (no pane_pid, /proc-restricted). Footer
+#     phrasings matched by the fallback: the status-line `N shell[s]` (the
+#     real Claude Code v2.1.204 form, e.g. `· 1 shell, 1 monitor ·`) and
+#     the legacy `N background bash[es]` form. This false-idle — a worker
+#     idling between turns with a live background shell showing ONLY the
+#     status line — was your-org/nexus-code#445; #455 removes the reliance
+#     on that presentation regex as primary.
+#   - monitor_handles (the `mon` signal): heartbeat when fresh, else the
+#     pane footer (`N monitor[s] still running` spinner-row or the
+#     `· N monitor ·` status-line form). Monitor handles run inside
+#     claude's node process, not as child processes, so the process tree
+#     cannot see them — the footer/heartbeat is their ONLY source.
+#   - `scheduled_wakeup_at` / `external_waits`: heartbeat only.
+#     `external_waits` has NO renderer fallback. A worker that
 #     hasn't run the PostToolUse hook AND hasn't called
 #     `monitor/declare-wait.sh` is by definition silent about its
 #     async work; the watcher can't infer it from pane bytes.
@@ -204,7 +245,8 @@ usage: pane-state.sh <window-index|session:window>
                      [--heartbeat-turn-end-staleness <seconds>]
                      [--heartbeat-async-staleness <seconds>]
                      [--over-limit-file <path>]
-                     [--pane-pid <pid>]
+                     [--pane-pid <pid>] [--bg-cpu <jiffies>]
+                     [--bg-shells <count>] [--bg-oldest-start <epoch>]
 EOF
     exit 2
 }
@@ -223,6 +265,9 @@ turn_end_staleness_override=
 async_staleness_override=
 over_limit_file_override=
 pane_pid_override=
+bg_cpu_override=
+bg_shells_override=
+bg_oldest_start_override=
 while (( $# > 0 )); do
     case "$1" in
         --fixture) fixture="$2"; shift 2;;
@@ -236,6 +281,9 @@ while (( $# > 0 )); do
         --heartbeat-async-staleness)   async_staleness_override="$2"; shift 2;;
         --over-limit-file)             over_limit_file_override="$2"; shift 2;;
         --pane-pid)                    pane_pid_override="$2"; shift 2;;
+        --bg-cpu)                      bg_cpu_override="$2"; shift 2;;
+        --bg-shells)                   bg_shells_override="$2"; shift 2;;
+        --bg-oldest-start)             bg_oldest_start_override="$2"; shift 2;;
         --all)
             shift
             if (( $# > 0 )) && [[ "$1" != -* ]]; then
@@ -505,6 +553,163 @@ _pane_has_live_claude() {
     return 1
 }
 
+# Walk the BACKGROUND-SHELL subtrees living under claude in the pane's
+# process tree (your-org/nexus-code#445, extended for #455). ONE walk,
+# three space-separated fields on stdout: `<count> <cpu> <reliable>`.
+#
+#   count    number of top-level background-shell subtrees rooted
+#            DIRECTLY under claude — the process-truth analogue of the
+#            status-line `N shell` token. This is the #455 reliability
+#            win: it is derived from the kernel process tree, so it is
+#            immune to a user-customised/version-changed status bar and
+#            to a regex coincidentally matching unrelated pane text.
+#            On the idle path (turn ended) claude's only remaining shell
+#            children are `run_in_background` jobs — foreground Bash-tool
+#            shells have exited — so this counts exactly the live
+#            background shells. A `sleep`-polling background shell still
+#            COUNTS (presence, not CPU, is the detector); the orphan-grace
+#            below handles the truly-idle/hung case via `cpu`.
+#
+#   cpu      sum of utime+stime jiffies over every process INSIDE those
+#            background-shell subtrees. Emitted as `bg_cpu=<jiffies>` on
+#            the `working-background` line so the watcher's idle probe can
+#            tell a background job that is genuinely computing (jiffies
+#            advancing across cycles) from a truly-orphaned shell doing
+#            nothing (jiffies frozen). CORROBORATION substrate for the
+#            orphan-grace cap: a `working-background` exemption whose
+#            bg_cpu never advances ages out, so a hung/idle background
+#            shell can't exempt a window forever. Absolute jiffies (not a
+#            rate) — the probe diffs them across cycles; a constant offset
+#            is harmless. Semantics unchanged from #445.
+#
+#   reliable 1 iff this walk is trustworthy as the AUTHORITATIVE
+#            background-shell signal: pgrep is present, pane_pid is a
+#            numeric pid whose /proc is readable, AND a claude node was
+#            found in the tree. When 0 (fixtures, empty pane_pid,
+#            /proc-restricted, no claude found) the caller must fall back
+#            to the footer/heartbeat signal rather than trust a possibly
+#            blind `0`.
+#
+# What counts, and why the scoping matters: we walk the pane tree and
+# tally shell subtrees rooted UNDER claude. This EXCLUDES claude/node
+# itself (its idle event loop always ticks, which would defeat a progress
+# test) and EXCLUDES MCP-server subprocesses (spawned by claude directly
+# as `node`/`python`/`uv`, never through a shell) — an MCP server's steady
+# idle CPU must not masquerade as background-compute progress, nor inflate
+# the shell count. The launcher shell hosting claude (the pane's own pid)
+# is likewise excluded because it sits ABOVE claude, not under it.
+# Verified against the live process tree (your-org/nexus-code#455): an
+# idle claude with no background job has zero shell children; a real
+# `run_in_background` shell (e.g. a supervisor until-loop) is a direct
+# claude child and counts; an MCP server is a `uv`/`python` child and does
+# not.
+#
+# Bounded BFS (depth cap) so a pathological tree can't run away. Prints
+# `0 0 0` when there is no live claude, no readable /proc, or pgrep is
+# unavailable.
+_pane_background_shells() {
+    local pane_pid="$1"
+    if ! [[ "$pane_pid" =~ ^[0-9]+$ ]] || ! command -v pgrep >/dev/null 2>&1; then
+        printf '0 0 0'; return 0
+    fi
+    local total=0 count=0 proc_ok=0 claude_found=0
+    # Oldest background-shell subtree ROOT start time, in clock ticks since
+    # boot (`/proc/<pid>/stat` field 22). Converted to an epoch by the caller
+    # side of this function. This is what makes the with-children episode age
+    # DERIVED rather than stored: it cannot be reset by churn in the child
+    # count, by a pane rendering, or by a watcher restart (#455 follow-up, the
+    # round-2 skeptic's finding). 0 = no background shell / unknown.
+    local oldest_ticks=0
+    # Queue entries: "pid:below_claude:parent_in_bgshell".
+    local queue="${pane_pid}:0:0" depth
+    for depth in 0 1 2 3 4 5 6 7 8 9; do
+        [[ -n "$queue" ]] || break
+        local next="" entry pid below pinbg
+        for entry in $queue; do
+            IFS=: read -r pid below pinbg <<<"$entry"
+            [[ "$pid" =~ ^[0-9]+$ ]] || continue
+            # Parse /proc/<pid>/stat: `pid (comm) state ppid ... utime stime`.
+            # comm may contain spaces/parens — split on the LAST ') '.
+            # Read via `read <` (NOT `$(< file)` — that command-substitution
+            # redirect returns EMPTY for non-self pids under the agent
+            # sandbox's /proc handling; `read`/`cat` work, which is why
+            # _pane_has_live_claude uses ps rather than $(<)). The brace
+            # group carries the `2>/dev/null` over the `<` redirection so a
+            # pid that exits between pgrep and the read (a stale queue
+            # entry) is skipped silently rather than leaking to stderr.
+            local stat comm after
+            { IFS= read -r stat < "/proc/$pid/stat"; } 2>/dev/null || continue
+            [[ -n "$stat" ]] || continue
+            proc_ok=1
+            after="${stat##*) }"
+            comm="${stat%) *}"; comm="${comm#*(}"
+            local -a f=($after)
+            # after[] is 0-indexed from `state`: utime=idx11, stime=idx12,
+            # starttime (stat field 22) = idx19.
+            local utime="${f[11]:-}" stime="${f[12]:-}" starttime="${f[19]:-}"
+            local is_shell=0 is_claude=0 in_bg=0
+            case "$comm" in
+                bash|sh|zsh|dash|ksh|fish|-bash|-zsh|-sh) is_shell=1 ;;
+                claude|claude.exe|claude-code) is_claude=1 ;;
+            esac
+            (( is_claude == 1 )) && claude_found=1
+            # A background-shell subtree ROOT: a shell directly under claude
+            # whose parent was NOT already inside a bg-shell subtree (so a
+            # nested subshell of the same job doesn't double-count).
+            if (( below == 1 )) && (( is_shell == 1 )) && (( pinbg == 0 )); then
+                count=$(( count + 1 ))
+                # Track the OLDEST such root: the episode began when the
+                # longest-lived background shell started. Shells coming and
+                # going cannot move this so long as the eldest survives.
+                if [[ "$starttime" =~ ^[0-9]+$ ]] \
+                   && { (( oldest_ticks == 0 )) || (( starttime < oldest_ticks )); }; then
+                    oldest_ticks="$starttime"
+                fi
+            fi
+            # This node's CPU counts iff it is under claude AND (it is a
+            # shell, or its parent was already inside a bg-shell subtree).
+            if (( below == 1 )) && { (( is_shell == 1 )) || (( pinbg == 1 )); }; then
+                in_bg=1
+                if [[ "$utime" =~ ^[0-9]+$ && "$stime" =~ ^[0-9]+$ ]]; then
+                    total=$(( total + utime + stime ))
+                fi
+            fi
+            # Descend. Children are "below claude" once this node is (or
+            # is) claude; they inherit this node's bg-shell membership.
+            local child_below=$(( below == 1 || is_claude == 1 ? 1 : 0 ))
+            local kid kids
+            kids=$(pgrep -P "$pid" 2>/dev/null | tr '\n' ' ')
+            for kid in $kids; do
+                [[ "$kid" =~ ^[0-9]+$ ]] || continue
+                next+=" ${kid}:${child_below}:${in_bg}"
+            done
+        done
+        queue=$(printf '%s' "$next" | tr -s ' ')
+    done
+    local reliable=0
+    (( proc_ok == 1 && claude_found == 1 )) && reliable=1
+    local oldest_epoch=0
+    (( oldest_ticks > 0 )) && oldest_epoch=$(_pane_ticks_to_epoch "$oldest_ticks")
+    printf '%d %d %d %d' "$count" "$total" "$reliable" "$oldest_epoch"
+}
+
+# Convert a `/proc/<pid>/stat` starttime (clock ticks since boot) to a unix
+# epoch: boot time (`btime` in /proc/stat) + ticks / CLK_TCK. Echoes 0 when
+# either input is unavailable, which callers treat as "unknown" (never as
+# "just started").
+_pane_ticks_to_epoch() {
+    local ticks="$1" btime="" hz=""
+    [[ "$ticks" =~ ^[0-9]+$ ]] && (( ticks > 0 )) || { printf '0'; return 0; }
+    local line
+    while IFS= read -r line; do
+        if [[ "$line" == btime\ * ]]; then btime="${line#btime }"; break; fi
+    done < /proc/stat 2>/dev/null
+    [[ "$btime" =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
+    hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    [[ "$hz" =~ ^[0-9]+$ ]] && (( hz > 0 )) || hz=100
+    printf '%d' $(( btime + ticks / hz ))
+}
+
 # ---- heartbeat helpers (issue #74) ---------------------------------------
 # Default staleness window: 30 s. Overridable per-invocation via
 # --heartbeat-staleness, and (for the main watcher path) via
@@ -663,36 +868,54 @@ _heartbeat_handle_counts() {
 
 # Pane-footer parse. Claude Code surfaces async-handle counts in
 # two places: the spinner row above the input (`✻ Cooked for 4s ·
-# 1 monitor still running`) and the status line below the input
-# (`-- INSERT -- ⏵⏵ bypass permissions on · 1 monitor · ← for
-# agents`). The spinner row carries the canonical phrasing
+# 1 monitor still running`) and the status line below the input.
+# The spinner row carries the canonical phrasing
 # `N monitor[s] still running` / `N background bash[es] [still ]running`;
 # the status line carries a shorter form that only renders when
 # the count is non-zero.
 #
-# Strategy: scan the bottom 15 rows (the spinner sits ~3 rows
-# above the input chevron in the standard 7-row claude TUI; bigger
-# margin protects against extra status-bar rows) for the canonical
-# "still running" phrase. We anchor on "still running" because it's
-# unique to the spinner row and never appears in unrelated text.
-# False-positive risk: a transcript paragraph that quotes the
-# phrase verbatim would false-trigger — empirically never seen.
+# CRITICAL — the status-line phrasing drifted (your-org/nexus-code#445).
+# Real Claude Code (verified v2.1.204) renders background shells as a
+# `N shell[s]` token, NOT `N background bash[es]`, and combines the two
+# counters when both are live:
 #
-# When the spinner phrase isn't present (e.g. mid-render, post-
-# Monitor close), we fall back to the status-line shape `· N
-# monitor[s]? ·` / `· N background bash[es]? ·` — both have a
-# middle-dot anchor that excludes the spinner row (which uses a
-# different separator and the "still running" suffix).
+#   -- INSERT -- ⏵⏵ bypass permissions on · gh auth login ·
+#      1 shell, 1 monitor · ← for agents
+#
+# i.e. ` · <cmd> · 1 shell, 1 monitor · ← for agents`. The two
+# counters share one ` · … · ` segment, joined by `, `. Standalone
+# forms are ` · 2 shells · ` (no monitor) and ` · 1 monitor · ` (no
+# shell). This was the paper-benchmark false-idle root cause: a worker
+# idling between turns with a live background shell only ever shows
+# the status-line form (the spinner "still running" form appears only
+# during active tool execution), and the old regex matched neither
+# `shell` nor the combined `, N monitor` boundary — so
+# background_bash_count stayed 0 and the idle-refinement never emitted
+# `working-background`.
+#
+# Strategy: scan the bottom 15 rows (the spinner sits ~3 rows above
+# the input chevron; bigger margin protects against extra status-bar
+# rows). Monitor: prefer the spinner "still running" form; else the
+# status-line count bounded by ` · `/`, ` on the left and ` · `/`, `
+# on the right (accepts both `· 1 monitor ·` and `1 shell, 1 monitor ·`).
+# Background shells: the modern `N shell[s]` token bounded by ` · ` on
+# the left and `,`/` · ` on the right (`· 2 shells ·`, `· 1 shell,`),
+# OR the legacy `N background bash[es] [still ]running` spinner/status
+# forms (kept for back-compat + the #183 synthetic fixtures). The
+# middle-dot / comma boundaries anchor on the status-line separators,
+# which never appear around unrelated transcript prose.
 _footer_handle_counts() {
     local plain="$1"
     local bottom mon=0 bg=0
     bottom=$(tail -n 15 <<<"$plain")
     if [[ "$bottom" =~ ([0-9]+)[[:space:]]+monitor[s]?[[:space:]]+still[[:space:]]+running ]]; then
         mon="${BASH_REMATCH[1]}"
-    elif [[ "$bottom" =~ ·[[:space:]]+([0-9]+)[[:space:]]+monitor[s]?[[:space:]]+· ]]; then
+    elif [[ "$bottom" =~ [·,][[:space:]]+([0-9]+)[[:space:]]+monitor[s]?[[:space:]]*[·,] ]]; then
         mon="${BASH_REMATCH[1]}"
     fi
-    if [[ "$bottom" =~ ([0-9]+)[[:space:]]+background[[:space:]]+(bash|process|bashes|processes)[[:space:]]+(still[[:space:]]+)?running ]]; then
+    if [[ "$bottom" =~ ·[[:space:]]+([0-9]+)[[:space:]]+shell[s]?[[:space:]]*[·,] ]]; then
+        bg="${BASH_REMATCH[1]}"
+    elif [[ "$bottom" =~ ([0-9]+)[[:space:]]+background[[:space:]]+(bash|process|bashes|processes)[[:space:]]+(still[[:space:]]+)?running ]]; then
         bg="${BASH_REMATCH[1]}"
     elif [[ "$bottom" =~ ·[[:space:]]+([0-9]+)[[:space:]]+background[[:space:]]+(bash|process|bashes|processes)[[:space:]]+· ]]; then
         bg="${BASH_REMATCH[1]}"
@@ -771,10 +994,14 @@ _heartbeat_external_waits_summary() {
 # variables but they can emit additional structured columns. The
 # pattern mirrors `list_idle_transitions` in `_idle_probe.sh`.
 #
-# Caller passes the pane-plain bytes (for footer parsing) and the
-# heartbeat path; either may be empty.
+# Caller passes the pane-plain bytes (for footer parsing), the
+# heartbeat path (either may be empty), and the process-tree
+# background-shell reading (`pt_bg` count + `pt_reliable`) measured
+# once by the caller via _pane_background_shells.
 _refine_idle_with_async_signals() {
     local pane_plain="$1" hb_file="$2" now="$3" async_staleness="$4"
+    local pt_bg="${5:-0}" pt_reliable="${6:-0}"
+    [[ "$pt_bg" =~ ^[0-9]+$ ]] || pt_bg=0
 
     local hb_mon=0 hb_bg=0
     if [[ -n "$hb_file" ]] && [[ -f "$hb_file" ]]; then
@@ -785,16 +1012,45 @@ _refine_idle_with_async_signals() {
     if [[ -n "$pane_plain" ]]; then
         read -r foot_mon foot_bg < <(_footer_handle_counts "$pane_plain")
     fi
-    # Heartbeat takes precedence when it reports a positive count;
-    # else fall back to footer. A heartbeat that reports 0 is a
-    # "no signal" not "definitely zero" — it's normal for the hook
-    # to leave the field 0 because it can't introspect claude's
-    # internal handle list. So we OR the two sources.
+    # Monitor handles run INSIDE claude's node process (async tool
+    # handles, not child processes), so the process tree can't see them
+    # — the footer/heartbeat remains their only source. Heartbeat takes
+    # precedence when it reports a positive count; else fall back to the
+    # footer. A heartbeat that reports 0 is "no signal" not "definitely
+    # zero" (the hook can't introspect claude's internal handle list),
+    # so we OR the two sources.
     local mon=$(( hb_mon > foot_mon ? hb_mon : foot_mon ))
-    local bg=$(( hb_bg > foot_bg ? hb_bg : foot_bg ))
+    # Background SHELLS are live child processes of claude, so the
+    # process tree is GROUND TRUTH for them (your-org/nexus-code#455).
+    # When the tree reading is reliable it is AUTHORITATIVE — it
+    # overrides the footer regex both UP (a customised/changed status
+    # bar that no longer renders the `N shell` token) and DOWN (a regex
+    # coincidentally matching unrelated pane text). The footer/heartbeat
+    # is consulted ONLY as a fallback when the tree reading is not
+    # trustworthy (fixtures, empty pane_pid, /proc-restricted, no claude
+    # found). Any residual footer false-positive on the fallback path is
+    # still backstopped by the bg_cpu orphan-grace.
+    local bg
+    if (( pt_reliable == 1 )); then
+        bg="$pt_bg"
+    else
+        bg=$(( hb_bg > foot_bg ? hb_bg : foot_bg ))
+    fi
 
     if (( mon > 0 )) || (( bg > 0 )); then
-        printf 'working-background'
+        # Signal the DRIVER so the caller can scope the orphan-grace
+        # cap (your-org/nexus-code#445). A background SHELL (bg>0) is
+        # fire-and-forget — claude is NOT woken when it finishes, so a
+        # hung one lingers and must be grace-capped via bg_cpu. A
+        # Monitor handle (mon>0, bg==0) is self-waking — claude resumes
+        # the instant it fires — so it must NEVER be aged out. The
+        # `bg_shell=1` marker is consumed by _finalize_idle_verdict and
+        # not propagated to the emit line.
+        if (( bg > 0 )); then
+            printf 'working-background\tbg_shell=1'
+        else
+            printf 'working-background'
+        fi
         return 0
     fi
 
@@ -982,16 +1238,80 @@ _finalize_idle_verdict() {
         refined_state="$raw"
         return 0
     fi
+    # Measure the background-shell process subtree ONCE
+    # (your-org/nexus-code#455): the count+reliability feed the bg
+    # detection (authoritative when reliable) and the cpu feeds the
+    # orphan-grace. Test overrides short-circuit the /proc walk:
+    #   --bg-shells N  → count=N, reliable=1 (exercise the process-tree
+    #                    authoritative path in fixtures).
+    #   --bg-cpu N     → legacy cpu-only injection; leaves the tree
+    #                    reading UNreliable so the footer/heartbeat drives
+    #                    bg (preserves pre-#455 fixture semantics).
+    #   --bg-oldest-start EPOCH → inject the oldest background-shell start
+    #                    epoch (the DERIVED episode start) for fixtures.
+    local pt_count=0 pt_cpu=0 pt_reliable=0 pt_oldest=0
+    if [[ -n "$bg_shells_override" ]]; then
+        pt_count="$bg_shells_override"; pt_reliable=1
+        pt_cpu="${bg_cpu_override:-0}"
+        pt_oldest="${bg_oldest_start_override:-0}"
+    elif [[ -n "$bg_cpu_override" ]]; then
+        pt_cpu="$bg_cpu_override"; pt_reliable=0
+        pt_oldest="${bg_oldest_start_override:-0}"
+    else
+        read -r pt_count pt_cpu pt_reliable pt_oldest \
+            < <(_pane_background_shells "${pane_pid:-}")
+    fi
     local out
     out=$(_refine_idle_with_async_signals \
-        "${pane_plain:-}" "$hb_file" "$hb_now" "$hb_async_staleness")
+        "${pane_plain:-}" "$hb_file" "$hb_now" "$hb_async_staleness" \
+        "$pt_count" "$pt_reliable")
     # Split on the first TAB. Refinement output is either
     # `<state>` or `<state>\t<extra>`.
+    local raw_extra=""
     if [[ "$out" == *$'\t'* ]]; then
         refined_state="${out%%$'\t'*}"
-        refined_extra="${out#*$'\t'}"
+        raw_extra="${out#*$'\t'}"
     else
         refined_state="$out"
+    fi
+    # A `bg_shell=1` marker (your-org/nexus-code#445) is INTERNAL — it
+    # flags a SHELL-driven working-background (grace-capped) vs a
+    # Monitor-handle one (self-waking, never aged out). Consume it
+    # here; only a genuine emit-extra (`orphan_kinds=…`) propagates.
+    local bg_shell=0
+    if [[ "$raw_extra" == "bg_shell=1" ]]; then
+        bg_shell=1
+    elif [[ -n "$raw_extra" ]]; then
+        refined_extra="$raw_extra"
+    fi
+    # Attach the background-shell CPU counter to a SHELL-driven
+    # `working-background` verdict so the watcher's idle probe can age
+    # out an orphaned (non-computing) background shell. Uses the
+    # `--bg-cpu` override when supplied (fixtures/tests), else measures
+    # the live pane subtree. NOT emitted for a Monitor-handle
+    # working-background: absence of `bg_cpu=` tells the probe to leave
+    # that exemption uncapped.
+    if [[ "$refined_state" == "working-background" ]] && (( bg_shell == 1 )); then
+        [[ "$pt_cpu" =~ ^[0-9]+$ ]] || pt_cpu=0
+        [[ "$pt_count" =~ ^[0-9]+$ ]] || pt_count=0
+        # Emit the live background-shell COUNT and the reliability of the
+        # process-tree walk alongside the CPU counter (your-org/nexus-code#455
+        # refine). The watcher's idle probe needs `bg_shells` to key its
+        # idle-with-children backoff + the wrap-up-with-children inconsistency
+        # detector, and `bg_reliable` to know whether the count is
+        # authoritative (process-tree ground truth) or a footer-fallback
+        # guess it must not make reap decisions on. On the fallback path
+        # (pt_reliable=0) the count is 0/unknown and the probe keeps the
+        # legacy #445 flat orphan-grace behaviour.
+        #
+        # `bg_oldest_start` is the start epoch of the OLDEST background-shell
+        # root — the with-children EPISODE start, read straight off the
+        # process tree. The probe derives the episode age from it instead of
+        # storing a clock, so no child-count churn, no pane rendering (an
+        # `autosuggest-only` ghost cycle), and no watcher restart can reset
+        # the absolute ceiling (#455 follow-up, round-2 skeptic finding).
+        [[ "$pt_oldest" =~ ^[0-9]+$ ]] || pt_oldest=0
+        refined_extra="${refined_extra:+$refined_extra }bg_shells=$pt_count bg_reliable=$pt_reliable bg_cpu=$pt_cpu bg_oldest_start=$pt_oldest"
     fi
 }
 
@@ -1155,7 +1475,28 @@ if (( has_bright )); then
 elif (( busy )); then
     emit busy
 elif (( has_autosuggest )); then
-    emit autosuggest-only
+    # An autosuggest ghost is a RENDERING of the input row. It says nothing
+    # about whether the process tree has live children, and ghost text renders
+    # identically to real input — the very signal that must not be trusted.
+    # Refine it exactly as the empty-input branch is refined
+    # (your-org/nexus-code#455 follow-up, round-2 skeptic): a worker holding a
+    # live background shell is `working-background` whether or not its input
+    # row happens to be drawing a ghost that poll. Treating the ghost as
+    # evidence of "no children" let a single cosmetic cycle silently reset the
+    # watcher's absolute ceiling.
+    #
+    # Fails CLOSED: `_finalize_idle_verdict` only PROMOTES an idle verdict
+    # (idle → working-background / working-self-paced / idle-orphan-async).
+    # When the tree cannot be walked it falls back to the footer/heartbeat and,
+    # failing those too, leaves the verdict unrefined — so an UNKNOWN child set
+    # is never mistaken for an EMPTY one. Only when nothing promotes does the
+    # pane read `autosuggest-only`, its original meaning: idle, ready to paste.
+    _finalize_idle_verdict idle
+    if [[ "$refined_state" == "idle" ]]; then
+        emit autosuggest-only
+    else
+        emit "$refined_state" ${refined_extra:+"$refined_extra"}
+    fi
 elif (( empty_input )); then
     _finalize_idle_verdict idle
     emit "$refined_state" ${refined_extra:+"$refined_extra"}

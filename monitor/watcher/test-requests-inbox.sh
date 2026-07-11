@@ -8,12 +8,16 @@
 #   2.  claim: enabled → .new → .claimed (atomic); emit line shape
 #       (request=/origin/kind/priority + summary + file=.claimed.md)
 #   3.  malformed (no `request:` frontmatter) → .failed, not claimed
-#   4.  re-emit cooldown: within cooldown a stamped request does NOT
-#       re-emit; once the cooldown elapses it re-emits (resurface-until-ack)
+#   4.  re-emit cooldown is a DELIVERY property (stamp-on-paste,
+#       your-org/nexus-code#483): an UNDELIVERED render leaves no stamp
+#       and the request re-emits next poll; after a simulated successful
+#       paste (requests_commit_emitted) the cooldown holds; once it
+#       elapses the request re-emits (resurface-until-ack)
 #   5.  ack self-clears: a claimed file the orchestrator renamed to .done
 #       no longer emits (no double-processing) — emission stops next poll
-#   6.  per-emit cap: more claimed than the cap → only `cap` emit; the
-#       leftovers (never-stamped) surface on the next poll — none lost
+#   6.  per-emit cap: more claimed than the cap → only `cap` emit; after
+#       each DELIVERY the next poll surfaces the next leftovers — none
+#       lost, drained at the cap-per-delivered-paste rate
 #   7.  fairness: round-robin across origins (one chatty origin can't starve)
 #   8.  max-age: a .claimed older than max_age → .failed (+ stops emitting)
 #   9.  GC: terminal .done/.failed past retention → removed, with the
@@ -78,6 +82,18 @@ source "$_test_dir/_requests.sh"
 
 _file() { "$RC" file "$@"; }   # producer side
 
+# Simulate the watcher's SUCCESSFUL-PASTE path for a render output: wrap
+# it in the `--- requests ---` section header exactly as compose_report
+# does, then commit the delivery stamps (what main.sh runs right after
+# paste_with_retry succeeds). Renders that are never "pasted" through
+# this helper must leave no cooldown stamp (stamp-on-paste, `#483`).
+_deliver() {
+    local rendered="$1" body="$WORK/pasted-body.$$"
+    printf -- '--- requests ---\n%s--- nexus-emit-sig 2026 x ---\n' "$rendered" > "$body"
+    requests_commit_emitted "$body"
+    rm -f "$body"
+}
+
 echo "== 1. disabled is a strict no-op =="
 export MONITOR_REQUESTS_ENABLED=false
 id=$(_file --origin w --kind question --slug off --message "while disabled")
@@ -102,14 +118,23 @@ requests_poll_emit >/dev/null
 assert_file    "malformed → .failed.md" "$REQ/20260629T000000Z-w-bad.failed.md"
 assert_no_file "malformed not claimed"  "$REQ/20260629T000000Z-w-bad.claimed.md"
 
-echo "== 4. re-emit cooldown =="
+echo "== 4. re-emit cooldown is a delivery property (stamp-on-paste) =="
 export MONITOR_REQUESTS_REEMIT_COOLDOWN_SECONDS=300
-# id is already claimed + stamped (emitted in step 2). A poll within
-# cooldown must NOT re-emit it.
-out=$(requests_poll_emit)
-assert_not_contains "within cooldown → no re-emit" "$out" "request=$id"
-# Simulate the cooldown elapsing: backdate its stamp in the TSV.
 state="$NEXUS_STATE_DIR/requests-emit-state.tsv"
+# id was RENDERED in step 2 but never delivered. Render must not have
+# stamped it (the stamp is a delivery record, `#483`), so it is still due.
+if [[ -s "$state" ]] && grep -q "^$id" "$state"; then
+    printf '  FAIL: render stamped the cooldown before any delivery\n' >&2; FAIL=$((FAIL+1))
+else
+    printf '  PASS: undelivered render leaves no cooldown stamp\n'; PASS=$((PASS+1))
+fi
+out=$(requests_poll_emit)
+assert_contains "undelivered → re-emits on the very next poll" "$out" "request=$id"
+# Deliver it (simulated successful paste) → the cooldown now holds.
+_deliver "$out"
+out=$(requests_poll_emit)
+assert_not_contains "delivered → within cooldown no re-emit" "$out" "request=$id"
+# Simulate the cooldown elapsing: backdate its stamp in the TSV.
 now=$(date +%s); old=$((now - 600))
 awk -v id="$id" -v old="$old" 'BEGIN{FS=OFS="\t"} $1==id{$2=old} {print}' "$state" > "$state.tmp" && mv "$state.tmp" "$state"
 out=$(requests_poll_emit)
@@ -129,17 +154,24 @@ for i in 1 2 3 4 5; do
     cid=$(CHAN_TS_OVERRIDE=$(printf '20260629T0000%02dZ' "$i") _file --origin solo --kind question --slug "c$i" --message "ask $i")
     want_ids["$cid"]=1
 done
-# poll 1: claim all 5, emit 2
+# poll 1: claim all 5, emit 2. An UNDELIVERED cap set must stay due (the
+# same 2 re-render until a paste lands — nothing was delivered, so
+# nothing rotates).
 out1=$(requests_poll_emit)
 n1=$(grep -c '^request=' <<<"$out1")
 assert_eq "poll1 emits exactly cap (2)" "$n1" "2"
-# poll 2: emit the next 2 leftovers (cooldown not relevant — never stamped)
+out1b=$(requests_poll_emit)
+assert_eq "undelivered cap set re-renders identically" "$out1b" "$out1"
+# Deliver poll 1 → poll 2 rotates to the next 2 leftovers.
+_deliver "$out1"
 out2=$(requests_poll_emit)
 n2=$(grep -c '^request=' <<<"$out2")
-assert_eq "poll2 emits next 2 leftovers" "$n2" "2"
+assert_eq "poll2 (after delivery) emits next 2 leftovers" "$n2" "2"
+_deliver "$out2"
 out3=$(requests_poll_emit)
 n3=$(grep -c '^request=' <<<"$out3")
-assert_eq "poll3 emits final leftover (1)" "$n3" "1"
+assert_eq "poll3 (after delivery) emits final leftover (1)" "$n3" "1"
+_deliver "$out3"
 # union of all emitted ids == all filed ids (none lost, none duplicated)
 emitted=$(printf '%s\n%s\n%s\n' "$out1" "$out2" "$out3" | sed -n 's/^request=\([^ ]*\).*/\1/p' | sort)
 uniq_n=$(printf '%s\n' "$emitted" | sort -u | wc -l)

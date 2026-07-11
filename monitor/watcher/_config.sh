@@ -581,6 +581,37 @@ MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS="${MONITOR_SERVICE_HEALTH_RESTAR
 # Env: MONITOR_SERVICE_HEALTH_FLAP_CEILING.
 MONITOR_SERVICE_HEALTH_FLAP_CEILING="${MONITOR_SERVICE_HEALTH_FLAP_CEILING:-$("$_cfg" monitor.service_health.flap_ceiling 3)}"
 [[ "$MONITOR_SERVICE_HEALTH_FLAP_CEILING" =~ ^[0-9]+$ ]] || MONITOR_SERVICE_HEALTH_FLAP_CEILING=3
+# Cold-build ceiling (seconds): upper bound on how long a jupyter/labsh
+# service's failing healthcheck is excused as an in-progress COLD `uvx` build
+# before the watcher stops deferring and restarts like any other service. A
+# cold JupyterLab env build (CPython + jupyterlab + extensions onto the NFS uv
+# cache) blocks the healthcheck for minutes (~615s observed); the watcher
+# defers to the supervisor for the life of that build so it can't kill it
+# mid-flight (your-org/nexus-code#326 follow-up), but caps the defer here so a
+# pathological wedged build is still recoverable. Default 1800 (30 min) — well
+# above the observed build and the supervisor's 900s START_GRACE, so a genuine
+# cold build never trips it. 0 disables the cold-build defer entirely. Env:
+# MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS.
+MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS="${MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS:-$("$_cfg" monitor.service_health.cold_build_ceiling_seconds 1800)}"
+[[ "$MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1800
+# Automatic reports-archive roll (your-org/nexus-code#447; roller is
+# monitor/reports-roll.sh, #444/#446). The watcher runs the idempotent,
+# ≥1-month-buffered roller on startup + once per day-boundary, so aged reports
+# get bucketed into reports/YYYY-MM/ with zero manual action. ON by default.
+# Set enabled=false (or interval=0) to fall back to the manual `ng reports-roll`.
+MONITOR_REPORTS_ROLL_ENABLED="${MONITOR_REPORTS_ROLL_ENABLED:-$("$_cfg" monitor.reports_roll.enabled true)}"
+# Cadence in seconds. Default 3600 (hourly): the day-stamp gate makes every
+# tick but the first-of-day a cheap no-op, so hourly just bounds how soon after
+# a day-boundary the roll runs. 0 disables the task. Env:
+# MONITOR_REPORTS_ROLL_INTERVAL_SECONDS.
+MONITOR_REPORTS_ROLL_INTERVAL_SECONDS="${MONITOR_REPORTS_ROLL_INTERVAL_SECONDS:-$("$_cfg" monitor.reports_roll.interval_seconds 3600)}"
+[[ "$MONITOR_REPORTS_ROLL_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_REPORTS_ROLL_INTERVAL_SECONDS=3600
+# Opt-in mid-write guard passed to the roller on this automated path: an
+# eligible file modified within this many seconds is skipped and rolled once it
+# settles. The ≥1-month buffer already makes eligible files a full month old,
+# so this is defense-in-depth. Default 300. Env: MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS.
+MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS="${MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS:-$("$_cfg" monitor.reports_roll.min_age_seconds 300)}"
+[[ "$MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS=300
 # Watcher-supervision (your-org/your-nexus, mutual-liveness design). The
 # ORCHESTRATOR arms a persistent Monitor that revives a crashed watcher
 # and touches a supervisor heartbeat each tick. The watcher's only role
@@ -660,6 +691,7 @@ export MONITOR_IDLE_THRESHOLD_SECONDS MONITOR_IDLE_CLOSE_HOURS MONITOR_IDLE_POOL
        MONITOR_SERVICE_HEALTH_GRACE_SECONDS MONITOR_SERVICE_HEALTH_DEFAULT_POLICY \
        MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS MONITOR_SERVICE_HEALTH_FLAP_CEILING \
        MONITOR_WATCHER_SUPERVISOR_ENABLED MONITOR_WATCHER_SUPERVISOR_HEARTBEAT_STALE_SECONDS \
+       MONITOR_REPORTS_ROLL_ENABLED MONITOR_REPORTS_ROLL_INTERVAL_SECONDS MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS \
        MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS \
        MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS MONITOR_OVER_LIMIT_MAX_ATTEMPTS
 # Crash-loop guard for `respawn_agent`. If more than RESPAWN_LOOP_LIMIT

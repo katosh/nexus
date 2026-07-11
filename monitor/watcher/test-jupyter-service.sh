@@ -208,7 +208,7 @@ wait_gone() {
 
 # --- fail-loud when labsh is missing ----------------------------------------
 echo '=== labsh missing → fail loud ==='
-out=$(PATH="/usr/bin:/bin" NEXUS_STATE_DIR="$NEXUS_STATE_DIR" "$UP" "$WORK/proj1" 2>&1); rc=$?
+out=$(PATH="$(th_hermetic_path "/usr/bin:/bin" "$WORK")" NEXUS_STATE_DIR="$NEXUS_STATE_DIR" "$UP" "$WORK/proj1" 2>&1); rc=$?
 assert_eq      "missing labsh exits nonzero" "$(( rc != 0 ))" "1"
 assert_contains "stderr names labsh"          "$out" "labsh"
 

@@ -810,3 +810,63 @@ _orchestrator_liveness_log_decide() {
     _ORCH_LIVENESS_LOG_STATE="$state"
     return 0
 }
+
+# ── one-shot re-paste rescue (extracted from main.sh, #489 skeptic C1) ──
+# The unstick budget is exhausted but the absolute deadline hasn't
+# passed: before killing an orchestrator that may merely have lost a
+# paste (dropped Enter, un-submitted input buffer), re-deliver the most
+# recent emit body and let the next cycles re-evaluate. Lives here (not
+# inline in main.sh) because the branch mutates request-delivery state
+# and needs regression coverage a main.sh-inline block cannot get.
+#
+# Collaborators — _newest_emit_archive, paste_with_retry,
+# requests_commit_emitted, log — are resolved at CALL time from the
+# sourcing shell (main.sh in production; stubs in tests).
+#
+#   $1 target window   $2 diff (archive) dir
+#   $3 resubmit marker file   $4 verdict label (for the log line)
+_orch_resubmit_rescue() {
+    local target="$1" diff_dir="$2" marker="$3" verdict="$4"
+    # Stamp the marker BEFORE pasting so the attempt is counted even if
+    # the paste itself fails — the dead-threshold remains the backstop
+    # either way, and an un-stamped failure would retry the paste every
+    # 5 s tick.
+    mkdir -p "$(dirname "$marker")" 2>/dev/null || true
+    : > "$marker" 2>/dev/null || true
+    touch -c "$marker" 2>/dev/null || true
+    local resubmit_body resubmit_rc
+    # Newest archive by NAME (stat-free) — NOT a `find -printf '%T@' |
+    # sort` stat storm, which wedged the SYNC-phase heartbeat at the
+    # 17k-file plateau (see _newest_emit_archive).
+    resubmit_body=$(_newest_emit_archive "$diff_dir")
+    if [[ -n "$resubmit_body" && -f "$resubmit_body" ]]; then
+        # Reuse the standard paste path (VI-mode `i BSpace` insert-mode
+        # force + content verification), but with the liveness stamp
+        # suppressed: the re-paste must not advance the last-paste
+        # clock it is racing against.
+        if paste_with_retry "$target" "$resubmit_body" no-liveness-stamp; then
+            log "orchestrator-liveness: re-submitted archive=$(basename "$resubmit_body") to $target ($verdict)"
+            # What the code KNOWS here: paste_with_retry verified the
+            # body's bytes are visible in the pane. What it does NOT
+            # know: whether the agent will ever consume them — this
+            # path fires precisely on evidence that it is not consuming
+            # pastes. The stamp below is therefore NOT a consumption
+            # claim; it starts the anti-respam clock for request rows
+            # whose bytes reached the pane (possibly for the first
+            # time: the archive may be a body the dedup gate
+            # suppressed). If the doubt proves right, two bounds
+            # re-surface the request: the re-nag cooldown (recovered
+            # orchestrator) and requests_reset_delivery_state on the
+            # respawn paths (replaced one). `no-liveness-stamp`
+            # suppresses only the last-paste clock this rescue races
+            # against, not this record (#489 skeptic Q1/C2).
+            requests_commit_emitted "$resubmit_body"
+        else
+            resubmit_rc=$?
+            log "orchestrator-liveness: re-submit paste failed rc=$resubmit_rc archive=$(basename "$resubmit_body") ($verdict)"
+        fi
+    else
+        log "orchestrator-liveness: re-submit requested but no emit archive found in $diff_dir ($verdict)"
+    fi
+    return 0
+}

@@ -287,6 +287,70 @@ monitor:
   # MONITOR_OPERATOR_ENGAGED_CHANGE_TTL_SECONDS.
   operator_engaged_change_ttl_seconds: 600
 
+  # Background-compute orphan grace in seconds (<your-org>/nexus-code#445).
+  # A worker running background compute (a `run_in_background` shell /
+  # `& disown` job — Palantir polling a Slurm job, etc.) reports
+  # `working-background` and is exempt from the idle-without-wrap-up
+  # nag. But a background shell is fire-and-forget: claude is not woken
+  # when it finishes, so a HUNG or doing-nothing shell would otherwise
+  # exempt the window forever. The probe tracks the background subtree's
+  # CPU jiffies across cycles; while they advance the worker is
+  # genuinely computing (exempt), but once they FREEZE for this many
+  # seconds the shell is orphaned and the window falls back to normal
+  # idle classification (reapable). Generous by design — the CPU-delta
+  # test means a live compute worker (any progress) NEVER ages out
+  # regardless of this value, so the grace only bounds a truly-frozen
+  # shell; err high so a live worker is never false-flagged idle.
+  # A Monitor-handle working-background is self-waking and never capped.
+  # Default 3600 = 1 h. Env override:
+  # MONITOR_BACKGROUND_ORPHAN_GRACE_SECONDS.
+  background_orphan_grace_seconds: 3600
+
+  # Idle-with-children long timeout + clarification protocol
+  # (<your-org>/nexus-code#455 refine). When the AUTHORITATIVE process-tree
+  # walk shows an otherwise-idle worker still holds ≥1 live background-shell
+  # child (bg_reliable=1, bg_shells>=1) and that child's CPU has FROZEN — the
+  # signature of a blocking wait on a long job, e.g. `sbatch --wait` on a
+  # Slurm job — the worker must NOT be reaped at the flat orphan grace above.
+  # Instead it earns a long, exponentially-backing-off grace: the watcher
+  # surfaces `idle-children-clarify` so the orchestrator injects a
+  # clarification prompt (the worker answers via monitor/worker-health.sh,
+  # declaring expected runtime + health), and re-asks on a backing-off
+  # schedule, only surfacing the window as reapable (`idle-too-long`) at a
+  # bounded hard ceiling. A CPU-ADVANCING child (genuine compute, or a
+  # self-waking poll loop) stays silently exempt as before — only a frozen
+  # child engages this path.
+  #
+  # base: seconds a child's CPU must stay frozen before the FIRST
+  #   clarification nudge (also the level-0 backoff interval).
+  #   Env: MONITOR_BG_CHILDREN_GRACE_BASE_SECONDS. Default 3600 = 1 h.
+  background_children_grace_base_seconds: 3600
+  # multiplier: each successive nudge interval = previous × this (bounded by
+  #   the interval cap). Env: MONITOR_BG_CHILDREN_BACKOFF_MULT. Default 2.
+  background_children_backoff_multiplier: 2
+  # interval cap: maximum seconds between two successive clarification
+  #   nudges. Env: MONITOR_BG_CHILDREN_INTERVAL_CAP_SECONDS. Default 21600 = 6 h.
+  background_children_interval_cap_seconds: 21600
+  # hard ceiling: the ABSOLUTE bound on any with-children exemption. Measured
+  #   as max(CPU-freeze age, with-children EPISODE age); once it is reached the
+  #   window surfaces as `idle-too-long` — a retire CANDIDATE, not a kill (the
+  #   orchestrator's retire-preflight remains the gate). It DOMINATES the
+  #   worker-health declaration: a `running` decl extends only up to the
+  #   ceiling, a child that burns a little CPU each poll cannot reset it, and
+  #   neither can churn in the NUMBER of background shells — the episode clock
+  #   is keyed on the window and cleared only when the child set empties.
+  #   The design priority is to surface a long-waiting worker for
+  #   investigation rather than let it linger forever; raise this if your jobs
+  #   legitimately outrun it. Env: MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS.
+  #   Default 172800 = 48 h.
+  background_children_grace_ceiling_seconds: 172800
+  # health slack: seconds added to a worker's declared `expected_runtime_s`
+  #   (via monitor/worker-health.sh --health running --runtime N) before the
+  #   watcher resumes asking — absorbs scheduler queue time / estimate slop.
+  #   The resulting deadline is still clamped to the ceiling above.
+  #   Env: MONITOR_WORKER_HEALTH_SLACK_SECONDS. Default 600 = 10 min.
+  worker_health_slack_seconds: 600
+
   # Worker-side heartbeat staleness threshold in seconds (issue #74).
   # Each nexus-spawned worker's per-spawn Claude Code hooks write a
   # state heartbeat to `monitor/.state/heartbeat/<window>.json` on
@@ -452,6 +516,28 @@ monitor:
     # issue; the evaluator opens a fresh nexus-code issue if it must
     # surface a block. Env: MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE.
     tracking_issue: ""
+    # Deployment gate (nexus-code#512): the release gate vets the Claude
+    # Code BINARY; this vets the ACT of deploying it — restarting the
+    # watcher under N mid-flight agents is a different risk from
+    # restarting an idle nexus. When more than this many live tmux
+    # windows count as agents-at-risk (everything except the
+    # orchestrator, the evaluator + restart-watchdog windows and
+    # `services`), the apply is DEFERRED — nothing bumped, verdict
+    # recorded, retried at the next daily fire. 0 disables the window
+    # gate (the count is still logged in every apply record). The gate
+    # also defers while any open <your-org>/nexus-code PR touches the
+    # watcher restart path, and records how far the clone lags
+    # origin/main (`behind_main=`) in decisions.tsv. Read by
+    # monitor/cc-auto-update-apply.sh at run time (not a watcher env).
+    # Env: CC_AUTO_MAX_LIVE_WINDOWS.
+    max_live_windows: 8
+    # NOTE — `enabled` above is REGISTRATION-TIME ONLY (nexus-code#513):
+    # a running watcher never re-reads it, so flipping it cannot stop an
+    # armed orchestrator restart. The runtime off switch is the durable
+    # hold marker, honoured by the reconcile on every tick:
+    #     monitor/cc-auto-update-apply.sh hold --reason "…" \
+    #         [--until-version X.Y.Z | --ttl-seconds N]
+    #     monitor/cc-auto-update-apply.sh unhold
 
   # Continuous service-health watch (service-health-watch). The
   # `service_health` watcher task runs every registered infra service's
@@ -563,11 +649,42 @@ monitor:
     loop_limit: 5
     loop_window_seconds: 600
 
-  # Read-only-FS (EROFS) escalation (<your-org>/nexus-code rofs-incident).
-  # When the project filesystem goes READ-ONLY the watcher dies and CANNOT
-  # be revived from inside the sandbox; revive-watcher.sh / the supervise
-  # tick detect it and raise a turn-INDEPENDENT operator alarm that does
-  # NOT touch the read-only project FS.
+  # Automatic reports-archive roll (<your-org>/nexus-code#447; roller is
+  # monitor/reports-roll.sh, #444/#446). The watcher runs the idempotent,
+  # ≥1-month-buffered roller on startup + once per day-boundary, so aged
+  # reports get bucketed into reports/YYYY-MM/ with zero manual action — the
+  # flat reports/ dir stays readdir-cheap. Emits a one-line
+  # `--- reports archived ---` breadcrumb ONLY when it actually moves a file
+  # (silent otherwise; routed through the normal change-or-timeout gate).
+  reports_roll:
+    # Master enable. DEFAULT TRUE. Set false (or interval_seconds 0) to fall
+    # back to the manual `monitor/ng reports-roll`. Env:
+    # MONITOR_REPORTS_ROLL_ENABLED.
+    enabled: true
+    # Cadence in seconds. Default 3600 (hourly). The day-stamp gate makes
+    # every tick but the first-of-day a cheap no-op (date compare, no scan),
+    # so this only bounds how soon after midnight the day's roll runs. 0
+    # disables the task. Env: MONITOR_REPORTS_ROLL_INTERVAL_SECONDS.
+    interval_seconds: 3600
+    # Opt-in mid-write guard: an eligible file modified within this many
+    # seconds is skipped and rolled once it settles. The ≥1-month buffer
+    # already makes eligible files a full month old, so this is
+    # defense-in-depth. Default 300. Env: MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS.
+    min_age_seconds: 300
+
+  # Read-only-FS (EROFS) guard + escalation (<your-org>/nexus-code#473).
+  # When the project filesystem goes READ-ONLY nothing inside the sandbox
+  # can repair it — the mount namespace is kernel-enforced and only a
+  # restart from OUTSIDE restores the writable bind. The watcher no longer
+  # dies on this: it enters a read-only DEGRADED mode (suspends every
+  # project-tree write, keeps its loop alive, refuses to self-restart) and
+  # raises a turn-INDEPENDENT operator alarm over channels that do NOT
+  # touch the read-only project FS. revive-watcher.sh and the supervise
+  # tick detect the same condition and share the throttle key below.
+  #
+  # How often the DEGRADED watcher re-probes the project FS to notice
+  # recovery (and then writes .state/fs-incidents.jsonl) is env-only:
+  # MONITOR_FS_DEGRADED_POLL_SECONDS, default 15.
   rofs_alarm:
     # How often (seconds) the read-only alarm may RE-RING for the same
     # sustained outage — throttle keyed in $TMPDIR (writable when the
@@ -1331,11 +1448,32 @@ monitor:
     # Where the host key + authorized_keys + pending enrollment tokens live.
     # OP-ONLY (0700), OUTSIDE the GitHub-tracked $SANDBOX_PROJECT_DIR tree so
     # `ng upload`/`ng wrap-up` can never reach it. Env: MONITOR_REMOTE_PRINCIPALS_DIR.
+    #
+    # ENFORCED, not conventional: this MUST resolve under $HOME/.claude
+    # (symlinks are resolved physically), be owned by you, be mode 0700, and
+    # contain no group/other-readable secret — or `remote-up.sh` and the
+    # supervisor REFUSE to start (_remote_principals_guard). Two reasons, both
+    # load-bearing: $SANDBOX_PROJECT_DIR is GROUP-SHARED lab storage
+    # (drwxrws--- on /shared) and a git worktree; and ~/.claude is the
+    # writable mount that SURVIVES a sandbox restart (which destroys /tmp).
+    # Do not relocate this into monitor/.state/. See
+    # skills/nexus.remote-access/REFERENCE.md §"Credential storage".
     principals_dir: ~/.claude/nexus-remote/
     # One-time enrollment-token lifetime (§4.9). Short by design: a token
     # authorizes adding ONE client key, is single-use, and is consumed on
-    # first enroll. Env: MONITOR_REMOTE_ENROLLMENT_TOKEN_TTL_SECONDS.
+    # first enroll. An EXPIRED token is refused fail-closed at redeem, and its
+    # enroll-only authorized_keys line is dropped by `ng remote prune-enroll`;
+    # `ng remote gc-tokens` (supervisor loop) then deletes the inert record.
+    # Env: MONITOR_REMOTE_ENROLLMENT_TOKEN_TTL_SECONDS.
     enrollment_token_ttl_seconds: 900
+    # monitor/.state/remote-ssh.log — the services.registry log column, and the
+    # one remote artifact in the shared tree. It carries connection IPs + key
+    # FINGERPRINTS only (both non-secret); never a token, key blob, or private
+    # key. Rotated IN PLACE (truncate, never rename — svc.sh holds an O_APPEND
+    # fd on the inode) once it exceeds max_bytes, keeping the last keep_lines.
+    # Env: MONITOR_REMOTE_SERVICE_LOG_MAX_BYTES / _KEEP_LINES.
+    service_log_max_bytes: 8388608
+    service_log_keep_lines: 2000
     # Token-authenticated SELF-ENROLLMENT over SSH (§4.9.1). Default true.
     # When on, the sshd wires an AuthorizedKeysCommand bootstrap so a client
     # can deliver its public key THROUGH the SSH key-offer and self-enroll

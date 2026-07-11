@@ -12,6 +12,66 @@ for the current release convention.
 
 ### Added
 
+- **Read-only-filesystem guard: the watcher degrades instead of dying
+  (issue 473).** Twice — 2026-06-29 and 2026-07-09 — the project tree
+  went read-only inside the sandbox mount namespace and the watcher
+  disappeared without a word. Both incidents run the identical script:
+  `version_check` sees drifted sources → `launcher.sh --replace` →
+  SIGTERM the incumbent → the successor dies in `>>"$LOGFILE"`, a fresh
+  `open()`, *before `main.sh` executes one line* → "did not publish a
+  live pidfile" → silence. The incumbent it replaced was fine: it held
+  its log fd from before the remount and had been logging normally
+  throughout. That asymmetry — an open fd survives its mount being
+  detached, a fresh `open()` does not — is why the outage was invisible
+  from the inside, and it is the constraint every part of this change
+  is built around.
+  - `monitor/_fs_probe.sh` — ONE canonical probe (`nexus_dir_writable`,
+    `nexus_path_writable`), sourceable and a CLI. It performs a
+    create+unlink of a **new** path on **every** call. Never a cached
+    fd, never a `stat`: a probe that appends to a held fd reports
+    *healthy* during a total outage, which is strictly worse than no
+    probe at all.
+  - `monitor/watcher/_fs_guard.sh` — a per-cycle probe in the watcher
+    loop. On failure the watcher enters **read-only degraded mode**: it
+    suspends every project-tree write, keeps its loop alive (a live
+    watcher is what notices recovery), and escalates **exactly once**
+    per incident over channels that need no filesystem write
+    (`sandbox-notify` → a GitHub incident issue via `mint-token.sh`,
+    whose cache lives on a different mount → a tmux paste). The
+    fire-once latch is in memory, deliberately: there is nowhere to
+    write a rate-limit cursor, and the process dies with the incident.
+  - **`launcher.sh` no longer decapitates.** `--replace` probes first
+    and refuses on a read-only FS, leaving the working incumbent alive;
+    `_version_restart_self` suppresses the self-restart for the same
+    reason. If a watcher must nonetheless cold-start on a read-only FS,
+    the launcher redirects its output to `$TMPDIR` so it *starts*,
+    discovers the condition, and reports it — rather than dying in its
+    own log redirect.
+  - **Durable trace on recovery.** The 2026-06-29 incident left no
+    record and was re-diagnosed from scratch ten days later. On the
+    recovery edge the watcher appends the incident (duration, onset
+    bounds, escalation channels used) to `.state/fs-incidents.jsonl`
+    and comments the resolution on the open incident issue.
+  - **`svc.sh status` leads with the truth**: a first-class
+    `fs <OK|READ-ONLY>` row *above* the per-service rows, and a
+    non-zero exit when read-only. It previously printed `UP` services,
+    and exited `0`, while nothing in the workspace could save a file.
+  - **The `PreToolUse` pending-tool hook fails OPEN**
+    (`monitor/hooks/pending-tool-record.sh`). It was an inline redirect
+    into the project tree whose non-zero exit blocked the tool call, so
+    a storage hiccup became a total `Bash`/`Write`/`Edit` outage for
+    every hook-gated worker. It is bookkeeping, not a security
+    boundary: it warns and gets out of the way.
+  - The operator-facing escalation message now leads with the remedy,
+    quotes the discriminating evidence (mount `ro` over an `rw`
+    superblock; the project's read-write bind absent from the
+    namespace), states that no data is lost and that the filer is
+    healthy so storage-support need not be paged, says what a restart costs,
+    and never suggests remounting or `unshare`-ing around a
+    kernel-enforced sandbox. It no longer asserts an NFS-flap root
+    cause, which was never established.
+  - `monitor/watcher/test-fs-guard.sh` — T1–T10, both directions.
+
 - **Worker respawn on recovery (`bootstrap-recover.sh` step 3 +
   `--no-workers`).** Boot recovery now also respawns the worker
   agents that were active in the last watcher snapshot

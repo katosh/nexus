@@ -446,6 +446,15 @@ _functional_fault_class() {
     [[ "$fail_count" =~ ^[0-9]+$ ]] || fail_count=0
     [[ "$delivery_age" =~ ^[0-9]+$ ]] || delivery_age=0
     [[ "$sla" =~ ^[0-9]+$ ]] || sla=600
+    if (( loop_alive_rc == 4 )); then
+        # Bucket 4 (nexus-code#491): the liveness heartbeat is FRESH —
+        # the ticker is beating — and the fault is a PROGRESS stall.
+        # Recording it as 'loop-heartbeat-stale' would be a lie of the
+        # exact class #491 is about (a mislabelled signal).
+        printf 'watcher-fault reason=loop-wedged-progress-stalled loop_alive_rc=%d delivery_age=%ds' \
+            "$loop_alive_rc" "$delivery_age"
+        return 0
+    fi
     if (( loop_alive_rc >= 2 )); then
         printf 'watcher-fault reason=loop-heartbeat-stale loop_alive_rc=%d delivery_age=%ds' \
             "$loop_alive_rc" "$delivery_age"

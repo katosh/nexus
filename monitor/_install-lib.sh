@@ -39,6 +39,12 @@ install_acquire_lock() {
     dir="$(install_lock_dir)"
     mkdir -p "$dir" 2>/dev/null || true
     lockfile="$dir/nexus-install-${name}.$(id -u).lock"
+    # flock-fd: fd 9 is DELIBERATELY held across the caller's whole
+    # install, including its git/clone children — the lock's job is to
+    # serialize the entire install, and those children are foreground
+    # and die with it. A child that daemonized (e.g. a git credential
+    # helper) would hold the lock; installers clone anonymous public
+    # URLs, so none is spawned. Class: your-org/nexus-code#494.
     if ! exec 9>"$lockfile"; then
         printf 'install-lib: WARNING: cannot open lock %s — proceeding without concurrency guard\n' "$lockfile" >&2
         return 0

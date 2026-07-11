@@ -40,6 +40,8 @@
 #                               because an in-sandbox (non-root) sshd cannot use
 #                               AuthorizedKeysCommand (root-owned requirement,
 #                               unattainable in the sandbox userns).
+#   gc-tokens                   delete expired/corrupt/stranded token RECORDS
+#                               (hygiene; expiry is already enforced at redeem)
 #   prune-enroll                remove enroll-only lines whose token is
 #                               consumed/expired (enroll window == token window)
 #   revoke --principal P        remove P's authorized_keys line(s)
@@ -439,6 +441,62 @@ cmd_prune_enroll() {
     return 0
 }
 
+# ── gc-tokens ─────────────────────────────────────────────────────────
+# Delete enrollment-token RECORDS that can no longer authorize anything:
+#   * expired      (now > expires)              — redeem already fails closed
+#   * corrupt      (no/garbage `expires=`)      — redeem already fails closed
+#   * stranded     (*.token.consumed.* leftovers from a crash mid-consume)
+#
+# This is HYGIENE, not an access control. A *consumed* record is already
+# removed at redeem (atomic mv → read → rm), and an *expired* record is already
+# refused at redeem (remote-enroll.sh, "token EXPIRED (fail-closed)") and its
+# authorized_keys enroll line is already dropped by `prune-enroll`. What was
+# missing is that the inert record files accumulated forever — six of them sat
+# for ~9 days on the operator's live endpoint. A file that can never grant
+# access is still a file that should not outlive its purpose.
+#
+# Records hold `principal=` + `expires=` ONLY (the filename is the token's
+# sha256; the plaintext token is never written to disk), so nothing secret is
+# read, printed, or logged here. Removal is by EXACT PATH, never a glob-rm.
+# Idempotent; safe from the supervisor loop and the healthcheck.
+cmd_gc_tokens() {
+    local d; d=$(_remote_principals_dir)
+    [[ -d "$d/enroll" ]] || return 0
+    local now; now=$(now_epoch) || return 0
+    [[ "$now" =~ ^[0-9]+$ ]] || return 0
+    local rec exp removed=0 stranded=0
+
+    for rec in "$d"/enroll/*.token; do
+        [[ -f "$rec" ]] || continue          # no nullglob: skip the literal no-match
+        exp=$(_kv_get "$rec" expires)
+        if [[ ! "$exp" =~ ^[0-9]+$ ]]; then
+            rm -f -- "$rec" && removed=$((removed+1))   # corrupt: unredeemable
+            continue
+        fi
+        if (( now > exp )); then
+            rm -f -- "$rec" && removed=$((removed+1))
+        fi
+    done
+
+    # Stranded claim-files: `enroll` renames rec → rec.consumed.$$ then rm's it.
+    # A crash in that window leaves the claim behind. It is already consumed
+    # (the redeemable name is gone), so it is always safe to remove — but wait
+    # one TTL so a live consume in flight is never raced.
+    local ttl; ttl=$(_remote_ttl); [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=900
+    local mtime
+    for rec in "$d"/enroll/*.token.consumed.*; do
+        [[ -f "$rec" ]] || continue
+        mtime=$(stat -c '%Y' "$rec" 2>/dev/null || stat -f '%m' "$rec" 2>/dev/null) || continue
+        [[ "$mtime" =~ ^[0-9]+$ ]] || continue
+        (( now - mtime > ttl )) || continue
+        rm -f -- "$rec" && stranded=$((stranded+1))
+    done
+
+    (( removed > 0 ))  && warn "gc-tokens: removed $removed expired/corrupt token record(s)"
+    (( stranded > 0 )) && warn "gc-tokens: removed $stranded stranded consume-claim file(s)"
+    return 0
+}
+
 # ── carrier-authline ──────────────────────────────────────────────────
 # Emit the restricted authorized_keys line for the OFF-HOST FORWARD-ONLY
 # CARRIER. The nexus sshd binds loopback (127.0.0.1:<port>) INSIDE the
@@ -610,6 +668,7 @@ case "$sub" in
     enroll)           cmd_enroll "$@" ;;
     enroll-invite)    cmd_enroll_invite "$@" ;;
     prune-enroll)     cmd_prune_enroll "$@" ;;
+    gc-tokens)        cmd_gc_tokens "$@" ;;
     revoke)           cmd_revoke "$@" ;;
     list)             cmd_list "$@" ;;
     carrier-authline) cmd_carrier_authline "$@" ;;
@@ -617,5 +676,5 @@ case "$sub" in
     ""|-h|--help)
         sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
         [[ -z "$sub" ]] && exit 1 || exit 0 ;;
-    *) die "unknown subcommand: $sub (gen-host-key|host-fingerprint|issue-token|enroll|enroll-invite|prune-enroll|revoke|list|carrier-authline|guard)" ;;
+    *) die "unknown subcommand: $sub (gen-host-key|host-fingerprint|issue-token|enroll|enroll-invite|prune-enroll|gc-tokens|revoke|list|carrier-authline|guard)" ;;
 esac

@@ -27,15 +27,65 @@
 #
 # Pure env, idempotent, no side effects — safe to source on every bash -c.
 
-# (a) Chain to the operator's prior BASH_ENV (Lmod init, etc.). locals-env
-#     stashed it here before re-pointing BASH_ENV at this file; guard against
-#     self-reference so a misconfiguration can't recurse.
-if [ -n "${NEXUS_PREV_BASH_ENV:-}" ] \
+# (a) Chain to the operator's prior BASH_ENV (Lmod init, etc.) — ONCE PER
+#     PROCESS TREE. locals-env stashed it here before re-pointing BASH_ENV at
+#     this file.
+#
+#     Why the once-per-tree guard (your-org/nexus-code#457). The prior BASH_ENV
+#     is typically Lmod's init (`/app/lmod/lmod/init/bash`), and BASH_ENV is
+#     sourced at the start of EVERY non-interactive bash. The watcher's poll
+#     path fires ~100 `bash config/load.sh <key>` config reads per cycle, each
+#     a fresh non-interactive bash that would re-source the ~6 KB Lmod init.
+#
+#     Sourcing that init does NOT itself spawn a bash — an earlier write-up said
+#     it did, and that reading was falsified. What it does is arm a
+#     `command_not_found_handle` (init/bash:185-201). Bash FORKS A CHILD before
+#     invoking that handler, and the child inherits the parent's argv. The
+#     handler unconditionally runs `command_not_found.py "$1"` — and when THAT
+#     is itself unresolvable (a PATH without /app/bin), the handler re-fires
+#     inside the forked child, which forks again: an unbounded parent→child
+#     chain, each level blocked in wait(), argv copied down, until the node's
+#     pid_max (36864) returned EAGAIN for every fork on the box. That is why the
+#     forensics found thousands of `bash …/main.sh --once` processes: they were
+#     forked CHILDREN of the bash that ran it, not re-invocations of it. The
+#     trigger is HERE, not in the watcher's --once tick.
+#
+#     Guarding the re-source keeps the handler off every DESCENDANT bash (it is
+#     not `export -f`'d — only module/ml are, init/bash:140-141 — so an exec'd
+#     child cannot inherit it), while the chain's real effects (PATH, the
+#     exported module/ml functions) still reach children through the
+#     environment. Sourcing once is therefore sufficient. The marker is exported
+#     BEFORE the source so a child bash the chained init itself spawns already
+#     sees it and does not re-enter.
+#
+#     The self-reference guard stays: a misconfiguration pointing the prior env
+#     back at this file must never source-loop.
+if [ -z "${NEXUS_BASH_ENV_CHAINED:-}" ] \
+   && [ -n "${NEXUS_PREV_BASH_ENV:-}" ] \
    && [ "${NEXUS_PREV_BASH_ENV}" != "${BASH_SOURCE[0]:-}" ] \
    && [ -r "${NEXUS_PREV_BASH_ENV}" ]; then
+    export NEXUS_BASH_ENV_CHAINED=1
     # shellcheck disable=SC1090
     . "${NEXUS_PREV_BASH_ENV}"
 fi
+
+# (a2) Disarm the recursion primitive itself (your-org/nexus-code#480).
+#
+#      The guard in (a) is ancestry-dependent: it spares every DESCENDANT bash,
+#      but the FIRST bash in a process tree still sources the chain and still
+#      arms `command_not_found_handle`. Give that shell a PATH without
+#      /app/bin and the fork chain of #457 returns in full.
+#
+#      So do not merely decline to re-arm the handler — remove it. Lmod does not
+#      `export -f` it, nothing in a non-interactive agent shell depends on it
+#      (its only job is the interactive "did you mean…" suggestion), and with it
+#      gone an unresolvable command is what it should always have been: a plain
+#      127. Ancestry stops mattering and a stripped PATH is harmless.
+#
+#      Unconditional and outside the (a) block on purpose: it must also cover a
+#      shell that inherited the marker but had the handler armed some other way.
+#      `|| :` because the caller may run under `set -e`.
+unset -f command_not_found_handle 2>/dev/null || :
 
 # (b) Force-front the nexus toolchain AFTER any re-prepend the chained env did.
 if [ -n "${NEXUS_ROOT:-}" ]; then
@@ -52,6 +102,10 @@ if [ -n "${NEXUS_ROOT:-}" ]; then
     # Front locals/bin first, then ghwrap, so the final order is
     # ghwrap : locals/bin : <rest> — matching .zshenv.
     [ -d "$_nb_locals/bin" ] && _nb_front_dir "$_nb_locals/bin"
+    # Fork-storm pip guard (monitor/pipwrap) — refuses the self-re-exec'ing
+    # sandbox /app/bin/pip (your-org/nexus-code#487); fronted before
+    # notifywrap/ghwrap so those keep the very-front slots, matching .zshenv.
+    [ -x "$NEXUS_ROOT/monitor/pipwrap/pip" ] && _nb_front_dir "$NEXUS_ROOT/monitor/pipwrap"
     # Engagement-gated sandbox-notify wrapper (monitor/notifywrap) — bash analog
     # of the .zshenv force-front; see monitor/notifywrap/sandbox-notify. Fronted
     # BEFORE ghwrap so ghwrap remains the very-front entry.

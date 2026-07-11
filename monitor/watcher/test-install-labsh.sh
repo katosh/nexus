@@ -23,6 +23,10 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 INSTALL="$_test_dir/../install-labsh.sh"
 REAL_GIT=$(command -v git) || { echo "FATAL: real git not found"; exit 1; }
 
+# th_hermetic_path only (fork-bomb precondition guard, #479); inline
+# assert helpers below shadow the helper-file versions.
+. "$_test_dir/_test_helpers.sh"
+
 PASS=0
 FAIL=0
 assert_eq() {
@@ -78,12 +82,15 @@ chmod +x "$FAIL_STUBS/git"
 
 run_install() {
     local sandbox="${1-__unset__}" bin="$2"; shift 2
+    # Synthetic PATH goes through th_hermetic_path so it can never drop
+    # command_not_found.py (fork-bomb precondition, #479 / #457).
+    local safe_path; safe_path=$(th_hermetic_path "$bin:/usr/bin:/bin" "$WORK")
     if [[ "$sandbox" == "__unset__" ]]; then
         LAST_STDOUT=$(env -u SANDBOX_PROJECT_DIR NEXUS_INSTALL_LOCK_DIR="$LOCKDIR" \
-            PATH="$bin:/usr/bin:/bin" bash "$INSTALL" "$@" 2>"$WORK/last.err")
+            PATH="$safe_path" bash "$INSTALL" "$@" 2>"$WORK/last.err")
     else
         LAST_STDOUT=$(SANDBOX_PROJECT_DIR="$sandbox" NEXUS_INSTALL_LOCK_DIR="$LOCKDIR" \
-            PATH="$bin:/usr/bin:/bin" bash "$INSTALL" "$@" 2>"$WORK/last.err")
+            PATH="$safe_path" bash "$INSTALL" "$@" 2>"$WORK/last.err")
     fi
     LAST_RC=$?
     LAST_STDERR=$(cat "$WORK/last.err")
@@ -133,7 +140,7 @@ echo '=== concurrency: two simultaneous installs → one clone, both exit 0 ==='
 SBX4="$WORK/sandbox-4"; mkdir -p "$SBX4"
 ( run_install "$SBX4" "$STUBS"; echo $? > "$WORK/c1.rc" ) &
 p1=$!
-( SANDBOX_PROJECT_DIR="$SBX4" NEXUS_INSTALL_LOCK_DIR="$LOCKDIR" PATH="$STUBS:/usr/bin:/bin" bash "$INSTALL" >/dev/null 2>&1; echo $? > "$WORK/c2.rc" ) &
+( SANDBOX_PROJECT_DIR="$SBX4" NEXUS_INSTALL_LOCK_DIR="$LOCKDIR" PATH="$(th_hermetic_path "$STUBS:/usr/bin:/bin" "$WORK")" bash "$INSTALL" >/dev/null 2>&1; echo $? > "$WORK/c2.rc" ) &
 p2=$!
 wait $p1; wait $p2
 assert_eq "both exit 0" "$(cat "$WORK/c1.rc")/$(cat "$WORK/c2.rc")" "0/0"

@@ -49,8 +49,16 @@ trap cleanup EXIT
 export NEXUS_STATE_DIR="$WORK/state"
 export NEXUS_SERVICES_REGISTRY="$WORK/services.registry"
 export NEXUS_ROOT="$WORK/nexusroot"
-export MONITOR_REMOTE_PRINCIPALS_DIR="$WORK/principals"
-mkdir -p "$WORK/state" "$WORK/nexusroot/monitor/.state"
+# The supervisor now enforces the credential-storage invariant fail-closed:
+# principals_dir MUST resolve under $HOME/.claude, 0700 (see
+# _remote_principals_guard, test-remote-principals-guard.sh). There is no env
+# escape hatch — by design. So the fixture relocates HOME rather than pointing
+# principals_dir at a bare mktemp dir, which the guard would (correctly) refuse.
+export HOME="$WORK/home"
+export MONITOR_REMOTE_PRINCIPALS_DIR="$HOME/.claude/principals"
+PRINCIPALS="$MONITOR_REMOTE_PRINCIPALS_DIR"
+mkdir -p "$WORK/state" "$WORK/nexusroot/monitor/.state" "$HOME/.claude"
+chmod 700 "$HOME/.claude"
 
 # pick a high, likely-free port; spread by PID to reduce parallel collisions
 PORT=$(( 21000 + ($$ % 4000) ))
@@ -110,9 +118,9 @@ timeout 5 bash "$SUP" >/dev/null 2>&1
 assert_rc "no host key → supervisor exits 1" "$?" "1"
 
 echo "== 5. registered + host key + stub sshd → listens, hardened argv =="
-mkdir -p "$WORK/principals"; chmod 700 "$WORK/principals"
-ssh-keygen -t ed25519 -f "$WORK/principals/ssh_host_ed25519_key" -N '' >/dev/null 2>&1 \
-    || { : > "$WORK/principals/ssh_host_ed25519_key"; }
+mkdir -p "$PRINCIPALS"; chmod 700 "$PRINCIPALS"
+ssh-keygen -t ed25519 -f "$PRINCIPALS/ssh_host_ed25519_key" -N '' >/dev/null 2>&1 \
+    || { : > "$PRINCIPALS/ssh_host_ed25519_key"; }
 rm -f "$WORK/sshd-argv"
 bash "$SUP" >/dev/null 2>&1 &
 SUP_PID=$!
@@ -131,7 +139,7 @@ assert_contains "argv: pubkey auth on"                   "$argv" "PubkeyAuthenti
 assert_contains "argv: binds configured port"            "$argv" "-p $PORT"
 assert_contains "argv: AuthorizedKeysFile in principals" "$argv" "principals/authorized_keys"
 assert_contains "argv: channel-only ⇒ PermitTTY=no"      "$argv" "PermitTTY=no"
-assert_contains "argv: pre-auth Banner configured"       "$argv" "Banner=$WORK/principals/banner.txt"
+assert_contains "argv: pre-auth Banner configured"       "$argv" "Banner=$PRINCIPALS/banner.txt"
 # ROOTLESS self-enroll (RFC §4.9.1): an in-sandbox sshd is NON-root and CANNOT
 # use AuthorizedKeysCommand (OpenSSH requires it owned by uid 0; the sandbox
 # userns has no uid-0-owned files). So the supervisor pins AuthorizedKeysCommand
@@ -143,8 +151,8 @@ assert_not_contains "argv: NO AuthorizedKeysCommandUser"                 "$argv"
 # NO global ForceCommand (per-key command= is authoritative — see header)
 assert_not_contains "argv: NO global ForceCommand"        "$argv" "ForceCommand"
 # the banner self-describes the policy + the expansion path (operator round-2)
-assert_file_exists "pre-auth banner written" "$WORK/principals/banner.txt"
-banner=$(cat "$WORK/principals/banner.txt" 2>/dev/null)
+assert_file_exists "pre-auth banner written" "$PRINCIPALS/banner.txt"
+banner=$(cat "$PRINCIPALS/banner.txt" 2>/dev/null)
 assert_contains "banner states the command policy" "$banner" "command policy: channel-only"
 assert_contains "banner points to the client's own operator (no nexus intake)" "$banner" "YOUR OWN operator"
 th_kill_own_child "$SUP_PID" TERM
@@ -152,8 +160,45 @@ wait "$SUP_PID" 2>/dev/null; suprc=$?
 SUP_PID=""
 assert_rc "supervisor TERM → exit 0" "$suprc" "0"
 
+echo "== 5a1. UNSAFE CREDENTIAL STORAGE ⇒ supervisor refuses to launch sshd =="
+# The end-to-end form of the invariant: it is not enough that
+# _remote_principals_guard returns non-zero — the SERVICE must not listen.
+# Pre-fix, a principals_dir in the group-shared project tree started an sshd
+# happily and wrote a host key + authorized_keys there.
+BADDIR="$WORK/nexusroot/monitor/.state/principals"   # i.e. the shared project tree
+mkdir -p "$BADDIR"; chmod 700 "$BADDIR"
+cp "$PRINCIPALS/ssh_host_ed25519_key" "$BADDIR/" 2>/dev/null || : > "$BADDIR/ssh_host_ed25519_key"
+rm -f "$WORK/sshd-argv"
+BPORT=$(( 25000 + ($$ % 4000) ))
+MONITOR_REMOTE_PRINCIPALS_DIR="$BADDIR" MONITOR_REMOTE_PORT=$BPORT \
+    timeout 5 bash "$SUP" > "$WORK/badsup.log" 2>&1
+assert_no_file "principals_dir OUTSIDE \$HOME/.claude ⇒ stub sshd NEVER invoked" "$WORK/sshd-argv"
+assert_contains "…supervisor logs a loud credential-storage refusal" \
+    "$(cat "$WORK/badsup.log" 2>/dev/null)" "refusing to launch sshd: unsafe credential storage"
+MONITOR_REMOTE_PRINCIPALS_DIR="$BADDIR" MONITOR_REMOTE_PORT=$BPORT bash "$HEALTH" >/dev/null 2>&1
+assert_rc "…and nothing is listening on that port" "$?" "1"
+
+echo "== 5a1b. LOOSE MODES at a VALID location ⇒ harden repairs, then sshd launches =="
+# The complement of 5a1. A wrong LOCATION is refused outright and never
+# auto-"fixed"; loose MODES at a correct location are repaired by
+# _remote_principals_harden (it only ever restricts, and only files we own) and
+# the service then launches. Without this case the guard could pass 5a1 by
+# refusing everything — including a healthy dir — and would get switched off.
+# The refusal side of the mode axis is unit-tested exhaustively in
+# test-remote-principals-guard.sh (0755/0750/enroll-0755/secret-0640/go-w).
+chmod 755 "$PRINCIPALS"; chmod 640 "$PRINCIPALS/ssh_host_ed25519_key"
+rm -f "$WORK/sshd-argv"
+HPORT=$(( 26000 + ($$ % 4000) ))
+MONITOR_REMOTE_PORT=$HPORT bash "$SUP" >/dev/null 2>&1 &
+HSUP=$!
+hl=1; for _ in $(seq 1 30); do MONITOR_REMOTE_PORT=$HPORT bash "$HEALTH" >/dev/null 2>&1 && { hl=0; break; }; sleep 0.2; done
+assert_rc "harden repairs the modes it owns ⇒ service launches" "$hl" "0"
+assert_eq "…principals_dir back to 0700" "$(stat -c '%a' "$PRINCIPALS" 2>/dev/null)" "700"
+assert_eq "…host key back to 0600"       "$(stat -c '%a' "$PRINCIPALS/ssh_host_ed25519_key" 2>/dev/null)" "600"
+th_kill_own_child "$HSUP" TERM; wait "$HSUP" 2>/dev/null; HSUP=""
+
 echo "== 5a2. self_enroll=false ⇒ AuthorizedKeysCommand pinned to none (manual only) =="
-rm -f "$WORK/sshd-argv"; rm -f "$WORK/principals/authorized_keys"
+rm -f "$WORK/sshd-argv"; rm -f "$PRINCIPALS/authorized_keys"
 OPORT=$(( 24000 + ($$ % 4000) ))
 MONITOR_REMOTE_SELF_ENROLL=false MONITOR_REMOTE_PORT=$OPORT bash "$SUP" >/dev/null 2>&1 &
 OSUP=$!
@@ -295,7 +340,7 @@ assert_contains "config health_timeout=1 honored in the probe" "$cferr" "no SSH 
 th_kill_own_child "$CFPID" KILL 2>/dev/null; wait "$CFPID" 2>/dev/null
 
 echo "== 5c. channel-only: supervisor REFUSES a command=-less authorized_keys (HIGH) =="
-printf 'ssh-ed25519 AAAAC3NzaShellKeyNoCommand danger@host\n' > "$WORK/principals/authorized_keys"
+printf 'ssh-ed25519 AAAAC3NzaShellKeyNoCommand danger@host\n' > "$PRINCIPALS/authorized_keys"
 BPORT=$(( 26000 + ($$ % 4000) ))
 MONITOR_REMOTE_PORT=$BPORT bash "$SUP" >/dev/null 2>&1 &
 BSUP=$!
@@ -323,7 +368,7 @@ assert_rc "unfiltered + command=-less key → DOES listen" "$u_listen" "0"
 uargv=$(cat "$WORK/sshd-argv" 2>/dev/null || echo "")
 assert_contains "unfiltered ⇒ PermitTTY=yes" "$uargv" "PermitTTY=yes"
 th_kill_own_child "$USUP" TERM; wait "$USUP" 2>/dev/null
-rm -f "$WORK/principals/authorized_keys"
+rm -f "$PRINCIPALS/authorized_keys"
 
 echo "== 6. remote-up: enable is ONE command (no flag) → row + host key + healthy =="
 deregister_row   # clean slate; remote-up writes the row itself (= enabling)
@@ -333,7 +378,7 @@ row=$(cat "$WORK/services.registry")
 assert_contains "row name nexus-remote-ssh" "$row" "nexus-remote-ssh"
 assert_contains "row policy emit-only"      "$row" "emit-only"
 assert_contains "row launch = supervisor"   "$row" "remote-sshd-supervised.sh"
-assert_file_exists "host key generated" "$WORK/principals/ssh_host_ed25519_key"
+assert_file_exists "host key generated" "$PRINCIPALS/ssh_host_ed25519_key"
 # idempotent: re-run leaves exactly one row
 REMOTE_UP_TIMEOUT=12 bash "$UP" >/dev/null 2>&1
 assert_eq "registry row idempotent (one row)" "$(grep -c 'nexus-remote-ssh' "$WORK/services.registry")" "1"
