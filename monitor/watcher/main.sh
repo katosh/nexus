@@ -137,11 +137,21 @@
 #                             (default 300)
 #   MONITOR_OVER_LIMIT_MAX_ATTEMPTS
 #                          -> monitor.over_limit.max_attempts
-#                             (default 10) — give up + drop the stamp
-#                             after this many still-suspended retries.
-#                             A drop without resumption is a load-bearing
-#                             signal of an Anthropic-side stall; the
-#                             operator should manually intervene.
+#                             (default 4) — after this many
+#                             still-suspended retries, FAIL OPEN:
+#                             paste the resume brief anyway and drop
+#                             the stamp. A suspended pane never
+#                             repaints on its own, so post-reset the
+#                             probe keeps reading over-limit; the
+#                             paste is the probe that breaks the
+#                             cycle (see _over_limit.sh header).
+#   MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS
+#                          -> monitor.over_limit.max_hold_seconds
+#                             (default 90000 = 25h) — absolute per-row
+#                             hold ceiling; a row older than this fails
+#                             OPEN regardless of pane state or probe
+#                             outcome. Bounds EVERY wake path (incl. a
+#                             persistently-failing pane-state probe).
 #   MONITOR_ORCH_UNRESPONSIVE_THRESHOLD_S
 #                          -> monitor.orchestrator_unresponsive_threshold_seconds
 #                             DEPRECATED (#164). When set, seeds the
@@ -1710,14 +1720,16 @@ _compose_report_body() {
         # worker (or, Phase 2, a confined remote SSH client) via
         # `ng request file`. Claimed + re-emitted (cooldown, cap, origin
         # fairness) by monitor/watcher/_requests.sh. Ack/answer protocol:
-        #   ng request ack <id>     (.claimed → .done; bare acknowledgement)
         #   ng request reply <id> … (.claimed → .replied; writes ## Reply +
         #                            reply: refs — worker/dir/issue, or the
         #                            no-publish progress/results fetch path)
+        #   ng request ack <id>     (.claimed → .done; bare acknowledgement —
+        #                            REFUSED on a reply:required request, which
+        #                            MUST be answered with `reply`)
         # See agent-prompt.md "Draining the request inbox".
         echo '--- requests ---'
         printf '%s' "$requests_lines"
-        echo '(read the cited file; ack via `ng request ack <id>` or answer via `ng request reply <id> …`)'
+        echo '(read the cited file; a `reply: required` request MUST be answered via `ng request reply <id> …` — `ack` refuses it; only a request without reply:required may be closed with the bare `ng request ack <id>`)'
     fi
     if [[ -n "$idle_lines" ]]; then
         # Idle-worker transitions: wrapped → orchestrator can consider
@@ -2880,6 +2892,7 @@ if [[ -n "$gh_now" || -n "$bell_now" || -n "$idle_now" || -n "$pending_now" || -
     log "startup-sweep paste start (target=${TARGET})"
     if _over_limit_orchestrator_paused; then
         log "startup-sweep paste suppressed: orchestrator over-limit"
+        _over_limit_record_held "$(basename "$archive_path")" "startup-sweep"
     elif paste_with_retry "$TARGET" "$emit_body"; then
         log "startup-sweep pasted to ${TARGET}"
         _emit_delivery_ok
@@ -3983,6 +3996,10 @@ _v2_task_compose_emit() {
                 :
             elif _over_limit_orchestrator_paused; then
                 log "emit paste suppressed: orchestrator over-limit (archive=$(basename "$archive_path"))"
+                # Record the held emit in the off-time log so the special
+                # first flushed emit (the resume brief) can point the
+                # operator at exactly what was withheld (your-nexus#275).
+                _over_limit_record_held "$(basename "$archive_path")" "$reason"
             elif paste_with_retry "$TARGET" "$emit_body"; then
                 log "pasted to ${TARGET}"
                 _emit_delivery_ok

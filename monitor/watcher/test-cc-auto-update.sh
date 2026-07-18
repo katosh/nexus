@@ -1027,6 +1027,150 @@ else
     fail "SIGTERM-hold wrong (rc=$rc, hold=$( [[ -f $auto/restart-hold ]] && echo yes || echo no ))"
 fi
 
+# ===== restart-outcome marker + abort-streak escalation (nexus-code#511) ====
+
+echo "== restart-outcome marker + abort escalation =="
+
+# A non-resolving tmux stub (no orchestrator→index mapping) reproduces the
+# target-window-unresolved abort (rc 23) this issue tracks. Same shape as
+# case 20c, factored so the streak tests can reuse it.
+_nonresolving_tmux() {
+    cat > "$1/tmux" <<EOF
+#!/usr/bin/env bash
+echo "tmux \$*" >> "$1/calls.log"
+case "\$1" in list-windows) exit 0 ;; esac
+exit 0
+EOF
+    chmod +x "$1/tmux"
+}
+
+# M1. abort writes the single-latest restart-outcome marker (outcome/code/
+#     cause/abort_streak), and the FIRST same-cause abort is streak=1.
+ROOT="$WORK/m1"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+auto="$ROOT/monitor/.state/cc-auto-update"
+_nonresolving_tmux "$ROOT"
+env $(apply_env "$ROOT") CC_AUTO_RESTART_ABORT_ESCALATE=3 bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+rc=$?
+if (( rc == 23 )) && [[ -f "$auto/restart-outcome" ]] \
+   && grep -q '^outcome=safe-bumped-restart-aborted$' "$auto/restart-outcome" \
+   && grep -q '^code=23$' "$auto/restart-outcome" \
+   && grep -q '^cause=target-window-unresolved=orchestrator$' "$auto/restart-outcome" \
+   && grep -q '^abort_streak=1$' "$auto/restart-outcome"; then
+    pass "abort writes restart-outcome marker (outcome/code/cause/streak=1)"
+else
+    fail "restart-outcome marker wrong after first abort (rc=$rc): $(cat "$auto/restart-outcome" 2>/dev/null | tr '\n' ' ')"
+fi
+# Streak 1 (< threshold 3): NO escalation row yet.
+grep -q $'\trestart-abort-escalation\t' "$auto/decisions.tsv" \
+    && fail "escalated at streak 1 (should not)" \
+    || pass "no escalation below threshold (streak 1)"
+
+# M2. consecutive same-cause aborts INCREMENT the streak; crossing the
+#     threshold shouts exactly once (a restart-abort-escalation audit row).
+env $(apply_env "$ROOT") CC_AUTO_RESTART_ABORT_ESCALATE=3 bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1   # streak 2
+grep -q '^abort_streak=2$' "$auto/restart-outcome" \
+    && pass "second same-cause abort → streak 2" || fail "streak did not reach 2"
+env $(apply_env "$ROOT") CC_AUTO_RESTART_ABORT_ESCALATE=3 bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1   # streak 3 → escalate
+if grep -q '^abort_streak=3$' "$auto/restart-outcome" \
+   && grep -q $'\trestart-abort-escalation\t' "$auto/decisions.tsv" \
+   && [[ "$(grep -c $'\trestart-abort-escalation\t' "$auto/decisions.tsv")" == "1" ]]; then
+    pass "streak reaches threshold (3) → escalates exactly once"
+else
+    fail "escalation-at-threshold wrong (streak=$(grep '^abort_streak' "$auto/restart-outcome"), escalations=$(grep -c $'\trestart-abort-escalation\t' "$auto/decisions.tsv"))"
+fi
+
+# M3. a SUCCESS resets the streak — escalation does not persist after the
+#     restart finally lands. Restore a resolving tmux (make_apply_root's
+#     default idle pane then drives a clean restart).
+cat > "$ROOT/tmux" <<EOF
+#!/usr/bin/env bash
+echo "tmux \$*" >> "$ROOT/calls.log"
+case "\$1" in
+  list-windows)
+    case "\$*" in *'#{window_name}|#{window_index}'*) echo "orchestrator|2" ;; esac
+    exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$ROOT/tmux"
+env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+rc=$?
+if (( rc == 0 )) && grep -q '^outcome=safe-bumped-restarted$' "$auto/restart-outcome" \
+   && grep -q '^abort_streak=0$' "$auto/restart-outcome"; then
+    pass "success resets the abort streak to 0 (outcome=restarted)"
+else
+    fail "streak not reset on success (rc=$rc): $(cat "$auto/restart-outcome" 2>/dev/null | tr '\n' ' ')"
+fi
+
+# M4. a DIFFERENT-cause abort does NOT continue a prior cause's streak — it
+#     restarts at 1 (only a genuinely-repeating failure escalates).
+ROOT="$WORK/m4"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+auto="$ROOT/monitor/.state/cc-auto-update"
+_nonresolving_tmux "$ROOT"
+env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1   # target-window, streak 1
+env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1   # target-window, streak 2
+grep -q '^abort_streak=2$' "$auto/restart-outcome" || fail "M4 setup: streak != 2"
+# Now a resolving tmux but an UNREADABLE pane-state → a different abort cause.
+cat > "$ROOT/tmux" <<EOF
+#!/usr/bin/env bash
+echo "tmux \$*" >> "$ROOT/calls.log"
+case "\$1" in
+  list-windows)
+    case "\$*" in *'#{window_name}|#{window_index}'*) echo "orchestrator|2" ;; esac
+    exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$ROOT/tmux"
+printf '#!/usr/bin/env bash\necho "usage: pane-state.sh <window-index>" >&2\nexit 2\n' > "$ROOT/pane-state"
+chmod +x "$ROOT/pane-state"
+env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
+    --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
+if grep -q '^cause=pane-state-unreadable$' "$auto/restart-outcome" \
+   && grep -q '^abort_streak=1$' "$auto/restart-outcome"; then
+    pass "a different abort cause resets the streak to 1 (no false escalation)"
+else
+    fail "different-cause streak-reset wrong: $(cat "$auto/restart-outcome" 2>/dev/null | tr '\n' ' ')"
+fi
+
+# M5. the INLINE seam makes a Step-5b abort DISTINGUISHABLE to a caller:
+#     `safe` (CC_AUTO_RESTART_INLINE=1) applies the bump AND propagates the
+#     restart's non-zero abort code — an evaluator can no longer read a
+#     restart-aborted fire as a clean success.
+ROOT="$WORK/m5"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+auto="$ROOT/monitor/.state/cc-auto-update"
+_nonresolving_tmux "$ROOT"
+env $(apply_env "$ROOT") CC_AUTO_RESTART_INLINE=1 bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+rc=$?
+if (( rc == 23 )) \
+   && [[ "$(cat "$ROOT/monitor/.state/cc-version-local" 2>/dev/null)" == "2.1.160" ]] \
+   && grep -q $'\tsafe-bumped-restart-handoff\t' "$auto/decisions.tsv" \
+   && grep -q $'\tsafe-bumped-restart-aborted\t' "$auto/decisions.tsv" \
+   && grep -q '^outcome=safe-bumped-restart-aborted$' "$auto/restart-outcome"; then
+    pass "inline safe: bump applied but restart abort PROPAGATED (rc 23, not 0)"
+else
+    fail "inline abort-propagation wrong (rc=$rc, pin=$(cat "$ROOT/monitor/.state/cc-version-local" 2>/dev/null))"
+fi
+
+# M6. REGRESSION: the DETACHED (production) path still exits 0 at hand-off —
+#     the async abort is a future event there, surfaced via the marker, not
+#     the exit code (proven green by case 12b's rc-0 + handoff assertion;
+#     re-pinned here for the exit-code contract specifically).
+ROOT="$WORK/m6"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+_nonresolving_tmux "$ROOT"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+rc=$?
+(( rc == 0 )) && pass "detached safe still exits 0 at hand-off (abort is a future event)" \
+    || fail "detached safe exit-code regressed (rc=$rc, want 0)"
+
 # ===== deployment gate (nexus-code#512) ====================================
 
 echo "== deployment gate =="

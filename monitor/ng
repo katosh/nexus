@@ -9,7 +9,16 @@
 #   ng react-issue   55 rocket             # react on the issue itself
 #   ng react   4272693242 eyes --repo OWNER/NAME    # cross-repo react (process/react/react-issue/process-issue all take --repo)
 #   ng show    4272693242                  # print comment body (read-only)
+#   ng show    4272693242 --meta           # + id/updated_at header (CAS snapshot
+#                                          #   for comment-edit --expect-updated-at)
 #   echo "done" | ng reply 7               # post a reply (body from stdin)
+#   ng comment-edit 4272693242 --body-file new.md --expect-updated-at <ts>
+#                # compare-and-swap edit of an existing comment: refuses
+#                # (exit 4) when the comment changed since your `ng show
+#                # --meta` read, instead of silently clobbering the
+#                # concurrent edit (#524). --force = deliberate
+#                # last-writer-wins (loud stderr warning). Prefer
+#                # `ng reply` (append) on contended threads.
 #   ng reply 7 --repo owner/name --body-file b.md   # cross-repo reply
 #   echo "ack" | ng comment 7              # alias of `ng reply` (issue/PR comment)
 #   ng close   12 --comment "shipped"      # comment + close, prints CLOSED
@@ -168,7 +177,7 @@
 #   - READ verbs (issue view, pr view, show) prefer the cwd's
 #     `git remote get-url origin` if it's a github.com URL (one-line
 #     stderr warning when different from $REPO), else fall back to $REPO.
-#   - WRITE verbs (reply, wrap-up, issue create, issue comment, pr
+#   - WRITE verbs (reply, comment-edit, wrap-up, issue create, issue comment, pr
 #     create, pr edit, pr merge, upload) prefer $REPO from config. If
 #     the cwd has a github origin that DIFFERS from $REPO, the verb
 #     refuses to write (structured error asking for explicit --repo)
@@ -184,7 +193,16 @@
 
 set -uo pipefail
 
-_script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# Dereference symlinks before resolving the script dir. `ng` is invoked
+# BY NAME through the `locals/bin/ng -> ../../monitor/ng` shim that
+# link-nexus-tools.sh provisions (and that the worker floor tells every
+# worker to use). Without `readlink -f`, BASH_SOURCE[0] is the shim path,
+# `_script_dir` resolves to `locals/bin`, and `$_script_dir/../config/load.sh`
+# points at the nonexistent `locals/config/load.sh` — so config loading
+# silently fails and every config-derived value falls back to a built-in
+# default (your-org/nexus-code#522). Matches the idiom already used by
+# entry.sh:93, install-claude-local.sh:67, link-nexus-tools.sh:41.
+_script_dir=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 _cfg="$_script_dir/../config/load.sh"
 
 REPO="$("$_cfg" github.repo)"
@@ -271,7 +289,8 @@ _usage_for() {
         cmd_reply)          echo "usage: ng reply <issue> [--repo <owner/name>] [--body-file <path>]" ;;
         cmd_comment)        echo "usage: ng comment <issue> [--repo <owner/name>] [--body-file <path>]   # alias of ng reply" ;;
         cmd_close)          echo "usage: ng close <issue> [--comment <text>]" ;;
-        cmd_show)           echo "usage: ng show <comment-id> [--repo <owner/name>]" ;;
+        cmd_show)           echo "usage: ng show <comment-id> [--repo <owner/name>] [--meta]" ;;
+        cmd_comment_edit)   echo "usage: ng comment-edit <comment-id> (--expect-updated-at <ts> | --force) [--repo <owner/name>] [--body-file <path>]   # CAS: exit 4 on concurrent edit; get <ts> from \`ng show <id> --meta\`" ;;
         cmd_upload)         echo "usage: ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin|latest] [--message <msg>]" ;;
         cmd_wrap_up)        echo "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--comment-body-file <path>|--no-comment] [--allow-stub] [--retain <reason>|--no-retain]" ;;
         cmd_report_init)    echo "usage: ng report-init <slug> [--project <name>] [--issue <#>] [--comment-id <id>] [--reports-dir <path>]" ;;
@@ -387,7 +406,7 @@ api() { GH_TOKEN=$(token) gh api "$@"; }
 # Resolve the target repo for --repo-aware verbs. Two modes:
 #
 # write (default — every verb that mutates GitHub state):
-#   reply, wrap-up, issue create, issue comment, pr create, pr edit,
+#   reply, comment-edit, wrap-up, issue create, issue comment, pr create, pr edit,
 #   pr merge, upload, dashboard put. Precedence:
 #     1. explicit --repo
 #     2. $REPO from config
@@ -485,6 +504,99 @@ _post_body() {
           | jq -r '.html_url // empty')
     [[ -n "$url" ]] || die "POST $endpoint failed"
     printf '%s\n' "$url"
+}
+
+# ---- CAS comment edit (#524 defect 1) -----------------------------------
+#
+# Every nexus agent posts as the SAME bot identity, so a concurrent
+# agent overwriting a comment edit is unattributable by construction —
+# GraphQL userContentEdits shows one author for every revision. A plain
+# `PATCH /repos/.../issues/comments/<id>` is last-writer-wins, and a
+# passing "re-fetch + grep the body" verification has a shelf life
+# (observed: `#282` comment 4960082155, a correction silently restored
+# to its refuted form ~10 min later by a concurrent consolidation).
+#
+# GitHub REST does NOT support server-side preconditions here: PATCH
+# with `If-Match` (or `If-Unmodified-Since`) is rejected with HTTP 400
+# "Conditional request headers are not allowed in unsafe requests
+# unless supported by the endpoint" (verified live 2026-07-15 against
+# api.github.com). So the compare-and-swap is client-side:
+#
+#   1. re-read the comment; abort LOUDLY if `updated_at` differs from
+#      the caller's snapshot (someone wrote between read and write);
+#   2. PATCH the new body;
+#   3. post-write verify: the PATCH response's stored body must equal
+#      what we sent (CR-normalized), else fail loud.
+#
+# Step 1 cannot close the read→write window entirely (no server-side
+# precondition exists), but it fully catches the observed failure
+# mode — a clobber landing minutes later — and two writers that BOTH
+# use this path can no longer silently lose either edit. `updated_at`
+# has 1-second granularity; the residual same-second blind spot is
+# documented, not hidden.
+#
+# _comment_patch_cas <target> <cid> <new-body> <expect-updated-at>
+#   stdout: comment html_url on success
+#   rc 0   success
+#   rc 4   concurrent edit detected (updated_at moved) — caller must
+#          re-read the CURRENT body, re-apply its edit, and retry
+#   rc 1   fetch/PATCH/verify failure
+_comment_patch_cas() {
+    local target="$1" cid="$2" new_body="$3" expect="$4"
+    [[ -n "$expect" ]] || { echo "ng: comment $cid: empty expected updated_at (CAS token required)" >&2; return 1; }
+    local meta cur_updated
+    meta=$(api "/repos/$target/issues/comments/$cid" 2>/dev/null) \
+        || { echo "ng: comment $cid: pre-write fetch failed" >&2; return 1; }
+    cur_updated=$(jq -r '.updated_at // empty' <<<"$meta")
+    [[ -n "$cur_updated" ]] \
+        || { echo "ng: comment $cid: malformed metadata (no updated_at)" >&2; return 1; }
+    if [[ "$cur_updated" != "$expect" ]]; then
+        {
+            printf 'ng: comment %s: CONCURRENT EDIT detected — updated_at moved (%s -> %s).\n' \
+                "$cid" "$expect" "$cur_updated"
+            printf 'ng: refusing to clobber. Re-read the CURRENT body (`ng show %s --meta`),\n' "$cid"
+            printf 'ng: re-apply your edit against it, then retry with the fresh updated_at.\n'
+        } >&2
+        return 4
+    fi
+    local resp url got_body
+    resp=$(jq -n --arg b "$new_body" '{body: $b}' \
+           | api -X PATCH "/repos/$target/issues/comments/$cid" --input -) \
+        || { echo "ng: comment $cid: PATCH failed" >&2; return 1; }
+    url=$(jq -r '.html_url // empty' <<<"$resp")
+    got_body=$(jq -r '.body // empty' <<<"$resp")
+    [[ -n "$url" ]] \
+        || { echo "ng: comment $cid: PATCH returned no html_url" >&2; return 1; }
+    # Post-write verify — the response body IS the stored artifact.
+    # Compare CR-normalized so a CRLF-vs-LF round-trip can't false-alarm.
+    if [[ "${got_body//$'\r'/}" != "${new_body//$'\r'/}" ]]; then
+        {
+            printf 'ng: comment %s: PATCH succeeded but the stored body differs from what was sent.\n' "$cid"
+            printf 'ng: treat the comment as contended — inspect it (`ng show %s --meta`) and re-edit.\n' "$cid"
+        } >&2
+        return 1
+    fi
+    printf '%s\n' "$url"
+}
+
+# Escape $1 for use inside a sed -E pattern (delimiter `%`).
+_re_escape() { printf '%s' "$1" | sed -e 's/[][(){}.*+?^$|\\%]/\\&/g'; }
+# Escape $1 for use as a sed replacement string (delimiter `%`).
+_sed_rep_escape() { printf '%s' "$1" | sed -e 's/[\\&%]/\\&/g'; }
+
+# Replace every http(s) URL token that ends in /<basename> — an
+# asset-repo link to this report — with <new-url>. Token boundaries are
+# whitespace, quotes, angle brackets, and `)` (the markdown-link
+# closer); a URL whose path CONTINUES past the basename is left alone
+# rather than corrupted. Pure text transform, no network.
+#   _replace_asset_links <body> <basename> <new-url>
+_replace_asset_links() {
+    local body="$1" bname="$2" new_url="$3"
+    local bname_re new_url_rep
+    bname_re=$(_re_escape "$bname")
+    new_url_rep=$(_sed_rep_escape "$new_url")
+    printf '%s\n' "$body" \
+        | sed -E "s%https?://[^[:space:]<>\"')]*/${bname_re}([^A-Za-z0-9._~/-]|\$)%${new_url_rep}\\1%g"
 }
 
 # ---- subcommands ----
@@ -685,6 +797,68 @@ cmd_comment() {
     cmd_reply "$@"
 }
 
+# `ng comment-edit <comment-id>` — compare-and-swap edit of an existing
+# issue/PR comment (#524 defect 1). The safe read-modify-write loop:
+#
+#   ng show <cid> --meta          # 1. read: body + updated_at snapshot
+#   <edit the body locally>       # 2. modify
+#   ng comment-edit <cid> --body-file new.md \
+#       --expect-updated-at <ts>  # 3. write: refused (rc 4) if the
+#                                 #    comment moved since your read
+#
+# --expect-updated-at is REQUIRED: without it the verb cannot tell a
+# clean write from a clobber, and last-writer-wins on a shared bot
+# identity is exactly the silent-lost-update incident this verb exists
+# to prevent. `--force` is the loud, deliberate opt-out (plain PATCH,
+# no precondition) for comments you provably own alone.
+#
+# Prefer APPENDING (`ng reply`) over mutating a long-lived shared
+# comment — an append can't lose anyone's edit. Reach for comment-edit
+# only when the comment must be corrected in place.
+cmd_comment_edit() {
+    _help_check "$@"
+    local cid="${1:-}"; shift || true
+    [[ -n "$cid" ]] || die "usage: ng comment-edit <comment-id> (--expect-updated-at <ts> | --force) [--repo <owner/name>] [--body-file <path>]"
+    local body_file="" repo_arg="" expect="" force=0
+    while (( $# > 0 )); do
+        case "$1" in
+            --body-file)         body_file="${2:-}"; shift 2 ;;
+            --repo)              repo_arg="${2:-}";  shift 2 ;;
+            --expect-updated-at) expect="${2:-}";    shift 2 ;;
+            --force)             force=1;            shift   ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+    if [[ -n "$expect" ]] && (( force == 1 )); then
+        die "comment-edit: --expect-updated-at and --force are mutually exclusive"
+    fi
+    local target body
+    target=$(_resolve_repo write "$repo_arg") || exit $?
+    body=$(_read_body "$body_file")
+    [[ -n "$body" ]] || die "empty body"
+    if (( force == 1 )); then
+        {
+            printf 'ng comment-edit: --force — writing WITHOUT a concurrency precondition\n'
+            printf '(last-writer-wins; a concurrent edit of comment %s would be clobbered).\n' "$cid"
+        } >&2
+        local resp url
+        resp=$(jq -n --arg b "$body" '{body: $b}' \
+               | api -X PATCH "/repos/$target/issues/comments/$cid" --input -) \
+            || die "comment-edit: PATCH failed (id=$cid)"
+        url=$(jq -r '.html_url // empty' <<<"$resp")
+        [[ -n "$url" ]] || die "comment-edit: PATCH returned no html_url (id=$cid)"
+        printf '%s\n' "$url"
+        return 0
+    fi
+    if [[ -z "$expect" ]]; then
+        die "comment-edit is compare-and-swap by design: pass --expect-updated-at <ts> (from \`ng show $cid --meta\`), or --force to deliberately clobber. Prefer \`ng reply\` (append) on contended threads."
+    fi
+    local url rc=0
+    url=$(_comment_patch_cas "$target" "$cid" "$body" "$expect") || rc=$?
+    (( rc == 0 )) || exit "$rc"
+    printf '%s\n' "$url"
+}
+
 cmd_close() {
     _help_check "$@"
     local issue="${1:-}"; shift || true
@@ -728,7 +902,7 @@ cmd_upload() {
 #      where <cwd-slug> mirrors Claude Code's path normalisation:
 #      every non-alphanumeric character (including '/' AND '_') becomes
 #      '-', and the leading '-' from a leading '/' is preserved.
-#      e.g. /home/operator/my_nexus → -home-operator-my-nexus.
+#      e.g. /shared/your-lab-m/user/operator/nexus → -fh-fast-setty-m-user-your-nexus.
 #      LAST-RESORT ONLY: freshest-jsonl is a heuristic, not the caller.
 #   3. Fallback: scan ~/.claude/projects/ for any project dir whose name
 #      contains the slugified cwd tail; pick the most-recently-modified.
@@ -1197,6 +1371,71 @@ _wrapup_prior_comment_url() {
         ] | last // empty' "$log_file" 2>/dev/null
 }
 
+# Re-point a prior wrap-up link comment at a fresh asset upload (#524
+# defect 2). Every `ng wrap-up` run re-uploads the report to a NEW
+# SHA-pinned blob, so a re-wrap that merely REUSES the prior comment
+# leaves the thread linking the PRE-correction report while printing
+# success (observed: `#523` — the reused comment linked a stale blob
+# with 0 mentions of the corrected finding; the new blob had 9).
+#
+# Reads the prior comment, splices every asset link ending in this
+# report's basename over to <new-asset-url>, and writes back through
+# the CAS path (_comment_patch_cas) so the re-point can't itself
+# reintroduce the lost-update race. One retry on a detected concurrent
+# edit (re-read + re-splice), then fail loud.
+#
+#   _wrapup_repoint_link_comment <target> <prior-comment-html-url>
+#                                <report-basename> <new-asset-url>
+#   stdout: comment html_url
+#   rc 0  re-pointed (or already pointing at the new blob)
+#   rc 2  cannot re-point (comment deleted / id unparseable / body no
+#         longer references this report) — caller should post fresh
+#   rc 1  hard failure (fetch/PATCH/verify), including CAS conflicts
+#         that persisted across the retry
+_wrapup_repoint_link_comment() {
+    local target="$1" prior_url="$2" bname="$3" new_url="$4"
+    local cid="${prior_url##*issuecomment-}"
+    if [[ ! "$cid" =~ ^[0-9]+$ ]]; then
+        printf 'wrap-up: prior comment url has no issuecomment-<id> suffix: %s\n' "$prior_url" >&2
+        return 2
+    fi
+    local attempt meta cur_body cur_updated new_body out rc
+    for attempt in 1 2; do
+        meta=$(api "/repos/$target/issues/comments/$cid" 2>/dev/null) || {
+            printf 'wrap-up: prior link comment %s no longer fetchable (deleted?)\n' "$cid" >&2
+            return 2
+        }
+        cur_body=$(jq -r '.body // empty' <<<"$meta")
+        cur_updated=$(jq -r '.updated_at // empty' <<<"$meta")
+        if [[ -z "$cur_body" || -z "$cur_updated" ]]; then
+            printf 'wrap-up: prior link comment %s: malformed metadata\n' "$cid" >&2
+            return 2
+        fi
+        new_body=$(_replace_asset_links "$cur_body" "$bname" "$new_url")
+        if [[ "$new_body" == "$cur_body" ]]; then
+            if [[ "$cur_body" == *"$new_url"* ]]; then
+                # Idempotent retry: the comment already links the new blob.
+                printf '%s\n' "$prior_url"
+                return 0
+            fi
+            printf 'wrap-up: prior link comment %s no longer references %s — posting fresh instead\n' \
+                "$cid" "$bname" >&2
+            return 2
+        fi
+        rc=0
+        out=$(_comment_patch_cas "$target" "$cid" "$new_body" "$cur_updated") || rc=$?
+        if (( rc == 0 )); then
+            printf '%s\n' "$out"
+            return 0
+        fi
+        # rc 4 = someone edited between our read and write; re-read the
+        # CURRENT body and re-splice once. Anything else is a hard fail.
+        (( rc == 4 )) || return 1
+    done
+    printf 'wrap-up: comment %s kept moving under concurrent edits; re-run ng wrap-up\n' "$cid" >&2
+    return 1
+}
+
 # ---- skeptic protocol (skills/nexus.skeptic) ----------------------------
 #
 # Read a window's spawn-stamped skeptic provenance from
@@ -1545,18 +1784,22 @@ _wrapup_skeptic_step() {
     local next=$((depth + 1))
     case "$effective" in
         required|required-escalated)
-            # Open a NEW skeptic round: clear the previous round's DONE
-            # sentinel BEFORE writing the pending marker. A completed round
-            # leaves $STATE_DIR/skeptic/<task>/DONE behind; left in place, the
-            # worker's very next `skeptic-channel.sh await` returns exit 10
-            # instantly and it retires believing it was validated when no
-            # skeptic ever spawned — the gate fails OPEN exactly on the
-            # re-validation rounds, which exist because something was already
-            # found wrong (issue #469). await independently refuses a DONE
-            # older than the marker; this is the fail-fast half of that pair.
-            if [[ -n "$sw_safe" ]]; then
-                rm -f "$STATE_DIR/skeptic/${sw_safe}/DONE" 2>/dev/null || true
-            fi
+            # Open a NEW skeptic round: archive the previous round's terminal
+            # sentinels BEFORE writing the pending marker. A completed round
+            # leaves $STATE_DIR/skeptic/<task>/DONE (and its .answered.md
+            # verdicts) behind; left in place, the worker's very next
+            # `skeptic-channel.sh await` returns exit 10 instantly and it
+            # retires believing it was validated when no skeptic ever
+            # spawned — the gate fails OPEN exactly on the re-validation
+            # rounds, which exist because something was already found wrong
+            # (issue #469). `reset` ARCHIVES the stale pair into
+            # <channel>/.stale-archive-<ts>/ rather than bare-`rm`-ing only
+            # the DONE (your-org/nexus-code#511): the forensic trail survives
+            # and stale verdicts do not pollute the new round. await
+            # independently refuses a DONE older than the marker; this is the
+            # fail-fast half of that pair.
+            [[ -n "$source_window" ]] \
+                && "$_script_dir/skeptic-channel.sh" reset "$source_window" >/dev/null 2>&1 || true
             [[ -n "$sw_safe" ]] && printf '%s' "$next" > "$pending_dir/${sw_safe}" 2>/dev/null || true
             ( cmd_log_action monitor --event skeptic-request \
                 --extra "target-window=$source_window" \
@@ -1655,8 +1898,10 @@ _wrapup_skeptic_step() {
 # The universal end-of-task hand-off, folded into one verb:
 #   1. upload the report to the asset repo (via upload-asset.sh)
 #   2. post a templated comment on <issue> with the asset URL
-#      (post-once idempotent: a re-run reuses a prior wrap-up's
-#      comment for this issue+report+repo instead of duplicating it)
+#      (post-once idempotent: a re-run does not duplicate the link
+#      comment for this issue+report+repo — it RE-POINTS the prior
+#      comment's asset URL at the fresh upload via the CAS edit
+#      path, since step 1 mints a new blob every run; #524 defect 2)
 #   3. rocket-react the trigger comment if --trigger-comment is set
 #   4. append a wrap-up entry to the action log
 #   5. append a window-retain entry (auto by default; --no-retain
@@ -1858,13 +2103,36 @@ cmd_wrap_up() {
         : > "$err_buf"
         # Post-once idempotency (B15 / your-org/your-nexus#236): if a
         # prior wrap-up for this (issue, report, repo) already posted the
-        # link comment, reuse its url rather than double-posting on a
-        # retry. The body built above is then discarded (cheap, no I/O).
+        # link comment, don't double-post on a retry. But step 1 just
+        # re-uploaded the report to a NEW blob, so reusing the prior
+        # comment AS-IS would pin the thread to the STALE upload while
+        # printing success (#524 defect 2). Re-point the prior comment's
+        # asset link(s) at the new blob via the CAS edit path; when the
+        # comment is gone or no longer references this report, post the
+        # canonical link comment fresh (a duplicate beats a stale link).
         local prior_comment_url
         prior_comment_url=$(_wrapup_prior_comment_url "$issue" "$basename" "$target")
         if [[ -n "$prior_comment_url" ]]; then
-            comment_url="$prior_comment_url"
-            comment_st=reused
+            local repoint_rc=0
+            comment_url=$(_wrapup_repoint_link_comment \
+                "$target" "$prior_comment_url" "$basename" "$asset_url" \
+                2>"$err_buf") || repoint_rc=$?
+            if (( repoint_rc == 0 )); then
+                comment_st=updated
+            elif (( repoint_rc == 2 )); then
+                : > "$err_buf"
+                if comment_url=$(_post_body "/repos/$target/issues/$issue/comments" "$body" 2>"$err_buf"); then
+                    comment_st=ok
+                else
+                    comment_st=failed
+                    failure_detail+="  comment: POST /repos/$target/issues/$issue/comments failed: $(tr '\n' ' ' < "$err_buf")"$'\n'
+                    comment_url=""
+                fi
+            else
+                comment_st=failed
+                failure_detail+="  comment: re-point of prior link comment $prior_comment_url failed: $(tr '\n' ' ' < "$err_buf")"$'\n'
+                comment_url=""
+            fi
         elif comment_url=$(_post_body "/repos/$target/issues/$issue/comments" "$body" 2>"$err_buf"); then
             comment_st=ok
         else
@@ -1961,8 +2229,8 @@ cmd_wrap_up() {
     fi
     if [[ "$comment_st" == ok ]]; then
         printf 'posted comment: %s\n' "$comment_url"
-    elif [[ "$comment_st" == reused ]]; then
-        printf 'posted comment: REUSED %s (post-once: prior wrap-up already commented)\n' "$comment_url"
+    elif [[ "$comment_st" == updated ]]; then
+        printf 'posted comment: UPDATED %s (post-once: link re-pointed to the new upload)\n' "$comment_url"
     elif [[ "$comment_st" == skipped ]]; then
         printf 'posted comment: SKIPPED (upload failed)\n'
     else
@@ -2660,20 +2928,41 @@ cmd_preflight() {
 # user-authored comments) so agents can quote prior bot deliverables in
 # replies. The security boundary is in the *processing* path, not the
 # read path.
+#
+# `--meta` additionally emits the CAS snapshot header for
+# `ng comment-edit --expect-updated-at` (the safe read half of the
+# read-modify-write loop, #524 defect 1):
+#   id=<cid>
+#   updated_at=<ts>
+#   body<<EOF
+#   <body>
+#   EOF
 cmd_show() {
     _help_check "$@"
     local cid="${1:-}"; shift || true
-    [[ -n "$cid" ]] || die "usage: ng show <comment-id> [--repo <owner/name>]"
-    local repo_arg=""
+    [[ -n "$cid" ]] || die "usage: ng show <comment-id> [--repo <owner/name>] [--meta]"
+    local repo_arg="" with_meta=0
     while (( $# > 0 )); do
-        case "$1" in --repo) repo_arg="${2:-}"; shift 2 ;; *) die "unknown flag: $1" ;; esac
+        case "$1" in
+            --repo) repo_arg="${2:-}"; shift 2 ;;
+            --meta) with_meta=1;       shift   ;;
+            *) die "unknown flag: $1" ;;
+        esac
     done
-    local target body
+    local target meta body
     target=$(_resolve_repo read "$repo_arg") || exit $?
-    body=$(api "/repos/$target/issues/comments/$cid" 2>/dev/null \
-           | jq -r '.body // empty')
+    meta=$(api "/repos/$target/issues/comments/$cid" 2>/dev/null) \
+        || die "comment $cid: fetch failed"
+    body=$(jq -r '.body // empty' <<<"$meta")
     [[ -n "$body" ]] || die "comment $cid: fetch failed (or empty body)"
-    printf '%s\n' "$body"
+    if (( with_meta == 1 )); then
+        local updated
+        updated=$(jq -r '.updated_at // empty' <<<"$meta")
+        [[ -n "$updated" ]] || die "comment $cid: malformed metadata (no updated_at)"
+        printf 'id=%s\nupdated_at=%s\nbody<<EOF\n%s\nEOF\n' "$cid" "$updated" "$body"
+    else
+        printf '%s\n' "$body"
+    fi
 }
 
 # ---- dashboard ----
@@ -3930,7 +4219,8 @@ cmd_skeptic() {
 #     ng request fetch <id> progress|results   (no-publish branch; path-confined pull)
 #     ng request list [--state …] | show <id> | reqfile <id> | dir
 #   ORCHESTRATOR:
-#     ng request ack   <id>                    (.claimed → .done; bare ack)
+#     ng request ack   <id>                    (.claimed → .done; bare ack —
+#                                               refused on a reply:required id, use reply)
 #     ng request reply <id> [--worker w] [--dir p] [--issue o/r#N] …  (.claimed → .replied)
 #     ng request fail  <id> --reason "<why>"
 # Run `ng request --help` for the full surface + exit-code contract.
@@ -4019,8 +4309,11 @@ GitHub writes & reads:
   react-issue <n> <emoji>        react to an issue
   reply <issue>                  post a comment (body from stdin/--body-file)
   comment <issue>                alias of reply
+  comment-edit <comment-id>      CAS edit of an existing comment (exit 4 on
+                                 concurrent change; snapshot via show --meta)
   close <issue>                  comment + close
-  show <comment-id>              print a comment body (read-only)
+  show <comment-id>              print a comment body (read-only; --meta adds
+                                 the updated_at CAS snapshot)
   suppress-emit <comment-id>     mute a watcher emit for a comment
   upload <path>                  push file to asset repo, print pinned URL
   preflight <owner/repo>         is the bot installed on this repo?
@@ -4082,6 +4375,7 @@ main() {
         react-issue)    cmd_react_issue   "$@" ;;
         reply)          cmd_reply         "$@" ;;
         comment)        cmd_comment       "$@" ;;
+        comment-edit)   cmd_comment_edit  "$@" ;;
         close)          cmd_close         "$@" ;;
         issue)          cmd_issue         "$@" ;;
         pr)             cmd_pr            "$@" ;;

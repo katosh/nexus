@@ -23,16 +23,27 @@
 #    "window": <tmux window name>,
 #    "hook_event_name": "StopFailure"}
 #
-# `reset_at`: the brief flagged issue #129 open question #2 — does
-# the StopFailure payload carry the reset timestamp? Without an
-# observed rate-limit event during PR #129's implementation work we
-# cannot empirically confirm the field name. This handler probes
-# several plausible paths (`.reset_at`, `.reset_time`,
-# `.rate_limit_reset`, nested under `.error.reset_at`) and writes
-# the first non-null match; otherwise writes `null`. The renderer
-# regex `_extract_over_limit_reset` (monitor/pane-state.sh:232)
-# remains the authoritative `reset_at` extractor until a real
-# StopFailure payload settles the field name.
+# `reset_at`: issue #129 open question #2 is now settled empirically.
+# 17 real rate-limit StopFailure payloads captured in production
+# (monitor/.state/stopfailure-raw-captures.jsonl, 2026-06-26 →
+# 2026-07-14) show the shape:
+#
+#   { "hook_event_name": "StopFailure",
+#     "error": "rate_limit",                       <- STRING, not .error_type
+#     "last_assistant_message":
+#       "You've hit your weekly limit · resets 3am (America/Los_Angeles)",
+#     "session_id": ..., "transcript_path": ..., "cwd": ...,
+#     "prompt_id": ..., "effort": {...} }
+#
+# There is NO dedicated reset field — the reset time rides inside
+# `last_assistant_message`. This handler therefore (a) filters on
+# `.error == "rate_limit"` (string) with `.error_type` /
+# `.error.type` kept as compatibility fallbacks, and (b) extracts
+# `reset_at` from the explicit fields if a future CC adds one, else
+# parses the `resets <suffix>` clause of `last_assistant_message`,
+# normalised to the same token grammar `_extract_over_limit_reset`
+# (monitor/pane-state.sh) produces — "3am_America/Los_Angeles" — so
+# `_over_limit_reset_at_to_epoch` parses both channels identically.
 #
 # Cleanup contract: the file persists until a successful Stop event
 # clears it (see the `rm -f` entry the Stop block in
@@ -46,9 +57,14 @@
 # payload shape, mirroring the capture line PR #132 added for
 # Notification.
 #
-# Required env (exported by spawn-worker.sh):
+# Required env:
 #   NEXUS_ROOT           absolute path to the primary nexus clone
-#   NEXUS_WORKER_WINDOW  tmux window name this worker was spawned into
+# Window resolution (first match wins):
+#   NEXUS_WORKER_WINDOW        exported by spawn-worker.sh (workers)
+#   NEXUS_ORCHESTRATOR_WINDOW  exported by the orchestrator launcher
+#                              (_respawn_compose_launcher)
+#   tmux display-message       best-effort $TMUX_PANE lookup, covering
+#                              manually-launched panes
 #
 # Hot-path discipline: O(ms). Two jq invocations + one mv. Failure
 # in any path short-circuits to exit 0 (a wedged hook must not
@@ -58,8 +74,16 @@ set -u
 
 payload=$(cat 2>/dev/null || true)
 
-window="${NEXUS_WORKER_WINDOW:-}"
+window="${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-}}"
 root="${NEXUS_ROOT:-}"
+
+# Last-resort window resolution for panes launched without either env
+# var (operator-manual launches). Best-effort; a failure leaves
+# `window` empty and we bail exactly as before.
+if [[ -z "$window" ]] && [[ -n "${TMUX_PANE:-}" ]] \
+    && command -v tmux >/dev/null 2>&1; then
+    window=$(tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null) || window=""
+fi
 
 if [[ -z "$window" ]] || [[ -z "$root" ]]; then
     exit 0
@@ -67,7 +91,11 @@ fi
 
 command -v jq >/dev/null 2>&1 || exit 0
 
-state_dir="$root/monitor/.state"
+# NEXUS_STATE_DIR: direct override (test escape hatch + the resolution
+# order pane-state.sh already uses for READING the stamp — the writer
+# must agree or the two sides split-brain). Same convention as the
+# sibling hooks (turn-failure-emit.sh, async-launch-detect.sh, …).
+state_dir="${NEXUS_STATE_DIR:-$root/monitor/.state}"
 mkdir -p "$state_dir" 2>/dev/null || exit 0
 
 # Empirical-capture: write every StopFailure payload to a jsonl log
@@ -78,10 +106,16 @@ printf '%s' "$payload" \
     | jq -c --arg window "$window" '. + {nexus_window: $window, nexus_capture_ts: now}' \
     >> "$state_dir/stopfailure-raw-captures.jsonl" 2>/dev/null || true
 
-# Filter: only act on rate_limit. Other error_types (api_error,
-# auth_failure, etc.) get captured to the raw log above but do not
-# write an over-limit stamp.
-error_type=$(jq -r '.error_type // empty' <<<"$payload" 2>/dev/null) || error_type=""
+# Filter: only act on rate_limit. Other errors (server_error,
+# invalid_request, etc.) get captured to the raw log above but do not
+# write an over-limit stamp. The REAL payload carries the token as a
+# STRING in `.error` (empirically confirmed — see header); the
+# `.error_type` / `.error.type` probes are compatibility fallbacks in
+# case a CC release moves the field.
+error_type=$(jq -r '
+    if (.error | type) == "string" then .error
+    else (.error_type // .error.type // empty) end
+' <<<"$payload" 2>/dev/null) || error_type=""
 [[ "$error_type" == "rate_limit" ]] || exit 0
 
 dest_dir="$state_dir/over-limit"
@@ -89,14 +123,43 @@ mkdir -p "$dest_dir" 2>/dev/null || exit 0
 
 ts=$(date +%s)
 session_id=$(jq -r '.session_id // ""' <<<"$payload" 2>/dev/null || printf '')
-error_message=$(jq -r '.error.message // .error // .message // ""' <<<"$payload" 2>/dev/null || printf '')
+# `last_assistant_message` carries the human-readable notice in the
+# real payload ("You've hit your weekly limit · resets 3am (…)").
+# Older probes kept as fallbacks for fabricated/legacy shapes.
+error_message=$(jq -r '
+    if (.last_assistant_message? // null) != null then .last_assistant_message
+    elif ((.error? // null) | type) == "object" then (.error.message? // "")
+    elif ((.error? // null) | type) == "string" then .error
+    else (.message? // "") end
+' <<<"$payload" 2>/dev/null) || error_message=""
 
-# Probe plausible reset_at field paths. The bare `// "null"` ladder
-# ensures we always end with a literal `null` for jq's --argjson
-# (which insists on JSON-valid input). The probed paths come from
-# inspecting the documented schemas across recent Claude Code
-# releases — settle this once we see a real payload (#129 q2).
-reset_at_raw=$(jq -r '.reset_at // .reset_time // .rate_limit_reset // .error.reset_at // .error.reset // "null"' <<<"$payload" 2>/dev/null)
+# Reset time. Explicit fields first (none exist in the empirical
+# payload today, but a future CC may add one), then parse the
+# `resets <suffix>` clause of the notice text and normalise it to the
+# same token grammar as pane-state.sh::_extract_over_limit_reset:
+# strip parens, whitespace → `_`, cap 40 chars. Example:
+#   "… · resets 3am (America/Los_Angeles)" → "3am_America/Los_Angeles"
+# `_over_limit_reset_at_to_epoch` (monitor/watcher/_over_limit.sh)
+# consumes exactly this shape. On no match we write `null`; the
+# watcher's 6h safety-fallback hold bounds the unparseable case.
+reset_at_raw=$(jq -r '
+    (.reset_at? // .reset_time? // .rate_limit_reset?
+     // (if ((.error? // null) | type) == "object"
+         then (.error.reset_at? // .error.reset?)
+         else null end)
+     // "null")
+' <<<"$payload" 2>/dev/null) || reset_at_raw="null"
+if [[ -z "$reset_at_raw" ]] || [[ "$reset_at_raw" == "null" ]]; then
+    # The `s/·.*$//` cut mirrors pane-state's _extract_over_limit_reset:
+    # anything after a following `·` separator is UI decoration, not
+    # part of the reset time.
+    reset_at_raw=$(printf '%s' "$error_message" \
+        | grep -oE 'resets[[:space:]]+[^[:cntrl:]]+' \
+        | head -1 \
+        | sed -E 's/[[:space:]]*·.*$//; s/^resets[[:space:]]+//; s/[[:space:]]+$//' \
+        | tr -d '()' | tr -s '[:space:]' '_' | sed 's/_*$//') || reset_at_raw=""
+    reset_at_raw="${reset_at_raw:0:40}"
+fi
 if [[ -n "$reset_at_raw" ]] && [[ "$reset_at_raw" != "null" ]]; then
     reset_at_json=$(jq -nc --arg v "$reset_at_raw" '$v')
 else

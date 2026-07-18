@@ -131,6 +131,11 @@ chmod +x "$FAKE_NEXUS/monitor/upload-asset.sh"
 STUB_DIR="$WORK/bin"
 mkdir -p "$STUB_DIR"
 GH_CAPTURE="$WORK/gh-calls.txt"
+# Stateful fake comment store for the post-once / re-point tests
+# (#524 defect 2): POST to the issue-comments endpoint persists the
+# body; GET/PATCH on /issues/comments/1234 read/mutate it.
+COMMENT_STORE="$WORK/comment-store.json"
+COMMENT_SEQ="$WORK/comment-updated-seq"
 
 # Stubbed tmux. wrap-up calls
 #   tmux display-message -p -t "$TMUX_PANE" '#{window_name}'
@@ -278,7 +283,9 @@ run_ng() {
 
 reset_mocks() {
     unset MOCK_UPLOAD_FAIL MOCK_UPLOAD_SHA MOCK_COMMENT_FAIL MOCK_ROCKET_FAIL
+    unset MOCK_COMMENT_MOVING
     rm -rf "$STATE_DIR"
+    rm -f "$COMMENT_STORE" "$COMMENT_SEQ"
 }
 
 # Standard well-formed report used across the happy-path tests.
@@ -1058,48 +1065,82 @@ gh_calls=$(<"$GH_CAPTURE")
 assert_contains  "hand-off ran: comment POSTed"             "$gh_calls" \
                  "/issues/42/comments"
 
-# Re-establish the FULL canonical gh stub: tests 11/13 above left a
-# simplified stub in place (returns .../cmt, ignores MOCK_*_FAIL). The
-# post-once tests below need both the issuecomment-1234 URL and the
-# MOCK_ROCKET_FAIL toggle, so restore the toggle-aware stub here.
+# Re-establish the FULL canonical gh stub — now STATEFUL (#524 defect
+# 2): tests 11/13 above left a simplified stub in place (returns
+# .../cmt, ignores MOCK_*_FAIL). The post-once tests below need the
+# issuecomment-1234 URL, the MOCK_ROCKET_FAIL toggle, AND a real
+# comment record: POST persists the body to $COMMENT_STORE; GET/PATCH
+# on /issues/comments/1234 read/mutate it (PATCH bumps updated_at).
+# MOCK_COMMENT_MOVING=1 bumps updated_at on every GET, simulating a
+# comment under sustained concurrent edits (the CAS must fail loud).
 cat > "$STUB_DIR/gh" <<STUB
 #!/usr/bin/env bash
 printf '%s\\n' "\$*" >> "$GH_CAPTURE"
 if [[ "\${1:-}" != "api" ]]; then exit 0; fi
 endpoint=""
+method="GET"
+body_json=""
 shift
 while (( \$# > 0 )); do
     case "\$1" in
-        --input)  shift 2 ;;
-        -X|-H|-f) shift 2 ;;
+        --input)  body_json=\$(cat); shift 2 ;;
+        -X)       method="\$2"; shift 2 ;;
+        -H|-f)    shift 2 ;;
         --)       shift; break ;;
         /*)       endpoint="\$1"; shift ;;
         *)        shift ;;
     esac
 done
 if ! [ -t 0 ]; then cat >/dev/null 2>&1 || true; fi
+_bump() {
+    n=\$(( \$( cat "$COMMENT_SEQ" 2>/dev/null || echo 0 ) + 1 ))
+    printf '%s' "\$n" > "$COMMENT_SEQ"
+    printf '2026-07-15T12:00:%02dZ' "\$n"
+}
 case "\$endpoint" in
-    */issues/*/comments)
-        if [[ "\${MOCK_COMMENT_FAIL:-0}" == "1" ]]; then
-            echo '{"message":"mock comment POST 422"}' >&2; exit 1
-        fi
-        printf '{"html_url":"https://mock.example/issuecomment-1234"}' ;;
     */issues/comments/*/reactions)
         if [[ "\${MOCK_ROCKET_FAIL:-0}" == "1" ]]; then
             echo '{"message":"mock reactions POST 422"}' >&2; exit 1
         fi
         printf '{"id":99999,"content":"rocket"}' ;;
+    */issues/comments/*)
+        if [[ ! -f "$COMMENT_STORE" ]]; then
+            echo '{"message":"Not Found"}' >&2; exit 1
+        fi
+        if [[ "\$method" == "PATCH" ]]; then
+            new_body=\$(jq -r '.body' <<<"\$body_json")
+            ts=\$(_bump)
+            jq --arg b "\$new_body" --arg t "\$ts" \\
+               '.body=\$b | .updated_at=\$t' "$COMMENT_STORE" > "$COMMENT_STORE.tmp" \\
+               && mv "$COMMENT_STORE.tmp" "$COMMENT_STORE"
+        elif [[ "\${MOCK_COMMENT_MOVING:-0}" == "1" ]]; then
+            ts=\$(_bump)
+            jq --arg t "\$ts" '.updated_at=\$t' "$COMMENT_STORE" > "$COMMENT_STORE.tmp" \\
+                && mv "$COMMENT_STORE.tmp" "$COMMENT_STORE"
+        fi
+        jq '. + {html_url:"https://mock.example/issuecomment-1234"}' "$COMMENT_STORE" ;;
+    */issues/*/comments)
+        if [[ "\${MOCK_COMMENT_FAIL:-0}" == "1" ]]; then
+            echo '{"message":"mock comment POST 422"}' >&2; exit 1
+        fi
+        posted=\$(jq -r '.body' <<<"\$body_json")
+        jq -n --arg b "\$posted" --arg t "2026-07-15T12:00:00Z" \\
+            '{body:\$b, updated_at:\$t}' > "$COMMENT_STORE"
+        printf '{"html_url":"https://mock.example/issuecomment-1234"}' ;;
     *) printf '{}' ;;
 esac
 exit 0
 STUB
 chmod +x "$STUB_DIR/gh"
 
-# ---- Test 31: post-once idempotency — a clean re-run reuses the prior
-#      link comment instead of double-posting (B15 / your-nexus#236).
+comment_store_body() { jq -r '.body' "$COMMENT_STORE" 2>/dev/null; }
+
+# ---- Test 31: post-once idempotency — a clean re-run does not duplicate
+#      the link comment (B15 / your-nexus#236) and, post-#524, re-points
+#      it at the fresh upload instead of silently REUSING the stale link.
 #      State (the action-log) persists across run_ng; only reset_mocks
 #      wipes it, so the two runs below share the log the guard reads. ----
-echo '=== post-once: re-running wrap-up reuses the prior comment, no duplicate POST ==='
+echo '=== post-once: re-running wrap-up updates the prior comment, no duplicate POST ==='
 reset_mocks
 run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
 assert_eq       "first wrap-up exits 0"               "$rc" "0"
@@ -1109,10 +1150,12 @@ gh_calls=$(<"$GH_CAPTURE")
 assert_contains "first run POSTs to the comments endpoint" "$gh_calls" \
                 "/repos/override-org/override-repo/issues/42/comments"
 # Second wrap-up for the SAME issue+report+repo. Must NOT re-POST.
+# (Same MOCK_UPLOAD_SHA → the link already points at this blob → the
+# re-point is a no-op UPDATE, still reported as such.)
 run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
 assert_eq       "re-run exits 0"                      "$rc" "0"
-assert_contains "re-run reuses the prior comment"     "$stdout" \
-                "posted comment: REUSED https://mock.example/issuecomment-1234"
+assert_contains "re-run updates (not blind-reuses) the prior comment" "$stdout" \
+                "posted comment: UPDATED https://mock.example/issuecomment-1234"
 gh_calls=$(<"$GH_CAPTURE")
 assert_not_contains "re-run does NOT POST a duplicate comment" "$gh_calls" \
                     "/repos/override-org/override-repo/issues/42/comments"
@@ -1134,12 +1177,15 @@ gh_calls=$(<"$GH_CAPTURE")
 assert_contains "first run POSTs the comment"         "$gh_calls" \
                 "/issues/42/comments"
 unset MOCK_ROCKET_FAIL
-# Worker retries the whole verb. Rocket now succeeds.
+# Worker retries the whole verb. Rocket now succeeds. The re-uploaded
+# blob keeps the same mock SHA, so the link comment needs no PATCH —
+# but the retry must still go through the post-once UPDATE path, not
+# a blind reuse.
 run_ng stdout stderr rc wrap-up 42 "$REPORT" \
     --trigger-comment 7777 --repo override-org/override-repo
 assert_eq       "retry exits 0"                       "$rc" "0"
-assert_contains "retry reuses the prior comment"      "$stdout" \
-                "posted comment: REUSED"
+assert_contains "retry updates the prior comment"     "$stdout" \
+                "posted comment: UPDATED"
 assert_contains "retry rockets successfully"          "$stdout" \
                 "rocketed comment 7777"
 gh_calls=$(<"$GH_CAPTURE")
@@ -1164,6 +1210,70 @@ assert_contains "second report posts a fresh comment" "$stdout" \
 gh_calls=$(<"$GH_CAPTURE")
 assert_contains "second report DID POST (not deduped)" "$gh_calls" \
                 "/issues/42/comments"
+
+# ---- Test 34 (LOAD-BEARING, #524 defect 2): a re-wrap after correcting
+#      the report re-uploads to a NEW blob; the post-once path must
+#      re-point the existing link comment's asset URL at that new blob.
+#      Pre-#524 behaviour: print "REUSED", never touch the comment —
+#      the thread keeps linking the PRE-correction report while the
+#      verb reports success (the #523 incident). RED on old code:
+#      the UPDATED line is absent and the stored comment still carries
+#      the stale SHA. -----------------------------------------------------
+echo '=== re-wrap after correction → link comment PATCHed to the NEW blob ==='
+reset_mocks
+export MOCK_UPLOAD_SHA="aaaa1111beforefix"
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
+assert_eq       "first wrap-up exits 0"                "$rc" "0"
+assert_contains "link comment stores the v1 blob URL"  "$(comment_store_body)" \
+                "https://github.com/asset-org/assets/raw/aaaa1111beforefix/assets/42/$(basename "$REPORT")"
+# The report gets materially corrected; the worker re-wraps. The upload
+# step mints a NEW sha for the corrected content.
+export MOCK_UPLOAD_SHA="bbbb2222corrected"
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
+unset MOCK_UPLOAD_SHA
+assert_eq       "re-wrap exits 0"                      "$rc" "0"
+assert_contains "stdout reports the UPDATED link comment" "$stdout" \
+                "posted comment: UPDATED https://mock.example/issuecomment-1234"
+store_body=$(comment_store_body)
+assert_contains "link comment NOW points at the corrected blob" "$store_body" \
+                "https://github.com/asset-org/assets/raw/bbbb2222corrected/assets/42/$(basename "$REPORT")"
+assert_not_contains "STALE blob URL is gone from the link comment" "$store_body" \
+                    "aaaa1111beforefix"
+gh_calls=$(<"$GH_CAPTURE")
+assert_contains "re-point went through PATCH on the comment" "$gh_calls" \
+                "-X PATCH /repos/override-org/override-repo/issues/comments/1234"
+assert_not_contains "no duplicate link comment POSTed"  "$gh_calls" \
+                    "/issues/42/comments"
+# The action log records the update so a THIRD wrap-up keys off it.
+LOG_FILE="$STATE_DIR/action-log.jsonl"
+log_lines=$(<"$LOG_FILE")
+assert_contains "log records comment=updated on the re-wrap" "$log_lines" \
+                '"comment":"updated"'
+
+# ---- Test 35: re-point under sustained concurrent edits → the CAS
+#      refuses and the wrap-up FAILS LOUDLY instead of clobbering
+#      (defect 1's fail-loud contract, exercised through the defect-2
+#      path that now depends on it). --------------------------------------
+echo '=== re-wrap while the comment keeps moving → loud failure, no clobber ==='
+reset_mocks
+export MOCK_UPLOAD_SHA="cccc3333firstpass"
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
+assert_eq       "first wrap-up exits 0"                "$rc" "0"
+export MOCK_UPLOAD_SHA="dddd4444secondpass"
+export MOCK_COMMENT_MOVING=1
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
+unset MOCK_COMMENT_MOVING MOCK_UPLOAD_SHA
+assert_eq       "re-wrap exits 1 when the comment keeps moving" "$rc" "1"
+assert_contains "stdout reports the comment step FAILED" "$stdout" \
+                "posted comment: FAILED"
+assert_contains "stderr names the re-point failure"     "$stderr" \
+                "re-point of prior link comment"
+store_body=$(comment_store_body)
+assert_contains "contended comment NOT clobbered (v1 link intact)" "$store_body" \
+                "cccc3333firstpass"
+gh_calls=$(<"$GH_CAPTURE")
+assert_not_contains "no PATCH landed on the moving comment" "$gh_calls" \
+                    "-X PATCH /repos/override-org/override-repo/issues/comments/1234"
 
 # ---- summary ------------------------------------------------------------
 

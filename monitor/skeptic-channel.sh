@@ -56,10 +56,14 @@
 # marker belongs to a previous round, and `await` must NOT treat it as
 # terminal — doing so retires a worker that believes it was validated when
 # no second skeptic ever spawned. await compares the two mtimes and keeps
-# waiting on a stale DONE (fail closed). wrap-up also clears a prior DONE
-# when it opens a round (fail fast); either guard alone would suffice for
-# the observed bug, but await's is the one that holds if a future caller
-# writes a pending marker without resetting the channel.
+# waiting on a stale DONE (fail closed). wrap-up also clears a prior round
+# when it opens a new one (fail fast) — via `reset`, which ARCHIVES the
+# prior DONE and its .answered.md verdicts into <channel>/.stale-archive-*
+# (your-org/nexus-code#511, upgrading the original bare `rm` so the trail
+# survives and stale verdicts do not pollute the next round). Either guard
+# alone would suffice for the observed bug, but await's is the one that
+# holds if a future caller writes a pending marker without resetting the
+# channel.
 #
 # That caller already exists: spawn-worker.sh (~:1457) writes a pending
 # marker DIRECTLY when the orchestrator spawns a skeptic, with no wrap-up
@@ -105,6 +109,9 @@
 #                                             [--min-interval S] [--no-nudge]
 #                                             skeptic → ensure all acked
 #   close   <task-id>                         skeptic → drop DONE sentinel
+#   reset   <task-id>                         open a new round: archive the
+#                                             prior DONE + .answered.md into
+#                                             .stale-archive-<ts>/ (no-op rc 0)
 #   list    <task-id>                         human-readable status table
 #   status  <task-id>                         machine: "open=N ack=A answered=M total=T done=0|1"
 #   nudge   <worker-window> [--task <id>] [--force] [--min-interval S]
@@ -721,6 +728,43 @@ cmd_close() {
     printf '%s\n' "$sentinel"
 }
 
+# reset <task-id> — open a NEW skeptic round cleanly by ARCHIVING the
+# previous round's terminal sentinels (the DONE close-marker and every
+# *.answered.md verdict) into <channel>/.stale-archive-<ts>/, rather than
+# leaving them where a fresh `require` round could mistake them for its
+# own. This is the archive-instead-of-rm upgrade of issue #469's guard 2
+# (ng wrap-up's `required` branch previously just `rm`-ed the DONE): a
+# clone that missed the fix let a prior fire's DONE survive and the retire
+# gate then failed OPEN on the re-validation round — precisely the
+# 2026-07 cc-auto-update incident (your-org/nexus-code#511). Archiving
+# preserves the forensic trail that incident was reconstructed from, and
+# sweeping the stale .answered.md verdicts too keeps `poll`/`status` and
+# the next skeptic's view of the channel honest. It NEVER touches the
+# pending marker or any open/ack request — those belong to the current
+# round. Idempotent: a no-op (rc 0) when there is nothing stale to archive
+# (fresh channel, or one already reset).
+cmd_reset() {
+    local task="${1:-}"; [[ -n "$task" ]] || die "usage: reset <task-id>"
+    local dir; dir=$(_channel_dir "$task")
+    [[ -d "$dir" ]] || return 0
+    # Terminal sentinels of a completed prior round: the DONE close-marker
+    # and any answered verdicts. Same nullglob-safe pattern cmd_status uses.
+    local -a stale=()
+    [[ -e "$dir/DONE" ]] && stale+=("$dir/DONE")
+    local f
+    for f in "$dir"/*.answered.md; do [[ -e "$f" ]] && stale+=("$f"); done
+    (( ${#stale[@]} )) || return 0
+    local ts archive
+    ts=$(date +%Y-%m-%dT%H%M%S 2>/dev/null || _now_iso)
+    archive="$dir/.stale-archive-$ts"
+    mkdir -p "$archive" || die "reset: cannot create archive dir: $archive"
+    for f in "${stale[@]}"; do
+        mv -f "$f" "$archive/" 2>/dev/null || true
+    done
+    printf 'reset %s: archived %d stale sentinel(s) → %s\n' \
+        "$task" "${#stale[@]}" "$archive"
+}
+
 # nudge: wake an idle worker that has pending requests. Reuses
 # paste-followup.sh (the only correct way to inject machine input into
 # a worker pane). Guards:
@@ -864,6 +908,7 @@ main() {
         await-answer) cmd_await_answer "$@" ;;
         reconcile)    cmd_reconcile    "$@" ;;
         close)        cmd_close        "$@" ;;
+        reset)        cmd_reset        "$@" ;;
         nudge)        cmd_nudge        "$@" ;;
         -h|--help|"")
             awk '/^$/{exit} NR>1' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'

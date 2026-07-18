@@ -113,10 +113,48 @@ fi
 # Grow-gate + new-binary check collapsed into ONE race-free poll: a
 # FRESH record (past the baseline offset) stamped with the candidate
 # version proves BOTH a context-preserving resume AND the new binary.
+#
+# Hardened against jsonl flush-visibility lag (your-org/nexus-code#532).
+# On a large session jsonl (~1.1 GB), `--resume` replays a big context and
+# the append is not durably visible to THIS independent poller until well
+# after the records' internal event-timestamps. The old fixed-deadline poll
+# false-negatived the 2.1.212 bump: the version records were on disk
+# ~90-120 s before the 180 s deadline yet the poll declared FAIL, which is
+# the trigger for a diagnose-and-fix path — burning attention on a healthy
+# bump and inviting a "fix" against a workspace that needs none. Three
+# hardenings, none of which weaken the success criterion (a fresh
+# candidate-version record is still required to declare success):
+#   1. GRACE window — keep polling for WATCHDOG_GRACE_SECONDS past the
+#      deadline, so a flush that lands seconds late still counts. A single
+#      grace read would have flipped 2.1.212 to SUCCESS. We are already
+#      past the respawn gate here, so a new orchestrator pane provably
+#      exists and the sid is unchanged — the only open question is whether
+#      the candidate-version stamp has become visible yet, which makes a
+#      generous grace low-risk.
+#   2. Per-poll diagnostics to the log (size, growth-past-baseline, time
+#      left) so the NEXT occurrence is diagnosable from the log instead of
+#      requiring live forensics.
+#   3. Growth-aware verdict — file grew past baseline but no candidate
+#      stamp within grace ⇒ "resumed on the OLD binary / wedged resume";
+#      never grew ⇒ "never resumed". The old message conflated the two.
+GRACE_SECONDS="${WATCHDOG_GRACE_SECONDS:-60}"
+VDEADLINE=$(( DEADLINE + GRACE_SECONDS ))
+last_size=$base_size
+diag() { printf '%s poll: %s\n' "$(date -Is)" "$*" >> "$LOG" 2>/dev/null || true; }
 while :; do
-    (( $(date +%s) > DEADLINE )) && fail "no fresh jsonl record stamped version=$candidate before deadline — cold spawn, wedged resume, or resumed on the OLD binary"
     tail -c +$(( base_size + 1 )) "$jsonl" 2>/dev/null \
         | grep -qF "\"version\":\"$candidate\"" && break
+    now=$(date +%s)
+    cur_size=$(stat -c%s "$jsonl" 2>/dev/null || echo "$last_size")
+    (( cur_size > last_size )) && last_size=$cur_size
+    diag "size=$cur_size (+$(( last_size - base_size )) past baseline) version=$candidate not-yet-visible; $(( VDEADLINE - now ))s to deadline"
+    if (( now > VDEADLINE )); then
+        if (( last_size > base_size )); then
+            fail "jsonl grew +$(( last_size - base_size )) bytes past baseline but no \"version\":\"$candidate\" record became visible within ${GRACE_SECONDS}s grace past the deadline — resumed on the OLD binary, or a wedged resume writing non-version records (size=$last_size)"
+        else
+            fail "no fresh jsonl record and the file never grew past baseline ($base_size bytes) after deadline+${GRACE_SECONDS}s grace — the orchestrator never resumed (cold spawn, or wedged before its first write)"
+        fi
+    fi
     sleep 2
 done
 

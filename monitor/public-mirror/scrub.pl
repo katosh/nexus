@@ -24,7 +24,20 @@ while (my $l = <$mf>) {
     push @map, [$src, $mode eq 'angle' ? $angle : $bare];
 }
 close $mf;
+# Case-preserving replacement: the `deny` leak gate matches case-INSENSITIVELY
+# (grep -i), so a case-sensitive scrub let variants like `@YOUR-ORG-BOT`
+# survive into the output (your-org/nexus-code#537). We therefore match
+# case-insensitively and preserve the matched text's case shape:
+#   - lowercase / Titlecase match -> the authored replacement verbatim
+#     (keeps existing behavior, e.g. `cluster` -> `cluster`),
+#   - ALL-CAPS match (len>1)      -> the replacement upper-cased
+#     (so `YOUR-ORG-BOT` -> `YOUR-ORG-BOT`, matching the public oracle).
+sub _cased {
+    my ($m, $r) = @_;
+    return uc $r if length($m) > 1 && $m eq uc($m) && $m ne lc($m);
+    return $r;
+}
 local $/; my $t = <STDIN>;
 $t = '' unless defined $t;
-for my $p (@map) { my ($a,$b) = @$p; $t =~ s/\Q$a\E/$b/g; }
+for my $p (@map) { my ($a,$b) = @$p; $t =~ s/(\Q$a\E)/_cased($1,$b)/gie; }
 print $t;

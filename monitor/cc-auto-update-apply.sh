@@ -107,6 +107,21 @@
 # workers get the candidate); only the running orchestrator stays on the
 # old binary. The evaluator/watchdog surfaces that version-split.
 #
+# Restart-outcome surfacing (your-org/nexus-code#511). The detached child's
+# terminal code lands in a log nothing reads, so `restart-orchestrator`
+# also writes `$AUTO_DIR/restart-outcome` — the SINGLE latest-state marker
+# (`outcome=/code=/cause=/candidate=/ts=/abort_streak=`) — on every exit
+# path. A caller reads the real restart outcome from that one file instead
+# of `tail`-ing the append-only decisions.tsv (which two evaluators did and
+# both miscounted, publishing "17"/"12" for a true 468). `abort_streak`
+# counts CONSECUTIVE same-cause aborts; crossing a threshold emits a
+# distinct `restart-abort-escalation` audit row + notify so a stuck restart
+# is caught on day 1, not day 9. In the INLINE seam (CC_AUTO_RESTART_INLINE,
+# below) `safe` runs the restart synchronously and PROPAGATES the child's
+# non-zero abort code — so a synchronous caller can tell a bump whose
+# restart succeeded from one whose restart aborted. The DETACHED (live) path
+# still exits 0 at hand-off, because the outcome is a future event there.
+#
 # Test injection (all default to the live mechanism):
 #   CC_AUTO_INSTALL_CMD           monitor/install-claude-local.sh
 #   CC_AUTO_WATCHER_RESTART_CMD   monitor/svc.sh restart watcher
@@ -648,14 +663,19 @@ cmd_safe() {
     # Explicit mode at creation (your-org/nexus-code#484) — both branches
     # below open this log with a bare `>>`.
     _ensure_service_log "$detached_log"
+    local restart_rc=0
     if [[ "${CC_AUTO_RESTART_INLINE:-0}" == "1" ]]; then
-        # Test seam: run the restart synchronously in a subshell. `trap -
-        # EXIT` clears the inherited apply.lock-cleanup trap so the
-        # subshell's own exit does not release the lock out from under
-        # this still-running function; the lock is released by the real
-        # EXIT trap when `safe` itself returns just below.
+        # Test/synchronous seam: run the restart in-process, so its terminal
+        # outcome is known NOW. `trap - EXIT` clears the inherited
+        # apply.lock-cleanup trap so the subshell's own exit does not
+        # release the lock out from under this still-running function (the
+        # lock is released by the real EXIT trap when `safe` itself returns
+        # just below); the subshell's OWN EXIT trap, set inside
+        # cmd_restart_orchestrator, still fires and writes the outcome
+        # marker. Capture the child's exit code so it can be propagated
+        # below — the `&& …=0 || …=$?` form is exact without `set -e`.
         ( trap - EXIT; cmd_restart_orchestrator --candidate "$candidate" --sid "$sid" ) \
-            >> "$detached_log" 2>&1 || true
+            >> "$detached_log" 2>&1 && restart_rc=0 || restart_rc=$?
     else
         setsid nohup bash "$SELF_PATH" restart-orchestrator \
             --candidate "$candidate" --sid "$sid" \
@@ -665,7 +685,15 @@ cmd_safe() {
     note "safe: bump to $candidate complete; orchestrator restart handed off to a detached watcher (idle-wait → force-restart-on-cap; log: $detached_log)"
     record_outcome "$candidate" "safe-bumped-restart-handoff" "detached sid=$sid"
     notify "cc-auto-update: $candidate applied; orchestrator restart handed off to a detached watcher (workspace version-split until it restarts)"
-    exit 0
+    # The DETACHED path (production) cannot know the restart outcome — it is
+    # a future event on a disowned process — so it exits 0 = "bump applied,
+    # restart handed off" and the eventual outcome is surfaced via the
+    # restart-outcome marker + abort-streak escalation. The INLINE seam DID
+    # observe the outcome synchronously, so it propagates a non-zero restart
+    # abort, making bump-applied-vs-restart-aborted distinguishable to a
+    # synchronous caller (your-org/nexus-code#511 fix 2). In the common
+    # clean-restart case restart_rc is 0, so exit 0 is unchanged.
+    exit "$restart_rc"
 }
 
 # ---- verb: restart-orchestrator -----------------------------------------
@@ -717,6 +745,36 @@ cmd_restart_orchestrator() {
         exit 25
     }
     trap '_restart_abort_to_hold' TERM
+
+    # Durable terminal-outcome surfacing (your-org/nexus-code#511). Every
+    # exit path below records a decisions.tsv row then exits with a
+    # documented code (0/21/22/23/24/25), but that code lands in a detached
+    # log nothing reads and the row sits in an append-only TSV — so the
+    # LATEST restart outcome was only discoverable by `tail`-ing the log
+    # (which two evaluators did and both miscounted). This EXIT trap mirrors
+    # the terminal row into the single-latest `restart-outcome` marker and
+    # maintains the consecutive-abort streak that escalates a stuck restart.
+    # Riding the EXIT trap covers every path — including the SIGTERM abort
+    # and the inline-seam subshell — without editing each exit site, and it
+    # never alters the exit code (it only reads $?).
+    _restart_outcome_on_exit() {
+        local _code=$? _last _status _detail
+        _last=$(tail -n 1 "$AUTO_DIR/decisions.tsv" 2>/dev/null || true)
+        # decisions.tsv row shape: ts<TAB>candidate<TAB>decision<TAB>detail
+        _status=$(printf '%s' "$_last" | cut -f3)
+        _detail=$(printf '%s' "$_last" | cut -f4)
+        # Match every restart terminal status — including the dash-less
+        # `safe-bumped-restarted` (clean restart) alongside
+        # `safe-bumped-restart-forced/-aborted/-held/-noop`. A `*` after
+        # `restart` (no hyphen) is required to catch the clean-restart case.
+        case "$_status" in
+            safe-bumped-restart*)
+                _cc_auto_write_restart_outcome \
+                    "$AUTO_DIR" "$_status" "$_code" "$_detail" "$candidate" ;;
+        esac
+        return 0
+    }
+    trap '_restart_outcome_on_exit' EXIT
 
     # Hold pre-flight (nexus-code#513): a held restart does not wait,
     # does not arm, does not kill.

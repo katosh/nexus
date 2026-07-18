@@ -292,6 +292,100 @@ _cc_auto_restart_hold_active() {
     return 0
 }
 
+# ---- restart outcome marker + abort-streak escalation --------------------
+# The detached `restart-orchestrator` verb decouples the idle-wait → kill
+# from cmd_safe's 600s-bound foreground call (see the apply.sh header). A
+# consequence the 2026-07 live incident made painfully clear
+# (your-org/nexus-code#511): the child's terminal exit code lands in a
+# detached log nothing reads, and the ONLY per-fire record is an
+# append-only `decisions.tsv` row. Reading the *latest* restart outcome
+# then meant `tail`-ing that TSV — which two separate evaluators did and
+# both miscounted (published "17" and "12" for a true 468). And nothing
+# escalated: the SAME `target-window-unresolved` abort recurred ~48×/day
+# for 12 days with no signal above the per-fire noise.
+#
+# This marker fixes both. `$auto_dir/restart-outcome` is the SINGLE
+# latest-state file (key=value, mirrors restart-hold) — a caller reads the
+# real outcome deterministically instead of grepping the append-only log.
+# And it carries an `abort_streak` that counts CONSECUTIVE aborts of the
+# same first-token cause; when the streak crosses a threshold the routine
+# shouts ONCE (a distinct `restart-abort-escalation` audit row + notify),
+# and again every repeat-interval thereafter — so a stuck restart surfaces
+# on day 1, not day 9. A non-abort outcome (restarted/forced/noop/held)
+# resets the streak: only a genuine, repeating failure escalates.
+#
+# _cc_auto_write_restart_outcome <auto_dir> <status> <code> <detail> <candidate>
+#   status   the decision string just recorded (safe-bumped-restart-*)
+#   code     the process exit code for that terminal path
+#   detail   the decision detail (its first whitespace-token is the cause)
+#   candidate the version the restart targeted
+# Always rc 0 (best-effort; never fails the terminal path it rides on).
+_cc_auto_write_restart_outcome() {
+    local dir="${1:?auto_dir required}" status="${2:?status required}"
+    local code="${3:-0}" detail="${4:-}" candidate="${5:-}"
+    mkdir -p "$dir" 2>/dev/null || return 0
+
+    # First whitespace-token of the detail is the stable cause key: it
+    # drops the per-fire `sid=…` tail so a recurring `pin-stale-pre-wait`
+    # or `target-window-unresolved=orchestrator` reads as ONE continuing
+    # streak, not a fresh one each fire.
+    local cause="${detail%% *}"
+    [[ -n "$cause" ]] || cause="$status"
+
+    # An abort is the only streak-continuing outcome. A deliberate hold, a
+    # no-op (the split healed itself), and a success all reset the count —
+    # escalation is for a real, repeating failure, never for expected paths.
+    local is_abort=0
+    [[ "$status" == "safe-bumped-restart-aborted" ]] && is_abort=1
+
+    local prev_streak=0 prev_cause=""
+    if [[ -f "$dir/restart-outcome" ]]; then
+        prev_streak=$(_cc_update_field "$dir/restart-outcome" abort_streak 2>/dev/null || echo 0)
+        prev_cause=$(_cc_update_field "$dir/restart-outcome" cause 2>/dev/null || echo "")
+        [[ "$prev_streak" =~ ^[0-9]+$ ]] || prev_streak=0
+    fi
+
+    local streak=0
+    if (( is_abort )); then
+        if [[ "$cause" == "$prev_cause" ]]; then
+            streak=$(( prev_streak + 1 ))
+        else
+            streak=1
+        fi
+    fi
+
+    local tmp="$dir/restart-outcome.tmp.$$"
+    {
+        printf 'outcome=%s\n'      "$status"
+        printf 'code=%s\n'         "$code"
+        printf 'cause=%s\n'        "$cause"
+        printf 'candidate=%s\n'    "$candidate"
+        printf 'ts=%s\n'           "$(date -Is 2>/dev/null || echo unknown)"
+        printf 'abort_streak=%s\n' "$streak"
+    } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+    mv -f "$tmp" "$dir/restart-outcome" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+
+    (( is_abort )) || return 0
+
+    # Escalate when the streak FIRST reaches the threshold, then again
+    # every repeat-interval — loud enough to catch on day 1, quiet enough
+    # not to spam every ~30-min reconcile tick.
+    local threshold="${CC_AUTO_RESTART_ABORT_ESCALATE:-3}"
+    local repeat="${CC_AUTO_RESTART_ABORT_ESCALATE_REPEAT:-48}"
+    [[ "$threshold" =~ ^[0-9]+$ && "$threshold" -gt 0 ]] || threshold=3
+    [[ "$repeat"    =~ ^[0-9]+$ && "$repeat"    -gt 0 ]] || repeat=48
+    if (( streak >= threshold )) \
+       && (( streak == threshold || (streak - threshold) % repeat == 0 )); then
+        _cc_auto_log_decision "$dir" "$candidate" "restart-abort-escalation" \
+            "streak=$streak cause=$cause code=$code"
+        declare -F log >/dev/null 2>&1 \
+            && log "cc-auto-update: orchestrator restart has ABORTED $streak× in a row on the same cause ($cause) — the version split is NOT self-healing. Inspect: monitor/.state/cc-auto-update/{restart-outcome,decisions.tsv,detached-restart.log}"
+        command -v sandbox-notify >/dev/null 2>&1 \
+            && sandbox-notify "cc-auto-update: restart aborted ${streak}× in a row (cause=$cause) — version split persists; needs attention" || true
+    fi
+    return 0
+}
+
 # _cc_auto_reconcile_pending_restart <nexus_root> <state_dir> <package> [now_epoch]
 #
 # RESTART-PENDING RECONCILIATION — fires INDEPENDENTLY of the registry

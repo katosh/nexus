@@ -458,8 +458,15 @@ _sh_write_state() {
 # clobber). It stops a live-but-wedged supervisor's process group, then
 # relaunches via recover_service. Returns svc.sh's rc. Test override:
 # SERVICE_HEALTH_SVC_BIN can point at a capture stub.
+# _sh_restart_service <name> [force]
+# <force>=1 means WE have already ruled a labsh cold build pathological on our
+# own clock (it is past our cold_build_ceiling), so svc.sh's cold-build guard
+# must not re-derive that verdict from the build's process age — a different
+# origin, which always reads younger than our `elapsed` and would veto this
+# restart. See the clock-origin note in the state machine.
 _sh_restart_service() {
-    local name="$1"
+    local name="$1" force="${2:-0}"
+    [[ "$force" =~ ^[01]$ ]] || force=0
     local svc; svc="$(_sh_svc_bin)"
     if [[ ! -x "$svc" && ! -f "$svc" ]]; then
         _sh_log "svc.sh not found at $svc — cannot auto-restart '$name'"
@@ -483,9 +490,9 @@ _sh_restart_service() {
     # watcher auto-restart from an operator/orchestrator intervention. The
     # recovery attribution below reads it as EVIDENCE, never infers.
     if [[ -n "${INSTANCE_LOCK_FD:-}" ]]; then
-        SVC_RESTART_ACTOR=watcher bash "$svc" restart "$name" >&2 {INSTANCE_LOCK_FD}>&-
+        SVC_FORCE="$force" SVC_RESTART_ACTOR=watcher bash "$svc" restart "$name" >&2 {INSTANCE_LOCK_FD}>&-
     else
-        SVC_RESTART_ACTOR=watcher bash "$svc" restart "$name" >&2
+        SVC_FORCE="$force" SVC_RESTART_ACTOR=watcher bash "$svc" restart "$name" >&2
     fi
 }
 
@@ -834,9 +841,40 @@ _service_health_check_tick() {
         local status note=""
         local cbceiling="${MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS:-1800}"
         [[ "$cbceiling" =~ ^[0-9]+$ ]] || cbceiling=1800
+
+        # Evaluate "is a labsh cold build materialising?" ONCE per tick, into a
+        # variable, because two decisions below need it and they must not
+        # disagree: the defer branch (don't restart a build in flight) and the
+        # act branch (tell svc.sh we have already ruled this build pathological).
+        #
+        # ── CLOCK ORIGIN — the whole point of this variable ──────────────────
+        # This module's ceiling counts from `first_unhealthy` (the INCIDENT).
+        # svc.sh's cold-build guard counts from the build process's own start
+        # (`etimes`). A build can only begin AFTER the service is already
+        # unhealthy, so `age = elapsed - D` with `D > 0` ALWAYS. Two clocks, the
+        # same 1800s duration, different origins: at our ceiling the build is
+        # still D seconds short of the guard's cap, so svc.sh REFUSED our first
+        # post-ceiling restart — a guaranteed wasted attempt out of three, and a
+        # permanent `flapping` (recovery dead) whenever D exceeds the restart
+        # budget, e.g. if monitor.service_health.grace_seconds is raised toward
+        # restart_cooldown_seconds. Found by the round-2 skeptic
+        # (your-org/your-nexus#273); it survived round 1 because the guard was
+        # tested as a function and nobody asked whether the WATCHER gets through.
+        #
+        # The fix is to have ONE origin decide. Reaching the act branch below
+        # while a build is live implies `elapsed >= cbceiling` BY CONSTRUCTION
+        # (the defer branch is the only gate on a live build, and it would have
+        # been taken otherwise) — i.e. WE have already declared it pathological,
+        # on OUR clock, which is exactly what the ceiling means. So we pass
+        # SVC_FORCE=1 and svc.sh's guard does not re-derive that verdict from a
+        # clock it cannot reconcile with ours.
+        local cb_build=0
         if (( cbceiling > 0 )) && _sh_is_labsh_service "$launch" "$health" \
-               && (( elapsed < cbceiling )) \
                && _sh_labsh_build_in_progress "$workdir"; then
+            cb_build=1
+        fi
+
+        if (( cb_build )) && (( elapsed < cbceiling )); then
             # --- labsh COLD BUILD in progress: defer to the supervisor
             #     (#326 already made it patient), NEVER restart. This
             #     SUSPENDS the grace/restart machine for the life of the
@@ -886,7 +924,13 @@ _service_health_check_tick() {
             #     elapsed, wedged or wrapper-dead).
             _sh_log "service '$name' restart attempt $(( attempts + 1 ))/${ceiling} via svc.sh restart (policy ${policy})"
             local rc=0
-            _sh_restart_service "$name" || rc=$?
+            # cb_build here ⇒ elapsed >= cbceiling (see the clock-origin note
+            # above): we have already ruled this build pathological on OUR
+            # clock, so svc.sh's guard must not veto us on its own.
+            if (( cb_build )); then
+                _sh_log "service '$name' has a live labsh build past the ${cbceiling}s cold-build ceiling — presumed WEDGED; forcing the restart through svc.sh's cold-build guard"
+            fi
+            _sh_restart_service "$name" "$cb_build" || rc=$?
             attempts=$(( attempts + 1 ))
             last_restart="$now"
             status="recovering"

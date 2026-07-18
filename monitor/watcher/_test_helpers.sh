@@ -76,8 +76,11 @@ unset -f command_not_found_handle 2>/dev/null || true
 # bring-up on a fork). Without it the mirror's CI reds on any
 # helper-sourcing test that runs a guarded script for real (the
 # bootstrap-recover stanza of test-jupyter-service.sh). On a tree
-# that ships no guard the export is inert; the mirror's Pages workflow
-# separately asserts the guard still fires without this variable.
+# that ships no guard (this source repo) the export is inert. NOTE: the
+# guard's REFUSAL path — that it still fires with this variable unset — is
+# not asserted by any CI (your-org/nexus-code#520); it cannot be, from
+# source, since the guard ships only in the mirror. That assertion belongs
+# in a mirror-side test, landed with the mirror sync.
 export NEXUS_PUBLIC_ENABLED=1
 
 : "${PASS:=0}"

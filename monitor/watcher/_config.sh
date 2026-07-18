@@ -267,7 +267,8 @@ MONITOR_STATE_LOG_MAX_BYTES="${MONITOR_STATE_LOG_MAX_BYTES:-$("$_cfg" monitor.st
 MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS="${MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS:-$("$_cfg" monitor.over_limit.wake_margin_seconds 300)}"
 MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS="${MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS:-$("$_cfg" monitor.over_limit.initial_backoff_seconds 60)}"
 MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS="${MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS:-$("$_cfg" monitor.over_limit.max_backoff_seconds 300)}"
-MONITOR_OVER_LIMIT_MAX_ATTEMPTS="${MONITOR_OVER_LIMIT_MAX_ATTEMPTS:-$("$_cfg" monitor.over_limit.max_attempts 10)}"
+MONITOR_OVER_LIMIT_MAX_ATTEMPTS="${MONITOR_OVER_LIMIT_MAX_ATTEMPTS:-$("$_cfg" monitor.over_limit.max_attempts 4)}"
+MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS="${MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS:-$("$_cfg" monitor.over_limit.max_hold_seconds 90000)}"
 # Orchestrator-liveness fresh-spawn fallback. Layered on top of the
 # PR #147 session-id pin: the pin fixed *who* gets resumed; this fallback
 # ensures the orchestrator's absence is *detectable* and *recoverable*
@@ -693,7 +694,8 @@ export MONITOR_IDLE_THRESHOLD_SECONDS MONITOR_IDLE_CLOSE_HOURS MONITOR_IDLE_POOL
        MONITOR_WATCHER_SUPERVISOR_ENABLED MONITOR_WATCHER_SUPERVISOR_HEARTBEAT_STALE_SECONDS \
        MONITOR_REPORTS_ROLL_ENABLED MONITOR_REPORTS_ROLL_INTERVAL_SECONDS MONITOR_REPORTS_ROLL_MIN_AGE_SECONDS \
        MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS \
-       MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS MONITOR_OVER_LIMIT_MAX_ATTEMPTS
+       MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS MONITOR_OVER_LIMIT_MAX_ATTEMPTS \
+       MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS
 # Crash-loop guard for `respawn_agent`. If more than RESPAWN_LOOP_LIMIT
 # respawns happen within RESPAWN_LOOP_WINDOW seconds, the watcher
 # stops respawning the orchestrator until the sliding window empties

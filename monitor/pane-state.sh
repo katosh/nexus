@@ -104,14 +104,21 @@
 #                      state-swap transitions. Callers should treat
 #                      `empty` as "don't know yet, try again next
 #                      cycle" — NOT as "claude is gone".
-#   over-limit       - the canonical "You've hit your limit · resets
-#                      <time>" notice is rendered at the bottom of the
-#                      pane; claude is functionally suspended until the
-#                      weekly Opus limit resets. Orchestrator should
-#                      schedule a resume rather than treat the worker
-#                      as idle. Anchored to the bottom ~15 rows so a
-#                      transcript mention of the same phrase doesn't
-#                      false-trigger.
+#   over-limit       - the canonical "You've hit your <flavor> limit ·
+#                      resets <time>" notice (flavor: "weekly",
+#                      "5-hour", …, or none) is rendered at the bottom
+#                      of the pane, OR a fresh StopFailure-hook stamp
+#                      (monitor/hooks/over-limit-emit.sh) exists for
+#                      the window; claude is functionally suspended
+#                      until the usage limit resets. Orchestrator
+#                      should schedule a resume rather than treat the
+#                      worker as idle. Text detection is anchored to
+#                      the bottom ~15 rows so a transcript mention of
+#                      the same phrase doesn't false-trigger; the hook
+#                      stamp expires after
+#                      MONITOR_OVER_LIMIT_STAMP_TTL_SECONDS (default
+#                      27h) so a missed Stop-clear can never latch the
+#                      state.
 #
 # Async-signal refinement (issue #183): the four classifications
 # below are NOT new top-level branches — they refine the existing
@@ -356,22 +363,38 @@ _has_askuq_overlay() {
 }
 
 # Anchor the over-limit notice on the bottom 15 rows of the pane. The
-# canonical text Claude Code renders in place of the input box is:
+# canonical text Claude Code renders is:
 #
 #     You've hit your limit · resets 3am (America/Los_Angeles)
 #     /extra-usage to finish what you're working on.
 #
-# Detection requires BOTH the "You've hit your limit" substring AND a
-# "resets <time>" companion within those 15 rows. The position anchor
-# is load-bearing: a transcript scrollback that paraphrases or quotes
+# but the headline VARIES by limit flavor — the 2026-07-14 incident
+# (your-org/nexus-code, over-limit emits) rendered
+#
+#     You've hit your weekly limit · resets 3am (America/Los_Angeles)
+#
+# and the exact-substring match on "You've hit your limit" silently
+# missed it, disabling the whole watcher-side hold. The match is now
+# a regex tolerating a flavor word between "your" and "limit"
+# ("weekly", "5-hour", "usage", …), a hit/reached verb, and any
+# apostrophe glyph (the TUI has rendered both ' and ’ historically —
+# the pattern anchors on "ve" and skips the apostrophe entirely).
+#
+# Detection still requires BOTH the headline AND a "resets <time>"
+# companion within the bottom 15 rows. The position anchor is
+# load-bearing: a transcript scrollback that paraphrases or quotes
 # the notice elsewhere in the pane would otherwise false-trigger
 # (issue #87 edge case). The companion-line requirement defends
 # against a half-rendered notice (e.g. only the headline visible
-# mid-redraw) and matches the canonical two-line shape.
+# mid-redraw) and matches the canonical two-line shape. A quoted
+# verbatim notice inside the bottom 15 rows CAN still false-trigger
+# (positional defense only); the consequence is bounded by design —
+# the watcher's hold is capped by the parsed reset time (6h fallback)
+# and fails open with a paste, never latching (_over_limit.sh).
 _detect_over_limit() {
     local plain="$1" bottom
     bottom=$(tail -n 15 <<<"$plain")
-    grep -qF "You've hit your limit" <<<"$bottom" || return 1
+    grep -qE "You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit" <<<"$bottom" || return 1
     grep -qE 'resets[[:space:]]+[^[:space:]]' <<<"$bottom" || return 1
     return 0
 }
@@ -387,11 +410,16 @@ _detect_over_limit() {
 _extract_over_limit_reset() {
     local plain="$1" bottom raw
     bottom=$(tail -n 15 <<<"$plain")
-    # Grab the entire suffix on the "resets " line. tr removes parens,
-    # then a single trailing-punctuation strip, then squeeze ws to `_`.
+    # Grab the suffix on the "resets " line, CUT at the next `·`
+    # separator — the renderer appends live decoration after the reset
+    # time ("… resets 3am (America/Los_Angeles) · Retrying in 8s"
+    # while claude retries a soft 429) which would otherwise pollute
+    # the token (observed against the real binary in
+    # test-realmodel-overlimit.sh). tr removes parens, then a single
+    # trailing-punctuation strip, then squeeze ws to `_`.
     raw=$(grep -oE 'resets[[:space:]]+[^[:cntrl:]]+' <<<"$bottom" \
               | head -1 \
-              | sed -E 's/^resets[[:space:]]+//; s/[[:space:]]+$//')
+              | sed -E 's/[[:space:]]*·.*$//; s/^resets[[:space:]]+//; s/[[:space:]]+$//')
     [[ -n "$raw" ]] || return 1
     raw=$(printf '%s' "$raw" | tr -d '()' | tr -s '[:space:]' '_' | sed 's/_*$//')
     raw="${raw:0:40}"
@@ -1202,6 +1230,35 @@ _emit_over_limit_from_stamp() {
     emit over-limit "reset_at=$reset_at"
 }
 
+# Anti-latch TTL on the hook-written stamp. The stamp's cleanup
+# contract is "the Stop hook on the next successful turn removes it"
+# — but a pane whose settings lost the Stop entry (respawn with stale
+# settings, manual launch) would otherwise read over-limit FOREVER,
+# and a permanently-suppressed watcher channel is a deadlock worse
+# than any wasted paste. A stamp older than the TTL (default 27h:
+# the longest "resets <clock-time>" horizon is 24h, plus margin) is
+# treated as expired — ignored and best-effort deleted, falling
+# through to the renderer detection, which re-detects a GENUINE
+# ongoing suspension from the live pane text.
+# Returns 0 when the stamp is expired (caller skips it).
+_over_limit_stamp_expired() {
+    local f="$1" now ts ttl
+    ttl="${MONITOR_OVER_LIMIT_STAMP_TTL_SECONDS:-97200}"
+    [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=97200
+    now="${now_override:-$(date +%s)}"
+    ts=""
+    if command -v jq >/dev/null 2>&1; then
+        ts=$(jq -r '.ts // empty' "$f" 2>/dev/null)
+    fi
+    # No parseable ts (jq missing / corrupt stamp): fall back to the
+    # file's mtime so a corrupt stamp still ages out.
+    if ! [[ "$ts" =~ ^[0-9]+$ ]]; then
+        ts=$(date +%s -r "$f" 2>/dev/null) || ts=""
+    fi
+    [[ "$ts" =~ ^[0-9]+$ ]] || return 0  # unreadable ⇒ treat as expired (fail open)
+    (( now - ts > ttl ))
+}
+
 # 0. Heartbeat substrate (issue #74). When the per-window heartbeat
 #    file is fresh, claude's own hook signal is authoritative — it
 #    cuts through renderer ambiguity (paste re-render, mid-spinner,
@@ -1400,8 +1457,15 @@ fi
 #     `worker-settings.json`. Cleared by the Stop hook on the next
 #     successful turn.
 if [[ -n "$ol_file" ]] && [[ -f "$ol_file" ]]; then
-    _emit_over_limit_from_stamp "$ol_file"
-    exit 0
+    if _over_limit_stamp_expired "$ol_file"; then
+        # Stale stamp (Stop-clear never fired). Drop it and fall
+        # through — the renderer scrape below re-detects a genuine
+        # ongoing suspension; a recovered pane classifies normally.
+        rm -f "$ol_file" 2>/dev/null || true
+    else
+        _emit_over_limit_from_stamp "$ol_file"
+        exit 0
+    fi
 fi
 
 # 1c. Over-limit text scrape (issue #87 fallback). The canonical

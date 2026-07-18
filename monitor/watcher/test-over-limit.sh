@@ -119,7 +119,7 @@ test_log() {
 }
 test_paste() {
     local win="$1" body="$2"
-    printf '%s\t%s\n' "$win" "$(cat "$body" 2>/dev/null | tr '\n' ' ' | head -c 400)" \
+    printf '%s\t%s\n' "$win" "$(cat "$body" 2>/dev/null | tr '\n' ' ' | head -c 2000)" \
         >> "$PASTE_LOG"
     # Caller may override: PASTE_RC=1 to simulate a failed paste.
     return "${PASTE_RC:-0}"
@@ -352,7 +352,10 @@ export MOCK_PANE_RESET_AT_2='3am'
 synth_row "_orchestrator" "orchestrator" "orchestrator" "3am" \
     $(( NOW - 60 )) $(( NOW - 600 )) $(( NOW - 1 )) 4
 NOW_FROZEN=$(date +%s)
-_over_limit_process_wakes "orchestrator"
+# Pin the attempt cap above this test's attempt count — the default
+# cap is 4 (fail-open), which would terminate the row before the
+# backoff arithmetic under test here gets exercised.
+MONITOR_OVER_LIMIT_MAX_ATTEMPTS=10 _over_limit_process_wakes "orchestrator"
 row=$(_over_limit_load "_orchestrator")
 attempts=$(awk -F'\t' '{print $8}' <<<"$row")
 next_at=$(awk -F'\t' '{print $7}' <<<"$row")
@@ -367,12 +370,19 @@ else
     FAIL=$(( FAIL + 1 ))
 fi
 
-echo '=== wake: max attempts → drop stamp (operator intervention required) ==='
+echo '=== wake: max attempts → FAIL OPEN (paste wake brief + drop stamp) ==='
+# A suspended pane never repaints on its own and the hook stamp only
+# clears on a successful turn, so post-reset the probe keeps reading
+# over-limit; the terminal action MUST be a paste (the probe that
+# breaks the cycle), never a silent drop — a silent drop lets the
+# next scan_panes re-stamp with a fresh reset horizon and the
+# suppression latches forever (2026-07-14 incident class).
 reset_state
+rm -f "$STATE_DIR/machine-input.tsv"
 export MOCK_TMUX_WINDOWS="worker-a|3"
 export MOCK_PANE_STATE_3=over-limit
 export MOCK_PANE_RESET_AT_3='3am'
-# attempts=9 → next bump → 10 → exceeds default cap.
+# attempts=9 → next bump → 10 → exceeds cap.
 synth_row "worker-a" "worker-a" "worker" "3am" \
     $(( NOW - 60 )) $(( NOW - 600 )) $(( NOW - 1 )) 9
 MONITOR_OVER_LIMIT_MAX_ATTEMPTS=10 _over_limit_process_wakes "orchestrator"
@@ -382,6 +392,35 @@ _over_limit_load "worker-a" >/dev/null \
 grep -q "max wake attempts" "$LOG_LOG" && \
     { printf '  PASS: max-attempts log emitted\n'; PASS=$(( PASS + 1 )); } || \
     { printf '  FAIL: max-attempts log missing (log: %s)\n' "$(cat "$LOG_LOG")" >&2; FAIL=$(( FAIL + 1 )); }
+grep -q "failing OPEN" "$LOG_LOG" && \
+    { printf '  PASS: fail-open logged\n'; PASS=$(( PASS + 1 )); } || \
+    { printf '  FAIL: fail-open log missing (log: %s)\n' "$(cat "$LOG_LOG")" >&2; FAIL=$(( FAIL + 1 )); }
+grep -q "worker-a" "$PASTE_LOG" && \
+    { printf '  PASS: wake brief pasted at max attempts (fail open)\n'; PASS=$(( PASS + 1 )); } || \
+    { printf '  FAIL: no paste at max attempts — silent drop is a latch (paste log: %s)\n' "$(cat "$PASTE_LOG")" >&2; FAIL=$(( FAIL + 1 )); }
+
+echo '=== wake: max attempts fail-open is bounded — orchestrator paused gate reopens ==='
+# After the fail-open drop the paused predicate must be FALSE (the
+# emit gate reopens even though the pane still reads over-limit).
+reset_state
+rm -f "$STATE_DIR/machine-input.tsv"
+export MOCK_TMUX_WINDOWS="orchestrator|2"
+export MOCK_PANE_STATE_2=over-limit
+export MOCK_PANE_RESET_AT_2='3am'
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am" \
+    $(( NOW - 60 )) $(( NOW - 600 )) $(( NOW - 1 )) 9
+_over_limit_orchestrator_paused || { printf '  FAIL: precondition — gate not paused\n' >&2; FAIL=$(( FAIL + 1 )); }
+MONITOR_OVER_LIMIT_MAX_ATTEMPTS=10 _over_limit_process_wakes "orchestrator"
+if _over_limit_orchestrator_paused; then
+    printf '  FAIL: gate still paused after fail-open — emits would stay suppressed\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: gate reopened after fail-open\n'
+    PASS=$(( PASS + 1 ))
+fi
+grep -q "orchestrator" "$PASTE_LOG" && \
+    { printf '  PASS: orchestrator wake brief pasted on fail-open\n'; PASS=$(( PASS + 1 )); } || \
+    { printf '  FAIL: orchestrator fail-open paste missing\n' >&2; FAIL=$(( FAIL + 1 )); }
 
 echo '=== wake: resumed orchestrator → paste brief + drop ==='
 reset_state
@@ -396,8 +435,8 @@ _over_limit_load "_orchestrator" >/dev/null \
     && { printf '  FAIL: row not dropped on resume\n' >&2; FAIL=$(( FAIL + 1 )); } \
     || { printf '  PASS: row dropped on resume\n'; PASS=$(( PASS + 1 )); }
 assert_contains "paste lands on TARGET window" "$(cat "$PASTE_LOG")" "orchestrator"
-assert_contains "brief mentions weekly limit"  "$(cat "$PASTE_LOG")" "weekly Opus limit reset"
-assert_contains "brief mentions duration"      "$(cat "$PASTE_LOG")" "suspended for"
+assert_contains "brief explains what happened" "$(cat "$PASTE_LOG")" "WHAT HAPPENED"
+assert_contains "brief flags usage-limit recovery" "$(cat "$PASTE_LOG")" "USAGE-LIMIT RECOVERY"
 # Orchestrator wakes must NOT stamp machine-input.tsv: the orchestrator
 # window is not retire-gated (#293, inventory rows 8/9). A stamp here
 # would be harmless but is deliberately omitted to match the existing
@@ -508,6 +547,150 @@ assert_eq "attempts unchanged on paste failure" "$attempts" "2"
 grep -q "paste failed; will retry" "$LOG_LOG" && \
     { printf '  PASS: paste-failure log emitted\n'; PASS=$(( PASS + 1 )); } || \
     { printf '  FAIL: paste-failure log missing\n' >&2; FAIL=$(( FAIL + 1 )); }
+
+# ---- ANTI-LATCH: refined-idle + unknown states must terminate the hold ---
+# Skeptic finding (PR #526 round 1): the three refined-idle states
+# (#183) and any unrecognised state fell into the old `*)` branch, which
+# backed off FOREVER with no max-attempts check — the emit gate could
+# latch closed indefinitely on a recovered orchestrator holding a Monitor
+# handle. These cases prove no state can suppress emits forever.
+echo '=== ANTI-LATCH: refined-idle states resolve the hold (resumption) ==='
+for st in working-background working-self-paced idle-orphan-async; do
+    reset_state
+    rm -f "$STATE_DIR/machine-input.tsv"
+    export MOCK_TMUX_WINDOWS="orchestrator|2"
+    export MOCK_PANE_STATE_2="$st"
+    export MOCK_PANE_RESET_AT_2=''
+    # A row that has ALREADY exhausted attempts (attempts=9): under the
+    # old code this would keep backing off; now it must resolve on the
+    # FIRST wake because the state is treated as resumption.
+    synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+        $(( NOW - 60 )) $(( NOW - 1800 )) $(( NOW - 1 )) 9
+    _over_limit_process_wakes "orchestrator"
+    if _over_limit_orchestrator_paused; then
+        printf '  FAIL: state=%s still holds the gate closed (LATCH)\n' "$st" >&2
+        FAIL=$(( FAIL + 1 ))
+    else
+        printf '  PASS: state=%s resolves the hold (gate reopened)\n' "$st"
+        PASS=$(( PASS + 1 ))
+    fi
+    grep -q "orchestrator" "$PASTE_LOG" \
+        && { printf '  PASS: state=%s pasted the resume brief\n' "$st"; PASS=$(( PASS + 1 )); } \
+        || { printf '  FAIL: state=%s did not paste a resume brief\n' "$st" >&2; FAIL=$(( FAIL + 1 )); }
+done
+
+echo '=== ANTI-LATCH: unknown state is bounded (fail-open at MAX_ATTEMPTS) ==='
+reset_state
+rm -f "$STATE_DIR/machine-input.tsv"
+export MOCK_TMUX_WINDOWS="orchestrator|2"
+export MOCK_PANE_STATE_2="some-future-state"
+export MOCK_PANE_RESET_AT_2='3am'
+# attempts=9 → next bump ≥ MAX_ATTEMPTS(4) → must fail OPEN, not back off.
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am" \
+    $(( NOW - 60 )) $(( NOW - 600 )) $(( NOW - 1 )) 9
+MONITOR_OVER_LIMIT_MAX_ATTEMPTS=10 _over_limit_process_wakes "orchestrator"
+# With the cap pinned above the attempt count, one wake should NOT
+# terminate — but it MUST have bumped attempts (bounded progress), not
+# sat still. Then drive it past the cap and require fail-open.
+reset_state
+export MOCK_TMUX_WINDOWS="orchestrator|2"
+export MOCK_PANE_STATE_2="some-future-state"
+export MOCK_PANE_RESET_AT_2='3am'
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am" \
+    $(( NOW - 60 )) $(( NOW - 600 )) $(( NOW - 1 )) 9
+_over_limit_process_wakes "orchestrator"   # default cap 4; 9→10 ≥ 4 → fail open
+if _over_limit_orchestrator_paused; then
+    printf '  FAIL: unknown state latched the gate closed (no fail-open)\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: unknown state fails open at the attempt cap (gate reopened)\n'
+    PASS=$(( PASS + 1 ))
+fi
+grep -q "failing OPEN" "$LOG_LOG" \
+    && { printf '  PASS: unknown-state fail-open logged\n'; PASS=$(( PASS + 1 )); } \
+    || { printf '  FAIL: unknown-state fail-open not logged\n' >&2; FAIL=$(( FAIL + 1 )); }
+
+echo '=== ANTI-LATCH: absolute hold ceiling bounds a persistently-failing probe ==='
+# Skeptic round-2 residual: a pane-state probe that returns EMPTY (a
+# BROKEN pane-state.sh — not any pane state) hits the probe-failure
+# branch, which backs off without consuming an attempt → retries every
+# 60s forever with the gate closed. The absolute ceiling
+# (MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS) must fail this open regardless.
+# Swap in a pane-state.sh that emits NOTHING (the broken-resolver shape)
+# so _over_limit_probe_pane genuinely returns empty; restore after.
+cat > "$WORK/monitor/pane-state.sh" <<'STUB'
+#!/usr/bin/env bash
+exit 0
+STUB
+chmod +x "$WORK/monitor/pane-state.sh"
+reset_state
+rm -f "$STATE_DIR/machine-input.tsv"
+export MOCK_TMUX_WINDOWS="orchestrator|2"
+# Row whose first_seen is WAY past the ceiling (26h ago > 25h default).
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+    $(( NOW - 60 )) $(( NOW - 26*3600 )) $(( NOW - 1 )) 3
+_over_limit_process_wakes "orchestrator"
+if _over_limit_orchestrator_paused; then
+    printf '  FAIL: probe-failure past ceiling still holds the gate (LATCH)\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: hold past absolute ceiling fails open (gate reopened)\n'
+    PASS=$(( PASS + 1 ))
+fi
+grep -q "absolute ceiling" "$LOG_LOG" \
+    && { printf '  PASS: ceiling fail-open logged\n'; PASS=$(( PASS + 1 )); } \
+    || { printf '  FAIL: ceiling fail-open not logged\n' >&2; FAIL=$(( FAIL + 1 )); }
+# A row INSIDE the ceiling with a failing probe must NOT fail open yet
+# (it retries — the ceiling must not prematurely eat a live hold).
+reset_state
+export MOCK_TMUX_WINDOWS="orchestrator|2"
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+    $(( NOW - 60 )) $(( NOW - 3600 )) $(( NOW - 1 )) 1
+_over_limit_process_wakes "orchestrator"
+if _over_limit_orchestrator_paused; then
+    printf '  PASS: probe-failure inside ceiling still holds (retry, no premature fail-open)\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: hold inside ceiling dropped prematurely\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+# Restore the normal reading stub for subsequent tests.
+cp "$STUB_DIR/pane-state.sh" "$WORK/monitor/pane-state.sh"
+chmod +x "$WORK/monitor/pane-state.sh"
+
+# ---- off-time log (operator ask, your-nexus#275) ------------------------
+echo '=== off-time log: fresh orchestrator hold starts it; record appends ==='
+reset_state
+rm -f "$(_over_limit_held_log_path)"
+# A fresh _orchestrator record (no prior row) must start the log.
+_over_limit_record "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles"
+held=$(_over_limit_held_log_path)
+[[ -f "$held" ]] \
+    && { printf '  PASS: fresh orchestrator hold starts the off-time log\n'; PASS=$(( PASS + 1 )); } \
+    || { printf '  FAIL: off-time log not started\n' >&2; FAIL=$(( FAIL + 1 )); }
+grep -q "hold began" "$held" 2>/dev/null \
+    && { printf '  PASS: off-time log carries a hold-start header\n'; PASS=$(( PASS + 1 )); } \
+    || { printf '  FAIL: off-time log header missing\n' >&2; FAIL=$(( FAIL + 1 )); }
+_over_limit_record_held "2026-07-15_11-00-00_abc123.md" "poll-resurface"
+_over_limit_record_held "2026-07-15_11-01-00_def456.md" "poll-full-state"
+n=$(grep -c $'\theld\t' "$held" 2>/dev/null || echo 0)
+[[ "$n" == "2" ]] \
+    && { printf '  PASS: two held emits recorded (n=%s)\n' "$n"; PASS=$(( PASS + 1 )); } \
+    || { printf '  FAIL: expected 2 held records, got %s\n' "$n" >&2; FAIL=$(( FAIL + 1 )); }
+# A REFRESH of the same hold must NOT truncate the log (progress preserved).
+_over_limit_record "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles"
+n2=$(grep -c $'\theld\t' "$held" 2>/dev/null || echo 0)
+[[ "$n2" == "2" ]] \
+    && { printf '  PASS: hold refresh preserves the off-time log\n'; PASS=$(( PASS + 1 )); } \
+    || { printf '  FAIL: hold refresh clobbered the log (n=%s)\n' "$n2" >&2; FAIL=$(( FAIL + 1 )); }
+
+echo '=== off-time log: resume brief points at it + explains what happened ==='
+brief=$(_over_limit_compose_resume_brief "3am_America/Los_Angeles" 3661 "worker-a" "$(( NOW - 3661 ))")
+assert_contains "brief names the off-time log path" "$brief" "over-limit-held.log"
+assert_contains "brief has WHAT HAPPENED section"   "$brief" "WHAT HAPPENED"
+assert_contains "brief has STATE NOW section"       "$brief" "STATE NOW"
+assert_contains "brief has LOG OF THE OFF-TIME"     "$brief" "LOG OF THE OFF-TIME"
+assert_contains "brief prints explicit T0 window"   "$brief" "The hold ran from"
 
 # ---- compose_resume_brief shape ------------------------------------------
 

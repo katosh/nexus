@@ -48,7 +48,9 @@
 #   (monitor/_channel_lib.sh): an explicit legal-from table, CLAIM-FIRST
 #   ordering, and exactly ONE re-resolve-on-race retry. The legal table:
 #
-#     ack    new|claimed → done               (idempotent at done; terminal≠done → no-op)
+#     ack    new|claimed → done               (idempotent at done; terminal≠done → no-op;
+#                                               REFUSED rc6 on a LIVE reply:required id —
+#                                               ack would close it without the demanded reply)
 #     fail   new|claimed → [.failing]  → failed  (idempotent at failed)
 #     reply  claimed     → [.replying] → replied (one reply; replied w/o --amend → rc 6)
 #     amend  replied     → replied            (same-state content update; non-replied → rc 6)
@@ -115,7 +117,8 @@
 #     reqfile <id>                                                # resolve id → path
 #     dir                                                         # print the inbox dir
 #   ORCHESTRATOR side:
-#     ack    <id>                                                 # .claimed → .done
+#     ack    <id>                                                 # .claimed → .done (bare ack;
+#            REFUSED on a reply:required id — use `reply` so the demanded answer isn't dropped)
 #     reply  <id> [--file f|--message t|-] [--status S] [--worker w] [--dir p]
 #            [--issue owner/repo#N] [--no-publish] [--progress p] [--results p]  # .claimed → .replied
 #     fail   <id> --reason "<why>"                                # → .failed
@@ -127,7 +130,8 @@
 #   3   not-ready (fetch results before it exists)
 #   4   await timed out (still pending)
 #   5   ownership check failed (principal != request origin)
-#   6   illegal state transition (e.g. reply to an already-replied id)
+#   6   illegal state transition (e.g. reply to an already-replied id; ack of a
+#       LIVE reply:required id — it would close without the demanded reply)
 #
 # State dir resolution mirrors monitor/ng + skeptic-channel.sh:
 #   NEXUS_STATE_DIR → NEXUS_ROOT/monitor/.state → config nexus.root →
@@ -904,6 +908,30 @@ cmd_reply() {
 cmd_ack() {
     local id="${1:-}"; [[ -n "$id" ]] || die "usage: ack <id>"
     _validate_id "$id"
+    # REPLY-REQUIRED GUARD: ack is the TERMINAL "acknowledged, no reply body"
+    # transition (.new|.claimed → .done). Running it on a request whose
+    # frontmatter demands `reply: required` would CLOSE the request WITHOUT the
+    # demanded reply — silent data loss the client cannot detect: it keeps
+    # awaiting a reply that never lands, and the operator has to re-file (the
+    # real incident that motivated this guard). Refuse LOUDLY and redirect to
+    # `reply`, making the footgun structurally impossible. Only a LIVE
+    # (new|claimed) request is at risk; an already-terminal id (replied → the
+    # reply was given; done/failed → handled or moot) falls through to the
+    # idempotent transition below, which is the correct harmless no-op —
+    # re-acking a settled request must never start erroring.
+    local _sf _path _state _reply
+    if _sf=$(_state_file_for_id "$id"); then
+        _path="${_sf%$'\t'*}"; _state="${_sf##*$'\t'}"
+        case "$_state" in
+            new|claimed)
+                _reply=$(_chan_frontmatter_field "$_path" reply)
+                if [[ "$_reply" == required ]]; then
+                    printf 'request-channel: id %s is reply:required — use `ng request reply %s …` (ack would close it to .done WITHOUT the required reply)\n' \
+                        "$id" "$id" >&2
+                    exit 6
+                fi ;;
+        esac
+    fi
     # Pure state rename (no content rewrite — the filename suffix is the state
     # of record) through the transition engine: an ack that races the watcher's
     # new→claimed claim re-resolves and completes from .claimed (ack-from-claimed

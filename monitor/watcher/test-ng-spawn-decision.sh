@@ -40,13 +40,16 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 # Build a fake nexus root so config/load.sh and pane-state.sh resolve.
-# Copy (not symlink) ng, since we'll later replace pane-state.sh in
-# the fake root with a stub and don't want that to bleed back through
-# a symlink into the real repo. ng itself can be a symlink — we don't
-# overwrite it.
+# COPY (not symlink) ng into the fake root. ng resolves its own dir with
+# `readlink -f "${BASH_SOURCE[0]}"` (your-org/nexus-code#522) — a symlink
+# here would be dereferenced back to the REAL repo, so `_script_dir` would
+# land on the real monitor/ and ng would use the real pane-state.sh instead
+# of the fake stub dropped below, defeating the whole harness. A regular-file
+# copy makes `_script_dir` == FAKE_ROOT/monitor, so the stub is picked up.
 FAKE_ROOT="$WORK/nexus"
 mkdir -p "$FAKE_ROOT/monitor/.state" "$FAKE_ROOT/config" "$FAKE_ROOT/reports"
-ln -sf "$_test_dir/../ng" "$FAKE_ROOT/monitor/ng"
+cp "$_test_dir/../ng" "$FAKE_ROOT/monitor/ng"
+chmod +x "$FAKE_ROOT/monitor/ng"
 # Minimal config so config/load.sh returns defaults instead of dying.
 cat > "$FAKE_ROOT/config/load.sh" <<'EOF'
 #!/usr/bin/env bash

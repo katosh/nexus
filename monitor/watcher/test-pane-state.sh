@@ -424,10 +424,10 @@ ol_idle_fixture="$FIX_DIR/idle-empty-synthetic.ansi"
 [[ -f "$ol_idle_fixture" ]] || { echo "needs $ol_idle_fixture" >&2; exit 1; }
 
 # 1. File present with reset_at populated → emit state=over-limit
-#    reset_at=<token>.
-cat > "$ol_tmp" <<'JSON'
-{"ts":1779000000,"session_id":"sess","error_type":"rate_limit","error_message":"weekly Opus limit","reset_at":"3am (America/Los_Angeles)","window":"olwin","hook_event_name":"StopFailure"}
-JSON
+#    reset_at=<token>. `ts` must be FRESH: stamps older than the
+#    anti-latch TTL (default 27h) are ignored + deleted by design.
+printf '{"ts":%s,"session_id":"sess","error_type":"rate_limit","error_message":"weekly Opus limit","reset_at":"3am (America/Los_Angeles)","window":"olwin","hook_event_name":"StopFailure"}\n' \
+    "$(date +%s)" > "$ol_tmp"
 out=$("$HELPER" --fixture "$ol_idle_fixture" --window 9 --name olwin --active 0 \
                 --over-limit-file "$ol_tmp" 2>&1)
 got_state=$(awk -F'[ =]' '{print $2}' <<<"$out")
@@ -452,9 +452,8 @@ fi
 #    reset_at=unknown. Documents the documented-blocked path the
 #    handler takes when no reset_at field was extractable from the
 #    StopFailure payload.
-cat > "$ol_tmp" <<'JSON'
-{"ts":1779000000,"session_id":"sess","error_type":"rate_limit","reset_at":null,"window":"olwin","hook_event_name":"StopFailure"}
-JSON
+printf '{"ts":%s,"session_id":"sess","error_type":"rate_limit","reset_at":null,"window":"olwin","hook_event_name":"StopFailure"}\n' \
+    "$(date +%s)" > "$ol_tmp"
 out=$("$HELPER" --fixture "$ol_idle_fixture" --window 9 --name olwin --active 0 \
                 --over-limit-file "$ol_tmp" 2>&1)
 got_state=$(awk -F'[ =]' '{print $2}' <<<"$out")
@@ -476,9 +475,10 @@ fi
 #    blocked) before over-limit-stamp before over-limit-text. The
 #    reverse would have a resumed worker stuck classifying as
 #    over-limit until the Stop hook fired again.
-cat > "$ol_tmp" <<'JSON'
-{"ts":1779000000,"session_id":"sess","error_type":"rate_limit","reset_at":"3am","window":"olwin","hook_event_name":"StopFailure"}
-JSON
+# ts is pinned near the frozen $NOW these sub-tests pass via --now,
+# so the stamp reads FRESH relative to the injected clock.
+printf '{"ts":%s,"session_id":"sess","error_type":"rate_limit","reset_at":"3am","window":"olwin","hook_event_name":"StopFailure"}\n' \
+    "$(( NOW - 60 ))" > "$ol_tmp"
 printf '{"state":"busy","last_activity":%s,"window":"olwin"}\n' "$NOW" > "$hb_file"
 out=$("$HELPER" --fixture "$ol_idle_fixture" --window 9 --name olwin --active 0 \
                 --over-limit-file "$ol_tmp" \
@@ -551,6 +551,70 @@ if [[ "$got_state" == "idle" ]]; then
     PASS=$(( PASS + 1 ))
 else
     printf '  FAIL: missing over-limit file — got=%s want=idle\n' "$got_state" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+rm -f "$ol_tmp"
+
+# 5. Anti-latch TTL (2026-07-14 incident follow-up): a stamp whose
+#    `ts` is older than MONITOR_OVER_LIMIT_STAMP_TTL_SECONDS (default
+#    27h) is EXPIRED — ignored, best-effort deleted, and the
+#    classifier falls through to the renderer. The stamp's cleanup
+#    contract ("Stop hook clears it on the next successful turn")
+#    has no successful turn to ride when a pane's settings lost the
+#    Stop entry; without the TTL that pane reads over-limit forever
+#    and the watcher's emit gate latches shut.
+stale_ts=$(( NOW - 100 * 3600 ))   # 100h old ≫ 27h TTL
+printf '{"ts":%s,"session_id":"sess","error_type":"rate_limit","reset_at":"3am","window":"olwin","hook_event_name":"StopFailure"}\n' \
+    "$stale_ts" > "$ol_tmp"
+out=$("$HELPER" --fixture "$ol_idle_fixture" --window 9 --name olwin --active 0 \
+                --over-limit-file "$ol_tmp" \
+                --heartbeat-file /dev/null --now "$NOW" 2>&1)
+got_state=$(awk -F'[ =]' '{print $2}' <<<"$out")
+if [[ "$got_state" != "over-limit" ]]; then
+    printf '  PASS: expired stamp (100h) ignored → state=%s (no latch)\n' "$got_state"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: expired stamp still classifies over-limit — the latch the TTL exists to prevent\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+if [[ ! -f "$ol_tmp" ]]; then
+    printf '  PASS: expired stamp deleted (self-cleaning)\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: expired stamp not deleted\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# 5b. TTL boundary: a stamp INSIDE the TTL still classifies
+#     over-limit (the TTL must not eat live suspensions).
+printf '{"ts":%s,"session_id":"sess","error_type":"rate_limit","reset_at":"3am","window":"olwin","hook_event_name":"StopFailure"}\n' \
+    "$(( NOW - 20 * 3600 ))" > "$ol_tmp"   # 20h old < 27h TTL
+out=$("$HELPER" --fixture "$ol_idle_fixture" --window 9 --name olwin --active 0 \
+                --over-limit-file "$ol_tmp" \
+                --heartbeat-file /dev/null --now "$NOW" 2>&1)
+got_state=$(awk -F'[ =]' '{print $2}' <<<"$out")
+if [[ "$got_state" == "over-limit" ]]; then
+    printf '  PASS: 20h-old stamp (inside TTL) still over-limit\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: inside-TTL stamp lost — got=%s want=over-limit\n' "$got_state" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# 5c. Corrupt stamp (no parseable ts, ancient mtime) ages out via
+#     the mtime fallback instead of latching.
+printf 'not json at all\n' > "$ol_tmp"
+touch -d '@1700000000' "$ol_tmp" 2>/dev/null || touch -t 202311140000 "$ol_tmp"
+out=$("$HELPER" --fixture "$ol_idle_fixture" --window 9 --name olwin --active 0 \
+                --over-limit-file "$ol_tmp" \
+                --heartbeat-file /dev/null 2>&1)
+got_state=$(awk -F'[ =]' '{print $2}' <<<"$out")
+if [[ "$got_state" != "over-limit" ]]; then
+    printf '  PASS: corrupt ancient stamp ages out via mtime (got %s)\n' "$got_state"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: corrupt ancient stamp latched over-limit\n' >&2
     FAIL=$(( FAIL + 1 ))
 fi
 

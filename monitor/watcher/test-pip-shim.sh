@@ -97,7 +97,19 @@ run_shim() {  # run_shim <path> <cmd-name> [env VAR=val ...] -- [args...]
             *)  envs+=("$1"); shift ;;
         esac
     done
-    OUT=$(env -u PIP_UNWRAPPED -u WATCHER_WINDOW \
+    # -u BASH_ENV is load-bearing, not hygiene: monitor/shellenv/bash_env.sh
+    # (the operator's BASH_ENV) force-fronts monitor/{ghwrap,notifywrap,pipwrap}
+    # onto PATH at the start of EVERY non-interactive bash — including the
+    # `#!/usr/bin/env bash` shim under test. That silently overwrites the
+    # synthetic $p we set here with the OPERATOR's pipwrap dir. When this
+    # test runs from a different clone than $BASH_ENV points at (any PR
+    # worktree / this fixture's clone), the shim then fails to recognize the
+    # fronted pipwrap as its own dir, exec's it, and the re-fronting repeats
+    # until resolution falls through to the REAL /app/bin/pip — a live
+    # `pip download` that storms and blows the suite timeout (#487 class).
+    # Dropping BASH_ENV keeps $p authoritative so the shim resolves against
+    # the fixture stubs, exactly what these assertions mean to exercise.
+    OUT=$(env -u PIP_UNWRAPPED -u WATCHER_WINDOW -u BASH_ENV \
               NEXUS_PIP_HAZARD_PREFIX="$WORK/app/" PATH="$p" \
               ${envs[@]+"${envs[@]}"} "$name" "$@" 2>&1)
     RC=$?

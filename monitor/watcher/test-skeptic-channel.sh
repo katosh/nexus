@@ -710,6 +710,52 @@ assert_nofile "first-round require -> no DONE conjured" "$NEXUS_STATE_DIR/skepti
 
 # ============================================================
 echo
+echo '=== #511: reset ARCHIVES stale sentinels (not bare-rm), incl. verdicts ==='
+# ============================================================
+# The archive-instead-of-rm upgrade of guard 1. A completed round leaves a
+# DONE close-marker AND a req-NNN-*.answered.md verdict; `reset` must sweep
+# BOTH into <channel>/.stale-archive-<ts>/ so the next `require` round is
+# clean and the forensic trail survives.
+XTASK=w511-reset
+XDIR="$NEXUS_STATE_DIR/skeptic/$XTASK"
+mkdir -p "$XDIR"
+printf 'closed by prior fire\n'  > "$XDIR/DONE"
+printf 'verdict: credible\n'     > "$XDIR/req-001-verdict.answered.md"
+printf 'a still-open request\n'  > "$XDIR/req-002-open.open.md"   # current round — must survive
+out=$("$CHAN" reset "$XTASK"); rc=$?
+assert_eq "reset exits 0" "$rc" "0"
+assert_nofile "reset moved DONE out of the channel root"            "$XDIR/DONE"
+assert_nofile "reset moved the .answered.md verdict out"           "$XDIR/req-001-verdict.answered.md"
+assert_file   "reset LEFT the current round's open request"        "$XDIR/req-002-open.open.md"
+arch=$(ls -d "$XDIR"/.stale-archive-* 2>/dev/null | head -1)
+assert_file   "archived DONE lives under .stale-archive-*"          "$arch/DONE"
+assert_file   "archived verdict lives under .stale-archive-*"       "$arch/req-001-verdict.answered.md"
+assert_contains "reset reports what it archived" "$out" "archived 2 stale sentinel(s)"
+
+# reset on a channel with nothing stale is an idempotent no-op (rc 0).
+"$CHAN" reset "$XTASK" >/dev/null 2>&1; rc=$?
+assert_eq "reset is idempotent (no-op rc 0 when nothing stale)" "$rc" "0"
+# reset on a never-seen channel is also a clean no-op (no dir conjured).
+"$CHAN" reset w511-never-seen >/dev/null 2>&1; rc=$?
+assert_eq "reset on an absent channel -> no-op rc 0" "$rc" "0"
+assert_nofile "reset does not conjure an absent channel dir" "$NEXUS_STATE_DIR/skeptic/w511-never-seen"
+
+# End-to-end: wrap-up require now ARCHIVES the prior DONE (guard 1 upgraded
+# from bare rm) — the DONE is gone from the channel root AND recoverable.
+ATASK=w511-wrapup-archive
+mk_prov "$ATASK" require 0 false ""
+mkdir -p "$NEXUS_STATE_DIR/skeptic/$ATASK"
+printf 'round-1 verdict\n' > "$NEXUS_STATE_DIR/skeptic/$ATASK/DONE"
+printf 'verdict: credible\n' > "$NEXUS_STATE_DIR/skeptic/$ATASK/req-001-v.answered.md"
+age_file "$NEXUS_STATE_DIR/skeptic/$ATASK/DONE" 60
+_wrapup_skeptic_step 511 "$ATASK" your-org/your-nexus 0 "" "" "" "" "" "" "" >/dev/null 2>&1
+assert_nofile "wrap-up require -> prior DONE gone from channel root" "$NEXUS_STATE_DIR/skeptic/$ATASK/DONE"
+aarch=$(ls -d "$NEXUS_STATE_DIR/skeptic/$ATASK"/.stale-archive-* 2>/dev/null | head -1)
+assert_file "wrap-up require -> prior DONE ARCHIVED (recoverable)" "$aarch/DONE"
+assert_file "wrap-up require -> fresh pending marker set" "$PEND/$ATASK"
+
+# ============================================================
+echo
 if (( FAIL == 0 )); then
     printf 'ALL TESTS PASSED (%d assertions)\n' "$PASS"
     exit 0

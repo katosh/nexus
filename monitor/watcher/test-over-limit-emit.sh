@@ -108,6 +108,79 @@ run_helper w4 '{"hook_event_name":"StopFailure"}'
 [[ ! -f "$ol_dir/w4.json" ]] && ok "missing error_type → no file" || bad "missing error_type wrote file" ""
 
 echo
+echo "=== REAL payload shape (empirical, 2026-07-14 incident captures) ==="
+# The production StopFailure payload carries the token as a STRING in
+# `.error` — `.error_type` does not exist. The original filter matched
+# only `.error_type`, so 17 real rate-limit events (2026-06-26 →
+# 2026-07-14) wrote NO stamp and the watcher pasted 63 emits into a
+# frozen orchestrator. These fixtures are verbatim-shaped from
+# monitor/.state/stopfailure-raw-captures.jsonl.
+
+real_payload='{"session_id":"710dc6c2-9a7a-4276-a293-d188f62437d4","transcript_path":"/home/u/.claude/projects/x/710dc6c2.jsonl","cwd":"/shared/x","prompt_id":"437aed6a-2647-4963-9d11-a0bbe5a23b99","effort":{"level":"high"},"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"You'"'"'ve hit your weekly limit · resets 3am (America/Los_Angeles)"}'
+run_helper w_real "$real_payload"
+f="$ol_dir/w_real.json"
+if [[ -f "$f" ]]; then
+    ok "real payload (.error string) writes stamp"
+    [[ "$(jq -r '.error_type' "$f")" == "rate_limit" ]] \
+        && ok "stamp normalises .error → error_type=rate_limit" \
+        || bad "real error_type" "$(jq -r '.error_type' "$f")"
+    got=$(jq -r '.reset_at' "$f")
+    [[ "$got" == "3am_America/Los_Angeles" ]] \
+        && ok "reset_at parsed from last_assistant_message (got: $got)" \
+        || bad "reset_at from notice" "got $got"
+    got=$(jq -r '.error_message' "$f")
+    [[ "$got" == *"hit your weekly limit"* ]] \
+        && ok "error_message carries the notice text" \
+        || bad "error_message" "got $got"
+else
+    bad "real payload wrote no stamp — the incident's exact failure mode" ""
+fi
+
+# Real-shape NON-rate-limit: `.error` string "server_error" must not stamp.
+run_helper w_real_srv '{"hook_event_name":"StopFailure","error":"server_error","last_assistant_message":"API Error"}'
+[[ ! -f "$ol_dir/w_real_srv.json" ]] \
+    && ok "real-shape server_error → no stamp" \
+    || bad "server_error stamped" "$(cat "$ol_dir/w_real_srv.json")"
+
+# Terse notice (no tz): "resets 11pm" → token "11pm".
+run_helper w_real_terse '{"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"You'"'"'ve hit your limit · resets 11pm"}'
+got=$(jq -r '.reset_at' "$ol_dir/w_real_terse.json" 2>/dev/null)
+[[ "$got" == "11pm" ]] && ok "terse notice reset_at (got: $got)" || bad "terse reset_at" "got $got"
+
+# Notice without any resets clause → reset_at null (watcher falls back
+# to the bounded 6h hold).
+run_helper w_real_noreset '{"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"You'"'"'ve hit your weekly limit"}'
+got=$(jq -r '.reset_at' "$ol_dir/w_real_noreset.json" 2>/dev/null)
+[[ "$got" == "null" ]] && ok "no resets clause → reset_at=null" || bad "no-resets reset_at" "got $got"
+
+echo
+echo "=== orchestrator window resolution (NEXUS_ORCHESTRATOR_WINDOW) ==="
+# The orchestrator launcher exports NEXUS_ORCHESTRATOR_WINDOW, not
+# NEXUS_WORKER_WINDOW; the hook must stamp under that name so the
+# watcher's scan of the target pane sees it.
+rc=$(env -i PATH="$PATH" \
+    NEXUS_ROOT="$WORK" NEXUS_ORCHESTRATOR_WINDOW=orchestrator \
+    bash "$HELPER" <<<'{"hook_event_name":"StopFailure","error":"rate_limit","last_assistant_message":"You'"'"'ve hit your weekly limit · resets 3am (America/Los_Angeles)"}'; echo $?)
+[[ "$rc" == "0" ]] || bad "orchestrator-env hook rc" "rc=$rc"
+f="$ol_dir/orchestrator.json"
+if [[ -f "$f" ]]; then
+    ok "orchestrator env → stamp under orchestrator window name"
+    [[ "$(jq -r '.window' "$f")" == "orchestrator" ]] \
+        && ok "stamp window field = orchestrator" \
+        || bad "orchestrator window field" "$(jq -r '.window' "$f")"
+else
+    bad "no orchestrator stamp written" "$(ls "$ol_dir" 2>/dev/null)"
+fi
+
+# Worker var wins over orchestrator var when both are set.
+rc=$(env -i PATH="$PATH" \
+    NEXUS_ROOT="$WORK" NEXUS_WORKER_WINDOW=w_prec NEXUS_ORCHESTRATOR_WINDOW=orch_prec \
+    bash "$HELPER" <<<'{"hook_event_name":"StopFailure","error":"rate_limit"}'; echo $?)
+[[ -f "$ol_dir/w_prec.json" && ! -f "$ol_dir/orch_prec.json" ]] \
+    && ok "NEXUS_WORKER_WINDOW takes precedence" \
+    || bad "window precedence" "$(ls "$ol_dir" 2>/dev/null)"
+
+echo
 echo "=== missing env vars → exit 0, no crash ==="
 
 # No NEXUS_WORKER_WINDOW

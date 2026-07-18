@@ -12,6 +12,10 @@
 #   5.  reply correlation: reply: frontmatter carries worker/dir/issue refs
 #   6.  reply-twice refused (one reply per request; non-zero, no torn file)
 #   7.  ack: .claimed → .done; idempotent on an already-terminal id (rc 0)
+#   7b. ack guard: ack of a LIVE reply:required request is REFUSED (rc 6) and
+#       leaves it .claimed (never a silent .done drop); the message redirects
+#       to `reply`; `reply` still transitions it → .replied; ack of a
+#       reply:optional (== default) request still acks → .done
 #   8.  fail: → .failed with the reason recorded
 #   9.  await exit-code map: replied=0, done=0, failed=2, pending=4
 #   10. fetch: path-confined to replies/<id>/{progress,results}.md;
@@ -166,6 +170,28 @@ assert_file "ack → .done.md" "$REQ/$aid.done.md"
 "$RC" ack "$aid" >/dev/null 2>&1; r2=$?
 assert_rc "first ack rc0"  "$r1" "0"
 assert_rc "double-ack rc0 (idempotent)" "$r2" "0"
+
+echo "== 7b. ack guard: reply:required refused, must be answered via reply =="
+# (i) ack on a LIVE reply:required request is REFUSED (rc6) and does NOT close it.
+gid=$("$RC" file --origin w --kind question --slug guardme --reply required --message "answer me")
+_claim "$gid"
+"$RC" ack "$gid" >/dev/null 2>&1; grc=$?
+assert_rc   "ack of reply:required refused rc6"          "$grc" "6"
+assert_file "reply:required stays .claimed (not closed)" "$REQ/$gid.claimed.md"
+[[ ! -f "$REQ/$gid.done.md" ]]; assert_rc "no .done written for reply:required ack" "$?" "0"
+# (ii) the refusal message redirects to `reply`.
+gerr=$("$RC" ack "$gid" 2>&1 >/dev/null)
+assert_contains "refusal message redirects to reply" "$gerr" "reply:required"
+# (iii) reply on that same reply:required request DOES transition it → .replied.
+"$RC" reply "$gid" --message "here is the answer" >/dev/null; rrc=$?
+assert_rc   "reply on reply:required rc0"  "$rrc" "0"
+assert_file "reply:required → .replied"    "$REQ/$gid.replied.md"
+# (iv) ack on a reply:optional (== default) request still acks to .done.
+oid=$("$RC" file --origin w --kind question --slug optack --reply optional --message body)
+_claim "$oid"
+"$RC" ack "$oid" >/dev/null; orc=$?
+assert_rc   "ack of reply:optional rc0"  "$orc" "0"
+assert_file "reply:optional → .done"     "$REQ/$oid.done.md"
 
 echo "== 8. fail =="
 fid=$("$RC" file --origin w --kind question --slug failme --message body)

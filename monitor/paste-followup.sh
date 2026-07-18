@@ -424,13 +424,30 @@ printf '%s\t%s\t%s\n' "$WINDOW" "$PASTE_EPOCH" "$SRC_TOKEN" \
 #    pane's current VI mode (the lone `i` would self-insert when
 #    already in insert mode; BSpace erases it — and in normal mode
 #    `i` switches and BSpace is a harmless cursor-left).
+#
+#    `-p` (bracketed paste) is LOAD-BEARING for multi-line messages
+#    (your-org/nexus-code#521). Without it, tmux replaces every embedded
+#    linefeed with its separator (carriage return by default), so each
+#    newline reaches the REPL as an Enter keystroke: on an idle pane the
+#    first line is submitted alone as its own turn and the rest is stranded
+#    in the input box; on a busy pane the words glue across the break. `-p`
+#    wraps the buffer in bracketed-paste control codes IFF the receiving
+#    application has requested bracketed-paste mode (per tmux(1)) — the
+#    Claude REPL does, so the whole message arrives as one literal paste
+#    and the newlines are text, not submits. The explicit Enter in step 3
+#    remains the sole submit. Verified on the deployed tmux 2.6:
+#    `paste-buffer -p` emits `ESC[200~ … ESC[201~` around the buffer once
+#    the pane has requested mode ?2004 (see test-paste-bracketed.sh).
+#    Safe-by-construction: on an application that did NOT request the mode,
+#    tmux inserts no codes and `-p` is identical to the prior behaviour —
+#    it can only fix, never regress.
 BUF="nexus-followup-$$-${RANDOM}"
 tmux send-keys -t "$WIN_ID" i BSpace 2>/dev/null \
     || die "tmux send-keys (insert-mode guard) failed for window $WINDOW"
 sleep 0.1
 tmux set-buffer -b "$BUF" -- "$MSG" \
     || die "tmux set-buffer failed"
-if ! tmux paste-buffer -d -b "$BUF" -t "$WIN_ID"; then
+if ! tmux paste-buffer -p -d -b "$BUF" -t "$WIN_ID"; then
     tmux delete-buffer -b "$BUF" 2>/dev/null || true
     die "tmux paste-buffer failed for window $WINDOW"
 fi

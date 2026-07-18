@@ -144,11 +144,13 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 log("  BODY(raw) {!r}".format(body[:400]))
 
-    def _json(self, code, obj):
+    def _json(self, code, obj, headers=None):
         payload = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        for k, v in (headers or {}).items():
+            self.send_header(str(k), str(v))
         self.end_headers()
         self.wfile.write(payload)
 
@@ -225,10 +227,25 @@ class Handler(BaseHTTPRequestHandler):
             # (config -> respawn); 400/invalid_request_error -> "unknown"
             # (msg-probed -> conversation -> respawn). Defaults to api_error
             # (the generic 5xx shape) to preserve prior behavior.
+            # `headers` (optional map) lets a scenario attach response
+            # headers to the error. Empirical note for over-limit
+            # spoofing (claude 2.1.x, test-realmodel-overlimit.sh):
+            # the SUBSCRIPTION usage-limit flow (anthropic-ratelimit-
+            # unified-status: rejected → hard stop + the composed
+            # "You've hit your weekly limit · resets <t>" notice) is
+            # gated on claude.ai OAuth scopes inside the binary and is
+            # UNREACHABLE under this harness's bearer-token auth — CC
+            # ignores the unified headers and soft-retries any 429.
+            # The reachable spoof: 429/rate_limit_error + a low
+            # CLAUDE_CODE_MAX_RETRIES in the worker env → retries
+            # exhaust → real StopFailure with error="rate_limit" and
+            # last_assistant_message="API Error: Request rejected
+            # (429) · <error_text>".
             return self._json(int(ctl.get("status", 500)),
                               {"type": "error",
                                "error": {"type": ctl.get("error_type", "api_error"),
-                                         "message": ctl.get("error_text", "mock error")}})
+                                         "message": ctl.get("error_text", "mock error")}},
+                              headers=ctl.get("headers"))
 
         if not wants_stream:
             # Non-streaming JSON Messages response.

@@ -59,6 +59,7 @@ OKFLAG="$WD/ok"
 # i.e. the restart holds. Absent ⇒ the restart does NOT recover it.
 FIXFLAG="$WORK/restart-fixes"
 SVC_CALLS="$WORK/svc-calls.log"
+SVC_FORCE_CALLS="$WORK/svc-force-calls.log"
 : > "$SVC_CALLS"
 
 # Capture stub for svc.sh: log the verb+name, optionally fix the service.
@@ -66,6 +67,13 @@ SVC_STUB="$WORK/svc-stub.sh"
 cat > "$SVC_STUB" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$SVC_CALLS"
+# Record the cold-build-guard override we were (or were not) handed. svc.sh's
+# guard counts a build's age from the BUILD PROCESS; this module counts from
+# FIRST_UNHEALTHY. The build starts after the service is already unhealthy, so
+# the guard's clock always reads younger and would veto our first post-ceiling
+# restart unless we force it. Capturing SVC_FORCE is what makes that divergence
+# assertable (your-org/your-nexus#273, round-2 skeptic).
+echo "\${1:-}:\${2:-} SVC_FORCE=\${SVC_FORCE:-<unset>}" >> "$SVC_FORCE_CALLS"
 # Mirror svc.sh's restart-attribution marker (_record_restart_marker): the
 # recovery path reads it as EVIDENCE of who restored the service.
 if [[ "\${1:-}" == restart && -n "\${2:-}" ]]; then
@@ -937,6 +945,7 @@ stop_build
 echo
 echo "## cold-build ceiling ⇒ a pathological never-binding build is eventually restarted"
 reset_jup
+: > "$SVC_FORCE_CALLS"             # scope the SVC_FORCE assertions to THIS case
 export MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1800
 rm -f "$JOK"; start_build          # a build that never binds a URL
 NEXUS_TEST_NOW=20000 _service_health_check_tick        # cold-build
@@ -946,6 +955,37 @@ assert_eq "no restart within the ceiling" "$(grep -c 'restart jupyter-fix' "$SVC
 NEXUS_TEST_NOW=21801 _service_health_check_tick        # >1800s in → ceiling passed
 assert_eq "past the ceiling the watcher restarts even a still-'building' service" \
     "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "1"
+
+# ── CLOCK ORIGIN: the ceiling must actually GET THROUGH svc.sh's guard ───────
+# The assertion above only proves we CALLED svc.sh. It passed all through round
+# 1 while the call was being REFUSED: svc.sh's cold-build guard ages the build
+# from the BUILD PROCESS (etimes), this module ages the incident from
+# FIRST_UNHEALTHY, and a build can only start after the service is already
+# unhealthy — so at our ceiling the build is always younger than the guard's cap
+# and the guard vetoed us. One wasted restart attempt out of three, every time;
+# permanent `flapping` (recovery dead) once that offset exceeds the restart
+# budget. Two clocks, same 1800s duration, different origins.
+#
+# We resolve it by deciding ONCE, here, on OUR clock, and telling svc.sh:
+# SVC_FORCE=1. These assertions FAIL if that coupling is ever broken.
+assert_eq "past the ceiling the watcher FORCES through svc.sh's cold-build guard (clock-origin fix)" \
+    "$(grep -c 'restart:jupyter-fix SVC_FORCE=1' "$SVC_FORCE_CALLS")" "1"
+assert_eq "the forced restart is the one issued at the ceiling (no un-forced restart of a live build)" \
+    "$(grep -c 'restart:jupyter-fix SVC_FORCE=0' "$SVC_FORCE_CALLS")" "0"
 stop_build
+
+# A restart with NO live build must NOT be forced: forcing unconditionally would
+# silently re-arm the original footgun (an operator/watcher discarding a build
+# that is legitimately materialising) if the defer branch above ever regressed.
+echo "## a restart with no cold build in flight is NOT forced (the guard stays armed)"
+reset_jup
+: > "$SVC_FORCE_CALLS"
+rm -f "$JOK"                       # unhealthy, but no build process at all
+NEXUS_TEST_NOW=30000 _service_health_check_tick        # fresh detection
+NEXUS_TEST_NOW=30100 _service_health_check_tick        # past grace → restart
+assert_eq "no live build ⇒ watcher does NOT set SVC_FORCE" \
+    "$(grep -c 'restart:jupyter-fix SVC_FORCE=0' "$SVC_FORCE_CALLS")" "1"
+assert_eq "no live build ⇒ nothing was force-restarted" \
+    "$(grep -c 'restart:jupyter-fix SVC_FORCE=1' "$SVC_FORCE_CALLS")" "0"
 
 th_summary_and_exit

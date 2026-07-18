@@ -66,9 +66,23 @@
 #   _over_limit_process_wakes <target_window>
 #     The wake loop. For each stamped row whose next_attempt_epoch ≤
 #     now, re-probe. If still over-limit: bump backoff (60s → 120s →
-#     240s → cap 300s), increment attempts, drop after MAX_ATTEMPTS
-#     (default 10). If transitioned out (idle/busy/empty/etc): paste
-#     the resume brief and drop the row. If pane-absent or window
+#     240s → cap 300s), increment attempts; at MAX_ATTEMPTS (default
+#     4) FAIL OPEN — paste the resume brief anyway and drop the row.
+#     The paste is deliberate, not optimistic: a suspended pane never
+#     repaints on its own and the hook stamp only clears on a
+#     successful turn, so "still reads over-limit" is EXPECTED after
+#     a genuine reset; the paste triggers the turn that either
+#     confirms recovery (Stop hook clears the stamp) or re-stamps
+#     with the current reset time (StopFailure hook). This is the
+#     anti-latch guarantee: the hold is bounded by
+#     reset_epoch + margin + Σbackoff (≈12 min past reset at
+#     defaults), never indefinite. If transitioned out — ANY alive
+#     state (idle/busy/empty/user-typing/autosuggest-only AND the
+#     refined-idle states working-background/working-self-paced/
+#     idle-orphan-async): paste the resume brief and drop the row.
+#     An UNRECOGNISED state routes through the same MAX_ATTEMPTS
+#     fail-open as over-limit, so NO state can hold the gate forever
+#     (skeptic finding, PR #526 round 1). If pane-absent or window
 #     missing: log + drop. Returns 0 always (logs are advisory).
 #
 # Env knobs (override config or default):
@@ -81,8 +95,16 @@
 #       pane still suspended.
 #   MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS    (default 300)
 #       Cap on the exponential backoff between retries.
-#   MONITOR_OVER_LIMIT_MAX_ATTEMPTS           (default 10)
-#       Give up + drop the row after this many wake attempts.
+#   MONITOR_OVER_LIMIT_MAX_ATTEMPTS           (default 4)
+#       Fail OPEN (paste the resume brief + drop the row) after this
+#       many still-over-limit wake attempts. Default 4 ≈ 7 min of
+#       grace past the reset margin (60+120+240s) before the paste.
+#   MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS       (default 90000 = 25h)
+#       Absolute per-row hold ceiling. A row older than this
+#       (now - first_seen) fails OPEN regardless of pane state or
+#       probe outcome — the belt-and-suspenders that bounds EVERY
+#       wake path, including a persistently-failing pane-state probe.
+#       Must exceed the longest legitimate reset horizon (24h).
 #
 # Logger contract: callers may set `_OVER_LIMIT_LOG_FN` to the name of
 # a function that takes one string arg. Default is a noop. Tests pin a
@@ -100,6 +122,40 @@ _over_limit_paste_noop() { return 0; }
 
 _over_limit_state_path() {
     printf '%s/over-limit-state.tsv' "${STATE_DIR:-.}"
+}
+
+# Off-time log (operator ask, your-nexus#275): a human-readable,
+# consolidated record of what the watcher HELD while the orchestrator was
+# over-limit. main.sh appends one line per suppressed emit; the resume
+# brief (the special first flushed emit) points the operator here so they
+# can see exactly what they missed during the off-time. Freshly started at
+# the top of each orchestrator hold (`_over_limit_held_log_start`), so it
+# always describes the most-recent incident; the per-emit full bodies stay
+# archived under monitor/.state/diffs/ as the permanent record.
+_over_limit_held_log_path() {
+    printf '%s/over-limit-held.log' "${STATE_DIR:-.}"
+}
+
+# Start (truncate + header) the off-time log for a new orchestrator hold.
+# Called from _over_limit_record when a fresh `_orchestrator` row appears.
+_over_limit_held_log_start() {
+    local t0="$1" path pretty
+    path=$(_over_limit_held_log_path)
+    mkdir -p "$(dirname "$path")" 2>/dev/null || true
+    pretty=$(date -d "@$t0" -Is 2>/dev/null || printf '%s' "$t0")
+    printf '# over-limit off-time log — orchestrator hold began %s (epoch %s)\n# one line per emit the watcher held while the pane was over-limit; full bodies under monitor/.state/diffs/\n' \
+        "$pretty" "$t0" > "$path" 2>/dev/null || true
+}
+
+# Append a held-emit record to the off-time log. Called by main.sh's
+# over-limit-suppressed emit branch. Best-effort; never fails the caller.
+_over_limit_record_held() {
+    local archive="$1" reason="$2" path ts
+    path=$(_over_limit_held_log_path)
+    mkdir -p "$(dirname "$path")" 2>/dev/null || true
+    ts=$(date -Is 2>/dev/null || date 2>/dev/null || printf '?')
+    printf '%s\theld\tarchive=%s\treason=%s\n' "$ts" "$archive" "$reason" \
+        >> "$path" 2>/dev/null || true
 }
 
 _over_limit_sanitize_key() {
@@ -197,6 +253,11 @@ _over_limit_record() {
         IFS=$'\t' read -r _ _ _ _ _ existing_first _ existing_attempts <<<"$existing"
         [[ "$existing_first" =~ ^[0-9]+$ ]] && first_seen="$existing_first"
         [[ "$existing_attempts" =~ ^[0-9]+$ ]] && attempts="$existing_attempts"
+    elif [[ "$key" == "_orchestrator" ]]; then
+        # Fresh orchestrator hold (no prior row) → start the off-time log
+        # so it describes THIS incident from the moment emits begin to be
+        # held. Refreshes of an existing hold leave it untouched.
+        _over_limit_held_log_start "$now"
     fi
     local next_attempt=$(( reset_epoch + wake_margin ))
     # Don't push next_attempt into the past if we've been sitting on a
@@ -299,14 +360,21 @@ _over_limit_resolve_window_index() {
         | awk -F'|' -v n="$name" '$1 == n { print $2; exit }'
 }
 
-# Build the resume brief that lands in the orchestrator's input box
-# when the watcher detects resumption. Arguments:
-#   $1  ISO-formatted reset_at token (display only)
+# Build the SPECIAL first flushed emit that lands in the orchestrator's
+# input box when the watcher detects resumption. Per the operator ask
+# (your-nexus#275) it explains, in order: (a) what happened — the pane
+# was over-limit and the watcher HELD its emits rather than piling them
+# into a frozen pane; (b) the state now — limit reset, back online, this
+# is the first emit since; (c) where to find a log of the off-time (the
+# consolidated held-emit log + the per-emit diff archives). Normal
+# state-change emits resume after this one. Arguments:
+#   $1  reset_at token (display only)
 #   $2  duration seconds (display only — formatted to Hh:MMm:SSs)
-#   $3  optional: comma-separated list of currently-stamped worker
-#       windows; empty means "no workers affected"
+#   $3  optional: comma-separated list of currently-stamped worker windows
+#   $4  optional: first_seen epoch (the hold start T0); when present the
+#       brief prints the explicit T0→reset window
 _over_limit_compose_resume_brief() {
-    local token="$1" duration="$2" workers="$3"
+    local token="$1" duration="$2" workers="$3" first_seen="${4:-}"
     # Pretty-print the token. The first `_` separates the time from
     # the tz; subsequent `_` chars inside the tz (e.g.
     # `America/Los_Angeles`) MUST be preserved. So we split on
@@ -322,17 +390,41 @@ _over_limit_compose_resume_brief() {
     local d_s=$(( duration % 60 ))
     local pretty_dur
     pretty_dur=$(printf '%dh %02dm %02ds' "$d_h" "$d_m" "$d_s")
+    local t0_pretty=""
+    if [[ "$first_seen" =~ ^[0-9]+$ ]]; then
+        t0_pretty=$(date -d "@$first_seen" -Is 2>/dev/null || printf '%s' "$first_seen")
+    fi
+    local held_log
+    held_log=$(_over_limit_held_log_path)
     {
-        printf 'Watcher resume: weekly Opus limit reset (%s).\n' "$pretty"
-        printf 'You were suspended for %s.\n' "$pretty_dur"
+        printf '=== WATCHER: USAGE-LIMIT RECOVERY (read first) ===\n'
+        printf '\n'
+        printf 'WHAT HAPPENED: this session hit its usage limit and could not\n'
+        printf 'complete turns. The watcher detected the over-limit status and HELD\n'
+        printf 'its emits (state-change and eligible-comment pastes) instead of\n'
+        printf 'piling them into a frozen pane.\n'
+        if [[ -n "$t0_pretty" ]]; then
+            printf 'The hold ran from %s until the limit reset (%s) — %s.\n' \
+                "$t0_pretty" "$pretty" "$pretty_dur"
+        else
+            printf 'The hold lasted %s (limit reset: %s).\n' "$pretty_dur" "$pretty"
+        fi
+        printf '\n'
+        printf 'STATE NOW: the limit has reset and you are back online. This is the\n'
+        printf 'FIRST emit since recovery; normal state-change emits resume after it.\n'
         if [[ -n "$workers" ]]; then
-            printf 'Workers still queued for wake: %s.\n' "$workers"
-            printf 'The watcher will paste a resume directive into each as it transitions out.\n'
+            printf 'Workers still queued for wake: %s (the watcher pastes a resume\n' "$workers"
+            printf 'directive into each as it transitions out).\n'
         else
             printf 'No workers were suspended in this window.\n'
         fi
-        printf 'Most recent watcher state is in monitor/.state/last-snapshot.txt; the previous emits remain archived under monitor/.state/diffs/ (paste path was paused while you were inert).\n'
-        printf 'Proceed with bootstrap.sh as you would on any resumption.\n'
+        printf '\n'
+        printf 'LOG OF THE OFF-TIME: the emits held while you were inert are recorded\n'
+        printf 'at %s\n' "$held_log"
+        printf '(one line per held emit); each full body is archived under\n'
+        printf 'monitor/.state/diffs/, and current canonical state is in\n'
+        printf 'monitor/.state/last-snapshot.txt. Review the held log to see what you\n'
+        printf 'missed, then proceed with bootstrap.sh as on any resumption.\n'
     }
 }
 
@@ -362,6 +454,67 @@ _over_limit_worker_summary() {
         | paste -sd, -
 }
 
+# Fail-open terminal: compose the appropriate brief, paste it (best
+# effort — the point is to break the hold, so a paste failure must not
+# keep the row alive), and DROP the row so the emit gate reopens. Used
+# both when a genuinely-over-limit pane exhausts its wake attempts and
+# when an unrecognised pane state must not be allowed to hold the gate
+# forever. Orchestrator gets the special resume brief (with T0); workers
+# get the terse brief + a machine-input ledger stamp (stamp-before-paste,
+# #293).
+_over_limit_failopen() {
+    local key="$1" window="$2" role="$3" token="$4" first_seen="$5" now="$6"
+    local duration=$(( now - first_seen ))
+    (( duration >= 0 )) || duration=0
+    local body
+    body=$(mktemp)
+    if [[ "$role" == "orchestrator" ]]; then
+        _over_limit_compose_resume_brief \
+            "$token" "$duration" "$(_over_limit_worker_summary)" "$first_seen" > "$body"
+    else
+        _over_limit_compose_worker_brief "$token" > "$body"
+        _machine_input_stamp "$window" "over-limit-wake"
+    fi
+    "$_OVER_LIMIT_PASTE_FN" "$window" "$body" || true
+    rm -f "$body"
+    _over_limit_drop "$key"
+}
+
+# "Still suspended" step: increment attempts, and at MAX_ATTEMPTS FAIL
+# OPEN (paste + drop) instead of backing off forever. This is the
+# anti-latch guarantee — EVERY non-resumption branch routes through here
+# so no pane state can suppress emits indefinitely. `state_label` is for
+# the log line only. Returns 0.
+_over_limit_bump_or_failopen() {
+    local key="$1" window="$2" role="$3" token="$4" reset_epoch="$5" \
+          first_seen="$6" attempts="$7" now="$8" state_label="$9"
+    local new_attempts=$(( attempts + 1 ))
+    local max_attempts="${MONITOR_OVER_LIMIT_MAX_ATTEMPTS:-4}"
+    [[ "$max_attempts" =~ ^[0-9]+$ ]] || max_attempts=4
+    if (( new_attempts >= max_attempts )); then
+        # A bare drop here would be a latch: the next _over_limit_scan_panes
+        # re-stamps the still-suspended-reading pane with a FRESH reset
+        # horizon, so "drop and wait" silently re-arms the suppression
+        # forever (the pane never changes precisely BECAUSE we stopped
+        # pasting). The wake paste is the probe that breaks the cycle — if
+        # the limit genuinely reset the pasted brief lands and the pane
+        # recovers; if it is truly still limited, the turn fails, the
+        # StopFailure hook re-stamps with the CURRENT reset time, and the
+        # next hold starts from accurate data. Cost is one paste; a
+        # wrongly-held channel hangs the whole nexus (2026-07-14, 63 emits
+        # into a frozen orchestrator).
+        "$_OVER_LIMIT_LOG_FN" \
+            "over-limit: max wake attempts (${max_attempts}) reached for '${window}' (key=${key}, state=${state_label}); failing OPEN — pasting wake brief and dropping stamp"
+        _over_limit_failopen "$key" "$window" "$role" "$token" "$first_seen" "$now"
+        return 0
+    fi
+    _over_limit_apply_backoff "$key" "$window" "$role" "$token" \
+        "$reset_epoch" "$first_seen" "$new_attempts" "$now"
+    "$_OVER_LIMIT_LOG_FN" \
+        "over-limit: '${window}' still suspended (state=${state_label}, attempt ${new_attempts}/${max_attempts}); next probe at $(date -d "@$(_over_limit_load_next_attempt "$key")" -Is 2>/dev/null || echo '?')"
+    return 0
+}
+
 # Per-row wake decision. Args: tab-row from the state file. Mutates
 # state (drops row, updates attempts/next_attempt) and pastes via the
 # injected _OVER_LIMIT_PASTE_FN.
@@ -373,6 +526,26 @@ _over_limit_evaluate_row() {
     [[ -n "$key" ]] || return 0
     # Not due yet — leave the row alone.
     (( now >= next_attempt )) || return 0
+
+    # ABSOLUTE anti-latch ceiling — the belt over every per-state
+    # suspenders. No hold may outlive first_seen + MAX_HOLD regardless of
+    # which branch it takes. This closes the ONE path the per-state
+    # fail-opens don't: a persistently-FAILING pane-state probe (empty
+    # output — not any pane state) backs off without consuming an attempt,
+    # so on a broken pane-state.sh it would retry every 60s forever with
+    # the gate closed (skeptic round-2 residual, PR #526). It also
+    # backstops any future branch that forgets to bound itself. The
+    # longest legitimate reset horizon is 24h ("resets <clock-time>"); the
+    # default ceiling adds an hour of margin. A negative delta (bogus
+    # future first_seen) never trips it.
+    local max_hold="${MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS:-90000}"  # 25h
+    [[ "$max_hold" =~ ^[0-9]+$ ]] || max_hold=90000
+    if (( now - first_seen > max_hold )); then
+        "$_OVER_LIMIT_LOG_FN" \
+            "over-limit: '${window}' (key=${key}) hold exceeded absolute ceiling (${max_hold}s since first_seen); failing OPEN"
+        _over_limit_failopen "$key" "$window" "$role" "$token" "$first_seen" "$now"
+        return 0
+    fi
 
     local probe_target
     if [[ "$role" == "orchestrator" ]]; then
@@ -401,29 +574,31 @@ _over_limit_evaluate_row() {
 
     case "$state" in
         over-limit)
-            local new_attempts=$(( attempts + 1 ))
-            local max_attempts="${MONITOR_OVER_LIMIT_MAX_ATTEMPTS:-10}"
-            [[ "$max_attempts" =~ ^[0-9]+$ ]] || max_attempts=10
-            if (( new_attempts >= max_attempts )); then
-                "$_OVER_LIMIT_LOG_FN" \
-                    "over-limit: max wake attempts (${max_attempts}) reached for '${window}' (key=${key}); dropping stamp — operator intervention required"
-                _over_limit_drop "$key"
-                return 0
-            fi
-            _over_limit_apply_backoff "$key" "$window" "$role" "$token" \
-                "$reset_epoch" "$first_seen" "$new_attempts" "$now"
-            "$_OVER_LIMIT_LOG_FN" \
-                "over-limit: '${window}' still suspended (attempt ${new_attempts}/${max_attempts}); next probe at $(date -d "@$(_over_limit_load_next_attempt "$key")" -Is 2>/dev/null || echo '?')"
+            # Genuinely still suspended — back off, and fail OPEN at the
+            # attempt cap rather than latch.
+            _over_limit_bump_or_failopen "$key" "$window" "$role" "$token" \
+                "$reset_epoch" "$first_seen" "$attempts" "$now" "over-limit"
             ;;
         absent|blocked)
             "$_OVER_LIMIT_LOG_FN" \
                 "over-limit: '${window}' (key=${key}) reads ${state}; pane lost during suspension — dropping stamp"
             _over_limit_drop "$key"
             ;;
-        idle|autosuggest-only|empty|busy|user-typing)
-            # Resumption. Paste the appropriate brief and drop the
-            # stamp. We compute duration from first_seen so it
-            # reflects total inertness, not just the last retry leg.
+        idle|autosuggest-only|empty|busy|user-typing|working-background|working-self-paced|idle-orphan-async)
+            # Resumption. ALL of these mean the pane is alive and
+            # servicing turns again — the limit has lifted. The three
+            # refined-idle states (working-background, working-self-paced,
+            # idle-orphan-async; issue #183) are refinements of `idle`,
+            # NOT a distinct suspension: an over-limit orchestrator that
+            # recovers on its own (a standing Monitor-handle self-wake or
+            # an operator prompt, both routine) and then idles under a
+            # `· N monitor ·` footer probes as working-background every
+            # cycle. Omitting them here left the row in the `*)` branch,
+            # which backed off forever with no cap and latched the emit
+            # gate closed indefinitely (skeptic finding, PR #526 round 1).
+            # Paste the appropriate brief and drop the stamp. We compute
+            # duration from first_seen so it reflects total inertness, not
+            # just the last retry leg.
             local duration=$(( now - first_seen ))
             (( duration >= 0 )) || duration=0
             local body
@@ -432,7 +607,7 @@ _over_limit_evaluate_row() {
                 local workers
                 workers=$(_over_limit_worker_summary)
                 _over_limit_compose_resume_brief \
-                    "$token" "$duration" "$workers" > "$body"
+                    "$token" "$duration" "$workers" "$first_seen" > "$body"
             else
                 _over_limit_compose_worker_brief "$token" > "$body"
                 # Stamp the machine-input ledger BEFORE the worker wake
@@ -464,11 +639,15 @@ _over_limit_evaluate_row() {
             rm -f "$body"
             ;;
         *)
-            "$_OVER_LIMIT_LOG_FN" \
-                "over-limit: '${window}' reads unexpected state '${state}'; treating as still-suspended"
-            local new_attempts=$(( attempts + 1 ))
-            _over_limit_apply_backoff "$key" "$window" "$role" "$token" \
-                "$reset_epoch" "$first_seen" "$new_attempts" "$now"
+            # Unrecognised pane state — a future pane-state.sh could add
+            # one. Treat conservatively as still-suspended, BUT route
+            # through the bounded step so even an unknown state cannot
+            # back off forever: it hits the same MAX_ATTEMPTS fail-open as
+            # `over-limit`. This is the belt-and-suspenders half of the
+            # anti-latch guarantee (the known refined-idle states are
+            # handled as resumption above; this catches anything new).
+            _over_limit_bump_or_failopen "$key" "$window" "$role" "$token" \
+                "$reset_epoch" "$first_seen" "$attempts" "$now" "unexpected:${state}"
             ;;
     esac
 }

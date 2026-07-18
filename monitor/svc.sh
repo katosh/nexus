@@ -47,6 +47,13 @@
 #                            process group, escalate to KILL after 5 s
 #   svc.sh restart <name>    stop + start (`restart watcher` uses
 #                            launcher.sh --replace)
+#   svc.sh --force <verb> <name>
+#                            override the cold-build guard. stop/restart of a
+#                            labsh service REFUSE while a uvx cold build is in
+#                            flight (~19 min on NFS, nothing listening the whole
+#                            time): restarting discards the build and starts the
+#                            clock over, which is what makes a slow bring-up
+#                            look like a crash loop. Also via SVC_FORCE=1.
 #   svc.sh logs <name>       tail -F the service's log(s) in this
 #                            terminal — for labsh JupyterLab services
 #                            the server's own stdout
@@ -95,6 +102,10 @@ export NEXUS_ROOT
 SERVICES_REGISTRY="${NEXUS_SERVICES_REGISTRY:-$NEXUS_ROOT/monitor/services.registry}"
 REFRESH="${SVC_REFRESH:-5}"
 
+# Override the cold-build guard (_coldbuild_guard). Set by `--force`, or by a
+# non-interactive caller exporting SVC_FORCE=1.
+SVC_FORCE="${SVC_FORCE:-0}"
+
 # Reuse the recovery path's primitives so health/launch/liveness
 # semantics match exactly. bootstrap-recover.sh guards its main behind
 # a BASH_SOURCE test, so sourcing yields the functions (and, via its
@@ -102,6 +113,13 @@ REFRESH="${SVC_REFRESH:-5}"
 # STATE_DIR / INTERVAL / _cfg globals — with no side effects.
 # shellcheck source=bootstrap-recover.sh
 source "$_script_dir/bootstrap-recover.sh"
+
+# Build-identity predicates (labsh_build_in_progress). The cold-build guard in
+# cmd_stop needs to know whether a uvx materialisation is in flight before it
+# TERMs anything. Sourced, not reimplemented, so svc.sh and the watcher share
+# ONE definition of "a build is running" — see _labsh_build_evidence.sh.
+# shellcheck source=_labsh_build_evidence.sh
+source "$_script_dir/_labsh_build_evidence.sh" 2>/dev/null || true
 
 # The tmux window the watcher pastes into — the orchestrator's home.
 # The cockpit window name (this dashboard) is config-resolved too, so
@@ -685,7 +703,7 @@ build_footer() {
             printf -v l '%s%s: work-root JupyterLab, available but not activated — activate: monitor/jupyter-up.sh --root%s' \
                 "$C_DIM" "$ADVERTISED_JUPYTER" "$C_0"
         else
-            printf -v l '%s%s: work-root JupyterLab, available but not activated — needs labsh: monitor/install-labsh.sh (or brew install operator/tools/labsh)%s' \
+            printf -v l '%s%s: work-root JupyterLab, available but not activated — needs labsh: monitor/install-labsh.sh (or brew install katosh/tools/labsh)%s' \
                 "$C_DIM" "$ADVERTISED_JUPYTER" "$C_0"
         fi
         FOOT+=("$l")
@@ -1313,6 +1331,189 @@ _restart_watcher() {
     return 1
 }
 
+# ── cold-build guard (your-org/your-nexus#273) ─────────────────────────────
+# A labsh bring-up must re-materialise its ephemeral uvx environment whenever
+# the resolution drifts (the jupyterlab spec labsh passes is UNPINNED, so any
+# new release among its ~96 packages changes the uv environments-v2 cache key).
+# Measured on this nexus 2026-07-13: 15m24s to link 96 packages onto NFS, plus
+# ~2min for jupyter-lab to import and bind — a ~19-minute bring-up during which
+# NOTHING is listening and the healthcheck legitimately fails.
+#
+# Every `stop`/`restart` in that window DISCARDS the build and starts the clock
+# over from zero. Two such restarts on 2026-07-13 turned one slow bring-up into
+# a 40-minute outage that LOOKED like a crash loop (a new pid each cycle) but
+# was just the same build being killed and restarted. The supervisor's own
+# watchdog never bounced it — the kills came from outside.
+#
+# So: refuse, loudly, and make the operator/agent say `--force`.
+#
+# ── THE FAILURE DIRECTION, STATED PLAINLY ───────────────────────────────────
+# This guard REFUSES a restart, so its dangerous direction is over-refusing:
+#
+#   refuses a PROGRESSING build   → correct; that is the whole point.
+#   refuses a WEDGED build        → automated recovery is DEFEATED. A human
+#                                   must diagnose it and run --force. WORSE
+#                                   than the 19-minute outage it prevents.
+#
+# The first cut of this guard (your-org/nexus-code#525, pre-review) had NO time
+# bound: it protected any live build at 2 seconds or at 5 hours. That silently
+# nullified the watcher's `cold_build_ceiling`, whose documented purpose is
+# exactly "a pathological wedged build must still be recoverable" — the watcher
+# would correctly decide to act past its ceiling, call `svc.sh restart`, and be
+# REFUSED. A guard against an operator footgun that becomes a footgun. Two
+# bounds now stop that:
+#
+#   1. AGE CAP. Past the ceiling a "build" is pathological BY DEFINITION, not
+#      in flight. The cap is the MINIMUM of the watcher's ceiling and the
+#      supervisor's reap budget, so this guard can never outlast the layer that
+#      is about to act — they cannot drift into a deadlock.
+#   2. PROGRESS. A build is protected only while it is MOVING. We sample a
+#      monotone counter (CPU time + bytes written + build-log growth) across
+#      calls; a build that has not advanced it for LABSH_BUILD_STALL_SECONDS is
+#      presumed wedged and released early.
+#
+# On AMBIGUITY (counters unreadable, no prior sample) we protect — but that
+# protection is hard-bounded by the age cap, so the worst case is a bounded
+# delay of automated recovery, never a permanent refusal.
+#
+# NOTE the stall window must be generous: a HEALTHY build on this NFS cache was
+# measured showing ZERO forward motion (frozen file count, frozen wchar, ~0 CPU,
+# `rpc_wait_bit_killable`) for 90+ seconds at a stretch while legitimately
+# progressing. Calling that "wedged" is precisely the mistake this guard exists
+# to prevent, so the default is 600s — ~6.7x the longest stall actually observed.
+
+# The age cap: never outlast the layer that is about to act on this build.
+_coldbuild_cap() {
+    local watcher_ceiling=1800 reap_budget="${LABSH_COLD_BUILD_BUDGET:-1800}" cap
+    if [[ -n "${MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS:-}" ]]; then
+        watcher_ceiling="$MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS"
+    elif [[ -x "${_cfg:-}" ]]; then
+        watcher_ceiling=$("$_cfg" monitor.service_health.cold_build_ceiling_seconds 1800 2>/dev/null)
+    fi
+    [[ "$watcher_ceiling" =~ ^[0-9]+$ ]] || watcher_ceiling=1800
+    [[ "$reap_budget"     =~ ^[0-9]+$ ]] || reap_budget=1800
+    # A ceiling of 0 disables the watcher's cold-build defer entirely; if the
+    # watcher will not defer at all, this guard must not either.
+    (( watcher_ceiling == 0 )) && { printf '0'; return 0; }
+    cap=$(( watcher_ceiling < reap_budget ? watcher_ceiling : reap_budget ))
+    printf '%s' "$cap"
+}
+
+# A monotone progress counter for a live build: CPU consumed + bytes written +
+# build-log growth. Any increase is forward motion. Prints nothing and fails if
+# it cannot be read (⇒ caller treats as "cannot establish a stall").
+_coldbuild_progress() {
+    local pid="$1" workdir="$2" stat rest ticks=0 wchar=0 bg=0
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    rest=${stat#*") "}                        # drop "pid (comm) " — comm may hold spaces
+    # shellcheck disable=SC2086
+    set -- $rest                              # ${12}=utime, ${13}=stime (fields 14/15 overall)
+    # ${12} NOT $12 — the latter is ${1}2, i.e. the state char with a "2" glued on.
+    [[ "${12:-}" =~ ^[0-9]+$ && "${13:-}" =~ ^[0-9]+$ ]] || return 1
+    ticks=$(( ${12} + ${13} ))
+    wchar=$(awk '/^wchar/{print $2; exit}' "/proc/$pid/io" 2>/dev/null)
+    [[ "$wchar" =~ ^[0-9]+$ ]] || wchar=0
+    bg=$(stat -c %s "$workdir/.jupyter/labsh.bg.log" 2>/dev/null)
+    [[ "$bg" =~ ^[0-9]+$ ]] || bg=0
+    printf '%s' $(( ticks + wchar + bg ))
+}
+
+# True iff the build has PROVABLY made no forward progress for >= the stall
+# window. Samples persist across invocations under STATE_DIR. Unprovable ⇒ 1
+# (not stalled ⇒ keep protecting, bounded by the age cap).
+_coldbuild_stalled() {
+    local name="$1" pid="$2" workdir="$3"
+    local stall="${LABSH_BUILD_STALL_SECONDS:-600}"
+    local f="$STATE_DIR/service-health/$name.buildprogress"
+    local now cur prev_pid prev_ts prev_cur
+
+    [[ "$stall" =~ ^[0-9]+$ ]] && (( stall > 0 )) || return 1
+    cur=$(_coldbuild_progress "$pid" "$workdir") || return 1
+    now=$(date +%s 2>/dev/null) || return 1
+    mkdir -p "$(dirname "$f")" 2>/dev/null || return 1
+
+    # `< "$f"` on a missing file is a REDIRECT failure: bash reports it itself
+    # ("No such file or directory") and the `2>/dev/null` on `read` is applied
+    # too late to suppress it. On every first-sight refusal that leaked a raw
+    # shell error into the operator's face. Test for readability first.
+    if [[ -r "$f" ]]; then
+        read -r prev_pid prev_ts prev_cur < "$f" || true
+    fi
+
+    # A different pid, an unreadable sample, or forward motion ⇒ re-baseline.
+    if [[ "${prev_pid:-}" != "$pid" ]] \
+       || [[ ! "${prev_ts:-}"  =~ ^[0-9]+$ ]] \
+       || [[ ! "${prev_cur:-}" =~ ^[0-9]+$ ]] \
+       || (( cur > prev_cur )); then
+        printf '%s %s %s\n' "$pid" "$now" "$cur" > "$f" 2>/dev/null || true
+        return 1
+    fi
+
+    # Same pid, counter has not advanced since prev_ts. Deliberately do NOT
+    # refresh the timestamp — the stall is measured from when motion stopped.
+    (( now - prev_ts >= stall ))
+}
+
+_coldbuild_guard() {
+    local name="$1" workdir="$2" launch="$3" ev pid age mins cap stall
+
+    (( SVC_FORCE )) && return 0
+    [[ "$launch" == *labsh-supervised.sh* ]] || return 0
+    declare -F labsh_build_in_progress >/dev/null || return 0
+
+    ev=$(labsh_build_in_progress "$workdir") || return 0
+    pid="${ev%% *}"; age="${ev##* }"
+    [[ "$age" =~ ^[0-9]+$ ]] || return 0        # unknown age ⇒ cannot bound ⇒ allow
+    mins=$(( age / 60 ))
+    cap=$(_coldbuild_cap)
+    stall="${LABSH_BUILD_STALL_SECONDS:-600}"
+
+    # cap 0 ⇒ the watcher's cold-build defer is disabled outright. If the layer
+    # that owns the policy will not defer, this guard must not defer either.
+    (( cap == 0 )) && return 0
+
+    # (1) past the cap it is pathological BY DEFINITION — let it be killed.
+    if (( cap > 0 && age >= cap )); then
+        echo "svc.sh: '$name' has a labsh build (pid $pid) running ${mins}m (${age}s) — at or past the ${cap}s cold-build ceiling." >&2
+        echo "svc.sh: a build this old is presumed WEDGED, not in flight. Allowing the restart so recovery can proceed." >&2
+        return 0
+    fi
+
+    # (2) alive but not MOVING for the whole stall window ⇒ presumed wedged.
+    if _coldbuild_stalled "$name" "$pid" "$workdir"; then
+        echo "svc.sh: '$name' has a labsh build (pid $pid, ${mins}m old) that has made NO forward progress" >&2
+        echo "svc.sh: (no CPU, no bytes written, no log growth) for >= ${stall}s — presumed wedged. Allowing the restart." >&2
+        return 0
+    fi
+
+    cat >&2 <<EOF
+svc.sh: REFUSING to stop '$name' — a labsh cold build is in flight AND PROGRESSING.
+
+  build pid $pid, running ${mins}m (${age}s); no URL bound yet.
+  A cold uvx bring-up takes ~19 min on this NFS cache (measured 2026-07-13:
+  15m24s to link 96 packages + ~2min to import and bind).
+
+  Stopping now DISCARDS that build and starts the ~19-minute clock over from
+  zero. Repeating it is what turns a slow bring-up into an apparent crash loop.
+
+  This refusal is BOUNDED. It lifts when EITHER:
+    - the build stops making progress (no CPU, no bytes written, no log growth)
+      for ${stall}s — note this is only re-checked when someone calls svc.sh
+      again, so it will not fire on its own while nothing is trying to stop it; or
+    - the build is ${cap}s old, at which point it is presumed wedged.
+
+  The watcher (policy auto-restart) forces a restart through this guard once the
+  service has been unhealthy past its cold-build ceiling, so a WEDGED build is
+  recovered without you. A build that is merely SLOW is what this refusal
+  protects — and it will bind on its own.
+
+  Watch it instead:  tail -f $workdir/.jupyter/labsh.bg.log
+  Override now:      svc.sh --force restart $name
+                     (or SVC_FORCE=1 svc.sh restart $name)
+EOF
+    return 1
+}
+
 cmd_stop() {
     local name="$1"
     case "$name" in
@@ -1320,6 +1521,8 @@ cmd_stop() {
         orchestrator|"$TARGET_WINDOW") _orchestrator_redirect ;;
     esac
     svc_require "$name"
+    _coldbuild_guard "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
+        "${SVC_LAUNCH[$REG_I]}" || return 1
     _stop_service "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
         "${SVC_LAUNCH[$REG_I]}" "${SVC_HEALTH[$REG_I]}"
 }
@@ -1351,6 +1554,13 @@ cmd_restart() {
         watcher) _restart_watcher; return ;;
         orchestrator|"$TARGET_WINDOW") _orchestrator_redirect ;;
     esac
+    # Run the cold-build guard HERE, before the marker and before the stop.
+    # cmd_stop's own `|| true` below is deliberate — a stop of an
+    # already-stopped service is benign and must not block the start — but it
+    # would also swallow a guard refusal, so the guard cannot live only there.
+    svc_require "$name"
+    _coldbuild_guard "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
+        "${SVC_LAUNCH[$REG_I]}" || return 1
     _record_restart_marker "$name"
     cmd_stop "$name" || true
     cmd_start "$name"
@@ -1391,6 +1601,14 @@ main() {
     if (( $# > 0 )) && [[ -z "$1" ]]; then
         die "empty argument (an unset variable expanding to \"\"?) — refusing to guess; run with no arguments for the dashboard or pass an explicit verb"
     fi
+    # --force: override the cold-build guard (see _coldbuild_guard). Accepted
+    # before the verb so `svc.sh --force restart jupyterlab` reads naturally.
+    # Also honoured via the SVC_FORCE env var, for non-interactive callers.
+    if [[ "${1:-}" == "--force" ]]; then
+        SVC_FORCE=1
+        shift
+    fi
+
     case "${1:-}" in
         -h|--help)        usage ;;
         status|--status|-1) cmd_status ;;

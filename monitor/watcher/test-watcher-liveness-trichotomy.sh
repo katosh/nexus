@@ -74,6 +74,21 @@ WD="$MON/watcher"
 STATE="$MON/.state"
 mkdir -p "$WD" "$STATE" "$ROOT/config"
 
+# Pin NEXUS_ROOT/NEXUS_LOCALS to THIS fixture so the test is hermetic to
+# the operator's ambient nexus, not merely when the caller remembers the
+# header's `env -u NEXUS_ROOT -u NEXUS_LOCALS`. revive-watcher.sh's
+# live-watcher refusal guard (nexus-code#491) scans the process table for
+# `$NEXUS_ROOT/monitor/watcher/main.sh`. Inheriting the operator's real
+# NEXUS_ROOT points that scan at the REAL, actively-forking watcher: case B
+# (a genuinely dead FIXTURE watcher that MUST be revived) then finds a live
+# host watcher, folds its fork-freshness in as "progress", and wrongly hits
+# the exit-5 refusal (22/3 under a bare `run-tests.sh`). Pinning both vars
+# is equivalent to unsetting them — revive-watcher.sh defaults its own root
+# to this copied-in location ($ROOT) — but makes the isolation the header
+# promises ("no live watcher or live state is touched") unconditional.
+export NEXUS_ROOT="$ROOT"
+export NEXUS_LOCALS="$ROOT/locals"
+
 cp "$_real_dir/_lib.sh" "$WD/_lib.sh"
 cp "$_real_dir/../revive-watcher.sh" "$MON/revive-watcher.sh"
 cp "$_real_dir/../watcher-supervise-tick.sh" "$MON/watcher-supervise-tick.sh"

@@ -160,3 +160,53 @@ labsh_build_scan() {
     done
     return 0
 }
+
+# labsh_build_in_progress <workdir>
+# Return 0 iff a labsh COLD BUILD is materialising for this service right now,
+# printing "<pid> <age-seconds>". This is the predicate `svc.sh` consults before
+# it TERMs a service, so that a restart cannot silently discard a bring-up that
+# is minutes into a ~19-minute NFS materialisation (your-org/your-nexus#273).
+#
+# Same two-part evidence as the watcher's `_sh_labsh_build_in_progress`, hosted
+# here — in the file that already owns build identity — so the caller that must
+# not DISTURB a build and the caller that must not MASK a dead service cannot
+# drift apart:
+#   (a) NO live server URL in the build log yet. labsh prints the banner only
+#       once jupyter-lab binds, i.e. AFTER the whole uvx materialisation. A URL
+#       present ⇒ the cold phase is over ⇒ NOT in progress, and the ordinary
+#       restart machinery applies — a bound-but-wedged server is still fully
+#       restartable, so this never weakens recovery; AND
+#   (b) a live build PROCESS, proven ours by uid + exe + cwd + pidfile/port.
+#
+# Fails CLOSED (⇒ 1, "not in progress") on anything unestablished. The asymmetry
+# is deliberate and is the opposite of the reaper's: a wrong "in progress" would
+# block recovery of a genuinely dead service, which is strictly worse than a
+# wrong "not in progress" (that costs one rebuild). Never suspend a restart for
+# a process we cannot PROVE is our build.
+labsh_build_in_progress() {
+    local workdir="${1:-}" jdir bglog port pid age
+    [[ -n "$workdir" ]] || return 1
+    jdir="$workdir/.jupyter"
+    [[ -d "$jdir" ]] || return 1
+
+    bglog="$jdir/labsh.bg.log"
+    if [[ -f "$bglog" ]] \
+       && grep -qE 'is running at|https?://[0-9A-Za-z._-]+:[0-9]+/' "$bglog" 2>/dev/null; then
+        return 1
+    fi
+
+    port=$(sed -n 's/^PORT=//p' "$jdir/labsh-service.env" 2>/dev/null | head -1)
+
+    # (b1) the pid labsh recorded for the backgrounded build.
+    pid=$(cat "$jdir/labsh.bg.pid" 2>/dev/null)
+    if [[ ! "$pid" =~ ^[0-9]+$ ]] || ! labsh_build_is_ours "$pid" "$workdir" "$port"; then
+        # (b2) a build from a prior supervisor generation whose bg.pid we no
+        #      longer hold — same identity gates, never an argv substring.
+        pid=$(labsh_build_scan "$workdir" "$port" | head -1)
+    fi
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+
+    age=$(labsh_build_age "$pid") || return 1
+    printf '%s %s' "$pid" "$age"
+    return 0
+}

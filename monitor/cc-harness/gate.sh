@@ -144,6 +144,11 @@ else
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-idle-busy.sh"
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-blocked-question.sh"
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-autosuggest.sh"
+        # Over-limit status + reset-time detection (2026-07-14 incident):
+        # pins the StopFailure payload shape (error="rate_limit" string +
+        # last_assistant_message) and the notice-text detection a CC bump
+        # can silently break — both broke unnoticed before this gate entry.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-overlimit.sh"
     )
 fi
 
