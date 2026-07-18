@@ -74,7 +74,7 @@
 #     its skeptic share a clone, so one project dir holds several
 #     sessions. The session-id is the key.
 #   - Do NOT hand-derive the project-dir slug. The transform maps `/`
-#     AND `_` to `-` (`/shared/your-lab-m/…` → `-fh-fast-setty-m-…`),
+#     AND `_` to `-` (`/shared/your-lab-m/…` → `-shared-your-lab-m-…`),
 #     which is easy to get wrong; and a bare `find` over `~/.claude`
 #     descends into `file-history/` + `cache/` and takes minutes.
 #     Session-ids are UUIDs — globally unique — so a bounded glob over

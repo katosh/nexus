@@ -75,7 +75,7 @@ STUB
 chmod +x "$STUB_CLAUDE"
 
 # Fixtures that drive the probes deterministically.
-FH_FAST="$WORK/fh-fast"
+FH_FAST="$WORK/shared"
 mkdir -p "$FH_FAST"
 HOME_NO_SKILLS="$WORK/home-no-skills"
 mkdir -p "$HOME_NO_SKILLS/.claude/skills"

@@ -55,9 +55,11 @@ map	secretuser	operator	<operator>
 map	brandx/public	zzkeepasset9zz	zzkeepasset9zz
 map	brandx	operator	<operator>
 map	zzkeepasset9zz	brandx/public	brandx/public
+map	priv-store	shared	shared
 deny	secretorg
 deny	secretuser
 deny	brandx
+deny	priv-store
 keep	your-org
 keep	brandx/public
 exclude	pm/mapping.tsv
@@ -73,6 +75,10 @@ printf 'see secretorg/tool for details\n' > "$REPO/doc.md"
 # keep brandx/public); a bare `@brandx` mention is the person and is mapped to
 # @operator. Mirrors the operator actor-login rule (kept asset vs bare handle).
 printf 'clone brandx/public and ping @brandx for review\n' > "$REPO/assets.txt"
+# Slug-encoded path: a private path scrubbed to /shared must ALSO be covered in
+# its dash-slug form (Claude Code slugifies /priv-store/... to -priv-store-...),
+# which matches neither the slashed nor underscored literal (your-org/nexus-code#493).
+printf 'session dir: -priv-store-user-x-nexus\n' > "$REPO/slug.txt"
 
 ( cd "$REPO"
   git init -q
@@ -109,6 +115,11 @@ grep -q 'brandx/public' "$av" && ok "kept public asset brandx/public survives th
                               || no "kept asset brandx/public was wrongly scrubbed: $(cat "$av")"
 grep -rq 'zzkeepasset9' "$REPO" 2>/dev/null && no "asset-protect sentinel leaked into output" \
                                             || ok "asset-protect sentinel fully restored (no leakage)"
+
+# 2c. slug-encoded path form is scrubbed (dash form of a denylisted path)
+sv="$REPO/slug.txt"
+grep -q 'priv-store' "$sv" && no "slug-encoded path not scrubbed: $(cat "$sv")" \
+                           || ok "slug-encoded path form scrubbed"
 
 # 3a. dictionary dropped from output
 [[ -e "$REPO/pm/mapping.tsv" ]] && no "dictionary still present after build" \

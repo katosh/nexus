@@ -902,7 +902,7 @@ cmd_upload() {
 #      where <cwd-slug> mirrors Claude Code's path normalisation:
 #      every non-alphanumeric character (including '/' AND '_') becomes
 #      '-', and the leading '-' from a leading '/' is preserved.
-#      e.g. /shared/your-lab-m/user/operator/nexus → -fh-fast-setty-m-user-your-nexus.
+#      e.g. /shared/your-lab-m/user/operator/nexus → -shared-your-lab-m-user-your-nexus.
 #      LAST-RESORT ONLY: freshest-jsonl is a heuristic, not the caller.
 #   3. Fallback: scan ~/.claude/projects/ for any project dir whose name
 #      contains the slugified cwd tail; pick the most-recently-modified.
