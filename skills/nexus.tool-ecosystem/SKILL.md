@@ -20,7 +20,7 @@ where a fast internal route to the owner exists.
 
 Each lab member runs a **nexus**: an agent workspace paired with a
 GitHub "asset + issue" repo (e.g. `<your-org>/<your-nexus>` is
-<operator>'s, `<your-org>/<other-nexus>` is Tomas's). Agents in these
+<operator>'s, `<your-org>/<other-nexus>` is otheruser's). Agents in these
 nexuses do real single-cell analysis every day, and that work
 leans on the lab's own software — kompot for differential
 abundance, Mellon for density inference, Palantir for trajectories,
@@ -90,7 +90,7 @@ When you hit a bug or rough edge in a lab-authored tool:
 Several lab-authored methods live under **another group's** GitHub
 org because that is their canonical home — most notably
 **`dpeerlab/Palantir`** (otheruser wrote Palantir in Dana Pe'er's
-lab; it still lives there and Manu, now the lab PI, co-maintains it
+lab; it still lives there and otheruser, now the lab PI, co-maintains it
 alongside <operator>). `dpeerlab`, `broadinstitute`, and the like are
 **external-public** repos under the workspace tier rules.
 
