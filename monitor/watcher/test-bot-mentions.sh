@@ -387,7 +387,7 @@ SEARCH_FIXTURE='{
         { "databaseId": 7401, "author": {"login": "operator"},
           "body": "@your-org-bot operator addressing the bot",
           "reactions": {"nodes": []} },
-        { "databaseId": 7402, "author": {"login": "huangy57-nexus-bot[bot]"},
+        { "databaseId": 7402, "author": {"login": "other-nexus-bot[bot]"},
           "body": "@your-org-bot sibling bot addressing the bot",
           "reactions": {"nodes": []} } ] } } ] } } }'
 rm -f "$STATE_DIR/last-bot-mention-cursor.txt" "$STATE_DIR/processed-comments.txt"

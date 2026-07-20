@@ -82,6 +82,11 @@ cp "$_test_dir/../_claude-bin.sh" "$FAKE_NEXUS/monitor/_claude-bin.sh"
 cp "$_test_dir/../_tmux-window.sh" "$FAKE_NEXUS/monitor/_tmux-window.sh"
 # And the shared frontmatter reader (#405 P2) for report resolution.
 cp "$_test_dir/../_fm_lib.sh" "$FAKE_NEXUS/monitor/_fm_lib.sh"
+# The #545 spawn-skeptic auto-ack step shells out to request-channel.sh
+# (+ its lib) to ack the pending request when a --skeptic-role spawn runs.
+cp "$_test_dir/../request-channel.sh" "$FAKE_NEXUS/monitor/request-channel.sh"
+chmod +x "$FAKE_NEXUS/monitor/request-channel.sh"
+cp "$_test_dir/../_channel_lib.sh" "$FAKE_NEXUS/monitor/_channel_lib.sh"
 mkdir -p "$FAKE_NEXUS/node_modules/.bin"
 cat > "$FAKE_NEXUS/node_modules/.bin/claude" <<'CLAUDE_STUB'
 #!/bin/bash
@@ -381,6 +386,57 @@ if [[ ! -f "$SKPEND/plain-no-mark" ]]; then
     printf '  PASS: ordinary spawn writes no skeptic-pending marker\n'; PASS=$(( PASS + 1 ))
 else
     printf '  FAIL: ordinary spawn unexpectedly wrote %s\n' "$SKPEND/plain-no-mark" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# ---- #545: a --skeptic-role spawn AUTO-ACKS the pending spawn-skeptic
+#      request whose origin == the reviewed target window ----------------
+# ng wrap-up files a `kind=spawn-skeptic` request (origin=<reviewed
+# window>) to PUSH the orchestrator to spawn the skeptic; spawning it IS
+# the ack, so spawn-worker.sh closes the loop. Join key: request.origin ==
+# skeptic-spawn.target-window. Pre-file a request for a fresh target, spawn
+# the role, assert the request is now terminal (.done) — and that an
+# UNRELATED request (different origin, or non-skeptic kind) is untouched.
+echo '=== #545: skeptic-role spawn auto-acks the matching spawn-skeptic request ==='
+CHAN="$FAKE_NEXUS/monitor/request-channel.sh"
+REQ_DIR="$FAKE_NEXUS/monitor/.state/requests"
+mkdir -p "$REQ_DIR"
+# The request whose origin is the window we're about to review.
+ACK_ID=$(NEXUS_STATE_DIR="$FAKE_NEXUS/monitor/.state" \
+    printf 'spawn-skeptic: validate ackme-worker\n\nissue: o/r#1\ndepth: 1\n' \
+    | NEXUS_STATE_DIR="$FAKE_NEXUS/monitor/.state" "$CHAN" file \
+        --origin ackme-worker --kind spawn-skeptic --slug skeptic-d1 --priority normal - 2>/dev/null)
+# A control request from a DIFFERENT origin — must survive.
+OTHER_ID=$(printf 'spawn-skeptic: validate other-worker\n\ndepth: 1\n' \
+    | NEXUS_STATE_DIR="$FAKE_NEXUS/monitor/.state" "$CHAN" file \
+        --origin other-worker --kind spawn-skeptic --slug skeptic-d1 --priority normal - 2>/dev/null)
+# A control request from the SAME origin but a different kind — must survive.
+QKIND_ID=$(printf 'a plain question from ackme-worker\n' \
+    | NEXUS_STATE_DIR="$FAKE_NEXUS/monitor/.state" "$CHAN" file \
+        --origin ackme-worker --kind question --slug ask --priority normal - 2>/dev/null)
+
+PATH="$STUB_BIN:$PATH" NEXUS_STATE_DIR="$FAKE_NEXUS/monitor/.state" \
+    "$SCRIPT" -n ackme-skeptic -c "$WORKDIR" -p "$PROMPT_FILE" \
+    --skeptic-role --skeptic-target ackme-worker >/dev/null 2>&1
+
+ack_state=$(NEXUS_STATE_DIR="$FAKE_NEXUS/monitor/.state" "$CHAN" list --state done 2>/dev/null | grep -c "$ACK_ID")
+if [[ -f "$REQ_DIR/$ACK_ID.done.md" ]]; then
+    printf '  PASS: matching spawn-skeptic request auto-acked to .done\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: request %s not acked (states: %s)\n' "$ACK_ID" \
+        "$(ls "$REQ_DIR/$ACK_ID".*.md 2>/dev/null)" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+if [[ ! -f "$REQ_DIR/$OTHER_ID.done.md" ]]; then
+    printf '  PASS: unrelated-origin request left untouched\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: unrelated-origin request %s was wrongly acked\n' "$OTHER_ID" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+if [[ ! -f "$REQ_DIR/$QKIND_ID.done.md" ]]; then
+    printf '  PASS: same-origin non-skeptic request left untouched\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: same-origin question request %s was wrongly acked\n' "$QKIND_ID" >&2
     FAIL=$(( FAIL + 1 ))
 fi
 

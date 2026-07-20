@@ -939,6 +939,75 @@ _openg_user_prompt_epoch() {
     printf '%s' "$e"
 }
 
+# Session-id column of the newest user-prompt submit stamped for
+# `window`. worker-heartbeat.sh writes the stamp as
+# `<epoch>\t<session-id>` — the session-id is claude's OWN session
+# (the hook fires inside the pane's Claude Code process), so it
+# identifies WHICH session submitted the prompt. Empty stdout +
+# non-zero when no stamp / no session-id column.
+_openg_user_prompt_session() {
+    local window="$1" path sid
+    [[ -n "$window" ]] || return 1
+    path=$(_user_prompt_stamp_path "$window")
+    [[ -f "$path" ]] || return 1
+    sid=$(awk -F'\t' 'NR == 1 { print $2; exit }' "$path" 2>/dev/null)
+    [[ -n "$sid" ]] || return 1
+    printf '%s' "$sid"
+}
+
+# The window's OWN spawn session-id — the `--session-id` UUID
+# spawn-worker.sh generates at birth (your-org/your-nexus#206) and
+# records in the provenance record `windows/<window>.json`
+# (`.session_id`). Primary source is that record; a spawn action-log
+# `session-id=` extra is the fallback for a window whose provenance
+# JSON is absent. Empty stdout + non-zero when neither is available
+# (loop-wrapper workers take no `--session-id`, so their own session
+# is unknowable here — the self-classification simply does not fire,
+# falling back to the pre-existing attribution). The window-name is
+# sanitized identically to spawn-worker.sh's `_write_provenance_record`.
+_openg_window_own_session() {
+    local window="$1" f sid=""
+    [[ -n "$window" ]] || return 1
+    f="${STATE_DIR:-.}/windows/${window//[^a-zA-Z0-9_-]/_}.json"
+    if [[ -f "$f" ]]; then
+        if command -v jq >/dev/null 2>&1; then
+            sid=$(jq -r '.session_id // empty' "$f" 2>/dev/null) || sid=""
+        else
+            sid=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1)
+        fi
+    fi
+    if [[ -z "$sid" ]]; then
+        # Fallback: newest spawn action-log event's `session-id=` extra.
+        local log_file="${STATE_DIR:-.}/action-log.jsonl"
+        if [[ -f "$log_file" ]] && command -v jq >/dev/null 2>&1; then
+            sid=$(grep '"event":"spawn"' "$log_file" 2>/dev/null | tac \
+                | jq -r --arg w "$window" \
+                    'select(.window == $w) | .["session-id"] // empty' 2>/dev/null \
+                | head -1) || sid=""
+        fi
+    fi
+    [[ -n "$sid" ]] || return 1
+    printf '%s' "$sid"
+}
+
+# TRUE when `window`'s newest user-prompt submit was stamped with the
+# window's OWN spawn session-id — provably machine/self input, NOT the
+# operator. The operator drives a DIFFERENT Claude Code session and
+# never types into a spawned worker's pane, so a submit carrying the
+# worker's own session-id is autosuggest / post-wrap typing / the
+# worker's own tool loop (the coembed-283-followup false positive,
+# 2026-07-17). Requires BOTH ids present AND equal — any doubt (a
+# missing stamp session-id, an unknown own session-id) returns FALSE,
+# so the pre-existing attribution stays in force and a genuine operator
+# submit (a DIFFERENT session-id) is never misclassified as self.
+_openg_prompt_is_self() {
+    local window="$1" stamp_sid own_sid
+    [[ -n "$window" ]] || return 1
+    stamp_sid=$(_openg_user_prompt_session "$window") || return 1
+    own_sid=$(_openg_window_own_session "$window") || return 1
+    [[ -n "$stamp_sid" && -n "$own_sid" && "$stamp_sid" == "$own_sid" ]]
+}
+
 # Remove `window`'s user-prompt stamp (disappearance prune). A
 # reused window-name then starts from "no submit yet" instead of
 # inheriting the prior life's stamp.
@@ -1567,6 +1636,28 @@ _openg_observe() {
             # a fresh episode normally. _openg_marked requires since>0, so
             # the resulting since=0 row reads as unmarked everywhere.
             since=0; last=0; reminded=0; src="machine"
+            prompt_seen="$prompt_epoch"; changed=1
+        elif _openg_prompt_is_self "$window"; then
+            # SELF-attributed (your-org/your-nexus, coembed-283-followup
+            # 2026-07-17). No covering machine-input stamp, yet the submit
+            # carries the window's OWN spawn session-id — so it is the
+            # worker's own pane self-activity (autosuggest, post-wrap
+            # typing, its own tool loop) under the operator's stated
+            # invariant (they drive a DIFFERENT session and never raw-type
+            # into a worker pane; they relay via paste-followup, which
+            # machine-stamps). Note the hook fires inside the worker's own
+            # session, so a human raw-typing here would stamp the same own
+            # session-id — indistinguishable; that path is out of scope by
+            # the invariant, and on the retire side check-1 pane-state
+            # (`user-typing`/`busy`) is the live backstop. Unlike
+            # the MACHINE branch above, we do NOT stamp the engagement-log
+            # or machine-submit ledger: this is not the orchestrator
+            # (re-)driving the window with new work, it is noise — so it
+            # must neither seed an operator-engaged mark NOR reset the
+            # idle-age anchor that keeps a wrapped, self-active-only window
+            # retire-eligible. Consume the stamp (advance prompt_seen) so
+            # attribution doesn't re-run, exactly like the phantom/redraw
+            # branch below.
             prompt_seen="$prompt_epoch"; changed=1
         else
             # OPERATOR-attributed by the machine rule. Mark only when

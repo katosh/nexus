@@ -78,6 +78,14 @@ cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
 NG="$FAKE_NEXUS/monitor/ng"
 STATE_DIR="$FAKE_NEXUS/monitor/.state"
 
+# The spawn-skeptic request-filing step (your-org/nexus-code#545) shells out
+# to $_script_dir/request-channel.sh (+ its libs). Provide the REAL scripts
+# in the fake monitor dir so cmd_wrap_up can file a request into $STATE_DIR.
+for _dep in request-channel.sh _channel_lib.sh _fm_lib.sh; do
+    cp "$_test_dir/../$_dep" "$FAKE_NEXUS/monitor/$_dep"
+done
+chmod +x "$FAKE_NEXUS/monitor/request-channel.sh"
+
 # Stubbed config — same shape as test-ng-reply-repo.sh.
 cat > "$FAKE_NEXUS/config/load.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -1160,7 +1168,7 @@ gh_calls=$(<"$GH_CAPTURE")
 assert_not_contains "re-run does NOT POST a duplicate comment" "$gh_calls" \
                     "/repos/override-org/override-repo/issues/42/comments"
 
-# ---- Test 32: the cailin scenario — a partial failure (rocket) makes the
+# ---- Test 32: the other-nexus scenario — a partial failure (rocket) makes the
 #      worker re-run the WHOLE verb (the only retry surface); the comment
 #      must not double-post while the rocket DOES get re-attempted. -------
 echo '=== post-once: retry after a rocket failure does not duplicate the comment ==='
@@ -1274,6 +1282,105 @@ assert_contains "contended comment NOT clobbered (v1 link intact)" "$store_body"
 gh_calls=$(<"$GH_CAPTURE")
 assert_not_contains "no PATCH landed on the moving comment" "$gh_calls" \
                     "-X PATCH /repos/override-org/override-repo/issues/comments/1234"
+
+# ---- Test 40+: spawn-skeptic request filing (your-org/nexus-code#545) ----
+# A require resolution files a `kind=spawn-skeptic` request into the
+# watcher-mediated inbox (Step 2b), carrying pointers; a clean first-pass
+# require is auto-spawnable (deliberate=false); --skeptic-contradicted flips
+# it to deliberate=true; a deny/undecided resolution files NOTHING; and a
+# retry is idempotent (no duplicate request).
+REQ_DIR="$STATE_DIR/requests"
+count_spawn_reqs() {  # non-terminal spawn-skeptic requests currently in the inbox
+    shopt -s nullglob
+    local -a f=("$REQ_DIR"/*spawn*skeptic*.new.md "$REQ_DIR"/*-skeptic-d*.new.md \
+                "$REQ_DIR"/*-skeptic-d*.claimed.md)
+    shopt -u nullglob
+    printf '%s' "${#f[@]}"
+}
+spawn_req_body() {  # concatenated body of every filed spawn-skeptic request
+    shopt -s nullglob
+    local -a f=("$REQ_DIR"/*-skeptic-d*.md)
+    shopt -u nullglob
+    (( ${#f[@]} > 0 )) && cat "${f[@]}" 2>/dev/null
+}
+
+echo '=== spawn-skeptic: a first-pass require FILES the request with pointers ==='
+reset_mocks
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="sk-req-worker"
+run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
+    --trigger-comment 4242 \
+    --skeptic-decision require --skeptic-rationale "touched shared infra"
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+assert_eq       "require wrap-up exits 0"                  "$rc" "0"
+assert_contains "stdout reports the filed spawn-skeptic request" "$stdout" \
+                "spawn-skeptic request: filed "
+assert_eq       "exactly one spawn-skeptic request filed"  "$(count_spawn_reqs)" "1"
+body=$(spawn_req_body)
+assert_contains "request frontmatter carries kind=spawn-skeptic" "$body" \
+                "kind: spawn-skeptic"
+assert_contains "request origin is the worker window"      "$body" \
+                "origin: sk-req-worker"
+assert_contains "body carries the issue pointer"           "$body" \
+                "issue: override-org/override-repo#77"
+assert_contains "body carries the trigger-comment pointer" "$body" \
+                "trigger-comment: 4242"
+assert_contains "body carries the report asset URL"        "$body" \
+                "report-asset-url: https://github.com/asset-org/"
+assert_contains "body carries the target window"           "$body" \
+                "target-window: sk-req-worker"
+assert_contains "body carries depth 1"                     "$body" \
+                "depth: 1"
+assert_contains "clean first pass is NOT deliberate"       "$body" \
+                "deliberate: false"
+
+echo '=== spawn-skeptic: --skeptic-contradicted → deliberate=true ==='
+reset_mocks
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="sk-contra-worker"
+run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
+    --skeptic-decision require --skeptic-rationale "shared infra" \
+    --skeptic-contradicted "overrode the skeptic's retry-loop suggestion"
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+assert_eq       "contradicted require exits 0"             "$rc" "0"
+body=$(spawn_req_body)
+assert_contains "contradiction flags deliberate=true"      "$body" \
+                "deliberate: true"
+assert_contains "reasons name the contradiction"           "$body" \
+                "worker-contradiction"
+assert_contains "the contradiction text rides the body"    "$body" \
+                "overrode the skeptic's retry-loop suggestion"
+
+echo '=== spawn-skeptic: an auto-deny resolution files NOTHING ==='
+reset_mocks
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="sk-deny-worker"
+run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
+    --skeptic-decision deny --skeptic-rationale "one-line doc typo, trivial"
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+assert_eq       "auto-deny wrap-up exits 0"                "$rc" "0"
+assert_eq       "NO spawn-skeptic request filed on deny"   "$(count_spawn_reqs)" "0"
+assert_not_contains "stdout says nothing about a spawn-skeptic request" "$stdout" \
+                    "spawn-skeptic request:"
+
+echo '=== spawn-skeptic: a retry is idempotent (no duplicate request) ==='
+reset_mocks
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="sk-retry-worker"
+run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
+    --skeptic-decision require --skeptic-rationale "shared infra"
+assert_eq       "first require wrap-up exits 0"            "$rc" "0"
+assert_eq       "one request after first wrap-up"          "$(count_spawn_reqs)" "1"
+run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
+    --skeptic-decision require --skeptic-rationale "shared infra"
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+assert_eq       "retry require wrap-up exits 0"            "$rc" "0"
+assert_contains "retry reports the request already filed"  "$stdout" \
+                "spawn-skeptic request: skipped (already filed)"
+assert_eq       "still exactly one request after retry"    "$(count_spawn_reqs)" "1"
+
+echo '=== spawn-skeptic: off-tmux wrap-up (no window) files NOTHING ==='
+reset_mocks
+run_ng stdout stderr rc wrap-up 77 "$REPORT" --repo override-org/override-repo \
+    --skeptic-decision require --skeptic-rationale "shared infra"
+assert_eq       "off-tmux require wrap-up exits 0"         "$rc" "0"
+assert_eq       "NO request filed without a source window" "$(count_spawn_reqs)" "0"
 
 # ---- summary ------------------------------------------------------------
 

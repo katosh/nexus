@@ -1347,7 +1347,7 @@ _wrapup_report_summary() {
 # (the rocket step fails, the log append fails, …) the verb returns 1 and
 # the worker re-runs the WHOLE verb — there is no per-step retry. Without
 # a guard, step 2 re-POSTs the link comment every time, so the issue
-# thread accrues duplicate result comments (the symptom cailin reported).
+# thread accrues duplicate result comments (the symptom other-nexus reported).
 #
 # Step 4 already records every successful wrap-up comment in the action
 # log with its url, keyed by (issue, report-basename, repo). Scan that log
@@ -1538,7 +1538,17 @@ _wrapup_skeptic_step() {
     local issue="$1" source_window="$2" repo="$3"
     local f_role="$4" f_decision="$5" f_rationale="$6" f_waive="$7"
     local f_verdict="$8" f_target="$9" f_depth="${10}" f_findings="${11}"
-    local f_orig="${12:-}"
+    local f_orig="${12:-}" f_contradicted="${13:-}"
+
+    # Request-intent signal for cmd_wrap_up's "Step 2b" (spawn-skeptic
+    # request filing, your-org/nexus-code#545). Default cleared here so a
+    # direct call (unit suite) that resolves to a non-require path leaves
+    # nothing for a caller to file; cmd_wrap_up also resets them before the
+    # call. Only the two require paths below set _SK_SPAWN_REQ=1.
+    _SK_SPAWN_REQ=0
+    _SK_SPAWN_TARGET=""; _SK_SPAWN_DEPTH=""; _SK_SPAWN_ORIG=""
+    _SK_SPAWN_MODE=""; _SK_SPAWN_EFFECTIVE=""
+    _SK_SPAWN_DELIBERATE=0; _SK_SPAWN_REASONS=""; _SK_SPAWN_CONTRADICTED=""
 
     # Resolve provenance for the source window.
     local prov mode depth role target orig
@@ -1663,6 +1673,27 @@ _wrapup_skeptic_step() {
                 --extra "depth=$next" \
                 --extra "reason=second-pass" \
                 --extra "issue=$issue" ) 2>/dev/null || true
+            # Signal cmd_wrap_up (Step 2b) to file a spawn-skeptic request
+            # for the NEXT pass. A recursion is by definition a prior-skeptic
+            # dispute (substantive new findings), so it is flagged
+            # `deliberate=true`: the orchestrator reads the prior verdict and
+            # decides (spawn+adjudicate / decline / escalate) rather than
+            # rubber-stamping (#545 recommendation 5). Only when a real source
+            # window resolved (an off-tmux skeptic wrap-up has nothing to
+            # spawn against).
+            if [[ -n "$source_window" ]]; then
+                _SK_SPAWN_REQ=1
+                _SK_SPAWN_TARGET="$source_window"
+                _SK_SPAWN_DEPTH="$next"
+                _SK_SPAWN_ORIG="$orig_eff"
+                _SK_SPAWN_MODE="$mode"
+                _SK_SPAWN_EFFECTIVE="second-pass"
+                _SK_SPAWN_DELIBERATE=1
+                _SK_SPAWN_REASONS="second-pass-dispute"
+                _SK_SPAWN_CONTRADICTED="$f_contradicted"
+                [[ -n "$f_contradicted" ]] \
+                    && _SK_SPAWN_REASONS="second-pass-dispute,worker-contradiction"
+            fi
             printf '\nSECOND-PASS SKEPTIC RECOMMENDED — this pass found substantive new issues\n'
             printf '(verdict=%s, findings=%s) at depth %s (cap %s). The next skeptic reviews the\n' \
                 "$verdict" "$findings" "$depth" "$max_depth"
@@ -1807,6 +1838,29 @@ _wrapup_skeptic_step() {
                 --extra "mode=$mode" \
                 --extra "decision=$effective" \
                 --extra "issue=$issue" ) 2>/dev/null || true
+            # Signal cmd_wrap_up (Step 2b) to file a spawn-skeptic request
+            # so the orchestrator gets a PUSH signal (the watcher-mediated
+            # request inbox), not just the pending marker + the 600s-delayed
+            # orphaned-skeptic-pending backstop (#545). A clean first-pass
+            # require is auto-spawnable (`deliberate=false`); it is escalated
+            # to `deliberate=true` only when a prior skeptic already ran
+            # (depth>0) or the worker overrode a skeptic suggestion
+            # (--skeptic-contradicted). Only when a source window resolved.
+            if [[ -n "$source_window" ]]; then
+                _SK_SPAWN_REQ=1
+                _SK_SPAWN_TARGET="$source_window"
+                _SK_SPAWN_DEPTH="$next"
+                _SK_SPAWN_ORIG=""          # first pass: orig == target
+                _SK_SPAWN_MODE="$mode"
+                _SK_SPAWN_EFFECTIVE="$effective"
+                _SK_SPAWN_CONTRADICTED="$f_contradicted"
+                local _delib=0 _reasons=""
+                (( depth > 0 )) && { _delib=1; _reasons="prior-skeptic-depth-$depth"; }
+                [[ -n "$f_contradicted" ]] \
+                    && { _delib=1; _reasons="${_reasons:+$_reasons,}worker-contradiction"; }
+                _SK_SPAWN_DELIBERATE=$_delib
+                _SK_SPAWN_REASONS="$_reasons"
+            fi
             printf '\n=== SKEPTIC REQUIRED (skills/nexus.skeptic) ===\n'
             if [[ "$effective" == "required-escalated" ]]; then
                 printf 'Spawn mode was `deny`, but you escalated to require — recorded.\n'
@@ -1890,6 +1944,126 @@ _wrapup_skeptic_step() {
     return 0
 }
 
+# File a `kind=spawn-skeptic` request into the watcher-mediated request
+# inbox (monitor/request-channel.sh) so the orchestrator gets a PUSH
+# signal to spawn the required skeptic — instead of relying on the pending
+# marker (pull) or the 600s-delayed orphaned-skeptic-pending backstop
+# (your-org/nexus-code#545). Driven by the _SK_SPAWN_* globals that
+# `_wrapup_skeptic_step` sets on a require/second-pass resolution. Called
+# by cmd_wrap_up AFTER the report is uploaded + the link comment posted, so
+# the request can carry the asset + comment URLs and the skeptic always has
+# a complete artifact.
+#
+# The request `## Details` carries POINTERS, not inline copies (keeps the
+# emitted summary small): issue + trigger-comment (the operator's original
+# ask), report path + asset URL + comment URL (the deliverable to
+# validate), the worker's stored prompt_file (the orchestrator's spawn
+# brief + woven-in operator context), window + session-id (the live worker
+# to question), and depth/orig/mode + the deliberate flag/reasons (recursion
+# + arbitration state). The orchestrator composes the skeptic brief from
+# these, spawns, then `ng request ack <id>`.
+#
+# BEST-EFFORT: like the retain step, a filing failure is surfaced on stderr
+# but NEVER flips the wrap-up exit code — the hand-off itself already
+# succeeded, and the pending marker + orphan backstop still guarantee the
+# skeptic is not lost. Echoes a single status token to stdout for the
+# caller to fold into its summary: `filed <id>` | `skipped (<why>)` |
+# `FAILED (<why>)`.
+#
+# Args: issue report_path asset_url comment_url trigger_comment repo
+_wrapup_file_spawn_skeptic_request() {
+    local issue="$1" report_path="$2" asset_url="$3" comment_url="$4"
+    local trigger_comment="$5" repo="$6"
+    (( ${_SK_SPAWN_REQ:-0} == 1 )) || { printf 'skipped (no require)'; return 0; }
+
+    local target="$_SK_SPAWN_TARGET"
+    local depth="${_SK_SPAWN_DEPTH:-1}"
+    [[ "$depth" =~ ^[0-9]+$ ]] || depth=1
+    # Origin must be filename-safe / un-spoofable ([A-Za-z0-9_-]); the
+    # request-channel `file` verb dies otherwise. Window names are already
+    # in this charset in practice, but sanitize defensively so a stray
+    # character degrades to a filed request rather than a hard die that
+    # aborts nothing. The real (unsanitized) window rides the body as
+    # `target-window=` / `window=`.
+    local origin="${target//[^A-Za-z0-9_-]/_}"
+    [[ -n "$origin" ]] || { printf 'skipped (empty origin)'; return 0; }
+
+    local chan="$_script_dir/request-channel.sh"
+    [[ -x "$chan" ]] || { printf 'FAILED (request-channel.sh missing)'; return 1; }
+
+    # Idempotency: a wrap-up retry re-enters this path, and the pending
+    # marker already guards against a double-SPAWN, but a duplicate REQUEST
+    # is avoidable noise. Skip when a non-terminal spawn-skeptic request for
+    # this origin+depth already sits in the inbox. Targeted globs only —
+    # never a broad rm/scan.
+    local slug="skeptic-d${depth}"
+    local reqdir="$STATE_DIR/requests"
+    if [[ -d "$reqdir" ]]; then
+        local existing g
+        shopt -s nullglob
+        for g in "$reqdir"/*-"${origin}"-"${slug}".new.md \
+                 "$reqdir"/*-"${origin}"-"${slug}".claimed.md; do
+            existing="$g"; break
+        done
+        shopt -u nullglob
+        [[ -n "${existing:-}" ]] && { printf 'skipped (already filed)'; return 0; }
+    fi
+
+    # Resolve prompt_file + session-id from the window provenance record.
+    local rec="$STATE_DIR/windows/${origin}.json"
+    local prompt_file="" session_id=""
+    if [[ -f "$rec" ]] && command -v jq >/dev/null 2>&1; then
+        prompt_file=$(jq -r '.prompt_file // ""' "$rec" 2>/dev/null); [[ "$prompt_file" == null ]] && prompt_file=""
+        session_id=$(jq -r '.session_id // ""'  "$rec" 2>/dev/null); [[ "$session_id" == null ]] && session_id=""
+    fi
+
+    local orig_eff="$_SK_SPAWN_ORIG"
+    [[ -n "$orig_eff" ]] || orig_eff="$target"     # first pass: orig == target
+    local deliberate=false
+    (( ${_SK_SPAWN_DELIBERATE:-0} == 1 )) && deliberate=true
+
+    # Compose the pointer body. First non-empty line = the emit summary
+    # (request-channel streams it verbatim into `--- requests ---`), so make
+    # it a self-describing one-liner. Everything else is the pointer table.
+    local body
+    body=$(cat <<EOF
+spawn-skeptic: validate \`${target}\` (issue #${issue}, depth ${depth}, ${_SK_SPAWN_EFFECTIVE:-required}$( [[ "$deliberate" == true ]] && printf ', DELIBERATE' ))
+
+issue: ${repo}#${issue}
+trigger-comment: ${trigger_comment:--}
+report-path: ${report_path}
+report-asset-url: ${asset_url:--}
+link-comment-url: ${comment_url:--}
+worker-prompt-file: ${prompt_file:--}
+window: ${target}
+session-id: ${session_id:--}
+target-window: ${target}
+orig-window: ${orig_eff}
+depth: ${depth}
+mode: ${_SK_SPAWN_MODE:-auto}
+effective: ${_SK_SPAWN_EFFECTIVE:-required}
+recommendation: require
+deliberate: ${deliberate}
+deliberate-reasons: ${_SK_SPAWN_REASONS:--}
+worker-contradicted: ${_SK_SPAWN_CONTRADICTED:--}
+
+Orchestrator: compose a skeptic brief from these pointers (skills/nexus.skeptic),
+spawn-worker.sh --skeptic-role against \`${target}\` (orig \`${orig_eff}\`, depth ${depth}),
+then \`ng request ack <id>\`. deliberate=true → read the prior verdict / the worker's
+contradiction and decide (spawn+adjudicate | decline | escalate) before spawning.
+EOF
+)
+
+    local id
+    if id=$(printf '%s' "$body" | "$chan" file \
+                --origin "$origin" --kind spawn-skeptic \
+                --slug "$slug" --priority normal - 2>/dev/null); then
+        [[ -n "$id" ]] && { printf 'filed %s' "$id"; return 0; }
+        printf 'FAILED (no id returned)'; return 1
+    fi
+    printf 'FAILED (request-channel file errored)'; return 1
+}
+
 # `ng wrap-up <issue> <report-path> [--trigger-comment <id>]
 #                                  [--repo OWNER/REPO]
 #                                  [--trigger-repo OWNER/REPO]
@@ -1943,7 +2117,7 @@ cmd_wrap_up() {
     # Skeptic-protocol flags (skills/nexus.skeptic). All optional and
     # backward-compatible: a wrap-up with none of these falls back to
     # the worker's spawn-stamped mode (provenance record) or `auto`.
-    local sk_decision="" sk_rationale="" sk_waive=""
+    local sk_decision="" sk_rationale="" sk_waive="" sk_contradicted=""
     local sk_role=0 sk_verdict="" sk_target="" sk_depth="" sk_findings="" sk_orig=""
     while (( $# > 0 )); do
         case "$1" in
@@ -1958,6 +2132,11 @@ cmd_wrap_up() {
             --skeptic-decision)  sk_decision="${2:-}";      shift 2 ;;
             --skeptic-rationale) sk_rationale="${2:-}";     shift 2 ;;
             --skeptic-waive)     sk_waive="${2:-}";         shift 2 ;;
+            # --skeptic-contradicted "<what/why>": the worker overrode one or
+            # more of a prior skeptic's suggestions. Flags the filed
+            # spawn-skeptic request `deliberate=true` so the orchestrator
+            # arbitrates rather than rubber-stamps (your-org/nexus-code#545).
+            --skeptic-contradicted) sk_contradicted="${2:-}"; shift 2 ;;
             --skeptic-role)      sk_role=1;                 shift   ;;
             --skeptic-verdict)   sk_verdict="${2:-}";       shift 2 ;;
             --skeptic-target)    sk_target="${2:-}";        shift 2 ;;
@@ -2046,10 +2225,23 @@ cmd_wrap_up() {
     # then the hand-off proceeds normally (the report IS what the skeptic
     # reads; posting it is correct, and the retire gate still blocks the
     # window until a verdict lands).
+    #
+    # It ALSO signals — via the _SK_SPAWN_* globals — whether a
+    # `kind=spawn-skeptic` request should be FILED into the watcher-mediated
+    # request inbox so the orchestrator gets a push signal to spawn the
+    # skeptic (your-org/nexus-code#545). The request is filed LATER, after
+    # Step 2 posts the link comment, so it can carry the asset + comment
+    # URLs — see the "Step 2b" block below. Reset the globals first so a
+    # non-require path (deny/waive/role-terminal) leaves nothing to file.
+    _SK_SPAWN_REQ=0
+    _SK_SPAWN_TARGET=""; _SK_SPAWN_DEPTH=""; _SK_SPAWN_ORIG=""
+    _SK_SPAWN_MODE=""; _SK_SPAWN_EFFECTIVE=""
+    _SK_SPAWN_DELIBERATE=0; _SK_SPAWN_REASONS=""; _SK_SPAWN_CONTRADICTED=""
     _wrapup_skeptic_step \
         "$issue" "$source_window" "$target" \
         "$sk_role" "$sk_decision" "$sk_rationale" "$sk_waive" \
         "$sk_verdict" "$sk_target" "$sk_depth" "$sk_findings" "$sk_orig" \
+        "$sk_contradicted" \
         || return $?
 
     # Step 1: upload the report. Stdout = URL; stderr = progress + errors.
@@ -2140,6 +2332,23 @@ cmd_wrap_up() {
             failure_detail+="  comment: POST /repos/$target/issues/$issue/comments failed: $(tr '\n' ' ' < "$err_buf")"$'\n'
             comment_url=""
         fi
+    fi
+
+    # Step 2b (skeptic protocol, your-org/nexus-code#545): file the
+    # `kind=spawn-skeptic` request into the watcher-mediated request inbox
+    # so the orchestrator gets a PUSH signal to spawn the required skeptic.
+    # Runs here — AFTER upload + comment — so the request carries the asset
+    # + comment URLs (the skeptic always has a complete artifact). Driven by
+    # the _SK_SPAWN_* globals set in Step 0b; a no-op unless the skeptic
+    # step resolved to a require/second-pass path with a real source window.
+    # Best-effort: the status is surfaced but never flips the wrap-up exit
+    # (the pending marker + orphan backstop still guarantee the skeptic is
+    # not lost).
+    local skreq_status=""
+    if (( ${_SK_SPAWN_REQ:-0} == 1 )); then
+        skreq_status=$(_wrapup_file_spawn_skeptic_request \
+            "$issue" "$report_path" "$asset_url" "$comment_url" \
+            "$trigger_comment" "$target") || true
     fi
 
     # Step 3: rocket the trigger comment, if one was supplied. Posts to
@@ -2253,6 +2462,19 @@ cmd_wrap_up() {
             "$source_window" "${retain_reason:-wrap-up-$(date -u +%Y-%m-%d)}"
     elif [[ "$retain_st" == failed ]]; then
         printf 'retained window: FAILED\n'
+    fi
+    # Spawn-skeptic request (Step 2b). Best-effort — a FAILED here does NOT
+    # flip the exit (the pending marker + orphan backstop still cover it),
+    # but it IS surfaced on stderr so the orchestrator can file it by hand.
+    if [[ -n "$skreq_status" ]]; then
+        case "$skreq_status" in
+            filed*)   printf 'spawn-skeptic request: %s\n' "$skreq_status" ;;
+            skipped*) printf 'spawn-skeptic request: %s\n' "$skreq_status" ;;
+            *)        printf 'spawn-skeptic request: %s\n' "$skreq_status"
+                      printf 'ng wrap-up: spawn-skeptic request not filed (%s) — the pending marker\n' "$skreq_status" >&2
+                      printf '  and orphaned-skeptic-pending backstop still cover the skeptic; you may\n' >&2
+                      printf '  file it by hand: ng request file --origin %s --kind spawn-skeptic ...\n' "$source_window" >&2 ;;
+        esac
     fi
 
     # Aggregate: failures (not skips) on the hand-off steps flip exit.

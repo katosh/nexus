@@ -559,7 +559,7 @@ SEARCH_FIXTURE='{
           "__typename": "Issue",
           "number": 91,
           "databaseId": 8901,
-          "author": {"login": "huangy57-nexus-bot[bot]"},
+          "author": {"login": "other-nexus-bot[bot]"},
           "body": "@operator sibling bot opened this",
           "repository": {"nameWithOwner": "external/repo-foo"},
           "reactions": {"nodes": []},
@@ -567,7 +567,7 @@ SEARCH_FIXTURE='{
             "nodes": [
               {
                 "databaseId": 9901,
-                "author": {"login": "huangy57-nexus-bot[bot]"},
+                "author": {"login": "other-nexus-bot[bot]"},
                 "body": "@operator sibling bot comment",
                 "reactions": {"nodes": []}
               },
@@ -592,8 +592,8 @@ SEARCH_FIXTURE='{
 }'
 rm -f "$STATE_DIR/last-mention-cursor.txt" "$STATE_DIR/processed-comments.txt"
 out=$(snapshot_mentions 2>/dev/null | _filter_to_user_author)
-assert_not_contains "huangy57 bot issue-body mention dropped" "$out" "n=91 id=8901"
-assert_not_contains "huangy57 bot comment dropped"            "$out" "id=9901"
+assert_not_contains "otheruser bot issue-body mention dropped" "$out" "n=91 id=8901"
+assert_not_contains "otheruser bot comment dropped"            "$out" "id=9901"
 assert_not_contains "your-org bot comment dropped"            "$out" "id=9902"
 assert_contains    "operator self-mention surfaces"             "$out" "id=9903 author=operator"
 # Body previews of dropped headers must drop with them.

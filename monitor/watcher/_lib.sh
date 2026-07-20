@@ -182,7 +182,7 @@ _nexus_sandbox_gate() {
 # in a different pid namespace or on a different host. Thin namespace-
 # agnostic wrapper around _nexus_instance_lock_live, used by
 # _watcher_alive to avoid false-reporting a cross-namespace peer watcher
-# as dead (your-org/nexus-code#350 — Connor's split-topology failure).
+# as dead (your-org/nexus-code#350 — otheruser's split-topology failure).
 _nexus_watcher_lock_held() {
     local state_dir="${1:?state_dir required}"
     _nexus_instance_lock_live "$state_dir/nexus-instance.lock" >/dev/null 2>&1

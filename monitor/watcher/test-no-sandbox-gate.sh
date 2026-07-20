@@ -12,7 +12,7 @@
 #   - in-sandbox short-circuit ignores a stray flag (no marker)
 #
 # Part 2 — `_watcher_alive` no longer false-reports a live cross-pid-ns
-# watcher as DEAD (Connor's split-topology failure):
+# watcher as DEAD (otheruser's split-topology failure):
 #   - heartbeat fresh + pid-identity FAILS + instance flock FREE  → DEAD
 #       (preserves the recycled-pid stale-heartbeat protection)
 #   - heartbeat fresh + pid-identity FAILS + instance flock HELD  → ALIVE

@@ -63,42 +63,42 @@ echo '=== every header shape: user-authored surfaces, bot/other drop ==='
 
 # Build a synthetic stream covering all six emit-line prefixes
 # (issue, pr, pr_review, issue_new, mention, cross_repo) × three
-# authors (huangy57-nexus-bot[bot], your-org-bot[bot], operator).
+# authors (other-nexus-bot[bot], your-org-bot[bot], operator).
 #
 # Each block is a `<header>\n  body: <preview>\n` pair. The chokepoint
 # must drop the bot blocks (header + body) and pass through the
 # operator blocks intact.
-STREAM=$'issue=1 id=101 author=huangy57-nexus-bot[bot]\n'\
+STREAM=$'issue=1 id=101 author=other-nexus-bot[bot]\n'\
 $'  body: sibling bot issue comment\n'\
 $'issue=1 id=102 author=your-org-bot[bot]\n'\
 $'  body: self bot issue comment\n'\
 $'issue=1 id=103 author=operator\n'\
 $'  body: operator issue comment\n'\
-$'pr=2 id=201 author=huangy57-nexus-bot[bot]\n'\
+$'pr=2 id=201 author=other-nexus-bot[bot]\n'\
 $'  body: sibling bot pr comment\n'\
 $'pr=2 id=202 author=your-org-bot[bot]\n'\
 $'  body: self bot pr comment\n'\
 $'pr=2 id=203 author=operator\n'\
 $'  body: operator pr comment\n'\
-$'pr_review=3 id=301 author=huangy57-nexus-bot[bot] path=src/a.py\n'\
+$'pr_review=3 id=301 author=other-nexus-bot[bot] path=src/a.py\n'\
 $'  body: sibling bot review comment\n'\
 $'pr_review=3 id=302 author=your-org-bot[bot] path=src/a.py\n'\
 $'  body: self bot review comment\n'\
 $'pr_review=3 id=303 author=operator path=src/a.py\n'\
 $'  body: operator review comment\n'\
-$'issue_new=4 id=4 author=huangy57-nexus-bot[bot]\n'\
+$'issue_new=4 id=4 author=other-nexus-bot[bot]\n'\
 $'  body: sibling bot opened issue\n'\
 $'issue_new=5 id=5 author=your-org-bot[bot]\n'\
 $'  body: self bot opened issue\n'\
 $'issue_new=6 id=6 author=operator\n'\
 $'  body: operator opened issue\n'\
-$'mention=external/repo kind=issue n=7 id=701 author=huangy57-nexus-bot[bot]\n'\
+$'mention=external/repo kind=issue n=7 id=701 author=other-nexus-bot[bot]\n'\
 $'  body: sibling bot cross-repo mention\n'\
 $'mention=external/repo kind=issue n=7 id=702 author=your-org-bot[bot]\n'\
 $'  body: self bot cross-repo mention\n'\
 $'mention=external/repo kind=issue n=7 id=703 author=operator\n'\
 $'  body: operator cross-repo mention\n'\
-$'cross_repo=ext/repo kind=pr n=8 id=801 author=huangy57-nexus-bot[bot]\n'\
+$'cross_repo=ext/repo kind=pr n=8 id=801 author=other-nexus-bot[bot]\n'\
 $'  body: sibling bot mention search hit\n'\
 $'cross_repo=ext/repo kind=pr n=8 id=802 author=your-org-bot[bot]\n'\
 $'  body: self bot mention search hit\n'\
@@ -176,7 +176,7 @@ assert_contains    "exact match surfaces"        "$out" "id=3 author=operator"
 # ---- body line containing `author=` text is gated by header ----
 
 echo '=== body line with `author=` substring inherits header gate ==='
-out=$(printf 'issue=1 id=1 author=operator\n  body: user note saying author=anyone here\nissue=1 id=2 author=huangy57-nexus-bot[bot]\n  body: bot note saying author=operator here\n' \
+out=$(printf 'issue=1 id=1 author=operator\n  body: user note saying author=anyone here\nissue=1 id=2 author=other-nexus-bot[bot]\n  body: bot note saying author=operator here\n' \
     | _filter_to_user_author)
 assert_contains    "operator header survives, body inlined" "$out" "id=1 author=operator"
 assert_contains    "operator body inlined as a whole"       "$out" "user note saying author=anyone here"

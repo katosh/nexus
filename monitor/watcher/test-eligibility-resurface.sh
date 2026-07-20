@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Regression tests for the eligibility-filter resurface bug surfaced by
-# other-nexus#9 / comment 4558979011 (2026-05-27):
+# other-nexus-nexus#9 / comment 4558979011 (2026-05-27):
 #
 #   Symptom — every poll cycle, watcher re-emits comments that already
 #   carry bot eyes + bot rocket reactions, even though the eligibility
@@ -61,7 +61,7 @@ trap 'rm -rf "$WORK"' EXIT
 STATE_DIR="$WORK/state"
 mkdir -p "$STATE_DIR"
 REPO="your-org/other-nexus"
-USER_LOGIN="tjbencomo"
+USER_LOGIN="otheruser"
 BOT_LOGIN="other-nexus-bot"
 
 MINT_STUB="$WORK/mint-token.sh"
@@ -135,7 +135,7 @@ ISSUE_FIXTURE='{
             "nodes": [
               {
                 "databaseId": 4558868003,
-                "author": {"login": "tjbencomo"},
+                "author": {"login": "otheruser"},
                 "body": "cron request from user",
                 "reactions": {"nodes": [
                   {"content": "EYES",   "user": {"login": "other-nexus-bot"}},
@@ -170,7 +170,7 @@ ISSUE_FIXTURE='{
             "nodes": [
               {
                 "databaseId": 4558999001,
-                "author": {"login": "tjbencomo"},
+                "author": {"login": "otheruser"},
                 "body": "user comment, bot eyes with null user",
                 "reactions": {"nodes": [
                   {"content": "EYES", "user": null}
@@ -200,7 +200,7 @@ ISSUE_FIXTURE='{
             "nodes": [
               {
                 "databaseId": 4558999002,
-                "author": {"login": "tjbencomo"},
+                "author": {"login": "otheruser"},
                 "body": "user comment, bot eyed explicitly",
                 "reactions": {"nodes": [
                   {"content": "EYES", "user": {"login": "other-nexus-bot"}}
@@ -232,10 +232,10 @@ ISSUE_FIXTURE='{
             "nodes": [
               {
                 "databaseId": 4558999003,
-                "author": {"login": "tjbencomo"},
+                "author": {"login": "otheruser"},
                 "body": "user comment, user self-eyed",
                 "reactions": {"nodes": [
-                  {"content": "EYES", "user": {"login": "tjbencomo"}}
+                  {"content": "EYES", "user": {"login": "otheruser"}}
                 ]}
               }
             ]
@@ -263,7 +263,7 @@ ISSUE_FIXTURE='{
             "nodes": [
               {
                 "databaseId": 4558999004,
-                "author": {"login": "tjbencomo"},
+                "author": {"login": "otheruser"},
                 "body": "comment with bot rocket and no eyes",
                 "reactions": {"nodes": [
                   {"content": "ROCKET", "user": {"login": "other-nexus-bot"}}
@@ -299,7 +299,7 @@ ISSUE_FIXTURE='{
             "nodes": [
               {
                 "databaseId": 4558999005,
-                "author": {"login": "tjbencomo"},
+                "author": {"login": "otheruser"},
                 "body": "bot eyed + rocket, no dedup file present",
                 "reactions": {"nodes": [
                   {"content": "EYES",   "user": {"login": "other-nexus-bot"}},
@@ -329,7 +329,7 @@ PR_FIXTURE='{
             "nodes": [
               {
                 "databaseId": 4559000001,
-                "author": {"login": "tjbencomo"},
+                "author": {"login": "otheruser"},
                 "body": "pr comment with null-user EYES",
                 "reactions": {"nodes": [
                   {"content": "EYES", "user": null}
@@ -355,7 +355,7 @@ NEW_ISSUES_FIXTURE='{
       "nodes": [
         {
           "number": 21,
-          "author": {"login": "tjbencomo"},
+          "author": {"login": "otheruser"},
           "body": "user issue, bot eyed with null user",
           "reactions": {"nodes": [
             {"content": "EYES", "user": null}

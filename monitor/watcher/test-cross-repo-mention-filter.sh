@@ -146,9 +146,9 @@ assert_contains    "watcher_alert still passes (off)"    "$out" "watcher_alert=r
 
 echo '=== mention_only: @bot match is case-insensitive ==='
 CROSS_REPO_SURFACE=mention_only
-out=$(printf 'mention=ext/r kind=issue n=1 id=9100 author=operator\n  body: hey @Your-Org-Bot please review\n' \
+out=$(printf 'mention=ext/r kind=issue n=1 id=9100 author=operator\n  body: hey @your-org-bot please review\n' \
     | _filter_cross_repo_surface)
-assert_contains "@YourOrgBotMixedCase matches" "$out" "id=9100"
+assert_contains "@your-orgBotMixedCase matches" "$out" "id=9100"
 
 out=$(printf 'mention=ext/r kind=issue n=1 id=9101 author=operator\n  body: HEY @YOUR-ORG-BOT FYI\n' \
     | _filter_cross_repo_surface)
@@ -263,7 +263,7 @@ assert_eq "empty in -> empty out" "$out" ""
 
 echo '=== composed: _filter_to_user_author | _filter_cross_repo_surface ==='
 CROSS_REPO_SURFACE=mention_only
-out=$(printf 'mention=ext/r kind=issue n=1 id=9400 author=huangy57-nexus-bot[bot]\n  body: ping @your-org-bot from sibling bot\nmention=ext/r kind=issue n=2 id=9401 author=operator\n  body: ping @your-org-bot from operator\nmention=ext/r kind=issue n=3 id=9402 author=operator\n  body: chat with other operator, no bot mention\n' \
+out=$(printf 'mention=ext/r kind=issue n=1 id=9400 author=other-nexus-bot[bot]\n  body: ping @your-org-bot from sibling bot\nmention=ext/r kind=issue n=2 id=9401 author=operator\n  body: ping @your-org-bot from operator\nmention=ext/r kind=issue n=3 id=9402 author=operator\n  body: chat with other operator, no bot mention\n' \
     | _filter_to_user_author | _filter_cross_repo_surface)
 assert_not_contains "sibling bot drops at author chokepoint" "$out" "id=9400"
 assert_contains    "operator + @bot mention surfaces"        "$out" "id=9401"

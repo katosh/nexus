@@ -75,6 +75,21 @@ stamp_user_prompt() {
     local window="$1" epoch="$2"
     printf '%s\ttest-session\n' "$epoch" > "$STATE_DIR/user-prompt/$window"
 }
+# Stamp a raw UserPromptSubmit with an EXPLICIT session-id — lets a
+# test control whether the submit carries the window's own spawn
+# session-id (self-activity) or a different one (operator).
+stamp_user_prompt_sid() {
+    local window="$1" epoch="$2" sid="$3"
+    printf '%s\t%s\n' "$epoch" "$sid" > "$STATE_DIR/user-prompt/$window"
+}
+# Write the provenance record spawn-worker.sh drops at birth
+# (windows/<window>.json), carrying the window's own --session-id.
+seed_provenance() {
+    local window="$1" sid="$2"
+    mkdir -p "$STATE_DIR/windows"
+    printf '{"window":"%s","session_id":"%s","kind":"task","spawned_by":"orchestrator"}\n' \
+        "$window" "$sid" > "$STATE_DIR/windows/${window//[^a-zA-Z0-9_-]/_}.json"
+}
 # Stamp a machine input (what paste-followup.sh writes BEFORE pasting).
 stamp_machine_input() {
     local window="$1" epoch="$2" src="${3:-paste-followup}"
@@ -256,6 +271,57 @@ run_preflight OUT RC opdrive-win --pane-state idle
 assert_eq      "exit 1 (no-go)"     "$RC"  "1"
 assert_contains "safe=0"            "$OUT" "safe=0"
 assert_contains "reason cites fresh submit" "$OUT" "fresh operator submit"
+
+# ── 12. GO: self-activity submit — session-id == own spawn session-id ─────
+#     The coembed-283-followup false positive (2026-07-17). A fresh
+#     user-prompt with NO covering machine input used to read as a fresh
+#     operator submit → safe=0, pinning a wrapped window open. But when
+#     the submit carries the window's OWN spawn session-id it is provably
+#     the worker's pane self-activity (autosuggest / post-wrap typing /
+#     its own tool loop), never the operator (who drives a DIFFERENT
+#     session and never types into a worker pane) → must GO.
+echo "## 12. self-activity submit (session-id == own) → GO"
+reset_state
+seed_provenance         self-win "sess-self-abc"
+stamp_user_prompt_sid   self-win "$(( NOW - 9 ))" "sess-self-abc"
+run_preflight OUT RC    self-win --pane-state idle
+assert_eq      "self submit -> exit 0 (go)" "$RC"  "0"
+assert_contains "self submit -> safe=1"     "$OUT" "safe=1"
+
+# ── 13. NO-GO: submit with a DIFFERENT session-id → conservative block ────
+#     A stamp whose session-id differs from the window's own spawn
+#     session-id (e.g. the worker's session was replaced by a resume /
+#     compaction, so its CURRENT session-id no longer matches provenance)
+#     is NOT provably self-activity → the pre-existing attribution stands
+#     and, newer than machine input and inside the freshness window, it
+#     blocks. This is the retire-SAFETY floor the self fix must not lower:
+#     the self branch only ever ADDS a GO for the provably-own-session
+#     case; everything else keeps blocking. (NB: a human raw-typing into
+#     the pane in steady state carries the SAME own session-id, not a
+#     different one — that path is out of scope by the never-raw-type
+#     invariant + check-1 pane-state, per the script header.)
+echo "## 13. submit with a different session-id → NO-GO (conservative)"
+reset_state
+seed_provenance         op-win "sess-own-xyz"
+stamp_user_prompt_sid   op-win "$(( NOW - 9 ))" "sess-operator-different"
+run_preflight OUT RC    op-win --pane-state idle
+assert_eq      "operator submit -> exit 1 (no-go)" "$RC"  "1"
+assert_contains "operator submit -> safe=0"        "$OUT" "safe=0"
+assert_contains "reason cites fresh submit"        "$OUT" "fresh operator submit"
+
+# ── 14. self-activity does NOT override a genuine machine paste path ───────
+#     Belt-and-suspenders: an orchestrator paste (machine-input stamp
+#     present) with the window's own session-id is already covered by the
+#     machine-input rule (test 4). Confirm the two guards compose — a self
+#     session-id submit that is ALSO machine-covered still GOes.
+echo "## 14. self session-id + covering machine paste → GO"
+reset_state
+seed_provenance         both-win "sess-both-111"
+stamp_user_prompt_sid   both-win "$(( NOW - 9 ))"  "sess-both-111"
+stamp_machine_input     both-win "$(( NOW - 10 ))" paste-followup
+run_preflight OUT RC    both-win --pane-state idle
+assert_eq      "self+machine -> exit 0 (go)" "$RC"  "0"
+assert_contains "self+machine -> safe=1"     "$OUT" "safe=1"
 
 # ---- summary -------------------------------------------------------------
 echo

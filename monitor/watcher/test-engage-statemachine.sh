@@ -138,6 +138,21 @@ stamp_user_prompt() {
     mkdir -p "$STATE_DIR/user-prompt"
     printf '%s\t%s\n' "$epoch" "test-session" > "$STATE_DIR/user-prompt/$window"
 }
+# UserPromptSubmit stamp with an EXPLICIT session-id (self-activity vs
+# operator discrimination).
+stamp_user_prompt_sid() {
+    local window="$1" epoch="$2" sid="$3"
+    mkdir -p "$STATE_DIR/user-prompt"
+    printf '%s\t%s\n' "$epoch" "$sid" > "$STATE_DIR/user-prompt/$window"
+}
+# Provenance record spawn-worker.sh writes at birth, carrying the
+# window's own --session-id.
+seed_provenance() {
+    local window="$1" sid="$2"
+    mkdir -p "$STATE_DIR/windows"
+    printf '{"window":"%s","session_id":"%s","kind":"task","spawned_by":"orchestrator"}\n' \
+        "$window" "$sid" > "$STATE_DIR/windows/${window//[^a-zA-Z0-9_-]/_}.json"
+}
 stamp_pane_change() {
     local window="$1" epoch="${2:-$(date +%s)}" hash="${3:-h$RANDOM}"
     mkdir -p "$STATE_DIR/pane-change"
@@ -264,6 +279,45 @@ assert_contains "seed records the post-wrap source" \
 assert_not_contains "no wrapped row while interactive"  "$out" $'chatback\twrapped'
 assert_not_contains "no retained row while interactive" "$out" $'chatback\tretained'
 unset MOCK_PANE_STATE_chatback
+
+# ---- (2b) post-wrap SELF-activity (own session-id) → NOT operator ---------
+# The coembed-283-followup false positive (2026-07-17). A UserPromptSubmit
+# with NO covering machine stamp used to fall straight into the OPERATOR
+# branch. But when it carries the window's OWN spawn session-id it is the
+# worker's pane self-activity (autosuggest / post-wrap typing / its own
+# tool loop), never the operator (who drives a DIFFERENT session) — it must
+# NOT seed an operator-engaged mark, else a wrapped window is pinned open.
+echo '=== post-wrap self-activity (own session-id) does NOT mark operator-engaged ==='
+rm -f "$STATE_DIR/operator-engaged.tsv" "$STATE_DIR/machine-input.tsv"
+rm -rf "$STATE_DIR/user-prompt" "$STATE_DIR/pane-change" \
+       "$STATE_DIR/machine-submit" "$STATE_DIR/windows"
+: > "$LOG"
+seed_provenance       selfwin "sess-selfwin-uuid"
+stamp_user_prompt_sid selfwin "$(( NOW - 60 ))" "sess-selfwin-uuid"
+stamp_pane_change     selfwin "$(( NOW - 30 ))"
+run_probe_capture out rc "_openg_observe selfwin idle '' $NOW \$(_openg_grace_seconds)"
+assert_eq "self-activity → operator-engaged row is unmarked (since=0)" \
+    "$(awk -F'\t' '$1=="selfwin" {print $2}' "$STATE_DIR/operator-engaged.tsv" 2>/dev/null)" \
+    "0"
+
+# Retire-SAFETY floor: a submit with a DIFFERENT session-id (not provably
+# self — e.g. the worker's session was replaced by resume/compaction) MUST
+# still seed the mark. The self fix narrows ONLY the provably-own-session
+# case; it never lowers the block for anything else. (A human raw-typing in
+# steady state carries the SAME own session-id, not a different one — out of
+# scope by the never-raw-type invariant + check-1 pane-state.)
+echo '=== post-wrap submit with a different session-id STILL marks ==='
+rm -f "$STATE_DIR/operator-engaged.tsv"
+rm -rf "$STATE_DIR/user-prompt"
+stamp_user_prompt_sid selfwin "$(( NOW - 60 ))" "sess-OPERATOR-different"
+stamp_pane_change     selfwin "$(( NOW - 30 ))"
+run_probe_capture out rc "_openg_observe selfwin idle '' $NOW \$(_openg_grace_seconds)"
+assert_contains "different session-id → operator-engaged mark seeded (since>0)" \
+    "$(awk -F'\t' '$1=="selfwin" && $2 != 0 { print "marked" }' "$STATE_DIR/operator-engaged.tsv" 2>/dev/null)" \
+    "marked"
+rm -f "$STATE_DIR/operator-engaged.tsv" "$STATE_DIR/machine-input.tsv"
+rm -rf "$STATE_DIR/user-prompt" "$STATE_DIR/pane-change" \
+       "$STATE_DIR/machine-submit" "$STATE_DIR/windows"
 
 # ---- control: machine-only wrap-up keeps today's behavior -----------------
 

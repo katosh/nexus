@@ -249,7 +249,7 @@ JSON
 #
 # Drops any delivery whose author isn't $USER_LOGIN via the chokepoint.
 # Same fixture-author trio used across every path's test
-# (huangy57-nexus-bot[bot], your-org-bot[bot], operator) so any
+# (other-nexus-bot[bot], your-org-bot[bot], operator) so any
 # regression in the universal-filter rule fails identically everywhere.
 
 echo '=== universal user-author filter: bot-authored deliveries drop, user surfaces ==='
@@ -275,7 +275,7 @@ mk_detail 7001 issue_comment created '{
   "action": "created",
   "repository": {"full_name": "your-org/your-nexus"},
   "issue": {"number": 100, "pull_request": null},
-  "comment": {"id": 97001, "user": {"login": "huangy57-nexus-bot[bot]"}, "body": "sibling bot comment"}
+  "comment": {"id": 97001, "user": {"login": "other-nexus-bot[bot]"}, "body": "sibling bot comment"}
 }'
 mk_detail 7002 issue_comment created '{
   "action": "created",
@@ -294,7 +294,7 @@ mk_detail 7003 issue_comment created '{
 mk_detail 7010 issues opened '{
   "action": "opened",
   "repository": {"full_name": "your-org/your-nexus"},
-  "issue": {"number": 200, "user": {"login": "huangy57-nexus-bot[bot]"}, "body": "sibling bot opened issue"}
+  "issue": {"number": 200, "user": {"login": "other-nexus-bot[bot]"}, "body": "sibling bot opened issue"}
 }'
 mk_detail 7011 issues opened '{
   "action": "opened",
@@ -312,7 +312,7 @@ mk_detail 7020 pull_request_review_comment created '{
   "action": "created",
   "repository": {"full_name": "your-org/your-nexus"},
   "pull_request": {"number": 300},
-  "comment": {"id": 97020, "path": "monitor/watcher/_github.sh", "user": {"login": "huangy57-nexus-bot[bot]"}, "body": "review by sibling bot"}
+  "comment": {"id": 97020, "path": "monitor/watcher/_github.sh", "user": {"login": "other-nexus-bot[bot]"}, "body": "review by sibling bot"}
 }'
 mk_detail 7021 pull_request_review_comment created '{
   "action": "created",
@@ -331,7 +331,7 @@ mk_detail 7022 pull_request_review_comment created '{
 mk_detail 7030 pull_request opened '{
   "action": "opened",
   "repository": {"full_name": "your-org/your-nexus"},
-  "pull_request": {"number": 400, "id": 990030, "user": {"login": "huangy57-nexus-bot[bot]"}, "body": "sibling bot PR"}
+  "pull_request": {"number": 400, "id": 990030, "user": {"login": "other-nexus-bot[bot]"}, "body": "sibling bot PR"}
 }'
 mk_detail 7031 pull_request opened '{
   "action": "opened",
@@ -348,19 +348,19 @@ rm -f "$STATE_DIR/last-delivery-cursor.txt" "$STATE_DIR/processed-comments.txt"
 out=$(snapshot_deliveries 2>/dev/null | _filter_to_user_author)
 
 # Per event type: the bot-authored pair drops, operator surfaces.
-assert_not_contains "huangy57 bot issue_comment dropped" "$out" "id=97001"
+assert_not_contains "otheruser bot issue_comment dropped" "$out" "id=97001"
 assert_not_contains "your-org bot issue_comment dropped" "$out" "id=97002"
 assert_contains    "operator issue_comment surfaces"       "$out" "issue=100 id=97003 author=operator"
 
-assert_not_contains "huangy57 bot issues:opened dropped" "$out" "issue_new=200"
+assert_not_contains "otheruser bot issues:opened dropped" "$out" "issue_new=200"
 assert_not_contains "your-org bot issues:opened dropped" "$out" "issue_new=201"
 assert_contains    "operator issues:opened surfaces"       "$out" "issue_new=202 id=202 author=operator"
 
-assert_not_contains "huangy57 bot pr_review_comment dropped" "$out" "id=97020"
+assert_not_contains "otheruser bot pr_review_comment dropped" "$out" "id=97020"
 assert_not_contains "your-org bot pr_review_comment dropped" "$out" "id=97021"
 assert_contains    "operator pr_review_comment surfaces"       "$out" "pr_review=300 id=97022 author=operator"
 
-assert_not_contains "huangy57 bot pull_request dropped" "$out" "id=990030"
+assert_not_contains "otheruser bot pull_request dropped" "$out" "id=990030"
 assert_not_contains "your-org bot pull_request dropped" "$out" "id=990031"
 assert_contains    "operator pull_request surfaces"       "$out" "pr=402 id=990032 author=operator"
 

@@ -62,7 +62,7 @@ role.)
 
 | Mode | Meaning | Wrap-up behaviour |
 |---|---|---|
-| `require` | A skeptic **must** validate this result. | Emits **SKEPTIC REQUIRED**, sets a `skeptic-pending` marker, logs `skeptic-request`. The marker is a **hard gate**: `retire-preflight.sh` (the mandatory pre-kill check) returns no-go while it is live, so the window **cannot be retired** until a skeptic returns a verdict (which clears it) — the task is genuinely not *done* until then. A worker cannot waive it: `--skeptic-decision deny` is refused, and `--skeptic-waive` is refused from a worker context (operator-scoped). The waive is loudly audited (`skeptic-decision decision=waived`); it is a discipline-and-audit control scoped to the operator session, not a cryptographic boundary. |
+| `require` | A skeptic **must** validate this result. | Emits **SKEPTIC REQUIRED**, sets a `skeptic-pending` marker, logs `skeptic-request`, and **files a `kind=spawn-skeptic` request** into the watcher-mediated request inbox so the orchestrator gets a *push* signal to spawn the skeptic (<your-org>/nexus-code#545 — see "The push signal" below). The marker is a **hard gate**: `retire-preflight.sh` (the mandatory pre-kill check) returns no-go while it is live, so the window **cannot be retired** until a skeptic returns a verdict (which clears it) — the task is genuinely not *done* until then. A worker cannot waive it: `--skeptic-decision deny` is refused, and `--skeptic-waive` is refused from a worker context (operator-scoped). The waive is loudly audited (`skeptic-decision decision=waived`); it is a discipline-and-audit control scoped to the operator session, not a cryptographic boundary. |
 | `auto` | No specification at spawn — **the worker decides** at wrap-up. | Presents the responsible-default heuristic and requires the worker to record a decision (`--skeptic-decision require\|deny --skeptic-rationale "<why>"`). Enforced by default (`enforce_auto_decision: true`): wrap-up *fails* until a decision + rationale is recorded. |
 | `deny` | No skeptic (trivial / low-impact / disabled at spawn). | Proceeds; records "skeptic explicitly denied at spawn." A worker may still *escalate* deny→require if it discovers the work was riskier than the spawn assumed (recorded). |
 
@@ -84,6 +84,47 @@ completed hand-off for cleanup to act on. The marker is the gate for a
 validate); the undecided state is gated by the wrap-up failure itself.
 With `enforce_auto_decision` off (advisory), an undecided wrap-up records
 `auto-undecided` and proceeds — the documented escape hatch.
+
+### The push signal (`kind=spawn-skeptic` request, #545)
+
+Spawning a skeptic is orchestrator work by design — there is no auto-spawn.
+Historically the orchestrator learned to spawn only by *polling* the
+worker's pane or via the 600s-delayed `orphaned-skeptic-pending` backstop,
+so first-pass requires routinely waited minutes (or were missed overnight).
+`ng wrap-up` now closes that gap: on a `require`/`required-escalated`
+resolution (and when a skeptic recommends a second pass), it files a
+`kind=spawn-skeptic` request into the watcher-mediated request inbox
+(`monitor/request-channel.sh`), which surfaces in the next watcher emit's
+`--- requests ---` section. The request is filed **after** the report
+uploads + the link comment posts, so it carries the asset + comment URLs
+and the skeptic always has a complete artifact. Filing is **best-effort** —
+a failure never fails the wrap-up (the pending marker + orphan backstop
+still cover it). The inbox is **on by default** as of #545
+(`monitor.requests.enabled: true`; reversible via `config/nexus.yml`).
+
+The request `## Details` carries **pointers** (not inline copies): `issue`
++ `trigger-comment` (the operator's original ask), `report-path` +
+`report-asset-url` + `link-comment-url` (the deliverable), the worker's
+`worker-prompt-file` (the orchestrator's spawn brief + woven-in operator
+context), `window`/`session-id`, and `depth`/`orig`/`mode`. The
+orchestrator composes the skeptic brief from these, spawns
+`spawn-worker.sh --skeptic-role`, and the spawn **auto-acks** the request
+(join key `request.origin == --skeptic-target`), so it self-clears without
+a manual `ng request ack`.
+
+**The orchestrator's say — `deliberate`.** The request carries a
+`deliberate` flag so the orchestrator spends attention only when it matters:
+- `deliberate: false` — a clean first-pass require. Auto-spawnable
+  (rubber-stamp); the orchestrator composes the brief and spawns.
+- `deliberate: true` — flagged when a prior skeptic disputed (a second-pass
+  recommendation, `depth > 0`) **or** the worker overrode a skeptic
+  suggestion via **`--skeptic-contradicted "<what/why>"`** at wrap-up. Here
+  the orchestrator reads the prior verdict / the contradiction and decides
+  (spawn-with-adjudication, decline, or escalate) rather than
+  rubber-stamping — the consensus case where its bigger-picture view is
+  wanted. Pass `--skeptic-contradicted` whenever you (the worker) knowingly
+  did NOT follow a skeptic's recommendation, so the disagreement is
+  arbitrated rather than silently shipped.
 
 ### The responsible default (the `auto` heuristic)
 

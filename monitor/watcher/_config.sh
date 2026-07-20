@@ -629,16 +629,23 @@ MONITOR_WATCHER_SUPERVISOR_HEARTBEAT_STALE_SECONDS="${MONITOR_WATCHER_SUPERVISOR
 [[ "$MONITOR_WATCHER_SUPERVISOR_HEARTBEAT_STALE_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_WATCHER_SUPERVISOR_HEARTBEAT_STALE_SECONDS=90
 
 # ── Request inbox (agent-channel RFC Part B/D; monitor/watcher/_requests.sh) ──
-# Master switch for the watcher-mediated request inbox. Default OFF (Phase
-# B1 ships inert; flip on after a soak, RFC §5). When false the
-# requests_poll task is a no-op (no claim, no emit), so a fresh clone is
-# inert. Env: MONITOR_REQUESTS_ENABLED. NOTE: this flag is not the ONLY
-# enable — _requests_enabled ALSO turns the inbox on when the confined
-# remote channel (`nexus-remote-ssh`) is registered, because a remote
-# client's only path to the orchestrator IS a filed request (see
+# Master switch for the watcher-mediated request inbox. Default ON as of
+# your-org/nexus-code#545: `ng wrap-up` files a `kind=spawn-skeptic`
+# request into this inbox when a worker's skeptic pass is required, and
+# that request is INERT unless the inbox emit surface is enabled — an
+# off-by-default inbox silently swallowed the one reliable push signal the
+# orchestrator has for spawning a required skeptic (the soak the original
+# Phase-B1 default was waiting for is complete; the emit is capped,
+# cooldown'd, and origin-fair, so turning it on is low-risk). Set
+# `monitor.requests.enabled: false` in config/nexus.yml to opt back out
+# (fully reversible). When false the requests_poll task is a no-op (no
+# claim, no emit). Env: MONITOR_REQUESTS_ENABLED. NOTE: this flag is not
+# the ONLY enable — _requests_enabled ALSO turns the inbox on when the
+# confined remote channel (`nexus-remote-ssh`) is registered, because a
+# remote client's only path to the orchestrator IS a filed request (see
 # _requests.sh). So enabling the remote channel drains the inbox without
-# needing this flag; local-only use still requires it.
-MONITOR_REQUESTS_ENABLED="${MONITOR_REQUESTS_ENABLED:-$("$_cfg" monitor.requests.enabled false)}"
+# needing this flag.
+MONITOR_REQUESTS_ENABLED="${MONITOR_REQUESTS_ENABLED:-$("$_cfg" monitor.requests.enabled true)}"
 # Re-emit cooldown (seconds) for a claimed-but-unacked request — mirrors
 # the pending-decisions cooldown. A claimed request re-surfaces every
 # cooldown until the orchestrator acks/replies (renames it off .claimed).

@@ -47,8 +47,19 @@
 #      submit counts even before the watcher poll has attributed it.
 #      A submit is the OPERATOR'S (→ no-go) when its epoch is newer
 #      than any known machine input (paste-followup / machine-input.tsv
-#      / spawn) by more than the attribution slack, AND it landed within
-#      the freshness window. This is the exact gap the incident exposed.
+#      / spawn) by more than the attribution slack, it landed within
+#      the freshness window, AND its stamped session-id is NOT the
+#      window's own spawn session-id. This is the exact gap the incident
+#      exposed. The session-id qualifier closes a second false positive
+#      (coembed-283-followup, 2026-07-17): a submit carrying the
+#      window's OWN session-id is the worker's pane self-activity
+#      (autosuggest / post-wrap typing / its own tool loop), never the
+#      operator — who drives a DIFFERENT session and never raw-types into
+#      a spawned worker's pane — so it must not pin a wrapped window open.
+#      SCOPE: a human raw-typing into the pane would stamp the same own
+#      session-id (the hook can't tell them apart); that path is out of
+#      scope by the never-raw-type invariant, backstopped by check-1
+#      (`user-typing`/`busy` veto, which runs first). See check 2's body.
 #   1b. A LIVE required-skeptic marker
 #      (`$STATE_DIR/skeptic/pending/<window>`, skills/nexus.skeptic). When
 #      a wrap-up requires an independent skeptic pass, it writes this
@@ -330,10 +341,59 @@ if (( up_epoch > 0 )); then
         [[ "$slack" =~ ^[0-9]+$ ]] || slack=120
     fi
 
+    # Self-attribution guard (coembed-283-followup false positive,
+    # 2026-07-17). Even with NO covering machine-input stamp, a submit
+    # stamped with the window's OWN spawn session-id is machine/self
+    # input (autosuggest / post-wrap typing / the worker's own tool
+    # loop) UNDER THE OPERATOR'S STATED INVARIANT: the operator drives a
+    # DIFFERENT Claude Code session and never raw-types into a spawned
+    # worker's pane (they relay via paste-followup, which machine-stamps).
+    # Such a submit must NOT read as operator re-engagement, else a
+    # wrapped, self-active-only window is pinned open (the recurring
+    # engaged-done + force-kill workaround).
+    #
+    # SCOPE / known limitation. The UserPromptSubmit hook fires INSIDE
+    # the worker's own --session-id-pinned process, so a human raw-typing
+    # a directive directly into the worker pane would ALSO stamp the
+    # window's own session-id — indistinguishable here from self-activity
+    # (the hook records no promptSource today). That raw-type path is out
+    # of scope by the invariant above; its backstop is check-1, which
+    # runs FIRST and vetoes on `user-typing` (live human) or `busy` /
+    # `working-*` (the worker still processing the human's submit). The
+    # residual exposure is the narrow window "human raw-types → worker
+    # FULLY idles → preflight runs in the gap → no machine cover"; a
+    # future hardening (record promptSource, treat `typed` as human) can
+    # close it if the never-raw-type invariant ever weakens. A DIFFERENT
+    # session-id keeps the pre-existing attribution — this is the
+    # CONSERVATIVE fallback (e.g. the worker's session was replaced by a
+    # resume/compaction), NOT the steady-state operator, who under the
+    # invariant carries the same session-id.
+    # Prefer the probe lib's shared predicate (identical to the watcher's
+    # own attribution); self-contained session-id comparison when it is
+    # unavailable.
+    up_is_self=0
+    if (( have_probe )) && declare -F _openg_prompt_is_self >/dev/null 2>&1; then
+        _openg_prompt_is_self "$win_name" 2>/dev/null && up_is_self=1
+    else
+        pf_stamp_sid=""; pf_own_sid=""
+        up_stamp="$STATE_DIR/user-prompt/$win_name"
+        [[ -f "$up_stamp" ]] && pf_stamp_sid=$(awk -F'\t' 'NR == 1 { print $2; exit }' "$up_stamp" 2>/dev/null)
+        pf_prov="$STATE_DIR/windows/${win_name//[^a-zA-Z0-9_-]/_}.json"
+        if [[ -n "$pf_stamp_sid" && -f "$pf_prov" ]]; then
+            if command -v jq >/dev/null 2>&1; then
+                pf_own_sid=$(jq -r '.session_id // empty' "$pf_prov" 2>/dev/null)
+            else
+                pf_own_sid=$(sed -n 's/.*"session_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$pf_prov" | head -1)
+            fi
+        fi
+        [[ -n "$pf_stamp_sid" && -n "$pf_own_sid" && "$pf_stamp_sid" == "$pf_own_sid" ]] && up_is_self=1
+    fi
+
     up_age=$(( now - up_epoch ))
     (( up_age < 0 )) && up_age=0
-    # Operator-attributed iff newer than machine input by > slack.
-    if (( up_epoch > machine_epoch + slack )) && (( up_age <= fresh_seconds )); then
+    # Operator-attributed iff newer than machine input by > slack AND not
+    # the window's own self-activity.
+    if (( up_epoch > machine_epoch + slack )) && (( up_age <= fresh_seconds )) && (( ! up_is_self )); then
         emit 0 "$pane_state" "fresh operator submit ${up_age}s ago not attributable to machine input (up=$up_epoch machine=$machine_epoch) — operator re-engaged since the retire decision"
         exit 1
     fi

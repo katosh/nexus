@@ -74,7 +74,7 @@
 #        stamp a generated `--session-id` since your-nexus#206);
 #     5. freshest <uuid>.jsonl under ~/.claude/projects/<workdir-slug>/
 #        where <slug> turns EVERY non-alphanumeric char into '-'
-#        ('/' AND '_' alike: group → your-lab-m).
+#        ('/' AND '_' alike: your-lab-m → your-lab-m).
 #     A target matching the UUID shape is taken as an explicit
 #     session-id override (then -n is required).
 #
@@ -661,7 +661,7 @@ _write_provenance_record() {
 _UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 
 # Claude Code's project-dir slug for a path: EVERY non-alphanumeric
-# character becomes '-' ('/' AND '_' alike — group → your-lab-m).
+# character becomes '-' ('/' AND '_' alike — your-lab-m → your-lab-m).
 # Mirrors ng's _report_session_id layer-2 rule; if Claude Code's slug
 # rule ever changes, fix both in the same commit.
 _resume_slug() { printf '%s' "$1" | sed 's|[^a-zA-Z0-9]|-|g'; }
@@ -1459,6 +1459,41 @@ if [ "$SKEPTIC_ROLE" -eq 1 ] && [ -n "$SKEPTIC_TARGET" ]; then
             --extra "orig-window=$SKEPTIC_ORIG" \
             --extra "depth=$SKEPTIC_DEPTH" \
             >/dev/null 2>&1 || true
+    fi
+    # Auto-ack the pending spawn-skeptic request (your-org/nexus-code#545).
+    # `ng wrap-up` files a `kind=spawn-skeptic` request into the request
+    # inbox to PUSH the orchestrator to spawn this skeptic; spawning it IS
+    # the acknowledgement, so close the loop here rather than relying on the
+    # orchestrator to remember `ng request ack`. The JOIN KEY is
+    # request.origin == skeptic-spawn.target-window: the request's origin is
+    # the reviewed window (ng files it with --origin <target>), which is
+    # exactly $SKEPTIC_TARGET here. Ack every non-terminal spawn-skeptic
+    # request whose `origin` frontmatter equals the sanitized target (a
+    # second-pass files a fresh request at a higher depth; a wrap-up retry
+    # may have filed a duplicate — ack them all, `ack` is idempotent). The
+    # skeptic/pending/<target> marker still independently guards double
+    # SPAWN; this just stops the request re-emitting. Best-effort — a miss
+    # degrades to the request re-emitting until the orchestrator acks by
+    # hand, never to a broken spawn.
+    _sk_req_dir="$NEXUS_ROOT/monitor/.state/requests"
+    _sk_chan="$NEXUS_ROOT/monitor/request-channel.sh"
+    if [ -d "$_sk_req_dir" ] && [ -x "$_sk_chan" ]; then
+        _sk_target_safe=$(printf '%s' "$SKEPTIC_TARGET" | tr -c 'a-zA-Z0-9_-' '_')
+        for _sk_rf in "$_sk_req_dir"/*.new.md "$_sk_req_dir"/*.claimed.md; do
+            [ -e "$_sk_rf" ] || continue
+            # Match on the frontmatter fields, not the filename, so this is
+            # robust to the request slug convention: kind must be
+            # spawn-skeptic AND origin must equal the reviewed window. The
+            # `|| _v=""` fallbacks keep a file racing away mid-read (the
+            # watcher claims/renames concurrently) from tripping errexit —
+            # this whole block is best-effort.
+            _sk_kind=$(sed -n 's/^kind:[[:space:]]*//p'   "$_sk_rf" 2>/dev/null | head -1) || _sk_kind=""
+            [ "$_sk_kind" = "spawn-skeptic" ] || continue
+            _sk_origin=$(sed -n 's/^origin:[[:space:]]*//p' "$_sk_rf" 2>/dev/null | head -1) || _sk_origin=""
+            [ "$_sk_origin" = "$_sk_target_safe" ] || continue
+            _sk_id=$(basename "$_sk_rf"); _sk_id=${_sk_id%.md}; _sk_id=${_sk_id%.*}
+            "$_sk_chan" ack "$_sk_id" >/dev/null 2>&1 || true
+        done
     fi
     if [ -x "$NEXUS_ROOT/monitor/skeptic-channel.sh" ]; then
         "$NEXUS_ROOT/monitor/skeptic-channel.sh" init "$SKEPTIC_TARGET" \

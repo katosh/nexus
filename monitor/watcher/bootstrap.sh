@@ -72,7 +72,7 @@ log() { echo "[bootstrap] $*" >&2; }
 # and may be absent in a worktree), and we'd respawn a watcher that posts
 # to a non-existent repo and can't mint a bot token — then file a
 # misleading "watcher incident" report instead of the real "setup
-# required" signal (the TracyY123 symptom in U11). `--validate` covers the
+# required" signal (the otheruser symptom in U11). `--validate` covers the
 # full required set (identity + the bot credentials mint-token needs), a
 # superset of B11's `--check-identity`. Only a definitive placeholder
 # verdict (exit 4) stops us; an inconclusive result (no config found —

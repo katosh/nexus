@@ -182,7 +182,7 @@ ng upload <path> [--repo-path <p>] [--message <m>]
 ```
 
 Most pr / issue / show verbs accept `--repo OWNER/NAME` to target a
-non-nexus repo (`<your-org>/<shared-node-tool>`, `<your-org>/kompot`, …). Unset, `ng`
+non-nexus repo (`<your-org>/shared-node-tool`, `<your-org>/kompot`, …). Unset, `ng`
 prefers the cwd's `git remote get-url origin` if it's a github.com URL
 (one-line stderr warning), else falls back to the configured nexus
 repo. The bot token is always minted from nexus config regardless. Run
@@ -535,12 +535,38 @@ Protocol (the channel is the file; the rename is the signal):
    `monitor/spawn-worker.sh --skeptic-role --skeptic-target <origin> …`
    with the fields from `## Details` — this is the formalized
    auto-skeptic request (the worker *files*, you *spawn*; no auto-spawn
-   fragility). For `kind=question`/`escalation`/…, do the work
-   (often: spawn a worker + open a tracking issue).
+   fragility). `ng wrap-up` now **files this request for real** whenever a
+   worker's skeptic pass resolves to `require`/`required-escalated` (or a
+   skeptic recommends a second pass), so this is your primary push signal —
+   not the 600s-delayed `orphaned-skeptic-pending` backstop. The `##
+   Details` carries POINTERS you compose the skeptic brief from: `issue` +
+   `trigger-comment` (the operator's original ask), `report-path` +
+   `report-asset-url` + `link-comment-url` (the deliverable), the worker's
+   `worker-prompt-file` (your spawn brief + woven-in operator context),
+   `window`/`session-id`, and `depth`/`orig`/`mode`.
+   **Weigh the `deliberate` field before spawning:**
+   - `deliberate: false` — a clean first-pass require. **Auto-spawnable
+     (rubber-stamp):** compose the brief and spawn; no judgement call.
+   - `deliberate: true` (see `deliberate-reasons` — `second-pass-dispute`
+     when a prior skeptic found substantive issues, `worker-contradiction`
+     when the worker overrode a skeptic suggestion via
+     `--skeptic-contradicted`). **You weigh in first:** read the prior
+     verdict / the contradiction, then spawn-with-adjudication, decline (the
+     findings are minor/acceptable — terminate the chain), or escalate to
+     the operator. This is the consensus case where your bigger-picture view
+     matters.
+
+   For `kind=question`/`escalation`/…, do the work (often: spawn a worker +
+   open a tracking issue).
 3. **Ack vs. reply — pick by whether a reply body is expected:**
    - **Bare ack** (the request needs only acknowledgement — e.g.
      `spawn-skeptic`, where the worker *sees* the skeptic appear):
-     `monitor/ng request ack <id>` (`.claimed → .done`; idempotent).
+     `monitor/ng request ack <id>` (`.claimed → .done`; idempotent). For
+     `spawn-skeptic` this is now **belt-and-suspenders**: `spawn-worker.sh
+     --skeptic-role` auto-acks the matching request (join key
+     `request.origin == --skeptic-target`) the moment you spawn, so the
+     request self-clears even if you forget. Ack by hand only if you
+     spawned the skeptic some other way.
    - **Reply** (the request carries `reply: required`, canonically a
      remote client that must learn *where the work went*):
      `monitor/ng request reply <id> --worker <window> --dir <abs-path>
@@ -566,9 +592,12 @@ Protocol (the channel is the file; the rename is the signal):
 
 A request whose `.claimed.md` you renamed simply no longer matches the
 watcher's glob, so it stops re-emitting on the next poll — self-clearing,
-exactly like a removed decision file. The inbox is **off by default**
-(`monitor.requests.enabled`); you only see this section once it is
-enabled. Full surface: `monitor/ng request --help`.
+exactly like a removed decision file. The inbox is **on by default** as of
+<your-org>/nexus-code#545 (`monitor.requests.enabled: true`) — an
+off-by-default inbox silently swallowed the `spawn-skeptic` push signal, so
+the default was flipped; set `monitor.requests.enabled: false` in
+`config/nexus.yml` to opt back out (fully reversible). Full surface:
+`monitor/ng request --help`.
 
 ## Embedding files (images and reports)
 
