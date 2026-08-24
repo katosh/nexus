@@ -449,26 +449,56 @@ _version_write_drift_record() {
 _version_window_exists() {
     local name="${1:?}"
     command -v tmux >/dev/null 2>&1 || return 1
-    tmux list-windows -F '#{window_name}' 2>/dev/null | grep -qxF "$name"
+    grep -qxF "$name" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"
 }
 
 # _version_window_id <name> — resolve the named window's immutable
-# tmux window ID (@N); empty + rc 1 when absent. The 2026-06-11
-# incident root cause: the cockpit-drift advisory's restart recipe
-# targeted the cockpit BY NAME, and the orchestrator — one window
-# index away from the cockpit — executed a kill that destroyed its
-# own window instead. Surfacing the ID makes the recipe typo-proof
-# (an ID never matches another window) and dangling-safe (a recipe
-# whose window was since recreated fails the kill harmlessly, and
-# the && stops the duplicate-cockpit spawn). Overridable in tests.
+# tmux window ID (@N). The 2026-06-11 incident root cause: the
+# cockpit-drift advisory's restart recipe targeted the cockpit BY
+# NAME, and the orchestrator — one window index away from the
+# cockpit — executed a kill that destroyed its own window instead.
+# Surfacing the ID makes the recipe typo-proof (an ID never matches
+# another window) and dangling-safe (a recipe whose window was since
+# recreated fails the kill harmlessly, and the && stops the
+# duplicate-cockpit spawn). Overridable in tests.
+#
+# THREE-STATE, same contract as monitor/_tmux-window.sh's resolvers
+# (your-org/nexus-code#699, extended here by `#701` item B):
+#
+#   rc 0  @id on stdout — present
+#   rc 1  tmux answered, no window by that name — genuinely absent
+#   rc 3  could NOT look: no tmux binary, `list-windows` failed, or a row
+#         came back in a shape we cannot parse
+#
+# It was two-valued — rc 1 for absent, for no tmux, and for a failed
+# `list-windows` alike — and `#699`'s manifest could not see it, because that
+# manifest discovers by NAME shape and this name matches none of the
+# conventions it knows. The manifest now also discovers on behaviour (calls
+# `list-windows` AND references window_id/window_index), which is what finds
+# this one; see test-tmux-window-resolver.sh Part D.
+#
+# The rc matters because the CONSUMER is permissive: an empty id degrades the
+# surfaced recipe from an ID-targeted `kill-window` to a NAME-targeted one —
+# the exact failure this function exists to prevent. That degradation is now
+# closed at the emit site as well (see _version_emit_section), so neither the
+# resolver's answer nor the record's contents can reintroduce a bare
+# name-targeted kill.
 _version_window_id() {
-    local name="${1:?}"
-    command -v tmux >/dev/null 2>&1 || return 1
-    local id
-    id=$(tmux list-windows -F '#{window_id}|#{window_name}' 2>/dev/null \
-         | awk -F'|' -v n="$name" '$2==n {print $1; exit}')
-    [[ -n "$id" ]] || return 1
-    printf '%s' "$id"
+    local name="${1:?}" rows rc=0 row rid rname
+    command -v tmux >/dev/null 2>&1 || return 3
+    rows=$(tmux list-windows -F '#{window_id}|#{window_name}' 2>/dev/null) || rc=$?
+    (( rc == 0 )) || return 3
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        rid="${row%%|*}"; rname="${row#*|}"
+        if [[ "$row" != *'|'* || ! "$rid" =~ ^@[0-9]+$ || -z "$rname" ]]; then
+            return 3
+        fi
+        [[ "$rname" == "$name" ]] || continue
+        printf '%s' "$rid"
+        return 0
+    done <<<"$rows"
+    return 1
 }
 
 # ---- emit surfacing -----------------------------------------------------------
@@ -503,18 +533,38 @@ _version_emit_section() {
                 printf 'The cockpit TUI in tmux window %s is orchestrator-owned; the watcher will NOT touch it.\n' \
                     "'${window:-services}'"
                 printf 'Restart it yourself to load the new code:\n'
-                # Kill by immutable window ID when known (2026-06-11
-                # incident: a name/index-targeted kill executed by the
-                # orchestrator destroyed the orchestrator's own window;
-                # an ID can never resolve to another window, and a
-                # recipe whose window was since recreated fails the
-                # kill harmlessly — the && then stops the spawn).
-                printf '  tmux kill-window -t %s && tmux new-window -dn %s %q\n' \
-                    "${window_id:-${window:-services}}" "${window:-services}" \
-                    "${nexus_root:+$nexus_root/}monitor/svc.sh"
+                # Kill by immutable window ID (2026-06-11 incident: a
+                # name/index-targeted kill executed by the orchestrator
+                # destroyed the orchestrator's own window; an ID can never
+                # resolve to another window, and a recipe whose window was
+                # since recreated fails the kill harmlessly — the && then
+                # stops the spawn).
+                #
+                # THE EMPTY-ID ARM USED TO UNDO EXACTLY THAT
+                # (your-org/nexus-code#701 item B). `${window_id:-${window:-services}}`
+                # silently fell back to targeting BY NAME whenever the id was
+                # missing — a `list-windows` that failed, no tmux, an older
+                # record written before ids were captured — so the guard
+                # degraded into the incident it was built to prevent, and did
+                # it most readily in the degraded conditions where a mis-aim
+                # is likeliest. A recipe that cannot be ID-targeted must
+                # RESOLVE the id at paste time, never fall back to the name:
+                # if the resolve comes back empty the `&&` chain stops and
+                # nothing is killed, which is the correct outcome.
                 if [[ -n "$window_id" ]]; then
+                    printf '  tmux kill-window -t %s && tmux new-window -dn %s %q\n' \
+                        "$window_id" "${window:-services}" \
+                        "${nexus_root:+$nexus_root/}monitor/svc.sh"
                     printf '(%s is the window ID of %s, resolved at detection — ID-targeted so a mis-aim cannot hit another window.)\n' \
                         "$window_id" "'${window:-services}'"
+                else
+                    printf '  wid=$(tmux list-windows -F "#{window_id}|#{window_name}" | awk -F"|" -v n=%q "\$2==n {print \$1; exit}")\n' \
+                        "${window:-services}"
+                    printf '  [ -n "$wid" ] && tmux kill-window -t "$wid" && tmux new-window -dn %s %q\n' \
+                        "${window:-services}" \
+                        "${nexus_root:+$nexus_root/}monitor/svc.sh"
+                    printf '(The window ID could not be resolved at detection, so the recipe resolves it at paste time. It is deliberately NOT name-targeted: `tmux kill-window -t %s` can resolve to a DIFFERENT window, which is the 2026-06-11 incident. If $wid comes back empty nothing is killed.)\n' \
+                        "'${window:-services}'"
                 fi
                 printf 'Ack/clear: rm %s\n' "$f"
                 ;;
@@ -532,6 +582,36 @@ _version_emit_section() {
                 printf 'Restart it to load the new code:\n'
                 printf '  %smonitor/svc.sh restart %s\n' \
                     "${nexus_root:+$nexus_root/}" "${comp#service-}"
+                printf 'Ack/clear: rm %s\n' "$f"
+                ;;
+            clone)
+                # your-org/nexus-code#614. `note` is a packed record:
+                #   behind|<commits>|<hours>|<branch>|<why>
+                #   could-not-determine|<reason>|<detail>|<branch>
+                local _cd_kind _cd_a _cd_b _cd_branch _cd_why
+                IFS='|' read -r _cd_kind _cd_a _cd_b _cd_branch _cd_why <<<"$note"
+                if [[ "$_cd_kind" == "could-not-determine" ]]; then
+                    # NEVER phrase this as healthy. An undetermined
+                    # deployment state is an alarm in its own right.
+                    printf 'DEPLOYMENT STATE UNKNOWN: could not determine whether this clone is behind origin/%s.\n' \
+                        "${_cd_branch:-dev}"
+                    printf 'reason=%s detail=%s\n' "${_cd_a:-?}" "${_cd_b:-?}"
+                    printf 'Treat this as a possible stale deployment, NOT a clean bill of health: the check could not see, so the running code may be arbitrarily far behind.\n'
+                    printf 'Diagnose by hand:\n'
+                    printf '  git -C %s ls-remote origin refs/heads/%s\n' \
+                        "${nexus_root:-.}" "${_cd_branch:-dev}"
+                else
+                    printf 'The PRIMARY CLONE is BEHIND origin/%s: %s.\n' \
+                        "${_cd_branch:-dev}" "${_cd_why:-drift detected}"
+                    printf 'running %.12s -> remote %.12s (detected %s).\n' \
+                        "${old:-?}" "$new" "$detected"
+                    printf 'Merged code is NOT running code: the watcher, spawner and every `ng` verb execute what is checked out here, not what is on %s.\n' \
+                        "${_cd_branch:-dev}"
+                    printf 'Deploy when no worker is mid-flight (this is deliberately a human-timed action — a pull swaps helper libraries under the running watcher and in-flight workers):\n'
+                    printf '  git -C %s pull --ff-only origin %s\n' \
+                        "${nexus_root:-.}" "${_cd_branch:-dev}"
+                    printf 'The version-aware watcher self-restarts on the resulting source-set drift; no manual restart needed.\n'
+                fi
                 printf 'Ack/clear: rm %s\n' "$f"
                 ;;
             *)
@@ -640,8 +720,17 @@ _version_check_tick() {
                     # restart recipe can't be mis-aimed (2026-06-11:
                     # a name/index-targeted kill from the orchestrator
                     # destroyed the orchestrator's own window).
-                    local cockpit_win_id
-                    cockpit_win_id=$(_version_window_id "$cockpit_win" 2>/dev/null) || cockpit_win_id=""
+                    local cockpit_win_id cockpit_id_rc=0
+                    cockpit_win_id=$(_version_window_id "$cockpit_win" 2>/dev/null) \
+                        || { cockpit_id_rc=$?; cockpit_win_id=""; }
+                    # An empty id no longer degrades the recipe to a
+                    # name-targeted kill (your-org/nexus-code#701 item B), but
+                    # WHY it is empty is still worth saying: rc 3 means we
+                    # never got to look, which is not the same as a window
+                    # that is not there, and only one of those is a fact.
+                    if (( cockpit_id_rc >= 2 )); then
+                        _version_log "cockpit window '$cockpit_win' id could NOT be resolved (rc $cockpit_id_rc — tmux unavailable or an unparseable row); the surfaced recipe will resolve it at paste time"
+                    fi
                     _version_write_drift_record "$state_dir" cockpit "$old" "$hash" \
                         "cockpit running old code" "$cockpit_win" "$cockpit_win_id"
                     _version_log "cockpit drifted; asked the orchestrator to restart window '$cockpit_win'${cockpit_win_id:+ ($cockpit_win_id)} (no direct kill)"

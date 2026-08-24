@@ -6,6 +6,9 @@
 #   build.sh [<mapping.tsv>]        (default: alongside this script)
 #
 # Run it on a clean checkout of the source branch (e.g. `dev`). It:
+#   - applies block-level OVERLAY transforms (pre-scrub) from the optional
+#     overlay/manifest.tsv, for public rewrites too semantic for line-wise
+#     substitution (missing manifest = no-op),
 #   - scrubs every tracked file by type (.md/.yml -> angle, else bare),
 #   - leaves tracked symlinks untouched (writing through them corrupts targets),
 #   - preserves the executable bit,
@@ -18,8 +21,60 @@ export LC_ALL=C
 _here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MAP="${1:-$_here/mapping.tsv}"
 SCRUB="$_here/scrub.pl"
+OVERLAY_DIR="$_here/overlay"
+OVERLAY_MANIFEST="$OVERLAY_DIR/manifest.tsv"
 [ -r "$MAP" ] || { echo "build.sh: mapping not readable: $MAP" >&2; exit 2; }
 root=$(git rev-parse --show-toplevel) && cd "$root"
+
+# 0. OVERLAY (pre-scrub, block-level). mapping.tsv can only do single-line,
+#    context-free substring substitution; a few public-fork transforms are
+#    multi-line + semantic (reframe an install section, delete a note pointing
+#    at an excluded page, trim a paragraph). Those are driven by the optional
+#    overlay manifest and applied HERE, before the scrub, so anchors and
+#    replacement content are matched/authored against the SOURCE tree. A missing
+#    manifest is a no-op (a fresh operator without overlays still builds). The
+#    overlay dir names internal anchors, so it is `exclude`d from the output
+#    (loop 2 drops it) exactly like mapping.tsv.
+apply_overlay_block() {
+  local target="$1" start="$2" end="$3" repl="$4"
+  [ -f "$target" ] || { echo "build.sh: overlay target missing: $target" >&2; exit 4; }
+  grep -qE -- "$start" "$target" || {
+    echo "build.sh: overlay START anchor not found in $target: /$start/ (drifted?)" >&2; exit 4; }
+  local replpath=""
+  if [ "$repl" != "-" ]; then
+    replpath="$OVERLAY_DIR/$repl"
+    [ -f "$replpath" ] || { echo "build.sh: overlay replacement missing: $replpath" >&2; exit 4; }
+  fi
+  awk -v start="$start" -v end="$end" -v repl="$replpath" '
+    function emitrepl(){ if (repl != "") { while ((getline line < repl) > 0) print line; close(repl) } }
+    BEGIN { state=0 }                       # 0=before 1=inside 2=after 3=skip-to-eof
+    {
+      if (state==0 && $0 ~ start) {
+        emitrepl()
+        if (end == "") { state=3 } else { state=1 }
+        next
+      }
+      if (state==1) { if ($0 ~ end) { print; state=2; next } else { next } }
+      if (state==3) { next }
+      print
+    }
+  ' "$target" > "$target.__o" || { echo "build.sh: overlay awk failed on $target" >&2; exit 4; }
+  mv "$target.__o" "$target"
+  # END anchor must have survived (proof the block boundary was found, not that
+  # we silently swallowed the rest of the file when END drifted out of range).
+  if [ -n "$end" ]; then
+    grep -qE -- "$end" "$target" || {
+      echo "build.sh: overlay END anchor gone from $target: /$end/ — block over-ran (drifted?)" >&2; exit 4; }
+  fi
+}
+if [ -r "$OVERLAY_MANIFEST" ]; then
+  while IFS=$'\t' read -r kind target start end repl; do
+    [ "${kind:-}" = "block" ] || continue
+    case "$kind" in \#*) continue;; esac
+    apply_overlay_block "$target" "$start" "$end" "$repl"
+    echo "build.sh: overlay applied to $target" >&2
+  done < <(grep -v '^[[:space:]]*#' "$OVERLAY_MANIFEST")
+fi
 
 # tracked symlinks — preserve verbatim
 mapfile -t SYMS < <(git ls-files -s | awk '$1=="120000"{ $1=$2=$3=""; sub(/^   /,""); print }')
@@ -50,8 +105,8 @@ done < <(git ls-files)
 #    exclude path, so re-reading it here (after it is dropped) would fail.
 for ex in "${EXCL[@]}"; do
   [ -n "$ex" ] || continue
-  git rm -q --cached --ignore-unmatch -- "$ex" >/dev/null 2>&1
-  rm -f -- "$ex"
+  git rm -rq --cached --ignore-unmatch -- "$ex" >/dev/null 2>&1
+  rm -rf -- "$ex"
 done
 
 # 3. FAIL LOUD if any excluded path survived (on disk or still tracked). The

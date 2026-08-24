@@ -81,7 +81,7 @@ The bot-maintained section of the overview issue body, between the two HTML-comm
 <!-- NEXUS_DASHBOARD_END -->
 ```
 
-Sections, when populated: Decisions Needed, Active Agents, Blocked / Waiting, Recently Completed, Project Status, Next Actions. Updated via `monitor/ng dashboard put`, which re-fetches the body, splices a new middle, and PATCHes — preserving any static prose outside the markers. The overview issue itself is **routing-only**; content threads belong on dedicated per-task issues. See [Operating → Dashboard](../operating/dashboard.md).
+Sections — the six-heading schema `ng dashboard validate` enforces with `grep -Fx`: `## Identity`, `## Infra`, `## Services`, `## In-flight`, `## Awaiting operator`, `## Recent landings`. Scaffold with `ng dashboard scaffold`. Updated via `monitor/ng dashboard put`, which re-fetches the body, splices a new middle, and PATCHes — preserving any static prose outside the markers. The overview issue itself is **routing-only**; content threads belong on dedicated per-task issues. See [Operating → Dashboard](../operating/dashboard.md).
 
 ### Wrap-up
 

@@ -102,6 +102,44 @@ wait_for() {  # wait_for <label> <deadline-s> -- cmd...
     printf '  FAIL: %s (deadline %ss)\n' "$label" "$deadline" >&2; FAIL=$(( FAIL + 1 )); return 1
 }
 
+# sup_pid_of <pidfile> — the supervisor pid, FIRST LINE ONLY, guarded.
+#
+# The pidfile is a three-line identity record since bcf9e3a (pid / ns= /
+# start=); line 1 is the pid and is bare by contract. `cat`ing the whole record
+# here did not merely produce a wrong string — it made the KILLs below no-ops
+# (`kill` rejects an argument with embedded newlines) while the paired
+# `assert_eq "supervisor dead" "$(kill -0 "$sup"; echo $?)" "1"` still PASSED,
+# because `kill -0` fails on garbage exactly as it does on a dead pid. Three
+# assertions asserting nothing, green (your-org/nexus-code#729).
+#
+# The guard is why that cannot recur silently: a non-pid FAILS loudly rather
+# than being handed to a `kill` whose failure reads as success. Same reasoning
+# as wait_gone's guard in test-jupyter-service.sh.
+#
+# THE READER AND THE ASSERTION ARE DELIBERATELY SEPARATE, and the split is the
+# point rather than style. This helper is consumed as `sup=$(sup_pid_of …)`,
+# which runs it in a SUBSHELL — so a `FAIL=$(( FAIL + 1 ))` inside it is
+# incremented in a child and LOST. Measured on this host:
+#
+#   FAIL=0; f() { FAIL=$(( FAIL + 1 )); }
+#   x=$(f); echo $FAIL   ->  0        # command substitution: counted nowhere
+#   f;      echo $FAIL   ->  1        # direct call: counted
+#
+# A guard that prints FAIL to stderr but never increments the counter lets
+# `th_summary_and_exit` report `0 failed` and exit 0 — a red suite reporting
+# green, which is the same "a green that is not a coverage claim" defect this
+# very commit exists to remove. So the helper stays a PURE READER and every
+# call site asserts in the PARENT shell, where the count survives.
+sup_pid_of() {  # sup_pid_of <pidfile> — prints line 1; empty if unreadable
+    # `[[ -r ]]` first, not `read … 2>/dev/null`: the redirection failure is
+    # the SHELL's and that redirect cannot reach it (#723).
+    local p=""
+    [[ -r "$1" ]] && read -r p < "$1"
+    printf '%s' "$p"
+}
+# Countable in the caller: `yes`/`no` so it can go through assert_eq.
+_is_pid() { [[ "$1" =~ ^[0-9]+$ ]] && printf 'yes' || printf 'no'; }
+
 server_pid_of() {  # live jupyter server pid for a project ('' if none)
     local d="$1" jf pid
     for jf in "$d"/.jupyter/share/jupyter/runtime/jpserver-*.json; do
@@ -185,7 +223,9 @@ got=$(cd "$PROJA" && labsh kernel exec -n analysis.ipynb 'print("post-rotate-ok"
 assert_contains "exec against post-rotation server" "$got" "post-rotate-ok"
 
 echo '=== [8] dead supervisor + dead server → bootstrap-recover revives ==='
-sup=$(cat "$NEXUS_STATE_DIR/services/jupyter-projA-fresh.pid")
+sup=$(sup_pid_of "$NEXUS_STATE_DIR/services/jupyter-projA-fresh.pid")
+assert_eq "projA supervisor pid is readable (a non-pid makes the KILL below a silent no-op)" \
+    "$(_is_pid "$sup")" "yes"
 kill -KILL "$sup" 2>/dev/null
 srv=$(server_pid_of "$PROJA") && kill -KILL "$srv" 2>/dev/null
 sleep 1
@@ -195,7 +235,9 @@ wait_for "healthy after recovery" 120 -- "$HEALTH" "$PROJA"
 
 echo '=== [9] --down: no orphans, deregistered ==='
 srv=$(server_pid_of "$PROJA")
-sup=$(cat "$NEXUS_STATE_DIR/services/jupyter-projA-fresh.pid")
+sup=$(sup_pid_of "$NEXUS_STATE_DIR/services/jupyter-projA-fresh.pid")
+assert_eq "projA supervisor pid is readable before --down (else 'supervisor dead' is vacuous)" \
+    "$(_is_pid "$sup")" "yes"
 out=$("$UP" "$PROJA" --down 2>&1); rc=$?
 assert_eq "down exits 0" "$rc" "0"
 sleep 2
@@ -358,7 +400,9 @@ assert_eq "wrong token rejected by root server" "$(( bad_rc != 0 ))" "1"
 
 echo '=== [22] root --down: no orphans, deregistered, kernelspecs kept ==='
 srv=$(server_pid_of "$RWS")
-sup=$(cat "$NEXUS_STATE_DIR/services/jupyterlab.pid")
+sup=$(sup_pid_of "$NEXUS_STATE_DIR/services/jupyterlab.pid")
+assert_eq "root supervisor pid is readable before --down (else 'supervisor dead' is vacuous)" \
+    "$(_is_pid "$sup")" "yes"
 out=$("$UP" --root "$RWS" --down 2>&1); rc=$?
 assert_eq "root down exits 0" "$rc" "0"
 sleep 2

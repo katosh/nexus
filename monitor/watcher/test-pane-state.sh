@@ -50,6 +50,13 @@ expected_state_for() {
         blocked-*)     echo blocked ;;
         absent-*)      echo absent ;;
         over-limit-*)  echo over-limit ;;
+        # Added by your-org/nexus-code#896. These six fixtures had no arm, so
+        # `expected_state_for` returned "" and the loop SKIPped them — six
+        # committed captures asserting nothing, and six panes a classifier
+        # change could silently flip. The prefix was missing, not the
+        # coverage: every one of them already classifies
+        # `working-background`.
+        working-background-*) echo working-background ;;
         *) echo "" ;;
     esac
 }
@@ -680,6 +687,81 @@ fi
 rm -f "$no_reset_tmp"
 
 echo
+echo "=== over-limit banner STRUCTURE, not substring (your-org/nexus-code#571) ==="
+# The detector must test the banner's structure — a clean lead-in plus a
+# contiguous "resets <time>" companion — not mere substring presence. Two
+# controls, each a genuine DIFFERENTIAL against a prior detector, so neither
+# can pass vacuously (skeptic standard: a gate never seen fail is not evidence).
+#
+# Shared strip+bottom pipeline, mirroring pane-state's production path
+# (_strip_ansi | _bottom_rows 15), so the differential greps below see exactly
+# the text _detect_over_limit sees.
+_ol_bottom_rows() {   # <fixture-path> -> stripped, blank-culled bottom 15 rows
+    sed -E $'s/\x1b\\[[0-9;?]*[a-zA-Z]//g' <"$1" | grep -v '^[[:space:]]*$' | tail -n 15
+}
+# The two historical headline patterns this fix supersedes.
+_OL_DEV_HEADLINE='You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit'
+_OL_591_HEADLINE='^[[:space:]]*You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit'
+
+# POSITIVE control — the retry-exhaustion render captured from CI
+# (run 30567702742): the headline sits MID-LINE, prefixed by the client's
+# `● API Error: Request rejected (429) · ` decoration. This is the arm #591's
+# bare `^[[:space:]]*` anchor silently BLINDED the detector to — an invisible
+# miss on the render the repo's own real-binary test treats as a true positive.
+apierror_fixture="$FIX_DIR/over-limit-apierror-midline-synthetic.ansi"
+if [[ -f "$apierror_fixture" ]]; then
+    out=$("$HELPER" --fixture "$apierror_fixture" --window 9 --name overw --active 0)
+    if grep -q 'state=over-limit' <<<"$out" \
+       && grep -q 'reset_at=3am_America/Los_Angeles' <<<"$out"; then
+        printf '  PASS: API-error mid-line banner parks (reset_at parsed)\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: API-error mid-line banner did NOT park (got: %s)\n' "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+    # Differential proof this control is load-bearing: #591's line-start anchor
+    # MISSES this exact row. Assert on the discriminating fact (the reverted
+    # anchor's behaviour), not just our own green — so a future re-introduction
+    # of `^[[:space:]]*` is caught here with a named reason.
+    _bot=$(_ol_bottom_rows "$apierror_fixture")
+    if grep -qE "$_OL_591_HEADLINE" <<<"$_bot"; then
+        printf '  FAIL: expected #591 line-start anchor to MISS the API-error row, but it matched — control is not a differential\n' >&2
+        FAIL=$(( FAIL + 1 ))
+    else
+        printf '  PASS: #591 line-start anchor misses this row (why the anchor was reverted)\n'
+        PASS=$(( PASS + 1 ))
+    fi
+fi
+
+# NEGATIVE control — a healthy, idle worker whose pane QUOTES the notice as
+# message content (`● user pasted: "You've hit your weekly limit · resets …"`)
+# INSIDE the bottom-15 window. Position alone does NOT save it here (unlike the
+# scrollback fixture above); the CLEAN-LEAD-IN gate must. Must classify idle.
+quoted_fixture="$FIX_DIR/idle-overlimit-quoted-relay-bottomrows-synthetic.ansi"
+if [[ -f "$quoted_fixture" ]]; then
+    out=$("$HELPER" --fixture "$quoted_fixture" --window 9 --name overw --active 0)
+    if ! grep -q 'state=over-limit' <<<"$out" && grep -q 'state=idle' <<<"$out"; then
+        printf '  PASS: bulleted quote in bottom rows does NOT park (lead-in gate)\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: bulleted quote in bottom rows false-parked (got: %s)\n' "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+    # Differential proof this control exercises the LEAD-IN gate, not position:
+    # the OLD two-grep detector (headline anywhere + resets anywhere) WOULD have
+    # parked this exact bottom-rows text. If it no longer does, the fixture has
+    # drifted out of the false-park class and the negative control is vacuous.
+    _bot=$(_ol_bottom_rows "$quoted_fixture")
+    if grep -qE "$_OL_DEV_HEADLINE" <<<"$_bot" && grep -qE 'resets[[:space:]]+[^[:space:]]' <<<"$_bot"; then
+        printf '  PASS: old two-grep detector WOULD have parked this (fixture is a true differential)\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: old two-grep detector would not have parked this — negative control is vacuous\n' >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+fi
+
+echo
 echo "=== dead-claude liveness gate ==="
 # Reproduces the original bug: a pane whose inner `claude` REPL has
 # exited but whose last-rendered bytes still match an alive-state
@@ -748,9 +830,16 @@ fi
 # Live, non-claude pid (sleep) must also classify as absent — the
 # gate is "live claude descendant", not "live anything". A sleep
 # child has no claude in its tree but is unambiguously alive.
+#
+# Grace pinned to 0 (your-org/nexus-code#777). This pid is forked on the line
+# above, so at the default grace it is inside the boot window and `unknown` is
+# the correct answer — a seconds-old process with nothing under it is exactly
+# what a spawn looks like before its launcher is forked. The property this
+# assertion was written for is the DESCENDANT rule, so take the boot window out
+# of the picture and let it test only that.
 sleep 60 &
 SLEEP_PID=$!
-out=$("$HELPER" --fixture "$FIX_DIR/autosuggest-merge-win3.ansi" \
+out=$(NEXUS_PANE_BOOT_GRACE_SECONDS=0 "$HELPER" --fixture "$FIX_DIR/autosuggest-merge-win3.ansi" \
                 --window 9 --name testwin --active 0 \
                 --pane-pid "$SLEEP_PID" 2>&1)
 kill "$SLEEP_PID" 2>/dev/null
@@ -834,6 +923,74 @@ else
     printf '  FAIL: textual delta did not move the hash (%s vs %s)\n' "$h_base" "$h_text" >&2; FAIL=$(( FAIL + 1 ))
 fi
 
+# --- fullscreen composer-nudge churn (your-org/nexus-code#573) -------------
+# Under `tui: fullscreen` the input box is pinned to the bottom of the
+# alternate screen and the gap above it is padded with blanks; into that gap
+# Claude Code flashes a RIGHT-JUSTIFIED contextual nudge (`● <tip> · /<cmd>`)
+# on its own timer. It sits ABOVE the `❯<NBSP>` row (so inside the hashed
+# region) and is non-numeric (so the digit-strip missed it), which churned an
+# idle pane's hash and pinned windows open. The fix keys on RIGHT-JUSTIFICATION
+# (a LARGE leading-space run, ≥32): a `●` pushed to the right edge is chrome
+# and is stripped; a `●` at column 0 OR any small indent (a code-fence line, a
+# pasted TUI capture) is real content and must still move the hash — this is
+# the over-strip guard the skeptic (req-001) demanded on the unrecoverable
+# axis. Shapes mirror the real fullscreen capture measured via monitor/cc-harness
+# on tmux 3.4: a `────` box border, a left-aligned `●` response, and the
+# right-justified `● … · /effort` nudge ~64–103 columns in.
+DASH=$'\xe2\x94\x80'; BUL=$'\xe2\x97\x8f'; MDOT=$'\xc2\xb7'
+GAP=$(printf '%64s' '')                          # 64-space right-align padding
+# A: nudge PRESENT in the gap (right-justified, 64 leading spaces).
+printf 'Routine transcript line one\n%s Assistant answered the question here\n%s%s tip of the day %s /effort\n%s%s%s%s\n\xe2\x9d\xaf%s%s[7m %s[0m\n' \
+    "$BUL" "$GAP" "$BUL" "$MDOT" "$DASH" "$DASH" "$DASH" "$DASH" \
+    "$NB" "$ESCB" "$ESCB" > "$ch_tmp/fs_nudge.ansi"
+# B: SAME pane, nudge GONE (blinked out) — only blank padding in the gap.
+printf 'Routine transcript line one\n%s Assistant answered the question here\n%s\n%s%s%s%s\n\xe2\x9d\xaf%s%s[7m %s[0m\n' \
+    "$BUL" "$GAP" "$DASH" "$DASH" "$DASH" "$DASH" \
+    "$NB" "$ESCB" "$ESCB" > "$ch_tmp/fs_nonudge.ansi"
+# C: a NEW left-aligned `●` assistant response arrived (genuine change) — the
+# nudge strip must NOT swallow this; the hash must move relative to B.
+printf 'Routine transcript line one\n%s Assistant answered the question here\n%s A second real assistant response\n%s\n%s%s%s%s\n\xe2\x9d\xaf%s%s[7m %s[0m\n' \
+    "$BUL" "$BUL" "$GAP" "$DASH" "$DASH" "$DASH" "$DASH" \
+    "$NB" "$ESCB" "$ESCB" > "$ch_tmp/fs_response.ansi"
+# D (skeptic req-001): a real transcript line whose first glyph is a `●` at a
+# SMALL indent — a `●` inside a fenced code block, a pasted TUI capture. The
+# fix must NOT eat it; the hash must move relative to B. If the strip matched a
+# `●` at ANY indent (the pre-req-001 code), this would collide with B and fail.
+printf 'Routine transcript line one\n%s Assistant answered the question here\n  %s indented literal dot inside a fence\n%s\n%s%s%s%s\n\xe2\x9d\xaf%s%s[7m %s[0m\n' \
+    "$BUL" "$BUL" "$GAP" "$DASH" "$DASH" "$DASH" "$DASH" \
+    "$NB" "$ESCB" "$ESCB" > "$ch_tmp/fs_indent.ansi"
+
+out_fsn=$("$HELPER" --fixture "$ch_tmp/fs_nudge.ansi"    --window 9 --name chw --active 0)
+out_fs0=$("$HELPER" --fixture "$ch_tmp/fs_nonudge.ansi"  --window 9 --name chw --active 0)
+out_fsr=$("$HELPER" --fixture "$ch_tmp/fs_response.ansi" --window 9 --name chw --active 0)
+out_fsi=$("$HELPER" --fixture "$ch_tmp/fs_indent.ansi"   --window 9 --name chw --active 0)
+h_fsn=$(ch_field "$out_fsn"); h_fs0=$(ch_field "$out_fs0")
+h_fsr=$(ch_field "$out_fsr"); h_fsi=$(ch_field "$out_fsi")
+
+# POSITIVE: the blinking right-justified nudge is invisible to the hash — the
+# idle pane reads STABLE whether the nudge is drawn or not.
+if [[ -n "$h_fsn" && "$h_fsn" == "$h_fs0" ]]; then
+    printf '  PASS: fullscreen composer nudge stripped — idle hash stable across blink\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: fullscreen nudge churned the hash (present=%s absent=%s)\n' "$h_fsn" "$h_fs0" >&2; FAIL=$(( FAIL + 1 ))
+fi
+# NEGATIVE (guards over-stripping): a left-aligned `●` response is real
+# content and MUST still move the hash. If the strip were alignment-blind
+# (matching a bare `●`) this would collide with B and the assertion fails.
+if [[ -n "$h_fsr" && "$h_fsr" != "$h_fs0" ]]; then
+    printf '  PASS: left-aligned assistant response still moves the hash (no over-strip)\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: real response did not move the hash — nudge strip over-reached (%s vs %s)\n' "$h_fsr" "$h_fs0" >&2; FAIL=$(( FAIL + 1 ))
+fi
+# NEGATIVE / skeptic req-001: a SMALL-indent `●` (code-fence content, pasted
+# capture) is real content and MUST still move the hash — the strip's
+# right-justification threshold must spare it, on the unrecoverable axis.
+if [[ -n "$h_fsi" && "$h_fsi" != "$h_fs0" ]]; then
+    printf '  PASS: small-indent ● content still moves the hash (right-justification threshold spares it)\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: small-indent ● content was eaten by the nudge strip (%s vs %s)\n' "$h_fsi" "$h_fs0" >&2; FAIL=$(( FAIL + 1 ))
+fi
+
 # Chevron-less pane: classifies absent via the renderer fallback
 # (no input row, no spinner, no pid supplied) and must still emit a
 # whole-capture hash — proving _content_hash neither hangs nor
@@ -872,7 +1029,11 @@ if command -v python3 >/dev/null 2>&1; then
     ZPARENT=$!
     # Give the child a beat to exec, exit, and become a zombie.
     sleep 0.5
-    out_z=$("$HELPER" --fixture "$ch_tmp/base.ansi" --window 9 --name chw --active 0 \
+    # Grace pinned to 0 (your-org/nexus-code#777): $ZPARENT is half a second
+    # old, so the default grace legitimately answers `unknown`. What is under
+    # test here is that a ZOMBIE claude does not count as live — a property of
+    # the tree walk, not of the boot window.
+    out_z=$(NEXUS_PANE_BOOT_GRACE_SECONDS=0 "$HELPER" --fixture "$ch_tmp/base.ansi" --window 9 --name chw --active 0 \
                       --pane-pid "$ZPARENT")
     kill "$ZPARENT" 2>/dev/null; wait "$ZPARENT" 2>/dev/null
     if grep -q 'state=absent' <<<"$out_z"; then
@@ -1164,6 +1325,61 @@ else
 fi
 
 echo
+echo "=== OSC 8 hyperlinks in the footer must not blind the handle-count parse ==="
+# _strip_ansi used to strip CSI only, so an OSC 8 hyperlink
+# (ESC ] 8 ; ; <url> ESC \ <anchor> ESC ] 8 ; ; ESC \) survived into the
+# plain text _footer_handle_counts parses — right on the ` · N shell[s] · `
+# boundary its regex anchors on. Claude Code renders clickable badges this
+# way. Both cases below use the FOOTER FALLBACK deliberately (no heartbeat,
+# no --bg-shells), because the footer parse is the surface under test.
+
+# (10e) POSITIVE: the handle count itself is inside a hyperlink. Under the
+#       old CSI-only strip the `·`→digit boundary is broken by the raw
+#       escape bytes and the count is missed → idle. It must read
+#       working-background.
+osc_foot="$FIX_DIR/working-background-osc8-prbadge-synthetic.ansi"
+if [[ -f "$osc_foot" ]]; then
+    out=$("$HELPER" --fixture "$osc_foot" \
+                    --window 9 --name osc8 --active 0 \
+                    --heartbeat-file "$async_tmp/missing.json" \
+                    --now "$ASYNC_NOW" --bg-cpu 777 2>&1)
+    got=$(awk -F'[ =]' '{print $2}' <<<"$out")
+    if [[ "$got" == "working-background" ]]; then
+        printf '  PASS: OSC 8-wrapped "2 shells" footer → working-background\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: OSC 8 footer count missed — got=%s want=working-background (full: %s)\n' "$got" "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+else
+    printf '  FAIL: missing fixture %s\n' "$osc_foot" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# (10f) NEGATIVE CONTROL: the same PR-badge hyperlink, but NO handle count
+#       anywhere. Stripping OSC must not manufacture a count out of the
+#       URL's digits — without this control, (10e) could "pass" by making
+#       _footer_handle_counts fire on any pane containing a hyperlink.
+osc_idle="$FIX_DIR/idle-osc8-prbadge-nocounts-synthetic.ansi"
+if [[ -f "$osc_idle" ]]; then
+    out=$("$HELPER" --fixture "$osc_idle" \
+                    --window 9 --name osc8n --active 0 \
+                    --heartbeat-file "$async_tmp/missing.json" \
+                    --now "$ASYNC_NOW" --bg-cpu 777 2>&1)
+    got=$(awk -F'[ =]' '{print $2}' <<<"$out")
+    if [[ "$got" == "idle" ]]; then
+        printf '  PASS: PR-badge hyperlink with no count → still idle (no phantom handle)\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: OSC 8 negative control — got=%s want=idle (full: %s)\n' "$got" "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+else
+    printf '  FAIL: missing fixture %s\n' "$osc_idle" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+echo
 echo "=== process-tree as the authoritative background-shell signal (your-org/nexus-code#455) ==="
 # The status-line `N shell` footer is presentation: a user can customise
 # the status bar, it changes across CC versions, and a regex can match
@@ -1328,16 +1544,59 @@ exec "$bogus_tmux_bin" -L "$bogus_sock" "\$@"
 TMUXSHIM
     chmod +x "$bogus_tmpdir/tmux"
     cleanup_bogus() {
-        PATH="$bogus_tmpdir:$PATH" tmux kill-server 2>/dev/null || true
+        # Pin the socket EXPLICITLY (-L), never via the PATH shim. The shim's
+        # creation above is unchecked and this same function `rm -rf`s the dir
+        # holding it, so a shim-dependent teardown resolves to the real tmux
+        # the moment either fails — and `$TMUX` (always set: every agent runs
+        # in a pane) then beats any TMUX_TMPDIR, landing `kill-server` on the
+        # operator's server and tearing down the whole sandbox.
+        # your-org/nexus-code#644.
+        "$bogus_tmux_bin" -L "$bogus_sock" kill-server 2>/dev/null || true
         rm -rf "$bogus_tmpdir"
     }
     trap cleanup_bogus EXIT
 
-    # Bring up an isolated tmux server. -f /dev/null neutralises the
-    # operator's personal tmux.conf so it can't perturb window names
-    # or base-index. `sleep 36000` keeps the pane alive without
-    # spawning anything that could match `_pane_has_live_claude`.
-    PATH="$bogus_tmpdir:$PATH" tmux -f /dev/null new-session -d \
+    # Bring up an isolated tmux server. `-f` neutralises the operator's
+    # personal tmux.conf so it can't perturb window names or base-index —
+    # but `-f` alone does NOT pin `default-shell`, which tmux derives from
+    # the invoking user. That omission is your-org/nexus-code#661.
+    #
+    # tmux runs `sleep 36000` THROUGH the pane shell, and shells differ in
+    # whether they exec it or fork first:
+    #
+    #   bash          execs directly           → pane pid IS sleep, no children
+    #   zsh 5.4.2     forks, then settles      → a live child for ~0.5s
+    #   sh (dash)     forks and does NOT       → a live child indefinitely
+    #                 settle under the
+    #                 default-command form
+    #
+    # Since your-org/nexus-code#649 a live descendant with no claude is
+    # `unknown`, not `absent` — correctly. So this fixture's verdict was a
+    # function of the OPERATOR'S ambient $SHELL and of host load: bash
+    # passed, this lab's zsh raced and failed under suite load, and CI's
+    # shell reproduced neither. A green cell meant something different
+    # from a green local run.
+    #
+    # NOT `th_tmux_fixture_conf` (the #555 guard) here, deliberately, and
+    # this is the one place that deviates from it: it pins `sh`, which is
+    # dash on this host, and dash under that config keeps a live child
+    # INDEFINITELY — measured `unknown` at 0s, 0.5s and 2s. Applying the
+    # generic guard would make this case permanently red rather than fix
+    # it. The guard is right about the axis and wrong about the value for
+    # a fixture that asserts on the pane's PROCESS TREE.
+    #
+    # Two independent defences, because the pin alone is a host
+    # assumption:
+    #   1. pin a shell that execs (bash), so no fork window exists
+    #   2. WAIT for the pane to settle, so the assertion never depends on
+    #      exec-vs-fork at all — this is the property the case actually
+    #      needs, and it is what the old code silently assumed
+    printf 'set -g base-index 0\nset -g pane-base-index 0\nset -g status off\n' \
+        > "$bogus_tmpdir/tmux.conf"
+    _ps661_shell=$(command -v bash 2>/dev/null) || _ps661_shell=""
+    [[ -n "$_ps661_shell" ]] \
+        && printf 'set -g default-shell %s\n' "$_ps661_shell" >> "$bogus_tmpdir/tmux.conf"
+    PATH="$bogus_tmpdir:$PATH" tmux -f "$bogus_tmpdir/tmux.conf" new-session -d \
         -s "$bogus_session" -x 80 -y 24 'sleep 36000'
 
     # Resolve the first real window index — base-index may be 0 or 1
@@ -1385,23 +1644,77 @@ TMUXSHIM
         FAIL=$(( FAIL + 1 ))
     fi
 
-    # Case 2: valid window, pane runs sleep (no claude descendant) →
-    # `state=absent` + populated name + exit 0. The process-liveness
-    # gate (_pane_has_live_claude) walks the pane's process tree,
-    # finds no claude/claude-code, and emits absent — the documented
-    # dead-claude path that the bogus-index fix MUST NOT regress.
-    valid_out=$(PATH="$bogus_tmpdir:$PATH" \
-        bash "$HELPER" "${bogus_session}:${valid_idx}" 2>&1)
-    valid_rc=$?
-    if (( valid_rc == 0 )) \
+    # Case 2: valid window, SETTLED pane running sleep (no claude and
+    # nothing else alive in its tree) → `state=absent` + populated name +
+    # exit 0. The documented dead-claude path the bogus-index fix must not
+    # regress.
+    #
+    # The settle wait is load-bearing, not defensive padding
+    # (your-org/nexus-code#661). "A pane with no claude in its tree
+    # reports absent" presupposes a pane that has finished BECOMING what
+    # is being asserted about it. Querying immediately asserted on a pane
+    # mid-fork, and since #649 that is legitimately `unknown`.
+    #
+    # Bounded, and it FAILS LOUD naming the shell rather than hanging or
+    # silently accepting `unknown` — a settle that never arrives is a real
+    # finding about the pane shell, not a reason to relax the assertion.
+    # Grace pinned to 0 (your-org/nexus-code#777). The pane under test is
+    # created moments earlier, so at the default 90 s grace it stays `unknown`
+    # for the whole 10 s budget and the settle loop can never succeed — the
+    # boot window is no longer a transient this test can wait out, it is the
+    # deliberate answer for a pane this young. Disabling it here keeps the
+    # assertion pointed at what #661 wrote it for: a SETTLED pane with nothing
+    # in its tree reports `absent` with a populated name and exit 0.
+    _ps661_settled=0
+    _ps661_deadline=$(( SECONDS + 10 ))
+    while (( SECONDS < _ps661_deadline )); do
+        valid_out=$(NEXUS_PANE_BOOT_GRACE_SECONDS=0 PATH="$bogus_tmpdir:$PATH" \
+            bash "$HELPER" "${bogus_session}:${valid_idx}" 2>&1)
+        valid_rc=$?
+        grep -qE "state=unknown[[:space:]]" <<<"$valid_out" || { _ps661_settled=1; break; }
+        sleep 0.2
+    done
+    if (( _ps661_settled == 0 )); then
+        printf '  FAIL: pane never settled within 10s (default-shell=%s) — still %q\n' \
+            "${_ps661_shell:-<ambient>}" "$valid_out" >&2
+        FAIL=$(( FAIL + 1 ))
+    elif (( valid_rc == 0 )) \
        && grep -qE "state=absent[[:space:]]" <<<"$valid_out" \
        && grep -qE "window=${valid_idx}([[:space:]]|$)" <<<"$valid_out" \
        && grep -qE 'name=[^[:space:]]' <<<"$valid_out"; then
-        printf '  PASS: valid index + sleep pane → state=absent + populated name + rc=0\n'
+        printf '  PASS: valid index + SETTLED sleep pane → state=absent + populated name + rc=0\n'
         PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: valid sleep-pane — rc=%s out=%q\n' \
             "$valid_rc" "$valid_out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+
+    # Case 2b: the OTHER half of the #649 contract, pinned at the same
+    # call site so the two can never drift apart again. A pane with a live
+    # descendant and no claude is `unknown` — NOT `absent`, because
+    # `absent` is the one kill-authorising state and must never be
+    # asserted about a pane that still has something running under it.
+    #
+    # `test-pane-state-boot-absent.sh` covers the boundary in isolation;
+    # the point here is that THIS fixture agrees with it rather than
+    # contradicting it, which is exactly what went wrong in #661.
+    PATH="$bogus_tmpdir:$PATH" tmux new-window -d -t "$bogus_session" \
+        -n livekid "sh -c 'sleep 300 & wait'" 2>/dev/null
+    live_idx=$(PATH="$bogus_tmpdir:$PATH" tmux list-windows -t "$bogus_session" \
+                 -F '#{window_index} #{window_name}' | awk '$2=="livekid"{print $1}' | head -1)
+    if [[ -n "$live_idx" ]]; then
+        live_out=$(PATH="$bogus_tmpdir:$PATH" \
+            bash "$HELPER" "${bogus_session}:${live_idx}" 2>&1)
+        if grep -qE "state=unknown[[:space:]]" <<<"$live_out"; then
+            printf '  PASS: live-descendant pane → state=unknown (not the kill-authorising absent)\n'
+            PASS=$(( PASS + 1 ))
+        else
+            printf '  FAIL: live-descendant pane should be unknown — got %q\n' "$live_out" >&2
+            FAIL=$(( FAIL + 1 ))
+        fi
+    else
+        printf '  FAIL: could not create the live-descendant window\n' >&2
         FAIL=$(( FAIL + 1 ))
     fi
 
@@ -1471,6 +1784,696 @@ if grep -qF 'bg_oldest_start=1699999999' <<<"$out"; then
 else
     printf '  FAIL: bg_oldest_start not emitted — %s\n' "$out" >&2
     FAIL=$(( FAIL + 1 ))
+fi
+
+echo
+echo "=== Bypass Permissions modal names itself (your-org/nexus-code#768) ==="
+# The mechanism: the binary migrates `bypassPermissionsModeAccepted` from
+# `.claude.json` into `settings.json` as `skipDangerousModePermissionPrompt`
+# and DELETES the original, so any between-boot rewrite of settings.json that
+# does not re-supply the key wedges the next boot on this modal. The COST was
+# never the wedge — it was that nothing named it: the pane read `empty`, which
+# means "don't know yet", so a deterministic config fault presented as a slow
+# boot and burned a probe run reported as "VI mode is unreachable".
+#
+# The filename-prefix harness above already asserts `blocked` for the live
+# fixture and `idle` for the quoted one. These four cases assert the parts a
+# prefix cannot: that the answer is SPECIFIC, that the live-ness guard is
+# load-bearing rather than decorative, and that the other three overlay kinds
+# did not become indistinguishable in the process.
+# This file counts assertions with inline printf rather than helpers, so the
+# helpers this section uses are defined here. They are NOT optional sugar: an
+# earlier revision called undefined `ok`/`bad`, and the result was `command not
+# found` on stderr with the counters untouched and the suite still printing ALL
+# TESTS PASSED — five assertions that silently did not run. Defining them where
+# they are used is what stops that recurring.
+ok()  { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
+bad() { printf '  FAIL: %s — %s\n' "$1" "$2" >&2; FAIL=$(( FAIL + 1 )); }
+
+bp_live="$FIX_DIR/blocked-bypass-permissions-synthetic.ansi"
+bp_quoted="$FIX_DIR/idle-bypass-modal-quoted-synthetic.ansi"
+[[ -f "$bp_live"   ]] || { echo "needs $bp_live" >&2; exit 1; }
+[[ -f "$bp_quoted" ]] || { echo "needs $bp_quoted" >&2; exit 1; }
+
+# (1) The live modal is named, not merely classified.
+out=$("$HELPER" --fixture "$bp_live" --window 9 --name bpwin --active 0 2>&1)
+if grep -qF 'state=blocked' <<<"$out" && grep -qF 'overlay=bypass-permissions' <<<"$out"; then
+    printf '  PASS: live modal → state=blocked overlay=bypass-permissions (the failure says its own name)\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: live modal — want state=blocked + overlay=bypass-permissions, got: %s\n' "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# (2) NEGATIVE CONTROL, and the reason this arm needed a live-ness guard at
+#     all: the modal's text is quoted in issue #768, in pane-state.sh's own
+#     comment, and in synthesize.sh — so an agent READING any of them has
+#     every shape literal on screen. A pane that merely displays the words
+#     must stay idle.
+out=$("$HELPER" --fixture "$bp_quoted" --window 9 --name bpwin --active 0 2>&1)
+if grep -qF 'state=idle' <<<"$out" && ! grep -qF 'overlay=' <<<"$out"; then
+    printf '  PASS: a pane merely QUOTING the modal stays idle (no overlay= claim)\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: quoted modal — want state=idle and no overlay=, got: %s\n' "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# (2b) THE BOUNDARY, constructed by the #776 skeptic and kept as a fixture.
+#      Case (2)'s fixture happens to carry four non-blank chrome rows below the
+#      quoted footer; against a `tail -n 3` window that is a 2-row margin, and
+#      the skeptic built the pane that eats it — an idle agent quoting the modal
+#      with only two rows below, which the bottom-slice guard alone classified
+#      `blocked`. A non-vacuity mutation does not probe a boundary; this does.
+bp_edge="$FIX_DIR/idle-bypass-modal-quoted-boundary-synthetic.ansi"
+[[ -f "$bp_edge" ]] || { echo "needs $bp_edge" >&2; exit 1; }
+out=$("$HELPER" --fixture "$bp_edge" --window 9 --name bpwin --active 0 2>&1)
+if grep -qF 'state=idle' <<<"$out" && ! grep -qF 'overlay=' <<<"$out"; then
+    ok "the 2-row-margin boundary pane stays idle (the margin is no longer what decides)"
+else
+    bad "boundary pane" "want state=idle and no overlay=, got: $out"
+fi
+
+# (2c) …and the STRUCTURAL test is what rejects it, not the margin. Widen the
+#      slice to something no realistic pane could fail and the boundary pane
+#      must STILL be idle — if it flips, the margin is secretly load-bearing
+#      again and the #776 finding has been reintroduced under a bigger number.
+#
+#      #896 added a SECOND arm (`_has_menu_dialog_frame`) using the same
+#      bottom-slice idiom, so the mutation now widens EVERY occurrence rather
+#      than the first. That is the stronger claim, not a concession: with the
+#      margin removed from every arm that has one, the boundary pane must still
+#      be idle, which can only be the REPL-row test doing it.
+bp_wide=$(mktemp)
+python3 - "$HELPER" "$bp_wide" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+old = "| grep -v '^[[:space:]]*$' | tail -n 3)\" || return 1"
+new = "| grep -v '^[[:space:]]*$' | tail -n 99)\" || return 1"
+assert s.count(old) >= 1, "slice expression not found — the mutation is a no-op"
+open(dst, 'w').write(s.replace(old, new))
+PY
+chmod +x "$bp_wide"
+out=$(bash "$bp_wide" --fixture "$bp_edge" --window 9 --name bpwin --active 0 2>&1)
+if grep -qF 'state=idle' <<<"$out"; then
+    ok "with the slice widened to 99 the boundary pane is STILL idle — the REPL-row test carries it, not the margin"
+else
+    bad "structural test" "widening the slice flipped the boundary pane to blocked, so the margin is still the discriminator: $out"
+fi
+rm -f "$bp_wide"
+
+# (3) BOTH live-ness tests are LOAD-BEARING, each proven by mutation against the
+#     pane only IT catches. With two guards, removing one and watching a single
+#     fixture proves nothing — the survivor still rejects it — so each mutation
+#     is paired with the shape that isolates it:
+#
+#       structural (no REPL row below the footer) → the BOUNDARY pane, whose
+#           footer sits inside the slice and which only the REPL-row test rejects
+#       bottom-slice (footer near the end)        → a pane quoting the modal high
+#           up with no REPL row below it at all, which only the slice rejects
+#
+#     Each mutation is applied in python against exact source text and asserts it
+#     matched, so a reworded guard fails loudly instead of mutating nothing and
+#     reporting a pass.
+bp_mut=$(mktemp); trap 'rm -f "$bp_mut" "$bp_high"' EXIT
+
+_bp_mutate() {   # _bp_mutate <marker> <python-body-file-content via stdin>
+    python3 - "$HELPER" "$bp_mut" "$1" <<'PY'
+import sys
+src, dst, which = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(src).read()
+if which == 'structural':
+    guard = ('    if grep -qF "❯${NBSP}" <<<"$(tail -n +"$(( footer_ln + 1 ))" <<<"$plain")"; then\n'
+             '        return 1   # a REPL input row lives below the footer ⇒ the pane is quoting\n'
+             '    fi\n')
+else:
+    guard = ("    grep -qF 'Enter to confirm' \\\n"
+             "        <<<\"$(printf '%s\\n' \"$plain\" | grep -v '^[[:space:]]*$' | tail -n 3)\" || return 1\n")
+if s.count(guard) != 1:
+    sys.exit("MUTATION TARGET NOT FOUND (%s): found %d" % (which, s.count(guard)))
+open(dst, 'w').write(s.replace(guard, "    : # %s live-ness test REMOVED by mutation\n" % which, 1))
+PY
+}
+
+# (3a) structural test, isolated by the boundary pane.
+if ! _bp_mutate structural; then
+    bad "mutation (structural)" "could not locate the REPL-row test to remove — this assertion has gone vacuous"
+elif ! bash -n "$bp_mut" 2>/dev/null; then
+    bad "mutation (structural)" "the mutated helper does not parse; the mutation missed its target"
+else
+    chmod +x "$bp_mut"
+    out=$(bash "$bp_mut" --fixture "$bp_edge" --window 9 --name bpwin --active 0 2>&1)
+    if grep -qF 'state=blocked' <<<"$out"; then
+        ok "removing the REPL-row test flips the BOUNDARY pane to blocked — it is what rejects it (#776 skeptic finding e)"
+    else
+        bad "mutation (structural)" "without the REPL-row test the boundary pane should false-positive, got: $out"
+    fi
+fi
+
+# (3b) bottom-slice test, isolated by a pane quoting the modal high up with NO
+#      REPL row below it — the structural test has nothing to catch, so only the
+#      slice can reject it.
+bp_high=$(mktemp)
+{
+    printf '%s\n' '  WARNING: Claude Code running in Bypass Permissions mode'
+    printf '%s\n' '    2. Yes, I accept'
+    printf '%s\n' '  Enter to confirm · Esc to cancel'
+    for _i in 1 2 3 4 5; do printf '%s\n' '  ...transcript continues, no input row captured...'; done
+} > "$bp_high"
+out=$("$HELPER" --fixture "$bp_high" --window 9 --name bpwin --active 0 2>&1)
+if ! grep -qF 'overlay=bypass-permissions' <<<"$out"; then
+    ok "a modal quoted high in the pane is rejected (footer outside the bottom slice)"
+else
+    bad "high-quote pane" "want no overlay= claim, got: $out"
+fi
+if ! _bp_mutate slice; then
+    bad "mutation (slice)" "could not locate the bottom-slice test to remove — this assertion has gone vacuous"
+elif ! bash -n "$bp_mut" 2>/dev/null; then
+    bad "mutation (slice)" "the mutated helper does not parse; the mutation missed its target"
+else
+    chmod +x "$bp_mut"
+    out=$(bash "$bp_mut" --fixture "$bp_high" --window 9 --name bpwin --active 0 2>&1)
+    if grep -qF 'overlay=bypass-permissions' <<<"$out"; then
+        ok "removing the bottom-slice test flips the high-quote pane — it too is load-bearing, not redundant"
+    else
+        bad "mutation (slice)" "without the slice test the high-quote pane should false-positive, got: $out"
+    fi
+fi
+
+# (4) The other three overlay kinds stay distinguishable. `blocked` was already
+#     correct for all four; the regression this guards is a future edit that
+#     collapses them to one label, which would put the diagnosis back where
+#     #768 found it.
+for pair in "blocked-permission-synthetic:permission" \
+            "blocked-ratelimit-synthetic:rate-limit" \
+            "blocked-askuq-synthetic:askuq"; do
+    bp_f="${pair%%:*}"; bp_want="${pair##*:}"
+    out=$("$HELPER" --fixture "$FIX_DIR/$bp_f.ansi" --window 9 --name bpwin --active 0 2>&1)
+    if grep -qF "overlay=$bp_want" <<<"$out"; then
+        printf '  PASS: %-34s → overlay=%s\n' "$bp_f" "$bp_want"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %s — want overlay=%s, got: %s\n' "$bp_f" "$bp_want" "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
+
+# ── your-org/nexus-code#801: dim BOX CHROME is not ghost text ──────────────
+#
+# `_detect_dim_run` searched `${input_row#*❯}` — everything after the chevron
+# TO END OF LINE — for a faint run carrying a visible character. A dim closing
+# box border is exactly that, so an EMPTY input box drawn with one classified
+# `autosuggest-only input=ghost`, and `state=idle` became UNREACHABLE for that
+# renderer (measured deterministically over a 28 s poll against the
+# integration stub, `#798`).
+#
+# The three fixtures below are the coverage boundary of that fix, chosen so
+# that no single wrong fix passes all three:
+#
+#   idle-empty-*      the NEGATIVE control — an empty box WITH a border must
+#                     read idle/blank. Nothing covered this, which is how the
+#                     defect survived.
+#   autosuggest-*     the POSITIVE control — REAL ghost bytes in the SAME
+#                     bordered box must still read autosuggest-only/ghost. A
+#                     "fix" that stopped detecting dim runs passes the first
+#                     fixture and fails here.
+#   user-typing-*     the KILL-AXIS control — vim INSERT, real operator text,
+#                     no bright marker. Pre-fix this read autosuggest-only /
+#                     input=ghost: a kill-authorised state AND a safe-to-paste
+#                     token, both about the operator's own words.
+#
+# `state=` alone is asserted by the filename-prefix sweep at the top of this
+# file. `input=` is asserted HERE because it is a SEPARATE contract read by a
+# different consumer (pasting, not retirement) and the prefix sweep is blind
+# to it — half of #801's consequence lives on that axis.
+echo
+echo "=== #801: dim box chrome vs ghost text ==="
+#   *-adjacent-*      the RUN-STRUCTURE control (skeptic F1). The glyph
+#                     manifest varies WHICH glyph; the mechanism also varies
+#                     HOW MANY dim introducers the renderer emits across the
+#                     border. A single `s///g` pass consumed the terminating
+#                     ESC and resumed after it, so adjacent runs were stripped
+#                     alternately and ONE SURVIVED — `#801` intact on a doubled
+#                     border. Two axes, both pinned.
+for pair in "idle-empty-dim-box-border-synthetic:idle:blank" \
+            "autosuggest-dim-box-border-synthetic:autosuggest-only:ghost" \
+            "user-typing-vim-dim-box-border-synthetic:user-typing:typed" \
+            "idle-empty-adjacent-dim-border-synthetic:idle:blank" \
+            "user-typing-vim-adjacent-dim-border-synthetic:user-typing:typed" \
+            "user-typing-vim-tripled-dim-border-synthetic:user-typing:typed"; do
+    ch_f="${pair%%:*}"; ch_rest="${pair#*:}"
+    ch_state="${ch_rest%%:*}"; ch_input="${ch_rest##*:}"
+    out=$("$HELPER" --fixture "$FIX_DIR/$ch_f.ansi" --window 9 --name chwin --active 0 2>&1)
+    got_state=$(awk -F'[ =]' '{print $2}' <<<"$out")
+    if [[ "$got_state" == "$ch_state" ]] && grep -qE "(^| )input=$ch_input( |$)" <<<"$out"; then
+        printf '  PASS: %-44s → state=%s input=%s\n' "$ch_f" "$ch_state" "$ch_input"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %s — want state=%s input=%s, got: %s\n' \
+            "$ch_f" "$ch_state" "$ch_input" "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
+
+# MUTATION. Neutering `_strip_dim_box_chrome` to the identity must flip ALL
+# THREE fixtures back to the pre-fix reading. Without this the three
+# assertions above are satisfied by a classifier that never looked at chrome
+# at all — they would pass on any tree where the fixtures happen to classify
+# correctly for some other reason, which is precisely the vacuous green this
+# repo keeps meeting. The mutation is applied against exact source text and
+# asserts it matched, so a renamed helper fails loudly rather than mutating
+# nothing and reporting a pass.
+ch_mut=$(mktemp); trap 'rm -f "$bp_mut" "$bp_high" "$ch_mut"' EXIT
+if ! python3 - "$HELPER" "$ch_mut" <<'PYMUT'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+marker = '_strip_dim_box_chrome() {\n'
+if s.count(marker) != 1:
+    sys.exit("MUTATION TARGET NOT FOUND: _strip_dim_box_chrome() defined %d time(s)" % s.count(marker))
+s = s.replace(marker, marker + '    printf %s "$1"; return 0   # MUTATION: chrome stripping REMOVED\n', 1)
+open(dst, 'w').write(s)
+PYMUT
+then
+    printf '  FAIL: mutation — could not locate _strip_dim_box_chrome; this section has gone vacuous\n' >&2
+    FAIL=$(( FAIL + 1 ))
+elif ! bash -n "$ch_mut" 2>/dev/null; then
+    printf '  FAIL: mutation — the mutated helper does not parse; the mutation missed its target\n' >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    chmod +x "$ch_mut"
+    ch_flipped=0
+    for ch_f in idle-empty-dim-box-border-synthetic \
+                autosuggest-dim-box-border-synthetic \
+                user-typing-vim-dim-box-border-synthetic \
+                idle-empty-adjacent-dim-border-synthetic \
+                user-typing-vim-adjacent-dim-border-synthetic \
+                user-typing-vim-tripled-dim-border-synthetic; do
+        out=$(bash "$ch_mut" --fixture "$FIX_DIR/$ch_f.ansi" --window 9 --name chwin --active 0 2>&1)
+        # Pre-fix, every one of the three read `autosuggest-only input=ghost`:
+        # the border satisfies the dim-run test, and that branch is evaluated
+        # before the empty-box arm, so all three collapse onto it.
+        if grep -qE '(^| )state=autosuggest-only( |$)' <<<"$out" \
+           && grep -qE '(^| )input=ghost( |$)' <<<"$out"; then
+            ch_flipped=$(( ch_flipped + 1 ))
+        else
+            printf '  note: %s did NOT collapse under mutation: %s\n' "$ch_f" "$out" >&2
+        fi
+    done
+    if (( ch_flipped >= 5 )); then
+        printf '  PASS: removing the chrome strip collapses the chrome fixtures to autosuggest-only/ghost — it is what decides them\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: mutation — only %d/5 fixtures flipped; the chrome strip is not what these assertions measure\n' \
+            "$ch_flipped" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+fi
+
+echo
+echo "=== #896: a select-dialog is recognised STRUCTURALLY, not by its wording ==="
+# The motivating instance is Claude Code's workspace-trust dialog: 2.1.232
+# stopped letting nested git repos inherit trust from a parent, so every
+# `work/<project>` worker spawn boots into it. pane-state read the frame as
+# `state=empty active=0` — "don't know yet" — so `_unstick.sh` never fired (its
+# case_B needs `blocked`) and a worker that would NEVER proceed was
+# indistinguishable from one that had merely not started.
+#
+# The trust dialog is ONE INSTANCE. These assertions are shaped around the
+# CLASS, and split along the two failure directions the fix has to survive:
+#
+#   CAN IT FIRE?   the live-captured trust frame, and an invented dialog whose
+#                  wording exists nowhere, must both classify `blocked`.
+#   CAN IT STAY SILENT?  four near-miss panes — each failing exactly ONE of the
+#                  arm's three conditions — must stay unblocked, and every
+#                  other committed fixture must acquire no `overlay=` at all.
+#
+# Direction 2 is the one that decides whether the fix is real: a detector that
+# always fires is the same defect as one that never does, failing toward the
+# other side.
+md_live="$FIX_DIR/blocked-workspace-trust-realmodel.ansi"
+md_unnamed="$FIX_DIR/blocked-unnamed-dialog-synthetic.ansi"
+md_quoted="$FIX_DIR/idle-trust-dialog-quoted-synthetic.ansi"
+for _f in "$md_live" "$md_unnamed" "$md_quoted"; do
+    [[ -f "$_f" ]] || { echo "needs $_f" >&2; exit 1; }
+done
+
+# (1) The live capture — from the REAL binary, not transcribed from a PR body
+#     (see test-integration/test-realmodel-trust-dialog.sh, which re-derives it).
+out=$("$HELPER" --fixture "$md_live" --window 9 --name mdwin --active 0 2>&1)
+if grep -qF 'state=blocked' <<<"$out" && grep -qF 'overlay=workspace-trust' <<<"$out"; then
+    ok "the live-captured trust dialog → state=blocked overlay=workspace-trust"
+else
+    bad "live trust dialog" "want state=blocked + overlay=workspace-trust, got: $out"
+fi
+
+# (2) THE CLASS ASSERTION. A dialog whose wording appears in no Claude Code
+#     release and nowhere else in this repo. A text-keyed fix passes (1) and
+#     fails this; that difference is the entire point of the change.
+out=$("$HELPER" --fixture "$md_unnamed" --window 9 --name mdwin --active 0 2>&1)
+if grep -qF 'state=blocked' <<<"$out" && grep -qF 'overlay=dialog' <<<"$out"; then
+    ok "a dialog nobody enumerated → state=blocked overlay=dialog (the class, not the instance)"
+else
+    bad "unnamed dialog" "want state=blocked + overlay=dialog, got: $out"
+fi
+
+# (2b) …and the naming table really is naming-only. Break the trust literals in
+#      `_name_menu_dialog_kind` and the LIVE capture must STILL be `blocked` —
+#      just under the generic kind. If it falls back to `empty`, detection was
+#      quietly depending on the wording after all.
+md_mut=$(mktemp); trap 'rm -f "$bp_mut" "$bp_high" "$md_mut" "${md_high:-}"' EXIT
+python3 - "$HELPER" "$md_mut" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+# Blind BOTH literals of the naming arm — one is not enough, since the arm is
+# an OR and the live frame carries the prose form as well as the option label.
+old = ("    if grep -qF 'trust this folder' <<<\"$plain\" \\\n"
+       "       || grep -qE 'Is this a project you created or one you trust\\?' <<<\"$plain\"; then\n")
+if s.count(old) != 1:
+    sys.exit("MUTATION TARGET NOT FOUND: _name_menu_dialog_kind trust arm, found %d" % s.count(old))
+new = "    if grep -qF 'ZZZ-no-such-literal-ZZZ' <<<\"$plain\"; then\n"
+open(dst, 'w').write(s.replace(old, new, 1))
+PY
+if [[ ! -s "$md_mut" ]]; then
+    bad "mutation (naming)" "could not rewrite the naming table — this assertion has gone vacuous"
+elif ! bash -n "$md_mut" 2>/dev/null; then
+    bad "mutation (naming)" "the mutated helper does not parse; the mutation missed its target"
+else
+    out=$(bash "$md_mut" --fixture "$md_live" --window 9 --name mdwin --active 0 2>&1)
+    if grep -qF 'state=blocked' <<<"$out" && grep -qF 'overlay=dialog' <<<"$out"; then
+        ok "blinding the naming table leaves the live trust dialog BLOCKED (kind falls back to dialog) — detection is not text-keyed"
+    else
+        bad "mutation (naming)" "want state=blocked + overlay=dialog with the literals blinded, got: $out"
+    fi
+fi
+
+# --- direction 2: can it stay silent? -------------------------------------
+#
+# (3) A running agent QUOTING the trust dialog. Every literal is on screen —
+#     the wording lives in the issue, in pane-state.sh's comment, and in
+#     synthesize.sh — so the shape alone would fire.
+#
+#     WHAT REJECTS IT IS CONDITION (a), NOT (c). This comment used to credit the
+#     REPL-row test ("a live dialog REPLACES the REPL, and this pane still has
+#     its input row"), which reads plausibly and is wrong: measured by removing
+#     (c) and re-running, this fixture is STILL `idle`. Its REPL chrome pushes
+#     the quoted footer out of the bottom slice, so (a) rejects it first and (c)
+#     never gets a say. The `-boundary-` fixture below is the one (c) rejects,
+#     and the mutation table uses it — so the COVERAGE was right and only the
+#     attribution was wrong (#896 skeptic, Finding 4). Recorded rather than
+#     silently corrected, because "the assertion passes" and "the assertion
+#     measures what its comment says" are different claims.
+out=$("$HELPER" --fixture "$md_quoted" --window 9 --name mdwin --active 0 2>&1)
+if grep -qF 'state=idle' <<<"$out" && ! grep -qF 'overlay=' <<<"$out"; then
+    ok "a pane QUOTING the trust dialog stays idle (no overlay= claim)"
+else
+    bad "quoted trust dialog" "want state=idle and no overlay=, got: $out"
+fi
+
+# (4) The four near-misses, one per condition. Each must classify as it did
+#     before this change — the `busy-` prefix loop above already asserts that;
+#     what these add is that none of them acquired an `overlay=` claim, which
+#     the prefix check cannot see.
+declare -A md_near=(
+    ["busy-menu-no-footer-synthetic.ansi"]="a menu-shaped list with no Enter/Esc affordance"
+    ["busy-footer-plain-list-synthetic.ansi"]="a footer over a list with no highlighted choice"
+    ["busy-footer-single-option-synthetic.ansi"]="a footer over a SINGLE option (one choice is not a menu)"
+    ["busy-esc-to-interrupt-menu-synthetic.ansi"]="the spinner's own lowercase 'esc to interrupt'"
+    ["busy-dialog-quoted-midrender-synthetic.ansi"]="a BUSY pane quoting the dialog, mid-render (no chevron at all)"
+    ["busy-dialog-quoted-queued-synthetic.ansi"]="a BUSY pane quoting the dialog with a message QUEUED behind the turn"
+)
+for md_f in "${!md_near[@]}"; do
+    [[ -f "$FIX_DIR/$md_f" ]] || { echo "needs $FIX_DIR/$md_f" >&2; exit 1; }
+    out=$("$HELPER" --fixture "$FIX_DIR/$md_f" --window 9 --name mdwin --active 0 2>&1)
+    if grep -qF 'state=busy' <<<"$out" && ! grep -qF 'overlay=' <<<"$out"; then
+        ok "near-miss stays busy: ${md_near[$md_f]}"
+    else
+        bad "near-miss $md_f" "want state=busy and no overlay=, got: $out"
+    fi
+done
+
+# (4b) THE FIELD THE PREFIX CANNOT SEE. `busy-*` gets `state=busy` from the
+#      filename loop, but `queued=1` is what CLAUDE.md cites as "input already
+#      waiting behind a running turn — do not paste into it again", and the
+#      first version of this arm SWALLOWED it: `busy queued=1` became `blocked
+#      overlay=workspace-trust`, because `_has_blocked_overlay` runs ahead of
+#      the queued-message check. A `state=busy` assertion alone would have
+#      passed on a pane that had lost the field. Assert the field.
+out=$("$HELPER" --fixture "$FIX_DIR/busy-dialog-quoted-queued-synthetic.ansi" \
+        --window 9 --name mdwin --active 0 2>&1)
+if grep -qF 'state=busy' <<<"$out" && grep -qE '(^| )queued=1( |$)' <<<"$out"; then
+    ok "the queued-message pane keeps queued=1 (the do-not-paste signal survives the overlay arm)"
+else
+    bad "queued pane" "want state=busy AND queued=1, got: $out"
+fi
+
+# (5) THE SWEEP. Every committed fixture, not just the ones this section names:
+#     exactly the `blocked-*` set may carry an `overlay=`, and nothing else may.
+#     This is the assertion that notices a future widening of the arm even if
+#     nobody thinks to add a fixture for what it broke.
+md_leaked=0 md_missing=0
+for md_f in "$FIX_DIR"/*.ansi; do
+    out=$("$HELPER" --fixture "$md_f" --window 9 --name mdwin --active 0 2>&1)
+    case "$(basename "$md_f")" in
+        blocked-*)
+            grep -qF 'overlay=' <<<"$out" || {
+                md_missing=$(( md_missing + 1 ))
+                printf '  note: %s is blocked-* but carries no overlay=: %s\n' "$(basename "$md_f")" "$out" >&2
+            } ;;
+        *)
+            grep -qF 'overlay=' <<<"$out" && {
+                md_leaked=$(( md_leaked + 1 ))
+                printf '  note: %s is NOT blocked-* but claims an overlay: %s\n' "$(basename "$md_f")" "$out" >&2
+            } ;;
+    esac
+done
+if (( md_leaked == 0 && md_missing == 0 )); then
+    ok "overlay= appears on exactly the blocked-* fixtures and no others (swept all $(ls -1 "$FIX_DIR"/*.ansi | wc -l))"
+else
+    bad "overlay sweep" "$md_leaked non-blocked fixtures claimed an overlay, $md_missing blocked fixtures carried none"
+fi
+
+# (6) EACH of the three conditions is load-bearing, proven by mutation against
+#     the near-miss that ONLY it rejects. Removing a condition and watching a
+#     fixture no other condition would have caught is what separates a guard
+#     from a comment. Every mutation asserts it matched its target, so a
+#     reworded condition fails loudly instead of mutating nothing and passing.
+_md_mutate() {   # _md_mutate <which>
+    python3 - "$HELPER" "$md_mut" "$1" <<'PY'
+import sys
+src, dst, which = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(src).read()
+SLICE = ("    grep -qE \"$footer_re\" \\\n"
+         "        <<<\"$(printf '%s\\n' \"$plain\" | grep -v '^[[:space:]]*$' | tail -n 3)\" || return 1\n")
+# The (d) guard, hoisted because three of the mutations below must remove it
+# FIRST. Their near-miss panes are BUSY — which is how these shapes actually
+# appear in production — so after #896's skeptic added (d) those panes fail TWO
+# conditions, and removing only the intended one leaves (d) still rejecting
+# them. That is correct behaviour and a VACUOUS mutation: it would have reported
+# "the guard is load-bearing" while measuring nothing. Composing the removal
+# keeps the claim honest and narrows it to what it can support — "given (d) is
+# gone, THIS is what rejects the pane".
+WORKING = ('    if _detect_busy "$plain" "$(wc -l <<<"$plain")" \\\n'
+           '       || _detect_queued_message "$plain"; then\n'
+           '        return 1\n'
+           '    fi\n')
+targets = {
+  # (a) a navigation footer, in the BOTTOM SLICE — the dialog is live rather
+  #     than quoted high in a transcript.
+  #
+  #     NOT mutated separately: the arm's `[[ -n "$footer_ln" ]] || return 1`.
+  #     It looks like a second condition and is not — the slice grep already
+  #     proves a footer exists somewhere, so the emptiness check is DEAD as a
+  #     discriminator and no pane can isolate it. It stays in the source as a
+  #     `set -u` guard against a future edit that decouples the two greps.
+  #     Writing a mutation for it would have produced a passing assertion
+  #     measuring nothing, which is the failure mode this whole section is
+  #     shaped against.
+  'slice': [SLICE],
+  # (b1) the `❯ N.` highlighted-choice requirement
+  'chevron': [WORKING, "    grep -qE '^[[:space:]]*❯ +[0-9]+\\.[[:space:]]' <<<\"$above\" || return 1\n"],
+  # (b2) the two-option floor
+  'siblings': [WORKING, "    (( options >= 2 )) || return 1\n"],
+  # (c) live-vs-quoted: no REPL row below the footer
+  'repl': ['    if grep -qF "❯${NBSP}" <<<"$(tail -n +"$(( footer_ln + 1 ))" <<<"$plain")"; then\n'
+           '        return 1\n'
+           '    fi\n'],
+  # the footer regex's case-sensitivity
+  'case': [WORKING, "    local footer_re='(Enter|Esc) to [a-z]'\n"],
+  # (d) positive evidence the agent is WORKING. The condition the #896 skeptic's
+  #     attack forced: (c) is an ABSENCE test, and two documented regimes have a
+  #     live REPL painting no `❯<NBSP>` row, so (c) goes inert exactly when a
+  #     busy pane quotes a dialog.
+  'working': [WORKING],
+}
+for guard in targets[which]:
+    if s.count(guard) != 1:
+        sys.exit("MUTATION TARGET NOT FOUND (%s): found %d" % (which, s.count(guard)))
+    if which == 'case':
+        repl = "    local footer_re='(Enter|Esc|enter|esc) to [a-z]'\n"
+    else:
+        repl = "    : # %s condition REMOVED by mutation\n" % which
+    s = s.replace(guard, repl, 1)
+open(dst, 'w').write(s)
+PY
+}
+
+#      The bottom-slice condition needs a pane no COMMITTED fixture supplies: a
+#      dialog quoted high in a transcript whose own REPL row has scrolled out of
+#      the capture, so the REPL-row test has nothing to catch and only the slice
+#      can reject it. Built here rather than committed because it is a mutation
+#      instrument, not a shape production renders.
+md_high=$(mktemp)
+{
+    printf '%s\n' '● Read(reports/nexus_2026-08-14_trust.md)'
+    printf '%s\n' '    ❯ 1. Yes, I trust this folder'
+    printf '%s\n' '      2. No, exit'
+    printf '%s\n' '    Enter to confirm · Esc to cancel'
+    for _i in 1 2 3 4 5; do printf '%s\n' '  ...transcript continues, no input row captured...'; done
+} > "$md_high"
+out=$("$HELPER" --fixture "$md_high" --window 9 --name mdwin --active 0 2>&1)
+if ! grep -qF 'overlay=' <<<"$out"; then
+    ok "a dialog quoted high in the pane is rejected (footer outside the bottom slice)"
+else
+    bad "high-quote pane" "want no overlay= claim, got: $out"
+fi
+
+# which condition, which pane it uniquely rejects, and what the pane must
+# become once that condition is gone. `-` in the fixture column means the
+# inline `$md_high` pane above.
+md_cases=(
+    "slice|-|the navigation-footer requirement (present, and near the end)"
+    "chevron|busy-footer-plain-list-synthetic.ansi|the highlighted-choice (❯ N.) requirement (with the agent-is-working test already removed)"
+    "siblings|busy-footer-single-option-synthetic.ansi|the two-option floor (with the agent-is-working test already removed)"
+    "repl|idle-trust-dialog-quoted-boundary-synthetic.ansi|the live-vs-quoted REPL-row test"
+    "case|busy-esc-to-interrupt-menu-synthetic.ansi|the footer's case-sensitivity (with the agent-is-working test already removed)"
+    "working|busy-dialog-quoted-midrender-synthetic.ansi|the agent-is-working test"
+    "working|busy-dialog-quoted-queued-synthetic.ansi|the agent-is-working test (queued regime)"
+)
+for md_case in "${md_cases[@]}"; do
+    IFS='|' read -r md_which md_fix md_label <<<"$md_case"
+    md_path="$FIX_DIR/$md_fix"
+    [[ "$md_fix" == "-" ]] && { md_path="$md_high"; md_fix="the high-quote pane"; }
+    [[ -f "$md_path" ]] || { echo "needs $md_path" >&2; exit 1; }
+    if ! _md_mutate "$md_which"; then
+        bad "mutation ($md_which)" "could not locate $md_label — this assertion has gone vacuous"
+        continue
+    fi
+    if ! bash -n "$md_mut" 2>/dev/null; then
+        bad "mutation ($md_which)" "the mutated helper does not parse; the mutation missed its target"
+        continue
+    fi
+    out=$(bash "$md_mut" --fixture "$md_path" --window 9 --name mdwin --active 0 2>&1)
+    if grep -qF 'state=blocked' <<<"$out"; then
+        ok "removing $md_label flips $md_fix to blocked — it is what rejects that pane"
+    else
+        bad "mutation ($md_which)" "without $md_label, $md_fix should false-positive, got: $out"
+    fi
+done
+rm -f "$md_mut" "$md_high"
+
+# (7) `blocked` is refused by the kill gate, and widening it took nothing off
+#     the allowlist. `empty` — the state these panes used to report — is
+#     INDETERMINATE and already refused, so this change moves a pane from one
+#     refusing state to another. The assertion pins that, because the
+#     nightmare direction for any pane-state widening is a state that becomes
+#     kill-authorising.
+if [[ -f "$_repo_root/monitor/_bookkeeping.sh" ]]; then
+    # shellcheck source=../_bookkeeping.sh
+    . "$_repo_root/monitor/_bookkeeping.sh"
+    if bk_pane_kill_authorized blocked; then
+        bad "kill gate" "bk_pane_kill_authorized AUTHORISED a kill on state=blocked"
+    elif [[ "${BK_REFUSE_KIND:-}" == "active" ]]; then
+        ok "bk_pane_kill_authorized refuses state=blocked as ACTIVE (widening blocked cannot authorise a kill)"
+    else
+        bad "kill gate" "blocked refused but as '${BK_REFUSE_KIND:-}', want 'active'"
+    fi
+    if bk_pane_kill_authorized empty; then
+        bad "kill gate" "bk_pane_kill_authorized AUTHORISED a kill on state=empty"
+    else
+        ok "bk_pane_kill_authorized still refuses state=empty (the allowlist is unchanged by this fix)"
+    fi
+else
+    bad "kill gate" "monitor/_bookkeeping.sh missing — the allowlist assertions did not run"
+fi
+
+# (8) NOTHING AUTO-ANSWERS IT, AND NO ARM FIRES ON A WORKING PANE.
+#
+#     The first version of this assertion grepped `_unstick.sh` for the string
+#     `trust this folder` and called its absence "nothing auto-answers a
+#     security prompt". That is a PRESENCE TEST on a literal, not a test of the
+#     property — the shape `#885` names on this board: auditing a helper by
+#     whether it is *called* cannot tell you what it *says in each arm*. It
+#     would pass unchanged if a future arm matched the dialog by some other
+#     literal, which is precisely the case it exists to catch.
+#
+#     Replaced with the property: drive the actual panes through the actual
+#     dispatcher and assert it selects NO arm. `_handle_unstick_window` takes
+#     its own `tmux capture-pane` — it never reads pane-state's verdict at all —
+#     so a fake `tmux` on PATH feeding it a fixture is the honest harness. It
+#     prints the matched arm's name, or nothing.
+if [[ -f "$_repo_root/monitor/watcher/_unstick.sh" ]]; then
+    md_fake=$(mktemp -d)
+    for md_case in "blocked-workspace-trust-realmodel.ansi|the LIVE trust dialog" \
+                   "busy-dialog-quoted-midrender-synthetic.ansi|a BUSY pane quoting it" \
+                   "busy-dialog-quoted-queued-synthetic.ansi|a pane with a message QUEUED"; do
+        IFS='|' read -r md_f md_label <<<"$md_case"
+        # A `tmux` that answers `capture-pane` with the fixture and ignores the rest.
+        {   printf '#!/usr/bin/env bash\n'
+            printf 'if [[ "${1:-}" == capture-pane ]]; then\n'
+            printf '  sed -E $%s %q\n' "'s/\\x1b\\[[0-9;?]*[a-zA-Z]//g'" "$FIX_DIR/$md_f"
+            printf '  exit 0\nfi\nexit 0\n'
+        } > "$md_fake/tmux"
+        chmod +x "$md_fake/tmux"
+        md_arm=$(PATH="$md_fake:$PATH" bash -c '
+            set -uo pipefail
+            STATE_DIR=$(mktemp -d); UNSTICK_DIR="$STATE_DIR/unstick"
+            UNSTICK_LOG="$STATE_DIR/unstick.log"; mkdir -p "$UNSTICK_DIR"
+            TARGET=orchestrator; WATCHER_WINDOW=watcher
+            . "'"$_repo_root"'/monitor/watcher/_unstick.sh" >/dev/null
+            _handle_unstick_window 7
+        ' 2>/dev/null)
+        if [[ -z "$md_arm" ]]; then
+            ok "_unstick.sh selects NO arm for $md_label (nothing auto-answers it, nothing fires on a working pane)"
+        else
+            bad "unstick $md_f" "want no arm, got '$md_arm' — an arm now acts on this pane"
+        fi
+    done
+    rm -rf "$md_fake"
+else
+    bad "unstick" "monitor/watcher/_unstick.sh missing — the auto-answer assertion did not run"
+fi
+
+# (8b) NON-VACUITY for (8): the harness must be capable of reporting an arm at
+#      all. A dispatcher that returns empty because the fake `tmux` broke would
+#      make all three assertions above pass while measuring nothing — the
+#      silent-zero shape this repo keeps re-finding. Feed it a pane that MUST
+#      match (the rate-limit menu) and require the arm to be named.
+if [[ -f "$_repo_root/monitor/watcher/_unstick.sh" ]]; then
+    md_fake=$(mktemp -d)
+    {   printf '#!/usr/bin/env bash\n'
+        printf 'if [[ "${1:-}" == capture-pane ]]; then\n'
+        printf '  sed -E $%s %q\n' "'s/\\x1b\\[[0-9;?]*[a-zA-Z]//g'" \
+            "$FIX_DIR/blocked-ratelimit-synthetic.ansi"
+        printf '  exit 0\nfi\nexit 0\n'
+    } > "$md_fake/tmux"
+    chmod +x "$md_fake/tmux"
+    md_arm=$(PATH="$md_fake:$PATH" bash -c '
+        set -uo pipefail
+        STATE_DIR=$(mktemp -d); UNSTICK_DIR="$STATE_DIR/unstick"
+        UNSTICK_LOG="$STATE_DIR/unstick.log"; mkdir -p "$UNSTICK_DIR"
+        TARGET=orchestrator; WATCHER_WINDOW=watcher
+        . "'"$_repo_root"'/monitor/watcher/_unstick.sh" >/dev/null
+        _handle_unstick_window 7
+    ' 2>/dev/null)
+    if [[ "$md_arm" == "ratelimit" ]]; then
+        ok "the same harness DOES report an arm for the rate-limit menu — (8)'s silence is a measurement, not a broken probe"
+    else
+        bad "unstick non-vacuity" "the rate-limit fixture should select 'ratelimit', got '$md_arm' — (8) above is vacuous"
+    fi
+    rm -rf "$md_fake"
 fi
 
 echo

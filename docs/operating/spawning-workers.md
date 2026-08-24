@@ -71,7 +71,7 @@ Once spawned, every worker honours the floor:
 
 - **Workdir** is in its `## Worker environment` header — either the primary clone (writes land directly) or a secondary clone / worktree (canonical writes route via PR).
 - **GitHub writes go through the bot**, via `monitor/ng <verb>` or `GH_TOKEN=$(./monitor/mint-token.sh) gh ...`. Plain `gh` (which would post under your account and silence your own notifications) is never used.
-- **No `--no-verify`, no force-push.** Pre-commit hook fails → fix the root cause and create a new commit.
+- **No `--no-verify`; no force-push to a *shared* branch** (`dev`, `main`, or any branch someone else has pushed commits to). Pre-commit hook fails → fix the root cause and create a new commit. Force-pushing the worker's *own* PR branch after rebasing it onto the current base is expected — a rebase makes the push non-fast-forward, and a `pull_request` run is computed against a merge ref built at run creation. The precondition command and the rationale reach the worker just-in-time from `bash-footgun-guard.sh` at the moment it runs `git push`, not from the floor.
 - **Reports first, then wrap-up.** The worker starts its final report via `monitor/ng report-init <slug>`, fills in the five mandatory sections, then calls:
 
     ```bash
@@ -93,7 +93,7 @@ Two ways a follow-up reaches a running worker, one per audience:
 
 ## Window naming
 
-Short, descriptive, kebab-case window names tied to the task or project: `repro-skills`, `data-mgmt`, `kompot-fig3`, `bench-eligibility`. The dashboard's *Active Agents* table surfaces the name; the watcher's `tmux list-windows` snapshot uses it; the [window-cleanup policy](#closing-windows) keys on it.
+Short, descriptive, kebab-case window names tied to the task or project: `repro-skills`, `data-mgmt`, `kompot-fig3`, `bench-eligibility`. The dashboard's *In-flight* table surfaces the name; the watcher's `tmux list-windows` snapshot uses it; the [window-cleanup policy](#closing-windows) keys on it.
 
 Check `tmux list-windows` or the dashboard before spawning to avoid collisions. The launcher refuses to create a window whose name already exists.
 

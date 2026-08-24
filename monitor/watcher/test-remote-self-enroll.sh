@@ -78,7 +78,14 @@ inv()    { bash "$EN" enroll-invite --principal "$1" --ttl "${2:-900}" 2>/dev/nu
 tokof()  { sed -n 's/^REMOTE_ENROLL_TOKEN=//p' <<<"$1"; }
 hashof() { printf '%s' "$1" | sha256sum | awk '{print $1}'; }
 # run the enroll session: sess <hash> <ssh_original_command> <stdin>
-sess()   { local h="$1" soc="${2-}" input="${3-}"; SSH_ORIGINAL_COMMAND="$soc" bash "$SESSION" "$h" <<<"$input"; }
+# SSH_CLIENT is set because sshd ALWAYS sets it for a forced command, and the
+# enroll session now enforces monitor.remote.from_cidr at runtime
+# (your-org/nexus-code#609 item 4) — failing CLOSED when the peer cannot be
+# determined. Omitting it modelled an invocation that cannot occur in production
+# (this script is only ever an sshd forced command) and made every enroll here
+# refuse with 14. The fail-closed-on-unknown-peer property itself is asserted in
+# test-remote-source-enforcement.sh.
+sess()   { local h="$1" soc="${2-}" input="${3-}"; SSH_CLIENT="${SESS_PEER:-140.107.116.184 51234 22022}" SSH_ORIGINAL_COMMAND="$soc" bash "$SESSION" "$h" <<<"$input"; }
 # grep -c prints the count (0 when none) AND exits 1 on no-match; capture the
 # number and swallow the exit (never chain `|| echo 0`, which double-appends).
 enroll_lines() { local n; n=$(grep -c 'enroll-[0-9a-f]\{64\}@nexus-remote' "$AK" 2>/dev/null); printf '%s' "${n:-0}"; }
@@ -157,10 +164,22 @@ assert_not_contains "no smuggled rm -rf in erin's line"  "$eline5" "rm -rf"
 echo "== 9. from= pin propagates to BOTH the enroll line AND the channel line =="
 o6=$(MONITOR_REMOTE_FROM_CIDR="10.1.2.0/24" inv frank); t6=$(tokof "$o6"); H6=$(hashof "$t6")
 eline6=$(grep "enroll-$H6@nexus-remote" "$AK")
-assert_contains "from= present in the enroll line" "$eline6" 'from="10.1.2.0/24"'
-MONITOR_REMOTE_FROM_CIDR="10.1.2.0/24" sess "$H6" "" "$(printf '%s\n%s' "$t6" "$CPUB")" >/dev/null 2>&1
+# POSTURE-AWARE pin (your-org/nexus-code#902): this fixture binds LOOPBACK, so
+# the written list must ALSO permit loopback — sshd enforces from= at publickey
+# time, before the forced command's carrier exemption can run, so a LAN-only pin
+# here is a credential no carrier client can ever use.
+assert_contains "from= carries the configured CIDR (enroll line)" "$eline6" 'from="10.1.2.0/24,'
+assert_contains "…and permits loopback, because this bind is loopback" "$eline6" '127.0.0.1/32
+# The peer must be INSIDE this case's own pin: the enroll session enforces
+# from_cidr at runtime now, so an off-CIDR peer is refused 14 before enrolling —
+# which is the point of the gate, and is asserted directly in
+# test-remote-source-enforcement.sh. Here we are testing from= PROPAGATION, so
+# connect from a permitted source exactly as a real client would.
+SESS_PEER="10.1.2.5 51234 22022" MONITOR_REMOTE_FROM_CIDR="10.1.2.0/24" sess "$H6" "" "$(printf '%s\n%s' "$t6" "$CPUB")" >/dev/null 2>&1
 assert_rc "frank enroll rc0" "$?" "0"
-assert_contains "from= present in frank's channel line" "$(grep 'frank@nexus-remote' "$AK")" 'from="10.1.2.0/24"'
+fline6=$(grep 'frank@nexus-remote' "$AK")
+assert_contains "from= carries the configured CIDR (channel line)" "$fline6" 'from="10.1.2.0/24,'
+assert_contains "…and the channel line permits loopback too (both sites agree)" "$fline6" '127.0.0.1/32'
 
 echo "== 10. enroll-invite respects self_enroll=false (manual-only) =="
 MONITOR_REMOTE_SELF_ENROLL=false bash "$EN" enroll-invite --principal grace >/dev/null 2>&1
@@ -231,7 +250,7 @@ EOF
         # PRODUCTION does NOT: the real forced command resolves principals_dir
         # from $HOME + config (config/load.sh), which a real login session has.
         start_sshd() { "$SSHD" -f "$WORK/sshd_config" -E "$WORK/sshd.log" 2>"$WORK/sshd.err" && sleep 1 &&
-            { ss -ltn 2>/dev/null | grep -q ":$LPORT " || netstat -ltn 2>/dev/null | grep -q ":$LPORT "; }; }
+            { grep -q ":$LPORT " <<<"$(ss -ltn 2>/dev/null)" || grep -q ":$LPORT " <<<"$(netstat -ltn 2>/dev/null)"; }; }
         stop_sshd() { [[ -f "$WORK/sshd.pid" ]] && kill "$(cat "$WORK/sshd.pid")" 2>/dev/null; sleep 0.3 2>/dev/null || true; }
         SSH_OPTS=(-p "$LPORT" -o StrictHostKeyChecking=no -o UserKnownHostsFile="$WORK/known"
                   -o BatchMode=yes -o ConnectTimeout=5 -o LogLevel=ERROR -o PreferredAuthentications=publickey
@@ -293,11 +312,11 @@ EOF
                 fi
                 stop_sshd
             else
-                echo "  SKIP: could not start sshd for the fix path"; stop_sshd
+                th_skip "self-enroll fix path" "could not start a non-root sshd — the post-fix enroll/consume cases did NOT run"; stop_sshd
             fi
             unset MONITOR_REMOTE_FROM_CIDR
         else
-            echo "  SKIP: could not start a non-root sshd on 127.0.0.1:$LPORT (environment-dependent)"
+            th_skip "self-enroll over a live sshd" "could not start a non-root sshd on 127.0.0.1:$LPORT (environment-dependent) — cases A-C did NOT run"
             stop_sshd
         fi
     fi

@@ -1,0 +1,89 @@
+name: conflict-markers
+
+# =============================================================================
+# A TREE-WIDE CHECK, SO IT CARRIES NO `paths:` FILTER (<your-org>/nexus-code#774)
+#
+# A merge-conflict marker can land in ANY tracked byte. The one that actually
+# reached `dev` landed in `CHANGELOG.md` and survived seven consecutive merges
+# — documentation, which no suite executes.
+#
+# That file is why this workflow exists separately instead of the check simply
+# riding along in `tests.yml`. Every other workflow here filters on `paths:`,
+# and `CHANGELOG.md` matches NONE of them:
+#
+#   tests.yml                    monitor/** config/** .github/workflows/** CLAUDE.md
+#   tests-slow-integration.yml   monitor/** config/** (self)
+#   cc-harness.yml               monitor/cc-harness/** …
+#   docs.yml                     docs/** mkdocs.yml (self)
+#   check-no-reports-leaked.yml  reports/**
+#
+# So a PR touching only `CHANGELOG.md` — exactly the shape of #759 and #756,
+# the two PRs that introduced the marker — gates on nothing. Adding
+# `CHANGELOG.md` to `tests.yml` would fix those two PRs and no others: it is a
+# FILENAME ALLOWLIST standing in for a whole-tree property, and it goes blind
+# again the next time a documentation file is added. The property is "no
+# tracked file", so the trigger is "every change".
+#
+# It carries no `branches:` filter either, for the #604 reason ci-signal.yml
+# documents at length: a PR based on a feature branch matches no
+# `branches: [main, dev]` filter, collects zero checks, and GitHub renders that
+# state identically to "all checks passed".
+#
+# WHAT THE TWO TRIGGERS EACH COVER — they are not redundant.
+#
+#   pull_request  checks out `refs/pull/N/merge`, i.e. the MERGE PREVIEW. This
+#                 catches a marker on the PR head AND a marker the merge would
+#                 produce. Replayed against history, it reddens at #759 and
+#                 #756 (the two introductions, both present on the PR head:
+#                 one marker and two respectively) and at #758 and #772 (which
+#                 introduced nothing but would have merged INTO a dirty dev,
+#                 which is the correct verdict — it stops the marker
+#                 propagating another merge).
+#
+#   push          checks the commit that actually landed. This is the only
+#                 trigger that can see a marker introduced BY THE MERGE
+#                 RESOLUTION itself — a marker present in neither parent,
+#                 which no PR-head check can observe. The #774 sequence shows
+#                 resolutions both removing (#761) and reintroducing (#756)
+#                 the marker without any step noticing, so the resolution is a
+#                 demonstrated source and not a hypothetical one.
+#
+# WHAT NEITHER COVERS: a marker committed and merged while this workflow is
+# disabled, and a marker in an UNTRACKED file (`git ls-files` is the scan set
+# by design — no sweep of work/, reports/, or operator scratch).
+#
+# NO `concurrency:` BLOCK, deliberately. The job has no `if:` and always
+# executes, so every run carries a real verdict and there is no cheap skip-run
+# to evict an expensive one (the #627/#628/#736 family). With nothing declared,
+# GitHub cancels nothing and no head sha can be left holding
+# cancelled+skipped. The job is one bash script over ~590 files, so there are
+# no runner minutes worth reclaiming by cancelling.
+#
+# `types:` includes `edited` because retargeting a PR's base emits ONLY the
+# `edited` event, and this check reads the MERGE PREVIEW — a different base is
+# a different merge result, so the previous verdict does not carry over.
+# =============================================================================
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conflict-markers:
+    name: no conflict markers in tracked files
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # `fetch-depth: 0` is NOT needed: the lint scans the working tree via
+      # `git ls-files`, not history. The default shallow checkout is enough,
+      # and on `pull_request` it is the merge preview described above.
+      - uses: actions/checkout@v6
+
+      - name: no tracked file contains a merge-conflict marker
+        run: bash monitor/test-conflict-marker-lint.sh

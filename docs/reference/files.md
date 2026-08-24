@@ -69,7 +69,7 @@ notifications (`notify.sh`).
 | `monitor/upload-asset.sh` | Commits a local file into the asset repo's `main` branch under `assets/...`; prints a SHA-pinned URL. `ng upload` is a thin shim over this | yes |
 | `monitor/notify.sh` | Tiered Pushover / ntfy / SMTP fan-out for events GitHub can't surface | yes |
 | `monitor/spawn-worker.sh` | Worker launcher — creates the tmux window, prepends the worker floor, execs `claude --dangerously-skip-permissions` | yes |
-| `monitor/pane-state.sh` | Robust pane-state classifier (`state=<idle|busy|user-typing|autosuggest-only|empty|blocked|absent> active=<0|1>`); the helper to call instead of eyeballing `tmux capture-pane` | yes |
+| `monitor/pane-state.sh` | Robust pane-state classifier. **Eleven** states: `state=<idle\|busy\|user-typing\|autosuggest-only\|empty\|blocked\|absent\|over-limit\|working-background\|working-self-paced\|idle-orphan-async> active=<0\|1>`. `working-background` and `working-self-paced` mean the worker is ACTIVE — a caller matching a shorter list retires a live worker. The helper to call instead of eyeballing `tmux capture-pane` | yes |
 | `monitor/svc.sh` | Service cockpit (read-only dashboard) + unified service CLI: `status`, `up`, `start/stop/restart <name>`, `logs <name>` | yes |
 | `monitor/bootstrap-recover.sh` | Idempotent whole-stack recovery — relaunches an unhealthy watcher via `launcher.sh` and every unhealthy, unsupervised registry service (headless). `svc.sh up` delegates here | yes |
 | `monitor/services.registry.example` | Annotated template for the operator-local `services.registry` (one TAB-separated service per line: name, workdir, launch, healthcheck, optional logfile) | yes |
@@ -80,6 +80,7 @@ notifications (`notify.sh`).
 | `monitor/skeptic-channel.sh` | The worker↔skeptic comms channel + `await` park used by `nexus.skeptic` (await-hang marker under `.state/skeptic/pending/`) | yes |
 | `monitor/worker-heartbeat.sh` | Worker liveness writer invoked from `worker-settings.json` hooks; parses the hook payload (`.tool_name`, `.session_id`, `.notification_type`) into `heartbeat/<window>.json` | yes |
 | `monitor/declare-wait.sh` / `monitor/declare-no-wait.sh` | Worker self-declarations of an external-wait (e.g. a long Slurm job) vs. no-wait, written keyed on `$NEXUS_WORKER_WINDOW` so the idle classifier refines `idle-orphan-async` | yes |
+| `monitor/_pane-live.sh` | `_tmux_pane_is_dead` — refuse to `paste-buffer` into a dead pane; a paste into one kills the tmux SERVER (`#745`) | yes |
 | `monitor/paste-followup.sh` | Deliver a follow-up message into a running worker/orchestrator window (VI-mode-hardened load-buffer/paste-buffer pattern) | yes |
 | `monitor/user-pat.sh` | Resolves the user's `gh auth token` PAT for surfaces the bot's installation token can't reach (`ng fetch-asset`, private-package installs) | yes |
 | `monitor/_claude-bin.sh` | Shared `$CLAUDE_BIN` resolver sourced by every spawn surface: env override → `node_modules/.bin/claude` → system `claude` | yes |
@@ -128,6 +129,7 @@ surfaces against a mock backend before a version bump is promoted.
 | `monitor/cc-harness/demo.sh` | Demonstration / smoke driver for the harness | yes |
 | `monitor/cc-harness/mock-backend.py` | Mock Claude backend the harness drives so spawns run offline/deterministically | yes |
 | `monitor/cc-harness/lint-no-mass-kill.sh` | Lint guard asserting no spawn path can mass-kill windows | yes |
+| `monitor/cc-harness/lint-no-tmux-server-kill.sh` | Lint guard on the tmux-SOCKET axis: `kill-server`/`kill-session` must be provably socket-scoped (`-L`/`-S`), and a `TMUX_TMPDIR` isolation without `unset TMUX` is a no-op because `$TMUX` outranks it (#644). `--selftest` is the negative control + pragma manifest | yes |
 | `monitor/cc-harness/_lib.sh` | Shared harness helpers | yes |
 | `monitor/cc-harness/README.md` | Harness rationale + usage | yes |
 
@@ -176,7 +178,9 @@ load-bearing ones, not the full list; run the whole suite with
 
 | Test file | Covers |
 |---|---|
+| `test-paste-dead-pane-guard.sh` | `_tmux_pane_is_dead` + the paste-buffer call-site manifest + end-to-end "server survives a corpse" (`#745`); `SLOW_TESTS=1` |
 | `test-lib.sh` | `_lib.sh` standalone classifiers (`_target_window_present`, `_classify_diff`, …) |
+| `test-target-window-live.sh` | `_target_window_present` against a real tmux `remain-on-exit` corpse + session-scope check (`#741`); `SLOW_TESTS=1` |
 | `test-unstick.sh` | `_unstick.sh` cases A / B / C |
 | `test-emit-gate.sh` | Compose-report / signal-vs-noise / resurface |
 | `test-graphql-gate.sh` | `_graphql_polling_gate` cadence + bucket-floor |

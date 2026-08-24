@@ -87,7 +87,7 @@ extract=$(awk '
 ' "${hits[@]}")
 markers=$(printf '%s\n' "$extract" | grep -c '^<<< ')
 assert_eq "one provenance marker per infra report" "$markers" "2"
-if printf '%s\n' "$extract" | grep -q 'archived-bucket infra finding'; then
+if grep -q 'archived-bucket infra finding' <<<"$extract"; then
     printf '  PASS: archived bucket content present in extract\n'; PASS=$((PASS + 1))
 else
     printf '  FAIL: archived bucket content missing from extract\n' >&2; FAIL=$((FAIL + 1))

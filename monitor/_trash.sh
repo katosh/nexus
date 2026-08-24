@@ -133,6 +133,15 @@ clear_trash() {
     fi
 
     local purged=0 kept=0 held=0 entry
+    # Save/restore rather than an unconditional `shopt -u` at the tail
+    # (your-org/nexus-code#721). This file is SOURCED — by
+    # install-claude-local.sh and by all three cc-harness entry points — so a
+    # bare `shopt -u nullglob dotglob` hands the caller these options OFF
+    # regardless of how it had them, silently changing how ITS globs expand
+    # after the call returns. Same correction PR #726 made at
+    # watcher/_idle_probe.sh, and the form watcher/main.sh already uses.
+    local _restore_glob
+    _restore_glob=$(shopt -p nullglob dotglob)
     shopt -s nullglob dotglob
     for entry in "$root"/*; do
         # Skip the gitkeep / stray .nfs locks themselves — let them age out.
@@ -155,7 +164,7 @@ clear_trash() {
             purged=$((purged+1))
         fi
     done
-    shopt -u nullglob dotglob
+    eval "$_restore_glob"
     printf '_trash: cleared %d, kept %d (too new), %d still held in %s\n' \
         "$purged" "$kept" "$held" "$root"
     return 0

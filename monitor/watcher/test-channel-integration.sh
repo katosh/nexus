@@ -57,10 +57,10 @@ CLIENT="$REPO_ROOT/monitor/client/nexus-request"
 # ── SLOW gate ──────────────────────────────────────────────────────────
 if [[ -z "${SLOW_TESTS:-}" ]]; then
     echo "skipped: test-channel-integration (SLOW_TESTS unset; set SLOW_TESTS=1 to run the real-sshd round-trip)"
-    exit 0
+    exit 77   # SKIP, not PASS (your-org/nexus-code#568 A6)
 fi
 
-skip() { echo "skipped: test-channel-integration — $*"; exit 0; }
+skip() { echo "skipped: test-channel-integration — $*"; exit 77; }   # SKIP (#568 A6)
 
 # ── precondition detection (each maps to a distinct, reported skip) ────
 command -v ssh        >/dev/null 2>&1 || skip "ssh client not found on PATH"
@@ -363,8 +363,21 @@ if [[ -x "$CLIENT" ]]; then
     done
     if [[ -n "$cid" && -f "$REQ_DIR/$cid.new.md" ]]; then
         mv "$REQ_DIR/$cid.new.md" "$REQ_DIR/$cid.claimed.md"
-        NEXUS_STATE_DIR="$STATE" bash "$CHAN" reply "$cid" - < "$FX/s5.body" >/dev/null 2>&1
+        # The reply's STATUS AND STREAMS are kept, not discarded (#832). When
+        # this stanza failed in CI it reported only the downstream symptom —
+        # `nexus-request exited 2` — while the `reason=` that names the cause
+        # sat unread in $FX/s5.emit and the reply's own stderr had been sent to
+        # /dev/null along with its exit code. A CI-only failure here was
+        # therefore unactionable without a local reproduction, and each
+        # occurrence destroyed the evidence needed to accumulate a sample.
+        NEXUS_STATE_DIR="$STATE" bash "$CHAN" reply "$cid" - < "$FX/s5.body" \
+            > "$FX/s5.reply.out" 2> "$FX/s5.reply.err"
+        s5rrc=$?
         wait "$nrpid"; nrrc=$?
+        s5_fail_before=$FAIL
+        # Asserted separately from the client's rc so a server-side reply
+        # failure names ITSELF instead of surfacing as a client exit 2.
+        assert_eq "S5 server-side reply exited 0" "$s5rrc" "0"
         assert_eq "S5 nexus-request exits 0 on a replied round-trip" "$nrrc" "0"
         emit=$(cat "$FX/s5.emit" 2>/dev/null)
         assert_contains "S5 emit carries the terminal state=replied event" "$emit" "state=replied"
@@ -372,6 +385,53 @@ if [[ -x "$CLIENT" ]]; then
         # equals the source sha, the client-tool round trip is byte-exact.
         assert_contains "S5 emitted reply_sha256 == source (client-tool byte-exact)" \
             "$emit" "reply_sha256=$s5src"
+        if (( FAIL > s5_fail_before )); then
+            # Everything a reader needs to tell the candidate mechanisms apart,
+            # printed at the moment of failure because there is no second
+            # chance: the fixture dir is removed by the EXIT trap.
+            {
+                printf '  ── S5 DIAGNOSTICS (see your-org/nexus-code#832) ──\n'
+                printf '     nexus-request rc=%s  ' "$nrrc"
+                case "$nrrc" in
+                    0) printf '(replied|acked)\n' ;;
+                    2) printf '(state=failed — the reason= below is the cause)\n' ;;
+                    3) printf '(state=timeout — lifetime budget exhausted, still pending)\n' ;;
+                    64) printf '(usage error — bad invocation, not a channel fault)\n' ;;
+                    143) printf '(terminated by signal — no emit)\n' ;;
+                    *) printf '(undocumented — an ABORT, so there may be NO emit at all)\n' ;;
+                esac
+                printf '     server-side `reply` rc=%s\n' "$s5rrc"
+                _rest=$(find "$REQ_DIR" -maxdepth 1 -name "$cid.*.md" 2>/dev/null \
+                            | sed 's|.*/||' | tr '\n' ' ')
+                printf '     request came to rest as: %s\n' \
+                    "${_rest:-(NO file for this id — it resolved to nothing)}"
+                # Each dump says so EXPLICITLY when it has nothing to show. An
+                # absent emit is the single most diagnostic outcome here — it
+                # separates "the client emitted a failure" from "the client
+                # ABORTED before emitting" — and a silently empty section
+                # renders those two identically. That conflation is the defect
+                # this whole change exists to remove; reproducing it inside the
+                # remedy is the #707 shape.
+                for _sec in "client emit:$FX/s5.emit" \
+                            "client stderr:$FX/s5.stderr" \
+                            "reply stderr:$FX/s5.reply.err"; do
+                    _lbl=${_sec%%:*}; _f=${_sec#*:}
+                    printf '     --- %s (%s) ---\n' "$_lbl" "$_f"
+                    if [[ -s "$_f" ]]; then
+                        sed 's/^/       /' "$_f" 2>/dev/null
+                    elif [[ -e "$_f" ]]; then
+                        printf '       (present but EMPTY)\n'
+                    else
+                        printf '       (ABSENT — never created)\n'
+                    fi
+                done
+                # Load belongs beside any timing reading: #832 was filed against
+                # an IDLE runner, and that measurement is what ruled contention
+                # out. A future occurrence needs the same number to be readable.
+                printf '     ambient load: %s\n' \
+                    "$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo unknown)"
+            } >&2
+        fi
     else
         # Could not drive the client tool without editing it → report a GAP, do
         # not leave the background process dangling.

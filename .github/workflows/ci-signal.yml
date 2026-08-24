@@ -1,0 +1,316 @@
+name: ci-signal
+
+# =============================================================================
+# THE ONE WORKFLOW THAT MUST NEVER BE FILTERED (<your-org>/nexus-code#604)
+#
+# `on: pull_request: branches: [...]` filters the PR's BASE branch. Every other
+# workflow in this repo carries such a filter, so a PR based on a FEATURE
+# branch matches none of them, collects ZERO checks, and GitHub renders that
+# state identically to "all checks passed" — MERGEABLE, no red, nothing to
+# click past, and an empty `statusCheckRollup` that any merge-when-green
+# automation reads as success. #593 sat in exactly that state.
+#
+# This workflow therefore declares NO `branches:` filter and NO `paths:`
+# filter, deliberately. It runs on every pull request into every base, so the
+# check set is never empty, and it recomputes from the workflow sources which
+# workflows SHOULD have gated this change — turning "no checks ran" into a
+# RED check with a name, instead of a silence.
+#
+# Adding a `branches:` or `paths:` filter here would trigger-gap the
+# trigger-gap detector out of existence. That is not left to good intentions:
+# monitor/ci-trigger-audit.py audits THIS FILE for those keys (SELF-BROKEN)
+# and monitor/test-ci-trigger-audit.sh fails if the audit stops catching it.
+#
+# `types:` includes `edited` on purpose. Changing a PR's base emits ONLY the
+# `edited` event — not `synchronize` — so a PR retargeted from a feature
+# branch onto `dev` would otherwise keep its stale, empty verdict forever.
+#
+# IT ALSO CHECKS THAT A GREEN IS A FIRST-PASS GREEN (<your-org>/nexus-code#748).
+# Everything above is about check sets that are EMPTY when they look full. The
+# adjacent failure is a check set that is full and whose greens are not the
+# first answer the head gave: `GET /actions/runs`, `gh run list` and the
+# check-runs API all return only the LATEST attempt, so a band that concluded
+# `failure` and was re-run to `success` at the same sha is byte-identical to
+# one that passed first time. At head d4df844f the SLOW band did exactly that
+# and read as clean to every tool in this repo; the red was found only by
+# enumerating attempts by hand.
+#
+# That is a genuinely different failure from the ones above, not a variant, and
+# the distinction is load-bearing: this repo's enumeration discipline — every
+# expected band named and `success` — defeats a MISSING verdict and is
+# structurally blind to a REPLACED one, because the band IS named and IS
+# `success`. So the audit reports REPLACED-VERDICT separately (exit 6) and
+# ranks it last, which makes exit 6 mean "the check set is otherwise clean and
+# the thing wrong with it is the retry".
+# =============================================================================
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+  actions: read        # list workflow runs for the head sha
+  pull-requests: read  # list the PR's changed files
+
+concurrency:
+  group: ci-signal-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ci-signal:
+    name: CI signal present
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: collect this PR's changed files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" \
+              --paginate --jq '.[].filename' > /tmp/changed-files.txt
+          echo "changed files: $(wc -l < /tmp/changed-files.txt)"
+          sed 's|^|  |' /tmp/changed-files.txt
+
+      - name: audit the trigger set against the runs GitHub recorded
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # `+e` EXPLICITLY, and it is load-bearing (found by <your-org>/nexus-code
+          # #762's own PR going red). GitHub's default shell for a `run:` block
+          # is `bash -e {0}`, so errexit is ON before this script's first line.
+          # `set -uo pipefail` does not turn it off. The audit below runs as
+          # `python3 … | tee`, so under errexit+pipefail a non-zero audit
+          # ABORTED THE STEP AT THE PIPELINE — before `rc=${PIPESTATUS[0]}`, and
+          # therefore before the whole rc-dispatch `case`.
+          #
+          # That case has consequently been DEAD CODE for every non-zero rc: the
+          # step went red with the audit's exit status, and not one of its
+          # `::error::ci-signal: …` explanations was ever emitted. The red was
+          # right and the sentence telling a reader WHY was silently dropped —
+          # this repo's own defect class (an absence that looks like nothing is
+          # missing) living in the guard written against it.
+          #
+          # Measured, not reasoned:
+          #   bash -e -c 'set -uo pipefail; (exit 3)|tee /dev/null; echo REACHED'
+          #     → prints nothing, exits 3
+          #   bash    -c 'set -uo pipefail; (exit 3)|tee /dev/null; echo REACHED'
+          #     → prints REACHED
+          #
+          # The poll loop and the dispatch below both assume they get to inspect
+          # `rc` themselves, so this step owns its error handling outright.
+          set +e -uo pipefail
+          # A workflow that SHOULD fire registers its run within seconds of the
+          # same event, but "seconds" is not "instantly" and this job races it.
+          # So: re-audit on a bounded poll, and ONLY for the retryable verdict
+          # (exit 4 = NO VERDICT: no run yet, OR a non-verdict run that a real
+          # run may still supersede. Its third member, UNEXECUTED-RUN (#846),
+          # is exit 4 too and is explicitly EXCLUDED from the poll below.)
+          # A TRIGGER-GAP (exit 1) is a property of
+          # the PR's shape, and a FAILED (exit 5) is a terminal verdict — both
+          # are settled, so retrying either would only delay the red.
+          deadline=$(( SECONDS + 180 ))
+          while :; do
+            # monitor/ci-observed-runs.jq EXTRACTS every run for this head sha
+            # as `path<TAB>status<TAB>conclusion<TAB>run_attempt<TAB>run_id`;
+            # the audit then applies the
+            # #628 verdict invariant (only success/failure count; skipped/
+            # cancelled/timed_out/absent are RED; a failure is distinct).
+            # Reading the extractor from that file rather than inlining it is
+            # what lets monitor/test-ci-trigger-audit.sh exercise the REAL
+            # expression instead of a copy that can drift away from it.
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${HEAD_SHA}&per_page=100" \
+                > /tmp/runs.json || echo '{"workflow_runs":[]}' > /tmp/runs.json
+            jq -r -f monitor/ci-observed-runs.jq < /tmp/runs.json > /tmp/raw-observed.txt \
+                || : > /tmp/raw-observed.txt
+            # Resolve what the SUPERSEDED attempts of any re-run concluded
+            # (#748). `/actions/runs` returns only the LATEST attempt, so a
+            # band that failed and was re-run green is byte-identical here to
+            # one that passed first time — the d4df844f near-miss. The
+            # extractor carries `run_attempt` for free; this step spends one
+            # API call per superseded attempt (zero on the overwhelmingly
+            # common all-attempt-1 head) to say what was replaced.
+            #
+            # NOT `|| : > /tmp/observed.txt`. Falling back to an EMPTY file
+            # would turn an enrichment failure into "no runs observed at all",
+            # i.e. MISSING-RUN for every gating workflow — a confident wrong
+            # answer. Falling back to the UNENRICHED rows is the honest
+            # degradation: the audit still applies the whole #628 verdict
+            # invariant and reports attempt provenance as UNSUPPLIED (a note
+            # saying "not checked"), rather than as verified-clean.
+            if ! bash monitor/ci-attempt-history.sh \
+                     --repo "${GITHUB_REPOSITORY}" \
+                     --observed /tmp/raw-observed.txt > /tmp/observed.txt; then
+              echo "::warning::ci-attempt-history failed; auditing WITHOUT attempt provenance (retries will read as UNSUPPLIED, not as clean)"
+              cp /tmp/raw-observed.txt /tmp/observed.txt
+            fi
+
+            # Did each `failure` EXECUTE anything (<your-org>/nexus-code#846)? A
+            # run GitHub aborted before assigning a runner — an account-billing
+            # block, a quota refusal, a startup failure — concludes `failure`
+            # with `steps: []`, and the audit used to call that a real red and
+            # send the reader into their own diff. Costs ZERO calls on a head
+            # with no failing run, which is every green head.
+            #
+            # Same honest-degradation shape as the block above, and for a
+            # sharper reason: falling back to the UNENRICHED rows leaves the
+            # execution column ABSENT, which the audit reads as `unknown`,
+            # which keeps every `failure` RED. So this step can only ever cost
+            # a worse MESSAGE, never a softer VERDICT. That direction is not
+            # incidental — it is the whole design of #846.
+            if bash monitor/ci-run-execution.sh \
+                     --repo "${GITHUB_REPOSITORY}" \
+                     --observed /tmp/observed.txt > /tmp/observed-exec.txt; then
+              mv /tmp/observed-exec.txt /tmp/observed.txt
+            else
+              echo "::warning::ci-run-execution failed; auditing WITHOUT execution evidence (a failure that executed zero steps will read as a real red, not as the CI-plumbing gap it is)"
+            fi
+
+            python3 monitor/ci-trigger-audit.py \
+                --workflows-dir .github/workflows \
+                --base-ref "$BASE_REF" \
+                --changed-files /tmp/changed-files.txt \
+                --observed /tmp/observed.txt \
+                --self-workflow ci-signal.yml | tee /tmp/audit.txt
+            rc=${PIPESTATUS[0]}
+
+            # An UNEXECUTED-RUN is exit 4 but is NOT the state this poll was
+            # sized for (<your-org>/nexus-code#846). Exit 4 is polled because "a
+            # run has not REGISTERED yet" resolves in seconds. A run that
+            # registered, was labelled `failure` and never started a job has
+            # already resolved — waiting cannot change it, because the cause is
+            # an account or runner-supply problem outside this repo. Polling it
+            # would burn 180s and a dozen API calls to re-read a settled fact,
+            # during an incident that is already costing everyone time. Same
+            # reasoning that exempts rc 3 below; different mechanism, so it is
+            # checked separately rather than folded in.
+            if (( rc == 4 )) && grep -q '^UNEXECUTED-RUN: ' /tmp/audit.txt; then
+              echo "--- a gating run concluded \`failure\` having executed ZERO steps; this will not resolve by waiting, so NOT polling ---"
+              break
+            fi
+            if (( rc == 4 )) && (( SECONDS < deadline )); then
+              echo "--- a gating run has not registered yet; re-auditing in 15s ---"
+              sleep 15
+              continue
+            fi
+            # rc 3 (NOT CONCLUDED, <your-org>/nexus-code#762) deliberately does
+            # NOT poll. Exit 4 is "a run has not REGISTERED", which resolves in
+            # seconds and is what this bounded poll was sized for. Exit 3 is "a
+            # run has not FINISHED", which takes the tens of minutes a suite
+            # takes — longer than this job's own 10-minute timeout. Polling it
+            # would convert a correct verdict into a timeout.
+            break
+          done
+
+          # WHY rc 3 IS NOT RED HERE, stated rather than left to the reader
+          # (<your-org>/nexus-code#762).
+          #
+          # This workflow is a PEER check-run, racing its siblings by design: it
+          # finishes in about a minute and the bands it audits take tens of
+          # minutes, so "a gating band is still in progress" is the NORMAL state
+          # at the moment this job reads. Treating it as a failure would redden
+          # ci-signal on essentially every PR in this repo, which is how a guard
+          # gets muted.
+          #
+          # The boundary that makes this honest is the one #762 drew: this check
+          # asserts that the check set is PRESENT AND HONEST — no band missing,
+          # none trigger-gapped, no verdict replaced — and it does NOT assert
+          # that the head is cleared to merge. The reader who needs the OTHER
+          # question answered — "is this head finished and green?" — has
+          # `ng ci-attempts <PR>`, which maps this same exit 3 to a REFUSAL to
+          # clear, because it is read on the merge path and this is not.
+          #
+          # WHAT ACTUALLY MAKES THE MAPPING SAFE — and what does NOT.
+          #
+          # This comment used to add: "the pending bands carry their own
+          # required check-runs and GitHub's own gate independently blocks the
+          # button on them." BOTH HALVES ARE FALSE on this repository, and the
+          # sentence was inherited verbatim from issue #762's own text. Measured
+          # three ways: `branches/{dev,main}` report `protected: false` with
+          # `required_status_checks.contexts: []`; `rulesets` and
+          # `rules/branches/{dev,main}` all return `[]`; and a live PR carrying
+          # SIX `failure` check-runs reports `mergeable_state: unstable` — not
+          # `blocked` — i.e. the merge button is available. Nothing is required
+          # here, so there is no independent gate to invoke. Citing one, in a
+          # change whose whole thesis is that a stated property nothing checks
+          # is this repo's dominant defect, was that defect.
+          #
+          # The mapping is still right, on TWO grounds that are actually true:
+          #
+          #   1. STRUCTURAL. Exit 3 is reachable only from inside the audit's
+          #      `if not findings:` branch, so a pending band cannot mask an
+          #      absent one — an absent band is exit 4 and exit 4 is RED here.
+          #      And PENDING is only ever assigned to a workflow with an
+          #      OBSERVED run that is not yet `completed`, so the runs provably
+          #      exist and are visibly in flight on every surface showing the PR.
+          #   2. PROPORTIONALITY. This job finishes in about a minute and the
+          #      bands take tens of minutes, so pending is the NORMAL state at
+          #      read time; failing on it would redden ci-signal on essentially
+          #      every PR, which mutes the guard.
+          #
+          # The consequence of the deleted sentence is worth stating plainly,
+          # because it makes the other half of #762 MORE load-bearing, not less:
+          # `ng ci-attempts` returning 3 is not a second line of defence, it is
+          # the ONLY one. Nothing downstream reads this check's conclusion as a
+          # merge clearance, and nothing should start.
+          if (( rc == 3 )); then
+            echo "::notice::ci-signal: the check set is present and honest; some gating bands have not concluded yet. That is expected — this check runs concurrently with them and does NOT wait. Their own check-runs carry the pass/fail; this check is not a merge clearance, and nothing on this repo is a required check, so it is not a gate either. For the merge question use \`ng ci-attempts <PR>\`, where this same state is a refusal."
+            # RETURN, do not fall through. Rewriting rc to 0 and dropping into
+            # the case below would ALSO print the rc-0 arm — "every gating
+            # workflow that has CONCLUDED carries a success verdict" — which is
+            # the vacuous quantifier this entire change exists to delete,
+            # printed underneath the honest notice that contradicts it.
+            exit 0
+          fi
+
+          # UNGATED (<your-org>/nexus-code#856). Every workflow that fired is
+          # green and NOT ONE was selected by what this diff changed — the
+          # bands that ran carry no `paths:` filter and cannot read these
+          # files. Handled here rather than in the `case` below for the same
+          # reason rc 3 is: falling through would also print the rc-0 arm, and
+          # "every gating workflow carries a success verdict" is exactly the
+          # vacuously-true sentence this exit code exists to stop printing.
+          #
+          # A WARNING, NOT AN ERROR, and the asymmetry is deliberate. A
+          # docs-only PR legitimately needs no suite, so reddening it would
+          # train readers to ignore this check — the same proportionality
+          # argument that keeps rc 3 green. But it is NOT silent either: the
+          # warning names the uncovered files, so "this change was examined by
+          # nothing" appears on the PR page instead of being inferred from a
+          # green tick. The merge decision belongs to `ng ci-attempts`, where
+          # this state is a refusal.
+          if (( rc == 8 )); then
+            echo "::warning::ci-signal: UNGATED — no workflow's \`paths:\` filter matched this diff, so NO suite examined the files it changes. The green checks beside this one fire on every PR and say nothing about these files. That may be correct (a docs-only change needs no suite) or it may be a \`paths:\` filter that never learned about this directory — this check cannot tell those apart, and both look identical from the outside. The audit above NAMES the uncovered files. For the merge question use \`ng ci-attempts <PR>\`, where this state is a refusal."
+            exit 0
+          fi
+
+          case "$rc" in
+            0) echo "::notice::ci-signal: every gating workflow has CONCLUDED and carries a success verdict for this head sha, and none is missing, gapped or replaced." ;;
+            1) echo "::error::ci-signal: this PR has LESS CI than it appears to have — see the audit above." ;;
+            2) echo "::error::ci-signal: the audit REFUSED to run (unparsed input). This is fail-closed by design." ;;
+            4) echo "::error::ci-signal: a gating workflow has NO VERDICT on this head sha (no run, or a run concluded skipped/cancelled/timed_out/…). The absence of a verdict is RED." ;;
+            5) echo "::error::ci-signal: a gating workflow FAILED on this head sha — a real red verdict, not an absence. Read the failing run's logs." ;;
+            6) echo "::error::ci-signal: every gating workflow is green, but one of those greens REPLACED an earlier \`failure\` at this same sha (or its provenance could not be read). A retried green is not a first-pass green. Decide whether the superseded red was a flake or a real defect, fix it, and push — re-running this check cannot clear it." ;;
+            *) echo "::error::ci-signal: unexpected audit exit $rc" ;;
+          esac
+          exit "$rc"
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo '## ci-signal'
+            echo
+            echo 'This check exists so that "no checks ran" can never look like'
+            echo '"all checks passed" (<your-org>/nexus-code#604).'
+            echo
+            echo '```'
+            cat /tmp/audit.txt 2>/dev/null || echo '(audit produced no output)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -130,6 +130,24 @@ Newly opened, awaiting merge:
   block from `spawn-worker.sh` only when an actual next skeptic is
   spawned. In-flight `<operator>/skeptic-marker-cleanup`. Move up into the
   Resolved table with the merge commit when it lands.
+- 2026-07-24 — **dead shell functions** left behind by refactors: two
+  provably-uncalled helpers in `monitor/_remote_lib.sh`
+  (`_remote_enroll_marker`, dead-from-birth — its `enroll-<hash>@nexus-
+  remote` marker is inlined at every call site; and
+  `_remote_pending_token_exists`, orphaned when the AuthorizedKeysCommand
+  gate was retired to a fail-closed tombstone in `2c124ec`), plus the
+  test-only `_reemit_acked_live` back-compat shim in
+  `monitor/watcher/_reemit.sh` (production caller superseded by the
+  three-way `_reemit_reaction_state` in `6417849`/`#360`). Neither remote
+  deletion touches a live security invariant; the shim's live-ack
+  behaviour is covered through the production `_reemit_gc` path.
+  Enumerated in `reports/nexus-usage_2026-07-24_144705_unused-parts.md`
+  (Tier 0) and skeptic-validated CREDIBLE-WITH-CAVEATS in
+  `reports/<your-nexus>-usage_2026-07-24_150325_skeptic-deadcode-verdict.md`.
+  In-flight `<operator>/cleanup-563-deadcode`
+  (`<your-org>/nexus-code#565`, not auto-merged — gated on operator
+  review). Move up into the Resolved table with the merge commit when it
+  lands.
 
 **Current open backlog.** As of 2026-06-17 the authoritative
 open-infrastructure backlog is the fleet meta-review at

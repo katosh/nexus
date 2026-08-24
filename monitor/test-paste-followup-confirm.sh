@@ -68,7 +68,7 @@ assert_not_contains() {
     fi
 }
 
-command -v jq >/dev/null 2>&1 || { echo "skipped: jq not on PATH"; exit 0; }
+command -v jq >/dev/null 2>&1 || { echo "skipped: jq not on PATH"; exit 77; }   # SKIP (#568 A6)
 
 # ---- harness -------------------------------------------------------------
 WORK=$(mktemp -d)
@@ -113,7 +113,10 @@ case "${1:-}" in
       # -F <fmt>
       fmt=""
       while (( $# )); do [[ "$1" == "-F" ]] && { fmt="${2:-}"; break; }; shift; done
-      if [[ "$fmt" == *window_id* ]]; then printf '@1\t%s\n' "$STUB_WINDOW"
+      if [[ "$fmt" == *window_id* ]]; then
+          # Delimiter EXTRACTED from the requested format (your-org/nexus-code#699).
+          d="${fmt#*'#{window_id}'}"; d="${d%%'#{window_name}'*}"
+          printf '@1%s%s\n' "$d" "$STUB_WINDOW"
       else printf '%s\n' "$STUB_WINDOW"; fi
       exit 0 ;;
   send-keys)

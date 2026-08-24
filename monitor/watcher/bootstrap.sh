@@ -37,6 +37,11 @@ _cfg="$_nexus_root/config/load.sh"
 # shellcheck source=_lib.sh
 source "$_script_dir/_lib.sh"
 
+# Cold-boot dropped-worker manifest (nexus-code#651). Delivered on stdout
+# below, alongside the missed diffs. Side-effect-free on source.
+# shellcheck source=../_dropped_manifest.sh
+source "$_script_dir/../_dropped_manifest.sh"
+
 # `$NEXUS_ROOT` and `$NEXUS_STATE_DIR` are honored so tests can pin
 # everything to a tmpdir without touching the operator's real tree.
 # `main.sh` already honors `$NEXUS_ROOT` the same way; this keeps
@@ -133,7 +138,7 @@ write_incident_report() {
     [[ -f "$STATE_DIR/watcher.log" ]] && log_tail=$(tail -40 "$STATE_DIR/watcher.log")
     local pane_tail="(tmux unavailable or window missing)"
     if command -v tmux >/dev/null 2>&1 \
-       && tmux list-windows -F '#{window_name}' 2>/dev/null | grep -qxF watcher; then
+       && grep -qxF watcher <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"; then
         pane_tail=$(tmux capture-pane -t watcher -p -S -80 2>/dev/null || echo "(capture-pane failed)")
     fi
     cat > "$report" <<EOF
@@ -256,6 +261,24 @@ if (( respawn_needed == 1 )); then
         "$recover_bin" --services-only >&2 \
             || log "bootstrap-recover.sh exited nonzero (rc=$?)"
     fi
+fi
+
+# --- (1b) cold-boot dropped-worker manifest -------------------------------
+#
+# your-org/nexus-code#651. A cold boot (`./watcher` with no `--continue`)
+# resurrects no workers and leaves a manifest of what it dropped. The
+# normal delivery is the situation report pasted into the freshly spawned
+# orchestrator; this is the backstop for every other way an orchestrator
+# can arrive at turn 1 — the watcher's own absent-target respawn, an
+# operator-started session, a spawn whose paste failed. Stdout is exactly
+# the right channel: it is already the on-wake context feed, and
+# agent-prompt.md makes this script the first action of every wake.
+#
+# Once-only by marker, and printed BEFORE the diffs so it is not buried
+# under a long catch-up.
+if _dropped_manifest_deliver "$STATE_DIR"; then
+    printf '\n'
+    log "delivered the cold-boot dropped-worker manifest ($(_dropped_manifest_path "$STATE_DIR"))"
 fi
 
 # --- (2) missed diffs -----------------------------------------------------

@@ -11,10 +11,27 @@
 # state are fixture-local (NEXUS_SERVICES_REGISTRY / NEXUS_STATE_DIR) —
 # the operator's live registry is never touched.
 #
-# Run: bash monitor/watcher/test-jupyter-service.sh
+# Run: bash monitor/watcher/test-jupyter-service.sh   (SLOW_TESTS=1 to enable)
 # Expected: ALL TESTS PASSED on stdout, exit 0.
-
+#
+# SLOW-GATED (your-org/nexus-code#558). This is a real-server integration
+# test in unit clothing: `start` spawns real token-checking HTTP servers on
+# real sockets, and the watchdog/rotation/squatter cases depend on a live
+# supervisor loop noticing a death and rebinding within a deadline. Under a
+# CPU-starved runner (`--jobs 4` on 2 vCPU) that supervisor is slow enough
+# that even load-scaled deadlines flake, and the squatter case additionally
+# races the watchdog's restart against a fresh python's bind — genuinely
+# timing/resource-dependent behaviour, exactly the tier-(c) "SLOW-gate it"
+# case. It must NOT sit in the fast band that gates every PR (that IS #558).
+# The disjoint-port-band fix and the squatter happens-before anchor below
+# harden it for when it DOES run — under SLOW_TESTS=1, i.e. the scheduled
+# full-suite job (your-org/nexus-code#559), where real-server tests belong.
 set -uo pipefail
+
+if [[ "${SLOW_TESTS:-0}" != "1" ]]; then
+    echo "skipped: test-jupyter-service (real-server watchdog/rotation timing; SLOW_TESTS=1 to run — #558)"
+    exit 77   # SKIP, not PASS (your-org/nexus-code#568 A6)
+fi
 
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 . "$_test_dir/_test_helpers.sh"
@@ -77,6 +94,25 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(('127.0.0.1', PORT), H).serve_forever()
 PY
 
+# Per-test-process port band (your-org/nexus-code#558). The stub used a
+# HARD-CODED base port 8888 and scanned only [8888,8897]. `test-jupyter-service`
+# and `test-labsh-phantom-adopt` BOTH used that identical window, so when the
+# runner scheduled them concurrently (`--jobs N`) they contended for the same
+# 10 ports — and this file's squatter test deliberately OCCUPIES one of them,
+# so the neighbour grabbing the rest exhausts the window and a restart genuinely
+# cannot rebind. That is a resource collision, not a slow host: a bigger
+# deadline cannot free a port the other test is holding (reproduced ~25% under
+# forced concurrency; the four failing assertions were all port-bind ones).
+# Fix: give each test FILE a disjoint band, jittered by PID so even two
+# instances of the same file rarely overlap, and widen the per-server scan so
+# the squatter + several project servers all fit. `LABSH_STUB_BASE_PORT`
+# expands here (write-time) into the stub, so no env-propagation dependency.
+# This file: 20000-band. test-labsh-phantom-adopt.sh: 40000-band.
+# fixture-port-lint: allow-scan-base  the stub written below bind-probes
+# [base, base+40) and uses the first port bind() accepts, so this number is a
+# scan START, not a port anything binds directly (your-org/nexus-code#800).
+LABSH_STUB_BASE_PORT=$(( 20000 + ($$ % 8000) ))
+
 cat > "$STUBS/labsh" <<STUB
 #!/usr/bin/env bash
 # Stub labsh: project-local state under \$PWD/.jupyter, same contract
@@ -91,15 +127,17 @@ case "\${1:-}" in
   start)
     shift
     if alive; then echo "labsh-stub: server is already running" >&2; exit 1; fi
-    port=8888
+    port=${LABSH_STUB_BASE_PORT}
     while (( \$# > 0 )); do case "\$1" in --port) port="\$2"; shift 2 ;; *) echo "\$1" >> "\$J/stub-start-args"; shift ;; esac; done
     mkdir -p "\$J"
     [[ -f "\$J/token" ]] || printf 'stubtok-%s' "\$RANDOM" > "\$J/token"
-    # labsh auto-increment: first free port in [port, port+9]
+    # labsh auto-increment: first free port in [port, port+39] (widened from
+    # 10 for #558 — the squatter test occupies one, and a per-file band leaves
+    # room for several project servers without spilling into a neighbour's band)
     port=\$(python3 - "\$port" <<'EOF'
 import socket, sys
 p = int(sys.argv[1])
-for q in range(p, p + 10):
+for q in range(p, p + 40):
     s = socket.socket()
     try: s.bind(('127.0.0.1', q)); s.close(); print(q); break
     except OSError: s.close()
@@ -160,7 +198,13 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$STUBS/uv"; chmod +x "$STUBS/uv"
 export PATH="$STUBS:$PATH"
 
 wait_for() {  # wait_for <label> <deadline-s> -- cmd...
-    local label="$1" deadline="$2"; shift 3
+    # Deadlines below are UNLOADED seconds; th_deadline scales them for the
+    # contention this run actually faces (your-org/nexus-code#558 — this
+    # file was green 93/93 standalone and failed every `--jobs 4` full-suite
+    # run purely because its ceilings were sized on an idle host). Polling
+    # returns the instant the predicate holds, so scaling up costs nothing
+    # on a green run.
+    local label="$1" deadline; deadline=$(th_deadline "$2"); shift 3
     local t=0
     while (( t < deadline * 4 )); do
         "$@" >/dev/null 2>&1 && { printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 )); return 0; }
@@ -169,15 +213,73 @@ wait_for() {  # wait_for <label> <deadline-s> -- cmd...
     printf '  FAIL: %s (deadline %ss)\n' "$label" "$deadline" >&2; FAIL=$(( FAIL + 1 )); return 1
 }
 
-reg_rows() { grep -c . "$NEXUS_SERVICES_REGISTRY" 2>/dev/null || echo 0; }
-sup_pid()  { cat "$NEXUS_STATE_DIR/services/$1.pid" 2>/dev/null; }
+# blocked_by <precondition-label> <dependent-label>...
+#
+# A TIMED-OUT PRECONDITION MUST NOT BE REPORTED AS A VALUE MISMATCH
+# (your-org/nexus-code#749). `wait_for` returns 1 on timeout and the script
+# carries on, so the assertions that follow it evaluate STALE state and fail on
+# their values. That is what the d4df844f SLOW band actually printed:
+#
+#     FAIL: server back on a new port (deadline 20s)
+#     FAIL: env port moved past the squatter — got 0 want 1
+#     FAIL: healthy again after rotation (deadline 20s)
+#     FAIL: rotation forced exactly one restart — got 2 want 3
+#
+# Two of those four are the timeout; the other two are the timeout WEARING A
+# PRODUCT REGRESSION'S CLOTHES. "rotation forced exactly one restart — got 2
+# want 3" reads as the rotation logic being broken, and it is not — the
+# rotation simply had not happened yet when the assertion sampled it. A reader
+# triaging that output goes looking for a bug in code that is fine.
+#
+# So the dependents are SKIPPED and reported as blocked. The count is
+# deliberately preserved — one FAIL per dependent, exactly as if it had run —
+# because a suite whose assertion total silently drops when a precondition
+# times out is a suite that can be quieted by breaking it earlier.
+blocked_by() {
+    local pre="$1" dep
+    shift
+    for dep in "$@"; do
+        printf '  FAIL: %s — NOT EVALUATED (precondition timed out: %s)\n' \
+            "$dep" "$pre" >&2
+        FAIL=$(( FAIL + 1 ))
+    done
+    return 0
+}
+
+# `|| true`, not `|| echo 0`: `grep -c` already prints `0` on no match and
+# exits 1, so the echo appended a SECOND value ("0\n0") — issue #725.
+reg_rows() { grep -c . "$NEXUS_SERVICES_REGISTRY" 2>/dev/null || true; }
+# `read -r`, NOT `cat`: the supervisor pidfile is a three-line IDENTITY record
+#
+#     32200
+#     ns=pid:[4026533826]
+#     start=681451272
+#
+# since bcf9e3a (the #606 orphan-reconcile work) — the ns/start lines are what
+# let a pid be distinguished from a recycled one across a container restart.
+# Line 1 is the pid and is bare BY CONTRACT; `_recover_launch_service` says so
+# in as many words ("every legacy reader does `read -r pid < pidfile`, so it
+# must stay first and bare"). This helper predates the format (2026-06-10 vs
+# 2026-07-29) and kept `cat`ing the whole record, so every caller received
+# $'32200\nns=…\nstart=…' where it expected a number (your-org/nexus-code#729).
+# The writer is correct and the reader is what moves.
+sup_pid()  {
+    # `[[ -r ]]` first, NOT `read … 2>/dev/null`: a redirection failure is
+    # reported by the SHELL, not by the command, so redirecting `read`'s
+    # stderr cannot suppress it and a missing pidfile would print a spurious
+    # "No such file or directory" (your-org/nexus-code#723, same remedy shape).
+    local p="" _f="$NEXUS_STATE_DIR/services/$1.pid"
+    [[ -r "$_f" ]] && read -r p < "$_f"
+    printf '%s' "$p"
+}
 
 # wait_gone <label> <deadline-s> <pid> — event-anchored process-death wait
 # (replaces fixed sleeps before liveness assertions: under CI load a kill
 # can take longer than a guessed sleep to land, and a too-long sleep just
 # wastes wall time on every run).
 wait_gone() {
-    local label="$1" deadline="$2" pid="$3" t=0
+    local label="$1" deadline pid="$3" t=0
+    deadline=$(th_deadline "$2")
     # An empty/garbage pid must FAIL, not vacuously pass: `kill -0 ""` is rc 1,
     # which would read as "gone" and silently green the assertion if a future
     # change stopped writing the pidfile this pid came from.
@@ -264,8 +366,11 @@ assert_eq "wrong token → unhealthy (squatter cannot pass)" "$(( out != 0 ))" "
 # --- watchdog: server death → bounce ----------------------------------------------
 echo '=== watchdog bounces a dead server ==='
 kill "$(cat "$WORK/proj1/.jupyter/stub.pid")" 2>/dev/null
-wait_for "server restarted by watchdog" 20 -- "$HEALTH" "$WORK/proj1"
-assert_eq "start-count incremented" "$(cat "$WORK/proj1/.jupyter/stub-start-count")" "2"
+if wait_for "server restarted by watchdog" 20 -- "$HEALTH" "$WORK/proj1"; then
+    assert_eq "start-count incremented" "$(cat "$WORK/proj1/.jupyter/stub-start-count")" "2"
+else
+    blocked_by "server restarted by watchdog" "start-count incremented"
+fi
 
 # --- watchdog: port stolen while down → auto-increment + env follow ----------------
 echo '=== preferred port stolen → server moves, env file follows ==='
@@ -273,9 +378,35 @@ old_port=$(cat "$WORK/proj1/.jupyter/stub.port")
 kill "$(cat "$WORK/proj1/.jupyter/stub.pid")" 2>/dev/null
 python3 "$STUBS/stub-server.py" "$old_port" SQUATTER >/dev/null 2>&1 &
 SQUAT_PID=$!
-wait_for "server back on a new port" 20 -- "$HEALTH" "$WORK/proj1"
-new_port=$(sed -n 's/^PORT=//p' "$WORK/proj1/.jupyter/labsh-service.env")
-assert_eq "env port moved past the squatter" "$(( new_port != old_port ))" "1"
+# Happens-before: the squatter must actually HOLD old_port before we assert
+# the watchdog's restart moved past it. Otherwise, under a slow runner, a
+# fresh python's bind races the watchdog and the restart can reclaim the
+# still-free old_port → new_port == old_port, a false failure
+# (your-org/nexus-code#558 residual). Poll until old_port is occupied.
+port_held=0
+for _ in $(seq 1 $(( $(th_deadline 10) * 10 )) ); do
+    # python exits 0 when old_port is HELD (bind raises OSError), 1 when free.
+    if python3 -c 'import socket,sys
+s=socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1]))); s.close(); sys.exit(1)  # free
+except OSError:
+    sys.exit(0)  # held' "$old_port"; then
+        port_held=1; break
+    fi
+    sleep 0.1
+done
+(( port_held == 1 )) || { printf '  FAIL: squatter never bound old_port %s\n' "$old_port" >&2; FAIL=$(( FAIL + 1 )); }
+if wait_for "server back on a new port" 20 -- "$HEALTH" "$WORK/proj1"; then
+    new_port=$(sed -n 's/^PORT=//p' "$WORK/proj1/.jupyter/labsh-service.env")
+    assert_eq "env port moved past the squatter" "$(( new_port != old_port ))" "1"
+else
+    # The exact pair that printed "got 0 want 1" at d4df844f: with the restart
+    # still pending, labsh-service.env still names old_port, so the assertion
+    # reports the watchdog failing to move the port — a claim about the product
+    # — when what actually happened is that it had not moved it YET.
+    blocked_by "server back on a new port" "env port moved past the squatter"
+fi
 kill "$SQUAT_PID" 2>/dev/null
 wait "$SQUAT_PID" 2>/dev/null   # reap quietly (no job-control noise)
 
@@ -283,9 +414,15 @@ wait "$SQUAT_PID" 2>/dev/null   # reap quietly (no job-control noise)
 echo '=== token rotation → bounce → healthy with new token ==='
 starts_before=$(cat "$WORK/proj1/.jupyter/stub-start-count")
 printf 'rotated-%s' "$RANDOM" > "$WORK/proj1/.jupyter/token"
-wait_for "healthy again after rotation" 20 -- "$HEALTH" "$WORK/proj1"
-assert_eq "rotation forced exactly one restart" \
-    "$(cat "$WORK/proj1/.jupyter/stub-start-count")" "$(( starts_before + 1 ))"
+if wait_for "healthy again after rotation" 20 -- "$HEALTH" "$WORK/proj1"; then
+    assert_eq "rotation forced exactly one restart" \
+        "$(cat "$WORK/proj1/.jupyter/stub-start-count")" "$(( starts_before + 1 ))"
+else
+    # "rotation forced exactly one restart — got 2 want 3" at d4df844f. The
+    # restart count is a MONOTONIC counter sampled mid-flight, so the mismatch
+    # says "not yet", never "wrong".
+    blocked_by "healthy again after rotation" "rotation forced exactly one restart"
+fi
 
 # --- post-start health grace: a warming server is waited out, not bounced ----------
 # Regression for the restart-flap (jupyterlab svc went unhealthy after a
@@ -326,8 +463,15 @@ wait_for "supervisor reached serving-at (URL present)" 20 -- grep -q 'serving at
 # regression FAILS THE MOMENT the bounce fires (with the exact evidence)
 # rather than being sampled once at the end; start-count is monotonic, so a
 # clean window-end poll proves it never exceeded 1 at any point inside it.
+# The window is scaled for the OPPOSITE reason to the wait_for deadlines
+# above: this is a NEGATIVE observation (pass = nothing happened), so under
+# contention a fixed 6 s window can end before the bounce it is meant to
+# catch would have fired — a false GREEN, not a flake. Scaling keeps the
+# coverage honest. Unlike a polled deadline, this one does cost its full
+# wall time on every green run, so it is scaled deliberately, not by reflex.
+bounce_window_s=$(th_deadline 6)
 bounce_watch=0; bounced=""
-while (( bounce_watch < 24 )); do          # 24 * 0.25s = 6s window
+while (( bounce_watch < bounce_window_s * 4 )); do
     if [[ "$(cat "$P3/.jupyter/stub-start-count" 2>/dev/null)" != "1" ]] \
        || grep -q 'restarting labsh server' "$SUP3LOG" 2>/dev/null; then
         bounced=yes; break
@@ -335,7 +479,7 @@ while (( bounce_watch < 24 )); do          # 24 * 0.25s = 6s window
     sleep 0.25; bounce_watch=$(( bounce_watch + 1 ))
 done
 if [[ -z "$bounced" ]]; then
-    printf '  PASS: no bounce while warming (exactly one start, watched %ss)\n' 6; PASS=$(( PASS + 1 ))
+    printf '  PASS: no bounce while warming (exactly one start, watched %ss)\n' "$bounce_window_s"; PASS=$(( PASS + 1 ))
 else
     printf '  FAIL: bounced while warming at +%ss (start-count=%s, log tail: %s)\n' \
         "$(( bounce_watch / 4 ))" "$(cat "$P3/.jupyter/stub-start-count" 2>/dev/null)" \
@@ -345,9 +489,13 @@ fi
 gated_rc=$("$HEALTH" "$P3" >/dev/null 2>&1; echo $?)
 assert_eq "still unhealthy while gated" "$(( gated_rc != 0 ))" "1"
 rm -f "$P3/.jupyter/.warming"        # warmup done: /api/status now 200
-wait_for "healthy once warmup completes" 25 -- "$HEALTH" "$P3"
-assert_eq "exactly one start through warmup→healthy (no flap)" \
-    "$(cat "$P3/.jupyter/stub-start-count")" "1"
+if wait_for "healthy once warmup completes" 25 -- "$HEALTH" "$P3"; then
+    assert_eq "exactly one start through warmup→healthy (no flap)" \
+        "$(cat "$P3/.jupyter/stub-start-count")" "1"
+else
+    blocked_by "healthy once warmup completes" \
+        "exactly one start through warmup→healthy (no flap)"
+fi
 kill -KILL "$SUP3" 2>/dev/null
 wait "$SUP3" 2>/dev/null   # reap our own child: no zombie, no exit-status noise later
 [[ -f "$P3/.jupyter/stub.pid" ]] && kill "$(cat "$P3/.jupyter/stub.pid")" 2>/dev/null
@@ -363,13 +511,20 @@ kill "$(cat "$WORK/proj1/.jupyter/stub.pid")" 2>/dev/null   # server too: simula
 wait_gone "KILLed supervisor is gone before recover runs" 10 "$sup"
 out=$("$RECOVER" --services-only 2>&1)
 assert_contains "recover relaunched the service" "$out" "service 'jupyter-proj1': relaunched"
-wait_for "healthy after recovery" 20 -- "$HEALTH" "$WORK/proj1"
-assert_eq "new supervisor pid recorded" "$(( $(sup_pid jupyter-proj1) != sup ))" "1"
+if wait_for "healthy after recovery" 20 -- "$HEALTH" "$WORK/proj1"; then
+    assert_eq "new supervisor pid recorded" "$(( $(sup_pid jupyter-proj1) != sup ))" "1"
+else
+    blocked_by "healthy after recovery" "new supervisor pid recorded"
+fi
 
 # --- adoption: hand-started server, supervisor comes later ---------------------------
 echo '=== hand-started server is adopted, not duplicated ==='
 mkdir -p "$WORK/proj2"
-( cd "$WORK/proj2" && labsh kernel add proj2 && labsh start --port 9601 ) >/dev/null 2>&1
+# proj2's hand-started server needs a port DISJOINT from proj1's band
+# [BASE, BASE+39]; BASE+1000 keeps it in this file's 20000-band but clear of
+# proj1 (your-org/nexus-code#558 — was a hard-coded 9601 that a concurrent
+# test file could also grab).
+( cd "$WORK/proj2" && labsh kernel add proj2 && labsh start --port $(( LABSH_STUB_BASE_PORT + 1000 )) ) >/dev/null 2>&1
 out=$("$UP" "$WORK/proj2" 2>&1); rc=$?
 assert_eq "activation over live server exits 0" "$rc" "0"
 assert_eq "no second server started" "$(cat "$WORK/proj2/.jupyter/stub-start-count")" "1"
@@ -407,8 +562,11 @@ spec_python() { python3 -c 'import json,sys; print((json.load(open(sys.argv[1]))
 # A manual crawl can lose the non-blocking flock to the supervisor's
 # periodic one; retry until we get a real sweep (it prints a summary).
 crawl_now() {
-    local i out
-    for i in 1 2 3 4 5 6 7 8; do
+    local i out tries
+    # Retry budget scales with contention: the loser of the flock is more
+    # likely, and slower to be handed the lock, the busier the host is.
+    tries=$(( $(th_deadline 8) ))
+    for (( i = 0; i < tries; i++ )); do
         out=$("$CRAWL" "$ROOTWS" 2>&1)
         [[ "$out" == *"registered="* ]] && { printf '%s' "$out"; return 0; }
         sleep 0.5
@@ -423,10 +581,18 @@ assert_contains "row is jupyterlab" "$(cat "$NEXUS_SERVICES_REGISTRY")" "jupyter
 assert_eq "health probe passes at the work root" "$("$HEALTH" "$ROOTWS" >/dev/null 2>&1; echo $?)" "0"
 assert_file_exists "periodic hook persisted" "$ROOTWS/.jupyter/labsh-service.periodic"
 assert_contains "periodic hook invokes the crawl" "$(cat "$ROOTWS/.jupyter/labsh-service.periodic")" "jupyter-kernel-crawl.sh"
-wait_for "crawl registered proj-alpha" 15 -- test -f "$KDIR/proj-alpha/kernel.json"
 wait_for "crawl registered proj-beta"  15 -- test -f "$KDIR/proj-beta/kernel.json"
-assert_contains "proj-alpha kernelspec points at alpha's venv" \
-    "$(spec_python "$KDIR/proj-alpha/kernel.json")" "$ROOTWS/alpha/.venv/bin/python"
+if wait_for "crawl registered proj-alpha" 15 -- test -f "$KDIR/proj-alpha/kernel.json"; then
+    assert_contains "proj-alpha kernelspec points at alpha's venv" \
+        "$(spec_python "$KDIR/proj-alpha/kernel.json")" "$ROOTWS/alpha/.venv/bin/python"
+else
+    # Without the guard this reads the kernelspec of a file that does not
+    # exist: spec_python yields empty and assert_contains reports the
+    # kernelspec pointing at the WRONG interpreter — a content claim about a
+    # file the crawl simply had not written yet.
+    blocked_by "crawl registered proj-alpha" \
+        "proj-alpha kernelspec points at alpha's venv"
+fi
 assert_no_file "venv-less dir got no kernelspec" "$KDIR/proj-gamma-novenv/kernel.json"
 assert_no_file "hidden dir skipped by shallow glob" "$KDIR/proj-.hidden/kernel.json"
 

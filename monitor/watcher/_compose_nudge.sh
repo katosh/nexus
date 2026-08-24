@@ -97,16 +97,24 @@ _compose_emit_nudge_check() {
     gh_mtime=$(_compose_nudge_mtime "$gh_out_file")
     gh_size=$(_compose_nudge_size  "$gh_out_file")
 
-    local should_nudge=0
+    # Two nudge lanes since your-org/nexus-code#562: comment sources
+    # (deliveries queue + github_poll staging) pull the lightweight
+    # `comment_surface` task forward — comments must not wait on the
+    # sweep-priced compose body — while the requests source keeps
+    # pulling `compose_emit` (requests surface only through the full
+    # compose path). When comment_surface is not registered
+    # (interval_seconds=0), comment sources fall back to nudging
+    # compose_emit, restoring the pre-#562 single-lane behaviour.
+    local nudge_comments=0 nudge_compose=0
 
     if (( queue_mtime > _compose_nudge_last_queue_mtime )); then
         _compose_nudge_last_queue_mtime=$queue_mtime
-        (( queue_size > 0 )) && should_nudge=1
+        (( queue_size > 0 )) && nudge_comments=1
     fi
 
     if (( gh_mtime > _compose_nudge_last_github_mtime )); then
         _compose_nudge_last_github_mtime=$gh_mtime
-        (( gh_size > 0 )) && should_nudge=1
+        (( gh_size > 0 )) && nudge_comments=1
     fi
 
     if [[ -n "$requests_out_file" ]]; then
@@ -114,20 +122,33 @@ _compose_emit_nudge_check() {
         req_size=$(_compose_nudge_size  "$requests_out_file")
         if (( req_mtime > _compose_nudge_last_requests_mtime )); then
             _compose_nudge_last_requests_mtime=$req_mtime
-            (( req_size > 0 )) && should_nudge=1
+            (( req_size > 0 )) && nudge_compose=1
         fi
     fi
 
-    (( should_nudge == 1 )) || return 1
+    if (( nudge_comments == 1 )) && [[ -z "${TASK_FN[comment_surface]:-}" ]]; then
+        nudge_comments=0
+        nudge_compose=1
+    fi
+
+    (( nudge_comments == 1 || nudge_compose == 1 )) || return 1
 
     # Guard against the registry being absent (test scaffolds, very-
     # early-startup sequences). `_schedule_*` already returns 64 with a
     # stderr message in that case; silence noise here so the post-tick
     # hook stays best-effort.
-    [[ -n "${TASK_FN[compose_emit]:-}" ]] || return 1
-    _schedule_fire_now compose_emit 2>/dev/null || true
-    _schedule_override compose_emit 5 60 2>/dev/null || true
-    return 0
+    local fired=1
+    if (( nudge_comments == 1 )) && [[ -n "${TASK_FN[comment_surface]:-}" ]]; then
+        _schedule_fire_now comment_surface 2>/dev/null || true
+        _schedule_override comment_surface 5 60 2>/dev/null || true
+        fired=0
+    fi
+    if (( nudge_compose == 1 )) && [[ -n "${TASK_FN[compose_emit]:-}" ]]; then
+        _schedule_fire_now compose_emit 2>/dev/null || true
+        _schedule_override compose_emit 5 60 2>/dev/null || true
+        fired=0
+    fi
+    return $fired
 }
 
 # Reset module state for tests. The watcher itself does not call this —

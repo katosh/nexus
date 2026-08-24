@@ -88,8 +88,16 @@ cch_skip_if_disabled() {
     fi
     if [[ -n "$why" ]]; then
         echo "skipped: $(basename "${0}") ($why)"
-        [[ "${CCH_GATE:-0}" == "1" ]] && exit 77
-        exit 0
+        # Exit 77 = SKIP (your-org/nexus-code#568 A6). This used to exit 0
+        # unless `CCH_GATE=1`, so under the canonical full-suite recipe all six
+        # `test-realmodel-*.sh` recorded **PASS in ~0.2 s** having asserted
+        # nothing — in the one band whose entire purpose is catching renderer
+        # drift against the real binary. A green ledger row for a test that
+        # declined to run is worse than a red one: it is a coverage claim the
+        # suite cannot support, and it is exactly the defect A6 exists to
+        # remove. `CCH_GATE` no longer changes the exit code, only whether the
+        # caller treats a skip as fatal.
+        exit 77
     fi
 }
 
@@ -105,6 +113,58 @@ cch_resolve_claude() {
         printf '%s' "$local_bin"; return 0
     fi
     return 1
+}
+
+# Write $CCH_CFG/settings.json — the isolated USER-SCOPE settings file, the
+# same scope a production nexus agent reads its own from. Called by cch_setup,
+# and callable again by a scenario that needs to re-seed BETWEEN boots (see
+# the migration hazard below, which makes hand-rolling that rewrite unsafe).
+#
+#   $1 / CCH_EDITOR_MODE  keyboard mode. UNSET defaults to `vim`; the EMPTY
+#                         string writes no key (the binary's own default).
+#   CCH_TUI               rendering mode. unset/empty writes no key.
+#
+# --- editorMode: production parity (your-org/nexus-code#724) --------------
+# Every production nexus agent inherits `editorMode: "vim"` from user scope.
+# Measured on the operator's live config: the key is present BOTH in
+# `$CLAUDE_CONFIG_DIR/settings.json` and in `$CLAUDE_CONFIG_DIR/.claude.json`,
+# and either one ALONE is sufficient — booted against 2.1.224, `-- INSERT --`
+# renders from a settings.json-only seed and from a .claude.json-only seed
+# alike, and from neither when neither is present. So the harness reproduces
+# it by the same route the operator declares it (settings.json), not by a
+# route that merely happens to work.
+#
+# Seeding nothing — what this harness did until #724 — boots the real binary
+# in the DEFAULT keyboard mode, so the gate validates a mode nobody runs. Same
+# class as the `tui` fix in #568. It matters concretely rather than
+# cosmetically: vim mode paints `-- INSERT --` into the status row, and
+# pane-state.sh's `_detect_vim_insert` reads exactly that row to decide
+# `user-typing` vs `idle` (#603/#626) — i.e. the production keyboard mode is
+# an INPUT to the classification this whole harness exists to gate.
+#
+# --- skipDangerousModePermissionPrompt: NOT optional, and not cosmetic ----
+# The real binary MIGRATES `.claude.json`'s `bypassPermissionsModeAccepted`
+# into settings.json under this name on first boot, and DELETES the original
+# key (measured on 2.1.224: `.claude.json` comes back with the key `null`,
+# settings.json comes back holding `skipDangerousModePermissionPrompt: true`).
+# So after any boot the ONLY thing suppressing the Bypass Permissions warning
+# lives in settings.json. A scenario that rewrites settings.json between boots
+# without re-supplying it wedges the NEXT boot on that modal dialog forever.
+# That used to report `state=empty` — "don't know yet" — so it read as a
+# timeout rather than as a config error; since your-org/nexus-code#768
+# pane-state.sh recognises the modal and reports `state=blocked
+# overlay=bypass-permissions`, so the wedge now names itself. The naming is a
+# diagnostic, NOT a substitute for this line: a named wedge is still a wedge,
+# and re-supplying the key is what prevents it. Writing it unconditionally here
+# makes the harness's own re-seed path safe, which is what lets the #724
+# scenario boot a seeded worker and an unseeded control in one run.
+cch_write_settings() {
+    local editor="${1-${CCH_EDITOR_MODE-vim}}"
+    local -a keys=('"skipDangerousModePermissionPrompt": true')
+    [[ -n "${CCH_TUI:-}" ]] && keys+=("\"tui\": \"$CCH_TUI\"")
+    [[ -n "$editor" ]]      && keys+=("\"editorMode\": \"$editor\"")
+    local IFS=,
+    printf '{%s}\n' "${keys[*]}" > "$CCH_CFG/settings.json"
 }
 
 # Bring up the run: tmpdir, mock backend, isolated config + tmux socket.
@@ -127,6 +187,32 @@ cch_setup() {
     #   folder trust -> per-project projects.<cwd>.hasTrustDialogAccepted
     # (custom-API-key dialog is avoided by using ANTHROPIC_AUTH_TOKEN
     # rather than ANTHROPIC_API_KEY — see cch_boot_worker.)
+    #
+    # NOTE — EDITOR MODE (load-bearing for GUIDE surface 2c). THIS BLOCK
+    # WRITES `.claude.json` AND CARRIES NO `editorMode` KEY — but the mode is
+    # no longer unset by the time a pane boots: `cch_write_settings` below
+    # seeds `editorMode` into `settings.json`, defaulting to **`vim`**
+    # (`${CCH_EDITOR_MODE-vim}`), which is what production runs (#724). So
+    # panes booted here come up in VI mode unless a scenario overrides
+    # `CCH_EDITOR_MODE`.
+    #
+    # This paragraph used to end "so every pane comes up in DEFAULT (emacs)
+    # mode", and that sentence survived a textually-clean merge of #724's
+    # seeding onto this branch while becoming false — the exact
+    # harness-boots-emacs premise the 2c thread spent two rounds correcting.
+    # Restated rather than deleted, because the HISTORY is still the point:
+    # while the mode really was unset, a probe prefixing its paste with the
+    # production VI-insert keys (`send-keys i BSpace`) was a NET NO-OP — it
+    # typed `i` and deleted it — and so could not distinguish "VI-insert
+    # hardening works" from "absent". Two rounds (2.1.216, 2.1.222)
+    # mislabelled such a probe `empirical`; the second was disproven by
+    # differential control (dropping the prefix left it passing
+    # identically). The standing rule is unchanged and now has teeth: never
+    # ASSUME the mode — set it explicitly and assert the `-- INSERT --` /
+    # `-- NORMAL --` indicator actually renders. That is what
+    # test-realmodel-vimode.sh does, in three arms (seeded `vim` => present;
+    # no key => absent; out-of-enum `vi` => absent, because the setting is a
+    # two-member enum `["normal","vim"]` carrying `.catch(void 0)`).
     if command -v jq >/dev/null 2>&1; then
         jq -n --arg wd "$CCH_WORKDIR" '{
             theme: "dark", hasCompletedOnboarding: true,
@@ -139,6 +225,8 @@ cch_setup() {
         printf '{"theme":"dark","hasCompletedOnboarding":true,"bypassPermissionsModeAccepted":true,"projects":{"%s":{"hasTrustDialogAccepted":true,"hasCompletedProjectOnboarding":true,"allowedTools":[]}}}\n' \
             "$CCH_WORKDIR" > "$CCH_CFG/.claude.json"
     fi
+
+    cch_write_settings
 
     # Default control directive: single-shot canned text.
     cch_control '{"mode":"text","text":"MOCK_OK_HELLO"}'
@@ -186,7 +274,7 @@ cch_setup() {
 
 cch_teardown() {
     if [[ -n "${CCH_TMUXWRAP:-}" && -x "${CCH_TMUXWRAP:-}" ]]; then
-        cch_tmux kill-server 2>/dev/null || true
+        cch_tmux kill-server 2>/dev/null || true   # tmux-scoped: cch_tmux() pins -L "$CCH_SOCKET" (this file)
     fi
     if [[ -n "${CCH_MOCK_PID:-}" ]]; then
         kill "$CCH_MOCK_PID" 2>/dev/null || true
@@ -216,23 +304,54 @@ cch_control() {
 }
 
 # Boot the real claude in a new tmux window against the mock. Echoes the
-# new window's index. Renderer-path only (no --settings hooks) so this
-# exercises pane-state's renderer classification; a heartbeat-substrate
-# variant is a documented follow-up.
+# new window's index.
+#
+# By DEFAULT this is the renderer path: no `--settings`, so no hooks are
+# wired and the scenario exercises pane-state's renderer classification
+# only. That default is why, for a long time, every gate scenario but
+# test-realmodel-overlimit.sh ran hook-free — and why GUIDE surface 2d
+# (hooks + settings) could never be cleared by the gate and fell back to
+# source inspection every round.
+#
+# Two opt-in knobs close that hole without disturbing the renderer
+# scenarios:
+#
+#   CCH_SETTINGS    path to a settings JSON passed as `--settings <path>`.
+#                   Set it to wire real hooks (PreToolUse, PostToolUse,
+#                   Notification, …) into the booted binary — see
+#                   monitor/watcher/test-integration/test-realmodel-pretooluse-hook.sh.
+#   CCH_EXTRA_ENV   extra `K=v` assignments spliced into the `env -i`
+#                   line (e.g. NEXUS_ROOT / NEXUS_STATE_DIR so a real
+#                   hook script writes into the harness tmpdir). The
+#                   CALLER is responsible for shell-quoting values; keep
+#                   them path-simple.
+#
+# Both default to empty, so existing scenarios boot BEHAVIOURALLY
+# identically — same argv, same env, no --settings — but NOT
+# byte-identically: with CCH_EXTRA_ENV empty the `%s` splice leaves one
+# extra space in the launch line. Measured: delta is exactly 1 byte, and
+# the two strings are identical once spaces are removed, so the token
+# sequence the shell parses is unchanged. Stating the measured fact rather
+# than rounding it up to "byte-identical".
 cch_boot_worker() {
     local name="$1"
     # env -i for a hermetic child: only the vars claude needs. PATH must
     # carry node (claude is a node program) — pass the harness PATH
     # through. ANTHROPIC_AUTH_TOKEN (bearer) instead of ANTHROPIC_API_KEY
     # avoids the interactive custom-API-key approval dialog.
+    local settings_arg=""
+    if [[ -n "${CCH_SETTINGS:-}" ]]; then
+        printf -v settings_arg ' --settings %q' "$CCH_SETTINGS"
+    fi
     local launch
     printf -v launch 'env -i HOME=%q PATH=%q CLAUDE_CONFIG_DIR=%q \
 ANTHROPIC_BASE_URL=%q ANTHROPIC_AUTH_TOKEN=mock-token \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \
 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_BUG_COMMAND=1 \
-TERM=%q %q --dangerously-skip-permissions' \
+%s TERM=%q %q --dangerously-skip-permissions%s' \
         "$CCH_CFG" "$PATH" "$CCH_CFG" \
-        "http://127.0.0.1:$CCH_MOCK_PORT" "${TERM:-xterm-256color}" "$CLAUDE_BIN"
+        "http://127.0.0.1:$CCH_MOCK_PORT" "${CCH_EXTRA_ENV:-}" \
+        "${TERM:-xterm-256color}" "$CLAUDE_BIN" "$settings_arg"
 
     cch_tmux new-window -d -t "$CCH_SESSION": -n "$name" -c "$CCH_WORKDIR" "$launch"
     local idx
@@ -340,6 +459,31 @@ wait_for() {
     printf '  FAIL: %s — predicate never satisfied within %ds (%d polls)\n' \
         "$label" "$max" "$attempts" >&2
     printf '         last cmd: %s\n' "$*" >&2
+    # Say WHAT WAS SEEN, not merely that the wait expired. A bare timeout
+    # invites "slow runner", which is the reading that cost your-org/
+    # nexus-code#768 a probe run: the pane was wedged on the Bypass
+    # Permissions modal the whole time, and nothing printed the state it was
+    # actually in. Emitting the full pane-state line makes the diagnosis
+    # available at the moment of failure — `state=blocked
+    # overlay=bypass-permissions` reads very differently from `state=empty`.
+    #
+    # This runs ONLY on the failure path, so it cannot perturb a passing
+    # scenario, and it is best-effort: a window that has gone away simply
+    # yields nothing rather than turning a test failure into a harness error.
+    if [[ "$1" == "cch_state_is" && -n "${2:-}" ]]; then
+        local observed
+        observed=$(cch_pane_state "$2" 2>/dev/null) || observed=""
+        if [[ -n "$observed" ]]; then
+            printf '         observed: %s\n' "$observed" >&2
+            case "$observed" in
+                *overlay=bypass-permissions*)
+                    printf '         ^ the pane is wedged on the Bypass Permissions modal, NOT slow.\n' >&2
+                    printf '           settings.json lost `skipDangerousModePermissionPrompt` between boots\n' >&2
+                    printf '           (your-org/nexus-code#768) — re-seed it via cch_write_settings.\n' >&2
+                    ;;
+            esac
+        fi
+    fi
     : "${FAIL:=0}"; FAIL=$(( FAIL + 1 )); return 1
 }
 

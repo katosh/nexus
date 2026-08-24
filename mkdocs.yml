@@ -93,7 +93,6 @@ nav:
       - Repos: admin/repos.md
       - Security: admin/security.md
       - Monitoring: admin/monitoring.md
-      - <your-lab> addendum: admin/site-addendum.md
   - Reference:
       - Architecture: reference/architecture.md
       - Config: reference/config.md

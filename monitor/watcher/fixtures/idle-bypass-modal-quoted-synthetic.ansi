@@ -1,0 +1,11 @@
+● Read(reports/nexus_2026-08-07_probe.md)
+  The worker wedged on this dialog:
+    WARNING: Claude Code running in Bypass Permissions mode
+    ❯ 1. No, exit
+      2. Yes, I accept
+    Enter to confirm · Esc to cancel
+  Re-supplying skipDangerousModePermissionPrompt fixes it.
+
+[39m❯ [0m
+[38;5;244m─[0m
+  ${ESC}[38;5;246m⏵⏵ bypass permissions on${ESC}[0m

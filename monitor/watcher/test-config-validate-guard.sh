@@ -226,6 +226,12 @@ BROOT="$WORK/main-tree"
 mkdir -p "$BROOT/monitor/watcher" "$BROOT/config" "$BROOT/monitor/.state" "$WORK/bin"
 cp "$_test_dir"/*.sh "$BROOT/monitor/watcher/"
 cp "$_src_root/monitor/_cc-version.sh" "$BROOT/monitor/" 2>/dev/null || true
+# `_config.sh` REFUSES to start without the integration-branch resolver
+# (your-org/nexus-code#763) — deliberately, since a fallback there would be a
+# second claimant on a repo-wide property. Copied unconditionally, NOT with
+# `|| true`: if it goes missing this fixture must fail loudly rather than
+# exercise the guards under test against a watcher that died before them.
+cp "$_src_root/monitor/_integration_branch.sh" "$BROOT/monitor/"
 chmod +x "$BROOT/monitor/watcher/main.sh"
 cat > "$BROOT/config/load.sh" <<EOF
 #!/usr/bin/env bash
@@ -277,5 +283,69 @@ assert_contains "bootstrap.sh prints its REFUSING message" "$boot_out" \
 incident_count=$(find "$CROOT/reports" -name '*watcher-incident.md' 2>/dev/null | wc -l | tr -d ' ')
 assert_eq "bootstrap.sh writes NO watcher-incident report" "$incident_count" "0"
 assert_eq "bootstrap.sh calls NO launcher" "$(cat "$WORK/launcher.calls")" ""
+
+echo '=== D. #866: an UNQUALIFIED issue reference is refused, loudly ==='
+
+# `#N` is repo-relative. In a comment body GitHub renders it and the ambiguity
+# is at least visible; in a CONFIG FIELD nothing renders it, so a bare number
+# is a reference whose repo is supplied invisibly by whichever consumer reads
+# it. This repo is cloned by every operator, so the same number names different
+# things in an asset repo and in the shared implementation repo — and a wrong
+# repo does not error, it publishes where nobody is looking.
+#
+# A FULLY REAL config is used so only the issue-reference check can fire; if it
+# shared a fixture with the placeholder cases above, a pass would not
+# distinguish "refused for the right reason" from "refused for any reason".
+REFROOT="$WORK/issueref"
+mkdir -p "$REFROOT"
+cp "$EXAMPLE" "$REFROOT/nexus.example.yml"
+_mkcfg() {  # $1 = the tracking_issue value, verbatim
+    cat > "$REFROOT/nexus.yml" <<YML
+nexus: {root: /real/nexus, node_module: nodejs}
+github:
+  repo: myorg/my-nexus
+  user_login: someone
+  bot_app_id: 12345
+  bot_installation_id: 67890
+  bot_pem_path: /real/key.pem
+monitor:
+  cc_auto_update:
+    tracking_issue: $1
+YML
+}
+_validate() {
+    NEXUS_EXAMPLE_PATH="$REFROOT/nexus.example.yml" NEXUS_CONFIG="$REFROOT/nexus.yml" \
+        bash "$_test_dir/../../config/load.sh" --validate 2>&1
+}
+
+# CONTROL FIRST: this fixture must PASS when the reference is qualified, or the
+# refusals below prove nothing about the reference in particular.
+_mkcfg '"myorg/my-nexus#229"'
+ctl_out=$(_validate); ctl_rc=$?
+assert_eq "CONTROL: fully-real config with a QUALIFIED reference validates" "$ctl_rc" "0"
+
+_mkcfg '""'
+e_out=$(_validate); e_rc=$?
+assert_eq "empty tracking_issue is fine (no standing issue)" "$e_rc" "0"
+
+_mkcfg '229'
+b_out=$(_validate); b_rc=$?
+assert_eq "bare number => exit 4 (loud refusal, not a guess)" "$b_rc" "4"
+assert_contains "…and names the field" "$b_out" "monitor.cc_auto_update.tracking_issue"
+assert_contains "…and offers the qualified form, keeping the number" "$b_out" 'owner/repo#229'
+assert_contains "…and explains WHY a bare number cannot be resolved" "$b_out" "repo-relative"
+
+_mkcfg '"nexus-code#229"'
+h_out=$(_validate); h_rc=$?
+assert_eq "half-qualified (no owner) => exit 4" "$h_rc" "4"
+
+# The cross-repo point, stated as a test: the SAME number is legal against two
+# different repos, so the number alone can never identify the target.
+_mkcfg '"your-org/nexus-code#229"'
+a_rc=0; _validate >/dev/null 2>&1 || a_rc=$?
+_mkcfg '"your-org/your-nexus#229"'
+b2_rc=0; _validate >/dev/null 2>&1 || b2_rc=$?
+assert_eq "same N qualifies against repo A" "$a_rc" "0"
+assert_eq "same N qualifies against repo B" "$b2_rc" "0"
 
 th_summary_and_exit

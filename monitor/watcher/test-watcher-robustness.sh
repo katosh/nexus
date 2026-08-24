@@ -94,7 +94,13 @@ else
 fi
 assert_not_contains "interim reports excluded"   "$snap" "interim"
 # Boundedness: 200 worktrees + 2000 reports must not take long with git off.
-if (( elapsed <= 10 )); then pass "snapshot bounded under load (${elapsed}s <= 10s)"; \
+# Bound raised 10 s → 60 s (the your-org/nexus-code#557 class review).
+# This is a genuine COMPLEXITY assertion: with git off, snapshot_local must
+# not walk 200 worktrees x 2000 reports. A regression there is not "a bit
+# slower", it is minutes-to-unbounded, so 60 s separates the two outcomes
+# just as cleanly as 10 s did — while no longer doubling as a wall-clock
+# bet on how much CPU this test happens to get.
+if (( elapsed <= 60 )); then pass "snapshot bounded under load (${elapsed}s <= 60s)"; \
     else fail "snapshot too slow under load: ${elapsed}s"; fi
 # Reports section is a BOUNDED, deterministic summary, NOT a full dump:
 #   * an exact total count of the 1900 FINAL reports (interim excluded), and

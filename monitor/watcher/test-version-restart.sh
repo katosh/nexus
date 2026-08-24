@@ -319,9 +319,26 @@ assert_contains "section carries the restart command" "$sec1" "monitor/svc.sh"
 assert_contains "section carries the ack path" "$sec1" "rm $EM/drift-cockpit"
 assert_eq "second emit silent (re-nag guarded)" "$rc2" "1"
 assert_empty "second emit body empty" "$sec2"
-# No window_id recorded (pre-feature record / resolver failed): the
-# recipe falls back to the name — never breaks on old drift files.
-assert_contains "id-less record: kill targets the window name" "$sec1" "tmux kill-window -t services"
+# No window_id recorded (pre-feature record / resolver failed).
+#
+# THIS ASSERTION USED TO PIN THE DEFECT (your-org/nexus-code#701 item B). The
+# fallback it guarded — `${window_id:-${window:-services}}` — rendered a
+# NAME-targeted `tmux kill-window`, which is the 2026-06-11 incident this
+# whole feature exists to prevent: the orchestrator, one window index from the
+# cockpit, executed a name-targeted kill that destroyed its own window. The
+# fallback fired exactly when the id could not be resolved, i.e. in the
+# degraded conditions where a mis-aim is likeliest.
+#
+# The old record must still produce a WORKING recipe — that part of the intent
+# was right — so the recipe now resolves the id at paste time and the `&&`
+# chain stops if it comes back empty. Both halves are asserted: no bare
+# name-targeted kill, and a recipe that still restarts the cockpit.
+assert_not_contains "id-less record: renders NO name-targeted kill-window" \
+    "$sec1" "tmux kill-window -t services"
+assert_contains "id-less record: resolves the id at paste time instead" \
+    "$sec1" 'wid=$(tmux list-windows'
+assert_contains "id-less record: still restarts the cockpit" \
+    "$sec1" "tmux new-window -dn services"
 # ID-targeted recipe (2026-06-11 incident: a name/index-aimed kill from
 # the orchestrator destroyed the orchestrator's own window): with a
 # window_id recorded, the surfaced kill targets the immutable @id.

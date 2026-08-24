@@ -82,15 +82,25 @@ tmux() {
             # Honour the -F format minimally: tests seed WINDOWS_LIST
             # with rows already shaped for the format the unit under
             # test requests. For resolve_window_id's
-            # `-F '#{window_id}\t#{window_name}'` (#323), synthesize a
+            # `-F '#{window_id}<D>#{window_name}'` (#323), synthesize a
             # deterministic @<lineno> id per window so the resolver
             # yields a stable @id the assertions can pin.
+            #
+            # The delimiter is EXTRACTED from the requested format, never
+            # assumed. It used to be hardcoded as a TAB, so when the resolver
+            # moved off TAB (your-org/nexus-code#699 — a C/POSIX locale makes
+            # tmux rewrite a TAB in `-F` output, turning every present window
+            # into a false "absent") this stub kept answering in the old
+            # shape and two assertions failed for a reason that had nothing
+            # to do with what they test. A stub that hardcodes what it claims
+            # to parse is the same defect class as the code under test.
             local F=""
             while (( $# > 0 )); do
                 case "$1" in -F) F="$2"; shift 2 ;; *) shift ;; esac
             done
-            if [[ "$F" == *'#{window_id}'* ]]; then
-                printf '%s\n' "$WINDOWS_LIST" | awk 'NF{printf "@%d\t%s\n", NR, $0}'
+            if [[ "$F" == *'#{window_id}'*'#{window_name}'* ]]; then
+                local d="${F#*'#{window_id}'}"; d="${d%%'#{window_name}'*}"
+                printf '%s\n' "$WINDOWS_LIST" | awk -v d="$d" 'NF{printf "@%d%s%s\n", NR, d, $0}'
             else
                 printf '%s\n' "$WINDOWS_LIST"
             fi
@@ -258,12 +268,18 @@ fi
 
 echo '=== main.sh paste_to_target: liveness stamp follows the configured target ==='
 
+# Since your-org/nexus-code#562 paste_to_target is a per-target flock
+# wrapper around _paste_to_target_unlocked — extract BOTH.
 fn_body=$(sed -n '/^paste_to_target() {/,/^}/p' "$_main_sh")
-if [[ -z "$fn_body" ]]; then
-    echo "FAIL: could not extract paste_to_target() from $_main_sh" >&2
+fn_body_unlocked=$(sed -n '/^_paste_to_target_unlocked() {/,/^}/p' "$_main_sh")
+if [[ -z "$fn_body" || -z "$fn_body_unlocked" ]]; then
+    echo "FAIL: could not extract paste_to_target()/_paste_to_target_unlocked() from $_main_sh" >&2
     FAIL=$(( FAIL + 1 ))
 else
     eval "$fn_body"
+    eval "$fn_body_unlocked"
+    # The lock wrapper logs on lock-timeout; provide a no-op logger.
+    declare -F log >/dev/null 2>&1 || log() { :; }
     # paste_to_target now resolves name→@id (#323); provide the real
     # resolver. It calls the `tmux` shell-function stubbed above, which
     # synthesizes @<lineno> ids for the window_id format.

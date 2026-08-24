@@ -1,0 +1,92 @@
+# input-box-chrome.manifest — the CHECKED coverage boundary for
+# your-org/nexus-code#801, recorded as DATA because prose cannot be made
+# to fail.
+#
+# Enforced by:  bash monitor/watcher/test-input-box-chrome.sh
+# Axis:         WHICH GLYPH the Claude Code renderer draws the composer's
+#               input box with — ONE OF TWO AXES; see below. It is
+#               deliberately NOT "the glyphs I happened to see in a
+#               capture" — every fixture in monitor/watcher/fixtures/
+#               agrees on today's renderer, and agreeing with today's
+#               renderer is exactly what #801 says is not enough.
+#
+# THIS FILE IS ONE OF TWO AXES, AND SAYING SO IS THE POINT (PR #827,
+# skeptic F1). The classifier varies on the border GLYPH — this file — and
+# independently on RUN STRUCTURE: how many dim SGR introducers the renderer
+# emits across the border. The first fix passed every row below and still
+# failed on a DOUBLED border, because the strip was a single `s///g` pass
+# whose branch consumes the terminating ESC: `g` resumed after that byte,
+# adjacent runs were stripped alternately, and ONE SURVIVED. A surviving
+# dim run carrying a visible character is `#801` intact.
+#
+# A coverage boundary that is honest, tested, and drawn on the axis the
+# SEARCH varied on rather than the axis the MECHANISM varies on is still
+# FALSE. That is this workspace's recurring failure, and this file offering
+# itself as *the* boundary was an instance of it.
+#
+# The run-structure axis is pinned as FIXTURES rather than as rows here,
+# because it varies over introducer COUNT, not over glyph:
+#   fixtures/idle-empty-adjacent-dim-border-synthetic.ansi
+#   fixtures/user-typing-vim-adjacent-dim-border-synthetic.ansi
+# asserted by the `#801` block in test-pane-state.sh, which mutant-tests
+# all five chrome fixtures against a neutered strip. Adding a glyph HERE
+# does not extend that axis; adding a fixture THERE does not extend this
+# one. Both must be considered when this guard is next touched.
+#
+# WHY THIS FILE EXISTS. `monitor/pane-state.sh:_detect_dim_run` decides
+# whether a faint (SGR 2) run after the chevron is an autosuggest GHOST.
+# It used to answer yes for any visible character, and a dim closing box
+# border is a visible character — so an EMPTY input box drawn with one
+# classified `autosuggest-only input=ghost` and `state=idle` became
+# UNREACHABLE. Measured, not reasoned: 28 s of deterministic polling
+# against the integration stub (`#798`). Claude Code does not draw that
+# border today; the guard's correctness therefore rested on a cosmetic
+# property of somebody else's renderer that nothing checked and nobody
+# owned. `_strip_dim_box_chrome` now erases dim runs whose whole visible
+# content is chrome, and THIS FILE is the definition of "chrome".
+#
+# WHAT A ROW MEANS.
+#   chrome   a dim run containing ONLY this glyph (and blanks) is box
+#            furniture: the pane reads `idle` / `input=blank`.
+#   content  a dim run containing this glyph is TEXT: the pane reads
+#            `autosuggest-only` / `input=ghost`.
+#
+# The `content` rows are not filler — they are the BOUNDARY, and they are
+# the honest part of this file. ASCII `|` and `+` are NOT treated as
+# chrome: they are ordinary characters a suggestion may legitimately open
+# with, and the cost of getting that wrong (a real ghost silently read as
+# an empty box) is worse than the cost of the border case. So a renderer
+# that ever draws an ASCII-art border is a KNOWN, RECORDED gap rather
+# than a surprise, and the row below is where a future reader finds that
+# out. `■` and `⓿` pin the two ends of the implemented byte ranges
+# (U+2500–U+257F box drawing, U+2580–U+259F block elements): they sit one
+# codepoint outside and must classify as content, so a range that quietly
+# widens turns this suite red.
+#
+# REGENERATING THIS FILE IS NOT A FIX. If the suite goes red, decide which
+# happened and say so in the commit message:
+#   * the renderer started drawing a border with a glyph listed `content`
+#     — move the row, and say which capture proves it.
+#   * a disposition FLIP — that is a behaviour change to the classifier
+#     every retirement decision reads. It needs the capture that
+#     justifies it, not a plausible argument.
+#
+# glyph<TAB>codepoint<TAB>disposition<TAB>why
+─	U+2500	chrome	the horizontal rule Claude Code draws above and below the composer TODAY (as `\x1b[38;5;244m`, not dim — listed because a dim variant is one theme change away)
+│	U+2502	chrome	THE motivating glyph: the closing border that made every idle pane read autosuggest-only in the #798 stub
+┃	U+2503	chrome	heavy vertical — the same border in a bolder box style
+╭	U+256D	chrome	rounded top-left corner; Claude Code's own box style elsewhere in its TUI
+╮	U+256E	chrome	rounded top-right corner
+╯	U+256F	chrome	rounded bottom-right corner
+╰	U+2570	chrome	rounded bottom-left corner
+═	U+2550	chrome	double horizontal — upper half of the box-drawing block, so it pins that the range is not just its first rows
+║	U+2551	chrome	double vertical
+█	U+2588	chrome	full block; the block-elements range exists for renderers that draw a solid gutter
+▏	U+258F	chrome	left one-eighth block — the thin left rule several TUIs use as a border
+▕	U+2595	chrome	right one-eighth block — its mirror, the likeliest thin CLOSING border
+|	U+007C	content	ASCII pipe. NOT chrome: a suggestion may open with it, and losing a real ghost is worse than keeping the border case. A renderer drawing an ASCII border is a recorded gap
++	U+002B	content	ASCII plus — the corner glyph of an ASCII-art box, same ruling and same reason as the pipe
+●	U+25CF	content	the status dot; geometric shapes are text, and this one already has a load-bearing meaning in _content_hash's nudge strip
+✻	U+273B	content	the spinner/banner glyph — dingbat, far outside any border range
+■	U+25A0	content	ONE CODEPOINT ABOVE the block-elements range (U+2580–U+259F). If a widened range ever swallows it, this row goes red
+⓿	U+24FF	content	ONE CODEPOINT BELOW the box-drawing range (U+2500–U+257F). Pins the lower edge the same way

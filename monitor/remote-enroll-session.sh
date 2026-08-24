@@ -81,6 +81,18 @@ fi
 # ── gate: the channel must be registered ───────────────────────────────
 _remote_registered || { _es_log "REFUSED(10): not registered"; echo "remote-enroll-session: channel not enabled." >&2; exit 10; }
 
+# ── gate: SOURCE ADDRESS (your-org/nexus-code#609 item 4) ──────────────
+# Same runtime enforcement of monitor.remote.from_cidr as the main forced
+# command. It matters MORE here, not less: this is the endpoint that installs a
+# new permanent credential, so an enrollment window reachable from outside the
+# pinned source range is the widest form of the gap. Fail-closed on an
+# undeterminable peer, exactly as in remote-forced-command.sh.
+if ! _remote_source_guard; then
+    _es_log "REFUSED(14): source address rejected: $_REMOTE_SRC_REASON"
+    echo "remote-enroll-session: refused: source address rejected: $_REMOTE_SRC_REASON" >&2
+    exit 14
+fi
+
 # ── validate the SERVER-BAKED token hash (misconfig backstop) ──────────
 [[ "$HASH" =~ ^[0-9a-f]{64}$ ]] || { _es_log "REFUSED(11): bad baked token hash"; echo "remote-enroll-session: misconfigured enroll line (bad token hash)." >&2; exit 11; }
 

@@ -79,7 +79,26 @@ SHAPE="pin"
 MESSAGE=""
 ASSETS_DIR="$_nexus_root/assets"
 
-usage() { awk '/^$/{exit}NR>1' "$0" >&2; exit "${1:-1}"; }
+# your-org/nexus-code#575. The full header block is a ~60-line design document.
+# Dumping it as the ERROR for a one-character flag typo reads as "something has
+# gone badly wrong inside the tool" rather than "that flag does not exist", and
+# it buries the one line that actually matters. Reserve it for an explicit
+# --help; on the error path print a one-line synopsis and name the exit-code
+# semantics, since misreading THOSE is what sends a reader off checking network
+# reachability and tokens when the real problem is on their command line.
+usage() {   # $1 = exit code (0 ⇒ explicit --help ⇒ full reference)
+    if [[ "${1:-1}" == 0 ]]; then
+        awk '/^$/{exit}NR>1' "$0" >&2
+    else
+        cat >&2 <<'EOU'
+usage: upload-asset.sh <local-path> [--issue N] [--repo-path <path>]
+                       [--shape pin|latest] [--message <msg>] [--repo <owner/name>]
+Run with --help for the full reference.
+Exit 1 is BAD USAGE — it is not an asset-repo failure (that is exit 3).
+EOU
+    fi
+    exit "${1:-1}"
+}
 
 while (( $# > 0 )); do
     case "$1" in
@@ -91,12 +110,46 @@ while (( $# > 0 )); do
         -h|--help)     usage 0 ;;
         --)            shift; break ;;
         -*)            echo "unknown flag: $1" >&2; usage 1 ;;
+        # ---- your-org/nexus-code#858 A: exactly ONE positional ----------
+        #
+        # A second bare positional used to be bound to --repo-path. The
+        # usage advertises one positional, so that binding was
+        # undocumented — and it is the one failure in this file that
+        # SUCCEEDS while doing the wrong thing.
+        #
+        # A bare ISSUE NUMBER is the plausible second argument here,
+        # because `ng wrap-up`, `ng reply`, `ng comment`, `ng react` and
+        # `ng close` all take one in that slot. Observed:
+        # `ng upload <report> 846` wrote `assets/846` (a FILE where the
+        # issue's own asset DIRECTORY lives), printed a resolving URL,
+        # and exited 0 — while leaving the link an `ng wrap-up` comment
+        # already pointed at aimed at the superseded copy. A reader
+        # following the issue link read the stale report; the pane said
+        # the upload succeeded.
+        #
+        # Refuse, and name the flag the caller almost certainly wanted.
+        # An all-digits token gets the `--issue` diagnostic specifically:
+        # that is the mistake that was actually made, and "unexpected
+        # argument" alone would leave the caller to guess between
+        # --issue and --repo-path.
         *)             if [[ -z "$LOCAL" ]]; then
                            LOCAL="$1"
-                       elif [[ -z "$REPO_PATH" ]]; then
-                           REPO_PATH="$1"
+                       elif [[ "$1" =~ ^[0-9]+$ ]]; then
+                           {
+                             echo "upload-asset.sh: unexpected second positional argument: $1"
+                             echo "  This takes exactly ONE positional (the local path). Did you mean:"
+                             echo "      upload-asset.sh $LOCAL --issue $1"
+                             echo "  A bare number here used to be taken as --repo-path and upload to"
+                             echo "  assets/$1, exit 0, and print a URL (your-org/nexus-code#858)."
+                           } >&2
+                           usage 1
                        else
-                           echo "unknown positional: $1" >&2; usage 1
+                           {
+                             echo "upload-asset.sh: unexpected second positional argument: $1"
+                             echo "  This takes exactly ONE positional (the local path)."
+                             echo "  To override placement, pass it as a flag: --repo-path $1"
+                           } >&2
+                           usage 1
                        fi
                        shift ;;
     esac

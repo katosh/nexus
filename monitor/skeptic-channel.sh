@@ -109,6 +109,20 @@
 #                                             [--min-interval S] [--no-nudge]
 #                                             skeptic → ensure all acked
 #   close   <task-id>                         skeptic → drop DONE sentinel
+#   resolve <task-id> --reason "<why>" [--disposition]
+#                                             ORCHESTRATOR-ONLY: clear a
+#                                             skeptic-pending marker that a
+#                                             returned verdict failed to clear,
+#                                             with a mandatory rationale written
+#                                             beside it + an audit event. The
+#                                             sanctioned replacement for a
+#                                             hand-`rm` (your-org/nexus-code#577).
+#                                             --disposition additionally
+#                                             releases retire-preflight check
+#                                             1c's `disposition: second-pass`
+#                                             gate, and is the ONE form that
+#                                             succeeds with NO marker present
+#                                             (your-org/nexus-code#813)
 #   reset   <task-id>                         open a new round: archive the
 #                                             prior DONE + .answered.md into
 #                                             .stale-archive-<ts>/ (no-op rc 0)
@@ -129,6 +143,14 @@
 #   4   await / await-answer timed out (no request / no answer in time)
 #   5   nudge skipped (worker busy / typing / unresolvable; or rate-limited)
 #   6   reconcile gave up: a worker never acked within the bound (a finding)
+#  11   await: COUNTERPART-FINISHED — the skeptic-pending marker was
+#       observed live and has since been removed, which `ng wrap-up
+#       --skeptic-role` does the instant it records a verdict. The
+#       reviewer is done but never ran `close`, so no DONE will ever
+#       arrive. Distinct from 4 (timed out — the wait may still be
+#       meaningful) and from 10 (the skeptic closed the channel
+#       deliberately). Read the verdict from the skeptic's report and
+#       proceed; do NOT re-enter await (your-org/nexus-code#615).
 #  10   await: DONE sentinel present AND newer than the task's pending
 #       marker (or no marker) — the skeptic closed the channel for THIS
 #       round; stop looping and proceed to retire. A DONE older than the
@@ -310,6 +332,76 @@ _await_heartbeat() {
     date +%s > "$dir/.await-heartbeat" 2>/dev/null || true
 }
 
+# ---- await singleton: reap the prior waiter before arming a new one ------
+#
+# your-org/nexus-code#615. `await` is bounded by --timeout, but a worker
+# re-enters it on every turn (the worker floor instructs exactly that),
+# and nothing reaped the PREVIOUS still-blocked waiter. Observed on
+# `kompot-spikeguard`: FIVE concurrent `skeptic-channel.sh await` on one
+# channel, arriving ~1/min, none exited, all `S`. Unbounded in principle
+# — one per worker turn, ~60/hour — and the stacked shells are counted
+# by `bg_shells`, so a leak volume was being read as worker liveness
+# (it drove a spurious `wrapped-with-children` whose advice was to close
+# the window).
+#
+# The invariant: ONE live waiter per (worker, channel), enforced rather
+# than assumed.
+#
+# HOW THE PRIOR WAITER IS IDENTIFIED — and why not by pattern. A pkill /
+# pgrep by script basename is the wrong instrument here: a read-only
+# pgrep on a script basename once matched, and a companion pkill then
+# killed, four unrelated production services. So we never search for
+# processes. We kill ONLY a pid this script itself recorded in
+# `<channel>/.await-owner`, and only after re-reading /proc to confirm
+# that pid is still an `await` for THIS task. If /proc is unreadable, or
+# the cmdline does not match, we leave it alone and simply take
+# ownership — a stale record must never authorise a kill.
+_await_owner_file() { printf '%s/.await-owner' "$1"; }
+
+# True iff <pid> is, right now, a `skeptic-channel.sh await <task>`.
+# Reads /proc/<pid>/cmdline (NUL-separated). Any doubt → false.
+_await_pid_is_ours() {
+    local pid="$1" task="$2" cmdline
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || return 1
+    [[ "$cmdline" == *"skeptic-channel.sh"* ]] || return 1
+    [[ "$cmdline" == *" await "* ]] || return 1
+    [[ "$cmdline" == *" $task"* ]] || return 1
+    return 0
+}
+
+# Reap the recorded prior waiter (if any, if still ours), then record
+# ourselves as the owner. Best-effort throughout: failing to reap must
+# never stop this await from running, or a transient /proc hiccup would
+# strand the worker.
+_await_claim_singleton() {
+    local task="$1" dir="$2"
+    local owner_file prior
+    owner_file=$(_await_owner_file "$dir")
+    if [[ -r "$owner_file" ]]; then
+        prior=$(head -1 "$owner_file" 2>/dev/null | tr -dc '0-9') || prior=""
+        if [[ -n "$prior" ]] && (( prior != $$ )) && _await_pid_is_ours "$prior" "$task"; then
+            kill -TERM "$prior" 2>/dev/null || true
+            warn "reaped prior await (pid $prior) on task $task before arming a new one (#615: one live waiter per channel)"
+        fi
+    fi
+    printf '%s\n' "$$" > "$owner_file" 2>/dev/null || true
+}
+
+# Release ownership on the way out, but ONLY if we still hold it — a
+# successor that already claimed the channel must not have its record
+# deleted by our exit.
+_await_release_singleton() {
+    local dir="${1:-}" owner_file cur
+    [[ -n "$dir" ]] || return 0
+    owner_file=$(_await_owner_file "$dir")
+    [[ -r "$owner_file" ]] || return 0
+    cur=$(head -1 "$owner_file" 2>/dev/null | tr -dc '0-9') || cur=""
+    [[ "$cur" == "$$" ]] && rm -f "$owner_file" 2>/dev/null
+    return 0
+}
+
 # Stamp a WORKER-side skeptic-channel action (ack / answer) into the
 # machine-input ledger ($STATE_DIR/machine-input.tsv), the SAME ledger
 # paste-followup.sh writes and the watcher's attribution + retire-preflight
@@ -336,7 +428,17 @@ _stamp_machine_input() {
     local window="$1" src="$2"
     [[ -n "$window" && -n "$src" ]] || return 0
     mkdir -p "$STATE_DIR" 2>/dev/null || return 0
-    printf '%s\t%s\t%s\n' "$window" "$(date +%s)" "$src" \
+    # Column 2 is MICROSECONDS since your-org/nexus-code#679, matching
+    # paste-followup.sh and _lib.sh's _machine_input_stamp. This writer's
+    # rows feed retire-preflight's `$1 == w` lookup, which takes a MAX
+    # across every src token, so a seconds row here mixed with
+    # microsecond rows elsewhere would make this writer's stamps
+    # permanently lose that max — silently disabling exactly the
+    # retirement gate the comment above says these rows exist to trip.
+    local _mi_epoch
+    _mi_epoch=$(date +%s%6N 2>/dev/null)
+    [[ "$_mi_epoch" =~ ^[0-9]{16,}$ ]] || _mi_epoch=$(( $(date +%s) * 1000000 ))
+    printf '%s\t%s\t%s\n' "$window" "$_mi_epoch" "$src" \
         >> "$STATE_DIR/machine-input.tsv" 2>/dev/null || true
 }
 
@@ -487,8 +589,52 @@ cmd_await() {
     mkdir -p "$dir" 2>/dev/null || true
     local sentinel; sentinel=$(_done_sentinel "$task")
     local marker;   marker=$(_pending_marker "$task")
+    # #615: one live waiter per (worker, channel). Reap the prior one
+    # before arming, and drop our record on every exit path.
+    _await_claim_singleton "$task" "$dir"
+    # The trap body runs at SCRIPT exit, in the top-level scope — `dir`
+    # is `local` to this function and is long gone by then, so a naive
+    # `"$dir"` there is an unbound-variable error under `set -u`. Stash
+    # it in a global the trap can actually see.
+    _AWAIT_DIR="$dir"
+    trap '_await_release_singleton "${_AWAIT_DIR:-}"' EXIT
+    # Did the pending marker EXIST while we were waiting? Its later
+    # disappearance is the signal that the verdict returned (see the
+    # counterpart-finished check below) — but only if we ever saw it.
+    # A worker that enters await with no marker at all was never parked
+    # on anything, and must not read that absence as a resolution.
+    local marker_seen=0
+    [[ -e "$marker" ]] && marker_seen=1
     local waited=0 f acked stale_warned=0
     while :; do
+        # Terminal: THE COUNTERPART FINISHED (your-org/nexus-code#615).
+        #
+        # `ng wrap-up --skeptic-role` removes the pending marker the
+        # instant a verdict is recorded — that removal IS the gate's own
+        # statement that the required validation happened. The skeptic's
+        # `close` (which drops DONE) is a SEPARATE, later, and entirely
+        # optional act, so a skeptic that delivers a verdict and goes
+        # idle without closing left the worker blocked forever.
+        #
+        # Observed: `kompot-sg3-skeptic` delivered its verdict at
+        # 20:50:53 and went idle; `kompot-spikeguard` was still stacking
+        # awaits at 23:32 on a channel holding nothing but a
+        # `.await-heartbeat` it was refreshing itself. The heartbeat
+        # proved THE WAITER was alive and was then read as evidence THE
+        # WAIT was meaningful — different properties. This check makes
+        # the wait's validity depend on the counterpart, which is the
+        # only thing that can actually end it.
+        #
+        # Distinct, loud exit code (11) so a caller can tell "your
+        # reviewer finished" apart from "timed out" (4) and from "the
+        # reviewer closed the channel" (10).
+        if (( marker_seen == 1 )) && [[ ! -e "$marker" ]]; then
+            printf 'COUNTERPART-FINISHED\n'
+            printf 'skeptic-channel: the skeptic-pending marker for task %s is gone — the reviewing skeptic recorded its verdict (ng wrap-up --skeptic-role clears the marker) without closing the channel. Ending the wait: nothing further can arrive on it. Read the verdict in the skeptic'"'"'s report, then proceed to retire.\n' \
+            "$task" >&2
+            return 11
+        fi
+        [[ -e "$marker" ]] && marker_seen=1
         # Terminal: the skeptic closed the channel FOR THIS ROUND.
         #
         # `close` is the only writer of DONE, and it also removes the
@@ -728,6 +874,128 @@ cmd_close() {
     printf '%s\n' "$sentinel"
 }
 
+# resolve <task-id> --reason "<why>" — the SANCTIONED way to clear a
+# skeptic-pending marker that a returned verdict failed to clear
+# (your-org/nexus-code#577).
+#
+# WHY THIS VERB EXISTS. The require-gate marker is cleared by exactly two
+# writers: a skeptic's `--skeptic-role` wrap-up, and `close`. When a verdict
+# exists but neither ran against THIS state dir, the marker is immortal:
+# `retire-preflight` reports `safe=0 … required skeptic has not returned a
+# verdict` forever, and the window can never be retired by the sanctioned path.
+# The #577 incident is the canonical case (a skeptic spawned from a secondary
+# clone logged its verdict into that clone's state dir), and the marker can also
+# outlive its round when a worker re-runs `wrap-up --skeptic-decision require`
+# after a verdict has already come back.
+#
+# The operator's only remaining move was `rm` — a hand-clear of the very marker
+# that exists to prevent hand-clearing. That is worse than no guard: it teaches
+# the bypass. Four such hand-clears exist in this workspace's state dir, each
+# with a hand-written `.<window>.cleared-rationale` file beside it. This verb
+# adopts that convention as the mechanism: same file, same place, but with the
+# authority check, the mandatory rationale, and the audit event that a bare `rm`
+# cannot give.
+#
+# It is NOT `--skeptic-waive`. A waive says "no skeptic is required after all"
+# and is recorded as a decision about the REQUIREMENT; `resolve` says "the
+# required validation HAPPENED and here is where it landed" and is recorded as a
+# statement about the EVIDENCE. Waive is also structurally unavailable here: it
+# only ever clears the marker of the window whose wrap-up invokes it, so it can
+# never release another window's gate.
+#
+# ORCHESTRATOR-ONLY, mirroring the waive guard: a worker must not be able to
+# release its own required validation, so a set NEXUS_WORKER_WINDOW refuses.
+cmd_resolve() {
+    local task="${1:-}"; [[ -n "$task" ]] || die "usage: resolve <task-id> --reason \"<why>\""
+    shift || true
+    local reason="" disposition=0
+    while (( $# > 0 )); do
+        case "$1" in
+            --reason) reason="${2:-}"; shift 2 || die "--reason needs text" ;;
+            # your-org/nexus-code#813 — also release retire-preflight check
+            # 1c's `disposition: second-pass` gate. That gate is armed by the
+            # REPORT, not by a marker, so this is the one form of `resolve`
+            # that must succeed with no marker on disk: the orchestrator has
+            # adjudicated the request and declined it, and needs somewhere on
+            # the record to say so. Without it the gate is a brick, and a
+            # brick teaches the `rm` bypass this verb exists to replace.
+            --disposition) disposition=1; shift ;;
+            *) die "unknown flag: $1" ;;
+        esac
+    done
+    if [[ -n "${NEXUS_WORKER_WINDOW:-}" ]]; then
+        cat >&2 <<EOF
+skeptic-channel: resolve is an OPERATOR/ORCHESTRATOR override and was invoked from
+  inside a worker session (NEXUS_WORKER_WINDOW=$NEXUS_WORKER_WINDOW). A worker may
+  not release its own required validation. If a verdict exists but the marker did
+  not clear, file it for the orchestrator:
+      ng request file --origin "$NEXUS_WORKER_WINDOW" --kind correction \\
+          --slug skeptic-marker-stuck --reply required
+EOF
+        return 1
+    fi
+    # A rationale is the point of the verb: the whole failure mode is an
+    # unaudited clear. Require something substantive, not a keystroke.
+    if (( ${#reason} < 20 )); then
+        die "resolve: --reason must be a substantive explanation (>=20 chars) naming WHERE the verdict is — it is written to the audit trail beside the marker"
+    fi
+    local marker; marker=$(_pending_marker "$task")
+    if [[ ! -e "$marker" && $disposition -eq 0 ]]; then
+        # Nothing to clear. Fail loud rather than reporting success: a silent
+        # no-op here would let `resolve` become a reflex incantation.
+        printf 'skeptic-channel: no skeptic-pending marker for task %s (%s) — nothing to resolve.\n' \
+            "$task" "$marker" >&2
+        printf '  (if you are declining a report'"'"'s `disposition: second-pass` rather than\n' >&2
+        printf '   clearing a marker, that gate is armed by the REPORT — pass --disposition.)\n' >&2
+        return 1
+    fi
+    mkdir -p "$PENDING_DIR" 2>/dev/null || true
+    # your-org/nexus-code#813 skeptic F5 — capture this BEFORE the `rm` below.
+    # The first draft re-tested `[[ -e "$marker" ]]` AFTER removing it, so the
+    # branch could never be true and a real marker clear reported "no marker was
+    # present". That lies to an orchestrator who has just invoked the verb that
+    # exists to REPLACE a hand-`rm` — the single message most likely to send
+    # them back to `rm`. Same false-cause class as the `SKIPPED (upload failed)`
+    # line the sibling PR fixes in this same batch.
+    local had_marker=0
+    [[ -e "$marker" ]] && had_marker=1
+    local rationale="$PENDING_DIR/.$(_safe "$task").cleared-rationale"
+    {
+        printf '# skeptic-pending marker resolved via `skeptic-channel resolve` (your-org/nexus-code#577)\n'
+        printf 'task-id  : %s\n' "$task"
+        printf 'resolved : %s\n' "$(_now_iso)"
+        if (( had_marker )); then
+            printf 'marker   : mtime %s\n' \
+                "$(date -Is -r "$marker" 2>/dev/null || echo unknown)"
+        else
+            printf 'marker   : none (disposition-only release)\n'
+        fi
+        (( disposition )) && printf 'scope    : also releases retire-preflight check 1c (disposition: second-pass)\n'
+        printf '\n%s\n' "$reason"
+    } >> "$rationale" 2>/dev/null || warn "resolve: could not write rationale to $rationale"
+    if (( had_marker )); then
+        rm -f "$marker" 2>/dev/null || die "resolve: could not remove marker: $marker"
+    fi
+    # The rationale's MTIME is what retire-preflight check 1c compares against
+    # the report's, so it must post-date the report for the release to count.
+    # `>>` already stamps now; this is stated because the comparison is remote
+    # from the write and a future refactor to an atomic-rename write would
+    # silently preserve an OLD mtime and make every release a no-op.
+    "$_script_dir/ng" log-action monitor \
+        --event skeptic-resolve \
+        --extra "task=$task" \
+        --extra "scope=$( (( disposition )) && printf 'marker+disposition' || printf 'marker' )" \
+        --extra "reason=$reason" >/dev/null 2>&1 || true
+    if (( had_marker )); then
+        printf 'resolved skeptic-pending marker for %s\n' "$task"
+    else
+        printf 'recorded a disposition-only resolution for %s (no marker was present)\n' "$task"
+    fi
+    printf 'rationale appended: %s\n' "$rationale"
+    (( disposition )) && printf 'retire-preflight check 1c (disposition: second-pass) is released for %s\n' "$task"
+    printf 'the window can now be retired by the sanctioned path (retire-preflight).\n'
+}
+
 # reset <task-id> — open a NEW skeptic round cleanly by ARCHIVING the
 # previous round's terminal sentinels (the DONE close-marker and every
 # *.answered.md verdict) into <channel>/.stale-archive-<ts>/, rather than
@@ -863,7 +1131,9 @@ cmd_nudge() {
 Re-enter the await loop with \`monitor/skeptic-channel.sh await ${task}\` — it acks each \
 \`*.open.md\` in ${dir} (rename to \`*.ack.md\`) and exits so you can answer with \
 \`monitor/skeptic-channel.sh answer ${task} <req> --file <reply>\` (rename to \
-\`*.answered.md\`). Then re-enter await until it exits 10 (the skeptic closed the channel).")
+\`*.answered.md\`). Then re-enter await until it exits 10 (the skeptic closed the channel) or 11 \
+(COUNTERPART-FINISHED — the skeptic recorded its verdict without closing; nothing more can arrive, \
+so stop re-entering and proceed to retire).")
 
     # SKEPTIC_PASTE_BIN is a test seam (hermetic suite injects a stub).
     local paste_bin="${SKEPTIC_PASTE_BIN:-$_script_dir/paste-followup.sh}"
@@ -908,6 +1178,7 @@ main() {
         await-answer) cmd_await_answer "$@" ;;
         reconcile)    cmd_reconcile    "$@" ;;
         close)        cmd_close        "$@" ;;
+        resolve)      cmd_resolve      "$@" ;;
         reset)        cmd_reset        "$@" ;;
         nudge)        cmd_nudge        "$@" ;;
         -h|--help|"")

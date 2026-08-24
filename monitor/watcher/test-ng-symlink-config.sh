@@ -68,6 +68,10 @@ trap 'rm -rf "$WORK"' EXIT
 TREE="$WORK/nexus"
 mkdir -p "$TREE/monitor" "$TREE/config" "$TREE/locals/bin"
 cp "$NG_REAL" "$TREE/monitor/ng"
+# `ng` sources monitor/_bookkeeping.sh and REFUSES TO START without
+# it (your-org/nexus-code#601/#605: degrading to the silent-coercion
+# behaviour it replaces is worse than refusing). Copy it alongside.
+cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$TREE/monitor/_bookkeeping.sh"
 
 # Stubbed config/load.sh: drops a marker EVERY time it is invoked (proving
 # it was found via the resolved _script_dir) and echoes a distinct sentinel

@@ -78,7 +78,7 @@ PIDFILE="\$STATE/watcher.pid"; HB="\$STATE/watcher-heartbeat"; ILOCK="\$STATE/ne
 peer=\$(cat "\$PIDFILE" 2>/dev/null || true)
 if [[ "\$peer" =~ ^[0-9]+\$ ]] && (( peer != \$\$ )) && kill -0 "\$peer" 2>/dev/null; then
     cl="/proc/\$peer/cmdline"
-    if [[ ! -r "\$cl" ]] || tr '\0' ' ' < "\$cl" 2>/dev/null | grep -q main.sh; then exit 1; fi
+    if [[ ! -r "\$cl" ]] || grep -q main.sh <<<"\$(tr '\0' ' ' < "\$cl" 2>/dev/null)"; then exit 1; fi
 fi
 exec {ILFD}<>"\$ILOCK" || exit 5
 flock -n "\$ILFD" || exit 4

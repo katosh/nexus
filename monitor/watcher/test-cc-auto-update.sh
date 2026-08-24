@@ -10,6 +10,15 @@
 # binary, gh, mint) via its CC_AUTO_* command-override env vars. No
 # live bump, no live restart, no network.
 #
+# …with ONE historical exception, now closed. `notify()` in
+# cc-auto-update-apply.sh was NOT among the overridden mechanisms, so every
+# decision branch exercised below rang a REAL terminal bell in the operator's
+# live tmux. Measured 2026-07-24: ~3.4 bells/second, ~250 transient `•bell`
+# windows per 73 seconds — the dominant residual source of the bell flood.
+# NEXUS_NOTIFY_QUIET=1 is the hard off-switch honoured by
+# monitor/notifywrap/sandbox-notify; run-tests.sh exports it suite-wide, and
+# the export below covers a DIRECT `bash monitor/watcher/test-cc-auto-update.sh`.
+#
 # Cases:
 #   trigger / scheduling
 #     1.  fire-epoch math: 04:00 resolves to today's 04:00 local.
@@ -115,6 +124,42 @@
 
 set -uo pipefail
 
+# No real terminal bell from a test run — see the header note. Covers a direct
+# `bash monitor/watcher/test-cc-auto-update.sh`; run-tests.sh exports it too.
+export NEXUS_NOTIFY_QUIET=1
+
+# HERMETIC ENV (your-org/nexus-code#655) — the FIFTH member of the class, and
+# the first found by monitor/nexus-root-sensitivity.sh rather than by a human
+# diffing the band.
+#
+# NEXUS_NOTIFY_QUIET=1 silences the BELL but does NOT silence the STATE WRITE:
+# monitor/notifywrap/sandbox-notify takes its `(0) Hard off` branch and still
+# calls `_nw_record "quiet" "suppress-quiet"`, which appends to
+# ${NEXUS_NOTIFY_STATE_DIR:-$NEXUS_ROOT/monitor/.state}/notify-decisions.jsonl.
+# cc-auto-update-apply.sh's notify() (:229) reaches that wrapper because
+# locals-env.sh / bash_env.sh PATH-front $NEXUS_ROOT/monitor/notifywrap — so the
+# R1 reconcile branch wrote five records into whatever root was inherited, with
+# every one of the 82 assertions passing and rc=0. Measured twice, 2026-08-05,
+# against a DECOY root.
+#
+# DESTINATION, stated precisely because the first write-up of this got it wrong:
+# the five records landed in the DECOY, which is where the measurement pointed
+# NEXUS_ROOT. An earlier version of this comment said "straight into the
+# OPERATOR'S PRIMARY .state" — that was an inference, not an observation, and it
+# is FALSE: the primary's notify-decisions.jsonl is unrotated back to
+# 2026-07-24 and holds ZERO `quiet`-class records for 2026-08-05. No primary
+# contamination occurred and nothing needs cleaning. The MECHANISM and the LEAK
+# are real; only the claimed destination was not.
+#
+# That shape is invisible to both existing detectors: the assertions never
+# move, so the `inherited-root` CI job stays green, and no `spawn` row is
+# emitted, so the retrospective action-log audit cannot see it either.
+#
+# The suite pins NEXUS_ROOT at each of its six explicit spawn call sites and
+# depends on the ambient value nowhere, so scrubbing is safe and is the same
+# one-line remedy the other four members carry.
+unset NEXUS_ROOT
+
 _script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MONITOR_DIR=$(cd "$_script_dir/.." && pwd)
 # shellcheck source=_cc_update.sh
@@ -149,6 +194,9 @@ make_root() {
 { "dependencies": { "@anthropic-ai/claude-code": "$floor" } }
 EOF
     cp "$MONITOR_DIR/cc-auto-update-prompt.md" "$root/monitor/cc-auto-update-prompt.md"
+    # The fire path resolves monitor.cc_auto_update.tracking_issue through this
+    # (your-org/nexus-code#866); a real root always has it.
+    cp "$MONITOR_DIR/issue-ref.sh" "$root/monitor/issue-ref.sh"
     cp "$MONITOR_DIR/cc-auto-update-watchdog-prompt.md" "$root/monitor/cc-auto-update-watchdog-prompt.md"
 }
 
@@ -508,10 +556,79 @@ EOF
     projects="$root/projects"
     mkdir -p "$projects/$slug"
     printf '{"version":"%s"}\n' "$floor" > "$projects/$slug/$sid.jsonl"
-    # green gate evidence mentioning the candidate
-    printf 'gating %s\n=== GATE GREEN — candidate is safe to promote ===\n' "$candidate" \
-        > "$root/gate.log"
+    # Green gate evidence mentioning the candidate. The scenario lines are
+    # part of the fixture on purpose: apply.sh cross-checks a
+    # `--surface-evidence <s>=gate` claim against the scenario names in
+    # THIS file, so a bare "GATE GREEN" would (correctly) refuse them.
+    {
+        printf 'gating %s\n' "$candidate"
+        printf -- '--- test-realmodel-idle-busy.sh ---\n'
+        printf -- '--- test-realmodel-blocked-question.sh ---\n'
+        printf -- '--- test-realmodel-autosuggest.sh ---\n'
+        printf -- '--- test-realmodel-overlimit.sh ---\n'
+        printf -- '--- test-realmodel-pretooluse-hook.sh ---\n'
+        printf '=== GATE GREEN — candidate is safe to promote ===\n'
+    } > "$root/gate.log"
+
+    # Changelog evidence + ledger for the completeness rule. The fixture
+    # is deliberately a TWO-release delta with a THIRD section at (not
+    # above) the installed floor: the derived release set must be
+    # {2.1.155, 2.1.160} — the installed release's own entries are not in
+    # the delta and must not be demanded. Entry counts: .160 → 2,
+    # .155 → 1, .150 → 1 (excluded).
+    {
+        printf '# Changelog\n\n'
+        printf '## %s\n\n' "$candidate"
+        printf -- '- Fixed the token counter wording on the spinner row\n'
+        printf -- '- Added a new --teleport flag nobody here uses\n\n'
+        printf '## 2.1.155\n\n'
+        printf -- '- Changed the permission dialog chevron styling\n\n'
+        printf '## %s\n\n' "$floor"
+        printf -- '- Fixed something that predates this delta entirely\n'
+    } > "$root/changelog.md"
+    {
+        printf -- '- Fixed the token counter wording on the spinner row | 2a, gate: counter unchanged\n'
+        printf -- '- Added a new --teleport flag nobody here uses | no nexus surface\n'
+        printf -- '- Changed the permission dialog chevron styling | 2b, gate: Case A literals intact\n'
+    } > "$root/ledger.md"
+
+    # UPSTREAM. apply.sh re-fetches the changelog itself rather than
+    # trusting --changelog-evidence (a skeptic truncated a release from 19
+    # entries to 5 in the supplied copy and was accepted at rc 0). The
+    # fetch is stubbed here; by default it serves a byte-identical copy,
+    # so the supplied-vs-upstream cross-check passes. Cases that need a
+    # divergence edit ONE side.
+    cp "$root/changelog.md" "$root/upstream-changelog.md"
+    cat > "$root/fetch-changelog" <<EOF
+#!/usr/bin/env bash
+[[ -n "\${FETCH_RC:-}" ]] && exit "\$FETCH_RC"
+cat "$root/upstream-changelog.md"
+EOF
+    chmod +x "$root/fetch-changelog"
 }
+
+# Changelog-completeness flags for the fixture above (GAP 2 of the
+# cc-update rigor fix): every release in the derived delta carries an
+# explicit dispositioned count, and the counts are cross-checked against
+# the entries this script parses out of changelog.md.
+cl_ok() {
+    printf -- '--changelog-evidence %s/changelog.md --changelog-ledger %s/ledger.md --changelog-dispositioned 2.1.155=1 --changelog-dispositioned 2.1.160=2' \
+        "$ROOT" "$ROOT"
+}
+
+# Per-surface evidence classes for apply.sh's labelling rule (the
+# cc-update rigor fix). `--surfaces-clear` is no longer a bare
+# attestation: every GUIDE surface 2a-2e needs an explicit evidence
+# class, `empirical` additionally needs a stated negative control, and a
+# `gate` claim is cross-checked against the scenario names in the gate
+# log. This set is the well-formed baseline the non-refusal cases use.
+#
+# NOTE 2c is SPLIT into 2c-paste / 2c-vi: the paste-delivery path and the
+# VI-insert guard are separate sub-claims, and the aggregate key `2c` is
+# refused, so a driven half can no longer pay for an inert one.
+SURF_OK="--surface-evidence 2a=gate --surface-evidence 2b=gate \
+--surface-evidence 2c-paste=reachability --surface-evidence 2c-vi=reachability \
+--surface-evidence 2d=gate --surface-evidence 2e=source-inspection"
 
 # Common env for an apply invocation rooted at $1.
 # CC_AUTO_GATE_PR_CMD=true → the deployment gate's PR probe (nexus-code
@@ -530,6 +647,7 @@ apply_env() {
         CC_AUTO_TMUX="$root/tmux" \
         CC_AUTO_PROJECTS_DIR="$root/projects" \
         CC_AUTO_GATE_PR_CMD=true \
+        CC_AUTO_CHANGELOG_FETCH_CMD="$root/fetch-changelog" \
         CC_AUTO_INVARIANT_TRIES=1 \
         CC_AUTO_IDLE_WAIT_SECONDS=2 CC_AUTO_IDLE_POLL_SECONDS=1 \
         CC_AUTO_ARM_WAIT_SECONDS=2 CC_AUTO_ARM_POLL_SECONDS=1
@@ -540,7 +658,7 @@ apply_env() {
 #     hand-off in-process so the whole chain is observable in one shot.
 ROOT="$WORK/a12"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 env $(apply_env "$ROOT") CC_AUTO_RESTART_INLINE=1 bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) \
     > "$ROOT/out.log" 2>&1
 rc=$?
 auto="$ROOT/monitor/.state/cc-auto-update"
@@ -577,18 +695,41 @@ ROOT="$WORK/a12b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 auto="$ROOT/monitor/.state/cc-auto-update"
 printf '#!/usr/bin/env bash\necho "state=busy active=1"\n' > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
-t0=$(date +%s)
-env $(apply_env "$ROOT") CC_AUTO_IDLE_WAIT_SECONDS=4 bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+# "Did not block on the idle-wait" is asserted as a HAPPENS-BEFORE, not as
+# a wall-clock ceiling (the your-org/nexus-code#557 class). The old form
+# required `elapsed < 3` against a 4 s wait; measured at CI fidelity
+# (2 vCPU, 6-way oversubscription) this call took 0-2 s, i.e. it came
+# within 1 s of failing on a run that was working perfectly. The ordering
+# below carries the same claim with no timing margin at all: if `safe` had
+# blocked through the wait, the kill would ALREADY be in calls.log by the
+# time it returned. Observing the kill still absent at return, and only
+# afterwards seeing it appear, is exactly what "detached" means.
+#
+# The wait is widened 4 s → 12 s purely to separate the two events. 12 s is
+# sized on measurement, not taste: under the harshest contention reproduced
+# for this class (1 vCPU, 8-way oversubscription) this foreground call took
+# at most 3 s, so 12 s is a 4x runway. The old 4 s wait left only a 1 s gap
+# against a 3 s worst case — which is exactly why the assertion went red on
+# 7 of 16 such runs.
+env $(apply_env "$ROOT") CC_AUTO_IDLE_WAIT_SECONDS=12 bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) \
     > "$ROOT/out.log" 2>&1
-rc=$?; elapsed=$(( $(date +%s) - t0 ))
+rc=$?
+# Sample the kill evidence AT the instant of return — before any polling.
+kill_at_return=0
+grep -q "kill-window -t orchestrator" "$ROOT/calls.log" 2>/dev/null && kill_at_return=1
 fg_ok=0
-(( rc == 0 )) && (( elapsed < 3 )) \
+(( rc == 0 )) && (( kill_at_return == 0 )) \
     && grep -q $'\tsafe-bumped-restart-handoff\t' "$auto/decisions.tsv" 2>/dev/null \
     && fg_ok=1
-# Poll up to ~16s for the detached child to wait out the cap + force-kill.
+# Now let the detached child wait out the 12 s cap and force-kill on its
+# own. 60 s of polling is 5x the runway; it breaks the instant the kill
+# lands, so the margin is free on every green run. (This file deliberately
+# does not source _test_helpers.sh — that would export
+# NEXUS_PUBLIC_ENABLED=1 into the code under test — so it does not use
+# th_deadline; a polled wait this generous does not need scaling.)
 killed=0
-for _ in $(seq 1 80); do
+for _ in $(seq 1 300); do
     if grep -q "kill-window -t orchestrator" "$ROOT/calls.log" 2>/dev/null \
        && grep -q $'\tsafe-bumped-restart-forced\t' "$auto/decisions.tsv" 2>/dev/null; then
         killed=1; break
@@ -596,9 +737,9 @@ for _ in $(seq 1 80); do
     sleep 0.2
 done
 if (( fg_ok == 1 && killed == 1 )); then
-    pass "safe detaches (rc 0 + handoff in ${elapsed}s ≪ 4s wait); child force-restarts on its own"
+    pass "safe detaches (rc 0 + handoff, kill not yet issued at return); child force-restarts on its own"
 else
-    fail "detach path wrong (rc=$rc elapsed=${elapsed}s fg_ok=$fg_ok killed=$killed): $(tail -2 "$ROOT/out.log")"
+    fail "detach path wrong (rc=$rc kill_at_return=$kill_at_return fg_ok=$fg_ok killed=$killed): $(tail -2 "$ROOT/out.log")"
 fi
 
 # 13. refusals: no attestation / no evidence / red gate
@@ -609,25 +750,450 @@ env $(apply_env "$ROOT") bash "$APPLY" safe \
     && pass "refused without --surfaces-clear (pin untouched)" \
     || fail "missing attestation not refused"
 env $(apply_env "$ROOT") bash "$APPLY" safe \
-    --candidate 2.1.160 --surfaces-clear >/dev/null 2>&1
+    --candidate 2.1.160 --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 (( $? == 3 )) && pass "refused without gate evidence" || fail "missing evidence not refused"
 printf 'gating 2.1.160\n=== GATE RED — do NOT promote this version ===\n' > "$ROOT/gate.log"
 env $(apply_env "$ROOT") bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 (( $? == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
     && pass "refused on a RED gate log" || fail "red gate not refused"
+
+# 13b. the labelling rule (cc-update rigor fix): --surfaces-clear alone is
+#      no longer sufficient. These are the refusals that make the flag
+#      mean something — five of six evaluation rounds passed a bare
+#      attestation over a probe that could not distinguish pass from fail.
+ROOT="$WORK/a13b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+pin_untouched() { [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]]; }
+
+# (a) attestation with NO per-surface evidence at all → refused.
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+    >/dev/null 2>&1
+(( $? == 3 )) && pin_untouched \
+    && pass "refused: --surfaces-clear with no --surface-evidence" \
+    || fail "bare attestation still accepted"
+
+# (b) partial coverage (2e missing) → refused. Every surface must be
+#     labelled; silence about one is how a surface goes unexamined.
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+    --surface-evidence 2a=gate --surface-evidence 2b=gate \
+    --surface-evidence 2c-paste=reachability --surface-evidence 2c-vi=reachability \
+    --surface-evidence 2d=gate \
+    >/dev/null 2>&1
+(( $? == 3 )) && pin_untouched && pass "refused: a surface with no evidence class" \
+    || fail "partial surface coverage accepted"
+
+# (c) `empirical` WITHOUT a negative control → refused. THE headline
+#     rule: the 2.1.216 and 2.1.222 rounds both labelled a reachability-
+#     only VI probe `empirical`.
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+    --surface-evidence 2a=gate --surface-evidence 2b=gate \
+    --surface-evidence 2c-paste=empirical --surface-evidence 2c-vi=reachability \
+    --surface-evidence 2d=gate --surface-evidence 2e=source-inspection \
+    >/dev/null 2>&1
+(( $? == 3 )) && pin_untouched \
+    && pass "refused: 'empirical' without a --negative-control" \
+    || fail "unsubstantiated 'empirical' label accepted"
+
+# (d) `empirical` WITH a negative control → accepted (rc 0). The rule
+#     must not be a blanket ban on the label; it must be payable.
+#     This is also the 2.1.224 shape done HONESTLY: the paste half is
+#     driven with a control, the VI half is `reachability`, and the
+#     audit row must derive the parent 2c as the WEAKER of the two.
+ROOT="$WORK/a13d"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+    --surface-evidence 2a=gate --surface-evidence 2b=gate \
+    --surface-evidence 2c-paste=empirical --surface-evidence 2c-vi=reachability \
+    --surface-evidence 2d=gate --surface-evidence 2e=source-inspection \
+    --negative-control '2c-paste=broke the delivery grep; probe went red' \
+    $(cl_ok) >/dev/null 2>&1
+rc=$?
+(( rc == 0 )) && [[ "$(cat "$ROOT/monitor/.state/cc-version-local" 2>/dev/null)" == "2.1.160" ]] \
+    && pass "accepted: 'empirical' backed by a stated negative control" \
+    || fail "substantiated 'empirical' wrongly refused (rc=$rc)"
+DEC="$ROOT/monitor/.state/cc-auto-update/decisions.tsv"
+grep -q $'\tsurface-evidence\t' "$DEC" 2>/dev/null \
+    && pass "surface-evidence labels recorded in the audit trail" \
+    || fail "surface-evidence audit row missing"
+# The composite's derived label is the WEAKEST sub-claim: 2c-paste is
+# `empirical`, 2c-vi is `reachability`, so 2c reads `reachability`. A
+# summary that let the driven half speak for the pair is the 2.1.224
+# defect verbatim.
+grep -q 'surface-evidence.*2c=reachability(weakest-of-subclaims)' "$DEC" 2>/dev/null \
+    && pass "composite 2c recorded as the weakest of its sub-claims" \
+    || fail "weakest-of-subclaims label missing: $(grep 'surface-evidence' "$DEC" | sed -n 1p)"
+
+# (e) `gate` claimed for a surface the gate log does not cover → refused.
+#     2d=gate is only payable when the PreToolUse scenario actually ran;
+#     crediting the over-limit scenario (Stop/StopFailure — a DIFFERENT
+#     hook event) for a PreToolUse changelog entry was the 2.1.222 error.
+ROOT="$WORK/a13e"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+grep -v 'pretooluse' "$ROOT/gate.log" > "$ROOT/gate-nohook.log"
+touch "$ROOT/gate-nohook.log"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate-nohook.log" --surfaces-clear \
+    $SURF_OK $(cl_ok) >/dev/null 2>&1
+(( $? == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
+    && pass "refused: 2d=gate without the PreToolUse scenario in the gate log" \
+    || fail "unsubstantiated 'gate' claim accepted"
+
+# (f) `gate` claimed for a surface NO scenario can cover (2e CLI flags)
+#     → refused, with a pointer to the honest classes.
+ROOT="$WORK/a13f"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+    --surface-evidence 2a=gate --surface-evidence 2b=gate \
+    --surface-evidence 2c-paste=reachability --surface-evidence 2c-vi=reachability \
+    --surface-evidence 2d=gate \
+    --surface-evidence 2e=gate >/dev/null 2>&1
+(( $? == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
+    && pass "refused: 'gate' for a surface no scenario covers" \
+    || fail "uncoverable 'gate' claim accepted"
+
+# (g) unknown class → refused (typo / invented vocabulary).
+ROOT="$WORK/a13g"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+    --surface-evidence 2a=gate --surface-evidence 2b=gate \
+    --surface-evidence 2c-paste=reachability --surface-evidence 2c-vi=probably-fine \
+    --surface-evidence 2d=gate \
+    --surface-evidence 2e=source-inspection >/dev/null 2>&1
+(( $? == 3 )) && pass "refused: unknown evidence class" || fail "unknown class accepted"
+
+# ---- 13b2. COMPOSITE surfaces (GAP 1 of the 2.1.224 skeptic verdict) -----
+# Surface 2c covers two mechanisms — the paste-delivery path (driven every
+# round) and the VI-insert guard (inert: the harness boots panes in
+# default mode, so the `i BSpace` prefix is a no-op, re-proven by
+# differential control on both 2.1.222 and 2.1.224). The per-surface
+# vocabulary could not express "half empirical, half reachability", so
+# the whole of 2c was labelled `empirical` — six times in seven rounds.
+
+# (h) the AGGREGATE key `2c` → refused, naming the two halves. This is
+#     the call the routine reaches for out of habit, so the refusal has
+#     to be the thing that teaches the split.
+#
+#     DISCRIMINATION: the sub-claims are ALSO supplied, correctly and
+#     completely, so `2c=` is the ONLY thing wrong with this invocation.
+#     The first version of this case passed `2c=empirical` INSTEAD of the
+#     halves, so it refused via the missing-2c-paste rule and survived
+#     deleting the key check outright — an assertion that never tested
+#     what it named (skeptic F4). Delete `_surface_key_check` now and
+#     this run is ACCEPTED at rc 0, because an unknown key is simply
+#     ignored by the per-surface loop.
+ROOT="$WORK/a13h"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+    $SURF_OK --surface-evidence 2c=reachability \
+    $(cl_ok) > "$ROOT/out.log" 2>&1
+rc=$?
+(( rc == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
+    && grep -q '2c-paste 2c-vi' "$ROOT/out.log" \
+    && pass "refused: composite surface 2c labelled as a whole (halves named)" \
+    || fail "aggregate 2c label accepted (rc=$rc)"
+
+# (i) the exact 2.1.224 claim, restated per-half: the VI half calling
+#     itself `empirical` on the paste half's control → refused. A control
+#     is per sub-claim; the driven half cannot pay for the inert one.
+ROOT="$WORK/a13i"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+    --surface-evidence 2a=gate --surface-evidence 2b=gate \
+    --surface-evidence 2c-paste=empirical --surface-evidence 2c-vi=empirical \
+    --surface-evidence 2d=gate --surface-evidence 2e=source-inspection \
+    --negative-control '2c-paste=broke the delivery grep; probe went red' \
+    $(cl_ok) >/dev/null 2>&1
+(( $? == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
+    && pass "refused: the inert 2c-vi half riding on 2c-paste's control" \
+    || fail "2c-vi=empirical accepted without its own control"
+
+# (j) a --negative-control attached to the composite parent satisfies
+#     NEITHER half → refused at the key, not silently ignored.
+ROOT="$WORK/a13j"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+    --surface-evidence 2a=gate --surface-evidence 2b=gate \
+    --surface-evidence 2c-paste=empirical --surface-evidence 2c-vi=reachability \
+    --surface-evidence 2d=gate --surface-evidence 2e=source-inspection \
+    --negative-control '2c=stripped the i BSpace prefix' \
+    $(cl_ok) >/dev/null 2>&1
+(( $? == 3 )) && pass "refused: --negative-control on the composite parent key" \
+    || fail "parent-keyed negative control silently accepted"
+
+# (k) a surface key that names nothing → refused (was silently ignored,
+#     then resurfaced as the far less obvious "no evidence for 2e").
+ROOT="$WORK/a13k"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+    $SURF_OK --surface-evidence 2z=gate $(cl_ok) >/dev/null 2>&1
+(( $? == 3 )) && pass "refused: unknown surface key" || fail "unknown surface key ignored"
+
+# ---- 13c. CHANGELOG COMPLETENESS (GAP 2 of the 2.1.224 skeptic verdict) --
+# The 2.1.224 report asserted "both releases read in full" and then
+# tabulated 41 of 50 entries. The nine it dropped included the
+# `bypassPermissions` vs org-disable-policy fix (the flag every nexus
+# spawn rides), the workflow-sandbox dynamic-`import()` escape, and
+# `sandbox.filesystem.denyWrite` covering the working directory — three
+# of them pre-flagged BY NAME in the spawn brief. "No impact" was the
+# default, not a claim. Same defect as 2.1.217's unread footer entry.
+#
+# The fixture's delta is TWO releases (2.1.155, 2.1.160) with a third
+# section at the installed floor that must NOT be demanded.
+CL_SURF="$SURF_OK"
+
+# (a) no --changelog-evidence at all → refused (the flags are mandatory
+#     on the safe path, exactly like gate evidence).
+ROOT="$WORK/a13c1"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+    $CL_SURF >/dev/null 2>&1
+(( $? == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
+    && pass "refused: no --changelog-evidence" || fail "missing changelog evidence accepted"
+
+# (b) a release IN THE DELTA with no disposition at all → refused. This
+#     is the two-release jump the 2.1.224 round half-read: dispositioning
+#     only the candidate's own changelog is not accounting for the delta.
+ROOT="$WORK/a13c2"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    --changelog-evidence "$ROOT/changelog.md" --changelog-ledger "$ROOT/ledger.md" \
+    --changelog-dispositioned 2.1.160=2 > "$ROOT/out.log" 2>&1
+(( $? == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
+    && grep -q 'release 2.1.155 is in the delta' "$ROOT/out.log" \
+    && pass "refused: a release in the delta carries no disposition" \
+    || fail "undispositioned intermediate release accepted"
+
+# (c) N != M → refused, with both numbers. M is COUNTED from the
+#     changelog here; the caller cannot assert it.
+ROOT="$WORK/a13c3"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    --changelog-evidence "$ROOT/changelog.md" --changelog-ledger "$ROOT/ledger.md" \
+    --changelog-dispositioned 2.1.155=1 --changelog-dispositioned 2.1.160=1 \
+    > "$ROOT/out.log" 2>&1
+(( $? == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
+    && grep -q 'dispositioned 1 of 2 entries' "$ROOT/out.log" \
+    && pass "refused: N != M for a release (M derived, not asserted)" \
+    || fail "undercount accepted"
+
+# (d) N == M but an entry is ABSENT from the ledger → refused. This is
+#     the check that makes N honest: an evaluator who believes they read
+#     everything would otherwise pass the count while the entry was
+#     never written down anywhere.
+ROOT="$WORK/a13c4"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+grep -v 'teleport' "$ROOT/ledger.md" > "$ROOT/ledger-short.md"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    --changelog-evidence "$ROOT/changelog.md" --changelog-ledger "$ROOT/ledger-short.md" \
+    --changelog-dispositioned 2.1.155=1 --changelog-dispositioned 2.1.160=2 \
+    > "$ROOT/out.log" 2>&1
+(( $? == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
+    && grep -q 'do not appear verbatim in the ledger' "$ROOT/out.log" \
+    && pass "refused: a counted entry missing from the ledger" \
+    || fail "bluffed count accepted"
+
+# (e) a PARAPHRASED entry does not count as dispositioned — the GUIDE's
+#     verbatim rule, now mechanical.
+ROOT="$WORK/a13c5"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+sed 's/Fixed the token counter wording on the spinner row/Fixed some counter stuff/' \
+    "$ROOT/ledger.md" > "$ROOT/ledger-para.md"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    --changelog-evidence "$ROOT/changelog.md" --changelog-ledger "$ROOT/ledger-para.md" \
+    --changelog-dispositioned 2.1.155=1 --changelog-dispositioned 2.1.160=2 \
+    >/dev/null 2>&1
+(( $? == 3 )) && pass "refused: a paraphrased entry is not a disposition" \
+    || fail "paraphrase accepted as verbatim"
+
+# (f) stale changelog evidence → refused (re-fetch from source, do not
+#     reuse a prior round's copy or summarise from memory).
+ROOT="$WORK/a13c6"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+touch -d '8 hours ago' "$ROOT/changelog.md"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    $(cl_ok) >/dev/null 2>&1
+(( $? == 3 )) && pass "refused: stale changelog evidence" || fail "stale changelog accepted"
+
+# (g) the SUPPLIED changelog has no section for the candidate → refused:
+#     you read something other than the candidate's changelog, which no
+#     amount of correct counting would catch.
+#
+#     DISCRIMINATION — and this took three tries, so the reasoning is
+#     recorded. The check is normally SUBSUMED by the upstream-vs-supplied
+#     diff: a supplied file missing the candidate's heading also has zero
+#     entries for it, so the diff refuses first and the assertion reds for
+#     a neighbouring reason. Round 3 passed `2.1.160=2` and refused via
+#     "release outside the delta"; round 4's fix passed only `2.1.155=1`
+#     and refused via the diff (measured rc 3, not the rc 0 that commit
+#     claimed).
+#
+#     The one shape where this check is the ONLY thing standing: an
+#     upstream candidate section with NO entries. Then supplied-vs-upstream
+#     for 2.1.160 is empty-vs-empty — the diff passes — N=0=M=0 passes,
+#     and the ledger has nothing to demand. Neutering the check therefore
+#     reaches rc 0 and COMPLETES THE BUMP, which is what a discriminating
+#     assertion has to be able to say.
+ROOT="$WORK/a13c7"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+# upstream: candidate section present but EMPTY; .155 unchanged
+{
+    printf '# Changelog\n\n'
+    printf '## 2.1.160\n\n'
+    printf '## 2.1.155\n\n'
+    printf -- '- Changed the permission dialog chevron styling\n\n'
+    printf '## 2.1.150\n\n'
+    printf -- '- Fixed something that predates this delta entirely\n'
+} > "$ROOT/upstream-changelog.md"
+# supplied: byte-identical EXCEPT the candidate heading is absent
+grep -v '^## 2.1.160$' "$ROOT/upstream-changelog.md" > "$ROOT/changelog-nocand.md"
+printf -- '- Changed the permission dialog chevron styling | 2b, gate\n' > "$ROOT/ledger-155.md"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    --changelog-evidence "$ROOT/changelog-nocand.md" --changelog-ledger "$ROOT/ledger-155.md" \
+    --changelog-dispositioned 2.1.155=1 --changelog-dispositioned 2.1.160=0 \
+    > "$ROOT/out.log" 2>&1
+(( $? == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
+    && grep -q 'your --changelog-evidence has no' "$ROOT/out.log" \
+    && pass "refused: supplied changelog has no section for the candidate" \
+    || fail "wrong changelog accepted: $(tail -1 "$ROOT/out.log")"
+
+# (g2) THE SPOOF. The supplied changelog is TRUNCATED — a release cut
+#      down to fewer entries — and N is declared to match the truncation.
+#      Every check that reads the supplied file agrees with itself, so
+#      this was ACCEPTED at rc 0 before apply.sh fetched upstream: a
+#      skeptic cut 2.1.223 from 19 bullets to 5, passed `2.1.223=5`, and
+#      got "dispositioned 36 of 36". Freshness is no obstacle — a
+#      hand-edited copy has a fresh mtime by construction.
+ROOT="$WORK/a13c7b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+# drop one of the candidate's two entries from the SUPPLIED copy only
+grep -v 'teleport' "$ROOT/changelog.md" > "$ROOT/changelog-cut.md"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    --changelog-evidence "$ROOT/changelog-cut.md" --changelog-ledger "$ROOT/ledger.md" \
+    --changelog-dispositioned 2.1.155=1 --changelog-dispositioned 2.1.160=1 \
+    > "$ROOT/out.log" 2>&1
+(( $? == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
+    && grep -q 'does not match the changelog this run fetched, for release 2.1.160' "$ROOT/out.log" \
+    && pass "refused: supplied changelog truncated, N matched to the truncation" \
+    || fail "the truncation spoof was not refused BY THE UPSTREAM DIFF (N!=M also catches this shape, so a refusal alone is not enough): $(tail -1 "$ROOT/out.log")"
+
+# (g3) the upstream fetch FAILS → refused, never silently falling back to
+#      the supplied copy (which is the very thing being verified).
+ROOT="$WORK/a13c7c"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") FETCH_RC=1 bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    $(cl_ok) > "$ROOT/out.log" 2>&1
+(( $? == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
+    && grep -q 'could not fetch' "$ROOT/out.log" \
+    && pass "refused: upstream changelog fetch failed (no fallback to the supplied file)" \
+    || fail "fetch failure did not refuse"
+
+# (g4) NESTED BULLETS COUNT. An indented sub-bullet used to be invisible
+#      to the parser: not counted into M, never demanded in the ledger,
+#      and the run accepted — a sub-entry describing a behaviour change
+#      would pass entirely unread. Upstream is flat today, so this is
+#      prospective; it is also the half of the parser that failed OPEN.
+ROOT="$WORK/a13c9b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+# add an indented sub-bullet under the candidate's first entry, both sides
+for f in "$ROOT/changelog.md" "$ROOT/upstream-changelog.md"; do
+    sed -i 's|^- Added a new --teleport flag nobody here uses$|- Added a new --teleport flag nobody here uses\n  - and it quietly changes how the status line renders|' "$f"
+done
+# ledger still lists only the 3 top-level entries, and N claims 2 for the
+# candidate — i.e. exactly what a round that never saw the sub-bullet
+# would pass.
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    $(cl_ok) > "$ROOT/out.log" 2>&1
+(( $? == 3 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
+    && grep -q 'dispositioned 2 of 3 entries' "$ROOT/out.log" \
+    && pass "refused: an indented sub-bullet counts as an entry (was silently skipped)" \
+    || fail "nested bullet not counted: $(tail -1 "$ROOT/out.log")"
+
+# and it is payable — disposition the sub-bullet and the run is accepted
+printf -- '- and it quietly changes how the status line renders | 2a, checked\n' >> "$ROOT/ledger.md"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    --changelog-evidence "$ROOT/changelog.md" --changelog-ledger "$ROOT/ledger.md" \
+    --changelog-dispositioned 2.1.155=1 --changelog-dispositioned 2.1.160=3 \
+    > "$ROOT/out.log" 2>&1
+rc=$?
+(( rc == 0 )) && grep -q 'dispositioned 4 of 4 entries' "$ROOT/out.log" \
+    && pass "accepted: sub-bullet dispositioned (4 of 4, sub-bullet included)" \
+    || fail "nested-bullet accounting wrongly refused (rc=$rc): $(tail -1 "$ROOT/out.log")"
+
+# (g5) THE ACCEPTANCE LINE CLAIMS NO PROVENANCE — because none was
+#      established, and three rounds of trying produced three false
+#      assurances instead. `M` is not spoofable by FILE (the fetch
+#      overrides it), but the fetch is a SUBPROCESS: round 3 was defeated
+#      by a hand-edited file, round 4 by CC_AUTO_CHANGELOG_FETCH_CMD,
+#      round 5 by a fake `gh` earlier in PATH — that last one printing
+#      "M from a live upstream anthropics/claude-code fetch" with no
+#      warning at all, because PATH is not something the previous fix's
+#      four-variable enumeration could see.
+#
+#      A caller who controls the environment controls subprocess
+#      resolution, and that set cannot be enumerated. So the claim is
+#      dropped rather than defended, and THIS asserts the drop: the
+#      summary must state the counts and say `provenance NOT
+#      established`, and must NOT name a source — no "live upstream", no
+#      "OVERRIDDEN", either of which would be an origin claim this run
+#      cannot back.
+#
+#      Driven here through the env seam (the suite has no network), but
+#      the assertion is deliberately indifferent to HOW the source was
+#      redirected — that indifference is the point.
+ROOT="$WORK/a13c10"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    $(cl_ok) > "$ROOT/out.log" 2>&1
+rc=$?
+DEC="$ROOT/monitor/.state/cc-auto-update/decisions.tsv"
+if (( rc == 0 )) \
+   && grep -q 'provenance NOT established' "$ROOT/out.log" \
+   && ! grep -qi 'live upstream\|OVERRIDDEN' "$ROOT/out.log" \
+   && grep -q 'changelog-completeness.*provenance NOT established' "$DEC" 2>/dev/null; then
+    pass "acceptance line states the counts and claims no provenance"
+else
+    fail "the acceptance line asserts an origin it did not establish (rc=$rc): $(grep -o 'M [a-z].*' "$ROOT/out.log" | tail -1)"
+fi
+
+# (h) a disposition for a release OUTSIDE the delta → refused, with the
+#     derived release set named. (2.1.150 is the installed floor: its
+#     entries are not part of this bump.)
+ROOT="$WORK/a13c8"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    $(cl_ok) --changelog-dispositioned 2.1.150=1 >/dev/null 2>&1
+(( $? == 3 )) && pass "refused: a disposition for a release outside the delta" \
+    || fail "out-of-delta disposition accepted"
+
+# (i) complete accounting → accepted, and the counts land in the audit
+#     trail so a reviewer sees "N of M" without re-reading the report.
+ROOT="$WORK/a13c9"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+env $(apply_env "$ROOT") bash "$APPLY" safe \
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $CL_SURF \
+    $(cl_ok) > "$ROOT/out.log" 2>&1
+rc=$?
+(( rc == 0 )) && [[ "$(cat "$ROOT/monitor/.state/cc-version-local" 2>/dev/null)" == "2.1.160" ]] \
+    && pass "accepted: every entry of every release in the delta dispositioned" \
+    || fail "complete changelog accounting wrongly refused (rc=$rc): $(tail -3 "$ROOT/out.log")"
+grep -q $'\tchangelog-completeness\t.*dispositioned 3 of 3 entries across 2 release' \
+    "$ROOT/monitor/.state/cc-auto-update/decisions.tsv" 2>/dev/null \
+    && pass "changelog counts recorded in the audit trail (3 of 3, 2 releases)" \
+    || fail "changelog-completeness audit row missing/wrong: $(grep changelog "$ROOT/monitor/.state/cc-auto-update/decisions.tsv" | sed -n 1p)"
 
 # 14. stale gate evidence
 ROOT="$WORK/a14"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 touch -d '8 hours ago' "$ROOT/gate.log"
 env $(apply_env "$ROOT") bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 (( $? == 3 )) && pass "refused on stale gate evidence" || fail "stale evidence not refused"
 
 # 15. install failure → rollback, no watcher restart, no kill
 ROOT="$WORK/a15"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 env $(apply_env "$ROOT") INSTALL_RC=1 bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 rc=$?
 if (( rc == 4 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
    && ! grep -q "watcher-restart" "$ROOT/calls.log" \
@@ -642,7 +1208,7 @@ ROOT="$WORK/a16"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\necho "2.1.150 (Claude Code)"\n' > "$ROOT/claude"
 chmod +x "$ROOT/claude"
 env $(apply_env "$ROOT") bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 (( $? == 5 )) && [[ ! -e "$ROOT/monitor/.state/cc-version-local" ]] \
     && pass "verify mismatch → rc 5, pin rolled back" \
     || fail "verify mismatch mishandled"
@@ -651,7 +1217,7 @@ env $(apply_env "$ROOT") bash "$APPLY" safe \
 ROOT="$WORK/a17"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '2.1.160\n' > "$ROOT/monitor/.state/cc-version-local"
 env $(apply_env "$ROOT") bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 (( $? == 0 )) && ! grep -q "install" "$ROOT/calls.log" \
     && pass "already-pinned → rc 0 no-op" || fail "already-pinned re-ran the bump"
 
@@ -659,7 +1225,7 @@ env $(apply_env "$ROOT") bash "$APPLY" safe \
 ROOT="$WORK/a18"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 rm -f "$ROOT/monitor/.state/orchestrator-session-id"
 env $(apply_env "$ROOT") bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 rc=$?
 if (( rc == 21 )) && [[ "$(cat "$ROOT/monitor/.state/cc-version-local")" == "2.1.160" ]] \
    && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log"; then
@@ -708,18 +1274,29 @@ fi
 #      usage to stderr and exits 2 with no stdout). The loop must FAIL
 #      LOUD (rc 23, no kill) — NOT force-kill against an unknown pane.
 ROOT="$WORK/a20b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
-printf '#!/usr/bin/env bash\necho "usage: pane-state.sh <window-index>" >&2\nexit 2\n' > "$ROOT/pane-state"
+printf '#!/usr/bin/env bash\necho "pane-state $*" >> "%s"\necho "usage: pane-state.sh <window-index>" >&2\nexit 2\n' \
+    "$ROOT/calls.log" > "$ROOT/pane-state"
 chmod +x "$ROOT/pane-state"
-t0=$(date +%s)
 env $(apply_env "$ROOT") bash "$APPLY" restart-orchestrator \
     --candidate 2.1.160 --sid "$(pin_of "$ROOT")" >/dev/null 2>&1
-rc=$?; elapsed=$(( $(date +%s) - t0 ))
+rc=$?
+# "no wait" is asserted as an INVOCATION COUNT, not a wall-clock ceiling
+# (your-org/nexus-code#557). The old form timed the run and required
+# `elapsed < 2` on an operation measured at 0.76-0.96 s — a ~1 s margin
+# that a CPU-starved runner erases, flaking ~29% at CI fidelity while
+# rc=23 was correct every time. The count is what the timer was really
+# proxying for: an unreadable probe must fail loud on the FIRST read, so
+# pane-state is queried exactly once. A regression that misread empty
+# stdout as "busy" would poll until the cap (3 queries at the fixture's
+# IDLE_WAIT=2/POLL=1) — discriminated by count with no timing margin at
+# all, and strictly more precise than the clock ever was.
+ps_calls=$(grep -c '^pane-state ' "$ROOT/calls.log" 2>/dev/null) || ps_calls=0
 if (( rc == 23 )) && ! grep -q "kill-window -t orchestrator" "$ROOT/calls.log" \
-   && (( elapsed < 2 )) \
+   && (( ps_calls == 1 )) \
    && grep -q $'\tsafe-bumped-restart-aborted\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv"; then
-    pass "unreadable pane-state → fail-loud (rc 23, no kill, no wait)"
+    pass "unreadable pane-state → fail-loud (rc 23, no kill, probed once — no poll loop)"
 else
-    fail "unreadable-pane-state handling wrong (rc=$rc, elapsed=${elapsed}s)"
+    fail "unreadable-pane-state handling wrong (rc=$rc, pane-state queries=$ps_calls, want 1)"
 fi
 
 # 20c. target window does NOT resolve to a tmux index (list-windows has
@@ -1147,7 +1724,7 @@ ROOT="$WORK/m5"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 auto="$ROOT/monitor/.state/cc-auto-update"
 _nonresolving_tmux "$ROOT"
 env $(apply_env "$ROOT") CC_AUTO_RESTART_INLINE=1 bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 rc=$?
 if (( rc == 23 )) \
    && [[ "$(cat "$ROOT/monitor/.state/cc-version-local" 2>/dev/null)" == "2.1.160" ]] \
@@ -1166,7 +1743,7 @@ fi
 ROOT="$WORK/m6"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 _nonresolving_tmux "$ROOT"
 env $(apply_env "$ROOT") bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 rc=$?
 (( rc == 0 )) && pass "detached safe still exits 0 at hand-off (abort is a future event)" \
     || fail "detached safe exit-code regressed (rc=$rc, want 0)"
@@ -1182,7 +1759,7 @@ ROOT="$WORK/g1"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\nprintf "503\\tmonitor/watcher/launcher.sh\\n503\\tmonitor/README.md\\n"\n' > "$ROOT/gate-prs"
 chmod +x "$ROOT/gate-prs"
 env $(apply_env "$ROOT") CC_AUTO_GATE_PR_CMD="$ROOT/gate-prs" bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 rc=$?
 auto="$ROOT/monitor/.state/cc-auto-update"
 if (( rc == 30 )) && [[ ! -f "$ROOT/monitor/.state/cc-version-local" ]] \
@@ -1197,7 +1774,7 @@ fi
 #     path is unclaimed → defer (fail-safe), distinct detail.
 ROOT="$WORK/g2"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 env $(apply_env "$ROOT") CC_AUTO_GATE_PR_CMD=false bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 rc=$?
 auto="$ROOT/monitor/.state/cc-auto-update"
 if (( rc == 30 )) && [[ ! -f "$ROOT/monitor/.state/cc-version-local" ]] \
@@ -1228,7 +1805,7 @@ EOF
 }
 ROOT="$WORK/g3"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
 env $(apply_env "$ROOT") CC_AUTO_TMUX="$ROOT/tmux" CC_AUTO_MAX_LIVE_WINDOWS=2 \
-    bash "$APPLY" safe --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    bash "$APPLY" safe --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 rc=$?
 auto="$ROOT/monitor/.state/cc-auto-update"
 if (( rc == 30 )) && [[ ! -f "$ROOT/monitor/.state/cc-version-local" ]] \
@@ -1240,7 +1817,7 @@ fi
 ROOT="$WORK/g3b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
 env $(apply_env "$ROOT") CC_AUTO_TMUX="$ROOT/tmux" CC_AUTO_MAX_LIVE_WINDOWS=3 \
     CC_AUTO_RESTART_INLINE=1 \
-    bash "$APPLY" safe --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    bash "$APPLY" safe --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 rc=$?
 auto="$ROOT/monitor/.state/cc-auto-update"
 if (( rc == 0 )) && grep -q "live_windows=3" "$auto/decisions.tsv" \
@@ -1260,7 +1837,7 @@ setsid bash "$ROOT/monitor/watcher/main.sh" & g4_p1=$!
 setsid bash "$ROOT/monitor/watcher/main.sh" & g4_p2=$!
 sleep 1
 env $(apply_env "$ROOT") bash "$APPLY" safe \
-    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear >/dev/null 2>&1
+    --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) >/dev/null 2>&1
 rc=$?
 kill "$g4_p1" "$g4_p2" 2>/dev/null; wait "$g4_p1" "$g4_p2" 2>/dev/null
 auto="$ROOT/monitor/.state/cc-auto-update"
@@ -1371,14 +1948,345 @@ printf 'candidate=9.9.9\ninstalled=9.9.8\npackage=p\ndetected=t\nskill=s\n' \
 # cases probe the emit CONTENT, so force the gate ON for both.
 export MONITOR_CC_UPDATE_EMIT_ENABLED=true
 out=$(MONITOR_CC_AUTO_UPDATE_ENABLED=true _cc_update_emit_section "$SD")
-printf '%s' "$out" | grep -q 'autonomous daily cc-update routine is ENABLED' \
+grep -q 'autonomous daily cc-update routine is ENABLED' <<<"$out" \
     && pass "emit NOTE present when routine enabled" \
     || fail "emit NOTE missing when enabled"
 rm -f "$SD/cc-update-surfaced"
 out=$(MONITOR_CC_AUTO_UPDATE_ENABLED=false _cc_update_emit_section "$SD")
-printf '%s' "$out" | grep -q 'autonomous daily' \
+grep -q 'autonomous daily' <<<"$out" \
     && fail "emit NOTE leaked when disabled" \
     || pass "emit NOTE absent when routine disabled"
+
+# ===== deployment-gate staleness: the INTEGRATION branch (nexus-code#754) ===
+#
+# The gate used to measure `HEAD..origin/main` while PRs merge to the
+# integration branch, so it under-reported the quantity it exists to report.
+# EVERY case below is written to fail against that old code — a test that
+# only asserted "some number is emitted" would have passed it, which is the
+# same proxy-instead-of-property defect one level up.
+
+echo "== deployment gate: staleness measures the integration branch (#754) =="
+
+# A real git clone whose HEAD sits on `main` while `dev` has advanced.
+# The working tree is NOT touched (no reset/checkout): the apply fixture's
+# package.json and monitor/ must survive, so HEAD is moved by writing the
+# ref directly.
+#   $1=root  $2=commits dev is ahead of main
+make_gate_clone() {
+    # NOT one `local` statement: `local` is a builtin, so ALL its arguments
+    # are expanded before it runs — `rem="$root/…"` would read `$root` from
+    # the enclosing scope, which is unset, and `set -u` aborts the suite.
+    local root="$1" ahead="$2" i
+    local rem="$root/.gitremote"
+    rm -rf "$rem"; mkdir -p "$rem"
+    (
+        export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t \
+               GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+        git init -q "$rem" && cd "$rem" || exit 1
+        git symbolic-ref HEAD refs/heads/main
+        echo base > f && git add -A && git commit -qm base
+        git checkout -qb dev
+        for ((i=1; i<=ahead; i++)); do echo "$i" >> f; git commit -qam "dev $i"; done
+        git checkout -q main
+    ) >/dev/null 2>&1 || return 1
+    git -C "$root" init -q                                            || return 1
+    git -C "$root" remote add origin "$rem"                           || return 1
+    git -C "$root" fetch -q origin 'refs/heads/*:refs/remotes/origin/*' || return 1
+    git -C "$root" update-ref refs/heads/main \
+        "$(git -C "$rem" rev-parse main)"                             || return 1
+    git -C "$root" symbolic-ref HEAD refs/heads/main                  || return 1
+}
+
+# A `git` shim that fails ONLY on `fetch` and is otherwise the real thing.
+# Lets a case prove the gate's answer does not depend on the fetch landing.
+make_nofetch_git() {
+    local root="$1" real; real=$(command -v git)
+    mkdir -p "$root/bin"
+    cat > "$root/bin/git" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do [[ "\$a" == fetch ]] && exit 1; done
+exec "$real" "\$@"
+EOF
+    chmod +x "$root/bin/git"
+}
+
+# G5a. THE PROPERTY. HEAD is level with `main` and 5 behind `dev`. The old
+#      code measured `main` and reported 0 — "up to date" about a clone
+#      missing five merged commits. Asserting 5 (and explicitly NOT 0) is
+#      what makes this a property test rather than a smoke test.
+ROOT="$WORK/g5a"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+if make_gate_clone "$ROOT" 5; then
+    out=$(env $(apply_env "$ROOT") MONITOR_CLONE_DRIFT_BRANCH=dev \
+              CC_AUTO_RESTART_INLINE=1 bash "$APPLY" safe --candidate 2.1.160 \
+              --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+              $SURF_OK $(cl_ok) 2>&1)
+    auto="$ROOT/monitor/.state/cc-auto-update"
+    row=$(grep 'deployment-gate' "$auto/decisions.tsv" 2>/dev/null | tail -1)
+    if [[ "$row" == *"behind_integration=5"* ]] \
+       && [[ "$row" == *"integration_branch=dev"* ]] \
+       && [[ "$row" != *"behind_integration=0"* ]]; then
+        pass "staleness measured against dev: 5 behind (main-based code said 0)"
+    else
+        fail "#754 staleness not measured against dev; row=$row"
+    fi
+    # The remediation must name the ref it measured — following the old
+    # `pull --ff-only origin main` landed the operator on a tree that still
+    # lacked the fix the WARN was about.
+    if grep -q 'commits behind origin/dev' <<<"$out" \
+       && grep -q 'pull --ff-only origin dev' <<<"$out" \
+       && ! grep -q 'origin/main' <<<"$out"; then
+        pass "WARN + remediation name origin/dev, the ref actually measured"
+    else
+        # `grep -m2`, NOT `grep … | head -2`: the latter is a new early-exit
+        # reader (#622/#682) and would move the checked population in
+        # early-exit-readers.manifest. That site would have been benign — the
+        # pipeline sits in a command substitution used as a string argument,
+        # so its status is consumed by nothing, the suite runs `set -uo
+        # pipefail` without `-e`, and it executes only on an already-failed
+        # assertion — but a permanent row on a checked boundary is a poor
+        # price for truncating a diagnostic. `-m2` needs no second process.
+        fail "#754 WARN/remediation still names the wrong ref: $(grep -im2 'behind' <<<"$out")"
+    fi
+else
+    fail "#754 fixture: could not build the gate git clone (G5a skipped)"
+fi
+
+# G5b. STALE REMOTE-TRACKING REF. Objects for the live tip are present
+#      locally, but `origin/dev` is rewound to the old tip and the fetch is
+#      made to fail. The old code answered 5 from the stale ref — a
+#      CONFIDENT WRONG NUMBER, not an `unknown`. The probe takes its tip
+#      from a live `ls-remote`, so the correct answer is 11.
+ROOT="$WORK/g5b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+if make_gate_clone "$ROOT" 5; then
+    stale=$(git -C "$ROOT" rev-parse origin/dev)
+    (
+        export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t \
+               GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+        cd "$ROOT/.gitremote" && git checkout -q dev
+        for i in 6 7 8 9 10 11; do echo "$i" >> f; git commit -qam "dev $i"; done
+        git checkout -q main
+    ) >/dev/null 2>&1
+    # Objects local, tracking ref deliberately left in the past.
+    git -C "$ROOT" fetch -q origin 'refs/heads/*:refs/remotes/origin/*' >/dev/null 2>&1
+    git -C "$ROOT" update-ref refs/remotes/origin/dev "$stale"
+    make_nofetch_git "$ROOT"
+    out=$(env $(apply_env "$ROOT") MONITOR_CLONE_DRIFT_BRANCH=dev \
+              PATH="$ROOT/bin:$PATH" CC_AUTO_RESTART_INLINE=1 \
+              bash "$APPLY" safe --candidate 2.1.160 \
+              --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+              $SURF_OK $(cl_ok) 2>&1)
+    auto="$ROOT/monitor/.state/cc-auto-update"
+    row=$(grep 'deployment-gate' "$auto/decisions.tsv" 2>/dev/null | tail -1)
+    if [[ "$row" == *"behind_integration=11"* ]] \
+       && [[ "$row" != *"behind_integration=5"* ]]; then
+        pass "stale tracking ref ignored: 11 from the live tip, not 5 from the past"
+    else
+        fail "#754 gate answered from a stale remote-tracking ref; row=$row"
+    fi
+else
+    fail "#754 fixture: could not build the gate git clone (G5b skipped)"
+fi
+
+# G5c. `unknown` IS LOUD. When the root is not a clone the margin cannot be
+#      established. The old code left `behind=unknown`, which failed the
+#      `^[0-9]+$` guard on the WARN and so emitted NOTHING — "could not
+#      look" rendered exactly like "up to date". That is #740's thesis
+#      inside #754's gate, and it is the reason this case exists.
+ROOT="$WORK/g5c"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+out=$(env $(apply_env "$ROOT") MONITOR_CLONE_DRIFT_BRANCH=dev \
+          CC_AUTO_RESTART_INLINE=1 bash "$APPLY" safe --candidate 2.1.160 \
+          --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+          $SURF_OK $(cl_ok) 2>&1)
+auto="$ROOT/monitor/.state/cc-auto-update"
+row=$(grep 'deployment-gate' "$auto/decisions.tsv" 2>/dev/null | tail -1)
+if grep -q 'COULD NOT DETERMINE whether this clone is behind' <<<"$out" \
+   && grep -q "'Could not look' is NOT 'up to date'" <<<"$out" \
+   && [[ "$row" == *"drift=unknown"* ]]; then
+    pass "unmeasurable staleness WARNs loudly and records drift=unknown"
+else
+    fail "#754 unknown staleness is still silent; row=$row"
+fi
+
+# G5e. THE FOURTH STATE — "behind by an UNMEASURED margin". HEAD provably
+#      differs from the live tip, but the margin cannot be counted (the tip
+#      object is not local and no API fallback is reachable). This is NOT
+#      `unknown`: staleness is PROVEN, only its size is not. Until this case
+#      existed the fourth arm was an assertion placed where it could not
+#      fail — the report claimed a distinct state that no test pinned.
+ROOT="$WORK/g5e"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
+if make_gate_clone "$ROOT" 5; then
+    # Drop the tip object locally: re-clone the remote's refs without the
+    # dev objects, so ls-remote still resolves a tip that `cat-file -e`
+    # cannot find. Simplest faithful form: point origin at a remote whose
+    # dev has advanced, and forbid fetching.
+    (
+        export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t \
+               GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
+        cd "$ROOT/.gitremote" && git checkout -q dev
+        for i in 6 7 8; do echo "$i" >> f; git commit -qam "dev $i"; done
+        git checkout -q main
+    ) >/dev/null 2>&1
+    # A shim that fails `fetch` AND reports a GitHub-shaped origin URL while
+    # every other call stays real. Both halves are needed: `ls-remote` must
+    # SUCCEED (so a tip is resolved and HEAD != tip is proven) while the tip
+    # OBJECT stays absent locally, and the origin URL must PARSE as a slug —
+    # a bare local path returns `no_origin_slug`, which lands in `unknown`
+    # and would silently test the wrong arm.
+    _real_git=$(command -v git)
+    mkdir -p "$ROOT/bin"
+    cat > "$ROOT/bin/git" <<EOF
+#!/usr/bin/env bash
+for a in "\$@"; do [[ "\$a" == fetch ]] && exit 1; done
+case "\$*" in *"remote get-url"*) echo "git@github.com:fake/fake.git"; exit 0 ;; esac
+exec "$_real_git" "\$@"
+EOF
+    chmod +x "$ROOT/bin/git"
+    # `gh` absent → the compare-API fallback cannot run → margin unmeasurable.
+    out=$(env $(apply_env "$ROOT") MONITOR_CLONE_DRIFT_BRANCH=dev \
+              PATH="$ROOT/bin:$PATH" _CLONE_DRIFT_GH_BIN=/nonexistent-gh \
+              CC_AUTO_RESTART_INLINE=1 bash "$APPLY" safe --candidate 2.1.160 \
+              --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+              $SURF_OK $(cl_ok) 2>&1)
+    auto="$ROOT/monitor/.state/cc-auto-update"
+    row=$(grep 'deployment-gate' "$auto/decisions.tsv" 2>/dev/null | tail -1)
+    if [[ "$row" == *"drift=behind"* ]] \
+       && [[ "$row" == *"behind_integration=unknown"* ]] \
+       && grep -q 'margin could not be measured' <<<"$out"; then
+        pass "proven-stale but unmeasured margin is its own state, not 'unknown'"
+    else
+        fail "#754 fourth state (behind, margin unknown) not distinct; row=$row"
+    fi
+else
+    fail "#754 fixture: could not build the gate git clone (G5e skipped)"
+fi
+
+# make_branch_config <root> <key> <value> — a config/load.sh faithful to
+# the real loader's EXIT CODES, which is the whole mechanism #763 turns
+# on: rc 0 = present, rc 2 = absent, and NO default is echoed for an
+# unknown key. The previous stub answered `echo "${2:-}"` (rc 0, empty)
+# for every unknown key, which cannot exhibit an absent-key fall-through
+# at all — it would pass for a resolver that never fell through.
+make_branch_config() {
+    local root="$1" key="$2" value="$3"
+    mkdir -p "$root/config"
+    cat > "$root/config/load.sh" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "$key" ]]; then printf '%s' "$value"; exit 0; fi
+if (( \$# >= 2 )); then printf '%s' "\$2"; exit 0; fi
+exit 2
+EOF
+    chmod +x "$root/config/load.sh"
+}
+
+# gate_branch_case <label> <suffix> <config-key> — build a clone whose
+# integration branch is `release`, record it under <config-key>, and
+# assert the gate measured `release`.
+gate_branch_case() {
+    local label="$1" suffix="$2" key="$3"
+    local ROOT="$WORK/$suffix"
+    make_apply_root "$ROOT" "2.1.150" "2.1.160"
+    if ! make_gate_clone "$ROOT" 5; then
+        fail "#763 fixture: could not build the gate git clone ($suffix skipped)"
+        return
+    fi
+    git -C "$ROOT" update-ref refs/remotes/origin/release "$(git -C "$ROOT" rev-parse origin/dev)"
+    ( cd "$ROOT/.gitremote" && git branch -f release dev ) >/dev/null 2>&1
+    make_branch_config "$ROOT" "$key" release
+    local out row auto
+    out=$(env $(apply_env "$ROOT") CC_AUTO_RESTART_INLINE=1 \
+              bash "$APPLY" safe --candidate 2.1.160 \
+              --gate-evidence "$ROOT/gate.log" --surfaces-clear \
+              $SURF_OK $(cl_ok) 2>&1)
+    auto="$ROOT/monitor/.state/cc-auto-update"
+    row=$(grep 'deployment-gate' "$auto/decisions.tsv" 2>/dev/null | tail -1)
+    if [[ "$row" == *"integration_branch=release"* ]] \
+       && grep -q 'pull --ff-only origin release' <<<"$out"; then
+        pass "$label"
+    else
+        fail "$label — row=$row"
+    fi
+}
+
+# G5d. THE BRANCH IS NOT HARDCODED. Swapping `dev` for a literal would be
+#      the same proxy one branch over, so the resolver is exercised against
+#      a non-default branch read from config — not from the environment,
+#      which would leave the config path untested.
+gate_branch_case "integration branch resolved from config, not hardcoded (release)" \
+                 g5d monitor.integration_branch
+
+# G5f. THE MIGRATION, AT THE CONSUMER (your-org/nexus-code#763). Identical
+#      fixture, but the value lives under the DEPRECATED
+#      `monitor.clone_drift.branch` — the state every existing operator
+#      clone is in, since `config/nexus.yml` is per-operator and not
+#      tracked here. A bare rename answers `dev` for this config, and does
+#      it silently, on the exact surface #754 had just finished making
+#      trustworthy. This is the gate-level twin of test-config-integration-branch.sh's
+#      M1; that suite proves the resolver, this one proves the consumer
+#      actually reaches it.
+gate_branch_case "deprecated key still measured at the GATE, not silently 'dev' (#763)" \
+                 g5f monitor.clone_drift.branch
+
+# ---- #866: an UNQUALIFIED tracking_issue must REFUSE to fire ----------------
+#
+# The defect: a bare number in monitor.cc_auto_update.tracking_issue was
+# interpolated into the prompt, where the template paired it with SURFACE_REPO.
+# A reference written for one repo was consumed against another, and every
+# evaluation posted successfully to an unrelated closed PR for a month.
+#
+# The fix must REFUSE, not correct: declining to fire is visible on the next
+# fire, whereas a misrouted evaluation is invisible forever. So the assertions
+# are about the NEGATIVE — no spawn, no prompt — plus an audit row that names
+# the reason, and a positive control that the same rig DOES fire when the
+# reference is qualified (otherwise "no spawn" proves nothing).
+
+ROOT="$WORK/r866a"; make_root "$ROOT" "2.1.150"
+SPAWN_LOG="$ROOT/spawned.log"; make_spawn_stub "$ROOT/spawn" "$SPAWN_LOG"
+CC_AUTO_SPAWN_CMD="$ROOT/spawn"
+FETCH_VERSION="2.1.160"
+MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE=229 \
+    NEXUS_TEST_NOW=$(epoch_at 05:00) run_tick "$ROOT" fetch_ok
+auto="$ROOT/monitor/.state/cc-auto-update"
+[[ ! -e "$SPAWN_LOG" ]] \
+    && pass "#866 bare tracking_issue → evaluator NOT spawned" \
+    || fail "#866 bare tracking_issue spawned anyway"
+[[ ! -f "$auto/eval-prompt-$DAY.md" ]] \
+    && pass "#866 …and no prompt was rendered with a guessed repo" \
+    || fail "#866 prompt rendered despite an unqualified reference"
+if grep -q 'refused-unqualified-tracking-issue' "$auto/decisions.tsv" 2>/dev/null; then
+    pass "#866 …and the refusal is recorded in decisions.tsv"
+else
+    fail "#866 no audit row for the refusal: $(cat "$auto/decisions.tsv" 2>/dev/null)"
+fi
+
+# POSITIVE CONTROL: identical rig, QUALIFIED reference → fires, and the prompt
+# carries the reference's OWN repo rather than the surface repo.
+ROOT="$WORK/r866b"; make_root "$ROOT" "2.1.150"
+SPAWN_LOG="$ROOT/spawned.log"; make_spawn_stub "$ROOT/spawn" "$SPAWN_LOG"
+CC_AUTO_SPAWN_CMD="$ROOT/spawn"
+FETCH_VERSION="2.1.160"
+MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE="your-org/your-nexus#229" \
+    NEXUS_TEST_NOW=$(epoch_at 05:00) run_tick "$ROOT" fetch_ok
+auto="$ROOT/monitor/.state/cc-auto-update"
+prompt="$auto/eval-prompt-$DAY.md"
+[[ -e "$SPAWN_LOG" ]] \
+    && pass "#866 CONTROL: qualified reference → evaluator DOES spawn" \
+    || fail "#866 CONTROL: qualified reference did not spawn (the negative above proves nothing)"
+if [[ -f "$prompt" ]] && grep -q 'your-org/your-nexus' "$prompt"; then
+    pass "#866 …and the prompt carries the reference's OWN repo"
+else
+    fail "#866 prompt lost the reference's repo"
+fi
+if [[ -f "$prompt" ]] && ! grep -q '{{TRACKING_REPO}}' "$prompt"; then
+    pass "#866 …and TRACKING_REPO is substituted, not left as a placeholder"
+else
+    fail "#866 TRACKING_REPO placeholder survived into the prompt"
+fi
+# The number alone must not be paired with the surface repo anywhere.
+if [[ -f "$prompt" ]] && ! grep -qE 'issue comment 229 --repo your-org/nexus-code' "$prompt"; then
+    pass "#866 …and 229 is never paired with the surface repo"
+else
+    fail "#866 the reference number got paired with SURFACE_REPO"
+fi
 
 # ---- summary --------------------------------------------------------------
 echo

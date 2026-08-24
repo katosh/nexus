@@ -14,12 +14,26 @@
 # off/never-registered service from false-alarming the `--- service health
 # ---` emit (the jupyterfix lesson: gate on the real intended state).
 #
-# REGISTERED: assert BOTH
+# REGISTERED: assert ALL THREE
 #   (a) the forced-command wrapper is present + executable (the
-#       confinement is meaningless without it), and
-#   (b) a listener is actually up on the configured bind:port.
-# Either missing → unhealthy (non-zero), which the emit-only policy
-# escalates to the orchestrator after the grace window.
+#       confinement is meaningless without it),
+#   (b) a listener is up on the configured bind:port AND speaks SSH, and
+#   (c) that listener is OURS — it presents OUR host key.
+# Any of the three missing → unhealthy (non-zero), which the emit-only
+# policy escalates to the orchestrator after the grace window.
+#
+# (c) EXISTS BECAUSE (b) IS NOT ENOUGH (your-org/nexus-code#609). The bind:port
+# is a host-global resource — the sandbox shares the host network namespace, so
+# every operator nexus on this machine competes for the same address (127.0.0.1
+# included; it is NOT private to a sandbox). On 2026-07-29 our daemon died with
+# a container restart, another operator's nexus-remote-ssh took
+# 140.107.222.134:22022 during the downtime, and THIS SCRIPT returned 0 for
+# 2h30m — because an `SSH-2.0-*` banner from ANY sshd satisfied it. Worse, a
+# 15-line socket server emitting eight bytes of `SSH-2.0-` also satisfied it: the
+# check was PROTOCOL-aware while its own comments claimed identity-awareness,
+# and that claim is why nobody suspected the green. The loser of a port race
+# reporting healthy is the failure mode; being DOWN is the truth, and the truth
+# is what lets the supervisor and the operator act.
 
 set -uo pipefail
 
@@ -42,12 +56,13 @@ BIND=$(_remote_bind_address)
 PORT=$(_remote_port)
 [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "remote-ssh-health: UNHEALTHY — bad port: $PORT" >&2; exit 1; }
 
-# IDENTITY-AWARE probe (the jupyter-health lesson applied to SSH): a bare
-# "a socket is listening on the port" check is false-healthy — ANY process
-# squatting the port would pass. So we read the SSH protocol BANNER (sshd
-# sends `SSH-2.0-…` immediately on TCP connect, before auth) and require it.
-# An unauthenticated connect that does NOT yield an SSH banner is NOT
-# healthy, exactly as jupyter-health rejects an unauthenticated 200.
+# STAGE 1 — PROTOCOL probe. A bare "a socket is listening" check is
+# false-healthy, so we read the SSH protocol BANNER (sshd sends `SSH-2.0-…`
+# immediately on TCP connect, before auth) and require it. This stage is
+# necessary but NOT sufficient: any responder emitting those eight bytes passes
+# it. Stage 2 below establishes IDENTITY — that is the check which corresponds
+# to jupyter-health rejecting an unauthenticated 200; the banner alone is only
+# the equivalent of "something answered the port".
 #
 # TIMEOUT precedence: legacy REMOTE_HEALTH_TIMEOUT env (kept for compat) →
 # monitor.remote.health_timeout via _remote_cfg (MONITOR_REMOTE_HEALTH_TIMEOUT
@@ -58,7 +73,7 @@ PORT=$(_remote_port)
 # prober no slack.
 TIMEOUT="${REMOTE_HEALTH_TIMEOUT:-$(_remote_health_timeout)}"
 [[ "$TIMEOUT" =~ ^[1-9][0-9]*$ ]] || TIMEOUT=10
-PROBE_HOST="$BIND"; case "$BIND" in 0.0.0.0|::|"") PROBE_HOST=127.0.0.1 ;; esac
+PROBE_HOST=$(_remote_probe_host "$BIND")
 
 # Probe rc contract (shared by _probe_banner and the nc fallback):
 #   0 = read an SSH banner (it IS sshd)
@@ -120,17 +135,69 @@ for _attempt in 1 2 3; do
     (( _attempt == 2 && brc != 3 )) && break
     (( _attempt < 3 )) && sleep "$_attempt"
 done
+# ── STAGE 2: IDENTITY. Something speaks SSH here — is it OURS? ──────────
+# Compare the host key the endpoint actually presents (read over a real key
+# exchange, so a banner cannot fake it) against the one we would serve. Runs
+# ONLY on the otherwise-healthy path, so it costs one extra TCP connection on a
+# green poll and none on a failing one — deliberate, because the banner probe
+# was reduced to ONE connect per attempt to stop starving sshd's MaxStartups=3
+# (#434/#431) and stage 2 must not undo that. Two SEQUENTIAL connects are not
+# three CONCURRENT ones.
+identity_gate() {
+    local rc
+    _remote_identity_probe "$PROBE_HOST" "$PORT" "$TIMEOUT"; rc=$?
+    # INDETERMINATE (tooling absent) earns one retry, like the banner probe:
+    # a starved prober is not evidence of anything.
+    if (( rc == 2 )); then
+        sleep 1
+        _remote_identity_probe "$PROBE_HOST" "$PORT" "$TIMEOUT"; rc=$?
+    fi
+    case "$rc" in
+        0) return 0 ;;
+        1)  # DEFINITE. No knob may downgrade this — it is the 2026-07-29 state.
+            echo "remote-ssh-health: UNHEALTHY — $_REMOTE_ID_REASON" >&2
+            echo "remote-ssh-health:   OUR channel is DOWN; the endpoint is being served by something else." >&2
+            echo "remote-ssh-health:   $(_remote_attribute_listener "$PORT")" >&2
+            # Distinguish "our supervisor is fighting this" from "our supervisor
+            # STOPPED and is waiting for an operator" (your-org/nexus-code#894).
+            # Without this line the two states are indistinguishable from health
+            # output, and only one of them is going to resolve itself.
+            _remote_bind_blocked && \
+                echo "remote-ssh-health:   $(_remote_bind_blocked_summary) — the supervisor STOPPED (permanent); remedy: monitor/remote-up.sh --down && monitor/remote-up.sh" >&2
+            return 1 ;;
+        3)  # DEFINITE. No host key ⇒ our supervisor cannot even launch.
+            echo "remote-ssh-health: UNHEALTHY — $_REMOTE_ID_REASON" >&2
+            echo "remote-ssh-health:   something IS answering ${PROBE_HOST}:${PORT}, so that listener is not ours." >&2
+            return 1 ;;
+        *)  # INDETERMINATE — the ONLY overridable verdict, because it is the
+            # only one that means "unknown" rather than "verified not ours".
+            if _remote_health_require_identity; then
+                echo "remote-ssh-health: UNHEALTHY — cannot verify endpoint identity: $_REMOTE_ID_REASON" >&2
+                echo "remote-ssh-health:   an unverifiable endpoint is reported DOWN by default. Install openssh-client," >&2
+                echo "remote-ssh-health:   or set monitor.remote.health_require_identity: false to accept protocol-only" >&2
+                echo "remote-ssh-health:   evidence (which CANNOT distinguish our daemon from another operator's)." >&2
+                return 1
+            fi
+            echo "remote-ssh-health: WARNING — identity unverified ($_REMOTE_ID_REASON);" >&2
+            echo "remote-ssh-health:   accepting protocol-only evidence because health_require_identity=false." >&2
+            return 0 ;;
+    esac
+}
+
 case "$brc" in
-    0) exit 0 ;;  # confirmed: a real sshd is answering
+    0) identity_gate && exit 0 || exit 1 ;;  # sshd is answering — and it is ours
     1) echo "remote-ssh-health: UNHEALTHY — listener on ${PROBE_HOST}:${PORT} is NOT sshd (non-SSH banner)" >&2; exit 1 ;;
     3) echo "remote-ssh-health: UNHEALTHY — connected to ${PROBE_HOST}:${PORT} but no SSH banner within ${TIMEOUT}s x3 attempts (sshd/prober starved under load, or a silent non-SSH listener)" >&2; exit 1 ;;
     2)
         # Could not banner-probe (no /dev/tcp AND no nc, or connect refused).
-        # Fall back to ss liveness: a present socket with no usable banner
-        # path is accepted (best-effort) with a caveat; no socket = down.
+        # Fall back to ss liveness — but STILL through the identity gate. ss
+        # reads the shared network namespace, so it sees another operator's
+        # socket exactly as it sees ours; accepting it bare was a second route
+        # to the same false green. ssh-keyscan does not depend on /dev/tcp or
+        # nc, so identity is usually still answerable here.
         if _ss_has_listener; then
-            echo "remote-ssh-health: WARNING — cannot banner-probe (no /dev/tcp or nc); accepting ss liveness only on ${PROBE_HOST}:${PORT}" >&2
-            exit 0
+            echo "remote-ssh-health: WARNING — cannot banner-probe (no /dev/tcp or nc); falling back to ss liveness on ${PROBE_HOST}:${PORT}" >&2
+            identity_gate && exit 0 || exit 1
         fi
         echo "remote-ssh-health: UNHEALTHY — no listener on ${PROBE_HOST}:${PORT}" >&2
         exit 1

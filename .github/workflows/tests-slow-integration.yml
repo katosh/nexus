@@ -1,0 +1,507 @@
+name: tests (slow + integration)
+
+# The SLOW test band (SLOW_TESTS=1) and the whole
+# monitor/watcher/test-integration/ suite (RUN_INTEGRATION=1) never
+# ran in CI — the fast per-PR gate in tests.yml deliberately leaves
+# both self-skipping. That gap is what let <your-org>/nexus-code#554
+# rot unguarded on dev (every integration scenario red, nothing
+# watching). This workflow closes it: it runs the FULL band with
+# both gates ON, on a nightly SCHEDULE (not a per-PR gate — the band
+# is too slow/heavy to block every push), plus manual dispatch.
+#
+# It is intentionally NON-BLOCKING: it triggers only on schedule and
+# workflow_dispatch, so it never gates a PR. Its job is to keep the
+# slow/integration rot VISIBLE on a cadence and honestly report red
+# — the exact failure mode #559 (and #484 before it) exist to kill.
+# Per #559, the residual integration failures the #554 comm fix (PR
+# #561) unmasks are the job's initial known-red set; they get burned
+# down to green, and only THEN is the job promoted to required.
+
+# ---------------------------------------------------------------------------
+# <your-org>/nexus-code#737 — MEASURED, not inferred. Until 2026-08-06 the only
+# triggers here were `schedule` + `workflow_dispatch`. GitHub registers and
+# schedules cron from the DEFAULT branch; this file was added to `dev` on
+# 2026-07-24 and `main` is hundreds of commits behind, so the file never reached
+# the default branch. The consequence is stronger than "the nightly was red and
+# nobody looked": `GET /actions/workflows/tests-slow-integration.yml` returned
+# **404** — GitHub did not know this workflow existed, and it produced ZERO runs
+# in the thirteen days it read as coverage. The control that isolates the
+# variable: ci-signal.yml is ALSO dev-only and had 151 runs, because it carries a
+# `pull_request` trigger, which fires from the PR head ref.
+#
+# So `pull_request` and `push` are here for a reason beyond coverage: they are
+# what makes this workflow EXIST as far as Actions is concerned, on the branch it
+# is authored on, before anything is believed about it. Asserted for every
+# workflow by monitor/lint-workflows.py rule SR001.
+#
+# ---------------------------------------------------------------------------
+# BEFORE YOU CHANGE THE TRIGGERS OR THE PATH FILTER BELOW, READ THIS.
+#
+# monitor/slow-band-known-red.tsv is described as a SELF-CLEANING tolerated set:
+# slow-band-drift.sh's STALE-TOLERATION direction means a tolerated test that
+# starts passing turns the band RED until someone deletes the line, so the list
+# cannot silently accrete permanent excuses.
+#
+# That property is INHERITED FROM THE TRIGGER CONFIGURATION IMMEDIATELY BELOW —
+# it is not intrinsic to the checker. It holds only while this workflow actually
+# RUNS on the changes that could invalidate an entry. Revert this band to
+# schedule-only (the pre-#737 state, under which GitHub 404'd the workflow and it
+# produced ZERO runs in thirteen days), or narrow `paths:` until it stops
+# matching, and enforcement evaporates SILENTLY: the ledger keeps its entries,
+# the checker keeps passing when invoked, nobody invokes it, and every entry rots
+# exactly as it did before the file existed. Nothing goes red to tell you.
+#
+# SR001 is the guard on the first half of that (a workflow whose only trigger is
+# `schedule` cannot fire off a non-default branch, and the lint fails it). There
+# is NO guard on the second half — narrowing `paths:` is not currently detected.
+# If you narrow it, you are taking the tolerated set's enforcement with you.
+# Raised by the #739 skeptic; recorded here rather than only in a report because
+# this is the file whose edit causes the loss.
+# ---------------------------------------------------------------------------
+#
+# The blocking-vs-not question is settled by SPLITTING THE BAND rather than by
+# choosing one horn. Keeping the whole band off the PR gate is the right call —
+# the integration suite drives a real tmux server per scenario and runs 30-60
+# min — but "not blocking" was never the defect. The defect was non-blocking AND
+# known-red, under which a new red is indistinguishable from the accepted ones.
+# Hence:
+#
+#   SLOW band (7 tests, ~7 min)   -> per-PR and per-push, BLOCKING, and cheap.
+#                                    Its verdict is the enumerated-tolerance
+#                                    diff (monitor/slow-band-drift.sh), so a
+#                                    tolerated red does not cost anyone a red
+#                                    check and a NEW red costs them one
+#                                    immediately. This is the band #729 lived in.
+#   SLOW + integration (full)     -> nightly/dispatch, as before. Still gated by
+#                                    the same enumerated tolerance.
+# ---------------------------------------------------------------------------
+on:
+  schedule:
+    # Nightly 07:00 UTC — after most pushes have settled, off the
+    # critical path (#559 "Proposed shape"). NOTE: this fires only once this
+    # file is on the DEFAULT branch; see the #737 note above.
+    - cron: '0 7 * * *'
+  pull_request:
+    # `edited` for the #604 reason every workflow here carries it: retargeting a
+    # PR's base emits ONLY the `edited` event. The job is gated on the base
+    # having actually changed, so title/body edits cost no runner minutes, and
+    # the concurrency key below is the exact negation of that gate (#628/#736).
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+    branches: [main, dev]
+    paths:
+      - 'monitor/**'
+      - 'config/**'
+      - '.github/workflows/tests-slow-integration.yml'
+  push:
+    branches: [main, dev]
+    paths:
+      - 'monitor/**'
+      - 'config/**'
+      - '.github/workflows/tests-slow-integration.yml'
+  workflow_dispatch:
+    inputs:
+      max_seconds:
+        description: 'per-invocation serial budget (run-tests.sh --max-seconds)'
+        required: false
+        default: '480'
+      per_test_timeout:
+        description: 'hard per-test ceiling in seconds (run-tests.sh --timeout; rc=124 => TIMEOUT, never a pass)'
+        required: false
+        default: '600'
+
+# Never cancel an in-flight nightly — a long resumable run must finish
+# so its ledger is honest. (The fast gate uses cancel-in-progress; this
+# band does not.)
+#
+# Two suffixes, both load-bearing (#736):
+#
+#  `-meta`/`-code`  the event class, mirroring the job `if:`'s negation exactly.
+#                   `cancel-in-progress: false` is NOT immunity: GitHub keeps
+#                   only the most recently QUEUED run pending per group and
+#                   cancels the previously pending one, so without this a
+#                   title-edit skip-run queued behind an in-flight run evicts a
+#                   PENDING code run for the same head sha — cancelled+skipped,
+#                   no verdict. Rule MC001.
+#  `-<sha>` on push a push run must never evict another push run's pending slot;
+#                   each pushed commit gets its own group and therefore its own
+#                   ledger. PR/schedule/dispatch runs share the `x` slot and
+#                   serialise as before.
+concurrency:
+  group: tests-slow-integration-${{ github.ref }}-${{ (github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.base.ref.from) && 'meta' || 'code' }}-${{ github.event_name == 'push' && github.sha || 'x' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The cheap half, made BLOCKING (<your-org>/nexus-code#737). Seven SLOW_TESTS=1
+  # scenarios, ~7 min serial as measured locally on 2026-08-06 — no
+  # RUN_INTEGRATION, so no real-tmux-per-scenario cost. This is the band #729's
+  # three broken assertions lived in, and the band the blocking PR gate
+  # (tests.yml, which never sets SLOW_TESTS) is silent about.
+  #
+  # Its verdict is NOT "everything passed". It is "the ledger matches the
+  # ENUMERATED tolerated-red set exactly, in both directions" — a new red fails
+  # the job, a tolerated red that started passing fails the job, and a tolerated
+  # red that stopped being RUN fails the job. That is what lets the band be
+  # blocking while a known red is outstanding, which is the trade #737 needed
+  # and the reason a cultural tolerated set had to become a file.
+  # ---------------------------------------------------------------------------
+  slow-band:
+    name: SLOW band vs enumerated tolerance
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: install runtime deps (jq + tmux + zsh)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq tmux zsh
+
+      - name: the tolerated-red set must parse before anything runs
+        # A malformed tolerance file is exit 2, and finding that out AFTER
+        # spending the band's minutes is finding it out too late. Also the
+        # checker's own negative control: a guard never observed failing is not
+        # evidence, so the planted deviations run before the real comparison.
+        run: bash monitor/slow-band-drift.sh --selftest
+
+      # -----------------------------------------------------------------------
+      # CONTRACT (<your-org>/nexus-code#739): this step's job is to PRODUCE a
+      # ledger, never to judge it. Judging is the `verdict` step's sole job.
+      #
+      #   run-tests rc 0 (all PASS/SKIP) or 1 (>=1 FAIL) -> the ledger is
+      #     COMPLETE and trustworthy, so this step SUCCEEDS. A red test is not
+      #     this step's verdict to deliver; the enumerated-tolerance diff
+      #     decides whether that red is tolerated or new.
+      #   rc 3 (budget exhausted -> PARTIAL ledger), rc 2 (refusal/usage) or
+      #     anything else (124, signals, …) -> there is no trustworthy ledger to
+      #     adjudicate, so this step FAILS loudly and names the rc. This is NOT
+      #     a blanket `|| true`: swallowing rc 3 would feed the drift check a
+      #     truncated ledger, whose missing rows read as UNACCOUNTED — a
+      #     harness timeout wearing a tolerated-set-rot costume (#730's
+      #     weaker-remedy mistake, avoided deliberately).
+      #
+      # Why the shape changed at all: GitHub runs `run:` bodies under
+      # `/usr/bin/bash -e {0}`. The previous body opened with `set -uo pipefail`
+      # — which does NOT clear `-e` — and then called run-tests.sh UNGUARDED, so
+      # the first red test aborted the step mid-body. Neither the exit-code echo
+      # NOR the `ledger=` output ever ran, the `verdict` step was `skipped`, and
+      # monitor/slow-band-known-red.tsv + slow-band-drift.sh were never
+      # consulted. The #737 tolerance mechanism was therefore inert on exactly
+      # the runs it exists for: every run in which a SLOW test is red. Measured
+      # on run 31133525540, where all three of `success` / `failure` / `skipped`
+      # appeared and the verdict was the skipped one.
+      #
+      # That is #721's shape — an ambient shell option silently overriding the
+      # code's intended contract, `-e` here playing the part ambient `pipefail`
+      # played there. The remedy is to make the intent explicit in the code
+      # (`|| rc=$?` + an enumerated disposition) rather than to override the
+      # shell, so a future edit that drops a `shell:` line cannot resurrect it.
+      # -----------------------------------------------------------------------
+      - name: run the SLOW band (SLOW_TESTS=1, no integration suite)
+        id: band
+        run: |
+          set -uo pipefail
+          LEDGER="${RUNNER_TEMP}/slow-band-ledger.tsv"
+          LOGS="${RUNNER_TEMP}/slow-band-logs"
+          : > "$LEDGER"; mkdir -p "$LOGS"
+          # Publish the ledger path BEFORE anything that can fail. The verdict
+          # step interpolates this output; an unset output does not error, it
+          # degrades to `slow-band-drift.sh ""` — a refusal whose message is
+          # about a missing argument rather than about the band.
+          echo "ledger=$LEDGER" >> "$GITHUB_OUTPUT"
+          # DISCOVER the band rather than enumerating it — an enumerated list is
+          # how the fixture copy list in test-respawn-loop-integration.sh drifted
+          # three times. Every SLOW_TESTS-gated scenario on disk is the band.
+          tests=()
+          while IFS= read -r t; do tests+=("$t"); done < <(
+              grep -l 'SLOW_TESTS' monitor/watcher/test-*.sh | sort)
+          if [ "${#tests[@]}" -eq 0 ]; then
+            echo "::error::no SLOW_TESTS-gated scenarios found — the band would pass vacuously"
+            exit 1
+          fi
+          echo "Discovered ${#tests[@]} SLOW scenario(s):"
+          printf '  %s\n' "${tests[@]}"
+          # NEXUS_TEST_DEADLINE_SCALE, and why this band needs it EXPLICITLY
+          # (<your-org>/nexus-code#749). th_deadline() scales every polled
+          # deadline in the suite, but its scale is CPU OVERSUBSCRIPTION —
+          # ceil(NEXUS_TEST_JOBS / nproc). This band passes no `--jobs` and
+          # exports no NEXUS_TEST_JOBS, so jobs=1; on a 2-vCPU ubuntu-latest
+          # that is ceil(1/2) = 1. The #558 scaling machinery is therefore
+          # STRUCTURALLY INERT here — every deadline is exactly its literal —
+          # in precisely the band that #737 made blocking. That is not a
+          # tuning miss, it is a lever that looks engaged and is not: the
+          # deadlines carry a comment saying they are scaled, and here they
+          # are not.
+          #
+          # Oversubscription is also the wrong axis for this runner. At
+          # d4df844f the band failed with loadavg 0.16 — an IDLE host — so
+          # there was no contention to scale for; a hosted runner is simply
+          # slower and more IO-variable per core than the workstation the
+          # literals were authored on. th_deadline's own doc anticipates this
+          # ("CI sets it where the runner shape is known"); nothing had.
+          #
+          # WHY 2, and why not more. Deadlines are POLLED ceilings — wait_for
+          # returns the instant its predicate holds — so raising one costs
+          # zero wall-clock on a green run and only lengthens how long a
+          # genuinely broken run waits before reporting. The ceiling is the
+          # per-test `--timeout 600` below: this file's deadlines total ~219 s
+          # unloaded, so scale 2 worst-cases at ~438 s (inside 600, so a
+          # timing failure still reports as per-assertion FAILs with labels)
+          # while scale 3 worst-cases at ~657 s, which would trip the per-test
+          # timeout and collapse that detail into a bare TIMEOUT. 2 is the
+          # largest scale that keeps a failure legible.
+          rc=0
+          SLOW_TESTS=1 NEXUS_TEST_DEADLINE_SCALE=2 env -u NEXUS_ROOT -u NEXUS_LOCALS \
+            bash monitor/watcher/run-tests.sh \
+              --timeout 600 --keep-logs "$LOGS" --state "$LEDGER" "${tests[@]}" || rc=$?
+          echo "run-tests exit=$rc (the VERDICT is the drift check below, not this)"
+          case "$rc" in
+            0|1) ;;
+            3) echo "::error::run-tests.sh exhausted its serial budget (rc=3) — the ledger is PARTIAL. Refusing to hand a truncated ledger to the tolerance diff, whose missing rows would read as UNACCOUNTED."
+               exit 1 ;;
+            *) echo "::error::run-tests.sh failed as a HARNESS (rc=$rc), not as a test result — there is no trustworthy ledger to adjudicate."
+               exit 1 ;;
+          esac
+          if [ ! -s "$LEDGER" ]; then
+            echo "::error::run-tests.sh exited $rc but the ledger is EMPTY — the band recorded nothing, so a green verdict would be vacuous."
+            exit 1
+          fi
+
+      # Its OWN step, deliberately, and NOT folded into the verdict body.
+      # monitor/test-slow-band-step-contract.sh identifies the verdict as the
+      # step whose ENTIRE body is a drift-check invocation, and that is a real
+      # invariant rather than a parser quirk: nothing may be smuggled in ahead
+      # of the adjudication, where it could mask or precede it. The first cut
+      # of this change prepended the notice to that body and broke the contract
+      # — correctly.
+      - name: record the run attempt (<your-org>/nexus-code#748)
+        if: ${{ !cancelled() }}
+        run: |
+          echo "run_attempt=${{ github.run_attempt }}"
+          if [ "${{ github.run_attempt }}" -gt 1 ]; then
+            echo "::warning::SLOW band: this is run attempt ${{ github.run_attempt }} — an EARLIER attempt did NOT succeed. A green verdict below does not mean the band was green first time; read attempt 1 before trusting it (<your-org>/nexus-code#748, #737)."
+          fi
+
+      - name: verdict — ledger vs monitor/slow-band-known-red.tsv
+        # Structurally unskippable. The step above is now contracted not to fail
+        # on a red test, so in the normal case this runs anyway — but "the
+        # verdict got skipped" is precisely the defect being fixed, and a
+        # condition is the only thing that makes it impossible rather than
+        # merely unlikely. `!cancelled()` rather than `always()`: a cancelled
+        # run has no ledger and no claim to adjudicate, and per this repo's own
+        # enumeration rule `cancelled` is neither success nor failure.
+        # slow-band-drift.sh's exit 2 (refusal on an unreadable/empty ledger) is
+        # the backstop that turns "the band never produced one" into a loud red.
+        if: ${{ !cancelled() }}
+        # ATTEMPT, SURFACED (<your-org>/nexus-code#748). `gh run list` and the
+        # check-runs API both report only the LATEST attempt, and nothing in
+        # this repo reads `run_attempt` at all — measured, `grep -rn
+        # run_attempt` over the tree returned ZERO matches. So a band that went
+        # red and was RETRIED green is indistinguishable from one that was green
+        # first time, to every tool, every emit and every human reading the
+        # checks UI. That is precisely the laundering this ledger exists to
+        # prevent: its whole premise is that a red cannot pass unnoticed.
+        #
+        # It nearly cost a bad merge on 2026-08-07 — a SLOW-band red was retried
+        # green and the PR then showed an unqualified pass, caught only because
+        # someone was watching the run live and enumerated attempts by hand.
+        #
+        # `github.run_attempt` is a CONTEXT VARIABLE, so this costs no API call.
+        # `::warning::` puts the qualification in the run summary and the checks
+        # UI, where it travels with the result instead of living in one person's
+        # memory.
+        run: bash monitor/slow-band-drift.sh "${{ steps.band.outputs.ledger }}"
+
+      - name: upload SLOW-band ledger + logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: slow-band-artifacts-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/slow-band-ledger.tsv
+            ${{ runner.temp }}/slow-band-logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+  slow-integration:
+    name: SLOW + integration band (scheduled)
+    # The full band stays off the per-PR/per-push path: it is the 30-60 min half.
+    # `push` and `pull_request` get the cheap `slow-band` job above instead.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # The band is dozens of multi-minute tests + per-scenario tmux
+    # bring-up: order 30-60 min wall (#559 "Expected cost"). 120 min
+    # leaves headroom for the resume-loop churn; a genuine overrun
+    # times out RED, which is the honest signal.
+    timeout-minutes: 120
+    env:
+      MAX_SECONDS: ${{ inputs.max_seconds || '480' }}
+      PER_TEST_TIMEOUT: ${{ inputs.per_test_timeout || '600' }}
+      # Same reasoning as the `slow-band` job's inline export (#749): this job
+      # passes no `--jobs`, so NEXUS_TEST_JOBS=1 and th_deadline scales by
+      # ceil(1/2) = 1 on a 2-vCPU runner — every polled deadline its bare
+      # literal, in a band of multi-minute tmux scenarios. Set at JOB level so
+      # it covers the canary/guard steps too, not only the band invocation.
+      # Enforced by lint-workflows.py TD001 (<your-org>/nexus-code#751).
+      NEXUS_TEST_DEADLINE_SCALE: 2
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: install runtime deps (jq + tmux + zsh)
+        # The integration suite drives a REAL tmux server per scenario
+        # (test-integration/_harness.sh), so tmux is load-bearing here,
+        # not just a `command -v` shim as in the fast gate. jq + zsh
+        # match tests.yml so the same tests behave identically.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq tmux zsh
+
+      # --- Anti-vacuous-pass guard 1: the integration suite is actually
+      #     SELECTED. Kills the "green because it ran nothing / skipped
+      #     the dir" failure mode (#484: a discovery glob that silently
+      #     excluded four suites shipped a green that meant less than it
+      #     said). If the selection ever drops the integration dir, this
+      #     step goes red BEFORE the band can pass vacuously.
+      - name: guard — integration suite is actually selected
+        run: |
+          set -uo pipefail
+          # Self-calibrating, no magic number: every RUN_INTEGRATION-gated
+          # scenario physically present in test-integration/ MUST be picked
+          # up by the runner's DEFAULT glob — the same selection the band
+          # below runs. `present` is the ground truth on disk; `listed` is
+          # what the band's own selection would run. listed < present means
+          # the glob dropped scenarios and the band would pass vacuously.
+          present=$(grep -lE 'RUN_INTEGRATION' monitor/watcher/test-integration/test-*.sh | wc -l)
+          if [ "$present" -lt 1 ]; then
+            echo "::error::no RUN_INTEGRATION-gated scenarios found in test-integration/ — nothing to cover"
+            exit 1
+          fi
+          listed=$(RUN_INTEGRATION=1 bash monitor/watcher/run-tests.sh --list | grep -c '(integration')
+          echo "gated scenarios present in dir: $present ; selected by the default glob: $listed"
+          if [ "$listed" -lt "$present" ]; then
+            echo "::error::default selection ($listed) misses gated integration scenarios ($present) — the band would pass vacuously"
+            exit 1
+          fi
+
+      # --- Anti-vacuous-pass guard 2: a planted always-failing test,
+      #     gated exactly like a real integration scenario, MUST turn
+      #     the runner red — and MUST self-skip (green) when the gate is
+      #     unset. This proves the harness both RUNS gated tests and
+      #     REPORTS their failures (does not mask them). A coverage job
+      #     that cannot go red on a real failure is worthless (#559).
+      - name: guard — a planted failure turns the runner RED
+        run: |
+          set -uo pipefail
+          canary_dir="$(mktemp -d)"
+          canary="$canary_dir/test-canary-must-fail.sh"
+          {
+            echo '#!/usr/bin/env bash'
+            echo 'set -uo pipefail'
+            echo 'if [ "${RUN_INTEGRATION:-0}" != "1" ]; then echo "skipped: canary (RUN_INTEGRATION=1 to enable)"; exit 0; fi'
+            echo 'echo "FAIL: canary — planted regression, MUST be reported red"'
+            echo 'exit 1'
+          } > "$canary"
+          # (a) gate ON  -> the canary runs and the runner MUST go red (nonzero).
+          if RUN_INTEGRATION=1 bash monitor/watcher/run-tests.sh "$canary" >/dev/null 2>&1; then
+            echo "::error::runner reported GREEN on a planted always-failing test — vacuous-pass hazard"
+            exit 1
+          fi
+          echo "OK: runner went red on the planted failure (gate ON)"
+          # (b) gate OFF -> the canary self-skips and the runner MUST be green.
+          if ! bash monitor/watcher/run-tests.sh "$canary" >/dev/null 2>&1; then
+            echo "::error::canary did not self-skip when RUN_INTEGRATION is unset — the gate mechanism is broken"
+            exit 1
+          fi
+          echo "OK: canary self-skips green (gate OFF)"
+
+      # --- The real thing: the FULL suite with SLOW_TESTS=1 +
+      #     RUN_INTEGRATION=1, driven by the bounded/resumable runner
+      #     (#499) so the ~175-test band terminates with an HONEST
+      #     ledger instead of timing out unaccounted. `env -u NEXUS_ROOT
+      #     -u NEXUS_LOCALS` is the canonical clean-env drive from
+      #     run-tests.sh's own header. Repeat the SAME bounded command
+      #     until the ledger is complete (exit != 3).
+      - name: run SLOW + integration band (bounded, resumable ledger)
+        id: band
+        run: |
+          set -uo pipefail
+          STATE="${RUNNER_TEMP}/suite-$(git rev-parse --short HEAD).tsv"
+          LOGS="${RUNNER_TEMP}/slow-integration-logs"
+          : > "$STATE"
+          mkdir -p "$LOGS"
+          echo "band config: MAX_SECONDS=$MAX_SECONDS PER_TEST_TIMEOUT=$PER_TEST_TIMEOUT"
+          rc=3
+          # Outer loop is a runaway backstop only; the 120-min job timeout
+          # is the real ceiling. Each iteration finishes the tests the
+          # ledger has not yet recorded, then --max-seconds stops cleanly.
+          #
+          # `|| rc=$?`, NOT a bare invocation followed by `rc=$?`
+          # (<your-org>/nexus-code#784, instance 3). GitHub runs `run:` bodies
+          # under `bash -e {0}` and the `set -uo pipefail` above does NOT
+          # clear `-e`, so a bare call aborted the step the instant the
+          # runner returned non-zero — before `rc=$?` was ever read. rc 3 is
+          # the RESUME signal this loop exists for, so the 40-iteration
+          # resumable ledger was dead code: it died on iteration 1, the
+          # `::endgroup::` never closed, `suite-ledger.tsv` was never
+          # produced, and the ADVISORY step (guarded by `|| true`) degraded
+          # silently. It went unnoticed because the band completes in ONE
+          # invocation on the PR path; it fires precisely when the band is
+          # red or over budget — the runs that matter. This is the SIBLING
+          # step of the one #739 fixed, in this same file, which is why #784
+          # also carries the EB lint family: two hand-fixes at two call
+          # sites did not close the class.
+          for i in $(seq 1 40); do
+            echo "::group::band invocation $i (budget ${MAX_SECONDS}s)"
+            rc=0
+            SLOW_TESTS=1 RUN_INTEGRATION=1 env -u NEXUS_ROOT -u NEXUS_LOCALS \
+              bash monitor/watcher/run-tests.sh \
+                --timeout "$PER_TEST_TIMEOUT" \
+                --keep-logs "$LOGS" \
+                --state "$STATE" --resume --max-seconds "$MAX_SECONDS" || rc=$?
+            echo "::endgroup::"
+            echo "band invocation $i exit=$rc"
+            [ "$rc" -ne 3 ] && break
+          done
+          cp "$STATE" "${RUNNER_TEMP}/suite-ledger.tsv" 2>/dev/null || true
+          echo
+          echo "=== final ledger ($STATE) ==="
+          cat "$STATE" || true
+          echo "=== band final exit=$rc (0 green / 1 red / 3 incomplete) ==="
+          exit "$rc"
+
+      - name: ADVISORY — full-band ledger vs the enumerated tolerance
+        # Deliberately advisory, and deliberately not left unsaid why
+        # (<your-org>/nexus-code#737). monitor/slow-band-known-red.tsv currently
+        # enumerates the SLOW half only, because that is the only half for which
+        # a ledger has ever existed: this workflow had never run at all, so the
+        # integration half's tolerated set — #559's, which was only ever
+        # cultural — cannot be pinned from measurement yet. Asserting a tolerance
+        # nobody has measured would be inventing data, which is worse than the
+        # gap it papers over.
+        #
+        # So this step REPORTS the diff and does not gate. The first real nightly
+        # produces the first integration ledger; enumerating it here and deleting
+        # `|| true` is the follow-up, and it is a deliberate promotion rather
+        # than something to notice later — an advisory step that quietly starts
+        # passing is its own "green row nobody re-examines".
+        if: always()
+        run: |
+          bash monitor/slow-band-drift.sh "${{ runner.temp }}/suite-ledger.tsv" || true
+          echo "(advisory until the integration half of the tolerated set is enumerated from a real nightly ledger — <your-org>/nexus-code#737)"
+
+      - name: upload band ledger + per-test logs
+        # Always: a nightly red is the whole point, and it must be
+        # debuggable without a lucky local re-run (mirrors tests.yml).
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: slow-integration-artifacts-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/suite-ledger.tsv
+            ${{ runner.temp }}/slow-integration-logs/
+          if-no-files-found: warn
+          retention-days: 14

@@ -59,6 +59,10 @@ trap 'rm -rf "$WORK"' EXIT
 FAKE_NEXUS="$WORK/nexus"
 mkdir -p "$FAKE_NEXUS/monitor" "$FAKE_NEXUS/config"
 cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
+# `ng` sources monitor/_bookkeeping.sh and REFUSES TO START without
+# it (your-org/nexus-code#601/#605: degrading to the silent-coercion
+# behaviour it replaces is worse than refusing). Copy it alongside.
+cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
 NG="$FAKE_NEXUS/monitor/ng"
 
 # State dir under the fake nexus so processed-comments cache writes

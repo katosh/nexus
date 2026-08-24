@@ -49,6 +49,10 @@ trap 'rm -rf "$WORK"' EXIT
 FAKE_ROOT="$WORK/nexus"
 mkdir -p "$FAKE_ROOT/monitor/.state" "$FAKE_ROOT/config" "$FAKE_ROOT/reports"
 cp "$_test_dir/../ng" "$FAKE_ROOT/monitor/ng"
+# `ng` sources monitor/_bookkeeping.sh and REFUSES TO START without
+# it (your-org/nexus-code#601/#605: degrading to the silent-coercion
+# behaviour it replaces is worse than refusing). Copy it alongside.
+cp "$(dirname "$_test_dir/../ng")/_bookkeeping.sh" "$FAKE_ROOT/monitor/_bookkeeping.sh"
 chmod +x "$FAKE_ROOT/monitor/ng"
 # Minimal config so config/load.sh returns defaults instead of dying.
 cat > "$FAKE_ROOT/config/load.sh" <<'EOF'
@@ -70,6 +74,14 @@ cat > "$STUB/tmux" <<'TS'
 #!/usr/bin/env bash
 case "${1:-}" in
     list-windows)
+        # MOCK_TMUX_LIST_RC lets a test make ONLY the enumeration fail while
+        # everything else about tmux keeps working — the wedged-server case
+        # your-org/nexus-code#802 is about. A real failed list-windows writes
+        # its diagnostic to stderr and prints nothing on stdout.
+        if [[ -n "${MOCK_TMUX_LIST_RC:-}" ]] && (( MOCK_TMUX_LIST_RC != 0 )); then
+            echo "no server running on /tmp/tmux-1000/default" >&2
+            exit "$MOCK_TMUX_LIST_RC"
+        fi
         printf '%s\n' "${MOCK_TMUX_WINDOWS:-}"
         ;;
     *) exit 0 ;;
@@ -114,9 +126,56 @@ run_ng() {
 echo '=== spawn-decision: window absent → spawn ==='
 export MOCK_TMUX_WINDOWS=""
 export MOCK_PANES=""
-out=$(run_ng spawn-decision missing-window 2>&1)
+export MOCK_TMUX_LIST_RC=0
+out=$(run_ng spawn-decision missing-window 2>&1); rc=$?
 assert_contains "absent window → decision=spawn" "$out" "decision=spawn"
 assert_contains "absent window → reason=window-absent" "$out" "reason=window-absent"
+assert_eq       "absent window → rc 0" "$rc" "0"
+
+# ── your-org/nexus-code#802 ───────────────────────────────────────────────
+# THE case the pre-#802 suite did not cover. It exercised "window absent →
+# spawn" with a WORKING tmux, which passes either way; the load-bearing test
+# is a FAILED enumeration, because that is the arm whose old output was
+# byte-identical to a genuine absence AND authorised the spawn.
+#
+# The negative control is the pair: with the identical stub and the identical
+# absent window, rc=0 must still say `spawn` (above) and rc!=0 must say
+# `ambiguous`. A guard that refused everything would pass the second
+# assertion alone.
+echo '=== spawn-decision: FAILED tmux list-windows → ambiguous, NOT window-absent ==='
+export MOCK_TMUX_WINDOWS="my-worker"
+export MOCK_TMUX_LIST_RC=1
+out=$(run_ng spawn-decision my-worker 2>&1); rc=$?
+assert_contains "enumeration failed → decision=ambiguous" "$out" "decision=ambiguous"
+assert_contains "enumeration failed → reason=enumeration-failed" "$out" "reason=enumeration-failed"
+assert_eq       "enumeration failed → rc 1 (documented 'classifier couldn't run')" "$rc" "1"
+# The load-bearing NEGATIVES: the failure must not be reported as a fact
+# about the window, and must not authorise the spawn.
+if grep -qF 'decision=spawn' <<<"$out"; then
+    printf '  FAIL: failed enumeration still says decision=spawn\n         in: %s\n' "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: failed enumeration does NOT say decision=spawn\n'; PASS=$(( PASS + 1 ))
+fi
+if grep -qF 'window-absent' <<<"$out"; then
+    printf '  FAIL: failed enumeration still claims window-absent\n         in: %s\n' "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: failed enumeration does NOT claim window-absent\n'; PASS=$(( PASS + 1 ))
+fi
+if grep -qF 'pane_state=absent' <<<"$out"; then
+    printf '  FAIL: failed enumeration still claims pane_state=absent\n         in: %s\n' "$out" >&2
+    FAIL=$(( FAIL + 1 ))
+else
+    printf '  PASS: failed enumeration does NOT claim pane_state=absent\n'; PASS=$(( PASS + 1 ))
+fi
+# A wedged server fails with rc 1 in practice; assert the arm is keyed on
+# "non-zero", not on the one value the stub happens to use.
+export MOCK_TMUX_LIST_RC=127
+out=$(run_ng spawn-decision my-worker 2>&1); rc=$?
+assert_contains "rc 127 enumeration → ambiguous too" "$out" "reason=enumeration-failed"
+assert_eq       "rc 127 enumeration → rc 1" "$rc" "1"
+export MOCK_TMUX_LIST_RC=0
 
 echo '=== spawn-decision: idle retained worker → continue ==='
 export MOCK_TMUX_WINDOWS="my-worker"

@@ -107,6 +107,16 @@
 #      run, the excess skipped with a loud notice. A worker whose session
 #      or workdir cannot be resolved (spawn-worker exit 11/12) is skipped
 #      loudly, never fatal.
+#      COLD BOOT OVERRIDE (your-org/nexus-code#651): when `entry.sh` has
+#      left a `mode=fresh` boot intent at `$STATE_DIR/boot-intent` — the
+#      operator started the nexus WITHOUT `--continue` — this entire step
+#      is replaced by a deliberate drop: no worker is resurrected, the
+#      snapshot they would have come from is ARCHIVED (never deleted), and
+#      a manifest of exactly what was dropped is written for delivery into
+#      the incoming orchestrator's first turn. The intent is one-shot
+#      (archived on read) so the mid-life recoveries that share this
+#      script — SessionStart, `bootstrap.sh`, `svc.sh up` — keep resuming
+#      workers as they should. See "cold boot" below the worker helpers.
 #
 # The registry is operator-local (gitignored) so each deployment lists
 # its own services without forking this script. Format + an annotated
@@ -185,6 +195,10 @@
 #                            monitor.target_window_index, 2).
 #   RECOVER_MAX_WORKERS    — worker-respawn sanity cap (default:
 #                            recover.max_workers, 12).
+#   RECOVER_BOOT_INTENT_TTL— seconds a `boot-intent` record stays
+#                            honourable (default:
+#                            recover.boot_intent_ttl_seconds, 900). An
+#                            older record is archived and ignored.
 #   RECOVER_INTERVAL       — poll interval for the watcher liveness
 #                            bucket (default: monitor.interval_seconds).
 
@@ -230,6 +244,13 @@ source "$_script_dir/watcher/_version_restart.sh"
 # shellcheck source=watcher/_idle_probe.sh
 source "$_script_dir/watcher/_idle_probe.sh" 2>/dev/null || true
 
+# Dropped-worker manifest helpers (your-org/nexus-code#651). We WRITE the
+# manifest; `spawn-fresh-orchestrator.sh` and `watcher/bootstrap.sh` read
+# and deliver it. Shared so the path and the once-only delivery rule have
+# exactly one definition. Side-effect-free on source.
+# shellcheck source=_dropped_manifest.sh
+source "$_script_dir/_dropped_manifest.sh"
+
 STATE_DIR="${NEXUS_STATE_DIR:-$NEXUS_ROOT/monitor/.state}"
 SERVICES_REGISTRY="${NEXUS_SERVICES_REGISTRY:-$NEXUS_ROOT/monitor/services.registry}"
 LAUNCHER_BIN="${RECOVER_LAUNCHER_BIN:-$_script_dir/watcher/launcher.sh}"
@@ -242,17 +263,27 @@ if [[ -x "$_cfg" ]]; then
     TARGET_WINDOW="${RECOVER_TARGET_WINDOW:-$("$_cfg" monitor.target_window orchestrator)}"
     SERVICES_WINDOW="${MONITOR_SERVICES_WINDOW:-$("$_cfg" monitor.services_window services)}"
     ORCH_WINDOW_INDEX="${RECOVER_ORCH_WINDOW_INDEX:-$("$_cfg" monitor.target_window_index 2)}"
+    BOOT_INTENT_TTL="${RECOVER_BOOT_INTENT_TTL:-$("$_cfg" recover.boot_intent_ttl_seconds 900)}"
 else
     INTERVAL="${RECOVER_INTERVAL:-60}"
     MAX_WORKERS="${RECOVER_MAX_WORKERS:-12}"
     TARGET_WINDOW="${RECOVER_TARGET_WINDOW:-orchestrator}"
     SERVICES_WINDOW="${MONITOR_SERVICES_WINDOW:-services}"
     ORCH_WINDOW_INDEX="${RECOVER_ORCH_WINDOW_INDEX:-2}"
+    BOOT_INTENT_TTL="${RECOVER_BOOT_INTENT_TTL:-900}"
 fi
 [[ "$MAX_WORKERS" =~ ^[0-9]+$ ]] || MAX_WORKERS=12
 [[ -n "$TARGET_WINDOW" ]] || TARGET_WINDOW=orchestrator
 [[ -n "$SERVICES_WINDOW" ]] || SERVICES_WINDOW=services
 [[ "$ORCH_WINDOW_INDEX" =~ ^[0-9]+$ ]] || ORCH_WINDOW_INDEX=2
+[[ "$BOOT_INTENT_TTL" =~ ^[0-9]+$ ]] || BOOT_INTENT_TTL=900
+
+# Boot-intent handoff (your-org/nexus-code#651). `entry.sh` records the
+# operator's fresh-vs-continue intent here; this script is the process
+# that actually performs — or refuses — the worker resurrection, so it is
+# the one that has to read it. See `_recover_read_boot_intent`.
+BOOT_INTENT_FILE="$STATE_DIR/boot-intent"
+SNAPSHOT_FILE="$STATE_DIR/last-snapshot.txt"
 
 # Run-mode globals (consumed by the functions below). Defaults here so
 # a test that sources this file for its functions sees sane values
@@ -263,6 +294,11 @@ DO_SERVICES=1
 DO_WORKERS=1
 DRY_RUN=0
 LIST_ONLY=0
+
+# 1 ⇒ the operator booted WITHOUT `--continue`: this run resurrects NO
+# workers at all. Resolved once from the boot-intent file (see
+# `_recover_read_boot_intent`); 0 for every ordinary mid-life recovery.
+COLD_BOOT=0
 
 # Operator-engaged windows captured at the very START of recovery
 # (before the watcher relaunch, whose first idle-probe cycle prunes
@@ -330,7 +366,7 @@ _recover_service_healthy() {
 _recover_window_exists() {
     local name="$1"
     command -v tmux >/dev/null 2>&1 || return 1
-    tmux list-windows -F '#{window_name}' 2>/dev/null | grep -qxF "$name"
+    grep -qxF "$name" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"
 }
 
 # Path of a service's headless-supervisor pidfile.
@@ -361,22 +397,88 @@ _recover_pidfile() { printf '%s/services/%s.pid' "$STATE_DIR" "$1"; }
 # check alone. The pidfile is per-service-name, which is what lets two
 # services that share a wrapper script (e.g. `serve-supervised.sh`) be
 # told apart — a bare `pgrep` on the wrapper could not.
-_recover_supervisor_state() {
+#
+# IDENTITY (your-org/nexus-code#606): a bare pid is NOT an identity. The
+# state dir lives on shared storage but a pid only means something inside
+# the pid NAMESPACE that minted it, so after a container restart every
+# recorded pid refers to a namespace that no longer exists. The cmdline
+# guard alone does not save us: several services share one wrapper
+# basename (`serve-supervised.sh` backs four rows here), so a recycled pid
+# that happens to run the same wrapper passes it and a DEAD supervisor
+# reads as `alive:` — the service is then wedged "leave it alone" forever.
+# So the record carries the minting pid namespace (`ns=`) and the
+# supervisor's kernel start-time (`start=`), and both are verified here.
+# Records written before this change carry neither; they degrade to
+# exactly the previous behaviour rather than being declared stale.
+_recover_ns_id() { readlink "/proc/$$/ns/pid" 2>/dev/null || true; }
+
+# Kernel start-time of a live pid (jiffies since boot; /proc/<pid>/stat
+# field 22). The canonical defeat for pid recycling: a recycled pid
+# necessarily carries a LATER start-time than the one we recorded. Field 2
+# (comm) may contain spaces, so split only what follows the final ") ".
+_recover_starttime() {
+    local pid="$1" sr
+    sr=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    sr=${sr#*") "}
+    # shellcheck disable=SC2086  # deliberate word-splitting of stat fields
+    set -- $sr
+    printf '%s' "${20:-}"
+}
+
+_RECOVER_SUP_STATE=''     # alive:<pid> | stale:<pid> | absent
+_RECOVER_SUP_PID=''       # the recorded pid, whatever its state
+_RECOVER_STALE_REASON=''  # why a stale record is stale (empty unless stale)
+
+_recover_mark_stale() { _RECOVER_SUP_STATE="stale:$1"; _RECOVER_STALE_REASON="$2"; }
+
+# The probe: same decision as _recover_supervisor_state but WITHOUT a
+# subshell, so the caller can read the stale REASON. A reason is not
+# cosmetic — `foreign-namespace` (the container-restart signature) and
+# `process-gone` demand different operator action, and `svc.sh` prints it.
+_recover_supervisor_probe() {
     local name="$1" launch="$2"
     local pf; pf=$(_recover_pidfile "$name")
-    [[ -f "$pf" ]] || { printf 'absent'; return 0; }
-    local pid; read -r pid < "$pf" 2>/dev/null
-    [[ "$pid" =~ ^[0-9]+$ ]] || { printf 'stale:%s' "${pid:-?}"; return 0; }
-    kill -0 "$pid" 2>/dev/null || { printf 'stale:%s' "$pid"; return 0; }
+    _RECOVER_SUP_STATE=''; _RECOVER_SUP_PID=''; _RECOVER_STALE_REASON=''
+    [[ -f "$pf" ]] || { _RECOVER_SUP_STATE='absent'; return 0; }
+    local pid='' rec_ns='' rec_start='' line n=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n+1))
+        if (( n == 1 )); then pid="$line"; continue; fi
+        case "$line" in
+            ns=*)    rec_ns="${line#ns=}" ;;
+            start=*) rec_start="${line#start=}" ;;
+        esac
+    done < "$pf"
+    _RECOVER_SUP_PID="$pid"
+    [[ "$pid" =~ ^[0-9]+$ ]] || { _recover_mark_stale "${pid:-?}" 'malformed-record'; return 0; }
+    # Namespace identity FIRST: a pid minted in a different pid namespace
+    # names nothing here, so asking `kill -0` about it is meaningless — it
+    # can only produce a false positive.
+    local cur_ns; cur_ns=$(_recover_ns_id)
+    if [[ -n "$rec_ns" && "$rec_ns" != unknown && -n "$cur_ns" && "$rec_ns" != "$cur_ns" ]]; then
+        _recover_mark_stale "$pid" 'foreign-namespace'; return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || { _recover_mark_stale "$pid" 'process-gone'; return 0; }
+    if [[ -n "$rec_start" && "$rec_start" != unknown ]]; then
+        local cur_start; cur_start=$(_recover_starttime "$pid")
+        if [[ -n "$cur_start" && "$cur_start" != "$rec_start" ]]; then
+            _recover_mark_stale "$pid" 'pid-recycled'; return 0
+        fi
+    fi
     local cmdline_file="/proc/$pid/cmdline"
     if [[ -r "$cmdline_file" ]]; then
         local cmdline tok
         cmdline=$(tr '\0' ' ' < "$cmdline_file" 2>/dev/null)
         tok=${launch%% *}     # first token of the launch cmd
         tok=${tok##*/}        # → its basename, e.g. serve-supervised.sh
-        [[ -n "$tok" && "$cmdline" == *"$tok"* ]] || { printf 'stale:%s' "$pid"; return 0; }
+        [[ -n "$tok" && "$cmdline" == *"$tok"* ]] || { _recover_mark_stale "$pid" 'cmdline-mismatch'; return 0; }
     fi
-    printf 'alive:%s' "$pid"
+    _RECOVER_SUP_STATE="alive:$pid"
+}
+
+_recover_supervisor_state() {
+    _recover_supervisor_probe "$1" "$2"
+    printf '%s' "$_RECOVER_SUP_STATE"
 }
 
 # Is the service's headless supervisor still alive? Thin boolean over
@@ -406,7 +508,18 @@ _recover_launch_service() {
     # running recovery would otherwise leak its own soft nproc ceiling
     # (spawn-worker.sh) into the long-lived service supervisor. The worker
     # ceiling is soft-only, so the raise is always permitted.
-    printf -v inner 'ulimit -Su "$(ulimit -Hu)" 2>/dev/null || true; echo $$ > %q; cd %q && exec %s' "$pf" "$workdir" "$launch"
+    # Line 1 is the pid (every legacy reader does `read -r pid < pidfile`, so
+    # it must stay first and bare). The `ns=`/`start=` lines below make the
+    # record an IDENTITY rather than a bare integer — see
+    # _recover_supervisor_probe for why a pid alone cannot be trusted across
+    # a container restart. `$$` is the invoking shell's pid even inside a
+    # command substitution, so /proc/$$/ reads describe the supervisor, not
+    # the substitution's forked subshell. Written before `exec`, which
+    # preserves both the pid and the start-time.
+    local idrec='_ns=$(readlink /proc/$$/ns/pid 2>/dev/null || printf unknown);'
+    idrec+=' _sr=$(cat /proc/$$/stat 2>/dev/null); _sr=${_sr#*") "}; set -- $_sr;'
+    idrec+=' printf "%s\nns=%s\nstart=%s\n" "$$" "${_ns:-unknown}" "${20:-unknown}"'
+    printf -v inner 'ulimit -Su "$(ulimit -Hu)" 2>/dev/null || true; { %s; } > %q; cd %q && exec %s' "$idrec" "$pf" "$workdir" "$launch"
     # Create the log with an explicit mode BEFORE the redirect opens it.
     # A bare `>>` would create it under the ambient umask (007 here) —
     # 0660, group-writable, in a group-shared tree — and a group-writable
@@ -431,12 +544,30 @@ _recover_launch_service() {
 # tmux window bears its name. A live supervisor or a present window
 # (even if the healthcheck is briefly failing) is left to its own
 # supervised-restart loop — relaunching it would orphan a duplicate.
-# Prints a one-word outcome (healthy | supervisor-alive | window-present
-# | workdir-missing | relaunched | launch-failed | dry-run-would-launch)
-# for the caller's tally.
+# Prints a one-word outcome (healthy | healthy-unsupervised |
+# supervisor-alive | window-present | workdir-missing | relaunched |
+# launch-failed | dry-run-would-launch) for the caller's tally.
+#
+# `healthy-unsupervised` is NOT a flavour of healthy (your-org/nexus-code#606).
+# A passing healthcheck proves something is SERVING; it says nothing about
+# whether we still supervise it. When a PRESENT-but-dead supervisor record
+# sits next to a green healthcheck, the daemon outlived its supervisor:
+# nothing will restart it when it next dies, and no wrapper self-heal is
+# left to defer to. Reporting that as plain `healthy` is the conflation
+# that let an orphan sit undetected across a container restart. We still do
+# not relaunch — a second supervisor on a bound port just fails EADDRINUSE
+# forever — so this is a REPORTING fix; `svc.sh restart` does the bounce.
+# Note the deliberate stale-vs-absent asymmetry: `absent` means nothing was
+# ever recorded (externally managed, not yet migrated), which contradicts
+# nothing and stays plain `healthy`.
 recover_service() {
     local name="$1" workdir="$2" launch="$3" health="$4" logfile="${5:-}"
     if _recover_service_healthy "$workdir" "$health"; then
+        _recover_supervisor_probe "$name" "$launch"
+        if [[ "$_RECOVER_SUP_STATE" == stale:* ]]; then
+            log "service '$name': healthcheck PASSES but the supervisor record is STALE (pid $_RECOVER_SUP_PID, $_RECOVER_STALE_REASON) — serving UNSUPERVISED; not relaunching (would collide with the live daemon). Reconcile: monitor/svc.sh restart '$name'"
+            echo healthy-unsupervised; return 0
+        fi
         log "service '$name': healthy"
         echo healthy; return 0
     fi
@@ -522,19 +653,34 @@ _recover_pin_orchestrator_window() {
     [[ "$ORCH_WINDOW_INDEX" =~ ^[0-9]+$ ]] || return 0
     _recover_window_exists "$target" || return 0
     # Resolve the target window's current session + index.
+    #
+    # Delimiter is '|', never a TAB (your-org/nexus-code#701 item A): in a
+    # non-UTF-8 locale tmux rewrites every byte outside printable ASCII in
+    # `-F` output to `_`, so a TAB-delimited row never split, `$3` never
+    # matched, and this function became a silent no-op — the orchestrator was
+    # simply never pinned, with nothing anywhere saying so. Not damage, but
+    # not what it claims either. '|' is printable, so no locale rewrites it,
+    # and validate_window_name forbids it inside a minted name.
     local line sess cur _name
-    line=$(tmux list-windows -a -F '#{session_name}'$'\t''#{window_index}'$'\t''#{window_name}' 2>/dev/null \
-           | awk -F'\t' -v w="$target" '$3 == w { print; exit }')
+    line=$(tmux list-windows -a -F '#{session_name}|#{window_index}|#{window_name}' 2>/dev/null \
+           | awk -F'|' -v w="$target" '$3 == w { print; exit }')
     [[ -n "$line" ]] || return 0
-    IFS=$'\t' read -r sess cur _name <<<"$line"
+    IFS='|' read -r sess cur _name <<<"$line"
     if [[ "$cur" == "$ORCH_WINDOW_INDEX" ]]; then
         log "orchestrator: already at canonical window index $ORCH_WINDOW_INDEX"
         return 0
     fi
     # Refuse to clobber a different window occupying the slot.
     local occupant
-    occupant=$(tmux list-windows -t "$sess" -F '#{window_index}'$'\t''#{window_name}' 2>/dev/null \
-               | awk -F'\t' -v i="$ORCH_WINDOW_INDEX" '$1 == i { print $2; exit }')
+    # '|', not a TAB — same reason as above (your-org/nexus-code#701 item A).
+    # Stated precisely: a locale that defeats THIS delimiter defeats the one
+    # above too, and that one returns early, so the locale alone never reaches
+    # here. Converted because the shape is wrong, not because a live path was
+    # demonstrated — were it reachable, an unsplit row would leave `occupant`
+    # empty and report a slot FREE that was never read, skipping the
+    # clobber-refusal below.
+    occupant=$(tmux list-windows -t "$sess" -F '#{window_index}|#{window_name}' 2>/dev/null \
+               | awk -F'|' -v i="$ORCH_WINDOW_INDEX" '$1 == i { print $2; exit }')
     if [[ -n "$occupant" && "$occupant" != "$target" ]]; then
         log "orchestrator: canonical index $ORCH_WINDOW_INDEX held by '$occupant' — NOT moving (orchestrator stays at $cur); free the slot to re-pin"
         return 0
@@ -708,6 +854,296 @@ _recover_snapshot_workers() {
     done < <(_recover_snapshot_tmux_windows "$snap")
 }
 
+# --- cold boot: resurrect nothing, report everything ------------------------
+#
+# your-org/nexus-code#651. `./watcher` without `--continue` must be a cold
+# boot of the WHOLE workspace, not just of the orchestrator. Before this,
+# `entry.sh` archived the orchestrator session pin and then handed
+# bring-up to us — and our worker walk, which knows nothing about the
+# operator's flag, faithfully resurrected every worker that had been alive.
+#
+# That is not a cosmetic gap. On 2026-07-30 the sandbox died roughly every
+# three minutes for a quarter of an hour; each death ran recovery, which
+# brought back the very worker whose activity was killing the sandbox,
+# which killed it again. Unconditional resurrection is an AMPLIFIER: it
+# turns a single fault into a self-sustaining outage loop, and the
+# operator's only escape hatch (boot cold) did not actually work.
+#
+# Three obligations on a cold boot, in order:
+#   1. Resurrect nothing.
+#   2. Lose nothing. The prior worker state is ARCHIVED, never deleted,
+#      mirroring the pin's `.archived.<epoch>` convention.
+#   3. Tell the orchestrator what it no longer has, in enough detail to
+#      make a per-worker re-spawn decision — and put that where it will
+#      actually be read (its turn-1 prompt), not only in a log.
+
+# Archive a state file to `<path>.archived.<epoch>` — the pin convention,
+# applied to whatever a cold boot has to stop honouring. Never deletes.
+# Prints the archived path on stdout; returns 1 if there was nothing to
+# archive or the rename failed (both non-fatal to the caller).
+_recover_archive_state_file() {
+    local path="$1" what="$2"
+    [[ -e "$path" ]] || return 1
+    local archived="$path.archived.$(date +%s)"
+    if mv -f "$path" "$archived" 2>/dev/null; then
+        log "$what: archived $(basename "$path") -> $(basename "$archived") (recoverable, never deleted)"
+        printf '%s' "$archived"
+        return 0
+    fi
+    log "$what: WARNING failed to archive $path — leaving it in place"
+    return 1
+}
+
+# Resolve the operator's fresh-vs-continue boot intent. Sets COLD_BOOT and
+# prints the verdict word (`fresh` | `continue` | `none` | `stale` |
+# `malformed`) for the caller's messaging.
+#
+# The intent is ONE-SHOT and is consumed here, because we are not only the
+# boot path: the SessionStart hook (`boot-recover.sh`), `bootstrap.sh`'s
+# per-turn refresh and a manual `svc.sh up` all land in this same script,
+# and every one of those is ordinary mid-life crash recovery where
+# resuming workers is exactly right. An intent left on disk would convert
+# all of them into worker massacres, so honouring it archives it.
+#
+# The TTL is the guard from the other side: an intent whose boot never
+# reached the worker walk (bring-up aborted, instance guard refused) must
+# expire rather than fire days later against an unrelated recovery. A
+# real cold boot reaches us within seconds — `entry.sh` -> `svc.sh up` ->
+# here — so the default 900 s is orders of magnitude of slack, and a
+# stale intent degrades to today's resume behaviour, loudly.
+#
+# `--dry-run` resolves but never consumes: `boot-recover.sh` runs us as a
+# pure health probe, and a probe that ate the boot intent would leave the
+# real run resurrecting everything.
+_recover_read_boot_intent() {
+    COLD_BOOT=0
+    [[ -f "$BOOT_INTENT_FILE" ]] || { printf none; return 0; }
+    local mode='' ts='' line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            mode=*) mode="${line#mode=}" ;;
+            ts=*)   ts="${line#ts=}" ;;
+        esac
+    done < "$BOOT_INTENT_FILE"
+    # A record without a usable timestamp falls back to the file's own
+    # mtime rather than being trusted unconditionally.
+    [[ "$ts" =~ ^[0-9]+$ ]] || ts=$(stat -c '%Y' "$BOOT_INTENT_FILE" 2>/dev/null \
+                                    || stat -f '%m' "$BOOT_INTENT_FILE" 2>/dev/null || echo '')
+    local age=-1
+    if [[ "$ts" =~ ^[0-9]+$ ]]; then
+        age=$(( $(date +%s) - ts ))
+    fi
+    if (( age < 0 || age > BOOT_INTENT_TTL )); then
+        log "boot-intent: IGNORING $BOOT_INTENT_FILE (mode=${mode:-?}, age=${age}s > ttl=${BOOT_INTENT_TTL}s) — a boot intent this old never reached its own worker walk; recovering normally"
+        (( DRY_RUN == 0 )) && _recover_archive_state_file "$BOOT_INTENT_FILE" "boot-intent" >/dev/null
+        printf stale; return 0
+    fi
+    case "$mode" in
+        fresh)
+            COLD_BOOT=1
+            log "boot-intent: FRESH boot requested (${age}s ago, no --continue) — this run will resurrect NO worker agents"
+            (( DRY_RUN == 0 )) && _recover_archive_state_file "$BOOT_INTENT_FILE" "boot-intent" >/dev/null
+            printf fresh ;;
+        continue)
+            log "boot-intent: --continue boot (${age}s ago) — resuming prior worker agents as usual"
+            (( DRY_RUN == 0 )) && _recover_archive_state_file "$BOOT_INTENT_FILE" "boot-intent" >/dev/null
+            printf continue ;;
+        *)
+            log "boot-intent: malformed record at $BOOT_INTENT_FILE (mode='${mode}') — recovering normally"
+            (( DRY_RUN == 0 )) && _recover_archive_state_file "$BOOT_INTENT_FILE" "boot-intent" >/dev/null
+            printf malformed ;;
+    esac
+    return 0
+}
+
+# Most recent report filed for a window, relative to $NEXUS_ROOT, or empty.
+# Same maxdepth-1 name-match the fresh-orchestrator situation report uses.
+_recover_worker_last_report() {
+    local window="$1" reports_dir="$NEXUS_ROOT/reports"
+    [[ -d "$reports_dir" ]] || return 0
+    find "$reports_dir" -maxdepth 1 -type f -name "*${window}*.md" \
+        -printf '%T@\treports/%f\n' 2>/dev/null | sort -nr | head -1 | cut -f2-
+}
+
+# One manifest entry for one dropped worker. Session-id and workdir come
+# from the CANONICAL resolver — `spawn-worker.sh --resume <window>
+# --dry-run`, which prints exactly what a real resume would have used and
+# touches nothing — so the manifest can never disagree with the command it
+# tells the orchestrator to run. An unresolvable worker is still listed,
+# with the resolver's own diagnostic: "we dropped something we cannot
+# describe" is the entry that most needs a human decision, and silently
+# omitting it would be the same silence-as-absence failure this whole
+# change exists to remove.
+_recover_manifest_entry() {
+    local window="$1" out rc session='' workdir='' report=''
+    out=$("$SPAWN_WORKER_BIN" --resume "$window" --dry-run 2>&1)
+    rc=$?
+    printf '### `%s`\n\n' "$window"
+    if (( rc == 0 )) && [[ "$out" == *"resolved:"* ]]; then
+        session=$(sed -n 's/.*[[:space:]]session=\(.*\) workdir=.*/\1/p' <<<"$out" | head -1)
+        workdir=$(sed -n 's/.*[[:space:]]workdir=\(.*\) jsonl=.*/\1/p' <<<"$out" | head -1)
+        printf -- '- session-id: `%s`\n' "${session:-(unresolved)}"
+        printf -- '- workdir: `%s`\n' "${workdir:-(unresolved)}"
+    else
+        printf -- '- session-id: **UNRESOLVED** (spawn-worker --dry-run exit %d)\n' "$rc"
+        printf -- '- resolver said: `%s`\n' "$(tr '\n' ' ' <<<"$out" | cut -c1-300)"
+    fi
+    report=$(_recover_worker_last_report "$window")
+    # Deliberately an `if`, not `"${report:+…}${report:-…}"`. `${var:-alt}`
+    # expands to the VALUE when the variable is set, so that pair fires BOTH
+    # arms on a non-empty report and emits the path twice (your-org/nexus-code#651
+    # skeptic, finding 4 — the same two-arm misreading as `#648`). It lands on
+    # the one field that tells the orchestrator a dropped worker had already
+    # finished, and a doubled path is a path an agent can mis-copy.
+    if [[ -n "$report" ]]; then
+        printf -- '- last report: `%s`\n' "$report"
+    else
+        printf -- '- last report: (none found under reports/)\n'
+    fi
+    printf -- '- re-spawn with: `monitor/spawn-worker.sh --resume %s`\n\n' "$window"
+}
+
+# Write the dropped-worker manifest. `$@` is the worker set the walk WOULD
+# have resumed. `$1` of the globals: $2 is the archived snapshot path (may
+# be empty) so the manifest names where its own evidence went.
+#
+# Any manifest already on disk is archived first, even when this boot
+# drops nothing: an undelivered manifest from an earlier cold boot must
+# never be read as a description of THIS one.
+# Write the manifest. `$1` is the archived snapshot path (may be empty); the
+# remaining args are the worker set the walk WOULD have resumed.
+#
+# The set is PARTITIONED by current tmux liveness, because a cold boot no
+# longer implies an empty board (your-org/nexus-code#651 skeptic r2, finding 1).
+# Before the liveness fix, reaching this code required no orchestrator window at
+# all — in practice the tmux server had died and taken every worker with it, so
+# "everything in the snapshot is gone" was true by construction. The liveness
+# fix deliberately routes the tmux-SURVIVED crash shape here as well, and there
+# every worker window is still running. Emitting them under "they are not
+# running now" would hand the incoming orchestrator a confident falsehood about
+# its own board, on turn 1, in precisely the scenario the fix exists to serve.
+#
+# Recovery never kills anything: declining to resurrect is not the same as
+# terminating, so a live worker is left alone and simply reported as such.
+_recover_write_dropped_manifest() {
+    local archived_snapshot="$1"; shift
+    local manifest; manifest=$(_dropped_manifest_path "$STATE_DIR")
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    [[ -e "$manifest" ]] && _recover_archive_state_file "$manifest" "dropped-manifest" >/dev/null
+    (( $# > 0 )) || return 0
+
+    # The SAME predicate entry.sh uses, from `_lib.sh` — not a second one, and
+    # not a name check. `_recover_window_exists` would file a `remain-on-exit`
+    # CORPSE worker under "still running", which is the exact misreading this
+    # whole change exists to remove, just relocated. Composed per the
+    # predicate's contract (`exists && has_live_agent`): its fail-safe answer
+    # is LIVE, so asking it about a window that is gone would invert the
+    # verdict. A corpse therefore lands in `gone`, correctly — dead work that
+    # `--resume` can legitimately replace (spawn-worker kills a dead pane).
+    local -a gone=() still=()
+    local window
+    for window in "$@"; do
+        if _recover_window_exists "$window" && _nexus_window_has_live_agent "$window"; then
+            still+=("$window")
+        else
+            gone+=("$window")
+        fi
+    done
+    (( ${#gone[@]} + ${#still[@]} > 0 )) || return 0
+
+    {
+        if (( ${#gone[@]} > 0 )); then
+            printf '# Cold boot dropped %d worker agent(s)\n\n' "${#gone[@]}"
+        else
+            printf '# Cold boot dropped no worker agents\n\n'
+        fi
+        printf 'The nexus was started **without `--continue`**, so this boot deliberately\n'
+        printf 'resurrected nothing.\n\n'
+        printf 'Nothing was deleted. '
+        if [[ -n "$archived_snapshot" ]]; then
+            printf 'The snapshot this was read from is archived at `%s`.\n\n' "${archived_snapshot#$NEXUS_ROOT/}"
+        else
+            printf 'The prior worker state is archived alongside it in the state dir.\n\n'
+        fi
+
+        if (( ${#gone[@]} > 0 )); then
+            printf '## Dropped — these are NOT running\n\n'
+            printf 'Alive in the last watcher snapshot, and a `--continue` boot WOULD have\n'
+            printf 'resumed them. This is a list of work that stopped, not a list of windows\n'
+            printf 'you have.\n\n'
+            printf 'Decide per worker whether it should come back. Judge from its last report\n'
+            printf 'and the issue it was working: some of this work is finished, some was\n'
+            printf 'abandoned mid-task, and at least one of these agents may be why the\n'
+            printf 'workspace went down. Resuming all of them is exactly the behaviour the\n'
+            printf 'operator opted out of.\n\n'
+            for window in "${gone[@]}"; do
+                _recover_manifest_entry "$window"
+            done
+        fi
+
+        if (( ${#still[@]} > 0 )); then
+            printf '## Still running — untouched, and NOT dropped\n\n'
+            printf 'These were in the snapshot too, but their windows are **alive right now**:\n'
+            printf 'the orchestrator died without taking them with it. A cold boot declines to\n'
+            printf 'RESURRECT; it never terminates a running agent, so recovery left them\n'
+            printf 'exactly as they were.\n\n'
+            printf 'Do NOT `--resume` these — `spawn-worker.sh --resume` exits 13 on a window\n'
+            printf 'with a live pane. If you want one gone, retire it deliberately (see\n'
+            printf '`skills/nexus.window-cleanup`); if you want it driven, paste a follow-up.\n\n'
+            for window in "${still[@]}"; do
+                printf -- '- `%s` — window alive; last report: %s\n' \
+                    "$window" "$(_recover_worker_last_report "$window" || true)"
+            done
+            printf '\n'
+        fi
+
+        printf -- '---\n\n'
+        printf 'Generated by `monitor/bootstrap-recover.sh` at %s (your-org/nexus-code#651).\n' "$(date -Is)"
+    } > "$manifest" 2>/dev/null || {
+        log "dropped-manifest: WARNING could not write $manifest — the orchestrator will not be told what was dropped"
+        return 1
+    }
+    log "dropped-manifest: wrote $manifest (${#gone[@]} dropped, ${#still[@]} still alive) — delivered to the orchestrator on its first turn"
+    return 0
+}
+
+# The cold-boot action itself: build the manifest from the worker set the
+# walk would have resumed, then archive the snapshot that set came from.
+#
+# Archiving the snapshot is load-bearing, not tidiness. It is the ONLY
+# input to `_recover_snapshot_workers`, so removing it closes the window
+# between this boot and the watcher's first fresh snapshot (~one poll
+# cycle) in which a SessionStart-triggered recovery — the very thing that
+# fired every three minutes during the 2026-07-30 loop — could still read
+# the pre-boot window list and resurrect the whole board anyway.
+_recover_cold_boot_drop() {
+    local -a dropped=()
+    local name
+    while IFS= read -r name; do
+        [[ -n "$name" ]] && dropped+=("$name")
+    done < <(_recover_snapshot_workers)
+
+    if (( DRY_RUN == 1 )); then
+        log "workers: cold boot — would DROP ${#dropped[@]} worker(s) and write the manifest (dry run: nothing archived)"
+        return 0
+    fi
+
+    local archived=''
+    archived=$(_recover_archive_state_file "$SNAPSHOT_FILE" "workers") || archived=''
+    _recover_write_dropped_manifest "$archived" "${dropped[@]+"${dropped[@]}"}"
+
+    if (( ${#dropped[@]} == 0 )); then
+        log "workers: cold boot — nothing to drop (no qualifying worker in the last snapshot)"
+    else
+        # "candidate(s)" not "DROPPED": since the liveness fix routed the
+        # tmux-survived crash shape here, some of these windows may still be
+        # running and were therefore never dropped. The manifest writer logs
+        # the authoritative dropped-vs-still-alive split right after this.
+        log "workers: cold boot — resurrected none; ${#dropped[@]} snapshot candidate(s): ${dropped[*]}"
+    fi
+    return 0
+}
+
 # Decide + act for one qualifying worker. Idempotent: a window that is
 # already alive is never double-spawned. Prints a one-word outcome
 # (already-alive | dry-run-would-resume | resumed | session-unresolvable
@@ -797,7 +1233,7 @@ _recover_main() {
             --no-workers)    DO_WORKERS=0; shift ;;
             --dry-run)       DRY_RUN=1; shift ;;
             --list)          LIST_ONLY=1; shift ;;
-            -h|--help)       sed -n '2,187p' "$0"; return 0 ;;
+            -h|--help)       sed -n '2,203p' "$0"; return 0 ;;
             *) echo "bootstrap-recover.sh: unknown flag: $1" >&2; return 1 ;;
         esac
     done
@@ -840,6 +1276,17 @@ _recover_main() {
         _recover_capture_engaged_windows
         [[ "$ENGAGED_WINDOWS" != " " ]] && \
             log "workers: operator-engaged windows captured:${ENGAGED_WINDOWS%" "}"
+
+        # Resolve the operator's boot intent, and on a cold boot do the
+        # drop NOW — before the watcher relaunch (which would overwrite
+        # the snapshot we are archiving) and before the orchestrator
+        # spawn (whose situation report is where the manifest gets
+        # delivered; it is composed the moment `recover_orchestrator`
+        # runs, so a manifest written any later would miss turn 1).
+        _recover_read_boot_intent >/dev/null
+        if (( COLD_BOOT == 1 )); then
+            _recover_cold_boot_drop
+        fi
     fi
 
     if (( DO_WATCHER == 1 )); then
@@ -884,6 +1331,11 @@ _recover_main() {
 
     if (( DO_WORKERS == 0 )); then
         log "workers: skipped (--no-workers / core-only)"
+    elif (( COLD_BOOT == 1 )); then
+        # The snapshot archive above already emptied the candidate set, so
+        # this branch is belt AND braces: the refusal is stated in code
+        # rather than left to depend on a file having been renamed.
+        log "workers: cold boot (no --continue) — resurrecting nothing; see the dropped-worker manifest"
     else
         recover_workers
     fi

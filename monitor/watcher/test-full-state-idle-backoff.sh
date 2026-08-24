@@ -58,6 +58,24 @@ for d in 0 600 1200 1800 2400 3600 7200 100000; do
 done
 assert_eq "curve is monotone non-decreasing" "$mono_ok" 1
 
+# ---- 1b. default backoff curve now caps at 7200 (watcher-emit-noise) ----
+# The default idle_backoff_max was raised 3600 → 7200: once the
+# discriminating fixes remove the misleading/redundant/no-op emits, the
+# residual deep-idle heartbeat is a pure liveness proof, and halving its
+# overnight rate is the operator-requested noise reduction. The extra
+# doubling adds one step (3600 → 7200 at ≥2 h idle). CLAMP-SAFE: the
+# orchestrator dead-threshold clamp is derived from the BASE floor +
+# full_state_emit_interval, NOT this max, so the curve below changes
+# nothing about the startup clamp arithmetic.
+echo "=== effective floor: raised default curve (base 900, max 7200) ==="
+export MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=7200
+assert_eq "idle 3599s → 1800 tier"   "$(_full_state_effective_floor 3599)"   1800
+assert_eq "idle 3600s → 3600 tier"   "$(_full_state_effective_floor 3600)"   3600
+assert_eq "idle 7199s → 3600 tier"   "$(_full_state_effective_floor 7199)"   3600
+assert_eq "idle 7200s → 7200 cap"    "$(_full_state_effective_floor 7200)"   7200
+assert_eq "idle 999999s → 7200 cap"  "$(_full_state_effective_floor 999999)" 7200
+MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=3600
+
 echo "=== effective floor: disabled / degenerate configs return base ==="
 MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED=false
 assert_eq "disabled → base at idle 0"    "$(_full_state_effective_floor 0)"     900
@@ -69,10 +87,48 @@ MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=600   # max<base
 assert_eq "max<base → base at idle 1e6"  "$(_full_state_effective_floor 1000000)" 900
 MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=3600
 
-echo "=== effective floor: non-power-of-two max clamps, never overshoots ==="
+# your-org/nexus-code#659. This block previously asserted
+# `max 3000: idle huge → 1800` under the label "never overshoots" — it
+# codified the defect as the contract. `max` is a CAP: the reachable
+# ceiling must equal it EXACTLY, for any positive value, not only for the
+# rungs `base * 2^k`. Assert the reachable ceiling, not the ladder shape;
+# the old assertion could not fail for this reason because rounding DOWN
+# also satisfies "≤ max".
+echo "=== effective floor: a non-rung max is a TRUE CAP (#659) ==="
 MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=3000
-assert_eq "max 3000: idle 1800 → 1800"   "$(_full_state_effective_floor 1800)"  1800
-assert_eq "max 3000: idle huge → ≤max"   "$(_full_state_effective_floor 999999)" 1800
+assert_eq "max 3000: idle 1800 → 1800 (rung below the cap)" \
+    "$(_full_state_effective_floor 1800)"   1800
+assert_eq "max 3000: idle huge → EXACTLY max, not the rung below" \
+    "$(_full_state_effective_floor 999999)" 3000
+
+# The reported case, verbatim: an operator asking for 12 h got 8 h,
+# permanently, at every quiet duration out to 55 h.
+MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=43200
+assert_eq "max 43200: idle 28800 → 28800"          "$(_full_state_effective_floor 28800)"  28800
+assert_eq "max 43200: idle 57599 → 28800"          "$(_full_state_effective_floor 57599)"  28800
+assert_eq "max 43200: idle 57600 → 43200 (the ask)" "$(_full_state_effective_floor 57600)"  43200
+assert_eq "max 43200: idle 999999 → 43200"         "$(_full_state_effective_floor 999999)" 43200
+
+# The tightest possible non-rung: max one second above base. Under the old
+# guard `eff * 2 <= max` this was unreachable for every input, because the
+# first step already overshoots — so a cap just above the base was inert.
+MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=901
+assert_eq "max 901 (base+1): idle huge → 901" "$(_full_state_effective_floor 999999)" 901
+
+# Monotonicity must survive the change: the floor never decreases as idle
+# grows, and never exceeds the cap. Swept across a non-rung max, which is
+# the shape that had no such guarantee before.
+MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=43200
+mono_ok=1; ceil_ok=1; prev=0
+for d in 0 450 900 1800 3600 7200 14400 28800 43200 57600 86400 172800 999999; do
+    cur=$(_full_state_effective_floor "$d")
+    (( cur < prev ))   && mono_ok=0
+    (( cur > 43200 ))  && ceil_ok=0
+    prev="$cur"
+done
+assert_eq "non-rung max: floor is monotonic in idle" "$mono_ok" 1
+assert_eq "non-rung max: floor never exceeds the cap" "$ceil_ok" 1
+
 MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=3600
 
 # ---- 2. suppression decision uses the effective floor -------------------

@@ -100,13 +100,47 @@ constant, and reaction) is diagrammed in
 | `over-limit` | `<window> OVER-LIMIT (resets <reset_at>; weekly Opus limit hit — schedule resume)` | The worker's claude session hit the weekly Opus limit and is functionally suspended. **Do NOT close**, and **don't try to schedule the resume yourself** — the watcher owns the wake-loop (issue #87 amendment). The orchestrator may itself be over-limit on the same weekly budget, so the actor responsible for scheduling must be one with no claude-API consumption. The watcher stamps the pane in `monitor/.state/over-limit-state.tsv`, retries every `monitor.over_limit.initial_backoff_seconds` (default 60s, exponential up to a 300s cap, gives up at `monitor.over_limit.max_attempts` default 10), and pastes a resume brief into the pane the moment `pane-state.sh` shows the suspension has cleared. `reset_at` is informational on this row. Inviolable — never suppressed by `window-retain`. |
 | `operator-engaged` | `<window> operator-engaged (src=<submit\|submit-after-wrap>; idle <age> — operator driving; idle/retire handling suppressed while engaged)` | **Do NOT close. Do NOT paste follow-ups.** The operator drives this window (issues #196, #201) — wrapped or never-wrapped. Seed: the worker's `UserPromptSubmit` hook stamped a prompt submit with no machine-input stamp covering it (no `paste-followup` event, no `machine-input.tsv` row, no spawn), AND that submit was corroborated by observed pane-content change within `monitor.operator_engaged_change_ttl_seconds` (default 600 — the <your-org>/<your-nexus>#205 follow-up replaced a fragile one-frame bright-text read with sustained transcript change). The hook is a deterministic contract event from Claude Code itself. Every orchestrator follow-up MUST still go through `monitor/paste-followup.sh`: an unstamped raw `tmux paste-buffer` fires the worker's `UserPromptSubmit` hook and reads as operator input. One informational row per engagement episode; while valid, `idle_prompt` decision rows are withheld and the window is **not retire-eligible**. The mark is **self-expiring**: once the pane goes static past the change TTL it lapses and the window becomes retire-eligible again — so it is never pinned open indefinitely on a stale or false mark. An `engaged-done` finished-signal, a newer spawn, or window close also ends it. A **wrap-up does NOT** (the <your-org>/<your-nexus>`#205` state-machine follow-up): an interactive session stays engaged across its own hand-off — the operator may have follow-up inquiries — and `ng wrap-up` prompts the agent to run `ng engaged-done` when it is genuinely finished; that signal drops the window back to the typical wrapped-window cleanup path. A post-wrap ORCHESTRATOR follow-up (stamped paste) instead regresses the window to busy: the engagement-log re-anchors at the submit, the standing retain is consumed, and the old wrap-up is superseded (the worker owes a fresh one — its idle row returns as `no-wrap-up`, not `wrapped`). |
 | `parked-awaiting-skeptic` | `<window> parked-awaiting-skeptic (idle <age>; skeptic reviewing — exempt from idle/close until verdict; see skills/nexus.skeptic)` | **Do NOT close** (`#285`). The worker wrapped up in `require` / auto-`require` mode and is blocked in `monitor/skeptic-channel.sh await`, legitimately waiting for the reviewing skeptic — a live `skeptic-pending` marker (`monitor/.state/skeptic/pending/<window>`, mtime refreshed each poll within `monitor.skeptic.await_hang_seconds`, default 600 s) drives this row. The marker clears only when the skeptic returns a verdict, at which point the window becomes retire-eligible and the next idle cycle reclassifies it `wrapped`. `retire-preflight.sh` independently blocks the kill while the marker is live (Hard gate 0, check 1b), so even a stale snapshot cannot strand the review. A *stale* marker (the `await` died, or the worker never entered the loop) lapses the exemption and the window resurfaces under normal idle classification. One informational row per park; not an action item. Protocol: [`skills/nexus.skeptic`](../nexus.skeptic/SKILL.md). |
-| `paste-unconfirmed` | `<window> paste-unconfirmed (paste <age>s ago; no UserPromptSubmit fired — the nudge silently failed; re-paste via monitor/paste-followup.sh)` | A `paste-followup` older than `monitor.paste_confirm_grace_seconds` (default 180; env `MONITOR_PASTE_CONFIRM_GRACE_SECONDS`) never fired the worker's `UserPromptSubmit` hook even though the window's hooks are demonstrably live (heartbeat present) — the Enter was swallowed (VI mode, an overlay, a redraw race) and the worker never received the prompt. **Re-paste via `monitor/paste-followup.sh`**; a confirmed re-paste clears the row. Never suppressed by `window-retain`; `idle-too-long` still overrides it. `--no-enter` pastes and hook-less windows are exempt by design. |
+| `paste-unconfirmed` | `<window> paste-unconfirmed (paste <age>s ago; no UserPromptSubmit fired — the nudge silently failed; re-paste via monitor/paste-followup.sh)` | A `paste-followup` older than `monitor.paste_confirm_grace_seconds` (default 180; env `MONITOR_PASTE_CONFIRM_GRACE_SECONDS`) never fired the worker's `UserPromptSubmit` hook even though the window's hooks are demonstrably live (heartbeat present) — the Enter was swallowed (VI mode, an overlay, a redraw race) and the worker never received the prompt. **VERIFY CONSUMPTION FIRST, then re-paste only if needed.** This class has FALSE POSITIVES (<your-org>/nexus-code#568 A9): `machine-submit/<window>` is stamped only by the watcher's `UserPromptSubmit` path, so a paste delivered via `paste-followup.sh`'s RETRY-ENTER path is fully consumed and still leaves the stamp unchanged — and because the worker then goes idle, the row never self-heals. Acting on it blindly re-delivers an already-executed instruction (duplicate comments/commits). Read the pane or transcript for evidence the pasted content was acted on; re-paste via `monitor/paste-followup.sh` only if it demonstrably was not. A confirmed re-paste clears the row. Never suppressed by `window-retain`; `idle-too-long` still overrides it. `--no-enter` pastes and hook-less windows are exempt by design. |
 | `engaged-close-reminder` | `<window> operator-engaged but operator away <age> (src=<seed>) — consider closing this window; reminder re-fires once per period until the operator returns or it closes` | The away phase's only surface (issue #201): fires once the operator has stopped driving for `monitor.operator_engaged_close_reminder_seconds` (default 86400 = 24 h; env `MONITOR_OPERATOR_ENGAGED_CLOSE_REMINDER_SECONDS`), then at most once per period. **Still do NOT auto-close** — the window belongs to the operator; relay the reminder (overview routing one-liner or dashboard) so the operator decides. The operator returning re-marks the window engaged and resets the cadence. |
 | `idle-awaiting-job` | `<window> idle-awaiting-job (idle <age>; <n> child(ren) … — exempt under long-timeout backoff)` | **Do NOT close.** (<your-org>/nexus-code#455 refine, case a.) The worker is idle but the AUTHORITATIVE process tree shows ≥1 live background-shell child whose CPU has frozen — the signature of a blocking wait on a long job (e.g. `sbatch --wait` on a Slurm job). It is exempt from reap under an exponentially-backing-off long timeout. Informational, one row per episode; not an action item. It flips to `idle-children-clarify` when the next backoff nudge is due, and surfaces as a retire candidate (`idle-too-long`) at the **absolute** hard ceiling (`monitor.background_children_grace_ceiling_seconds`, default 48 h) — which no health declaration and no CPU-advancing child can postpone. |
 | `idle-children-clarify` | `<window> idle-children-clarify (idle <age>; … — paste the worker-health clarification prompt; …)` | **Paste the Background-child clarification template (below).** (Case a.) A clarification nudge is due: the child CPU has stayed frozen past the current backoff step, or the worker declared `stuck`/`done`. The worker answers via `monitor/worker-health.sh` → `monitor/.state/worker-health/<window>.json`; the watcher reads it next cycle to **extend** the grace (a declared-runtime job still running), **reap** (stuck / done-with-leftover-children), or keep asking on the backing-off schedule. Never auto-close — ask first. |
-| `wrapped-with-children` | `<window> wrapped-with-children (idle <age>; … — inconsistency: …)` | **Inconsistency — clarify or close, do NOT auto-reap.** (Case b.) The worker ran `ng wrap-up`, has **no skeptic pending**, but STILL has ≥1 live background-shell child: either leftover/stale children, or a premature wrap while a job runs (strongest when the child CPU is still advancing). Paste the Background-child clarification template (below); the worker answers via `monitor/worker-health.sh`. If it declares `done` the children are leftover and the window is safe to close; if `running` it wrapped prematurely (extend or close); if `stuck` it needs help. **Not** emitted for a skeptic-parked worker — see `parked-awaiting-skeptic`. |
+| `wrapped-with-children` | `<window> wrapped-with-children (idle <age>; … [child: <comm>:<cmd>] — inconsistency: …)` | **Inconsistency — clarify or close, do NOT auto-reap.** (Case b.) The worker ran `ng wrap-up`, has **no skeptic pending**, but STILL has ≥1 live background-shell child that is **not** a nexus protocol wait: either leftover/stale children, or a premature wrap while a job runs (strongest when the child CPU is still advancing). The emit **names** the offending child (`[child: zsh:sbatch_--mem_64G_run_pipeline.sh]`), so triage starts from what the process actually is rather than from a bare count (<your-org>/nexus-code#590). Paste the Background-child clarification template (below); the worker answers via `monitor/worker-health.sh`. If it declares `done` the children are leftover and the window is safe to close; if `running` it wrapped prematurely (extend or close); if `stuck` it needs help. **Not** emitted for a skeptic-parked worker (see `parked-awaiting-skeptic`), nor when every live child is a **protocol wait loop** (see the note below). |
 | `parked-awaiting-skeptic` | `<window> parked-awaiting-skeptic (… skeptic reviewing — exempt from idle/close)` | **Do NOT close.** Wrapped-with-children is the *expected* shape here, not an inconsistency: `ng wrap-up` is what writes the skeptic-pending marker, and the worker then holds its `skeptic-channel await` re-check loop in a background shell. The park is authoritative on the marker `monitor/.state/skeptic/pending/<window>`, not on the pane. A STALE marker (the await loop died past the hang threshold) lapses the exemption and the window resurfaces as `wrapped-with-children`, so the park can never mute a window forever. |
 | Suppressed (footer) | `(N retained windows suppressed: <w1> (<reason1>), <w2> (<reason2>), …)` | None — the orchestrator already decided to retain these. The footer is auditability so retention remains visible without re-triaging. |
+
+**Protocol wait loops are not an inconsistency (<your-org>/nexus-code#590).**
+`wrapped-with-children` used to fire on essentially every skeptic-gated
+worker. The sequence: `ng wrap-up` tells the worker to hold a
+`skeptic-channel await` re-check loop in a background shell → the skeptic
+returns a verdict, which **clears** the pending marker → the
+`parked-awaiting-skeptic` exemption lapses while that prescribed child is
+still polling (up to its own await timeout). Both emits observed on
+2026-07-29 were exactly this, 11–14 minutes after the clearing verdict.
+
+An alarm that fires routinely trains the operator to dismiss it, and then
+the genuine case — a real orphaned `sbatch`/`nohup` — arrives looking like
+the twenty false ones before it. So `pane-state.sh` now reports
+`bg_infra=<n>` (how many live background-shell roots are nexus protocol
+waits — `skeptic`/`request` `await`, matched on the nexus's OWN command
+surface, never on third-party package names) plus `bg_cmd=<comm>:<cmd>`
+naming one representative child. When **every** live child is a protocol
+wait, no inconsistency is emitted; the window falls through to ordinary
+wrapped handling and is retire-eligible (the loop dies with the window).
+In the cumulative **full-state** snapshot — whose job is to account for
+every window, so silence there would be a gap rather than a fix — the same
+window is listed as `wrapped-awaiting-protocol (<n> protocol wait
+child(ren) [child: …] — prescribed by wrap-up; retire-eligible)`. No
+action; it is there so the window is not unexplained.
+The exemption is bounded by the same absolute ceiling as case (a), so a
+worker that wraps `await` in an `until` loop still surfaces eventually —
+with the loop named.
+
+Worth knowing when reading old reports: this was first attributed to the
+worker's **zotero MCP server**. That was wrong, and structurally so — an
+MCP stdio server is spawned by claude as `uvx`/`uv`/`node`/`python`, never
+through a shell, so it has never contributed to the background-shell count
+at all (`uvx` is an ELF binary; verified against the live process tree,
+where the zotero server appears as `comm=uv` and counts 0).
 
 The watcher dedupes against its prior cycle's idle set on
 `(window, class)`, so a row only appears the cycle it
@@ -177,6 +211,71 @@ plus one tmux query). The watcher's `--- idle workers ---`
 section narrows the survey when it's present: only windows it
 flagged need triage; the rest are confirmed busy or untracked.
 
+### Don't misread a busy worker as idle (three signals that lie)
+
+Killing a worker that only *looks* idle is the expensive mistake this
+survey exists to avoid.
+
+**`state=empty` is NOT a liveness verdict, and no kill decision may rest
+on it.** `pane-state.sh` documents it as *"the renderer is in an
+ambiguous state … treat as don't know yet, try again next cycle"* — and
+the escalation recipe here used to treat it as evidence the window was
+finished. On 2026-07-29 window `0:7` read `state=empty` while showing a
+turn 4m38s in flight, a `git fetch` running, and a message queued behind
+it; following the documented guidance would have destroyed all three.
+The state that positively asserts a dead agent is **`absent`** (renderer
+empty **AND** no live `claude` in the pane's process tree) — that is the
+correct gate, and `retire-preflight.sh` now enforces it: the kill gate is
+an **allowlist** (`idle`, `autosuggest-only`, `absent`,
+`idle-orphan-async`) with a default-**deny** arm, so `empty`,
+`over-limit`, and any state added later refuse rather than fall through
+(<your-org>/nexus-code#603). A pane holding a **queued message** reports
+`busy queued=1` — never paste again into one; the input is already
+waiting.
+
+Three further misreads have each nearly killed active work:
+
+- **`pane_current_command=bash` is NOT a claude-exit signal.** The
+  launcher keeps `bash` as the pane's foreground process while claude
+  (node) runs underneath, so `tmux list-panes -F '#{pane_current_command}'`
+  reports `bash` even for a worker mid-computation (a heavy sbatch showed
+  `fg=bash` for an hour). Never infer "claude exited → safe to kill" from
+  `fg=bash`. Use `pane-state.sh <index>` `state=` **plus** the session
+  jsonl mtime (`stat -c %Y ~/.claude/projects/<slug>/<session>.jsonl` —
+  fresh age = alive + active).
+- **A `· N shell` status-line indicator (or a live spinner verb with an
+  elapsed timer) = BUSY.** `N shell` means a background shell/waiter is
+  running — the worker is actively working even with an empty `❯` box and
+  a momentarily-stale jsonl. Only paste a follow-up when the pane shows a
+  bare idle prompt with NO spinner and NO `N shell`.
+- **Before declaring an empty-pane worker "stalled", READ its last jsonl
+  assistant message.** `pane=empty` + frozen jsonl mtime is *ambiguous* —
+  equally "ended turn, stalled" and "ended turn, waiting on an armed
+  `Monitor` / background job." mtime alone cannot disambiguate; a worker
+  waiting on its own test suite or an sbatch states that intent in its
+  last jsonl line (the in-process analogue of a `squeue` check). Read it
+  before you nudge or reap.
+
+Corollary: after `kill-window` + respawn under the **same** window name,
+the killed worker's `monitor/.state/decisions/<name>.<fp>.json` lingers
+with the DEAD session_id and re-emits as a pending decision — confirm the
+decision's `session_id` matches the live worker (spawn output) before
+treating it as a real prompt; if it's the killed worker's, ack it with
+`monitor/ng decision-ack <window> <fp>`.
+
+**Do not `rm` it** (`#790`). `rm` was the documented ack and it does not
+stick: the fingerprint is `sha1(window | kind | message)` and
+`idle_prompt`'s message is a constant, so for that kind it is a pure
+function of the window — the next idle fire writes back the identical
+filename. `ng decision-ack` writes the tombstone, which both the hook and
+the watcher honour as terminal.
+
+The window-reuse hazard above is also narrower now: the watcher reaps
+decisions for windows absent from tmux (past
+`MONITOR_PENDING_REAP_MIN_AGE_SECONDS`, default 900 s), so a stale file
+survives a respawn only inside that grace. Check `session_id` anyway —
+the grace is exactly when a fast respawn happens.
+
 ## Triggers — when to consider closing
 
 A window is a **close candidate** when any of the following
@@ -196,13 +295,16 @@ worker has work in flight.
    trigger, not (2).
 2. **Wrapped + idle.** A matching `reports/*.md` exists (see
    "Matching reports to windows" below), AND `pane-state.sh`
-   reports `idle | autosuggest-only | empty`, AND the
+   reports `idle | autosuggest-only` (**not** `empty` — see the
+   `empty` note above; it is a "don't know", and the preflight
+   will refuse the kill on it), AND the
    worker's session jsonl
    (`~/.claude/projects/<slug>/<session>.jsonl`) has not
    been modified for **≥ 30 min**. The clean case — the
    worker filed its report and stopped.
 3. **Long-idle without report.** Pane is `idle | autosuggest-
-   only | empty` for **≥ 90 min** AND no matching report.
+   only` for **≥ 90 min** AND no matching report. (`empty` does
+   not qualify — it asserts nothing about liveness.)
    Don't close yet — paste the finish-and-report follow-up
    (template below) and re-check on the next wake. Close
    after a further **30 min** if the report hasn't landed.
@@ -828,18 +930,62 @@ fi
 #     window.pane → `can't find pane …` → the kill silently no-ops and
 #     the window leaks. The @id is per-server-lifetime, so we re-resolve
 #     here (NAME is the durable key) rather than caching it across turns.
-WID=$(monitor/_tmux-window.sh id "$WIN") \
-    || { echo "could not resolve @id for $WIN — already gone? tmux list-windows to confirm" >&2; return 1 2>/dev/null || exit 1; }
+# `bash …`, not a bare exec. `_tmux-window.sh` ships mode 100644 by design —
+# `ng` SOURCES it (<your-org>/nexus-code#650), and test-ng-tmux-helper-runnable.sh
+# Test 4 asserts retire-window still completes with the helper `chmod a-x`ed.
+# So the mode is deliberately irrelevant to the code path, and this doc must
+# not be the one place that depends on it: `monitor/_tmux-window.sh id …`
+# exits rc 126 here, today.
+#
+# THREE states, not two. `|| { … "already gone?" }` alone launders "I could not
+# look" into "it is not there" — and this is the MANUAL fallback, i.e. what you
+# run precisely when the automatic path is unavailable. As written it reported
+# "already gone?" for a window that was live the whole time.
+#
+# The resolver now states the contract itself (<your-org>/nexus-code#699), so
+# these arms are no longer a local convention this doc has to keep in step:
+#   0  present            2  cannot ask (empty name)
+#   1  looked, ABSENT     3  could NOT look (no tmux / list-windows failed)
+# plus the shell's own 126 / 127 for "could not run" (#650). Hence the rule
+# below: rc 0 is the only yes, rc 1 is the only no, everything else refuses.
+WID=$(bash monitor/_tmux-window.sh id "$WIN"); _wid_rc=$?
+if (( _wid_rc > 1 )); then
+    # 2 = cannot ask, 3 = could not look, 126 = not executable, 127 = not
+    # found, anything else = could not run. ABORT. Do not prune, do not kill:
+    # a window you did not OBSERVE is NOT an absent window, and everything
+    # downstream here is irreversible. The resolver printed why on stderr.
+    echo "could not determine whether $WIN exists (rc $_wid_rc) — refusing. Re-run 'bash monitor/_tmux-window.sh id $WIN' and read its diagnostic; rc 126 means the file has lost its +x bit." >&2
+    return 1 2>/dev/null || exit 1
+fi
+if (( _wid_rc != 0 )) || [[ -z "$WID" ]]; then
+    echo "$WIN is genuinely absent from tmux — already gone; tmux list-windows to confirm" >&2
+    return 1 2>/dev/null || exit 1
+fi
 
 # 1. Capture the workdir from the live pane BEFORE kill.
 WORKDIR=$(tmux display -p -t "$WID" '#{pane_current_path}' 2>/dev/null || true)
 
-# 2. Locate the worker's most recent session jsonl. Claude Code
-#    writes to ~/.claude/projects/<workdir-slug>/<uuid>.jsonl;
-#    the slug is the workdir path with '/' -> '-' (verify by ls).
-SLUG=$(printf '%s' "$WORKDIR" | sed 's|/|-|g')
-JSONL=$(ls -t "$HOME/.claude/projects/$SLUG/"*.jsonl 2>/dev/null | head -1)
-SESSION_ID=$(basename -s .jsonl "$JSONL" 2>/dev/null || true)
+# 2. Resolve the worker's session-id from RECORDED state
+#    (<your-org>/nexus-code#647). Do NOT derive a project slug from the
+#    workdir. The old form here sed-replaced only '/' with '-', and
+#    Claude Code maps '_' to '-' as well, so on a host whose
+#    paths contain `your-lab-m` that named a directory which does not
+#    exist — for EVERY window, always. `ls` failed, `2>/dev/null` hid
+#    it, SESSION_ID came out empty, and window-close logged
+#    `session-id=unknown` — silently disabling `ng respawn`, the very
+#    surface this capture exists to feed.
+#
+#    Adding '_' to the sed would work today and break on the next
+#    character Claude Code maps. The session-id is recorded at spawn;
+#    read it. `ng session-id` FAILS LOUD (exit 3) rather than emitting
+#    a plausible `unknown`, and `--verify` additionally confirms a
+#    transcript exists — located by glob on the id, so it is correct
+#    for a worker in work/<clone> whose project dir differs from the
+#    primary's.
+if ! SESSION_ID=$(monitor/ng session-id "$WIN" --verify); then
+    echo "no session-id for $WIN — respawn will NOT be possible; decide deliberately before killing" >&2
+    SESSION_ID=""
+fi
 
 # 3. (Optional) post a brief closing message into the worker's
 #    transcript. Forensically useful; the session log retains
@@ -868,7 +1014,26 @@ monitor/ng log-action monitor \
     --extra "session-id=${SESSION_ID:-unknown}" \
     --note "<reason: wrapped-idle | long-idle-no-report | stuck-exhausted | tmux-absent>"
 
-# 6. (Optional) prune the worker's worktree if it had one
+# 6. Prune EVERY state surface that names this window, then VERIFY.
+#    `ng retire-window` (<your-org>/nexus-code#602) does the whole
+#    teardown — preflight, kill, prune, verify — so prefer it to the
+#    hand-run sequence above whenever the extra forensics of steps 1-3
+#    are not needed. Its final step re-reads the surfaces and FAILS if
+#    any still names the window: exit 0 asserts the property, not that
+#    the `rm`s returned 0.
+#
+#    Do NOT maintain a hand-copied list of state directories here. That
+#    is what this used to be, `idle-state.tsv` was never on it, and
+#    every retirement of a wrapped worker therefore left a row that kept
+#    the dead window in `--- idle workers ---` FOREVER. The list now
+#    lives once, as data, in BK_RETIRE_SURFACES (monitor/_bookkeeping.sh),
+#    read by both the teardown and the test that checks it.
+monitor/ng retire-window "$WIN" --keep-window --reason wrapped-idle
+# ...or, for the whole thing in one verb (gate + kill + prune + verify):
+#   monitor/ng retire-window "$WIN" --reason wrapped-idle
+#   monitor/ng retire-window "$WIN" --dry-run     # show what would go
+
+# 7. (Optional) prune the worker's worktree if it had one
 #    AND the branch is merged or abandoned. Conservative —
 #    leave the worktree in place when the branch is unmerged.
 git -C work/<project> worktree list
@@ -985,26 +1150,46 @@ by the re-emit cooldown and a valid `operator-engaged` mark. Once the
 `operator-engaged` mark self-expires (pane static past
 `monitor.operator_engaged_change_ttl_seconds`, default 600 s), the
 `idle_prompt` decision resurfaces again — and keeps doing so every
-cooldown period forever, even after the window closes. Without a
-tombstone, a single ignored decision from a long-dead window
-re-fires indefinitely.
+cooldown period for as long as the window lives. Without a tombstone, a
+single ignored decision re-fires indefinitely.
+
+Two later fixes narrowed this, and neither removes the obligation.
+Dead-window rows are dropped from the emit, and since `#790` their files
+are **reaped** once the window has been absent from tmux for
+`MONITOR_PENDING_REAP_MIN_AGE_SECONDS` (default 900 s) — so "even after
+the window closes", which this section used to claim, is no longer true.
+And also since `#790` the row is withheld while the pane reads `busy` /
+`working-background` / `working-self-paced` / `user-typing`, or carries
+`queued=1`. Both are about *when the row is worth your attention*; only a
+tombstone is an **ack**.
 
 ### Tombstone recipe
 
 ```bash
-WIN='<window>'
-FP='<12-hex-fingerprint>'  # from the emit line: fp=<FP>
-REASON='<user-owned-idle | interactive-kept | interactive-auto-retired>'
-DECISIONS_DIR="$NEXUS_ROOT/monitor/.state/decisions"
+monitor/ng decision-ack '<window>' '<12-hex-fp>' \
+    --reason '<user-owned-idle | interactive-kept | interactive-auto-retired>'
 
-jq -n \
-    --arg window "$WIN" \
-    --arg fp     "$FP" \
-    --arg reason "$REASON" \
-    --arg ts     "$(date -Is)" \
-    '{"window": $window, "fp": $fp, "reason": $reason, "ts": $ts}' \
-  > "$DECISIONS_DIR/${WIN}.${FP}.handled.json"
+# The emit row cites this verbatim on its `ack=` line, and the row's
+# `file=` path is accepted directly:
+#   monitor/ng decision-ack "$NEXUS_ROOT/monitor/.state/decisions/<w>.<fp>.json"
+# Every un-acked decision for one window: monitor/ng decision-ack <w> --all
 ```
+
+> **The hand-rolled version this replaces was broken** (`#790`). It was
+>
+> ```bash
+> jq -n … > "$DECISIONS_DIR/${WIN}.${FP}.handled.json"   # WRONG
+> ```
+>
+> — it *created* the tombstone and left `${WIN}.${FP}.json` in place. The
+> hook honoured that (no further writes), but `render_pending_decisions`
+> skipped only the tombstone FILE, never a live `.json` standing next to
+> one. So the row kept re-emitting every cooldown and the operator who
+> followed this recipe exactly got no suppression at all — the defect
+> living inside its own remedy. Both halves are fixed: the reader now
+> honours a tombstone sibling (so tombstones written by hand under the
+> old recipe became real retroactively), and `ng decision-ack` *renames*
+> rather than copies, so it cannot produce that shape. Use the verb.
 
 The watcher skips any `*.handled.json` file on the next cycle; the
 decision disappears from the pending-decisions section. The original
@@ -1061,16 +1246,12 @@ has `"kind": "interactive"`:
 
 5. **Tombstone any pending decision** for the window:
    ```bash
-   for f in monitor/.state/decisions/"${WIN}".*.json; do
-       [[ -f "$f" ]] || continue
-       [[ "$f" != *.handled.json ]] || continue
-       fp=$(basename "$f" .json); fp="${fp##*.}"
-       jq -n --arg w "$WIN" --arg fp "$fp" \
-              --arg r "interactive-auto-retired" --arg ts "$(date -Is)" \
-           '{"window":$w,"fp":$fp,"reason":$r,"ts":$ts}' \
-           > "monitor/.state/decisions/${WIN}.${fp}.handled.json"
-   done
+   monitor/ng decision-ack "$WIN" --all --reason interactive-auto-retired
    ```
+   (`--all` is a no-op-with-a-diagnostic when the window has none. The
+   hand-rolled loop this replaces wrote the tombstone *alongside* the
+   live `.json` and therefore suppressed nothing — see the Tombstone
+   recipe above, `#790`.)
 
 ### Distinction from task retire
 

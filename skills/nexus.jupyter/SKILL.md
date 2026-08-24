@@ -15,7 +15,7 @@ This skill is the nexus *service* layer. The labsh *primitives*
 (`start`/`stop`/`kernel add`/`kernel exec`/`kernel inspect`/`notebook
 attach`/`notebook append`, shared-node etiquette, networking, the
 Rust/AI-extension fallback chain) are documented in the **`<yourlab>.labsh`**
-skill (`~/.claude/<hpc-skills>/skills/<yourlab>.labsh/SKILL.md`) and
+skill (`~/.claude/hpc-skills/skills/<yourlab>.labsh/SKILL.md`) and
 `work/labsh/doc/labsh.md` — read those for anything kernel-level. Here:
 how a project's labsh JupyterLab becomes an activate-once, self-healing,
 boot-surviving nexus service, and what to do by default.
@@ -177,7 +177,7 @@ project dir; whether to use the root session (default — "interact via
 proj-<project>` then `labsh-root.sh kernel exec`") or per-project
 isolation ("activate with `monitor/jupyter-up.sh <dir>` (idempotent),
 interact via `labsh kernel exec/inspect` per `<yourlab>.labsh`"); and the
-shared-node etiquette line from `<yourlab>.labsh` if the target is <node>.
+shared-node etiquette line from `<yourlab>.labsh` if the target is <cluster>k1.
 Workers must NOT hand-edit `services.registry` — `jupyter-up.sh`
 owns those rows.
 

@@ -201,7 +201,7 @@ parsed=$(svc_parse_registry "$REG")
 [[ "$(printf '%s\n' "$parsed" | wc -l)" == 2 ]] \
     && pass "parse: 2 valid records (comment/blank/malformed dropped)" \
     || fail "parse: expected 2 records, got: $parsed"
-printf '%s\n' "$parsed" | grep -qF "$HOME/wd-a" \
+grep -qF "$HOME/wd-a" <<<"$parsed" \
     && pass "parse: ~ expanded in workdir" || fail "parse: ~ not expanded"
 b_health=$(printf '%s\n' "$parsed" | awk -F'\t' '$1=="svcB"{print $4}')
 b_log=$(printf '%s\n' "$parsed" | awk -F'\t' '$1=="svcB"{print $5}')
@@ -231,7 +231,7 @@ touch "$ROOT/monitor/.state/watcher.log"
 touch "$ROOT/monitor/.state/watcher-scheduler.jsonl"
 wlf=$(watcher_log_files)
 if [[ "$(printf '%s\n' "$wlf" | wc -l)" == 2 ]] \
-   && printf '%s\n' "$wlf" | grep -qx "$ROOT/monitor/.state/watcher-scheduler.jsonl"; then
+   && grep -qx "$ROOT/monitor/.state/watcher-scheduler.jsonl" <<<"$wlf"; then
     pass "watcher logs: scheduler jsonl joins the resolved set"
 else
     fail "watcher logs dual: [$wlf]"
@@ -833,7 +833,14 @@ build_case guard
 PANES_ALL="$ROOT/panes-all.txt"        # pane_id|pane_pid|win_id|win_name
 PANES_OWN="$ROOT/panes-own.txt"        # pane pids of the own window
 OWN_PANE_PID_FILE="$ROOT/own-pane-pid"
-OWN_WINDOW_FILE="$ROOT/own-window"     # "<win_id>\t<win_name>"
+# "<win_id>|<win_name>" — ONE source of truth for both single-field queries
+# below. _nexus_self_pane_window asks for '#{window_id}' and '#{window_name}'
+# separately (your-org/nexus-code#701 item A: a single multi-field format is
+# what a non-UTF-8 locale mangles), so the stub must answer each on its own.
+# Deriving both from this one file rather than hardcoding a parallel copy is
+# deliberate — a stub that hardcodes what it claims to serve is the same
+# defect class as the code under test.
+OWN_WINDOW_FILE="$ROOT/own-window"
 TMUX_GUARD_LOG="$ROOT/tmux-guard.log"
 cat > "$BIN/tmux" <<TM
 #!/usr/bin/env bash
@@ -851,9 +858,12 @@ case "\$1" in
               *)  fmt="\$1"; shift ;;
           esac
       done
+      _ow=\$(cat "$OWN_WINDOW_FILE" 2>/dev/null)
       case "\$fmt" in
-          '#{pane_pid}') cat "$OWN_PANE_PID_FILE" 2>/dev/null ;;
-          *)             cat "$OWN_WINDOW_FILE" 2>/dev/null ;;
+          '#{pane_pid}')    cat "$OWN_PANE_PID_FILE" 2>/dev/null ;;
+          '#{window_id}')   printf '%s\n' "\${_ow%%|*}" ;;
+          '#{window_name}') printf '%s\n' "\${_ow#*|}" ;;
+          *)                printf '%s\n' "\$_ow" ;;
       esac
       ;;
   list-panes)
@@ -876,7 +886,7 @@ run_svc ""
 # must HOST the process: pane_pid is this test shell ($$), an ancestor
 # of the run_svc child.
 printf '%s\n' "$$" > "$OWN_PANE_PID_FILE"
-printf '@9\torchestrator\n' > "$OWN_WINDOW_FILE"
+printf '@9|orchestrator\n' > "$OWN_WINDOW_FILE"
 : > "$PANES_OWN"          # no orchestrator process in the window
 : > "$TMUX_GUARD_LOG"
 TMUX=/tmp/fake,1,1 TMUX_PANE=%0 PATH="$BIN:$PATH" NEXUS_ROOT="$ROOT" \
@@ -890,10 +900,79 @@ fi
 
 # (b2) same, but a live orchestrator shares the window → still refused,
 # but the name is the orchestrator's — NO rename.
+#
+# THE PRECONDITION MUST BE THE PROPERTY, NOT A PROXY (#675).
+#
+# This case used to be `sleep 0.1` then `[[ -r /proc/<pid>/environ ]]`,
+# and it failed intermittently in CI on `dev` and on unrelated branches,
+# on a different cell each time, never reproducibly in a local run:
+#
+#     FAIL: live-orch rename protection: rc=4 renames=1
+#
+# `rc=4 renames=1` says the guard REFUSED correctly but renamed anyway —
+# so what broke was live-orchestrator DETECTION, not the refusal.
+#
+# The mechanism, measured rather than guessed. `VAR=1 sleep 30 &` forks
+# first and `execve`s second, and `/proc/<pid>/environ` is materialised
+# from the process image at EXEC. In the window between the two it is a
+# perfectly readable snapshot of the forked *bash* — which does not
+# carry the marker. So `-r` answers YES while the content answers NO.
+# With no sleep at all, that window is open 258 times in 300 on this
+# host (86%); `sleep 0.1` merely narrows it, and under CI load 0.1s is
+# sometimes not enough. The production probe
+# (`_nexus_pid_tree_has_env_marker`) requires the marker to be PRESENT,
+# so it correctly reports "no orchestrator in this window", the rename
+# proceeds, and the assertion fails — on whichever cell loses the race.
+#
+# A fixed sleep used as a synchronisation primitive is the shape that
+# passes locally and fails under load. So: poll the ACTUAL property,
+# with the SAME predicate production uses, bounded — and keep the
+# pre-existing skip when it never becomes true, since an environ that
+# is unreadable (or a kernel without /proc) is a legitimate skip and
+# never a failure.
+#
+# Ruled OUT while diagnosing, recorded so it is not re-investigated:
+# the `tr … | grep -qxF` in the production probe runs under svc.sh's
+# `pipefail`, which is `#622`'s inversion shape — but a real environ is
+# ~6 KB, well inside the 64 KB pipe buffer, so `tr` completes its write
+# before `grep -q` exits and there is no SIGPIPE. Measured 0 inversions
+# in 400 runs. `#622` is real; this site is not one of its victims.
+# THE EXEC MUST HAVE LANDED (#680 skeptic F3). `/proc/<pid>/environ` is
+# pre-exec a COW snapshot of the PARENT bash's initial-stack environment.
+# `_respawn.sh:581` does `export NEXUS_IS_ORCHESTRATOR=1`, so when this
+# suite is run BY an agent under a live orchestrator — the one context
+# the operator actually runs it in — every bash it spawns already
+# carries the marker, and a naive content check answers YES off the
+# parent's env 35% of the time, before the child has exec'd at all.
+# That would make "poll the actual property" vacuous exactly where it
+# matters, replacing one proxy with another.
+#
+# `/proc/<pid>/comm` discriminates cleanly: immediately after fork it
+# reads `bash` (pre-exec) and after exec it reads the target program.
+# Requiring BOTH — comm has flipped AND the marker is present — is the
+# property this case actually depends on. Capture-then-match rather
+# than `tr | grep -q`, per #622 (see _lib.sh).
+_orch_marker_visible() {
+    local pid="$1" comm="" data=""
+    [[ -r "/proc/$pid/environ" ]] || return 1
+    read -r comm < "/proc/$pid/comm" 2>/dev/null || return 1
+    [[ "$comm" == "sleep" ]] || return 1
+    data=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) || return 1
+    [[ -n "$data" ]] || return 1
+    grep -qxF 'NEXUS_IS_ORCHESTRATOR=1' <<<"$data"
+}
+
 NEXUS_IS_ORCHESTRATOR=1 sleep 30 &
 GUARD_ORCH_PID=$!
-sleep 0.1
-if [[ -r "/proc/$GUARD_ORCH_PID/environ" ]]; then
+# Bounded wait for the exec to land: ~5s at 0.05s granularity. Two
+# orders of magnitude more headroom than the old fixed 0.1s, and it
+# exits the instant the property holds, so the fast path stays fast.
+_orch_wait=0
+while (( _orch_wait < 100 )) && ! _orch_marker_visible "$GUARD_ORCH_PID"; do
+    sleep 0.05
+    _orch_wait=$(( _orch_wait + 1 ))
+done
+if _orch_marker_visible "$GUARD_ORCH_PID"; then
     printf '%s\n' "$GUARD_ORCH_PID" > "$PANES_OWN"
     : > "$TMUX_GUARD_LOG"
     TMUX=/tmp/fake,1,1 TMUX_PANE=%0 PATH="$BIN:$PATH" NEXUS_ROOT="$ROOT" \
@@ -901,15 +980,35 @@ if [[ -r "/proc/$GUARD_ORCH_PID/environ" ]]; then
     if [[ $RC == 4 ]] && ! grep -q "rename-window" "$TMUX_GUARD_LOG"; then
         pass "cockpit in target window with live orchestrator: refused, name untouched"
     else
-        fail "live-orch rename protection: rc=$RC renames=$(grep -c rename-window "$TMUX_GUARD_LOG")"
+        # The precondition held when we checked it (the marker was
+        # visible), so a failure here is no longer the #675 race —
+        # report the marker's state at failure time so the next reader
+        # can tell a real regression from a precondition that lapsed.
+        fail "live-orch rename protection: rc=$RC renames=$(grep -c rename-window "$TMUX_GUARD_LOG") marker_still_visible=$(_orch_marker_visible "$GUARD_ORCH_PID" && echo yes || echo no)"
     fi
-else
+elif [[ ! -r "/proc/$GUARD_ORCH_PID/environ" ]]; then
+    # The ONLY legitimate skip: no /proc to read (a platform without it,
+    # or a permissions regime that hides it). Asserts nothing about the
+    # guard, and never could.
     pass "(b2) skipped: /proc environ unreadable"
+else
+    # TIMEOUT IS A FAILURE, NOT A SKIP (#680 skeptic F2). The first
+    # version of this bounded wait fell through to `pass` when the
+    # 5s budget expired — so a change that made the precondition never
+    # hold would have shown up as a green suite with the case silently
+    # not running, which is the same "silence read as health" defect
+    # this whole PR is about, reintroduced by the fix for it.
+    #
+    # /proc IS readable here, so the environment is capable of
+    # answering; the marker simply never became visible in 5s. That is
+    # either a real regression in how the marker is set, or a bound
+    # that has become too tight — both want a human, neither is a pass.
+    fail "(b2) precondition never held: /proc readable but NEXUS_IS_ORCHESTRATOR absent from $GUARD_ORCH_PID after 5s (comm=$(cat "/proc/$GUARD_ORCH_PID/comm" 2>/dev/null || echo '?'))"
 fi
 kill "$GUARD_ORCH_PID" 2>/dev/null; wait "$GUARD_ORCH_PID" 2>/dev/null
 
 # (c) live peer cockpit elsewhere → refused (exit 4), peer untouched.
-printf '@1\tmywindow\n' > "$OWN_WINDOW_FILE"   # own window NOT the target
+printf '@1|mywindow\n' > "$OWN_WINDOW_FILE"   # own window NOT the target
 mkdir -p "$ROOT/fakecockpit"
 printf '#!/usr/bin/env bash\nsleep 60\n' > "$ROOT/fakecockpit/svc.sh"
 bash "$ROOT/fakecockpit/svc.sh" &
@@ -995,33 +1094,44 @@ bash -c 'exit 0' & GHOST=$!; wait "$GHOST" 2>/dev/null
 echo "$GHOST" > "$ROOT/monitor/.state/services/svcorph.pid"   # dead record => orphan
 
 run_svc stop svcorph
-[[ $RC == 0 ]] && pass "stop-orphan: exits 0" || fail "stop rc=$RC"
-grep -q 'no live supervisor' "$ROOT/err" \
-    && pass "stop-orphan: reports there was no supervisor to stop" \
-    || fail "no supervisor line: $(cat "$ROOT/err")"
-[[ ! -f "$ROOT/monitor/.state/services/svcorph.pid" ]] \
-    && pass "stop-orphan: the stale record is removed" \
-    || fail "pidfile survived"
+# CONTRACT CHANGED (your-org/nexus-code#606). `stop` used to exit 0 and delete
+# the record here, which read as "service stopped" while the daemon kept
+# serving — and threw away the record of the supervisor that died. It now
+# refuses and fails loudly. These assertions previously pinned the defect.
+[[ $RC != 0 ]] && pass "stop-orphan: exits NON-ZERO (it could not stop the daemon)" \
+    || fail "stop-orphan: exited 0 though nothing was stopped"
+grep -q 'REFUSING to drop the pid record' "$ROOT/err" \
+    && pass "stop-orphan: refuses to destroy the record, and says so" \
+    || fail "no refusal line: $(cat "$ROOT/err")"
+[[ -f "$ROOT/monitor/.state/services/svcorph.pid" ]] \
+    && pass "stop-orphan: the record is PRESERVED as evidence" \
+    || fail "pidfile destroyed on an orphan"
 # The load-bearing assertion: a still-passing healthcheck after `stop` means an
 # orphaned daemon is serving. Silence here is the false all-clear.
-grep -q 'WARNING' "$ROOT/err" \
+grep -q 'SERVING UNSUPERVISED' "$ROOT/err" \
     && pass "stop-orphan: WARNS that the daemon is still serving" \
     || fail "stop-orphan: silent all-clear! err=$(cat "$ROOT/err")"
-grep -q 'removed the record, not the daemon' "$ROOT/err" \
-    && pass "stop-orphan: says the record was removed, not the daemon" \
+grep -q 'cannot stop what it does not track' "$ROOT/err" \
+    && pass "stop-orphan: distinguishes the record from the daemon" \
     || fail "no record-vs-daemon warning"
 grep -q "svc.sh restart svcorph" "$ROOT/err" \
     && pass "stop-orphan: names the reconcile action" \
     || fail "no reconcile guidance"
 
 # A genuinely-down service with a dead record must stay quiet: nothing survives,
-# so there is nothing to warn about.
+# so there is nothing to warn about — and the consistent litter IS cleaned up.
 reg_line svcdown "$ROOT/wd" 'echo noop' 'false' > "$REG"
 echo "$GHOST" > "$ROOT/monitor/.state/services/svcdown.pid"
 run_svc stop svcdown
-grep -q 'WARNING' "$ROOT/err" \
+grep -qE 'SERVING UNSUPERVISED|REFUSING' "$ROOT/err" \
     && fail "stop-orphan: warned about a genuinely DOWN service" \
     || pass "stop-orphan: a truly down service triggers no orphan warning"
+[[ $RC == 0 ]] \
+    && pass "stop-orphan: a truly down service exits 0" \
+    || fail "stop-orphan: down service exited $RC"
+[[ ! -f "$ROOT/monitor/.state/services/svcdown.pid" ]] \
+    && pass "stop-orphan: a down service's stale record IS removed" \
+    || fail "stop-orphan: stale record kept for a down service"
 unset NEXUS_ROOT
 cleanup_case
 

@@ -118,7 +118,7 @@ jobs:
             exit 1
           fi
           echo "Discovered ${#tests[@]} tests."
-          bash monitor/watcher/run-tests.sh --jobs 2 "${tests[@]}"
+          bash monitor/watcher/run-tests.sh --jobs 4 "${tests[@]}"
 
       - uses: actions/setup-python@v6
         with:

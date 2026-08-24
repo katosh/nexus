@@ -48,13 +48,22 @@ make_gh_stub "$STUB_DIR/gh" "$CAPTURE" --with-body-capture "$BODY_CAPTURE" <<'CA
         printf '%s' '{"users":[{"login":"reviewer-x"}]}'
         ;;
     */pulls/*/merge)
+        # #628: model GitHub's 409 when the pinned head no longer matches the
+        # branch head. The body (with the pinned sha) is captured to the body
+        # file for the test to assert on; the 409 path is driven by env so the
+        # stub need not parse stdin.
+        if [[ "${MOCK_MERGE_409:-0}" == "1" ]]; then
+            echo '{"message":"Head branch was modified. Review and try the merge again."}'
+            echo 'gh: Head branch was modified. Review and try the merge again. (HTTP 409)' >&2
+            exit 1
+        fi
         printf '%s' '{"sha":"abc1234deadbeef","merged":true}'
         ;;
     */pulls/*)
         if [[ "$method" == "PATCH" ]]; then
             printf '%s' '{"html_url":"https://mock.example/pulls/42-edited","number":42}'
         elif [[ "$method" == "GET" ]]; then
-            printf '%s' '{"number":42,"state":"open","user":{"login":"the-author"},"head":{"ref":"feature-branch"},"base":{"ref":"main"},"title":"a pr title"}'
+            printf '%s' '{"number":42,"state":"open","user":{"login":"the-author"},"head":{"ref":"feature-branch","sha":"fetchedhead000"},"base":{"ref":"main"},"title":"a pr title"}'
         else
             printf '%s' '{}'
         fi
@@ -82,6 +91,7 @@ run_ng() {
         NEXUS_STATE_DIR="$WORK/state" \
         PATH="$STUB_DIR:$PATH" \
         MOCK_REVIEWER_FAIL="${MOCK_REVIEWER_FAIL:-0}" \
+        MOCK_MERGE_409="${MOCK_MERGE_409:-0}" \
         -- "$NG" "$@" ) >"$_out_tmp" 2>"$_err_tmp"
     _rc=$?
     _stdout=$(<"$_out_tmp"); _stderr=$(<"$_err_tmp")
@@ -284,6 +294,31 @@ echo '=== ng pr merge 42 (no --delete-branch) → no DELETE ==='
 run_ng out err rc pr merge 42
 calls=$(<"$CAPTURE")
 assert_not_contains "no DELETE without flag"         "$calls" "-X DELETE"
+
+# ---- Test 17b: cmd_pr_merge — the #628 head-sha PIN --------------------
+# The merge PUT must carry a `sha` so GitHub rejects a moved head (the #627
+# verified-vs-merged divergence). Default pins the fetched head; --sha pins the
+# caller's verified head; a 409 head-moved is surfaced loudly, never silent.
+
+echo '=== ng pr merge 42 → body pins the fetched head sha + hint on stderr ==='
+run_ng out err rc pr merge 42
+assert_eq        "exit 0"                            "$rc" "0"
+body=$(jq -c . < "$BODY_CAPTURE")
+assert_contains  "payload pins fetched head sha"     "$body" '"sha":"fetchedhead000"'
+assert_contains  "stderr hints to pass --sha"        "$err" "pass --sha <verified-head>"
+
+echo '=== ng pr merge 42 --sha <verified> → body pins THAT sha, no hint ==='
+run_ng out err rc pr merge 42 --sha verifiedhead999
+assert_eq        "exit 0"                            "$rc" "0"
+body=$(jq -c . < "$BODY_CAPTURE")
+assert_contains  "payload pins the --sha value"      "$body" '"sha":"verifiedhead999"'
+assert_not_contains "no hint when --sha given"       "$err" "pass --sha <verified-head>"
+
+echo '=== ng pr merge 42 --sha <stale> when head moved → 409 surfaced, exit != 0 ==='
+MOCK_MERGE_409=1 run_ng out err rc pr merge 42 --sha stalehead111
+assert_eq        "exit 1 (merge rejected)"           "$rc" "1"
+assert_contains  "names the head-moved rejection"    "$err" "REJECTED"
+assert_contains  "tells the operator to re-verify"   "$err" "Re-verify the NEW head"
 
 # ---- Test 18: cmd_pr_view — one-liner from canned meta -----------------
 

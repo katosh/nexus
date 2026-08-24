@@ -297,7 +297,15 @@ assert_eq "stderr is empty on success"                    "$err" ""
 if [[ -f "$WORK/cache/token.json" ]]; then
     printf '  PASS: %s\n' "cache file written"; PASS=$(( PASS + 1 ))
 else
-    printf '  FAIL: %s — %s missing\n' "cache file written" "$WORK/cache/token.json" >&2; FAIL=$(( FAIL + 1 ))
+    # your-org/nexus-code#794: this line used to cite "$WORK/cache/token.json",
+    # a path this suite's own EXIT trap deletes before any reader — in CI, before
+    # the artifact collector even runs. List the directory's actual contents
+    # instead; that is the evidence a reader would have gone looking for.
+    printf '  FAIL: %s — no cache file was written\n' "cache file written" >&2
+    printf '        contents of the cache dir at failure (listed, not cited — the work\n' >&2
+    printf '        dir does not outlive this process):\n' >&2
+    ls -la "$WORK/cache" 2>&1 | sed 's/^/          | /' >&2
+    FAIL=$(( FAIL + 1 ))
 fi
 
 # ---- Test 8: --jwt-only emits the App JWT, skips the install exchange --

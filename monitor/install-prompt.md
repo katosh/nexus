@@ -673,12 +673,11 @@ When the asset repo is `your-org/*` but HPC is `no`, say one line:
 
 > Skipping `hpc-skills` — it's HPC-only. If you later run nexus
 > on a your-institution node, install it then via
-> `./monitor/install-hpc-skills.sh` (or see
-> `docs/admin/site-addendum.md`).
+> `./monitor/install-hpc-skills.sh`.
 
 ### 6.2 — `labsh` (orthogonal opt-in)
 
-`operator/labsh` is a general-purpose project-local JupyterLab
+`katosh/labsh` is a general-purpose project-local JupyterLab
 wrapper. It's not your-lab-specific and not HPC-specific, so the
 offer is decoupled from the previous decision.
 
@@ -687,8 +686,8 @@ and skip to Phase 7.
 
 Otherwise present an opt-in question (default-no):
 
-> Install `operator/labsh` project-local JupyterLab wrapper? [y/N]
-> (Note: `operator/labsh#3` documents a sandbox-interaction issue
+> Install `katosh/labsh` project-local JupyterLab wrapper? [y/N]
+> (Note: `katosh/labsh#3` documents a sandbox-interaction issue
 > with `labsh-attach` — review the upstream issue before relying
 > on the attach flow.)
 
@@ -700,7 +699,7 @@ blank) as no. On yes:
 ```
 
 The script clones into `$SANDBOX_PROJECT_DIR/work/labsh/` and
-prints the `operator/labsh#3` caveat on stdout. Report "`labsh`
+prints the `katosh/labsh#3` caveat on stdout. Report "`labsh`
 ready" on success. On non-zero exit, surface the stderr verbatim
 and ask whether to retry, skip, or abort.
 

@@ -31,23 +31,9 @@
 # shell sources their real ~/.zshenv (not this one), so their PATH — where
 # homebrew shadowing nexus tools is deliberately fine — is untouched.
 [ -r "$HOME/.zshenv" ] && . "$HOME/.zshenv"
-if [ -n "${NEXUS_ROOT:-}" ]; then
-    # Front locals/bin first, then ghwrap, so the final order is
-    # ghwrap : locals/bin : <rest>. NEXUS_LOCALS is exported by locals-env
-    # (full mode); fall back to $NEXUS_ROOT/locals defensively.
-    _nx_locals="${NEXUS_LOCALS:-$NEXUS_ROOT/locals}"
-    [ -d "$_nx_locals/bin" ] && path=("$_nx_locals/bin" $path)
-    # Fork-storm pip guard (monitor/pipwrap) — refuses the self-re-exec'ing
-    # sandbox /app/bin/pip (your-org/nexus-code#487); same force-front
-    # rationale as ghwrap. Fronted before notifywrap/ghwrap so those keep
-    # the very-front slots.
-    [ -x "$NEXUS_ROOT/monitor/pipwrap/pip" ] && path=("$NEXUS_ROOT/monitor/pipwrap" $path)
-    # Engagement-gated sandbox-notify wrapper (monitor/notifywrap) — same
-    # force-front rationale as ghwrap; keeps the bell gate on PATH front after
-    # ~/.zshenv re-prepends linuxbrew. See monitor/notifywrap/sandbox-notify.
-    # Fronted BEFORE ghwrap so ghwrap remains the very-front entry.
-    [ -x "$NEXUS_ROOT/monitor/notifywrap/sandbox-notify" ] && path=("$NEXUS_ROOT/monitor/notifywrap" $path)
-    [ -x "$NEXUS_ROOT/monitor/ghwrap/gh" ] && path=("$NEXUS_ROOT/monitor/ghwrap" $path)
-    typeset -U path
-    unset _nx_locals
-fi
+# Force the nexus toolchain to the FRONT of PATH after ~/.zshenv's linuxbrew
+# re-prepend. Shared with the .zshrc/.zprofile/.zlogin proxies via one snippet
+# so the four cannot drift (your-org/nexus-code#578). $ZDOTDIR is this file's
+# own directory — reliable in a startup file, where ${0} is the shell name,
+# not the file path (so ${0:A:h} would resolve to the zsh binary's dir).
+[ -r "${ZDOTDIR:-$NEXUS_ROOT/monitor/shellenv}/front-path.zsh" ] && . "${ZDOTDIR:-$NEXUS_ROOT/monitor/shellenv}/front-path.zsh"

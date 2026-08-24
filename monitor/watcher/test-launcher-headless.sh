@@ -205,7 +205,7 @@ fi
 
 # 2c. The spawned watcher is ALIVE and its argv identifies it as main.sh.
 if [[ "$CHILD_PID" =~ ^[0-9]+$ ]] && kill -0 "$CHILD_PID" 2>/dev/null \
-   && tr '\0' ' ' < "/proc/$CHILD_PID/cmdline" 2>/dev/null | grep -q "monitor/watcher/main.sh"; then
+   && grep -q "monitor/watcher/main.sh" <<<"$(tr '\0' ' ' < "/proc/$CHILD_PID/cmdline" 2>/dev/null)"; then
     pass "spawned watcher (pid=$CHILD_PID) is alive with a main.sh argv"
 else
     fail "spawned watcher not alive / wrong argv; pid=${CHILD_PID:-absent}"

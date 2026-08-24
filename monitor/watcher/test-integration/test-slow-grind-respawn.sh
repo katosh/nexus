@@ -75,8 +75,7 @@ echo "  consec_limit=$SCENARIO_LIMIT cooldown=${SCENARIO_COOLDOWN_S}s interval=$
 # ---------------------------------------------------------------------------
 real_tmux=$(PATH=/usr/local/bin:/usr/bin:/bin command -v tmux)
 if [[ -z "$real_tmux" ]]; then
-    echo "FAIL: could not resolve real tmux on a clean PATH" >&2
-    th_summary_and_exit
+    th_abort "could not resolve real tmux on a clean PATH"
 fi
 cat > "$HARNESS_BIN/tmux" <<TMUXWRAP
 #!/usr/bin/env bash
@@ -145,11 +144,31 @@ chmod +x "$HARNESS_DIR/config/load.sh"
 # pattern that pre-dated the test-integration harness.
 # ---------------------------------------------------------------------------
 mkdir -p "$HARNESS_DIR/monitor/watcher"
-for f in main.sh _lib.sh _github.sh _deliveries.sh _mentions.sh \
-         _unstick.sh _idle_probe.sh; do
-    cp "$HARNESS_REPO_ROOT/monitor/watcher/$f" \
-       "$HARNESS_DIR/monitor/watcher/$f"
+# Mirror EVERY watcher module, not a hand-maintained subset
+# (your-org/nexus-code#568 A8). main.sh sources its helpers from
+# `$_script_dir/`, and the enumerated list had drifted far behind the module
+# set: of 28 `_*.sh` modules only 7 were copied, so the spawned watcher died
+# at startup on `_target_absent.sh: No such file or directory` and then on
+# `INTERVAL: unbound variable` (the missing `_config.sh` never ran its
+# lookups). The scenario then waited out its deadline against a watcher that
+# had never been alive, and reported a failure that had nothing to do with the
+# behaviour under test. A glob cannot drift: every future extraction is
+# mirrored automatically.
+cp "$HARNESS_REPO_ROOT/monitor/watcher/main.sh" "$HARNESS_DIR/monitor/watcher/main.sh"
+for f in "$HARNESS_REPO_ROOT"/monitor/watcher/_*.sh; do
+    cp "$f" "$HARNESS_DIR/monitor/watcher/$(basename "$f")"
 done
+# ...and the SIBLING helpers the watcher sources from `monitor/` one level up
+# (`_log-mode.sh`, `_tmux-window.sh`, `_cc-version.sh`, `_channel_lib.sh`,
+# `_fs_probe.sh`), plus `reports-roll.sh`. Missing `_log-mode.sh` in particular
+# is not silent-but-harmless: `source` of an absent file returns non-zero
+# WITHOUT aborting, so the watcher ran on with `_ensure_service_log: command
+# not found` spraying from every scheduler tick and every alert. Same glob
+# discipline as above -- enumerate by pattern, never by hand.
+for f in "$HARNESS_REPO_ROOT"/monitor/_*.sh; do
+    cp "$f" "$HARNESS_DIR/monitor/$(basename "$f")"
+done
+cp "$HARNESS_REPO_ROOT/monitor/reports-roll.sh" "$HARNESS_DIR/monitor/reports-roll.sh" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Engage the failure injection BEFORE launching the watcher so the
@@ -230,8 +249,8 @@ log_grep() { grep -qF -- "$1" "$WATCHER_LOG" 2>/dev/null; }
 tripped_absent() { [[ ! -f "$TRIPPED" ]]; }
 counter_cleared() { [[ ! -f "$COUNTER" ]]; }
 orch_window_exists() {
-    "$HARNESS_TMUX" list-windows -t "$HARNESS_SESSION" \
-        -F '#{window_name}' 2>/dev/null | grep -qxF orchestrator
+    grep -qxF orchestrator <<<"$("$HARNESS_TMUX" list-windows -t "$HARNESS_SESSION" \
+        -F '#{window_name}' 2>/dev/null)"
 }
 
 # ---------------------------------------------------------------------------

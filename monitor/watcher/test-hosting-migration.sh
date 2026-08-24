@@ -138,7 +138,7 @@ fi
 # …and the steady-state compose_report call must NOT pass it (10th arg
 # absent), so later cycles can never re-nag.
 steady_call=$(grep -n 'compose_report "\$reason"' "$MAIN" | head -1)
-if [[ -n "$steady_call" ]] && ! grep 'compose_report "\$reason"' "$MAIN" | grep -q 'hosting_migration'; then
+if [[ -n "$steady_call" ]] && ! grep -q 'hosting_migration' <<<"$(grep 'compose_report "\$reason"' "$MAIN")"; then
     pass "steady-state compose_report call never carries the notice (no per-cycle nag)"
 else
     fail "steady-state compose_report call unexpectedly references hosting_migration: $steady_call"

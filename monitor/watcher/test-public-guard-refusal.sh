@@ -65,7 +65,7 @@ rc_of(){ run_guard "$1" >/dev/null 2>&1; echo $?; }
 out=$(run_guard unset); rc=$?
 [[ $rc -ne 0 ]] && ok "refuses (exit $rc) when NEXUS_PUBLIC_ENABLED is unset" \
                 || no "did NOT refuse with the unlock unset (exit 0) — guard defeated"
-printf '%s' "$out" | grep -qi 'nexus is disabled' \
+grep -qi 'nexus is disabled' <<<"$out" \
     && ok "prints the 'nexus is disabled' refusal message on stderr" \
     || no "refusal message missing/changed: $out"
 
@@ -79,7 +79,7 @@ printf '%s' "$out" | grep -qi 'nexus is disabled' \
 out1=$(run_guard '1'); rc1=$?
 [[ $rc1 -eq 0 ]] && ok "allows (exit 0) when NEXUS_PUBLIC_ENABLED=1" \
                  || no "refused even with the unlock set to 1 (exit $rc1): $out1"
-printf '%s' "$out1" | grep -qi 'nexus is disabled' \
+grep -qi 'nexus is disabled' <<<"$out1" \
     && no "emitted the refusal message on the allow path: $out1" \
     || ok "no refusal message on the allow path"
 

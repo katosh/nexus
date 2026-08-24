@@ -74,7 +74,7 @@ these six H2 sections, in this order:
 
 | Section | Populated by |
 |---------|--------------|
-| `## Identity` | **Pointer** to the `ng nexus-identity` block above — never a copy (single source of truth) |
+| `## Identity` | **Pointer** to the `ng nexus-identity` block above — never a copy (single source of truth). The generated block's own `## Nexus Identity` heading also satisfies this slot (`#886`), so `ng nexus-identity > body.md` + the other five sections validates clean |
 | `## Infra` | Operator-narrated: watcher / orchestrator / CC-pin health |
 | `## Services` | Auto-populatable from `monitor/services.registry` (name + healthcheck); narrate exceptions |
 | `## In-flight` | Active worker windows (mirrors `tmux list-windows` + heartbeats) |
@@ -101,6 +101,23 @@ ng dashboard get                      # fetch the current dashboard middle
   block there would be a footgun. Use `validate` when you want the
   hard failure.
 
+**`put --body-file` takes SECTIONS-ONLY — never the whole fetched body.**
+`put` splices `<f>` *between* the issue's `NEXUS_DASHBOARD_START/END`
+markers, preserving the intro + markers and replacing only the content
+between them. So `<f>` must be the six `##` sections alone — no intro, no
+`NEXUS_DASHBOARD_*` markers. **The trap:** fetching the current body
+(`gh api …/issues/1 --jq .body`), editing it, and passing that whole
+thing back to `put` nests the entire body (intro + markers + content)
+*inside* the markers, one level deeper per `put` — a real overview `#1`
+accumulated **8 nested marker pairs** (~4100 lines) this way. For routine
+updates keep a sections-only file and `put` that. If a body already has
+multiple marker pairs, do **not** `put` it — extract the intro (everything
+before the first `NEXUS_DASHBOARD_START`), append one clean marker pair
+wrapping fresh sections-only content, and PATCH wholesale
+(`jq -Rs '{body:.}' | gh api -X PATCH …/issues/1 --input -`); verify
+`grep -c NEXUS_DASHBOARD_START` on the live body `== 1` and
+`ng dashboard validate`.
+
 ## Consistency with the rest of the nexus
 
 - The identity block is **metadata, not content** — it does not
@@ -115,9 +132,17 @@ ng dashboard get                      # fetch the current dashboard middle
 ## Where the schema lives (for maintainers)
 
 `monitor/ng`: `DASH_REQUIRED_SECTIONS` (the section array),
+`DASH_SECTION_ALIASES` (headings that also satisfy a required section),
+`IDENTITY_HEADING` (the identity block's H2, declared once and consumed
+by the generator, the scaffold's pointer prose and the validator),
 `_dashboard_template` (scaffold), `_dashboard_missing_sections`
 (checker shared by `validate` and `put`-warn), and `cmd_nexus_identity`
 (the identity generator + idempotent upsert). Tests:
-`monitor/watcher/test-ng-dashboard.sh` (scaffold + validate + put-warn)
-and `monitor/watcher/test-ng-nexus-identity.sh` (identity render +
-idempotent upsert).
+`monitor/watcher/test-ng-dashboard.sh` (scaffold + validate + put-warn),
+`monitor/watcher/test-ng-nexus-identity.sh` (identity render +
+idempotent upsert), and
+`monitor/watcher/test-ng-identity-dashboard-sync.sh` — the cross-check
+(`#886`): the validator consumes the generator's output, and renaming
+`IDENTITY_HEADING` must move all three consumers together. **A generator
+and its validator have to be checked against EACH OTHER**, not
+separately; each was individually correct here and the pair was not.

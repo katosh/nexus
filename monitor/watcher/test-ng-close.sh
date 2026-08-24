@@ -32,6 +32,10 @@ trap 'rm -rf "$WORK"' EXIT
 FAKE_NEXUS="$WORK/nexus"
 mkdir -p "$FAKE_NEXUS/monitor" "$FAKE_NEXUS/config"
 cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
+# `ng` sources monitor/_bookkeeping.sh and REFUSES TO START without
+# it (your-org/nexus-code#601/#605: degrading to the silent-coercion
+# behaviour it replaces is worse than refusing). Copy it alongside.
+cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
 NG="$FAKE_NEXUS/monitor/ng"
 
 cat > "$FAKE_NEXUS/config/load.sh" <<'STUB'
@@ -101,16 +105,24 @@ exit 0
 STUB
 chmod +x "$STUB_DIR/gh"
 
+# Non-git cwd. `close` now routes through `_resolve_repo write` (#568 A4), so
+# — like every other write verb — it REFUSES when the cwd's git origin differs
+# from the configured $REPO (the issue-#108 misroute block). The suite lives
+# inside the nexus-code checkout, whose origin is exactly such a mismatch, so
+# run from a neutral directory. This mirrors test-ng-issue.sh's harness.
+NEUTRAL_CWD="$WORK/neutral"
+mkdir -p "$NEUTRAL_CWD"
+
 run_ng() {
     local _out_var="$1" _err_var="$2" _rc_var="$3"; shift 3
     local _stdout _stderr _rc _out_tmp _err_tmp
     _out_tmp=$(mktemp); _err_tmp=$(mktemp)
     : > "$CAPTURE"
-    env -u TMUX -u TMUX_PANE -u NEXUS_ROOT -u NEXUS_CONFIG -u HOME \
+    ( cd "$NEUTRAL_CWD" && env -u TMUX -u TMUX_PANE -u NEXUS_ROOT -u NEXUS_CONFIG -u HOME \
         NEXUS_STATE_DIR="$WORK/state" \
         NG_CLOSE_CAPTURE="$CAPTURE" \
         PATH="$STUB_DIR:$PATH" \
-        "$NG" "$@" >"$_out_tmp" 2>"$_err_tmp"
+        "$NG" "$@" ) >"$_out_tmp" 2>"$_err_tmp"
     _rc=$?
     _stdout=$(<"$_out_tmp"); _stderr=$(<"$_err_tmp")
     rm -f "$_out_tmp" "$_err_tmp"
@@ -129,6 +141,38 @@ assert_contains  "stderr mentions usage"             "$err" "usage: ng close"
 run_ng out err rc close 42 --bogus thing
 assert_eq        "unknown flag → exit non-zero"      "$rc" "1"
 assert_contains  "stderr names unknown flag"         "$err" "unknown flag: --bogus"
+
+# ---- Test 1b: --repo override (your-org/nexus-code#568 A4) ---------------
+# `close` was the one write verb whose single-arm parser made `--repo` a HARD
+# ERROR while issue create/comment/view all accepted it, and the one that never
+# passed through `_resolve_repo` — so it could not target another repo at all,
+# and never emitted the #108 cwd-mismatch refusal. Mirrors test-ng-issue.sh
+# Test 15.
+
+echo '=== ng close 42 --repo other-org/other-repo ==='
+run_ng out err rc close 42 --repo other-org/other-repo
+assert_eq        "exit 0 with --repo override"       "$rc" "0"
+assert_contains  "stdout prints CLOSED"              "$out" "CLOSED"
+calls=$(<"$CAPTURE")
+assert_contains  "PATCH endpoint embeds --repo"      "$calls" "-X PATCH /repos/other-org/other-repo/issues/42"
+assert_not_contains "default repo not targeted"      "$calls" "/repos/default-org/default-repo/issues/42"
+
+echo '=== ng close 42 --repo X --comment → both calls hit X ==='
+run_ng out err rc close 42 --repo other-org/other-repo --comment "shipped"
+assert_eq        "exit 0"                            "$rc" "0"
+calls=$(<"$CAPTURE")
+assert_contains  "pre-close comment POST embeds --repo" "$calls" "/repos/other-org/other-repo/issues/42/comments"
+
+echo '=== ng close --repo refuses a cwd/REPO mismatch without --repo ==='
+# Run from INSIDE this checkout (origin your-org/nexus-code) against the
+# stubbed $REPO default-org/default-repo: the #108 guard must now fire for
+# `close` exactly as it does for every other write verb.
+mismatch_err=$(
+    env -u TMUX -u TMUX_PANE -u NEXUS_ROOT -u NEXUS_CONFIG -u HOME \
+        NEXUS_STATE_DIR="$WORK/state" NG_CLOSE_CAPTURE="$CAPTURE" \
+        PATH="$STUB_DIR:$PATH" "$NG" close 42 2>&1 >/dev/null || true
+)
+assert_contains  "cwd-mismatch refusal now covers close" "$mismatch_err" "pass --repo explicitly to override"
 
 # ---- Test 2: close without --comment ------------------------------------
 

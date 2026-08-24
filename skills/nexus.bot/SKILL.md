@@ -22,19 +22,71 @@ The only GitHub interactions that may still use the user's identity
 are `git commit` and `git push` (commit authorship stays the user's
 on the commit graph).
 
-## The bot is the DEFAULT — the `gh` wrapper
+## The bot is the DEFAULT — the `gh` wrapper is a BACKSTOP
 
-You do not have to remember the rule for the common case: a bare
-`gh <write>` already runs as the bot. A PATH-FRONT `gh` wrapper
-(`monitor/ghwrap/gh`) is prepended to the front of `PATH` for every
-agent process: process-wide by `monitor/locals-env.sh` (full mode),
-and re-asserted to the FRONT per-command by
-`monitor/shellenv/.zshenv` (reached via
-`ZDOTDIR=$NEXUS_ROOT/monitor/shellenv`). The per-command force-front
-is the load-bearing bit — `~/.zshenv` re-prepends linuxbrew (where
-the real `gh` lives) on every `zsh -c`, so the wrapper dir is pushed
-back to the front AFTER that, winning the race (<your-org>/nexus-code
-PR #349, operator request comment 4795415597).
+A bare `gh <write>` normally runs as the bot. **Do not rely on that.**
+Lead with `GH_TOKEN=$("$NEXUS_ROOT"/monitor/mint-token.sh) gh <write> …`
+and then assert the identity with
+`"$NEXUS_ROOT"/monitor/assert-bot-author.sh <url>`. The wrapper has been
+observed broken on a live clone — five operator-authored writes in one
+day (`#497`) — and the failure is silent by construction: the write
+succeeds, GitHub mutes the operator's self-notification, and the thread
+goes dark. The assertion is the only loud check, and it is independent
+of whether the wrapper is healthy — so lead with the explicit mint +
+`assert-bot-author` REGARDLESS. The wrapper is what catches the quick
+ack you fire off without thinking; it is not the mechanism you design
+around. A PATH-FRONT `gh` wrapper (`monitor/ghwrap/gh`) is prepended to
+the front of `PATH` for every agent process: process-wide by
+`monitor/locals-env.sh` (full mode), and re-asserted to the FRONT
+per-command by a shared snippet (`monitor/shellenv/front-path.zsh`)
+sourced from `.zshenv` AND the interactive/login proxies
+`.zshrc`/`.zprofile`/`.zlogin` (reached via
+`ZDOTDIR=$NEXUS_ROOT/monitor/shellenv`). The per-command force-front is
+the load-bearing bit — `~/.zshenv`/`~/.zshrc` re-prepend linuxbrew (where
+the real `gh` lives) on every shell, so the wrapper dir is pushed back to
+the front AFTER that, winning the race (<your-org>/nexus-code PR #349,
+operator request comment 4795415597).
+
+`#578` closed the specific hole behind the `#497` breakage — the
+Claude Code Bash tool sources a PATH SNAPSHOT captured by a
+LOGIN+INTERACTIVE shell, and the `.zshrc` proxy re-prepended linuxbrew
+without re-fronting, so the snapshot buried the wrapper — by re-fronting
+in all four proxies, AND made wrapper reachability a fail-CLOSED
+spawn-time precondition (`monitor/assert-shims-wrapped.sh`, run by every
+agent launcher). So the bare-`gh` backstop is now RELIABLE rather than
+silently broken.
+
+`#589` generalised that precondition. The PATH root cause is not
+`gh`-specific — it buries EVERY PATH-front shim at once — and the other
+shims fail in the opposite direction: an unwrapped `gh` is fail-SAFE by
+accident (the scoped `GH_CONFIG_DIR` leaves it with no credentials),
+whereas an unwrapped `pip` is fail-OPEN and takes the node down
+(`#487`). So the guard now enumerates the shim set from the shim
+DIRECTORIES (`monitor/*wrap` → `gh`, `pip`, `pip3`, `sandbox-notify`, …)
+rather than a hand-maintained list, refuses if any is unresolved or
+shadowed by an alias, and additionally OBSERVES that the worker's soft
+`RLIMIT_NPROC` ceiling reaches a spawned child and grandchild (the
+launcher's `ulimit -Su … || true` swallows its own failure, so the
+ceiling cannot be inferred from the source). `monitor/assert-gh-wrapped.sh`
+survives as a deprecated forwarding shim for stale launchers and forks.
+
+`#612` gave it a THIRD outcome. When the guard cannot examine its subject at
+all — `NEXUS_ROOT` unset, no shim dirs, no probe shell — it exits **79 "NOT
+CHECKED"** rather than `0`, because a guard that did not run must not be
+indistinguishable from one that passed. 79 still allows the spawn, but the
+launcher records it as a durable row in
+`monitor/.state/guard-unverified.log`, so "this agent started unverified" is
+establishable after the fact; `NEXUS_REQUIRE_SHIM_CHECK=1` turns it into a
+refusal. If you see that row for your own window, the bare-`gh` backstop was
+NOT verified for your spawn — lead with the explicit mint and assert the
+author, which you should be doing anyway.
+
+That does NOT demote the lead-with-explicit rule: the
+`assert-bot-author` loud check remains the only thing that catches an
+identity slip from ANY cause, and in a spawn context with no operator
+ambient auth the explicit bot-token mint is also what makes even READS
+resolve. Explicit mint + assert stays the default; the reliable wrapper
+is the safety net under it.
 
 A real **executable** — not the earlier zsh *function* — because a
 function only shadows `gh` inside the zsh shells that source it; the
@@ -52,9 +104,14 @@ What it does, per invocation:
   mint (refuses the call) rather than letting `GH_TOKEN=""` fall
   through to the operator's ambient auth (the security-boundary
   rule below).
-- **READ + `gh auth …` → pass through untouched.** Reads don't
-  notify; `gh auth token` is the user-PAT path `ng fetch-asset`
-  needs.
+- **READ + `gh auth …` → run as the OPERATOR, on the operator's own
+  credentials.** Not "untouched": `locals-env` scopes the ambient
+  `GH_CONFIG_DIR` to a credential-free dir (so an unwrapped `gh` fails
+  CLOSED), and the wrapper RE-SUPPLIES the operator's real config for
+  reads. So a read — including of a PRIVATE repo — succeeds with NO
+  caller-supplied token; do NOT hand-roll
+  `GH_TOKEN=$(./monitor/mint-token.sh) gh …` for a read. `gh auth token`
+  is the user-PAT path `ng fetch-asset` needs.
 - **`GH_TOKEN` already set → pass through unchanged.** The watcher
   and correct callers (incl. `GH_TOKEN=$(./monitor/mint-token.sh)
   gh …`) set it explicitly; the wrapper never double-injects.
@@ -72,7 +129,7 @@ Verb classification (err toward WRITE on ambiguity):
 | `secret`/`variable` | set·delete·remove |
 | `workflow`/`run`/`cache`/`gpg-key`/`ssh-key` | run·enable·disable / cancel·rerun·delete / delete / add·delete |
 | `api` | `--method`/`-X` in {POST,PATCH,PUT,DELETE}; OR a request body (`-f/-F/--field/--raw-field`, or `--input <file>`) with no explicit GET (gh defaults those to POST); OR **`api graphql`** (mutations are hard to tell from queries — graphql defaults to the bot) |
-| everything else (reads, `gh auth`, `status`, `search`, …) | pass through |
+| everything else (reads, `gh auth`, `status`, `search`, …) | run as operator, own config restored (no bot token) |
 
 Scope: the wrapper is **inert for the watcher** (it runs with
 `WATCHER_WINDOW` set and presets `GH_TOKEN` inline, so its
@@ -376,6 +433,56 @@ Don't pipe `mint-token.sh` straight into `GH_TOKEN=$(...)` without
 checking — the script is also CWD-sensitive, and a silent empty
 return from a non-nexus-root cwd is the most-cited security-relevant
 foot-gun in the workspace report corpus.
+
+## Reading and editing comments safely
+
+Three traps that have each produced a wrong action (a duplicate post, a
+"not addressed" complaint, a live-on-GitHub contradiction):
+
+- **`.../issues/<N>/comments` returns only the OLDEST 30 without
+  `--paginate`.** So `jq '.[-1]'` gives the 30th-oldest comment, not the
+  newest — on a long thread it reads a months-old comment as current and
+  makes "did the worker post yet? / race-check before I post" answer
+  backwards (it caused a duplicate figure-post that had to be deleted).
+  For "latest comment" / "did X post" / pre-takeover checks, always
+  `gh api --paginate .../issues/<N>/comments --jq '.[] | …' | tail`, or
+  fetch a specific comment by id (`.../issues/comments/<id>`, unaffected).
+  Corollary: don't infer "worker didn't deliver" from missing on-disk
+  artifacts (a worker can upload figures inline from the notebook,
+  leaving no local PNG) — check the actual paginated thread.
+
+- **Addressing an operator's question needs a visible REPLY COMMENT — a
+  body edit + 🚀 is invisible to the human.** A rocket/👀 clears the
+  watcher's eligible-comment loop but does NOT show the operator the
+  answer; an edit buried in a long issue body doesn't appear in the
+  comment timeline, so the operator scanning the thread sees their
+  question "followed by nothing" and asks why it wasn't addressed. When a
+  worker or the orchestrator answers an operator comment, the deliverable
+  MUST include a reply comment on that thread carrying (or linking +
+  summarizing) the answer. Bake it into worker prompts that answer an
+  operator comment.
+
+- **Editing a shared consolidated comment is last-writer-wins, and every
+  agent posts as the same bot — so a clobber is unattributable and
+  silent.** A PATCH that verified clean at T can be overwritten by a
+  concurrent agent at T+10 min, leaving a refuted claim live while
+  another record says the opposite. Defenses: **verify the ARTIFACT, not
+  the 200** (re-fetch and grep for what you added *and* the phrases you
+  removed); **splice into the CURRENT body, never a stale local copy**
+  (re-fetch → splice → PATCH → prove); **re-verify LATER on a contended
+  record** (a passing grep has a shelf life — arm a background re-check
+  if `updated_at`/edit-count shows active editing); and **prefer
+  appending your own comment** over mutating a shared one when the
+  content can stand alone.
+
+- **The watcher-emit `body` field is TRUNCATED — re-fetch before quoting
+  an operator comment into a worker brief.** The `--- eligible github
+  comments ---` snippet cuts multi-paragraph asks with `…`; quoting it
+  verbatim silently drops load-bearing later paragraphs (a second ask, a
+  breadcrumb reminder). Treat the emitted body as a *pointer* and fetch
+  the full text — `gh api repos/<owner>/<repo>/issues/comments/<id> --jq
+  '.body'` — before pasting it into a prompt. If you must shorten, label
+  the truncation so the worker knows to re-fetch.
 
 ## See Also
 

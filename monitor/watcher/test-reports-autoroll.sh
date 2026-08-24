@@ -14,7 +14,8 @@
 #   3. Quiet when nothing rolls: a run that moves 0 files writes NO notice and
 #      does NOT pull compose_emit forward (no emit noise — the #443 concern).
 #   4. Emits (once) when it DOES roll: writes the notice + fires compose_emit;
-#      the emit-section surfaces it once and self-clears (no flap).
+#      the emit-section surfaces it once and the notice is consumed when the
+#      paste carrying it LANDS (#568 A2), so no flap and no silent loss.
 #   5. Buffer invariant holds on the auto path: a report inside the ≥1-month
 #      buffer (previous/current month) is never moved.
 #   6. Mid-write guard on the auto path: with MIN_AGE>0 a freshly-written
@@ -74,7 +75,16 @@ _pluck_fn() {
     ' "$MAIN_SH"
 }
 
-fns_src=$(_pluck_fn _v2_task_reports_roll; printf '\n'; _pluck_fn _reports_roll_emit_section)
+# The emit section now registers the notice for consumption-on-delivery
+# instead of deleting it at render time (#568 A2), so the one-shot ledger
+# helpers come along. `_ONESHOT_PENDING=()` is top-level state in main.sh,
+# not a function — declare it here.
+_ONESHOT_PENDING=()
+fns_src=$(_pluck_fn _v2_task_reports_roll; printf '\n'
+          _pluck_fn _reports_roll_emit_section; printf '\n'
+          _pluck_fn _oneshot_reset; printf '\n'
+          _pluck_fn _oneshot_defer; printf '\n'
+          _pluck_fn _oneshot_commit)
 if [[ -z "$fns_src" ]] || ! grep -q '_v2_task_reports_roll' <<<"$fns_src"; then
     echo "FAIL: could not pluck _v2_task_reports_roll from $MAIN_SH" >&2
     exit 1
@@ -149,15 +159,36 @@ assert_eq   "day-stamp still written (we DID run)" "$(cat "$REPORTS_ROLL_LAST_DA
 assert_absent "no notice file when nothing rolled (silent)" "$REPORTS_ROLL_NOTICE_FILE"
 
 # ---- 4: emit-section surfaces once then self-clears -----------------------
-echo "== _reports_roll_emit_section is one-shot (prints then consumes) =="
+echo "== _reports_roll_emit_section is one-shot, consumed on DELIVERY (#568 A2) =="
 setup_state
 printf 'Auto-archived aged reports into monthly reports/YYYY-MM/ buckets.\nreports-roll.sh: rolled 2, ...\n' \
     > "$REPORTS_ROLL_NOTICE_FILE"
+# CONTRACT CHANGED by your-org/nexus-code#568 A2: the notice is consumed when
+# the paste carrying it LANDS, not when it is read. Consuming at read time lost
+# the breadcrumb outright on the two paths that render a body and never paste
+# it — a cold boot (target window not yet registered → rc=2) and the routine
+# over-limit hold. It now fails toward a duplicate report instead of a lost one.
+_oneshot_reset
 first=$(_reports_roll_emit_section "$REPORTS_ROLL_NOTICE_FILE")
-second=$(_reports_roll_emit_section "$REPORTS_ROLL_NOTICE_FILE")
+# The caller — not the helper — registers the notice: the render above is a
+# `$(…)` subshell, so a ledger append inside the helper would be discarded.
+# Both production call sites do exactly this.
+[[ -n "$first" ]] && _oneshot_defer "$REPORTS_ROLL_NOTICE_FILE"
 assert_eq   "first read yields the notice" "$(printf '%s' "$first" | grep -c 'Auto-archived')" "1"
-assert_absent "notice consumed after first read" "$REPORTS_ROLL_NOTICE_FILE"
-assert_eq   "second read yields nothing (self-cleared)" "$second" ""
+if [[ -f "$REPORTS_ROLL_NOTICE_FILE" ]]; then
+    printf '  PASS: %s\n' "notice SURVIVES the read (consumed on delivery, not on render)"; PASS=$((PASS + 1))
+else
+    printf '  FAIL: notice deleted at render time — the #568 A2 regression\n' >&2; FAIL=$((FAIL + 1))
+fi
+# An undelivered body (paste failed / suppressed) must re-surface it.
+second=$(_reports_roll_emit_section "$REPORTS_ROLL_NOTICE_FILE")
+assert_eq   "undelivered body re-surfaces the notice next cycle" \
+            "$(printf '%s' "$second" | grep -c 'Auto-archived')" "1"
+# Delivery consumes it, exactly once.
+_oneshot_commit
+assert_absent "notice consumed after a landed paste" "$REPORTS_ROLL_NOTICE_FILE"
+third=$(_reports_roll_emit_section "$REPORTS_ROLL_NOTICE_FILE")
+assert_eq   "post-delivery read yields nothing (no re-nag)" "$third" ""
 
 # ---- 5: buffer invariant on the auto path (explicit) ----------------------
 echo "== auto path never moves a report inside the buffer =="

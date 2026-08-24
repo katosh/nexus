@@ -75,7 +75,7 @@ scan_tree() {
             tok="${fd:-$num}"
             [[ -n "$tok" ]] || continue
             # only LOCK acquisitions: the same fd token appears on a flock line
-            grep -E '(^|[^#])flock' "$f" | grep -q -- "$tok" || continue
+            grep -q -- "$tok" <<<"$(grep -E '(^|[^#])flock' "$f")" || continue
             # hardened: a same-fd close-at-spawn anywhere in the file
             if [[ -n "$fd" ]]; then
                 grep -qF -- "{$fd}>&-" "$f" && continue
@@ -84,7 +84,7 @@ scan_tree() {
             fi
             # annotated: `# flock-fd:` within the 8 lines above the exec
             start=$(( lineno > 8 ? lineno - 8 : 1 ))
-            sed -n "${start},${lineno}p" "$f" | grep -q '# flock-fd:' && continue
+            grep -q '# flock-fd:' <<<"$(sed -n "${start},${lineno}p" "$f")" && continue
             printf '%s:%s fd=%s\n' "$f" "$lineno" "$tok"
         done < <(grep -nE 'exec [0-9]+[<>]|exec \{[A-Za-z_][A-Za-z0-9_]*\}[<>]' "$f" 2>/dev/null)
     done < <(find "$root" -name '*.sh' -type f | LC_ALL=C sort)

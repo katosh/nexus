@@ -212,6 +212,130 @@ echo "=== leading --repo VALUE before the group is not mis-parsed ==="
 r=$( unset GH_TOKEN WATCHER_WINDOW; MINT_TOKEN_BIN="$MINT_OK" run_shim gh -R your-org/nexus-code pr comment 345 --body x )
 case "$r" in *"token=[$BOT_TOKEN]"*) ok "gh -R owner/repo pr comment → still classified WRITE → bot" ;; *) bad "leading -R parse" "got: $r" ;; esac
 
+echo "=== FAIL-CLOSED classification (your-org/nexus-code#568 A3) ==="
+# Table-driven identity assertions. Before the inversion the classifier
+# defaulted to READ, so any group with no `case` arm — and any subcommand an
+# arm did not enumerate — routed through the OPERATOR's ambient credentials.
+# The five surfaces below are the ones an independent probe confirmed doing
+# exactly that, plus the two structural cases (an unrecognised group; a
+# recognised group's unenumerated subcommand) that let the gap re-open.
+#
+# Row format: <expect bot|op> <argv…>. `bot` = the minted token was injected;
+# `op` = passthrough with no token (operator identity).
+expect_identity() {
+    local want="$1"; shift
+    local label="$*"
+    local r; r=$( unset GH_TOKEN WATCHER_WINDOW; MINT_TOKEN_BIN="$MINT_OK" run_shim gh "$@" )
+    case "$want:$r" in
+        "bot:"*"token=[$BOT_TOKEN]"*) ok "gh $label → BOT" ;;
+        "op:"*'token=[]'*)            ok "gh $label → operator passthrough" ;;
+        bot:*) bad "gh $label" "expected BOT token, got: $r" ;;
+        op:*)  bad "gh $label" "expected operator passthrough, got: $r" ;;
+    esac
+}
+
+# The five empirically-confirmed operator-routing writes.
+expect_identity bot project item-create --owner o --title t
+expect_identity bot project item-add 1 --owner o --url u
+expect_identity bot project item-delete 1 --owner o --id x
+expect_identity bot project item-edit --id x --field-id f --text t
+expect_identity bot project close 1 --owner o
+expect_identity bot project field-delete --id f
+expect_identity bot codespace create -r o/r
+expect_identity bot codespace delete -c name
+expect_identity bot release delete-asset v1 asset.tgz
+expect_identity bot repo deploy-key add key.pub
+expect_identity bot agent-task create --body x
+
+# Structural case 1: a command GROUP the shim has never heard of. This is the
+# one that keeps the gap closed as gh grows new surface.
+expect_identity bot totally-new-group create --thing x
+expect_identity bot --repo o/r totally-new-group create   # global flag value skipped
+
+# Structural case 2: a recognised group, subcommand absent from its read
+# allowlist. `pr update-branch` and `issue unpin` exist in gh and were never
+# enumerated by the old write lists.
+expect_identity bot pr update-branch 1
+expect_identity bot issue unpin 1
+expect_identity bot repo autolink create --key-prefix K --url U
+
+# The reads these groups DO declare must still reach the operator — the
+# inversion must not sweep the read surface into the bot.
+expect_identity op  project list --owner o
+expect_identity op  project item-list 1 --owner o
+expect_identity op  codespace list
+expect_identity op  release download v1
+expect_identity op  repo deploy-key list
+expect_identity op  agent-task list
+expect_identity op  org list
+expect_identity op  ruleset list
+expect_identity op  attestation verify a.tgz -o o
+expect_identity op  run watch 123
+expect_identity op  cache list
+expect_identity op  secret list
+expect_identity op  workflow view w.yml
+expect_identity op  search issues --repo o/r
+expect_identity op  status
+expect_identity op  browse --no-browser
+
+# Bare / flags-only invocations are reads, not unrecognised groups.
+expect_identity op  --version
+expect_identity op  --help
+
+# `gh <group>` with no subcommand prints help → read, never a mint.
+expect_identity op  pr
+expect_identity op  project
+
+# The fail-closed verdict announces itself on stderr rather than surprising
+# the caller with an unexplained bot identity (suppressible: GH_SHIM_QUIET).
+r=$( unset GH_TOKEN WATCHER_WINDOW; MINT_TOKEN_BIN="$MINT_OK" run_shim_err gh totally-new-group create )
+case "$r" in
+    *'fail-closed'*) ok "unclassified WRITE announces the fail-closed verdict on stderr" ;;
+    *) bad "fail-closed announcement" "got: $r" ;;
+esac
+r=$( unset GH_TOKEN WATCHER_WINDOW; GH_SHIM_QUIET=1 MINT_TOKEN_BIN="$MINT_OK" run_shim_err gh totally-new-group create )
+if [ -z "${r#0|}" ]; then
+    ok "GH_SHIM_QUIET=1 suppresses the announcement"
+else
+    bad "GH_SHIM_QUIET" "expected empty stderr, got: $r"
+fi
+# An explicitly-classified write stays quiet — the note is for the default arm.
+r=$( unset GH_TOKEN WATCHER_WINDOW; MINT_TOKEN_BIN="$MINT_OK" run_shim_err gh pr comment 1 --body x )
+if [ -z "${r#0|}" ]; then
+    ok "an allowlist-classified WRITE (pr comment) prints no note"
+else
+    bad "note scope" "expected empty stderr for pr comment, got: $r"
+fi
+
+echo "=== token scoping: the injected GH_TOKEN must not persist (#568) ==="
+# `VAR=… func` is only call-scoped under zsh/bash; POSIX shells persist it.
+# The shim uses an explicit subshell so the scoping does not depend on which
+# shell sourced it. Assert the variable is gone in the caller after a write.
+r=$(
+    unset -f gh 2>/dev/null || true
+    unset GH_TOKEN WATCHER_WINDOW
+    # shellcheck disable=SC1090
+    . "$SHIM"
+    MINT_TOKEN_BIN="$MINT_OK" gh pr comment 1 --body x >/dev/null 2>&1
+    printf 'after=[%s]' "${GH_TOKEN:-}"
+)
+case "$r" in
+    'after=[]') ok "GH_TOKEN does not leak into the caller after a WRITE" ;;
+    *) bad "GH_TOKEN scoping" "got: $r" ;;
+esac
+# Same assertion under a POSIX-conformant shell, where the old prefix-assignment
+# form genuinely persisted. dash is the reference; skip cleanly if absent.
+if command -v dash >/dev/null 2>&1; then
+    r=$( PATH="$FAKEBIN:$PATH" NEXUS_ROOT="$NEXUS_ROOT" MINT_TOKEN_BIN="$MINT_OK" \
+         dash -c ". '$SHIM'; unset GH_TOKEN; gh pr comment 1 --body x >/dev/null 2>&1; printf 'after=[%s]' \"\${GH_TOKEN:-}\"" 2>/dev/null )
+    case "$r" in
+        'after=[]') ok "dash: GH_TOKEN does not leak after a WRITE (POSIX prefix-assignment trap closed)" ;;
+        *) bad "dash GH_TOKEN scoping" "got: $r" ;;
+    esac
+else
+    echo "  (skip: dash not available — POSIX persistence case unexercised)"
+fi
+
 echo "=== zsh integration: real ZDOTDIR/.zshenv delivery path ==="
 # The production mechanism is the PATH-FRONT wrapper (monitor/ghwrap/gh):
 # ZDOTDIR=$NEXUS_ROOT/monitor/shellenv → .zshenv FORCE-prepends the wrapper dir

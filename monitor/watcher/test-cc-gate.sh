@@ -12,11 +12,16 @@
 # node). The pre-fix gate did exactly that: the skip path exited 0 and
 # the gate's rc only flipped on a non-zero exit, so all-skipped == green.
 #
-# Mechanism: CCH_GATE=1 makes a self-skip exit 77 (autotools SKIP
-# sentinel) instead of 0, WITHOUT changing the exit-0 self-skip the
-# fast-loop runner (run-tests.sh, counts rc==0 as PASS) relies on. The
-# gate classifies 0=pass / 77=skip / other=fail and goes RED on any skip
-# or fail, with a passed/failed/skipped tally in the headline.
+# Mechanism: a self-skip exits 77 (the autotools SKIP sentinel). The gate
+# classifies 0=pass / 77=skip / other=fail and goes RED on any skip or fail,
+# with a passed/failed/skipped tally in the headline.
+#
+# Note the exit code no longer depends on CCH_GATE (your-org/nexus-code#568 A6).
+# It used to exit 0 unless the gate was set, to "preserve" run-tests.sh's
+# rc==0==PASS fast loop — which meant the broad suite laundered every declined
+# realmodel scenario into the PASS column. run-tests.sh now has a real SKIP
+# status, so the sentinel is unconditional and the two runners agree: a scenario
+# that declined to run is reported as declined, in both.
 #
 # Fully hermetic: the gate's scenario list is overridden with stub
 # scripts via CCH_GATE_SCENARIOS, and a real claude binary is stood in
@@ -131,22 +136,30 @@ fi
 echo
 echo "=== CCH_GATE skip sentinel in _lib.sh ==="
 
-# (6) Without CCH_GATE, a self-skip exits 0 — preserves the run-tests.sh
-#     fast-loop contract (rc==0 == PASS) so the broad suite stays green.
+# (6) A self-skip exits 77 (SKIP) whether or not CCH_GATE is set.
+#
+#     CONTRACT CHANGE, your-org/nexus-code#568 A6. This case previously
+#     asserted the opposite — exit 0 without CCH_GATE — to "preserve the
+#     run-tests.sh fast-loop contract (rc==0 == PASS) so the broad suite stays
+#     green". That reasoning is exactly backwards, and A6 is the fix: the suite
+#     stayed green by counting six scenarios that had asserted NOTHING as
+#     passes, in the one band that guards renderer drift against the real
+#     binary. `run-tests.sh` now has a real SKIP status, so a declined run is
+#     reported as declined instead of being laundered into the PASS column.
 ( unset CCH_GATE RUN_CC_HARNESS; . "$LIB"; cch_skip_if_disabled ) >/dev/null 2>&1
 rc=$?
-if (( rc == 0 )); then
-    ok "no CCH_GATE → self-skip exits 0 (fast-loop contract preserved)"
+if (( rc == 77 )); then
+    ok "no CCH_GATE → self-skip still exits 77 (declined ≠ passed, #568 A6)"
 else
-    bad "default skip exit 0" "rc=$rc"
+    bad "default skip exit 77" "rc=$rc (a skip must never be laundered into a PASS)"
 fi
 
-# (7) Under CCH_GATE=1, the same self-skip exits 77 (the SKIP sentinel
-#     the gate keys on). RUN_CC_HARNESS unset → the first skip branch.
+# (7) CCH_GATE=1 keeps the same 77 (the sentinel gate.sh keys on). Retained as
+#     an explicit pin that setting the gate does not perturb the exit code.
 ( unset RUN_CC_HARNESS; CCH_GATE=1; export CCH_GATE; . "$LIB"; cch_skip_if_disabled ) >/dev/null 2>&1
 rc=$?
 if (( rc == 77 )); then
-    ok "CCH_GATE=1 → self-skip exits 77 (SKIP sentinel)"
+    ok "CCH_GATE=1 → self-skip exits 77 (unchanged by the gate)"
 else
     bad "gate skip exit 77" "rc=$rc"
 fi

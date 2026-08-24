@@ -176,6 +176,10 @@ _requests_claim() {
     rret=${MONITOR_REQUESTS_REPLIED_RETENTION_SECONDS:-$ret}
     [[ "$rret" =~ ^[0-9]+$ ]] || rret=$ret
 
+    # Save/restore, not a bare `shopt -u` at the tail (your-org/nexus-code#721):
+    # this file is SOURCED (watcher/main.sh + three suites), so unsetting
+    # unconditionally hands the caller nullglob OFF however it had it.
+    local _restore_glob; _restore_glob=$(shopt -p nullglob)
     shopt -s nullglob 2>/dev/null
     # 1) claim new → claimed (or mark malformed failed). Route every rename
     # through the shared single-winner primitive `_chan_claim_rename` (the
@@ -261,7 +265,7 @@ _requests_claim() {
             [[ -n "$id" ]] && rmdir "$dir/.ids/$id" 2>/dev/null || true
         fi
     done
-    shopt -u nullglob 2>/dev/null
+    eval "$_restore_glob"
     return 0
 }
 
@@ -292,6 +296,8 @@ requests_render() {
 
     # Gather claimed → a TSV stream: prank \t ts \t origin \t id \t kind \t priority \t summary \t file
     local stream="" f id origin kind priority prank ts summary
+    # Save/restore — see the note in the GC above (your-org/nexus-code#721).
+    local _restore_glob; _restore_glob=$(shopt -p nullglob)
     shopt -s nullglob 2>/dev/null
     for f in "$dir"/*.claimed.md; do
         [[ -e "$f" ]] || continue
@@ -326,7 +332,7 @@ requests_render() {
         [[ -n "$summary" ]] || summary="(no summary — read the cited file)"
         stream+="$prank"$'\t'"$ts"$'\t'"$origin"$'\t'"$id"$'\t'"$kind"$'\t'"$priority"$'\t'"$summary"$'\t'"$f"$'\n'
     done
-    shopt -u nullglob 2>/dev/null
+    eval "$_restore_glob"
 
     if [[ -z "$stream" ]]; then
         : > "$state_file"   # no claimed → clear stale cooldown rows

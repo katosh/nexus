@@ -231,6 +231,58 @@ assert_eq        "exit 0"                            "$rc" "0"
 calls=$(<"$CAPTURE")
 assert_contains  "POST endpoint embeds --repo"       "$calls" "/repos/other-org/other-repo/issues/9/comments"
 
+# ---- Test 16 (your-org/nexus-code#641 part 1): the post RECEIPT ---------
+#
+# The reported defect was a 4 kB intent posting as 239 B with nothing making
+# the discrepancy visible. `ng` posted faithfully; the operator had no cheap
+# way to notice. So the verb now says what it sent — and, for a `--body-file`
+# specifically, warns when the file resolved to almost nothing.
+#
+# The two constraints are as important as the feature and are asserted here,
+# not just documented: the receipt is on STDERR (stdout is the URL and callers
+# parse it), and it NEVER flips the exit code (the comment DID post; failing a
+# successful publish is a worse trade than the one being fixed).
+
+echo '=== #641 the receipt reports the byte count on STDERR ==='
+printf 'x%.0s' {1..800} > "$WORK/big.md"
+run_ng out err rc issue comment 7 --body-file "$WORK/big.md"
+assert_eq        "#641 a normal comment still exits 0"  "$rc" "0"
+assert_contains  "#641 stderr reports the byte count"   "$err" "ng: posting 800 bytes"
+assert_contains  "#641 …and names where the body came from" "$err" "$WORK/big.md"
+# STDOUT must stay parseable — the URL and nothing else. A receipt on stdout
+# would corrupt every caller that captures it.
+assert_not_contains "#641 the receipt is NOT on stdout" "$out" "ng: posting"
+# An 800-byte file is over the floor, so the warning must be SILENT here or
+# the warning carries no information.
+assert_not_contains "#641 no warning for a body over the floor" "$err" "WARNING"
+
+echo '=== #641 a suspiciously small --body-file WARNS, and still posts ==='
+printf 'oops\n' > "$WORK/tiny.md"
+run_ng out err rc issue comment 7 --body-file "$WORK/tiny.md"
+assert_contains  "#641 stderr warns the file is under the floor" "$err" "under the 200-byte floor"
+# LOAD-BEARING: the warning must not become a failure. The comment posted;
+# turning a successful publish into a non-zero exit would be a regression
+# worse than the silence it replaces.
+assert_eq        "#641 the warning does NOT flip the exit code" "$rc" "0"
+calls=$(<"$CAPTURE")
+assert_contains  "#641 …and the comment is still POSTed"        "$calls" \
+                 "-X POST /repos/default-org/default-repo/issues/7/comments"
+
+echo '=== #641 CONTROL: stdin is the short-comment channel and is NOT warned ==='
+# Warning on stdin would fire on every legitimate one-line comment, and a
+# guard that cries wolf is how operators learn to ignore it.
+# NB: feed stdin by REDIRECT, not by pipe. `printf ... | run_ng ...` puts the
+# helper in a pipeline SUBSHELL, so its `printf -v` never reaches the caller
+# and every assertion silently reads the PREVIOUS test's stderr. That is how
+# this block first "passed" the byte-count assertion while checking the wrong
+# run entirely.
+printf 'ack\n' > "$WORK/ack.txt"
+run_ng out err rc issue comment 7 < "$WORK/ack.txt"
+assert_eq        "#641 a short stdin comment exits 0"   "$rc" "0"
+assert_contains  "#641 …is still counted"               "$err" "ng: posting 3 bytes"
+assert_contains  "#641 …and attributed to stdin"        "$err" "from stdin"
+assert_not_contains "#641 …but is NOT warned about"     "$err" "WARNING"
+
 # ---- summary -----------------------------------------------------------
 
 th_summary_and_exit

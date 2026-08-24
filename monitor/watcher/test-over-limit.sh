@@ -156,9 +156,17 @@ reset_state() {
 
 # Helper: synthesize a stamp row directly (bypass _over_limit_record
 # so we can pin specific timestamps for the wake-loop tests).
+#
+# The row stays EIGHT fields (your-org/nexus-code#592 keeps the observation
+# epoch in a sidecar so an older watcher can still parse this file). Arg 9 is
+# the OBSERVATION, written to that sidecar, and defaults to NOW because every
+# caller here simulates a hold still in progress — which is by definition one
+# the 60s scan is observing continuously. Tests wanting a STALE observation
+# pass an explicit older epoch; see test-over-limit-reset-clock.sh.
 synth_row() {
     local key="$1" window="$2" role="$3" token="$4"
     local reset_epoch="$5" first_seen="$6" next_attempt="$7" attempts="$8"
+    local observed="${9:-$(date +%s)}"
     local path
     path=$(_over_limit_state_path)
     mkdir -p "$(dirname "$path")"
@@ -166,6 +174,7 @@ synth_row() {
         "$key" "$window" "$role" "$token" \
         "$reset_epoch" "$first_seen" "$next_attempt" "$attempts" \
         >> "$path"
+    _over_limit_observation_set "$key" "$observed"
 }
 
 NOW=$(date +%s)
@@ -208,6 +217,41 @@ assert_eq "empty → +6h fallback" "$epoch" "$expected"
 # Garbage token → fallback.
 epoch=$(_over_limit_reset_at_to_epoch "not_a_time" "$NOW")
 assert_eq "unparseable → +6h fallback" "$epoch" "$expected"
+
+# ---- your-org/nexus-code#574: a malformed TZ must not resolve SILENTLY ----
+# GNU `date` does not fail on an invalid TZ — it falls back to UTC and exits 0.
+# So the pre-existing `[[ $epoch =~ ^[0-9]+$ ]]` guard passes and the 6h safety
+# net never engages: the hold expires hours off, with no error anywhere. The
+# live token that produced this carried a trailing ANSI reset plus a stray
+# quote on the timezone half; measured skew was 17 hours at rc=0.
+_esc=$(printf '\033')
+epoch=$(_over_limit_reset_at_to_epoch "3am_America/Los_Angeles${_esc}[0m\"" "$NOW")
+assert_eq "ANSI-tainted tz → +6h fallback, not a silent 17h skew" "$epoch" "$expected"
+
+# The exact observed production token, byte for byte.
+epoch=$(_over_limit_reset_at_to_epoch "3am_America/Los_Angeles${_esc}[0m" "$NOW")
+assert_eq "observed live token → +6h fallback" "$epoch" "$expected"
+
+# A zone that is charset-clean but simply does not exist must also fall back
+# rather than resolve as UTC.
+epoch=$(_over_limit_reset_at_to_epoch "3am_Not/AZone" "$NOW")
+assert_eq "nonexistent zone → +6h fallback" "$epoch" "$expected"
+
+# NEGATIVE CONTROL for the guard itself: the sanitiser must not become so
+# eager that it rejects legitimate zones. These must still resolve normally
+# (a future epoch within 26h), NOT hit the fallback — otherwise the fix would
+# have "passed" by disabling timezone handling altogether.
+for _tz in "America/Los_Angeles" "UTC" "Europe/Berlin" "Asia/Tokyo"; do
+    epoch=$(_over_limit_reset_at_to_epoch "3am_${_tz}" "$NOW")
+    if [[ "$epoch" =~ ^[0-9]+$ ]] && (( epoch >= NOW )) && (( epoch <= NOW + 26*3600 )) \
+       && (( epoch != expected )); then
+        printf '  PASS: valid zone %s still resolves (not fallback)\n' "$_tz"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: valid zone %s no longer resolves (got %s)\n' "$_tz" "$epoch" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+done
 
 # ---- stamp lifecycle ------------------------------------------------------
 
@@ -303,6 +347,72 @@ _over_limit_load "worker-b" >/dev/null \
 _over_limit_load "_orchestrator" >/dev/null \
     && { printf '  FAIL: busy orchestrator wrongly stamped\n' >&2; FAIL=$(( FAIL + 1 )); } \
     || { printf '  PASS: busy orchestrator not stamped\n'; PASS=$(( PASS + 1 )); }
+
+echo '=== scan_panes: reconciles a stamped pane that reads ALIVE (#592) ==='
+# End-to-end for the 15-hour emit blackout. The scan probes every pane every
+# 60s; before #592 it discarded the answer unless the pane read over-limit, so
+# a row parked at a miscomputed instant kept the suppression gate shut while
+# the scan watched a live pane every minute. Now the scan expedites the wake,
+# and the 5s wake loop resumes the pane on its next tick.
+for _alive in idle busy empty working-background; do
+    reset_state
+    export MOCK_TMUX_WINDOWS="$(printf 'orchestrator|2\nworker-a|3')"
+    export MOCK_PANE_STATE_2="$_alive"
+    export MOCK_PANE_STATE_3="$_alive"
+    # Both parked a full day out, as the production rows were.
+    synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+        $(( NOW + 86400 )) $(( NOW - 43200 )) $(( NOW + 86700 )) 0 $(( NOW - 43200 ))
+    synth_row "worker-a" "worker-a" "worker" "3am_America/Los_Angeles" \
+        $(( NOW + 86400 )) $(( NOW - 43200 )) $(( NOW + 86700 )) 0 $(( NOW - 43200 ))
+    # Sample the clock adjacent to the call: reconcile stamps the real `now`,
+    # and NOW is captured once at file top, so wall-clock drift across this
+    # loop would otherwise make the tolerance flaky (it did).
+    t_scan=$(date +%s)
+    _over_limit_scan_panes "orchestrator"
+    orch_next=$(awk -F'\t' '{print $7}' <<<"$(_over_limit_load _orchestrator)")
+    wrk_next=$(awk -F'\t' '{print $7}' <<<"$(_over_limit_load worker-a)")
+    if (( orch_next >= t_scan - 2 && orch_next <= t_scan + 10 )) \
+       && (( wrk_next >= t_scan - 2 && wrk_next <= t_scan + 10 )); then
+        printf '  PASS: state=%s expedites both parked wakes to ~now\n' "$_alive"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: state=%s left wakes parked (orch=%s worker=%s, t_scan=%s, was %s)\n' \
+            "$_alive" "$orch_next" "$wrk_next" "$t_scan" "$(( NOW + 86700 ))" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+    # …and the wake loop then actually resumes them, clearing the gate.
+    _over_limit_process_wakes "orchestrator"
+    if _over_limit_orchestrator_paused; then
+        printf '  FAIL: state=%s — gate still suppressed after reconcile+wake\n' "$_alive" >&2
+        FAIL=$(( FAIL + 1 ))
+    else
+        printf '  PASS: state=%s — reconcile+wake reopened the emit gate\n' "$_alive"
+        PASS=$(( PASS + 1 ))
+    fi
+    unset MOCK_PANE_STATE_2 MOCK_PANE_STATE_3
+done
+
+echo '=== scan_panes: a still-over-limit pane is NOT expedited ==='
+# Polarity guard: reconcile must not undo a legitimate parked wake.
+reset_state
+export MOCK_TMUX_WINDOWS="orchestrator|2"
+export MOCK_PANE_STATE_2=over-limit
+export MOCK_PANE_RESET_AT_2='3am_America/Los_Angeles'
+# The horizon must be the one the parser derives from first_seen, or the
+# self-heal correctly rewrites it (it is an exact re-derivation test now, not
+# a threshold — skeptic finding B on #582). An arbitrary fixture value here
+# would exercise the heal rather than the polarity guard this test is for.
+_genuine_first=$(( NOW - 60 ))
+_genuine_reset=$(_over_limit_reset_at_to_epoch "3am_America/Los_Angeles" "$_genuine_first")
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+    "$_genuine_reset" "$_genuine_first" "$(( _genuine_reset + 300 ))" 0 "$_genuine_first"
+_over_limit_scan_panes "orchestrator"
+orch_next=$(awk -F'\t' '{print $7}' <<<"$(_over_limit_load _orchestrator)")
+assert_eq "genuine hold keeps its parked wake" "$orch_next" "$(( _genuine_reset + 300 ))"
+_over_limit_orchestrator_paused \
+    && { printf '  PASS: genuine hold still suppresses emits\n'; PASS=$(( PASS + 1 )); } \
+    || { printf '  FAIL: genuine hold stopped suppressing\n' >&2; FAIL=$(( FAIL + 1 )); }
+unset MOCK_PANE_STATE_2 MOCK_PANE_RESET_AT_2
 unset MOCK_PANE_STATE_2 MOCK_PANE_STATE_3 MOCK_PANE_STATE_4 MOCK_PANE_RESET_AT_3
 
 # ---- process_wakes state machine ------------------------------------------
@@ -673,13 +783,13 @@ grep -q "hold began" "$held" 2>/dev/null \
     || { printf '  FAIL: off-time log header missing\n' >&2; FAIL=$(( FAIL + 1 )); }
 _over_limit_record_held "2026-07-15_11-00-00_abc123.md" "poll-resurface"
 _over_limit_record_held "2026-07-15_11-01-00_def456.md" "poll-full-state"
-n=$(grep -c $'\theld\t' "$held" 2>/dev/null || echo 0)
+n=$(grep -c $'\theld\t' "$held" 2>/dev/null) || n=0
 [[ "$n" == "2" ]] \
     && { printf '  PASS: two held emits recorded (n=%s)\n' "$n"; PASS=$(( PASS + 1 )); } \
     || { printf '  FAIL: expected 2 held records, got %s\n' "$n" >&2; FAIL=$(( FAIL + 1 )); }
 # A REFRESH of the same hold must NOT truncate the log (progress preserved).
 _over_limit_record "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles"
-n2=$(grep -c $'\theld\t' "$held" 2>/dev/null || echo 0)
+n2=$(grep -c $'\theld\t' "$held" 2>/dev/null) || n2=0
 [[ "$n2" == "2" ]] \
     && { printf '  PASS: hold refresh preserves the off-time log\n'; PASS=$(( PASS + 1 )); } \
     || { printf '  FAIL: hold refresh clobbered the log (n=%s)\n' "$n2" >&2; FAIL=$(( FAIL + 1 )); }

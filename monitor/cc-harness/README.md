@@ -27,6 +27,32 @@ reproduces it. This harness is that surface. The two are complementary:
 the stub suite owns lifecycle; cc-harness owns "does the real TUI still
 render what pane-state expects."
 
+> **Second catch (<your-org>/nexus-code#568).** Asked to confirm that making
+> `"tui": "fullscreen"` the shipped default left the observability surfaces
+> unchanged, this harness found that it did not — and the default was
+> consequently **never shipped**: `"tui": "fullscreen"` was reverted out of
+> `worker-settings.json` / `orchestrator-settings.json` in b37bb68
+> (`<your-org>/nexus-code#570`, see `#573`), so fullscreen is an OPT-IN mode and
+> the binary's own default is what workers run. Under fullscreen
+> (alternate-screen) rendering the input box is pinned to the bottom of a
+> full-height screen and the gap above it is padded with blank rows. Every
+> bottom-anchored scan in `pane-state.sh` used `tail -n 15`, which conflates
+> "the last 15 rows of CONTENT" with "the last 15 rows of the GRID" — the same
+> thing only in the inline renderer. Measured at the moment the notice was
+> painted: **40 rows captured, 10 non-blank, notice at raw row 32 from the
+> bottom but non-blank row 6.** So the scan saw nothing but padding and
+> `_detect_over_limit` returned "no notice" for a pane visibly painting one —
+> the renderer fallback silently degrading a rate-limited worker to `idle`.
+> Masked in production by the heartbeat stamp, exposed exactly where the
+> fallback matters (stale/missing heartbeat, inherited panes). Fixed with
+> `pane-state.sh::_bottom_rows`, which strips blanks before bounding, keeping
+> the anti-scrollback anchoring the raw form was chosen for. Regression
+> fixture: `fixtures/over-limit-fullscreen-padded-synthetic.ansi`.
+>
+> The general point: the stub suite could not have caught this at all —
+> `stub-claude.sh` has no TUI handling, so it would have gone green under both
+> modes and that green would have meant nothing.
+
 > **First catch.** On its first run this harness surfaced a real
 > pane-state gap: claude 2.1.147 renders the *post-turn* idle box with
 > the reverse-video space cursor as the **last cell** of the `❯<NBSP>`
@@ -73,7 +99,8 @@ work:
 | `demo.sh` | Human-facing live demo (`--stop` to tear down). A real round-trip + an AskUserQuestion menu you attach to and pick from. |
 | `gate.sh` | Pre-update gate: run the scenarios against a candidate cc version in a throwaway prefix; green/red exit. Runs `lint-no-mass-kill.sh` as a pre-flight. |
 | `lint-no-mass-kill.sh` | Safety lint: forbids cmdline-pattern process kills (`pkill -f`/`--full`, `pgrep -f`, `killall`) in harness code — they match the shared project-local claude binary across the sandbox's one PID namespace and wipe every agent (crash postmortem 2026-05-29). Allows PID-scoped `pkill -P`. Run by `gate.sh` and the CI workflow. |
-| `../watcher/test-integration/test-realmodel-*.sh` | The scenarios (`idle-busy`, `blocked-question`, `autosuggest`, `long-exchange`, **`apispoof`**, **`overlimit`**). Auto-discovered by `run-tests.sh`; gated on `RUN_CC_HARNESS=1`. `apispoof` is the end-to-end stall-detection test: real claude → mock 529/404 → real StopFailure → real `turn-failure-emit.sh` marker → real watcher classifier → `interrupted` + recovery verb → real resume that completes when the mock recovers. `overlimit` is the usage-limit chain (2026-07-14 incident): real claude → mock 429 `rate_limit_error` (retries exhausted via `CLAUDE_CODE_MAX_RETRIES=1`) → real StopFailure `error="rate_limit"` → real `over-limit-emit.sh` stamp with the reset time parsed from the notice → production `pane-state.sh` `over-limit` → watcher emit-gate hold → real Stop-hook clear → wake flush. The error control-knob also accepts a `headers` map; note CC's subscription unified-rate-limit headers are OAuth-gated and inert under the harness's bearer auth (see the scenario header). |
+| `lint-no-tmux-server-kill.sh` | Safety lint on the tmux-**socket** axis (blast radius strictly worse than the above: killing the tmux server ends the session `bwrap` holds open, tearing down the whole sandbox — <your-org>/nexus-code#644). Requires `kill-server` to carry an explicit `-L`/`-S`, `kill-session` to carry `-t`, and flags a `TMUX_TMPDIR` isolation in any file that never does `unset TMUX` — socket precedence is `-L`/`-S` > `$TMUX` > `TMUX_TMPDIR` > default, and `$TMUX` is always set because every agent runs in a pane. Quoted occurrences are treated as data, not calls. Wrapper-routed calls may carry a `# tmux-scoped: <reason>` pragma; pragmas are **counted** and the count is pinned by `--selftest`, so an exemption cannot be added silently. `--selftest` is the negative control (asserts the lint fails on planted violations, including the #644 line verbatim, for the expected rule id); `--manifest` lists every destructive call site. Run by `gate.sh` and the CI workflow. |
+| `../watcher/test-integration/test-realmodel-*.sh` | The scenarios (`idle-busy`, `blocked-question`, `autosuggest`, `long-exchange`, **`apispoof`**, **`overlimit`**, **`pretooluse-hook`**, **`trust-dialog`**). Auto-discovered by `run-tests.sh`; gated on `RUN_CC_HARNESS=1`. `apispoof` is the end-to-end stall-detection test: real claude → mock 529/404 → real StopFailure → real `turn-failure-emit.sh` marker → real watcher classifier → `interrupted` + recovery verb → real resume that completes when the mock recovers. `overlimit` is the usage-limit chain (2026-07-14 incident): real claude → mock 429 `rate_limit_error` (retries exhausted via `CLAUDE_CODE_MAX_RETRIES=1`) → real StopFailure `error="rate_limit"` → real `over-limit-emit.sh` stamp with the reset time parsed from the notice → production `pane-state.sh` `over-limit` → watcher emit-gate hold → real Stop-hook clear → wake flush. `pretooluse-hook` is the GUIDE-2d hook-contract test: real claude booted with a `--settings`-wired **PreToolUse** hook (via the `CCH_SETTINGS` override) → mock `tool_use` turn → real Bash tool call → assert `hook_event_name=PreToolUse`, `tool_name=Bash`, and an intact `.tool_input.command`, the exact fields `monitor/hooks/gh-write-guard.sh` and `bash-footgun-guard.sh` parse. It ships two negative controls (a hooks-stripped arm that must NOT fire, and a doctored-payload arm proving the field extractor is not vacuous) so a green result is not decorative. `trust-dialog` is the structural select-dialog arm (<your-org>/nexus-code#896): the workspace-trust dialog used to classify `state=empty` — "don't know yet" — so nothing unstuck a worker that would never proceed, and 2.1.232 made that every nested-repo spawn. It un-seeds `hasTrustDialogAccepted` (the ONE key `_lib.sh` seeds to skip the gate), asserts the production classifier reports `blocked` + `overlay=workspace-trust`, carries a trusted control arm that must reach idle, and re-derives `fixtures/blocked-workspace-trust-realmodel.ansi` from the live binary so the committed capture cannot rot into fiction. It exercises the pinned version, not just a staged candidate: 2.1.232 changed WHEN the dialog appears, not WHAT it renders. The error control-knob also accepts a `headers` map; note CC's subscription unified-rate-limit headers are OAuth-gated and inert under the harness's bearer auth (see the scenario header). |
 
 ## Injectable control — "a pipe we can inject text into"
 
@@ -185,8 +212,14 @@ new fixture captured from the candidate) before the bump is safe.
   heavier `test-integration` Pass-B scenarios.
 - **3-miss paste→respawn** against the real binary.
 - **Heartbeat-substrate variant**: boot with `worker-settings.json` hooks
-  so the harness also exercises the heartbeat path (this slice is
-  renderer-path only, which is what exposed the empty-box finding).
+  so the harness also exercises the heartbeat path. PARTIALLY DONE:
+  `cch_boot_worker` now honours a `CCH_SETTINGS` env override (plus
+  `CCH_EXTRA_ENV`), and `test-realmodel-pretooluse-hook.sh` uses it to
+  pin the **PreToolUse** payload contract. Still hook-free by default,
+  and still uncovered: `PostToolUse`, `Notification`,
+  `PermissionRequest`, `UserPromptSubmit`, and the `Stop` heartbeat stamp
+  itself (`test-realmodel-overlimit.sh` covers `Stop`/`StopFailure` only
+  on the over-limit path).
 - **FIFO injection** mode for live byte-streaming, in addition to the
   control file.
 - **Live autosuggest emission.** `test-realmodel-autosuggest.sh` asserts the

@@ -1,0 +1,364 @@
+# summary-honesty.manifest — what each suite's green does NOT certify,
+# recorded as DATA on BOTH axes the mechanisms vary on.
+#
+# ── WHY THIS FILE WAS REBUILT (your-org/nexus-code#821) ──────────────────
+#
+# The first version recorded one bucket — "hand-rolled summary with no count
+# guard", 172 files — and treated everything else as protected. The `#819`
+# skeptic showed that was wrong in a way that mattered, and measuring the
+# correction showed it was wrong more widely than reported:
+#
+#   * A COUNT GUARD AND THE LEDGER PROTECT DIFFERENT THINGS, and neither
+#     implies the other. Treating "routes through th_summary_and_exit" as
+#     "protected" conflated them.
+#   * FIVE of the 17 files excluded as "count-guarded" had NO count guard at
+#     all. The classifier matched the WORD `EXPECTED` anywhere in the file —
+#     including `EXPECTED_TARGET` (a config value), `EXPECTED_SLUG` (a path),
+#     and, in `test-deliveries-split.sh`, the string `UNEXPECTEDLY` inside a
+#     printf. It matched a substring, not a mechanism.
+#   * ONE more used a FLOOR (`-lt`) rather than an exact comparison. A suite
+#     can clear a floor and still under-assert, so a floor is not protection
+#     against a vanished assertion; it only catches a collapse.
+#
+# ── THE TWO AXES ────────────────────────────────────────────────────────
+#
+#   ledger=yes   routes through `th_summary_and_exit`, so its green certifies
+#                that SOMETHING was asserted and that no FAIL was swallowed by
+#                a subshell (your-org/nexus-code#805).
+#                It certifies NOTHING about how much was asserted.
+#
+#   count=exact  compares its assertion total against an expected total with
+#                `!=`/`==`, so a VANISHED assertion reddens (#807).
+#   count=floor  compares with `-lt`/`-gt`. Catches a collapse below the floor;
+#                a suite can clear the floor and still under-assert.
+#   count=none   nothing pins how much ran.
+#
+# A file is omitted from this manifest only when it is `ledger=yes` AND
+# `count=exact`. Measured on this tree: **6 of 253** banner-printing files.
+# That number is the honest headline, and it is much smaller than the earlier
+# "60 protected" — because that figure was counting one axis and reporting it
+# as though it covered both.
+#
+# ── WHAT THIS DOES NOT CLAIM ────────────────────────────────────────────
+# The classification is STRUCTURAL: which mechanisms a file carries, decidable
+# from source. It does NOT claim a listed file actually under-asserts today, or
+# that an omitted one is correct — proving either is a per-file argument. It
+# claims only what a reader can check: this green is not backed by that
+# mechanism.
+#
+# ── THE RATCHET ─────────────────────────────────────────────────────────
+# Protection may only INCREASE. A file whose recorded state weakens reds; a
+# banner-printing file missing from this list reds; a file that becomes
+# `ledger=yes`+`count=exact` must have its line DELETED, or the list stops
+# describing the tree. Do not regenerate this to clear a red — regenerating is
+# how a measurement becomes a rubber stamp.
+#
+# TWO WAYS A FILE CAN BE MISSING, and they are not the same act:
+#
+#   YOU ARE ADDING THE SUITE. Route it through `th_summary_and_exit` and give it
+#   an exact count guard. Do NOT append a line — appending is opting your own new
+#   code out of the standard, which is the whole thing this file exists to stop.
+#
+#   IT ARRIVED BY MERGE from another change. Then the manifest is simply out of
+#   date, and recording it is the honest act: this list must describe the tree,
+#   and silently rewriting another author's just-landed suite to clear your own
+#   red is worse than recording reality. Record it, note where it came from, and
+#   the ratchet keeps the number falling from there — its author owns raising it.
+#
+# The distinction is between opting YOUR code out (never) and describing SOMEONE
+# ELSE'S accurately (always).
+#
+# For a suite built on DELIBERATE failing assertions (positive controls run in
+# `$( … )`), `th_expect_fail` is the sanctioned way to adopt the ledger without
+# a false red. See its header in _test_helpers.sh.
+#
+# Checked by monitor/watcher/test-summary-honesty-manifest.sh
+#
+# <path>::ledger=<yes|no>::count=<exact|floor|none>
+monitor/test-ci-head-attempts.sh::ledger=no::count=none
+monitor/test-ci-signal-step-contract.sh::ledger=no::count=none
+monitor/test-ci-trigger-audit.sh::ledger=no::count=none
+monitor/test-conflict-marker-lint.sh::ledger=no::count=none
+monitor/test-interpreter-parity.sh::ledger=no::count=none
+monitor/test-lint-citations.sh::ledger=no::count=none
+monitor/test-lint-errexit-branch.sh::ledger=no::count=none
+monitor/test-lint-workflows.sh::ledger=no::count=none
+monitor/test-ng-cross-surface.sh::ledger=no::count=exact
+monitor/test-paste-followup-confirm.sh::ledger=no::count=none
+monitor/test-paste-probe-step-contract.sh::ledger=no::count=none
+monitor/test-public-mirror-scrub.sh::ledger=no::count=none
+monitor/test-retire-preflight.sh::ledger=no::count=none
+monitor/test-service-log-mode.sh::ledger=no::count=none
+monitor/test-slow-band-drift.sh::ledger=no::count=none
+monitor/watcher/test-administrative-paste.sh::ledger=no::count=none
+monitor/watcher/test-assert-bot-author.sh::ledger=no::count=none
+monitor/watcher/test-assert-shims-wrapped.sh::ledger=no::count=none
+monitor/watcher/test-async-launch-detect.sh::ledger=no::count=none
+monitor/watcher/test-bash-env-chain-guard.sh::ledger=no::count=none
+monitor/watcher/test-bash-env-cnf-handler.sh::ledger=no::count=none
+monitor/watcher/test-bash-footgun-guard.sh::ledger=no::count=exact
+monitor/watcher/test-block-askuserquestion-hook.sh::ledger=no::count=none
+monitor/watcher/test-boot-recover.sh::ledger=no::count=none
+monitor/watcher/test-bootstrap-claude-install.sh::ledger=no::count=none
+monitor/watcher/test-bootstrap-install.sh::ledger=no::count=none
+monitor/watcher/test-bootstrap-lab-context.sh::ledger=no::count=none
+monitor/watcher/test-bootstrap-phases-dryrun.sh::ledger=no::count=none
+monitor/watcher/test-bootstrap-race.sh::ledger=no::count=none
+monitor/watcher/test-bootstrap-recover.sh::ledger=no::count=none
+monitor/watcher/test-bootstrap-stub-claude.sh::ledger=no::count=none
+monitor/watcher/test-bootstrap-venv.sh::ledger=no::count=none
+monitor/watcher/test-bot-mentions.sh::ledger=no::count=none
+monitor/watcher/test-calibrate-pressure-thresholds.sh::ledger=yes::count=none
+monitor/watcher/test-case-skip-propagation.sh::ledger=yes::count=none
+monitor/watcher/test-cause-classify.sh::ledger=no::count=none
+monitor/watcher/test-cc-gate.sh::ledger=no::count=none
+monitor/watcher/test-cc-harness-waitfor-diagnostic.sh::ledger=no::count=none
+monitor/watcher/test-claude-loop.sh::ledger=no::count=none
+monitor/watcher/test-claude-md-618-remedies.sh::ledger=no::count=exact
+monitor/watcher/test-claude-md-lstree-pathspec.sh::ledger=no::count=none
+monitor/watcher/test-clone-drift.sh::ledger=yes::count=none
+monitor/watcher/test-cold-boot-manifest.sh::ledger=no::count=none
+monitor/watcher/test-comment-surface.sh::ledger=no::count=none
+monitor/watcher/test-compose-emit-multibyte.sh::ledger=no::count=none
+monitor/watcher/test-compose-emit-nudge.sh::ledger=no::count=none
+monitor/watcher/test-config-integration-branch.sh::ledger=yes::count=none
+monitor/watcher/test-config-validate-guard.sh::ledger=yes::count=none
+monitor/watcher/test-count-fallback-lint.sh::ledger=yes::count=none
+monitor/watcher/test-cpu-pressure-note.sh::ledger=yes::count=none
+monitor/watcher/test-cross-repo-mention-filter.sh::ledger=no::count=none
+monitor/watcher/test-decision-gate-states.sh::ledger=no::count=none
+monitor/watcher/test-declare-wait.sh::ledger=no::count=none
+monitor/watcher/test-deliveries-event-prefilter.sh::ledger=no::count=none
+monitor/watcher/test-deliveries-mention.sh::ledger=no::count=none
+monitor/watcher/test-deliveries-race.sh::ledger=no::count=none
+monitor/watcher/test-deliveries-split.sh::ledger=no::count=none
+monitor/watcher/test-diagnostics-outlive-their-paths.sh::ledger=yes::count=none
+monitor/watcher/test-early-exit-reader-manifest.sh::ledger=no::count=exact
+monitor/watcher/test-eligibility-resurface.sh::ledger=no::count=none
+monitor/watcher/test-eligibility-staleness.sh::ledger=no::count=none
+monitor/watcher/test-emit-dedup.sh::ledger=no::count=none
+monitor/watcher/test-emit-gate-recover.sh::ledger=no::count=none
+monitor/watcher/test-emit-gate.sh::ledger=no::count=none
+monitor/watcher/test-emit-section-cap.sh::ledger=no::count=none
+monitor/watcher/test-emit-suppression.sh::ledger=no::count=none
+monitor/watcher/test-engage-long-exchange.sh::ledger=no::count=none
+monitor/watcher/test-engage-statemachine.sh::ledger=no::count=none
+monitor/watcher/test-engage-stress.sh::ledger=no::count=none
+monitor/watcher/test-filter-skip-marker.sh::ledger=no::count=none
+monitor/watcher/test-filter-to-user-author.sh::ledger=no::count=none
+monitor/watcher/test-flock-fd-cloexec.sh::ledger=no::count=none
+monitor/watcher/test-fm-lib.sh::ledger=no::count=none
+monitor/watcher/test-fork-headroom-guard.sh::ledger=no::count=none
+monitor/watcher/test-fs-guard.sh::ledger=yes::count=none
+monitor/watcher/test-full-state-clock-only-change.sh::ledger=no::count=none
+monitor/watcher/test-full-state-emit-noise.sh::ledger=no::count=none
+monitor/watcher/test-full-state-idle-backoff.sh::ledger=no::count=none
+monitor/watcher/test-full-state-suppression.sh::ledger=no::count=none
+monitor/watcher/test-gh-capable.sh::ledger=no::count=exact
+monitor/watcher/test-gh-shim.sh::ledger=no::count=none
+monitor/watcher/test-gh-wrapper.sh::ledger=no::count=none
+monitor/watcher/test-graphql-backoff-bound.sh::ledger=yes::count=none
+monitor/watcher/test-graphql-gate.sh::ledger=no::count=none
+monitor/watcher/test-graphql-search-paged.sh::ledger=yes::count=none
+monitor/watcher/test-guard-closure-boundary.sh::ledger=yes::count=none
+monitor/watcher/test-guards-for-diff.sh::ledger=yes::count=none
+monitor/watcher/test-idle-classification.sh::ledger=no::count=none
+monitor/watcher/test-idle-probe-interrupted.sh::ledger=no::count=none
+monitor/watcher/test-idle-probe.sh::ledger=no::count=none
+monitor/watcher/test-infra-review-recursion.sh::ledger=no::count=none
+monitor/watcher/test-inherited-root-guard.sh::ledger=yes::count=none
+monitor/watcher/test-install-claude-local.sh::ledger=no::count=none
+monitor/watcher/test-install-hpc-skills.sh::ledger=no::count=none
+monitor/watcher/test-install-labsh.sh::ledger=no::count=none
+monitor/watcher/test-install-prompt-content.sh::ledger=no::count=none
+monitor/watcher/test-install-shell-hook.sh::ledger=no::count=none
+monitor/watcher/test-instance-heartbeat.sh::ledger=no::count=none
+monitor/watcher/test-instance-lock-fd-leak.sh::ledger=yes::count=none
+monitor/watcher/test-instance-lock.sh::ledger=no::count=none
+monitor/watcher/test-integration/test-graceful-exit-relaunch.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-same-name-recycle.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-slow-grind-respawn.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-spawn-busy-idle-absent.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-wrapup-retain-close.sh::ledger=yes::count=none
+monitor/watcher/test-jupyter-service.sh::ledger=yes::count=none
+monitor/watcher/test-jupyter-up-refusal.sh::ledger=no::count=none
+monitor/watcher/test-jupyter-up-timeout.sh::ledger=yes::count=none
+monitor/watcher/test-lab-context.sh::ledger=no::count=none
+monitor/watcher/test-labsh-phantom-adopt.sh::ledger=yes::count=none
+monitor/watcher/test-labsh-reap-stale-builds.sh::ledger=no::count=none
+monitor/watcher/test-launcher-empty-target.sh::ledger=no::count=none
+monitor/watcher/test-launcher-headless.sh::ledger=no::count=none
+monitor/watcher/test-launcher-pidfile.sh::ledger=no::count=none
+monitor/watcher/test-launcher-replace.sh::ledger=no::count=none
+monitor/watcher/test-lib.sh::ledger=no::count=none
+monitor/watcher/test-link-nexus-tools.sh::ledger=no::count=none
+monitor/watcher/test-lit-empty-vs-failed.sh::ledger=no::count=none
+monitor/watcher/test-lit-openalex.sh::ledger=no::count=none
+monitor/watcher/test-lit-probe-order-dependence.sh::ledger=no::count=floor
+monitor/watcher/test-locals-env.sh::ledger=no::count=none
+monitor/watcher/test-log-no-dup.sh::ledger=no::count=none
+monitor/watcher/test-mcp-shell-risk.sh::ledger=yes::count=none
+monitor/watcher/test-mint-token.sh::ledger=no::count=none
+monitor/watcher/test-newest-emit-archive.sh::ledger=no::count=none
+monitor/watcher/test-nexus-client-convergence.sh::ledger=yes::count=none
+monitor/watcher/test-nexus-reply-watch.sh::ledger=yes::count=none
+monitor/watcher/test-nexus-request.sh::ledger=yes::count=none
+monitor/watcher/test-nexus-root-sensitivity.sh::ledger=no::count=none
+monitor/watcher/test-ng-close.sh::ledger=yes::count=none
+monitor/watcher/test-ng-comment-edit.sh::ledger=yes::count=none
+monitor/watcher/test-ng-dashboard.sh::ledger=yes::count=none
+monitor/watcher/test-ng-fetch-asset.sh::ledger=no::count=none
+monitor/watcher/test-ng-help.sh::ledger=yes::count=none
+monitor/watcher/test-ng-issue.sh::ledger=yes::count=none
+monitor/watcher/test-ng-log-action.sh::ledger=yes::count=none
+monitor/watcher/test-ng-mint-jwt.sh::ledger=yes::count=none
+monitor/watcher/test-ng-nexus-identity.sh::ledger=yes::count=none
+monitor/watcher/test-ng-pr.sh::ledger=yes::count=none
+monitor/watcher/test-ng-preflight.sh::ledger=yes::count=none
+monitor/watcher/test-ng-process.sh::ledger=yes::count=none
+monitor/watcher/test-ng-react-repo.sh::ledger=no::count=none
+monitor/watcher/test-ng-reply-repo.sh::ledger=yes::count=none
+monitor/watcher/test-ng-report-check.sh::ledger=no::count=none
+monitor/watcher/test-ng-report-grep.sh::ledger=no::count=exact
+monitor/watcher/test-ng-report-init-forkfree.sh::ledger=no::count=exact
+monitor/watcher/test-ng-report-init.sh::ledger=no::count=none
+monitor/watcher/test-ng-show.sh::ledger=yes::count=none
+monitor/watcher/test-ng-spawn-decision.sh::ledger=no::count=none
+monitor/watcher/test-ng-state-dir.sh::ledger=no::count=none
+monitor/watcher/test-ng-symlink-config.sh::ledger=no::count=none
+monitor/watcher/test-ng-tmux-helper-runnable.sh::ledger=no::count=exact
+monitor/watcher/test-ng-usage-tap.sh::ledger=no::count=none
+monitor/watcher/test-ng-watcher-status.sh::ledger=yes::count=none
+monitor/watcher/test-ng-wrap-up-reply-to.sh::ledger=no::count=none
+monitor/watcher/test-ng-wrap-up.sh::ledger=no::count=none
+monitor/watcher/test-no-sandbox-gate.sh::ledger=no::count=none
+monitor/watcher/test-notification-record.sh::ledger=no::count=none
+monitor/watcher/test-over-limit-emit.sh::ledger=no::count=none
+monitor/watcher/test-over-limit-reset-clock.sh::ledger=yes::count=none
+monitor/watcher/test-over-limit.sh::ledger=yes::count=none
+monitor/watcher/test-pane-cache.sh::ledger=no::count=none
+monitor/watcher/test-pane-state-boot-absent.sh::ledger=no::count=exact
+monitor/watcher/test-pane-state-wrapped-idle.sh::ledger=no::count=none
+monitor/watcher/test-pane-state.sh::ledger=no::count=none
+monitor/watcher/test-paste-bracketed.sh::ledger=no::count=none
+monitor/watcher/test-paste-content-marker.sh::ledger=no::count=none
+monitor/watcher/test-paste-dead-pane-guard.sh::ledger=no::count=none
+monitor/watcher/test-paste-epoch-granularity.sh::ledger=no::count=none
+monitor/watcher/test-paste-epoch-prepaste.sh::ledger=no::count=none
+monitor/watcher/test-paste-followup.sh::ledger=no::count=none
+monitor/watcher/test-paste-verdict-carryforward.sh::ledger=no::count=none
+monitor/watcher/test-pending-decisions.sh::ledger=no::count=none
+monitor/watcher/test-pidfile-early-publish.sh::ledger=no::count=none
+monitor/watcher/test-pip-shim.sh::ledger=no::count=none
+monitor/watcher/test-prune-rotation.sh::ledger=no::count=none
+monitor/watcher/test-public-guard-refusal.sh::ledger=no::count=none
+monitor/watcher/test-reemit-backoff.sh::ledger=no::count=none
+monitor/watcher/test-reemit-closed-target.sh::ledger=no::count=none
+monitor/watcher/test-reemit-two-tier.sh::ledger=no::count=none
+monitor/watcher/test-reemit-until-acked.sh::ledger=no::count=none
+monitor/watcher/test-remote-bind-guard.sh::ledger=yes::count=none
+monitor/watcher/test-remote-carrier-authline.sh::ledger=yes::count=none
+monitor/watcher/test-remote-enroll.sh::ledger=yes::count=none
+monitor/watcher/test-remote-forced-command.sh::ledger=yes::count=none
+monitor/watcher/test-remote-identity-health.sh::ledger=yes::count=none
+monitor/watcher/test-remote-port-change-notify.sh::ledger=yes::count=none
+monitor/watcher/test-remote-port-select.sh::ledger=yes::count=none
+monitor/watcher/test-remote-principals-guard.sh::ledger=yes::count=none
+monitor/watcher/test-remote-self-enroll.sh::ledger=yes::count=none
+monitor/watcher/test-remote-service-log.sh::ledger=yes::count=none
+monitor/watcher/test-remote-service.sh::ledger=yes::count=none
+monitor/watcher/test-remote-source-enforcement.sh::ledger=yes::count=none
+monitor/watcher/test-reports-autoroll.sh::ledger=no::count=none
+monitor/watcher/test-reports-cache-stable.sh::ledger=no::count=none
+monitor/watcher/test-reports-roll.sh::ledger=no::count=none
+monitor/watcher/test-request-channel.sh::ledger=no::count=none
+monitor/watcher/test-requests-delivery-stamp.sh::ledger=no::count=none
+monitor/watcher/test-requests-inbox.sh::ledger=no::count=none
+monitor/watcher/test-respawn-async.sh::ledger=no::count=none
+monitor/watcher/test-respawn.sh::ledger=no::count=none
+monitor/watcher/test-run-tests-bounded.sh::ledger=no::count=none
+monitor/watcher/test-scheduler-priority-queue.sh::ledger=no::count=none
+monitor/watcher/test-secondary-clone-state.sh::ledger=no::count=none
+monitor/watcher/test-service-health-diagnostic.sh::ledger=yes::count=none
+monitor/watcher/test-settings-json.sh::ledger=no::count=none
+monitor/watcher/test-settings-overlay.sh::ledger=yes::count=none
+monitor/watcher/test-sigpipe-assertion-lint.sh::ledger=no::count=none
+monitor/watcher/test-skeptic-channel.sh::ledger=no::count=none
+monitor/watcher/test-skeptic-fidelity.sh::ledger=no::count=none
+monitor/watcher/test-snapshot-deliveries.sh::ledger=no::count=none
+monitor/watcher/test-snapshot-github-failure.sh::ledger=no::count=none
+monitor/watcher/test-snapshot-github.sh::ledger=no::count=none
+monitor/watcher/test-snapshot-mentions.sh::ledger=no::count=none
+monitor/watcher/test-snapshot-tmux-filter.sh::ledger=no::count=none
+monitor/watcher/test-spawn-fresh-orchestrator.sh::ledger=no::count=none
+monitor/watcher/test-spawn-pathfront.sh::ledger=no::count=none
+monitor/watcher/test-spawn-shape-manifest.sh::ledger=no::count=exact
+monitor/watcher/test-spawn-worker-cwd.sh::ledger=no::count=exact
+monitor/watcher/test-spawn-worker-reply-to.sh::ledger=no::count=none
+monitor/watcher/test-spawn-worker-resume.sh::ledger=no::count=none
+monitor/watcher/test-spawn-worker.sh::ledger=no::count=none
+monitor/watcher/test-startup-window-signal.sh::ledger=no::count=none
+monitor/watcher/test-stub-claude-manifest.sh::ledger=no::count=none
+monitor/watcher/test-svc-orphan-reconcile.sh::ledger=no::count=none
+monitor/watcher/test-svc.sh::ledger=no::count=none
+monitor/watcher/test-target-absent.sh::ledger=no::count=none
+monitor/watcher/test-target-window-live.sh::ledger=no::count=none
+monitor/watcher/test-task-registration-table.sh::ledger=no::count=none
+monitor/watcher/test-tmux-lookup-sigpipe.sh::ledger=no::count=none
+monitor/watcher/test-tmux-window-resolver.sh::ledger=no::count=exact
+monitor/watcher/test-trash-install.sh::ledger=no::count=none
+monitor/watcher/test-turn-failure-emit.sh::ledger=no::count=none
+monitor/watcher/test-unstick.sh::ledger=no::count=none
+monitor/watcher/test-upload-asset-bootstrap.sh::ledger=no::count=none
+monitor/watcher/test-upload-asset-concurrency.sh::ledger=no::count=none
+monitor/watcher/test-upload-asset-fd-leak.sh::ledger=no::count=none
+monitor/watcher/test-upload-asset-gitignore.sh::ledger=no::count=none
+monitor/watcher/test-v2-staging-tasks.sh::ledger=no::count=none
+monitor/watcher/test-verify-stack.sh::ledger=yes::count=none
+monitor/watcher/test-watcher-robustness.sh::ledger=no::count=none
+monitor/watcher/test-window-session-id.sh::ledger=no::count=none
+monitor/watcher/test-worker-health.sh::ledger=no::count=none
+monitor/watcher/test-worker-heartbeat.sh::ledger=no::count=none
+monitor/watcher/test-worker-nproc-bound.sh::ledger=no::count=none
+monitor/watcher/test-wrong-launch-guard.sh::ledger=no::count=none
+monitor/watcher/test-zsh-modifier-lint.sh::ledger=no::count=none
+
+# ── ENTERED THE POPULATION WHEN THE SELECTOR WAS FIXED (your-org/nexus-code#864)
+#
+# These 25 suites were NOT newly written and NOT newly unguarded. They were
+# invisible to the guard, because the selector grepped each file for the
+# literal `ALL TESTS PASSED` and these route their footer through
+# `th_summary_and_exit` — so the HELPER prints the banner and their own bytes
+# never carry it. Adopting the shared helper, which this manifest's own remedy
+# text prescribes, REMOVED a suite from the guard. Their absence was
+# indistinguishable from compliance.
+#
+# All 25 are `ledger=yes count=none`: the ledger protects them from announcing
+# a pass over zero assertions, and nothing protects them from announcing one
+# over too few. Recording that is the point; fixing it is each suite's own
+# work, and each needs an EXPECTED-count guard.
+monitor/test-bookkeeping-contract.sh::ledger=yes::count=none
+monitor/watcher/test-ambient-shell-option-scope.sh::ledger=yes::count=none
+monitor/watcher/test-channel-integration.sh::ledger=yes::count=none
+monitor/watcher/test-erofs-escalation.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-jupyter-service-real.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-realmodel-apispoof.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-realmodel-autosuggest.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-realmodel-blocked-question.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-realmodel-idle-busy.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-realmodel-long-exchange.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-realmodel-overlimit.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-realmodel-pretooluse-hook.sh::ledger=yes::count=none
+monitor/watcher/test-integration/test-realmodel-vimode.sh::ledger=yes::count=none
+monitor/watcher/test-notify-gate.sh::ledger=yes::count=none
+monitor/watcher/test-recovery-verb-mutation.sh::ledger=yes::count=none
+monitor/watcher/test-service-health.sh::ledger=yes::count=none
+monitor/watcher/test-shell-files.sh::ledger=yes::count=none
+monitor/watcher/test-supervisor-liveness.sh::ledger=yes::count=none
+monitor/watcher/test-target-config.sh::ledger=yes::count=none
+monitor/watcher/test-version-restart-self.sh::ledger=yes::count=none
+monitor/watcher/test-version-restart.sh::ledger=yes::count=none
+monitor/watcher/test-watcher-liveness-trichotomy.sh::ledger=yes::count=none
+monitor/watcher/test-watcher-singleton-groups.sh::ledger=yes::count=none
+monitor/watcher/test-watcher-supervise.sh::ledger=yes::count=none
+monitor/watcher/test-write-probe.sh::ledger=yes::count=none

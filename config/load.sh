@@ -61,7 +61,8 @@ done
 command -v python3 >/dev/null || { echo "load.sh: python3 required" >&2; exit 3; }
 
 NEXUS_CFG_PATH="$pick" NEXUS_EXAMPLE_PATH="$nexus_root/config/nexus.example.yml" KEY="$KEY" DEFAULT="$DEFAULT" python3 - <<'PY'
-import os, sys
+import os
+import re, sys
 try:
     import yaml
 except ImportError:
@@ -189,6 +190,68 @@ if key in ('--check-identity', '--validate'):
         placeholder = _dig(example, rkey)
         if placeholder is not None and str(effective) == str(placeholder):
             bad.append((rkey, str(effective), remedy))
+
+    # --- qualified issue references (your-org/nexus-code#866) ----------------
+    # A field whose value is an ISSUE resolves against a REPO. When the value
+    # is a bare number the repo comes from whatever the consuming code passes,
+    # which is invisible at the point the operator types it — and this repo is
+    # cloned by every operator, so the same number names different things in an
+    # asset repo and in the shared implementation repo. Checked in BOTH modes,
+    # because a misrouted reference is an identity-class error: it publishes to
+    # somebody else's thread while looking entirely successful.
+    #
+    # Empty is fine (no standing issue). Only a present-but-unqualified value
+    # is refused, and it is refused rather than corrected: a corrected NUMBER
+    # is right until the next reader supplies a different repo.
+    # Fields whose value is an ISSUE and which therefore resolve against a REPO.
+    # MUST be qualified `owner/repo#N`.
+    issue_refs = [
+        ('monitor.cc_auto_update.tracking_issue', 'MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE'),
+    ]
+    # DECLARED EXEMPTIONS (your-org/nexus-code#874 F3). A field is exempt only
+    # when its repo is a STATED SIBLING FIELD, so the pair is unambiguous even at
+    # its default — the bare number never has to be guessed against an implied
+    # repo. The exemption lives HERE, in the machinery, with its companion named:
+    # an exemption argued in some other file's header is invisible to the check
+    # that would otherwise enforce it, which is the same undeclared-exemption
+    # shape this validator exists to remove. Adding a field here is a deliberate
+    # act that must name the sibling that makes it safe.
+    issue_refs_exempt = [
+        ('monitor.remote.endpoint_issue', 'monitor.remote.endpoint_issue_repo'),
+    ]
+    for _k, _companion in issue_refs_exempt:
+        if _dig(cfg, _companion) is None and _dig(cfg, _k) is not None:
+            print("load.sh: NOTE — %s is exempt from qualification because %s "
+                  "states its repo, but that companion key is absent from this "
+                  "config." % (_k, _companion), file=sys.stderr)
+    unqualified = []
+    for rkey, envvar in issue_refs:
+        override = os.environ.get(envvar)
+        effective = override if override else _dig(cfg, rkey)
+        if effective is None:
+            continue
+        val = str(effective).strip()
+        if val == '':
+            continue
+        if not re.match(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9][0-9]*$', val):
+            unqualified.append((rkey, val))
+
+    if unqualified:
+        print("load.sh: REFUSING — an issue reference is not qualified with its repo:",
+              file=sys.stderr)
+        for rkey, val in unqualified:
+            print(f"    {rkey} = {val}", file=sys.stderr)
+            digits = ''.join(ch for ch in val if ch.isdigit()).lstrip('0') or 'N'
+            print(f'        -> set to "owner/repo#{digits}" (e.g. "your-org/nexus-code#{digits}")',
+                  file=sys.stderr)
+        print("  `#N` is repo-relative and this repo is cloned by every operator, so a bare",
+              file=sys.stderr)
+        print("  number silently resolves against whichever repo the consumer happens to pass.",
+              file=sys.stderr)
+        print("  Qualify it, or leave it empty. See config/nexus.example.yml for the field's note.",
+              file=sys.stderr)
+        print(f"  resolved config: {path}", file=sys.stderr)
+        sys.exit(4)
 
     if bad:
         what = 'nexus identity' if key == '--check-identity' else 'nexus config'

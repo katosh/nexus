@@ -46,7 +46,7 @@ set -uo pipefail
 
 if [ "${SLOW_TESTS:-0}" != "1" ]; then
     echo "skipped: $(basename "$0") (set SLOW_TESTS=1 to enable; ~30s wall-clock)"
-    exit 0
+    exit 77   # SKIP, not PASS (your-org/nexus-code#568 A6)
 fi
 
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)

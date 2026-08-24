@@ -52,7 +52,7 @@ faux_group_reap() {
         rest="${stat##*) }"
         read -r _ _ g _ <<<"$rest"
         [[ "$g" == "$pgid" ]] || continue
-        if tr '\0' '\n' < "$d/cmdline" 2>/dev/null | grep -qF "$WORK"; then
+        if grep -qF "$WORK" <<<"$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null)"; then
             ok=1; break
         fi
     done

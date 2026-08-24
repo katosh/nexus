@@ -93,13 +93,28 @@ emit_padding_rows() {
 # input row's 10-row preceding window (scanned by `_detect_busy`)
 # falls entirely within the freshly-cleared visible area, never
 # reaching into the scrollback residue from a prior busy phase.
+#
+# NO DIM RUN AFTER THE CHEVRON — and this row deliberately carries no
+# closing `│`. `_detect_dim_run` (`#626`) inspects `${input_row#*❯}` for
+# `\x1b[2m` followed by a visible character, and a DIM CLOSING BORDER on
+# the input row is exactly that: the ghost-text detector fires on the box,
+# not on any suggestion. This row used to end `…$DIM│$RESET`, so the stub's
+# idle frame classified `autosuggest-only` FOREVER, and
+# `test-spawn-busy-idle-absent.sh`'s `state=idle` probe could never pass —
+# measured red at 16728e7 on this host, 28 s of polling, deterministic
+# rather than a timeout. The stub was wrong, not the classifier: every real
+# and synthetic idle capture under `monitor/watcher/fixtures/` (9 of 9,
+# including the `realmodel` one) classifies `idle`, and NONE carries a dim
+# run after the chevron — the closing border is not part of the captured
+# input row in Claude Code's own renderer. Keep it that way; a stub whose
+# frames classify differently from real captures tests the stub.
 render_idle_frame() {
     clear_pane
     emit_padding_rows 12
     printf '%s%s%s\n' \
         "$DIM" "╭─────────────────────────────────────────────────╮" "$RESET"
-    printf '%s│%s ❯%s%s %s                                               %s│%s\n' \
-        "$DIM" "$RESET" "$NBSP" "$REVERSE" "$RESET" "$DIM" "$RESET"
+    printf '%s│%s ❯%s%s %s\n' \
+        "$DIM" "$RESET" "$NBSP" "$REVERSE" "$RESET"
     printf '%s%s%s\n' \
         "$DIM" "╰─────────────────────────────────────────────────╯" "$RESET"
 }

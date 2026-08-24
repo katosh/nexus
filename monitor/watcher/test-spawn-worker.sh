@@ -15,6 +15,27 @@ set -uo pipefail
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SCRIPT_REAL="$_test_dir/../spawn-worker.sh"
 
+# ---- HERMETIC ENV (your-org/nexus-code#655) -----------------------------
+#
+# This suite builds a FIXTURE nexus and invokes the fixture's copy of
+# spawn-worker.sh. But #577's root resolution honours a VALID INHERITED
+# $NEXUS_ROOT over its own script-relative root -- correctly, that is the
+# whole point of #577 -- so an ambient NEXUS_ROOT silently redirects every
+# prompt-composition assertion at the PRIMARY's floor, worker-settings and
+# reports dir instead of the fixture's.
+#
+# Every nexus-spawned agent has NEXUS_ROOT exported, and CI does not: its
+# cell is literally named `unit suite (NEXUS_ROOT unset)`. That single
+# variable is #655's "dev red locally / green in CI", measured:
+#
+#     test-spawn-worker.sh          75 pass / 24 fail  ->  101 / 0
+#     test-spawn-worker-resume.sh   55 pass / 48 fail  ->  103 / 0
+#
+# It is NOT the bash 4.4 vs 5.2 axis -- CI's dedicated 4.4 cell is green.
+# Scrub it here so the suite means the same thing in both environments; a
+# test whose verdict depends on the caller's exported env is not a test.
+unset NEXUS_ROOT
+
 PASS=0
 FAIL=0
 
@@ -82,6 +103,13 @@ cp "$_test_dir/../_claude-bin.sh" "$FAKE_NEXUS/monitor/_claude-bin.sh"
 cp "$_test_dir/../_tmux-window.sh" "$FAKE_NEXUS/monitor/_tmux-window.sh"
 # And the shared frontmatter reader (#405 P2) for report resolution.
 cp "$_test_dir/../_fm_lib.sh" "$FAKE_NEXUS/monitor/_fm_lib.sh"
+# The shim-guard TEMPLATE (your-org/nexus-code#589). spawn-worker.sh emits its
+# launcher guard from monitor/guard-block.sh.in and REFUSES rather than
+# emitting an empty block, so this fixture must supply it like any other hard
+# dependency. (No assert helper is copied: absent under BOTH roots the
+# launcher refuses, but this suite never RUNS a launcher — it inspects the
+# generated prompt — so the guard is emitted and simply never executed.)
+cp "$_test_dir/../guard-block.sh.in" "$FAKE_NEXUS/monitor/guard-block.sh.in"
 # The #545 spawn-skeptic auto-ack step shells out to request-channel.sh
 # (+ its lib) to ack the pending request when a --skeptic-role spawn runs.
 cp "$_test_dir/../request-channel.sh" "$FAKE_NEXUS/monitor/request-channel.sh"
@@ -569,6 +597,127 @@ if [[ -f "$REAL_FLOOR_SKILL" ]]; then
                     "$floor_body" "scancel <jobid>"
 fi
 
+# ---- Test 7d: the force-push BOUNDARY, not a blanket ban (#835) --------
+#
+# The floor used to say "never force-push", flat. That contradicted the
+# merge gate, which REQUIRES a rebase onto the current base before merge:
+# a `pull_request` run is computed against a merge ref built at run
+# creation and `rerun-failed-jobs` reuses that same stale ref, so a later
+# green can describe a base that has moved — and rebasing onto the current
+# base makes the push non-fast-forward.
+#
+# NOTE: an earlier version of this comment said "only a NEW HEAD
+# re-evaluates". That was REFUTED by experiment — the merge ref is
+# DEMAND-TRIGGERED, recomputed when something queries the PR's
+# mergeability (measured: stale for 26h and 36h; refreshed within two
+# minutes of one GET). The carve-out is unaffected: a rebase still makes
+# the push non-fast-forward. Only the mechanism sentence was wrong.
+#
+# The blanket ban is the dangerous regression here, because it READS as
+# correct: a reviewer restoring it sees a safety rule being tightened, not
+# a rule that tells every worker to refuse a rebase CI depends on. Hence
+# an explicit negative assertion rather than trusting review.
+
+echo '=== force-push: floor carries the boundary, hook carries the how (#835) ==='
+if [[ -f "$REAL_FLOOR_SKILL" ]]; then
+    floor_body=$(awk '/^## Worker floor$/{f=1;next} /^## /{f=0} f' "$REAL_FLOOR_SKILL")
+    # The carve-out must be present and must be SCOPED. "shared" is the
+    # load-bearing word: without it the sentence licenses force-pushing dev.
+    assert_contains "floor scopes the ban to a SHARED branch" \
+                    "$floor_body" "force-push a **shared** branch"
+    assert_contains "floor still names dev and main as shared" \
+                    "$floor_body" '(`dev`, `main`'
+    # The discriminator must be OBSERVABLE. An author-keyed one is not:
+    # every agent here commits with the operator's identity, so "another
+    # author's commits" has no referent a worker can check (#835 skeptic).
+    assert_contains "floor keys the boundary on a CHECKABLE property" \
+                    "$floor_body" "someone else has pushed commits to"
+    assert_not_contains "floor does NOT key the boundary on AUTHORSHIP" \
+                    "$floor_body" "another author's commits"
+    assert_contains "floor licenses the rebase force-push on your OWN branch" \
+                    "$floor_body" "PR branch after rebasing it onto the current base is expected"
+    # The blanket forms, explicitly refused — matched against a
+    # WHITESPACE-FLATTENED copy. The floor is hand-wrapped prose, so the
+    # restored ban would almost certainly arrive split across a line break
+    # ("Never `--no-verify`, never\n  force-push; …"), and a raw substring
+    # check sails straight past it. Found by mutation-testing this very
+    # assertion: reverting the floor left it GREEN while five siblings went
+    # red. A negative assertion that only fires on one line-wrapping of the
+    # text it forbids is not a guard.
+    floor_flat=$(printf '%s' "$floor_body" | tr '\n' ' ' | tr -s ' ')
+    assert_not_contains "floor does NOT carry the blanket 'never force-push;'" \
+                    "$floor_flat" "never force-push;"
+    assert_not_contains "floor does NOT carry the old 'no-verify, never' blanket" \
+                    "$floor_flat" '`--no-verify`, never force-push'
+    # The floor states the boundary only — the runnable precondition is the
+    # hook's job. Keeping it out is what holds the per-spawn token cost down.
+    assert_not_contains "floor does NOT inline the precondition command" \
+                    "$floor_body" "origin/dev..HEAD"
+fi
+if [[ -f "$FOOTGUN_CONF" ]]; then
+    conf_body=$(cat "$FOOTGUN_CONF")
+    assert_contains "footgun conf points at the FAIL-CLOSED checker" \
+                    "$conf_body" "monitor/force-push-check.sh <your git push args>"
+    assert_contains "footgun conf warns the hand-rolled form is vacuous when blind" \
+                    "$conf_body" "FOUR measured false-clearance modes"
+    assert_contains "footgun conf warns the author check cannot see a sibling" \
+                    "$conf_body" "an AUTHOR check cannot see a sibling"
+    assert_contains "footgun conf says --force-with-lease does not backstop it" \
+                    "$conf_body" "lease is satisfied by the very fetch"
+    assert_contains "footgun conf explains why a new head is required" \
+                    "$conf_body" "after rebasing it onto the current base is EXPECTED"
+    assert_contains "footgun conf prefers --force-with-lease" \
+                    "$conf_body" "force-with-lease"
+    # ROW ORDER is load-bearing: bash-footgun-guard.sh takes the FIRST
+    # matching row, and the generic `git-push` regex matches every
+    # force-push too. If the force-push rows drift below it, a force-push
+    # silently receives the generic cwd-leak reminder instead of the
+    # boundary — no error, no failing match, just the wrong advice at the
+    # one moment it matters. Compare line numbers, not mere presence.
+    fp_line=$(grep -n '^force-push|' "$FOOTGUN_CONF" | head -1 | cut -d: -f1)
+    gp_line=$(grep -n '^git-push|'   "$FOOTGUN_CONF" | head -1 | cut -d: -f1)
+    if [[ -n "$fp_line" && -n "$gp_line" ]] && (( fp_line < gp_line )); then
+        printf '  PASS: force-push rows precede the generic git-push row (first match wins)\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: force-push row must precede git-push (force-push=%s git-push=%s)\n' \
+            "${fp_line:-none}" "${gp_line:-none}" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+    # The conf's FIELD SEPARATOR is `|`, so a regex field holding a bare `|`
+    # is silently TRUNCATED at that byte — the row still parses, matches
+    # something narrower than intended, and nothing errors. Assert the
+    # property structurally rather than by row count: field 3 of every row
+    # must contain no bare `|`. (`\p` is the hook's literal-pipe escape and
+    # is substituted after splitting, so it is legal and must be tolerated.)
+    bare_pipe_rows=$(awk -F'|' '/^[a-z]/ { if ($3 ~ /\|/) print }' "$FOOTGUN_CONF" | wc -l)
+    if [[ "$bare_pipe_rows" -eq 0 ]]; then
+        printf '  PASS: no conf regex field contains a bare `|` (would truncate silently)\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %s conf row(s) have a `|` in the regex field — use `\\p`\n' "$bare_pipe_rows" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+    # All three force forms must be covered. `+refspec` is the one that
+    # matters most: `git push origin +dev` IS the forbidden act (#835 skeptic).
+    # Compare the REGEX FIELDS as fixed strings — the forms are themselves
+    # regex source, so matching them as patterns re-reads `[a-zA-Z]` as a
+    # bracket expression and silently never matches.
+    fp_regexes=$(awk -F'|' '/^force-push\|/ { print $3 }' "$FOOTGUN_CONF")
+    while IFS= read -r _form; do
+        [ -n "$_form" ] || continue
+        if grep -qF -- "$_form" <<<"$fp_regexes"; then
+            printf '  PASS: force-push row covers %s\n' "$_form"; PASS=$(( PASS + 1 ))
+        else
+            printf '  FAIL: no force-push row covers %s\n' "$_form" >&2; FAIL=$(( FAIL + 1 ))
+        fi
+    done <<'FORMS'
+--force
+[[:space:]]-[a-zA-Z]*f
+[[:space:]]\+
+FORMS
+fi
+
 # ---- Test 8: loop-wrapper opt-in switches the launcher shape -----------
 #
 # Issue #75. When MONITOR_RETAIN_USE_LOOP_WRAPPER=1, the launcher
@@ -806,6 +955,253 @@ else
     printf '  FAIL: bash-footgun-guard.sh not found at %s\n' "$FOOTGUN_HOOK" >&2
     FAIL=$(( FAIL + 1 ))
 fi
+
+# ---- Test 7: the stateful arg parser (your-org/nexus-code#568 D11 + B7) ----
+#
+# TWO gaps this closes, both in the same ~155-line hand-rolled state machine:
+#
+#   D11: `--topic` was the ONLY flag with zero test references anywhere in the
+#        suite — neither its value form nor its missing-value error branch.
+#   B7:  nothing anywhere asserted what happens when a flag's VALUE ITSELF
+#        LOOKS LIKE A FLAG (`--topic --model`). That is the classic failure of
+#        a `for arg in "$@"` parser that cannot `shift`: the "expecting a
+#        value" state has to be threaded by hand through eleven separate
+#        `expect_*_val` variables, and the one case that distinguishes a
+#        correct implementation from a subtly wrong one was untested. Writing
+#        it FIRST is what makes the collapse to a `while`/`shift` loop provable
+#        rather than hopeful.
+#
+# `--print-prompt` is the seam: it runs the whole parser and exits before any
+# tmux/spawn side effect, so these are pure, fast parser assertions.
+
+echo '=== arg parser: value-taking flags, incl. values that look like flags ==='
+
+parse_out() {  # parse_out <args...> → stdout of a --print-prompt run
+    PATH="$STUB_BIN:$PATH" "$SCRIPT" -n parser-win -c "$WORKDIR" -p "$PROMPT_FILE" \
+        --print-prompt "$@" 2>/dev/null
+}
+parse_err() {  # parse_err <args...> → "<rc>|<stderr>"
+    local e r
+    e=$(PATH="$STUB_BIN:$PATH" "$SCRIPT" -n parser-win -c "$WORKDIR" -p "$PROMPT_FILE" \
+        --print-prompt "$@" 2>&1 >/dev/null); r=$?
+    printf '%s|%s' "$r" "$e"
+}
+
+# D11: --topic in both spellings must be consumed, not leaked into the prompt
+# body as a positional.
+out=$(parse_out --topic refactor-the-parser)
+assert_not_contains "--topic <value> is consumed, not treated as prompt text" \
+                    "$out" "refactor-the-parser"
+out=$(parse_out --topic=refactor-the-parser)
+assert_not_contains "--topic=<value> is consumed, not treated as prompt text" \
+                    "$out" "refactor-the-parser"
+
+# D11: the missing-value error branch (spawn-worker.sh's `--topic requires a
+# value`) had no coverage at all.
+r=$(parse_err --topic)
+case "$r" in
+    0\|*) printf '  FAIL: bare --topic should be an error, exited 0\n' >&2; FAIL=$(( FAIL + 1 )) ;;
+    *"--topic requires a value"*) printf '  PASS: bare --topic errors with its own message\n'; PASS=$(( PASS + 1 )) ;;
+    *) printf '  FAIL: bare --topic: unexpected result %s\n' "$r" >&2; FAIL=$(( FAIL + 1 )) ;;
+esac
+
+# B7's proof gap: a value that is itself flag-shaped. The parser is stateful,
+# so `--topic --model` MUST consume `--model` AS THE TOPIC VALUE (the state
+# machine is in "expecting a value"), and must NOT re-interpret it as the
+# --model flag. Whatever the parser does here is its contract; assert it, so a
+# rewrite has something to preserve.
+r=$(parse_err --topic --model)
+case "$r" in
+    *"--model requires a value"*)
+        printf '  FAIL: --topic --model: the value was re-read as a flag (state machine leaked)\n' >&2
+        FAIL=$(( FAIL + 1 )) ;;
+    0\|*) printf '  PASS: --topic --model consumes "--model" AS the topic value (stateful, no re-dispatch)\n'
+        PASS=$(( PASS + 1 )) ;;
+    *) printf '  FAIL: --topic --model: unexpected result %s\n' "$r" >&2; FAIL=$(( FAIL + 1 )) ;;
+esac
+
+# Same shape on the other value-taking flags, so the whole family is pinned.
+for flag in --kind --model --issue --reply-to --skeptic --skeptic-depth; do
+    r=$(parse_err "$flag")
+    case "$r" in
+        0\|*) printf '  FAIL: bare %s should be an error, exited 0\n' "$flag" >&2; FAIL=$(( FAIL + 1 )) ;;
+        *"$flag requires a"*) printf '  PASS: bare %s errors with its own message\n' "$flag"; PASS=$(( PASS + 1 )) ;;
+        *) printf '  FAIL: bare %s: unexpected result %s\n' "$flag" "$r" >&2; FAIL=$(( FAIL + 1 )) ;;
+    esac
+done
+
+# ══ your-org/nexus-code#814: the clone-freshness block ═════════════════════
+#
+# A worker pinned into a stale clone draws a repo-wide NEGATIVE from an object
+# store missing the commits that would refute it. The prompt now carries how
+# old the clone's knowledge of its remote is — and specifically NOT
+# `.git/FETCH_HEAD` mtime, which #814 proposed and then disproved: a FAILED
+# fetch truncates it to zero bytes and updates its mtime, so it reads fresher
+# than the tree is in exactly the failure case that matters.
+#
+# The FETCH_HEAD case below is the load-bearing one. It builds a clone that is
+# genuinely 1 commit behind, points it at an unreachable remote, fails a fetch
+# (so FETCH_HEAD is zero bytes with a BRAND-NEW mtime), and asserts the emitted
+# block still reports the OLD ref. A regression to the mtime probe passes every
+# other assertion here and fails this one.
+echo '=== #814: the prompt carries the clone freshness block ==='
+FRESH_ROOT="$WORK/freshness"
+mkdir -p "$FRESH_ROOT"
+git init -q "$FRESH_ROOT/upstream"
+git -C "$FRESH_ROOT/upstream" config user.email t@t
+git -C "$FRESH_ROOT/upstream" config user.name t
+echo one > "$FRESH_ROOT/upstream/a"
+git -C "$FRESH_ROOT/upstream" add -A
+# Back-dated, not `sleep`-separated. The FETCH_HEAD control below compares the
+# file's mtime (now) against this commit's date, and at real-clock speed the
+# whole fixture lands inside ONE second — the first draft tied at
+# 1786185465 == 1786185465 and went red on a `>`. A fixed old date makes the
+# comparison deterministic instead of a race the suite would lose occasionally
+# and blame on load.
+GIT_AUTHOR_DATE='2020-01-01T00:00:00 +0000' \
+GIT_COMMITTER_DATE='2020-01-01T00:00:00 +0000' \
+    git -C "$FRESH_ROOT/upstream" commit -qm one
+git -C "$FRESH_ROOT/upstream" branch -M main
+git clone -q "$FRESH_ROOT/upstream" "$FRESH_ROOT/clone" 2>/dev/null
+git -C "$FRESH_ROOT/clone" config user.email t@t
+git -C "$FRESH_ROOT/clone" config user.name t
+STALE_SHA=$(git -C "$FRESH_ROOT/clone" rev-parse --short origin/main)
+
+out=$("$SCRIPT" -n fresh-win -c "$FRESH_ROOT/clone" -p "$PROMPT_FILE" --print-prompt 2>&1)
+rc=$?
+assert_eq        "#814 --print-prompt still exits 0"   "$rc" "0"
+assert_contains  "#814 the block is present"           "$out" "Clone freshness"
+assert_contains  "#814 it reports the remote-tracking ref"    "$out" "origin/main"
+assert_contains  "#814 it reports the ref's SHA"       "$out" "$STALE_SHA"
+assert_contains  "#814 it states the negative-claim rule" "$out" \
+                 "ONLY AS OLD AS THAT DATE"
+assert_contains  "#814 it names the local-object-store trap" "$out" \
+                 "git log --all"
+# NO "newest remote-tracking ref anywhere" line — see the F2 case below for why
+# that claim was removed rather than qualified.
+assert_not_contains "#814 F2 no falsifiable \"bound on your knowledge\" claim" \
+                 "$out" "newest remote-tracking ref"
+
+echo '=== #814 THE REFUTATION: a failed fetch must NOT make the clone look fresh ==='
+# Advance upstream so the clone is genuinely behind, then break the remote and
+# fail a fetch — the shape #814 measured (`x-access-token` URL, "Invalid
+# username or token").
+echo two > "$FRESH_ROOT/upstream/b"
+git -C "$FRESH_ROOT/upstream" add -A
+git -C "$FRESH_ROOT/upstream" commit -qm two
+NEW_SHA=$(git -C "$FRESH_ROOT/upstream" rev-parse --short HEAD)
+git -C "$FRESH_ROOT/clone" remote set-url origin "$FRESH_ROOT/does-not-exist"
+GIT_TERMINAL_PROMPT=0 git -C "$FRESH_ROOT/clone" fetch origin >/dev/null 2>&1
+FH="$FRESH_ROOT/clone/.git/FETCH_HEAD"
+FH_SIZE=$(stat -c %s "$FH" 2>/dev/null || echo missing)
+assert_eq        "#814 CONTROL: the failed fetch truncated FETCH_HEAD to 0 bytes" \
+                 "$FH_SIZE" "0"
+# …and its mtime is now NEWER than the ref it is supposed to describe. This is
+# the measurement that kills the mtime probe; assert it rather than assert it
+# in prose.
+FH_MTIME=$(stat -c %Y "$FH" 2>/dev/null || echo 0)
+REF_MTIME=$(git -C "$FRESH_ROOT/clone" log -1 --format=%ct origin/main 2>/dev/null || echo 0)
+if (( FH_MTIME > REF_MTIME )); then
+    printf '  PASS: #814 CONTROL: FETCH_HEAD mtime is NEWER than the ref it describes\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: #814 CONTROL: expected FETCH_HEAD mtime (%s) > ref date (%s)\n' \
+        "$FH_MTIME" "$REF_MTIME" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+out=$("$SCRIPT" -n fresh-win2 -c "$FRESH_ROOT/clone" -p "$PROMPT_FILE" --print-prompt 2>&1)
+assert_contains  "#814 the block STILL reports the stale ref after a failed fetch" \
+                 "$out" "$STALE_SHA"
+assert_not_contains "#814 …and does NOT report the unfetched upstream commit" \
+                 "$out" "$NEW_SHA"
+assert_contains  "#814 the block warns against the FETCH_HEAD mtime probe" \
+                 "$out" "FETCH_HEAD"
+
+echo '=== #814 F2: a clone that PUSHED but never fetched must NOT read fresh ==='
+# Skeptic finding F2, the one that would not merge. `git push` writes
+# refs/remotes/origin/<branch> LOCALLY without fetching anything, so any signal
+# derived from remote-tracking ref dates advances on the worker's own push while
+# the clone learns nothing — a LOCAL operation moving a REMOTE-knowledge
+# indicator, the same shape as the FETCH_HEAD mtime probe this block rejects,
+# and falsified in the OPTIMISTIC direction.
+#
+# This is the fixture that control was missing: the clone is genuinely blind to
+# upstream commits, then does exactly what every nexus worker does — branch,
+# commit, push -u.
+git -C "$FRESH_ROOT/clone" remote set-url origin "$FRESH_ROOT/upstream"
+git -C "$FRESH_ROOT/clone" checkout -q -b operator/mytask
+echo mine > "$FRESH_ROOT/clone/mine"
+git -C "$FRESH_ROOT/clone" add -A
+git -C "$FRESH_ROOT/clone" commit -qm "my work"
+git -C "$FRESH_ROOT/clone" push -q -u origin operator/mytask 2>/dev/null
+# Ground truth: the clone still cannot see the upstream commit made earlier.
+PUSH_BLIND=$(git -C "$FRESH_ROOT/clone" cat-file -e "$NEW_SHA" 2>/dev/null && echo NO || echo YES)
+assert_eq        "#814 F2 CONTROL: the clone really is blind to upstream" "$PUSH_BLIND" "YES"
+
+out=$("$SCRIPT" -n pushed-win -c "$FRESH_ROOT/clone" -p "$PROMPT_FILE" --print-prompt 2>&1)
+assert_contains  "#814 F2 the block still reports the STALE default-branch sha" \
+                 "$out" "$STALE_SHA"
+assert_not_contains "#814 F2 …and never the unfetched upstream commit" "$out" "$NEW_SHA"
+# The load-bearing negative: nothing in the block may present the worker's own
+# push as evidence of remote knowledge.
+assert_not_contains "#814 F2 no \"bound on your knowledge\" claim survives" \
+                 "$out" "cannot know anything the remote did after this"
+# And the resolution order must not have picked the pushed branch.
+assert_not_contains "#814 F2 the pushed feature branch is not the primary line" \
+                 "$out" "resolved via @{upstream}"
+assert_contains  "#814 F2 the default branch is what is reported"      "$out" \
+                 "resolved via origin/HEAD"
+
+echo '=== #814: a clone with NO remote says UNKNOWN, not fresh ===''
+# The silent-absence arm. #814 suggested a hardcoded `origin/main`, which emits
+# NOTHING in a repo that has no such ref — the same defect class one level up.
+git init -q "$FRESH_ROOT/noremote"
+git -C "$FRESH_ROOT/noremote" config user.email t@t
+git -C "$FRESH_ROOT/noremote" config user.name t
+git -C "$FRESH_ROOT/noremote" commit -q --allow-empty -m x
+out=$("$SCRIPT" -n nrem-win -c "$FRESH_ROOT/noremote" -p "$PROMPT_FILE" --print-prompt 2>&1)
+rc=$?
+assert_eq        "#814 no-remote clone still exits 0"  "$rc" "0"
+assert_contains  "#814 no-remote says NONE RESOLVED"   "$out" "NONE RESOLVED"
+assert_contains  "#814 …and calls it UNKNOWN, not fresh" "$out" "is UNKNOWN, not fresh"
+
+echo '=== #814: a non-git workdir degrades cleanly, does not break the spawn ==='
+mkdir -p "$FRESH_ROOT/plain"
+out=$("$SCRIPT" -n plain-win -c "$FRESH_ROOT/plain" -p "$PROMPT_FILE" --print-prompt 2>&1)
+rc=$?
+assert_eq        "#814 non-git workdir still exits 0"  "$rc" "0"
+assert_contains  "#814 non-git workdir says so"        "$out" "NOT A GIT REPOSITORY"
+assert_contains  "#814 CONTROL: the rest of the prompt is intact" "$out" \
+                 "FLOOR_MARKER_TOKEN_a78b21"
+
+echo '=== #814: the REAL worker floor carries the negative-claim rule ==='
+# #814 item 2. Asserted against the REAL skills file, not the fake floor this
+# suite injects: the composed-prompt assertions above use a fixture floor, so
+# they would pass with the rule absent from the thing that actually ships.
+# Extract the same way spawn-worker.sh does — `## Worker floor` to the next H2
+# — so a rule that drifts BELOW that boundary (and therefore never reaches a
+# worker) goes red rather than passing on a whole-file grep.
+REAL_FLOOR=$(awk '
+  /^## Worker floor[[:space:]]*$/ { in_floor = 1; next }
+  in_floor && /^## / { exit }
+  in_floor { print }
+' "$_test_dir/../../skills/nexus.worker-defaults/SKILL.md" 2>/dev/null)
+# Whitespace-squeezed, because the floor is hard-wrapped prose: asserting a
+# phrase that happens to straddle a line break makes the test a hostage to
+# reflow, and "reflow the paragraph" would then read as a real regression.
+REAL_FLOOR_FLAT=$(printf '%s' "$REAL_FLOOR" | tr '\n' ' ' | tr -s ' ')
+assert_contains  "#814 the shipped floor states the fetch-age rule" "$REAL_FLOOR_FLAT" \
+                 "only as old as its last fetch"
+assert_contains  "#814 …and names the local-object-store readers by name" "$REAL_FLOOR" \
+                 "git log --all"
+assert_contains  "#814 …and refuses the FETCH_HEAD mtime probe" "$REAL_FLOOR" \
+                 "FETCH_HEAD"
+# Skeptic infra item 1: the rule named only the READ side of the family. The
+# WRITE side — your own push makes your clone look fresh — is the one an agent
+# triggers by following this floor's own instruction to push its branch.
+assert_contains  "#814 F2 …and names the WRITE side of the family too" \
+                 "$REAL_FLOOR_FLAT" "your own \`git push\`"
 
 # ---- summary ----------------------------------------------------------
 

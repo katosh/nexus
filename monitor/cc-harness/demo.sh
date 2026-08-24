@@ -87,7 +87,10 @@ stop_demo() {
             && echo "killed session $DEMO_SESSION (default socket)" \
             || echo "no session $DEMO_SESSION on default socket"
     else
-        dtmux kill-server 2>/dev/null && echo "killed tmux server (-L $DEMO_SOCKET)" || echo "no tmux server on -L $DEMO_SOCKET"
+        # -L spelled out HERE rather than inherited from SOCKET_ARGS: this is
+        # a kill-server, so its target must be provable from the call site,
+        # not from the branch invariant above (#644).
+        "$(_real_tmux)" -L "$DEMO_SOCKET" kill-server 2>/dev/null && echo "killed tmux server (-L $DEMO_SOCKET)" || echo "no tmux server on -L $DEMO_SOCKET"
     fi
     if [[ -f "$STATE_ROOT/mock.pid" ]]; then
         kill "$(cat "$STATE_ROOT/mock.pid")" 2>/dev/null && echo "stopped mock backend"
@@ -122,7 +125,8 @@ PY=$(_python) || { echo "no python3" >&2; exit 1; }
 if [[ -n "$HERE" ]]; then
     dtmux kill-session -t "$DEMO_SESSION" 2>/dev/null
 else
-    dtmux kill-server 2>/dev/null
+    # See stop_demo(): -L explicit so the target is provable at the call site.
+    "$(_real_tmux)" -L "$DEMO_SOCKET" kill-server 2>/dev/null
 fi
 [[ -f "$STATE_ROOT/mock.pid" ]] && kill "$(cat "$STATE_ROOT/mock.pid")" 2>/dev/null
 reset_state_root

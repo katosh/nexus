@@ -110,21 +110,81 @@ _fm_get() {
 # wrapper over the shared `_fm_get`.
 reply_state() { _fm_get "$1" state; }
 
+# ── THE CLIENT-SIDE PORT DEFAULT (your-org/nexus-code#893, F1) ──────────
+#
+# This MUST mirror `_remote_derived_port` in monitor/_remote_lib.sh:
+#
+#     22100 + cksum(<operator's unix account>) % 900
+#
+# `#893` moved the SERVER off the shared constant 22022 and left this client
+# default at 22022 — so the two halves of one fix disagreed, and a client on
+# the default reached either nothing or ANOTHER OPERATOR'S ENDPOINT, which is
+# `#893`'s own failure mode arriving from the other side. (It fails closed —
+# ssh verifies the host key before offering the client key, so no credential is
+# presented to a stranger — but pointing a client at a third party is not a
+# default worth keeping.)
+#
+# THE IDENTITY IS THE SSH LOGIN USER, and that is not a coincidence: the server
+# derives from ITS `$USER`, sshd is launched with `AllowUsers=$USER`, and the
+# endpoint dialect hands the client that same account as <SSH-USER>. So the one
+# value the client must already know to connect is exactly the one the port
+# derives from.
+#
+# WHY THE FORMULA IS DUPLICATED RATHER THAN SOURCED: this file is SHIPPED TO
+# THE CLIENT'S MACHINE and must stand alone — it cannot source
+# monitor/_remote_lib.sh, which lives only in the operator's sandbox. The
+# duplication is therefore forced, and the mitigation is a cross-implementation
+# AGREEMENT TEST (test-nexus-client-port-derivation.sh) that fails if these two
+# ever disagree on any identity. Do not "fix" a drift by editing one side.
+#
+# POSIX sh only (`cksum`, `awk` — both POSIX); no bashisms, this runs under the
+# client's /bin/sh.
+_nexus_derived_port() {
+    _npd_id="${1:-}"
+    [ -n "$_npd_id" ] || return 1
+    _npd_crc=$(printf '%s' "$_npd_id" | cksum 2>/dev/null | awk '{print $1}')
+    case "$_npd_crc" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    printf '%s' "$(( 22100 + _npd_crc % 900 ))"
+}
+
 # Resolve the ssh identity from $ssh_alias (+ NEXUS_REMOTE_SSH_* overrides).
 # Sets $SSH (the program, default `ssh` — the hermetic-test seam) and $SSH_ID
 # (the connection args). Both are left unquoted on use so a stub like
 # SSH="sh test/fake-ssh.sh" word-splits correctly.
+# rc 1 (with a log line) when the endpoint cannot be resolved — see the port
+# rules above; callers must not proceed on a non-zero return.
 resolve_ssh_id() {
     : "${SSH:=ssh}"
     if [ -n "${NEXUS_REMOTE_SSH_HOST:-}" ]; then
-        _port="${NEXUS_REMOTE_SSH_PORT:-22022}"
+        _port="${NEXUS_REMOTE_SSH_PORT:-}"
         _user="${NEXUS_REMOTE_SSH_USER:-}"
         _key="${NEXUS_REMOTE_SSH_KEY:-$HOME/.ssh/nexus-remote}"
+        if [ -z "$_port" ]; then
+            # Derive from the login user when we have it. NEVER fall back to a
+            # constant: 22022 pointed at a stranger, and any other hardcoded
+            # number would be the same defect with a different digit.
+            if [ -n "$_user" ]; then
+                _port=$(_nexus_derived_port "$_user") || _port=''
+            fi
+        fi
+        if [ -z "$_port" ]; then
+            # FAIL LOUD. Without the login user the client cannot derive the
+            # operator's port and must not guess — a guess here is a connection
+            # attempt against whoever happens to hold that port.
+            log "cannot determine the remote port: NEXUS_REMOTE_SSH_HOST is set but NEXUS_REMOTE_SSH_PORT is not,"
+            log "  and NEXUS_REMOTE_SSH_USER is unset so the per-operator port cannot be derived (nexus-code#893)."
+            log "  Set NEXUS_REMOTE_SSH_PORT explicitly (your operator's setup message carries it), or set"
+            log "  NEXUS_REMOTE_SSH_USER to the operator's login account so it can be derived."
+            return 1
+        fi
         _target="${_user:+$_user@}$NEXUS_REMOTE_SSH_HOST"
         SSH_ID="-p $_port -i $_key $_target"
     else
         SSH_ID="$ssh_alias"
     fi
+    return 0
 }
 
 # ---- deliver: stdout is the event; mirror atomically to --out ----------

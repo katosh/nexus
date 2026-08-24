@@ -49,18 +49,9 @@ assert_eq() {
     fi
 }
 
-assert_contains() {
-    local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
-        printf '  PASS: %s\n' "$label"
-        PASS=$(( PASS + 1 ))
-    else
-        printf '  FAIL: %s\n' "$label" >&2
-        printf '         expected to find: %s\n' "$needle" >&2
-        printf '         in:\n%s\n' "$hay" | sed 's/^/           /' >&2
-        FAIL=$(( FAIL + 1 ))
-    fi
-}
+# assert_eq / assert_contains come from _test_helpers.sh (sourced above).
+# A byte-identical local copy used to shadow the helper here — dead code by
+# definition, and the kind that quietly diverges (your-org/nexus-code#568 D8).
 
 # ---- harness setup -------------------------------------------------------
 

@@ -24,6 +24,26 @@
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/_test_helpers.sh"
 
+# ---- HERMETIC ENV (your-org/nexus-code#655) -----------------------------
+#
+# The THIRD suite on this variable, and it leaks by a different path than the
+# other two -- which is why a static "does it build a fixture nexus?" sweep
+# does not find it. This file never mentions NEXUS_ROOT or a fixture at all.
+#
+# It PATH-shadows `sandbox-notify` with a recording stub in $STUB_BIN. But
+# `monitor/locals-env.sh:177` prepends `$NEXUS_ROOT/monitor/notifywrap` to the
+# FRONT of PATH -- ahead of the stub -- so with an ambient NEXUS_ROOT the real
+# wrapper services the alarm, the stub never runs, and the two
+# `alarm rang sandbox-notify` assertions read an empty log. Deterministic:
+#
+#     env -u NEXUS_ROOT   ->  36 passed, 0 failed   (x3)
+#     ambient NEXUS_ROOT  ->  34 passed, 2 failed   (x3)
+#
+# Every nexus-spawned agent exports NEXUS_ROOT; CI does not. Same root cause as
+# the two spawn-worker suites, same fix, different leak path: there the
+# inherited root overrode a FIXTURE root, here it front-runs a PATH STUB.
+unset NEXUS_ROOT
+
 _dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=monitor/watcher/_lib.sh
 source "$_dir/_lib.sh"

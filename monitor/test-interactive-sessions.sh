@@ -118,17 +118,17 @@ fi
 # ── T5: ng interactive-sessions --dry-run renders markdown with table header ─
 OUTPUT=$(NEXUS_ROOT="$TMP/nexus" NEXUS_STATE_DIR="$TMP/ng-state" \
     "$NG" interactive-sessions --dry-run 2>/dev/null)
-if printf '%s' "$OUTPUT" | grep -q '<!-- interactive-sessions:start -->'; then
+if grep -q '<!-- interactive-sessions:start -->' <<<"$OUTPUT"; then
     ok "T5: output contains start marker"
 else
     fail "T5: output missing start marker"
 fi
-if printf '%s' "$OUTPUT" | grep -q '| Window | Topic | Status |'; then
+if grep -q '| Window | Topic | Status |' <<<"$OUTPUT"; then
     ok "T5: output contains table header"
 else
     fail "T5: output missing table header — got: $(printf '%s' "$OUTPUT" | head -5)"
 fi
-if printf '%s' "$OUTPUT" | grep -q '<!-- interactive-sessions:end -->'; then
+if grep -q '<!-- interactive-sessions:end -->' <<<"$OUTPUT"; then
     ok "T5: output contains end marker"
 else
     fail "T5: output missing end marker"
@@ -150,7 +150,7 @@ fi
 # T1 wrote a provenance record for "test-interactive" with kind=interactive.
 OUTPUT6=$(NEXUS_ROOT="$TMP/nexus" NEXUS_STATE_DIR="$TMP/ng-state" \
     "$NG" interactive-sessions --dry-run 2>/dev/null)
-if printf '%s' "$OUTPUT6" | grep -q 'test-interactive'; then
+if grep -q 'test-interactive' <<<"$OUTPUT6"; then
     ok "T6: output lists 'test-interactive' from provenance record"
 else
     # The task kind (T2 write) is 'task' not 'interactive', so only T1 record
@@ -179,8 +179,8 @@ BLOCK_V2="${START_M}"$'\n''## v2'$'\n'"${END_M}"
 BODY_BEFORE="## Intro\n\nSome text."
 BODY_AFTER=$(printf '%s\n\n%s' "$BODY_BEFORE" "$BLOCK_V1")
 # Verify appended body contains both intro and block.
-if printf '%s' "$BODY_AFTER" | grep -q 'Some text.' \
-   && printf '%s' "$BODY_AFTER" | grep -q "$START_M"; then
+if grep -q 'Some text.' <<<"$BODY_AFTER" \
+   && grep -q "$START_M" <<<"$BODY_AFTER"; then
     ok "T8a: block absent case: appended"
 else
     fail "T8a: block absent case: unexpected body"
@@ -195,9 +195,9 @@ NEW_BODY=$(printf '%s' "$BODY_AFTER" \
          in_block { next }
          { print }')
 
-if printf '%s' "$NEW_BODY" | grep -q 'Some text.' \
-   && printf '%s' "$NEW_BODY" | grep -q '## v2' \
-   && ! printf '%s' "$NEW_BODY" | grep -q '## v1'; then
+if grep -q 'Some text.' <<<"$NEW_BODY" \
+   && grep -q '## v2' <<<"$NEW_BODY" \
+   && ! grep -q '## v1' <<<"$NEW_BODY"; then
     ok "T8b: block present case: replaced v1 with v2, non-block content preserved"
 else
     fail "T8b: block present case — got: $(printf '%s' "$NEW_BODY")"

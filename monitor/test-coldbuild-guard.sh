@@ -213,7 +213,7 @@ check "the guard's OWN default age cap is 1800s (read from its refusal text)" \
 # The refusal must not leak raw shell errors at the operator (the first-sight
 # refusal used to emit "buildprogress: No such file or directory" — a redirect
 # failure bash reports itself, which `read`'s 2>/dev/null cannot suppress).
-if printf '%s' "$msg" | grep -qE 'No such file or directory|line [0-9]+:'; then
+if grep -qE 'No such file or directory|line [0-9]+:' <<<"$msg"; then
     bad "refusal text leaks a raw shell error to the operator"
 else
     ok "refusal text is clean (no raw shell error leaked)"

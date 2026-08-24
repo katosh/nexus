@@ -102,7 +102,7 @@ fi
 # The nexus toolchain is home-independent by contract; monitor/watcher/test-
 # bootstrap-venv.sh check 12 enforces it and caught the first draft of this
 # change. Pinned here too, next to the code that tempted the violation.
-if grep -vE '^[[:space:]]*#' "$LOCALS_ENV" | grep -qE '(\$HOME|/\.local/|/\.cache/uv|~/)'; then
+if grep -qE '(\$HOME|/\.local/|/\.cache/uv|~/)' <<<"$(grep -vE '^[[:space:]]*#' "$LOCALS_ENV")"; then
     fail "T1c locals-env.sh references a home path in executable code"
 else
     ok "T1c locals-env.sh names no home path in executable code"
@@ -133,7 +133,7 @@ t2_out=$(env -u NEXUS_ROOT XDG_CONFIG_HOME="$OPCFG_HOME" HOME="$TMP/home" \
         PATH=$(printf %s "$PATH" | tr ":" "\n" | grep -v "/monitor/ghwrap$" | paste -sd:)
         PATH="$STUB_BIN:$PATH"; export PATH
         command gh auth token 2>&1' _ "$LOCALS_ENV")
-if printf '%s' "$t2_out" | grep -q 'OPERATOR_PAT_SENTINEL'; then
+if grep -q 'OPERATOR_PAT_SENTINEL' <<<"$t2_out"; then
     fail "T2 a bypassing bare gh STILL reaches the operator PAT (fail-OPEN)"
 else
     ok "T2 a bypassing bare gh cannot authenticate (fail-closed)"

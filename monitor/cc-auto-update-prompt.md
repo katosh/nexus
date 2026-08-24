@@ -16,8 +16,13 @@ bump; surface instead.**
 - The evaluation guide (READ IT FIRST): `{{NEXUS_ROOT}}/{{GUIDE}}`
 - **Surface repo** (the IMPLEMENTATION repo — every cc-update issue/PR you
   open or comment goes HERE, never the asset repo): `{{SURFACE_REPO}}`
-- Tracking issue **on `{{SURFACE_REPO}}`** (empty = no standing issue;
-  open a fresh one there if you need to surface): `{{TRACKING_ISSUE}}`
+- Tracking issue: `{{TRACKING_ISSUE}}` **on `{{TRACKING_REPO}}`** (empty = no
+  standing issue; open a fresh one on the surface repo if you need to surface).
+  The tracking issue carries its OWN repo, which is not necessarily the surface
+  repo — use `{{TRACKING_REPO}}` for it and `{{SURFACE_REPO}}` for anything you
+  open fresh. Never assume they are the same (<your-org>/nexus-code#866: a
+  reference written for one repo, consumed against another, posted for a month
+  where nobody was reading).
 - Date of this fire: {{DATE}}
 
 ## Ground rules
@@ -50,8 +55,20 @@ bump; surface instead.**
 **1–4. Evaluate per the GUIDE** (`{{GUIDE}}`, Steps 1–4):
 changelog between {{INSTALLED}} and {{CANDIDATE}} → collision analysis
 across the surfaces (2a pane-state markers, 2b unstick dialogs, 2c
-VI-mode, 2d hooks/settings, 2e CLI flags) → run the gate, capturing
-the output as evidence:
+paste delivery + VI-mode, 2d hooks/settings, 2e CLI flags) → run the
+gate, capturing the output as evidence.
+
+SAVE the changelog you fetch — it is evidence, and the apply step counts
+entries out of it rather than trusting your table:
+
+    GH_TOKEN=$({{NEXUS_ROOT}}/monitor/mint-token.sh) gh api \
+        repos/anthropics/claude-code/contents/CHANGELOG.md --jq '.content' \
+      | tr -d '\n' | base64 -d \
+      > {{STATE_DIR}}/cc-auto-update/changelog-{{CANDIDATE}}.md
+
+(the `tr -d '\n'` matters — the API returns wrapped base64 and a bare
+`base64 -d` fails on it). Then write the per-entry ledger as you read,
+one line per entry, quote verbatim + disposition.
 
     {{NEXUS_ROOT}}/monitor/cc-harness/gate.sh --version {{CANDIDATE}} \
         2>&1 | tee {{STATE_DIR}}/cc-auto-update/gate-{{CANDIDATE}}.log
@@ -66,10 +83,113 @@ standing directive, stricter than the GUIDE's interactive table):
       {{NEXUS_ROOT}}/monitor/cc-auto-update-apply.sh safe \
           --candidate {{CANDIDATE}} \
           --gate-evidence {{STATE_DIR}}/cc-auto-update/gate-{{CANDIDATE}}.log \
-          --surfaces-clear
+          --surfaces-clear \
+          --surface-evidence 2a=gate \
+          --surface-evidence 2b=gate \
+          --surface-evidence 2c-paste=<class> \
+          --surface-evidence 2c-vi=<class> \
+          --surface-evidence 2d=gate \
+          --surface-evidence 2e=<class> \
+          --changelog-evidence <the CHANGELOG.md you fetched this session> \
+          --changelog-ledger <one line per entry: verbatim quote + disposition> \
+          --changelog-dispositioned <release>=<N>   # one per release in the delta
 
-  Pass `--surfaces-clear` ONLY as a truthful attestation that the
-  changelog review cleared the non-gate surfaces. The script runs GUIDE
+  `--surfaces-clear` is NOT a bare attestation any more, and the script
+  will refuse (exit 3) without the per-surface labels. For EVERY surface
+  key — `2a 2b 2c-paste 2c-vi 2d 2e` — you must state HOW it was
+  cleared, from this vocabulary:
+
+  - `gate` — a cc-harness scenario covered it. Cross-checked against the
+    scenario names in your gate log, so it cannot be claimed loosely.
+    Payable for 2a, 2b and 2d only; nothing in the harness covers 2c/2e.
+  - `empirical` — you drove a probe against the candidate binary AND
+    showed the probe can go RED. Requires
+    `--negative-control <surface>=<what you broke and what failed>`.
+  - `reachability` — the hazardous input path cannot be reached in this
+    nexus, so the entry is inert here. Say this instead of `empirical`
+    when your "probe" merely confirmed nothing bad happened.
+  - `source-inspection` — you read the code and reasoned about it.
+
+  **Why the labels are enforced.** In five of six rounds this routine
+  reached a defensible conclusion through an unsubstantiated mechanism: a
+  reachability-only probe was labelled `empirical`, and `--surfaces-clear`
+  laundered it into "I tested it". Two known ways a probe silently stops
+  testing anything: a NO-OP INPUT PREFIX (the VI-insert `i BSpace` prefix
+  in a pane that boots in default mode — 2.1.216 and 2.1.222) and DEAD
+  INSTRUMENTATION (a regex that never matched — 2.1.218). `reachability`
+  is a perfectly good, honest answer; an unsubstantiated `empirical` is
+  not. Use the same labels in your report table, verbatim.
+
+  **Why 2c is SPLIT.** It covers two mechanisms — the paste-buffer
+  DELIVERY path and the VI-INSERT guard. Both are now drivable: since
+  `#724` the harness seeds `editorMode` defaulting to **`vim`**, so panes
+  boot in production parity and `test-realmodel-vimode.sh` drives the VI
+  half with three arms. (Before `#724` the harness booted default mode, so
+  an `i BSpace` prefix was a no-op there and could not be labelled
+  `empirical`.) Note `apply.sh` still maps no gate scenario to `2c-vi`, so
+  `gate` is refused for it regardless. Six of seven rounds labelled the
+  pair `empirical` on the delivery half's evidence alone. The aggregate
+  key `2c` is now REFUSED; label `2c-paste` and `2c-vi` separately, each
+  with its own class and its own negative control. The audit row records
+  the derived `2c` as the WEAKEST of the two.
+
+  **"Not drivable in the harness" is NOT "unreachable in the nexus" — do
+  not label `2c-vi=reachability` without running the two commands in
+  GUIDE 2c ON THE HOST YOU ARE EVALUATING.** The answer differs between
+  operators, measured on two hosts the same day (2026-08-07): one has
+  `editorMode: "vim"` in `~/.claude.json` and `~/.claude/settings.json`
+  with 9 of 10 agent panes rendering `-- INSERT --`; the other has no
+  `editorMode` key in any of its 5 settings files and 0 of 4 panes. Where
+  it IS reached, the `i` prefix in the spawn/follow-up paste path is
+  load-bearing in production even though the harness cannot exercise it,
+  and the honest label is `source-inspection` — `#724`'s probe has landed
+  (`test-realmodel-vimode.sh`, and `cch_setup` now seeds `editorMode:
+  "vim"`), but `apply.sh` maps no gate scenario to `2c-vi`, so `gate` is
+  refused for it and `source-inspection` is still the payable label. Where
+  the checks return zero, `reachability` is payable. Note
+  also that the accepted enum is exactly `["normal","vim"]` and the
+  binary discards an out-of-enum value SILENTLY (`.catch(void 0)`) — so a
+  control that seeds `"vi"` proves nothing, which is how an earlier round
+  reached a confident conclusion from a probe that could not fire. See
+  `<your-org>/nexus-code#724`.
+
+  **Changelog completeness is enforced too.** The 2.1.224 round wrote
+  "both releases read in full" and tabulated 41 of 50 entries — the nine
+  it dropped included the `bypassPermissions` vs org-disable-policy fix
+  (the flag every spawn here rides), the workflow-sandbox dynamic
+  `import()` escape, and `sandbox.filesystem.denyWrite` covering the
+  working directory. "No impact" was the DEFAULT, not a claim. Same
+  defect as 2.1.217's unread entry. So: save the changelog you fetched
+  (`--changelog-evidence`), write a ledger with ONE LINE PER ENTRY
+  carrying the entry VERBATIM plus its disposition (`--changelog-ledger`
+  — "no nexus surface" IS a disposition), and pass
+  `--changelog-dispositioned <release>=<N>` for EVERY release in the
+  delta (a two-release jump means both changelogs). **`apply.sh` fetches
+  the changelog itself** and derives the release set, M, and the entry
+  texts from THAT copy — your supplied file is cross-checked against it
+  section by section and refused if it differs. It then refuses when
+  `N != M` or when an entry is missing from the ledger. So editing the
+  file you pass does not move M: the first cut of this check trusted the
+  supplied file, and a skeptic truncated a release from 19 entries to 5
+  and was accepted at rc 0.
+
+  **What that does NOT give you, stated plainly because it is your job
+  to know it.** The fetch runs as a subprocess, so it is only as
+  trustworthy as the environment YOU are running in — three successive
+  attempts to make the counts provenance-authoritative were each
+  defeated by a different route (a hand-edited file, then
+  `CC_AUTO_CHANGELOG_FETCH_CMD`, then a `gh` earlier in `PATH`). The
+  script therefore claims nothing about where the bytes came from, and
+  its acceptance line says `provenance NOT established`. **You are the
+  one establishing it**: fetch the changelog yourself, in this session,
+  the way Step 1 shows, and read what you fetched. The check catches the
+  failure that has actually recurred — believing you read everything
+  when nine entries went undispositioned — not a caller who sets out to
+  fool it. That caller already owns the bump path outright
+  (`CC_AUTO_INSTALL_CMD` alone decides what gets installed), so do not
+  read the counts as an integrity guarantee they were never able to be.
+
+  The script runs GUIDE
   Step 5 in the foreground (local pin + install + binary verify +
   watcher restart), then hands GUIDE Step 5b — wait for orchestrator
   idle, spawn the restart watchdog, wait for its armed marker, kill the
@@ -96,7 +216,10 @@ standing directive, stricter than the GUIDE's interactive table):
     `monitor/svc.sh restart watcher`.
   - **Exits 2/3/4/5/7** — the bump was refused or failed before the
     watcher was ever touched, and the pin does not stand: untouched for
-    2 (usage), 3 (gate refused), 7 (another apply holds the lock), and
+    2 (usage), 3 (refused — gate evidence, per-surface evidence, or
+    changelog completeness; the refusal line names which and why, and it
+    is a real finding, not a formality to route around), 7 (another
+    apply holds the lock), and
     for 4 when the pin write itself failed; rolled back for 4 after a
     failed install and 5 after a failed binary verify. Nothing to retry
     but the cause.
@@ -162,8 +285,8 @@ standing directive, stricter than the GUIDE's interactive table):
 
   Then surface the specifics (which scenario failed / which changelog
   entry) in your report AND on `{{SURFACE_REPO}}` (never the asset repo):
-  if `{{TRACKING_ISSUE}}` is configured, comment on it —
-  `monitor/ng issue comment {{TRACKING_ISSUE}} --repo {{SURFACE_REPO}} --body-file <file>`;
+  if `{{TRACKING_ISSUE}}` is configured, comment on it **on its own repo** —
+  `monitor/ng issue comment {{TRACKING_ISSUE}} --repo {{TRACKING_REPO}} --body-file <file>`;
   otherwise open a fresh issue there —
   `monitor/ng issue create --repo {{SURFACE_REPO}} --title "cc-update blocked: {{CANDIDATE}}" --body-file <file>`.
 
@@ -176,10 +299,11 @@ cleared, decisions taken, apply exit code) in your report.
   `monitor/ng report-check <report-path>` and exit. Do NOT open or
   comment on any issue — a clean auto-update bothers no one.
 - **review/compat/block** → wrap up against the surface repo. If
-  `{{TRACKING_ISSUE}}` is non-empty, wrap up against it **on the
-  implementation repo**:
-  `monitor/ng wrap-up {{TRACKING_ISSUE}} <report-path> --repo {{SURFACE_REPO}}`
-  (the `--repo` is mandatory — a bare `wrap-up` posts to the asset repo).
+  `{{TRACKING_ISSUE}}` is non-empty, wrap up against it **on the repo that
+  reference names**:
+  `monitor/ng wrap-up {{TRACKING_ISSUE}} <report-path> --repo {{TRACKING_REPO}}`
+  (the `--repo` is mandatory — a bare `wrap-up` posts to the asset repo, and
+  `{{TRACKING_REPO}}` is not necessarily `{{SURFACE_REPO}}`).
   If no tracking issue is configured, the issue you opened on
   `{{SURFACE_REPO}}` in the decision step IS the surface — link the
   report there with

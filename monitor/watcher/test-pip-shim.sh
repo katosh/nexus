@@ -174,6 +174,55 @@ case "$ag_path" in
     *)         assert_eq "full mode fronts pipwrap" "absent"  "fronted" ;;
 esac
 
+# ---- 5. symlinked wrapper dir: the shim must not resolve to ITSELF --------
+#
+# your-org/nexus-code#568 A5. The resolution loop compared DIRECTORY STRINGS
+# only, so the same wrapper reached under a second name — a symlink, a bind
+# mount, an automount alias — did not match "our dir" and got selected as "the
+# real pip". The shim then exec's itself, forever: an unbounded fork loop
+# inside the guard written to stop the #487 fork storm. Both sibling wrappers
+# (ghwrap/gh, notifywrap/sandbox-notify) already had the realpath second gate;
+# this one did not, and nothing anywhere exercised the case.
+#
+# The `timeout` is the assertion's teeth: a self-resolving shim does not fail,
+# it HANGS. Bounded so a regression is a red test, never a wedged suite.
+
+echo '=== a symlinked wrapper dir does not resolve to itself (A5) ==='
+LINKDIR="$WORK/pipwrap-symlink"
+ln -sfn "$SHIM_DIR" "$LINKDIR"
+# A minimal toolbin carrying ONLY what the shim itself needs to run
+# (`env`, `bash`, `readlink`, `dirname`, `basename`) and deliberately NO pip —
+# the PATH under test must not accidentally offer a system pip as the answer.
+TOOLBIN="$WORK/toolbin"; mkdir -p "$TOOLBIN"
+for _t in env bash readlink dirname basename; do
+    _tp=$(command -v "$_t" 2>/dev/null) && ln -sf "$_tp" "$TOOLBIN/$_t"
+done
+# PATH: the symlink alias FIRST (so $0 resolves through it), then the REAL
+# wrapper dir, then the pip-free toolbin. With the realpath gate both wrapper
+# paths are skipped and resolution correctly finds nothing.
+sym_out=$(timeout 20 env -u PIP_UNWRAPPED -u WATCHER_WINDOW -u BASH_ENV \
+              NEXUS_PIP_HAZARD_PREFIX="$WORK/app/" \
+              PATH="$LINKDIR:$SHIM_DIR:$TOOLBIN" \
+              "$LINKDIR/pip" install requests 2>&1)
+sym_rc=$?
+assert_eq       "symlinked wrapper dir does not hang (no self-exec loop)" \
+                "$([[ $sym_rc == 124 || $sym_rc == 137 ]] && echo hung || echo bounded)" "bounded"
+assert_eq       "resolution refuses instead of self-invoking"  "$sym_rc" "127"
+assert_contains "refusal names the missing real pip"           "$sym_out" "no real"
+
+# Positive control: with a genuine pip beyond the two wrapper paths, the shim
+# resolves THAT one — the realpath gate must not over-skip.
+SAFEDIR="$WORK/safebin"; mkdir -p "$SAFEDIR"
+printf '#!/usr/bin/env bash\nprintf "SAFE_PIP %%s\\n" "$*"\n' > "$SAFEDIR/pip"
+chmod +x "$SAFEDIR/pip"
+sym_out=$(timeout 20 env -u PIP_UNWRAPPED -u WATCHER_WINDOW -u BASH_ENV \
+              NEXUS_PIP_HAZARD_PREFIX="$WORK/app/" \
+              PATH="$LINKDIR:$SHIM_DIR:$TOOLBIN:$SAFEDIR" \
+              "$LINKDIR/pip" install requests 2>&1)
+sym_rc=$?
+assert_eq       "non-hazardous real pip beyond the aliases still runs" "$sym_rc" "0"
+assert_contains "the SAFE pip received the argv"    "$sym_out" "SAFE_PIP install requests"
+
 # ---- summary --------------------------------------------------------------
 
 echo

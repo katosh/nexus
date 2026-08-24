@@ -191,7 +191,10 @@ case "$timeout" in ''|*[!0-9]*) die_usage "--timeout must be a non-negative inte
 # NEXUS_REMOTE_SSH_HOST wins when set (no ssh-config block required). $SSH is
 # the hermetic-test seam (default `ssh`). resolve_ssh_id (shared lib) reads
 # $ssh_alias + the NEXUS_REMOTE_SSH_* overrides and sets $SSH / $SSH_ID.
-resolve_ssh_id
+# rc 1 = the endpoint could not be resolved (no port, and none derivable —
+# nexus-code#893 F1). Exit 64 like any other configuration fault rather than
+# proceeding with an unset port, which would connect to whatever holds it.
+resolve_ssh_id || exit 64
 
 # ---- idempotency sentinel (crash-restart double-emit guard) ------------
 # Written BEFORE the visible reply emit. If a prior instance crashed AFTER

@@ -43,7 +43,7 @@ set -uo pipefail
 
 if [ "${SLOW_TESTS:-0}" != "1" ]; then
     echo "skipped: $(basename "$0") (set SLOW_TESTS=1 to enable; ~60s wall-clock)"
-    exit 0
+    exit 77   # SKIP, not PASS (your-org/nexus-code#568 A6)
 fi
 
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -184,6 +184,30 @@ oe_since() {
 oe_marked_windows() {
     awk -F'\t' '$2 != 0 && $2 != "" { print $1 }' \
         "$STATE_DIR/operator-engaged.tsv" 2>/dev/null
+}
+
+# Rewrite a window's pane-change stamp epoch, preserving its hash
+# (`pane-change/<window>` is `<last_hash>\t<last_change_epoch>`).
+#
+# The mark's validity is `now - last_change_epoch <= TTL`, so any
+# assertion about "inside" or "past" the TTL is really an assertion
+# about that epoch. Deriving it from wall-clock — set a frame, then
+# race the probe against a 3 s TTL, or `sleep TTL+2` to age out — makes
+# the test a function of host load: under a 4-way parallel suite on a
+# loaded box the fixture setup alone (build_frame + two frame_hash
+# calls + set_window_frame + a subshell probe) overran the 3 s budget,
+# the mark lapsed early, and "static cycle 1 (within TTL): still
+# engaged" failed (your-org/nexus-code#555, 1 of 3 full-suite runs).
+# Setting the epoch explicitly makes both directions exact and drops
+# the sleeps. Safe because the frames used here are asserted
+# hash-identical, so `_openg_observe` re-stamps without advancing the
+# epoch we just wrote.
+set_change_epoch() {
+    local window="$1" epoch="$2" path hash
+    path="$STATE_DIR/pane-change/$window"
+    [[ -f "$path" ]] || { echo "set_change_epoch: no stamp at $path" >&2; return 1; }
+    hash=$(awk -F'\t' 'NR == 1 { print $1; exit }' "$path")
+    printf '%s\t%s\n' "$hash" "$epoch" > "$path"
 }
 
 # ---- frame builder ---------------------------------------------------------
@@ -419,10 +443,13 @@ assert_eq "noise variant of final transcript is hash-identical" \
     "$(frame_hash "$FRAME_DIR/convo-static-noise.ansi")" \
     "$(frame_hash "$FRAME_DIR/convo-idle-12.ansi")"
 set_window_frame convo "$FRAME_DIR/convo-static-noise.ansi"
+# Inside the TTL by construction, not by racing the fixture's own setup.
+set_change_epoch convo "$(date +%s)"
 run_probe_capture CYCLE_OUT CYCLE_RC \
     "MONITOR_OPERATOR_ENGAGED_CHANGE_TTL_SECONDS=$TTL MONITOR_IDLE_THRESHOLD_SECONDS=0 list_really_idle_workers"
 assert_contains "static cycle 1 (within TTL): still engaged" "$CYCLE_OUT" $'convo\toperator-engaged'
-sleep $(( TTL + 2 ))
+# Age the stamp past the TTL directly instead of sleeping through it.
+set_change_epoch convo "$(( $(date +%s) - TTL - 2 ))"
 run_probe_capture CYCLE_OUT CYCLE_RC \
     "MONITOR_OPERATOR_ENGAGED_CHANGE_TTL_SECONDS=$TTL MONITOR_IDLE_THRESHOLD_SECONDS=0 list_really_idle_workers"
 assert_not_contains "static past TTL: mark lapsed"          "$CYCLE_OUT" $'convo\toperator-engaged'

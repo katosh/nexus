@@ -355,15 +355,6 @@ _reemit_target_state() {
     return 0
 }
 
-# Back-compat shim: 0 = bot acked (👀 or 🚀), 1 = not, 2 = gh failure.
-# Retained for any caller/test that only needs the boolean ack.
-_reemit_acked_live() {
-    local st
-    st=$(_reemit_reaction_state "$1" "$2") || return 2
-    [[ "$st" == "rocket" || "$st" == "eyes" ]] && return 0
-    return 1
-}
-
 # _reemit_gc
 #
 # Two-tier reaction-gated GC (your-org/nexus-code#360). Evicts 🚀'd (done)

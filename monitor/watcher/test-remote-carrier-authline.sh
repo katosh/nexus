@@ -160,7 +160,7 @@ AllowTcpForwarding yes
 LogLevel ERROR
 EOF
         if "$SSHD" -f "$WORK/sshd_config" -E "$WORK/sshd.log" 2>/dev/null && sleep 1 && \
-           { ss -ltn 2>/dev/null | grep -q ":$LPORT " || netstat -ltn 2>/dev/null | grep -q ":$LPORT "; }; then
+           { grep -q ":$LPORT " <<<"$(ss -ltn 2>/dev/null)" || grep -q ":$LPORT " <<<"$(netstat -ltn 2>/dev/null)"; }; then
             # two loopback TCP targets that announce which port answered
             python3 - "$PERMIT" "$DENY" <<'PY' >/dev/null 2>&1 &
 import socket,sys,threading,time
@@ -218,7 +218,7 @@ PY
             kill "$TARGETS" 2>/dev/null; wait "$TARGETS" 2>/dev/null
             [[ -f "$WORK/sshd.pid" ]] && kill "$(cat "$WORK/sshd.pid")" 2>/dev/null
         else
-            echo "  SKIP: could not start a non-root sshd on 127.0.0.1:$LPORT (environment-dependent)"
+            th_skip "carrier authline over a live sshd" "could not start a non-root sshd on 127.0.0.1:$LPORT (environment-dependent) — the forward-target cases did NOT run"
             [[ -f "$WORK/sshd.pid" ]] && kill "$(cat "$WORK/sshd.pid")" 2>/dev/null
         fi
     fi

@@ -1,6 +1,6 @@
 # Reports
 
-`reports/` is the durable, append-only log of what every agent did and what it learned. The watcher snapshots filenames and mtimes; the orchestrator surfaces new reports in *Recently Completed*; `ng wrap-up` uploads them to the asset repo and posts link comments on the tracking issue. This page covers the operator-visible contract; the per-section semantics live in [`skills/nexus.report/SKILL.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.report/SKILL.md).
+`reports/` is the durable, append-only log of what every agent did and what it learned. The watcher snapshots filenames and mtimes; the orchestrator surfaces new reports in *Recent landings*; `ng wrap-up` uploads them to the asset repo and posts link comments on the tracking issue. This page covers the operator-visible contract; the per-section semantics live in [`skills/nexus.report/SKILL.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.report/SKILL.md).
 
 ## Filename convention
 
@@ -57,7 +57,7 @@ Three reasons, in order of frequency.
 
 **Resumption surface.** If a session crashes, the orchestrator restarts, or a sibling worker needs to pick up where you left off, the report is what survives. `How to Resume` is load-bearing: it tells the next worker which branch to check out, which Slurm job ID to poll, which kernel still holds the loaded dataset.
 
-**Dashboard input.** The watcher's report-snapshot diff feeds the orchestrator's wake; the orchestrator's *Active Agents* and *Recently Completed* sections are computed from the filename list. A new `reports/*.md` is the visible signal that work has progressed.
+**Dashboard input.** The watcher's report-snapshot diff feeds the orchestrator's wake; the orchestrator's *In-flight* and *Recent landings* sections are computed from the filename list. A new `reports/*.md` is the visible signal that work has progressed.
 
 **Source for the periodic infra-review.** `## Infrastructure Issues` sections aggregate across sessions into a ranked backlog of tooling fixes. See [the feedback loop](#the-infrastructure-issues-feedback-loop) below.
 

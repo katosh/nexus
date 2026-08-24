@@ -29,9 +29,13 @@
 #   ANTHROPIC_API_KEY         Anthropic API key for the probe. Pulled
 #                             from environment only — never read from
 #                             config. When empty the probe no-ops.
-#   PROBE_MODEL               Model id for the probe (default
-#                             "claude-haiku-4-5-20251001" — currently
-#                             the cheapest model).
+#   PROBE_MODEL               Model id for the probe. Resolved ONCE by
+#                             _config.sh (monitor.watcher.probe_model)
+#                             and exported by main.sh — this module
+#                             holds no default of its own, so there is
+#                             exactly one place the value comes from
+#                             (your-org/nexus-code#568 D13). Empty ⇒ the
+#                             probe no-ops rather than guessing an id.
 #   RATELIMIT_HEURISTIC_MIN   Minutes-from-now to set as the synthetic
 #                             reset-epoch when the probe is disabled or
 #                             fails. Default 30.
@@ -250,6 +254,32 @@ _unstick_module_dir="${BASH_SOURCE[0]%/*}"
 [[ "$_unstick_module_dir" == "${BASH_SOURCE[0]}" ]] && _unstick_module_dir=.
 # shellcheck source=../_log-mode.sh
 source "$_unstick_module_dir/../_log-mode.sh"
+# Dead-pane paste guard (#745). Sourced EXPLICITLY rather than relied on
+# transitively from main.sh: this module is also sourced standalone by
+# test-unstick.sh, and a missing function is rc 127 — which reads as "not
+# dead" and silently restores a hazard that kills the tmux SERVER. Fail
+# LOUD instead.
+# shellcheck source=../_pane-live.sh
+[[ -r "$_unstick_module_dir/../_pane-live.sh" ]] && source "$_unstick_module_dir/../_pane-live.sh"
+if ! declare -F _tmux_pane_is_dead >/dev/null 2>&1; then
+    # FAIL-CLOSED FALLBACK (#745). Without the real predicate we cannot
+    # tell a live pane from a corpse, and a paste into a corpse kills the
+    # tmux SERVER — so every paste refuses, loudly, at the moment it is
+    # attempted.
+    #
+    # Deliberately NOT an `exit`/`return` at load time. The first cut
+    # refused to LOAD, and CI showed why that is wrong: several fixtures
+    # build partial trees from ENUMERATED copy lists, so the file is
+    # simply absent there, and four unrelated suites died on modules
+    # they never paste from. A missing paste guard must stop PASTES, not
+    # module loading. Quiet at load, loud at use: the noise belongs where
+    # the hazard is.
+    _tmux_pane_is_dead() {
+        printf '%s: _pane-live.sh unavailable — cannot prove %q is a live pane, refusing to paste (your-org/nexus-code#745: a paste into a dead pane kills the tmux server)\n' \
+            "${BASH_SOURCE[1]##*/}" "${1:-?}" >&2
+        return 0
+    }
+fi
 unset _unstick_module_dir
 
 unstick_log() {
@@ -293,7 +323,18 @@ _probe_ratelimit_reset() {
     [[ "${RATELIMIT_PROBE,,}" == "true" ]] || return 0
     [[ -n "${ANTHROPIC_API_KEY:-}" ]] || return 0
     command -v curl >/dev/null 2>&1 || return 0
-    local model="${PROBE_MODEL:-claude-haiku-4-5-20251001}"
+    # NO second default (your-org/nexus-code#568 D13). `_config.sh:804` already
+    # resolves PROBE_MODEL — env → config → default — and main.sh exports it to
+    # every module. Repeating the literal id here made this a SECOND source of
+    # truth for a value that already had one: a config change would move the
+    # watcher's probe model everywhere except the one code path that actually
+    # issues the probe. Fail visibly instead of silently probing a different
+    # model than the operator configured.
+    local model="${PROBE_MODEL:-}"
+    if [[ -z "$model" ]]; then
+        log "ratelimit-probe: PROBE_MODEL unset (config resolution did not run?); skipping probe" 2>/dev/null || true
+        return 0
+    fi
     local resp_headers
     resp_headers=$(curl -sS -m 15 -D - -o /dev/null \
         -H "x-api-key: ${ANTHROPIC_API_KEY}" \
@@ -678,8 +719,8 @@ _handle_unstick_window() {
     # the chip-bar shape; the bottom-anchored footer gates live-ness.
     if grep -qF 'Type something.' <<<"$pane" \
        && grep -qF 'Chat about this' <<<"$pane" \
-       && printf '%s\n' "$pane" | grep -v '^[[:space:]]*$' | tail -n 3 \
-            | grep -qF 'Esc to cancel'; then
+       && grep -qF 'Esc to cancel' \
+            <<<"$(printf '%s\n' "$pane" | grep -v '^[[:space:]]*$' | tail -n 3)"; then
         if [[ "$window" == "${TARGET:-orchestrator}" ]]; then
             _act_askuq "$window" "$pane"
             printf 'askuq'
@@ -716,6 +757,18 @@ _handle_unstick_window() {
 # target into insert mode regardless of starting state.
 _paste_line_to_window() {
     local window="$1" text="$2"
+    # #745: never paste into a dead pane — it kills the tmux server
+    # (20/20 measured), taking the watcher and every worker with it.
+    # This site is a live hazard rather than a theoretical one: the
+    # unstick cascade pastes into WORKER windows, `spawn-worker.sh`
+    # sets `remain-on-exit` on all of them, and a retired worker is a
+    # corpse. Returning 1 is the existing "paste failed" contract, so
+    # every caller already handles it.
+    if _tmux_pane_is_dead "$window"; then
+        printf '_unstick: window %q is a dead pane — refusing to paste (your-org/nexus-code#745: a paste into a dead pane kills the tmux server)\n' \
+            "$window" >&2
+        return 1
+    fi
     local buf="nexus-unstick-$$-${RANDOM}-${RANDOM}"
     local tmpfile
     tmpfile=$(mktemp)
@@ -778,7 +831,7 @@ _cascade_heads_up_orchestrator() {
     local n="$1"; shift
     local target="${TARGET:-orchestrator}"
     local windows=("$@")
-    if ! tmux list-windows -F '#{window_name}' 2>/dev/null | grep -qxF "$target"; then
+    if ! grep -qxF "$target" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"; then
         unstick_log "case=B action=heads-up-skip target=$target reason=window-missing"
         return 1
     fi
@@ -837,6 +890,33 @@ _act_ratelimit() {
         else
             unstick_log "case=B action=schedule-cascade source=probe reset_iso=$probed reset_epoch=$reset_epoch count=${#windows[@]}"
         fi
+        printf '%s\n' "$reset_epoch" > "$reset_file"
+    fi
+
+    # your-org/nexus-code#594 audit — THIRD instance of the class. This
+    # gate defers the unstick cascade until a stored instant, and that
+    # instant comes either from `_probe_ratelimit_reset` (an API-supplied
+    # value nothing range-checks) or from a heuristic. Unlike the two
+    # gates in _github.sh it is at least self-limiting — once `now`
+    # passes it, the cascade fires — but nothing bounds how far into the
+    # future the value may be, so one malformed `reset_at`, a clock
+    # skew, or a cached file surviving from a previous epoch defers the
+    # cascade arbitrarily. Clamp it: no cascade may be deferred longer
+    # than the heuristic window, measured from NOW rather than from the
+    # unverified stamp. A non-numeric or past value collapses to `now`,
+    # which fires the cascade immediately — the safe direction, since
+    # the cascade's own ack path handles a premature nudge but nothing
+    # recovers a nudge that never fires.
+    local _rl_max="${RATELIMIT_HEURISTIC_MIN:-30}"
+    [[ "$_rl_max" =~ ^[0-9]+$ && "$_rl_max" -gt 0 ]] || _rl_max=30
+    _rl_max=$(( _rl_max * 60 ))
+    if [[ ! "$reset_epoch" =~ ^[0-9]+$ ]]; then
+        unstick_log "case=B action=reset-epoch-reconciled reason=malformed stored=${reset_epoch:-<empty>} using=now"
+        reset_epoch="$now"
+        printf '%s\n' "$reset_epoch" > "$reset_file"
+    elif (( reset_epoch > now + _rl_max )); then
+        unstick_log "case=B action=reset-epoch-clamped stored=$reset_epoch clamped_to=$(( now + _rl_max )) ceiling_s=$_rl_max"
+        reset_epoch=$(( now + _rl_max ))
         printf '%s\n' "$reset_epoch" > "$reset_file"
     fi
 

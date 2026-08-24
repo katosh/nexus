@@ -187,7 +187,7 @@ fi
 # We NEVER fall back to a system/home uv — that is the dependency we are
 # eliminating.
 _bv_fetch_uv() {
-    if [[ -x "$_bv_uvbin" ]] && "$_bv_uvbin" --version 2>/dev/null | grep -qw "$_bv_version"; then
+    if [[ -x "$_bv_uvbin" ]] && grep -qw "$_bv_version" <<<"$("$_bv_uvbin" --version 2>/dev/null)"; then
         return 0    # already provisioned at the pinned version
     fi
     if [[ -z "$_bv_expsha" ]]; then
@@ -220,7 +220,7 @@ _bv_fetch_uv() {
     install -m 0755 "$tmp/uv-$_bv_target/uv"  "$_bv_locals/bin/uv"  || { rm -rf "$tmp"; return 1; }
     [[ -f "$tmp/uv-$_bv_target/uvx" ]] && install -m 0755 "$tmp/uv-$_bv_target/uvx" "$_bv_locals/bin/uvx"
     rm -rf "$tmp"
-    "$_bv_uvbin" --version 2>/dev/null | grep -qw "$_bv_version" || {
+    grep -qw "$_bv_version" <<<"$("$_bv_uvbin" --version 2>/dev/null)" || {
         printf 'bootstrap-venv: fetched uv does not report version %s\n' "$_bv_version" >&2; return 1; }
     return 0
 }

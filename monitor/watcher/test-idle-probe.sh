@@ -133,6 +133,8 @@ bgcpu_key="MOCK_BG_CPU_${win//[^a-zA-Z0-9_]/_}"
 bgshells_key="MOCK_BG_SHELLS_${win//[^a-zA-Z0-9_]/_}"
 bgrel_key="MOCK_BG_RELIABLE_${win//[^a-zA-Z0-9_]/_}"
 bgold_key="MOCK_BG_OLDEST_START_${win//[^a-zA-Z0-9_]/_}"
+bginfra_key="MOCK_BG_INFRA_${win//[^a-zA-Z0-9_]/_}"
+bgcmd_key="MOCK_BG_CMD_${win//[^a-zA-Z0-9_]/_}"
 state="${!key:-busy}"
 reset_at="${!reset_key:-}"
 orphan_kinds="${!orphan_key:-}"
@@ -141,6 +143,8 @@ bg_cpu="${!bgcpu_key:-}"
 bg_shells="${!bgshells_key:-}"
 bg_reliable="${!bgrel_key:-}"
 bg_oldest_start="${!bgold_key:-}"
+bg_infra="${!bginfra_key:-}"
+bg_cmd="${!bgcmd_key:-}"
 extras=""
 [[ -n "$reset_at" ]]      && extras+=" reset_at=$reset_at"
 [[ -n "$orphan_kinds" ]]  && extras+=" orphan_kinds=$orphan_kinds"
@@ -149,6 +153,8 @@ extras=""
 [[ -n "$bg_reliable" ]]   && extras+=" bg_reliable=$bg_reliable"
 [[ -n "$bg_cpu" ]]        && extras+=" bg_cpu=$bg_cpu"
 [[ -n "$bg_oldest_start" ]] && extras+=" bg_oldest_start=$bg_oldest_start"
+[[ -n "$bg_infra" ]]      && extras+=" bg_infra=$bg_infra"
+[[ -n "$bg_cmd" ]]        && extras+=" bg_cmd=$bg_cmd"
 printf 'state=%s%s\n' "$state" "$extras"
 exit 0
 STUB
@@ -773,7 +779,14 @@ unset MOCK_PANE_STATE_wbgorph MOCK_BG_CPU_wbgorph
 export MOCK_TMUX_WINDOWS="$(printf 'wbgfresh|%s' "$OLD_TS")"
 seed_engagement_log_matching_activity
 mkdir -p "$STATE_DIR/background-progress"
-printf '%s\t%s\n' 700 "$(( NOW - 10 ))" > "$STATE_DIR/background-progress/wbgfresh"
+# Anchor the freeze-start to the CURRENT clock, not to the suite-start `NOW`.
+# The case asserts "frozen, but the freeze began INSIDE the grace" and the grace
+# in force here is 60s (set above), so anchoring to a `NOW` captured minutes
+# earlier made the assertion depend on how long the preceding suite took to run:
+# it passed at ~19s of elapsed suite time and failed at ~65s. That is a fixture
+# encoding a wrong assumption, not a real behaviour boundary — the assertion
+# itself is unchanged and still exercises exactly the within-grace branch.
+printf '%s\t%s\n' 700 "$(( $(date +%s) - 10 ))" > "$STATE_DIR/background-progress/wbgfresh"
 export MOCK_PANE_STATE_wbgfresh=working-background
 export MOCK_BG_CPU_wbgfresh=700   # frozen, but stored epoch only 10s old
 run_probe_capture out rc 'list_really_idle_workers'
@@ -1074,6 +1087,150 @@ assert_contains "stale skeptic marker → wrapped-with-children resurfaces" "$ou
     $'bgw5\twrapped-with-children'
 rm -f "$STATE_DIR/skeptic/pending/bgw5"
 unset MOCK_PANE_STATE_bgw5 MOCK_BG_SHELLS_bgw5 MOCK_BG_RELIABLE_bgw5 MOCK_BG_CPU_bgw5
+: > "$LOG"
+
+# ---- (b6)-(b9): protocol-wait children are not an inconsistency (#590) ----
+#
+# The wrapped-with-children emit fired on EVERY skeptic-gated worker. Sequence:
+# `ng wrap-up` tells the worker to hold a `skeptic-channel await` re-check loop
+# in a background shell; the skeptic returns a verdict, which CLEARS the pending
+# marker; the prescribed await child keeps polling until its own timeout. So the
+# `parked-awaiting-skeptic` exemption (b4) lapses while the prescribed child is
+# still alive, and the window resurfaced as an "inconsistency" demanding a
+# decision. Firing routinely trains the operator to dismiss it — and then a
+# genuine orphaned `sbatch` arrives looking like the twenty false ones before it.
+# Reproduced live on 2026-07-29: two emits, both ~11-14 min AFTER the verdict
+# that cleared the marker.
+
+# (b6) Wrapped, marker already cleared, the ONLY child is a protocol await loop
+#      → must NOT surface as an inconsistency.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"12","window":"bgw6","report":"bgw6_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgw6|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgw6 120 500
+export MOCK_PANE_STATE_bgw6=working-background
+export MOCK_BG_SHELLS_bgw6=1 MOCK_BG_RELIABLE_bgw6=1 MOCK_BG_CPU_bgw6=500
+export MOCK_BG_OLDEST_START_bgw6="$(( NOW - 120 ))"   # young episode
+export MOCK_BG_INFRA_bgw6=1
+export MOCK_BG_CMD_bgw6='zsh:./monitor/skeptic-channel.sh_await_bgw6'
+run_probe_capture out rc 'list_really_idle_workers'
+assert_not_contains "protocol await loop only → NOT wrapped-with-children (#590)" "$out" \
+    "wrapped-with-children"
+unset MOCK_PANE_STATE_bgw6 MOCK_BG_SHELLS_bgw6 MOCK_BG_RELIABLE_bgw6 \
+      MOCK_BG_CPU_bgw6 MOCK_BG_OLDEST_START_bgw6 MOCK_BG_INFRA_bgw6 MOCK_BG_CMD_bgw6
+
+# (b7) NEGATIVE CONTROL for (b6): the same shape with a NON-protocol child
+#      (a real orphaned job) MUST still surface. Without this, (b6) could be
+#      passing because the detector was switched off wholesale.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"13","window":"bgw7","report":"bgw7_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgw7|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgw7 120 500
+export MOCK_PANE_STATE_bgw7=working-background
+export MOCK_BG_SHELLS_bgw7=1 MOCK_BG_RELIABLE_bgw7=1 MOCK_BG_CPU_bgw7=500
+export MOCK_BG_OLDEST_START_bgw7="$(( NOW - 120 ))"
+export MOCK_BG_INFRA_bgw7=0
+export MOCK_BG_CMD_bgw7='zsh:sbatch_--mem_64G_run_pipeline.sh'
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "real orphaned job still surfaces (#590 negative control)" "$out" \
+    $'bgw7\twrapped-with-children'
+# and it NAMES the child — the whole point of #590's minimum ask.
+assert_contains "the emit NAMES the offending child" "$out" \
+    "sbatch_--mem_64G_run_pipeline.sh"
+unset MOCK_PANE_STATE_bgw7 MOCK_BG_SHELLS_bgw7 MOCK_BG_RELIABLE_bgw7 \
+      MOCK_BG_CPU_bgw7 MOCK_BG_OLDEST_START_bgw7 MOCK_BG_INFRA_bgw7 MOCK_BG_CMD_bgw7
+
+# (b8) MIXED set: one protocol await loop + one real job → still surfaces, and
+#      reports the count of children that need a DECISION (1), not the raw 2.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"14","window":"bgw8","report":"bgw8_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgw8|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgw8 120 500
+export MOCK_PANE_STATE_bgw8=working-background
+export MOCK_BG_SHELLS_bgw8=2 MOCK_BG_RELIABLE_bgw8=1 MOCK_BG_CPU_bgw8=500
+export MOCK_BG_OLDEST_START_bgw8="$(( NOW - 120 ))"
+export MOCK_BG_INFRA_bgw8=1
+export MOCK_BG_CMD_bgw8='zsh:nohup_train.py'
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "mixed set → still surfaces the real child" "$out" \
+    $'bgw8\twrapped-with-children'
+assert_contains "mixed set → counts only the decision-worthy child" "$out" \
+    "1 live child"
+unset MOCK_PANE_STATE_bgw8 MOCK_BG_SHELLS_bgw8 MOCK_BG_RELIABLE_bgw8 \
+      MOCK_BG_CPU_bgw8 MOCK_BG_OLDEST_START_bgw8 MOCK_BG_INFRA_bgw8 MOCK_BG_CMD_bgw8
+
+# (b9) The (b6) exemption is BOUNDED, never a permanent mute. A single `await`
+#      is self-limiting, but a worker that wraps it in an `until` loop would
+#      otherwise hold the window exempt forever. Past the ABSOLUTE ceiling the
+#      window surfaces again, with the loop named.
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"15","window":"bgw9","report":"bgw9_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgw9|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+seed_frozen_child bgw9 120 500
+# SAVE/RESTORE, never unset: line ~815 exports a section-wide ceiling of 3600
+# that later cases (c3) depend on, so clearing it here would silently break them.
+_saved_ceiling="${MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS:-}"
+export MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS=600
+export MOCK_PANE_STATE_bgw9=working-background
+export MOCK_BG_SHELLS_bgw9=1 MOCK_BG_RELIABLE_bgw9=1 MOCK_BG_CPU_bgw9=500
+export MOCK_BG_OLDEST_START_bgw9="$(( NOW - 5000 ))"   # far past the ceiling
+export MOCK_BG_INFRA_bgw9=1
+export MOCK_BG_CMD_bgw9='zsh:./monitor/skeptic-channel.sh_await_bgw9'
+run_probe_capture out rc 'list_really_idle_workers'
+assert_contains "protocol-only exemption is bounded by the absolute ceiling" "$out" \
+    $'bgw9\twrapped-with-children'
+assert_contains "past-ceiling emit names the protocol loop" "$out" \
+    "skeptic-channel.sh_await_bgw9"
+if [[ -n "$_saved_ceiling" ]]; then
+    export MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS="$_saved_ceiling"
+else
+    unset MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS
+fi
+unset _saved_ceiling
+unset MOCK_PANE_STATE_bgw9 MOCK_BG_SHELLS_bgw9 MOCK_BG_RELIABLE_bgw9 \
+      MOCK_BG_CPU_bgw9 MOCK_BG_OLDEST_START_bgw9 MOCK_BG_INFRA_bgw9 MOCK_BG_CMD_bgw9
+: > "$LOG"
+
+# (b10)/(b11) The FULL-STATE snapshot classifies INDEPENDENTLY of
+# list_really_idle_workers, so it needs the same exclusion — otherwise the false
+# positive fixed above simply reappears at the full-state cadence (which is
+# exactly where the two 2026-07-29 emits were recorded: `*_full-state.md` and
+# `*_resurface.md` under monitor/.state/diffs).
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"16","window":"bgs1","report":"bgs1_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgs1|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+export MOCK_PANE_STATE_bgs1=working-background
+export MOCK_BG_SHELLS_bgs1=1 MOCK_BG_RELIABLE_bgs1=1 MOCK_BG_CPU_bgs1=500
+export MOCK_BG_INFRA_bgs1=1
+export MOCK_BG_CMD_bgs1='zsh:./monitor/skeptic-channel.sh_await_bgs1'
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_not_contains "snapshot: protocol-only child is NOT an inconsistency" "$out" \
+    "wrapped-with-children"
+assert_contains "snapshot: reported as the benign prescribed state" "$out" \
+    "wrapped-awaiting-protocol"
+unset MOCK_PANE_STATE_bgs1 MOCK_BG_SHELLS_bgs1 MOCK_BG_RELIABLE_bgs1 \
+      MOCK_BG_CPU_bgs1 MOCK_BG_INFRA_bgs1 MOCK_BG_CMD_bgs1
+
+rm -f "$STATE_DIR/idle-state.tsv"; clear_bg_state
+echo '{"ts":"2026-05-10T12:00:00-07:00","event":"wrap-up","issue":"17","window":"bgs2","report":"bgs2_2026-05-10_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' > "$LOG"
+export MOCK_TMUX_WINDOWS="$(printf 'bgs2|%s' "$OLD_TS")"
+seed_engagement_log_matching_activity
+export MOCK_PANE_STATE_bgs2=working-background
+export MOCK_BG_SHELLS_bgs2=1 MOCK_BG_RELIABLE_bgs2=1 MOCK_BG_CPU_bgs2=500
+export MOCK_BG_INFRA_bgs2=0
+export MOCK_BG_CMD_bgs2='zsh:sbatch_--mem_64G_run_pipeline.sh'
+run_probe_capture out rc 'render_full_state_snapshot'
+assert_contains "snapshot: a real orphaned job still surfaces" "$out" \
+    "wrapped-with-children"
+assert_contains "snapshot: and names the child" "$out" \
+    "sbatch_--mem_64G_run_pipeline.sh"
+unset MOCK_PANE_STATE_bgs2 MOCK_BG_SHELLS_bgs2 MOCK_BG_RELIABLE_bgs2 \
+      MOCK_BG_CPU_bgs2 MOCK_BG_INFRA_bgs2 MOCK_BG_CMD_bgs2
 : > "$LOG"
 
 # ---- inverted priority: the exemption is BOUNDED (#455 follow-up) ---------
@@ -1387,6 +1544,10 @@ LOG="$STATE_DIR/action-log.jsonl"
 FAKE_NEXUS_14="$WORK/fake-nexus-14"
 mkdir -p "$FAKE_NEXUS_14/monitor" "$FAKE_NEXUS_14/reports"
 cp "$FAKE_NEXUS_8/monitor/ng" "$FAKE_NEXUS_14/monitor/ng"
+# `ng` sources monitor/_bookkeeping.sh and REFUSES TO START without
+# it (your-org/nexus-code#601/#605: degrading to the silent-coercion
+# behaviour it replaces is worse than refusing). Copy it alongside.
+cp "$(dirname "$FAKE_NEXUS_8/monitor/ng")/_bookkeeping.sh" "$FAKE_NEXUS_14/monitor/_bookkeeping.sh"
 cp "$STUB_DIR/pane-state.sh" "$FAKE_NEXUS_14/monitor/pane-state.sh"
 echo "stub content" > "$FAKE_NEXUS_14/reports/stubworker_2026-05-10_120000_partial.md"
 RETAIN_TS=$(date -Is -d "@$(( OLD_TS + 10 ))")
@@ -1772,6 +1933,14 @@ assert_contains  "absent pane-state → pane-absent"                "$out" \
                  $'crashed\tpane-absent'
 assert_contains  "pane-absent carries advisory detail"            "$out" \
                  "claude process gone or unresponsive"
+# The negative control for your-org/nexus-code#808's split: `absent` must keep
+# the relaunch advisory. Without this, "make blocked say something else" could
+# be satisfied by making EVERY pane-absent row say the blocked thing — which
+# would tell an operator to answer an overlay on a pane whose process is gone.
+assert_contains  "absent keeps the relaunch advisory"             "$out" \
+                 "relaunch or close"
+assert_not_contains "absent is NOT given the blocked advisory"    "$out" \
+                    "ANSWER it in the pane"
 # Even with a wrap-up event present, pane-absent still wins.
 echo '{"event":"wrap-up","issue":"77","window":"crashed","report":"crashed_2026-05-11_120000_done.md","upload":"ok","comment":"ok","rocket":"ok"}' >> "$LOG"
 run_probe_capture out rc 'list_really_idle_workers'
@@ -1796,6 +1965,28 @@ export MOCK_PANE_STATE_stalled=blocked
 run_probe_capture out rc 'list_really_idle_workers'
 assert_contains  "blocked pane-state → pane-absent"               "$out" \
                  $'stalled\tpane-absent'
+# your-org/nexus-code#808 — THE ADVISORY, not just the class. `blocked` means
+# the agent is ALIVE and rendering a modal only a human can clear; it shares
+# the `pane-absent` surface with `absent` because both need the operator, but
+# the two need OPPOSITE actions. Observed in production 2026-08-07 against a
+# worker displaying an AskUserQuestion: the operator was told the process was
+# gone and to relaunch it.
+#
+# The class assertion above passed throughout that incident. That is the point
+# of these two lines: the string is what an operator reads and acts on, and
+# nothing asserted it.
+#
+# The negative asserts the ABSENT advisory is absent, NOT the bare phrase
+# "relaunch or close" — the blocked advisory ends "do NOT relaunch or close",
+# which CONTAINS that phrase. A substring test on it fires on the corrected
+# wording and reports the fix as the bug. (It did, on the first draft of this
+# very assertion.) So the discriminator is the unnegated advisory itself.
+assert_not_contains "blocked is NOT told the process is gone"     "$out" \
+                    "claude process gone or unresponsive"
+assert_contains  "blocked is told to ANSWER the overlay"          "$out" \
+                 "ANSWER it in the pane"
+assert_contains  "blocked advisory NEGATES the relaunch"          "$out" \
+                 "do NOT relaunch or close"
 
 # ---- Test 28: state=empty → skip (no row) -----------------------------
 #
@@ -1881,6 +2072,61 @@ assert_contains  "pane-absent row renders advisory"               "$out" \
                  "- docs-merge-and-polish pane-absent"
 assert_contains  "pane-absent row includes relaunch hint"         "$out" \
                  "relaunch or close"
+
+# ---- Test 31a: the pane-absent renderer honours the ROW's advisory ------
+#
+# your-org/nexus-code#808, the second half. The classifier computes a
+# per-state advisory into column 4; this awk arm used to print a FIXED string
+# and discard it. So the advisory was decided in one file and overwritten in
+# another, and the fix in `list_really_idle_workers` alone would have been
+# invisible to every operator.
+#
+# Two rows, one render, because the failure this guards is "print one string
+# for everything" — which a single-row test cannot distinguish from "print
+# the right string". Each row must show its OWN advisory and NOT the other's.
+echo '=== render_idle_section honours the per-row pane-absent advisory (#808) ==='
+rm -f "$STATE_DIR/idle-state.tsv"
+out=$(PATH="$STUB_DIR:$PATH" bash -c "
+    set -uo pipefail
+    STATE_DIR='$STATE_DIR'
+    NEXUS_ROOT='$NEXUS_ROOT'
+    source '$PROBE'
+    list_really_idle_workers() {
+        printf 'crashedwin\tpane-absent\t900\tclaude process gone or unresponsive; relaunch or close\n'
+        printf 'askuqwin\tpane-absent\t900\toverlay awaiting the operator (blocked) — ANSWER it in the pane; do NOT relaunch or close\n'
+    }
+    render_idle_section
+" 2>/dev/null)
+assert_contains  "blocked row renders its own advisory"           "$out" \
+                 "askuqwin pane-absent (overlay awaiting the operator (blocked) — ANSWER it in the pane"
+assert_contains  "absent row still renders the relaunch advisory" "$out" \
+                 "crashedwin pane-absent (claude process gone or unresponsive; relaunch or close)"
+# The load-bearing negative: the blocked row must not carry the ABSENT
+# advisory anywhere on its line. Asserted per-LINE, because that advisory
+# legitimately appears on the OTHER row in the same output — a whole-output
+# assertion here would be vacuous.
+#
+# The probe is "claude process gone or unresponsive", not "relaunch or
+# close": the corrected blocked wording ends "do NOT relaunch or close" and
+# so CONTAINS the latter. Testing for it would flag the fix as the defect.
+askuq_line=$(printf '%s\n' "$out" | grep -F 'askuqwin' || true)
+assert_not_contains "blocked LINE never claims the process is gone" "$askuq_line" \
+                    "claude process gone"
+assert_contains  "blocked LINE negates the relaunch"              "$askuq_line" \
+                 "do NOT relaunch or close"
+# …and an empty detail column falls back to the historical wording rather
+# than rendering an empty parenthesis, so a row from an older producer still
+# says something actionable.
+out=$(PATH="$STUB_DIR:$PATH" bash -c "
+    set -uo pipefail
+    STATE_DIR='$STATE_DIR'
+    NEXUS_ROOT='$NEXUS_ROOT'
+    source '$PROBE'
+    list_really_idle_workers() { printf 'legacywin\tpane-absent\t900\t\n'; }
+    render_idle_section
+" 2>/dev/null)
+assert_contains  "empty detail falls back, never renders blank"   "$out" \
+                 "legacywin pane-absent (claude process gone or unresponsive; relaunch or close)"
 
 # ---- Tests 31b: over-limit classification + rendering (issue #87) -------
 

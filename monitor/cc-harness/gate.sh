@@ -79,9 +79,38 @@ trap cleanup EXIT
 # project-local claude binary across the whole sandbox PID namespace and
 # wipes every agent at once (crash postmortem 2026-05-29). Fail red before
 # touching a candidate binary.
+#
+# The negative control runs FIRST here too, for the same reason it does for the
+# tmux lint below — and specifically because what it controls is the FILE LIST.
+# Both of these lints were blind to every extensionless executable in the repo
+# (your-org/nexus-code#792) and not one test went red, because nothing had ever
+# asserted which files get read. A guard that reports clean because it looked
+# at nothing is worse than no guard.
 echo "=== safety lint: no cmdline-pattern process kills in harness ==="
+if ! "$_self_dir/lint-no-mass-kill.sh" --selftest; then
+    echo "gate.sh: mass-kill lint FAILED ITS OWN NEGATIVE CONTROL — refusing to gate." >&2
+    exit 1
+fi
 if ! "$_self_dir/lint-no-mass-kill.sh"; then
     echo "gate.sh: harness safety lint failed — refusing to gate." >&2
+    exit 1
+fi
+
+# Second safety pre-flight, on the OTHER axis. The mass-kill lint above bounds
+# the PROCESS axis; this one bounds the TMUX-SOCKET axis, where the blast
+# radius is strictly worse: killing the tmux server ends the session bwrap is
+# holding open, so the entire sandbox is torn down (your-org/nexus-code#644 —
+# five tear-downs in 33 minutes, every worker and service lost each time).
+# The negative control runs FIRST: a guard never observed failing is not
+# evidence, so prove the lint still fails on planted violations before
+# trusting its verdict on the real tree.
+echo "=== safety lint: tmux kill-server/kill-session must be socket-scoped ==="
+if ! "$_self_dir/lint-no-tmux-server-kill.sh" --selftest; then
+    echo "gate.sh: tmux-socket lint FAILED ITS OWN NEGATIVE CONTROL — refusing to gate." >&2
+    exit 1
+fi
+if ! "$_self_dir/lint-no-tmux-server-kill.sh"; then
+    echo "gate.sh: tmux-socket safety lint failed — refusing to gate." >&2
     exit 1
 fi
 
@@ -149,6 +178,33 @@ else
         # last_assistant_message) and the notice-text detection a CC bump
         # can silently break — both broke unnoticed before this gate entry.
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-overlimit.sh"
+        # PreToolUse hook contract (GUIDE surface 2d). Before this entry
+        # the gate wired NO hooks outside the over-limit scenario's
+        # Stop/StopFailure pair, so a changelog entry touching PreToolUse
+        # could only ever be cleared by source inspection — and "partial
+        # gate coverage" was credited for a different hook event. Drives a
+        # real Bash tool call through a --settings-wired PreToolUse hook
+        # and pins the exact fields gh-write-guard.sh / bash-footgun-guard.sh
+        # parse. Carries its own negative controls (see the file header).
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-pretooluse-hook.sh"
+        # Production KEYBOARD MODE (your-org/nexus-code#724). Every nexus agent
+        # runs `editorMode: "vim"`; until #724 the harness seeded none, so the
+        # gate validated a mode no worker is in. This list is HARDCODED, so a
+        # scenario that exists but is not named here is not gated — adding the
+        # file without adding this line would have reproduced #724 one level
+        # down, which is the failure mode #724 is itself an instance of.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-vimode.sh"
+        # The STRUCTURAL select-dialog arm (your-org/nexus-code#896). A
+        # full-screen dialog used to classify `empty` — "don't know yet" — so
+        # nothing unstuck a worker that would never proceed; 2.1.232 made that
+        # every nested-repo spawn via the workspace-trust dialog. This is the
+        # gate entry a FUTURE release's new modal trips: the arm is structural,
+        # so it should keep holding, and if a repaint of the menu chrome breaks
+        # it the gate says so before the pin moves. It also re-derives the
+        # committed capture (`fixtures/blocked-workspace-trust-realmodel.ansi`)
+        # from the live binary, which is the only thing stopping a captured
+        # fixture from quietly becoming fiction.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-trust-dialog.sh"
     )
 fi
 

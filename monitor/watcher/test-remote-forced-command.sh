@@ -42,6 +42,40 @@ trap 'rm -rf "$WORK"' EXIT
 export NEXUS_STATE_DIR="$WORK/state"
 export MONITOR_REMOTE_PRINCIPALS_DIR="$WORK/principals"
 export NEXUS_REMOTE_LOG="$WORK/fc.log"
+
+# ── HERMETIC CONFIG + AN SSH PEER (your-org/nexus-code#609 finding F12) ─────
+# Two independent leaks, both of which made this suite's verdict depend on the
+# machine it ran on. It is the THIRD suite in this family with the same defect; the
+# other two were fixed in `983a601` and this one needed both remedies and got
+# neither.
+#
+# 1. CONFIG. `config/load.sh` resolves its root from $NEXUS_ROOT, which EVERY nexus
+#    agent has set — so a run from any clone read the PRIMARY clone's
+#    config/nexus.yml, i.e. this operator's live `from_cidr`. Pin NEXUS_CONFIG at a
+#    fixture instead. Note an empty env override does NOT neutralize a configured
+#    value: `_remote_cfg` treats "" as unset (`[[ -n "$val" ]]`), so
+#    MONITOR_REMOTE_FROM_CIDR="" cannot opt out of an operator's pin — a fixture
+#    config file is the only reliable isolation.
+# 2. SSH_CLIENT. The wrapper is ONLY ever invoked as an sshd forced command, and
+#    sshd always sets SSH_CLIENT. Omitting it modelled an invocation that cannot
+#    occur in production, so gate 3 correctly fails closed on an undeterminable peer
+#    and 74 cases got exit 14 where they assert 12/0.
+#
+# Measured before the fix, at `065bd99`: NEXUS_ROOT set -> 17 passed / 74 failed;
+# `env -u NEXUS_ROOT` -> 91/0. CI was green only because a CI checkout has no
+# config/nexus.yml and the documented full-suite drive unsets NEXUS_ROOT. A suite
+# whose verdict flips on an ambient variable is not testing the code.
+cat >"$WORK/nexus.yml" <<'FCYML'
+monitor:
+  remote:
+    bind_address: 127.0.0.1
+    from_cidr: ""
+FCYML
+export NEXUS_CONFIG="$WORK/nexus.yml"
+# Present as sshd would present it, so gate 3 is exercised rather than tripped.
+# The fail-closed-on-unknown-peer behaviour itself is asserted directly in
+# test-remote-source-enforcement.sh, so nothing is lost by supplying it here.
+export SSH_CLIENT="140.107.116.184 51234 22022"
 # Registration IS the enable signal (no MONITOR_REMOTE_ENABLED flag): the
 # wrapper gates on the nexus-remote-ssh row in services.registry. Register it.
 export NEXUS_SERVICES_REGISTRY="$WORK/services.registry"

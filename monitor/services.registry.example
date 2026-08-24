@@ -26,6 +26,52 @@
 #   healthcheck shell command run in <workdir>; exit 0 == healthy.
 #               Keep it cheap and fast (short curl timeout / pgrep /
 #               test -f) — it runs on every recovery sweep.
+#
+#               VERIFY IDENTITY, NOT JUST LIVENESS (your-org/nexus-code#609).
+#               This sandbox SHARES THE HOST NETWORK NAMESPACE, so a port is
+#               a HOST-GLOBAL resource: `localhost:8765` is reachable by, and
+#               bindable by, every other operator's sandbox on this machine.
+#               A healthcheck that only asks "does something answer this
+#               port?" therefore CANNOT distinguish YOUR service from
+#               somebody else's that won a bind race — and the loser of that
+#               race reports HEALTHY while serving nothing. That is not
+#               theoretical: nexus-remote-ssh was down for 2h30m on
+#               2026-07-29 while another operator's daemon answered its port
+#               and its banner-only probe returned 0 the whole time.
+#
+#               So make the probe ask for something only YOUR service can
+#               produce. Cheap patterns, in order of preference:
+#                 * an authenticated endpoint whose token lives in your tree
+#                   (monitor/jupyter-health.sh is the reference: /api/status
+#                   403s without the project's own token, so another user's
+#                   Jupyter on the port fails);
+#                 * a body assertion on a path your service alone serves,
+#                   not a bare 200 on `/`. Write it CAPTURE-THEN-MATCH:
+#                       grep -q '<your-marker>' <<<"$(curl -fsS …)"
+#                   and NEVER the piped form
+#                       curl -fsS … | grep -q '<your-marker>'   grepq-antipattern
+#                   Under `pipefail` (which bootstrap-recover.sh sets, and
+#                   healthchecks inherit) `grep -q` exits at the match and
+#                   SIGPIPEs curl, so the pipeline reports 141 — FAILURE —
+#                   at the moment the marker was FOUND. An HTTP body is
+#                   routinely larger than curl's 4 KB stdio chunk, so a
+#                   marker near the top of the response inverts reliably.
+#                   That false negative restarts a HEALTHY service
+#                   (your-org/nexus-code#622);
+#                 * a cryptographic identity (monitor/remote-ssh-health.sh
+#                   compares the live endpoint's SSH host key against ours).
+#               A bare `curl -fsS -o /dev/null http://localhost:PORT/` is a
+#               LIVENESS PROXY. It is better than nothing and fine for a
+#               service whose false-green costs little — but know that is
+#               what you are choosing, and prefer a marker grep in the
+#               capture-then-match form above: it closes the whole class.
+#
+#               `pgrep`-based checks are namespace-scoped (so a foreign
+#               process cannot satisfy them) but carry their own trap: an
+#               `-f` pattern matches ANY process whose argv contains the
+#               string, and an agent's argv carries its entire prompt. Scope
+#               such checks by cwd/workdir and refuse on ambiguity
+#               (your-org/nexus-code#608).
 #   logfile     OPTIONAL. The service's logfile. It serves two readers:
 #               (1) the cockpit `monitor/svc.sh` tails it (dashboard
 #               picks and the `logs <name>` verb), and

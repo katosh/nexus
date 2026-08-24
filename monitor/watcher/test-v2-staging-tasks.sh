@@ -68,7 +68,7 @@ for _i in 1 2 3 4 5 6; do
 done
 [[ -f "$WORK/stage/slow_w.rc" ]]      && pass "sidecar .rc file appeared"         || fail "sidecar .rc never appeared"
 [[ -f "$WORK/stage/slow_w.out" ]]     && pass "final .out file present"           || fail ".out file missing"
-ls -1 "$WORK/stage/" | grep -q "\.tmp\." && fail "tmp file left behind in stage" "$(ls -1 "$WORK/stage/")" \
+grep -q "\.tmp\." <<<"$(ls -1 "$WORK/stage/")" && fail "tmp file left behind in stage" "$(ls -1 "$WORK/stage/")" \
                                          || pass "no stale .tmp files in stage"
 content=$(cat "$WORK/stage/slow_w.out" 2>/dev/null || echo "")
 assert_eq ".out content matches helper stdout" "$content" "slow-writer-output"
@@ -80,7 +80,7 @@ rm -rf "$WORK/stage"
 mkdir -p "$WORK/stage"
 echo 'sync-content-line1' | _scheduler_stage_write_atomic mysync
 [[ -f "$WORK/stage/mysync.out" ]]    && pass "sync .out file present"            || fail "sync .out missing"
-ls -1 "$WORK/stage/" | grep -q "\.tmp\." && fail "sync tmp file left behind"      \
+grep -q "\.tmp\." <<<"$(ls -1 "$WORK/stage/")" && fail "sync tmp file left behind"      \
                                          || pass "no stale sync .tmp files"
 content=$(cat "$WORK/stage/mysync.out" 2>/dev/null || echo "")
 assert_eq "sync .out content matches stdin" "$content" "sync-content-line1"

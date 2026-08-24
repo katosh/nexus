@@ -989,7 +989,7 @@ _follow_split() {
     local cmd='exec tail -n 200 -F' f
     for f in "$@"; do printf -v cmd '%s %q' "$cmd" "$f"; done
     if [[ -n "$SVC_LOG_PANE" ]] \
-       && tmux list-panes -F '#{pane_id}' 2>/dev/null | grep -qxF "$SVC_LOG_PANE"; then
+       && grep -qxF "$SVC_LOG_PANE" <<<"$(tmux list-panes -F '#{pane_id}' 2>/dev/null)"; then
         tmux respawn-pane -k -t "$SVC_LOG_PANE" "$cmd" 2>/dev/null
     else
         SVC_LOG_PANE=$(tmux split-window -d -v -p 40 -P -F '#{pane_id}' "$cmd" 2>/dev/null)
@@ -1044,8 +1044,12 @@ _close_log_pane() {
 _cockpit_wrong_launch_guard() {
     local self_info win_id win_name
     if self_info=$(_nexus_self_pane_window); then
-        win_id="${self_info%%$'\t'*}"
-        win_name="${self_info#*$'\t'}"
+        # Delimiter is '|', never a TAB: a non-UTF-8 locale rewrites a TAB in
+        # tmux `-F`/`display-message -p` output to `_`, which used to collapse
+        # both fields into one mangled string and make this guard fail OPEN
+        # (your-org/nexus-code#701 item A).
+        win_id="${self_info%%|*}"
+        win_name="${self_info#*|}"
         if [[ "$win_name" == "$TARGET_WINDOW" ]]; then
             if ! _nexus_window_has_orchestrator "$win_id"; then
                 tmux rename-window -t "$win_id" "${SERVICES_WINDOW}-misplaced" 2>/dev/null || true
@@ -1182,8 +1186,151 @@ cmd_start() {
     echo "[svc] $name: $outcome" >&2
     case "$outcome" in
         healthy|relaunched|supervisor-alive|window-present) return 0 ;;
+        # A green healthcheck over a dead supervisor record is NOT a
+        # successful start (your-org/nexus-code#606): `start` did nothing, and
+        # the thing that is serving answers to nobody. Fail loudly and name
+        # the one verb that actually reconciles.
+        healthy-unsupervised)
+            echo "[svc] $name:   the healthcheck passes but the daemon is UNSUPERVISED — 'start' cannot adopt a running daemon." >&2
+            echo "[svc] $name:   Reconcile: monitor/svc.sh restart $name" >&2
+            return 1 ;;
         *) return 1 ;;
     esac
+}
+
+# Locate the daemon behind an ORPHANED service — one whose healthcheck
+# passes while its supervisor record is stale. Prints the ONE verified pid,
+# or returns non-zero when the owner cannot be identified UNAMBIGUOUSLY.
+#
+# IDENTIFY-BY-BASENAME ALONE IS A FOOTGUN, and it drew blood while this fix
+# was being written: matching the wrapper BASENAME (`serve-supervised.sh`)
+# hit four unrelated production rows that share that wrapper, and the caller
+# TERMed all of them. The basename cannot be dropped either — registry launch
+# fields are commonly RELATIVE (`./serve-supervised.sh`) while the running
+# cmdline is absolute, so the token as written matches nothing. What makes a
+# basename match safe is the SECOND half of the predicate:
+#   (a) /proc/<pid>/cmdline mentions the wrapper basename, AND
+#   (b) /proc/<pid>/cwd IS the service's workdir — recovery launches every
+#       supervisor with `cd <workdir>`, and it is the workdir, not the
+#       script, that distinguishes two rows sharing one wrapper.
+# `pgrep` only PROPOSES; every candidate is re-verified from /proc before it
+# is named to a caller that will signal it. We never `pkill -f` — pattern
+# killing matches the watcher's own command line and has taken it down.
+#
+# AMBIGUITY IS FATAL, NEVER RESOLVED BY GUESSING: a service has exactly one
+# supervisor, so two or more survivors mean the predicate did not identify
+# it. Refuse. Killing "all the matches" is precisely the blast radius this
+# whole change exists to prevent.
+# Results are returned in GLOBALS, not on stdout: a caller capturing stdout
+# with $(…) would run this in a subshell, and the ambiguity verdict set there
+# would be discarded — the guard would then be unreachable, silently.
+#   _SVC_LOCATE_PID        the single identified pid (return 0)
+#   _SVC_LOCATE_AMBIGUOUS  space-separated candidates when >1 matched
+# Returns 0 iff exactly one candidate was positively identified.
+_SVC_LOCATE_PID=''
+_SVC_LOCATE_AMBIGUOUS=''
+_svc_locate_orphan_daemon() {
+    local launch="$1" workdir="$2" tok base pid cl cwd uid wd_real
+    local -a hits=()
+    _SVC_LOCATE_PID=''; _SVC_LOCATE_AMBIGUOUS=''
+    tok=${launch%% *}
+    base=${tok##*/}
+    [[ -n "$base" ]] || return 1
+    command -v pgrep >/dev/null 2>&1 || return 1
+    uid=$(id -u 2>/dev/null) || return 1
+    wd_real=$(readlink -f "$workdir" 2>/dev/null)
+    [[ -n "$wd_real" ]] || return 1
+    while read -r pid; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        (( pid == $$ || pid == PPID )) && continue
+        [[ -r "/proc/$pid/cmdline" ]] || continue
+        cl=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+        [[ "$cl" == *"$base"* ]] || continue
+        cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
+        [[ "$cwd" == "$wd_real" ]] || continue
+        hits+=( "$pid" )
+    done < <(pgrep -u "$uid" -f -- "$base" 2>/dev/null)
+    if (( ${#hits[@]} == 1 )); then _SVC_LOCATE_PID="${hits[0]}"; return 0; fi
+    (( ${#hits[@]} > 1 )) && _SVC_LOCATE_AMBIGUOUS="${hits[*]}"
+    return 1
+}
+
+# Genuinely reconcile an orphaned service: locate the daemon, stop it,
+# restart it under a supervisor, leave a valid record. Where it CANNOT, it
+# fails loudly with the reason rather than reporting health — a passing
+# healthcheck is never sufficient evidence that a reconcile worked
+# (your-org/nexus-code#606).
+_svc_reconcile_orphan() {
+    local name="$1" workdir="$2" launch="$3" health="$4" logfile="$5"
+    local st="$6" why="$7"
+    local pf pid i
+    pf=$(_recover_pidfile "$name")
+    echo "[svc] $name: ORPHANED DAEMON — healthcheck passes, supervisor record is $st${why:+ ($why)}. Reconciling." >&2
+
+    # No command substitution: the verdict comes back in globals (see the
+    # function's header) precisely so the ambiguity branch stays reachable.
+    if _svc_locate_orphan_daemon "$launch" "$workdir"; then
+        pid="$_SVC_LOCATE_PID"
+    else
+        if [[ -n "$_SVC_LOCATE_AMBIGUOUS" ]]; then
+            echo "[svc] $name: CANNOT RECONCILE — discovery is AMBIGUOUS: pids $_SVC_LOCATE_AMBIGUOUS all match" >&2
+            echo "[svc] $name:   '${launch%% *}' in $workdir. A service has ONE supervisor, so this predicate has" >&2
+            echo "[svc] $name:   not identified it — and killing every match is how a targeted bounce becomes an" >&2
+            echo "[svc] $name:   outage. Nothing was signalled. Resolve by hand, by recorded pid." >&2
+        else
+            echo "[svc] $name: CANNOT RECONCILE — no process we can see runs '${launch%% *}' with cwd $workdir." >&2
+            echo "[svc] $name:   Something IS answering the healthcheck, so the listener belongs to a process outside" >&2
+            echo "[svc] $name:   this view: another container/pid-namespace (a record whose reason is 'foreign-namespace'" >&2
+            echo "[svc] $name:   is the signature), or another UID entirely. Identify the owner before acting:" >&2
+            echo "[svc] $name:     ss -ltnpe | grep <port>     # uid:65534 with no pid = not ours, do NOT kill" >&2
+            echo "[svc] $name:   A daemon you cannot see is one you must not signal. Escalate to the operator." >&2
+        fi
+        echo "[svc] $name:   Pid record PRESERVED at $pf (evidence)." >&2
+        return 1
+    fi
+
+    echo "[svc] $name: located daemon pid $pid (cwd $workdir) — TERM to its process group" >&2
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "[svc] $name: pid $pid still alive after 5s — KILL" >&2
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    sleep 0.5
+
+    # The daemon we could see is gone. If the healthcheck STILL passes, then
+    # whatever is serving was never ours — exactly the case a green probe
+    # would otherwise launder into "reconciled".
+    if _recover_service_healthy "$workdir" "$health"; then
+        echo "[svc] $name: CANNOT RECONCILE — killed the process(es) we found, yet the healthcheck STILL passes." >&2
+        echo "[svc] $name:   A DIFFERENT process is serving this endpoint — the healthcheck cannot tell it from ours" >&2
+        echo "[svc] $name:   (a port probe, or an SSH banner, proves only that SOMETHING answers). Do not kill blindly:" >&2
+        echo "[svc] $name:   identify the listener's owner first (ss -ltnpe), then escalate to the operator." >&2
+        return 1
+    fi
+
+    rm -f "$pf"
+    local outcome
+    outcome=$(recover_service "$name" "$workdir" "$launch" "$health" "$logfile")
+    echo "[svc] $name: relaunch outcome: $outcome" >&2
+    case "$outcome" in
+        relaunched|healthy) ;;
+        *)  echo "[svc] $name: CANNOT RECONCILE — the daemon was stopped but the relaunch reported '$outcome'." >&2
+            echo "[svc] $name:   The service is now DOWN and unsupervised. See the service log, then retry." >&2
+            return 1 ;;
+    esac
+    # Insist on a VALID record: a reconcile that leaves no live supervisor
+    # has not reconciled, however green the probe goes.
+    _recover_supervisor_probe "$name" "$launch"
+    if [[ "$_RECOVER_SUP_STATE" != alive:* ]]; then
+        echo "[svc] $name: CANNOT RECONCILE — relaunched, but no live supervisor record exists (state: $_RECOVER_SUP_STATE${_RECOVER_STALE_REASON:+, $_RECOVER_STALE_REASON})." >&2
+        return 1
+    fi
+    echo "[svc] $name: reconciled — daemon bounced, supervisor $_RECOVER_SUP_STATE, record $pf" >&2
+    return 0
 }
 
 # TERM the supervisor's process group (setsid made it a session+group
@@ -1196,18 +1343,27 @@ _stop_service() {
     local pf pid i
     pf=$(_recover_pidfile "$name")
     if ! _recover_service_running "$name" "$launch"; then
+        # ORPHAN CHECK BEFORE ANY REMOVAL (your-org/nexus-code#606). The old
+        # code deleted the record first and only then noticed the healthcheck
+        # still passed — discarding the record of the daemon it had just
+        # failed to stop, and then advising `restart`, which called straight
+        # back into here. Order matters: probe, then decide.
+        _recover_supervisor_probe "$name" "$launch"
+        local st="$_RECOVER_SUP_STATE" why="$_RECOVER_STALE_REASON"
+        if _recover_service_healthy "$workdir" "$health"; then
+            echo "[svc] $name: REFUSING to drop the pid record — the healthcheck PASSES but no live supervisor holds it (record: $st${why:+, $why})." >&2
+            echo "[svc] $name:   A daemon is SERVING UNSUPERVISED. 'stop' cannot stop what it does not track, and deleting" >&2
+            echo "[svc] $name:   the record would destroy the only evidence of which supervisor died. Record PRESERVED." >&2
+            echo "[svc] $name:   Reconcile (locates the daemon, bounces it, re-supervises): monitor/svc.sh restart $name" >&2
+            return 1
+        fi
         echo "[svc] $name: no live supervisor — nothing to stop" >&2
-        # Removing the record does NOT stop an orphaned daemon: the supervisor
-        # is what we track, and it is already gone. Say so loudly, or `stop`
-        # reads as "service stopped" while the daemon keeps serving,
-        # unsupervised and now unrecorded.
+        # Healthcheck FAILS too: the record is consistent litter (the
+        # supervisor died and took the service with it), so dropping it is
+        # safe and keeps recovery from tripping over a dead pid.
         if [[ -f "$pf" ]]; then
             rm -f "$pf"
-            echo "[svc] $name: removed stale pidfile" >&2
-            if _recover_service_healthy "$workdir" "$health"; then
-                echo "[svc] $name: WARNING — the healthcheck STILL PASSES: an orphaned daemon is serving without a supervisor, and its pid record is now gone." >&2
-                echo "[svc] $name:           'stop' removed the record, not the daemon. Use 'svc.sh restart $name' to reconcile (it will bounce the daemon)." >&2
-            fi
+            echo "[svc] $name: removed stale pid record ($st${why:+, $why}); service is down, so nothing is left unsupervised" >&2
         fi
         return 0
     fi
@@ -1562,6 +1718,19 @@ cmd_restart() {
     _coldbuild_guard "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
         "${SVC_LAUNCH[$REG_I]}" || return 1
     _record_restart_marker "$name"
+    # ORPHAN PATH FIRST (your-org/nexus-code#606). The plain stop→start
+    # sequence cannot reconcile an orphan: `stop` has no live supervisor to
+    # signal, and `start` short-circuits on the daemon's own passing
+    # healthcheck — so the bounce this verb promises never happened, and it
+    # printed `healthy`. Detect the state up front and do the real work.
+    local _n="${SVC_NAME[$REG_I]}" _w="${SVC_WORKDIR[$REG_I]}"
+    local _l="${SVC_LAUNCH[$REG_I]}" _h="${SVC_HEALTH[$REG_I]}" _g="${SVC_LOG[$REG_I]}"
+    _recover_supervisor_probe "$_n" "$_l"
+    if [[ "$_RECOVER_SUP_STATE" != alive:* ]] && _recover_service_healthy "$_w" "$_h"; then
+        _svc_reconcile_orphan "$_n" "$_w" "$_l" "$_h" "$_g" \
+            "$_RECOVER_SUP_STATE" "$_RECOVER_STALE_REASON"
+        return
+    fi
     cmd_stop "$name" || true
     cmd_start "$name"
 }

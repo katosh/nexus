@@ -58,22 +58,40 @@
 # interactive shells use locals-env's PATH-ONLY mode (which returns before the
 # wrapper prepend AND the ZDOTDIR export), so they never get the wrapper.
 #
-# CLASSIFICATION (see the verb table in skills/nexus.bot/SKILL.md):
-#   WRITE  → auto-inject the bot token (minted via monitor/mint-token.sh,
-#            the SAME source `ng` uses — no token logic is reimplemented):
-#            pr create|edit|merge|comment|close|reopen|ready|review;
-#            issue create|edit|comment|close|reopen|lock|unlock|delete|
-#            transfer|pin|unpin|develop; release create|edit|delete|upload;
-#            repo create|edit|delete|archive|unarchive|rename|fork|sync;
-#            label create|edit|delete|clone; secret set|delete;
-#            variable set|delete; gist create|edit|delete|rename;
-#            `api` with --method/-X in {POST,PATCH,PUT,DELETE}, `api graphql`
-#            (default graphql to the bot — mutations are hard to tell from
-#            queries; the bot is the safe call), and `api <path>` with a
-#            request body (-f/-F/--field/--raw-field, or --input <file>) and
-#            no explicit GET (gh defaults those to POST). Ambiguous → WRITE.
-#   READ + `gh auth …` → PASS THROUGH untouched. Reads don't notify;
-#            `gh auth token` is the user-PAT path `ng fetch-asset` depends on.
+# CLASSIFICATION — FAIL-CLOSED (see the verb table in skills/nexus.bot/SKILL.md).
+# This header is a summary of the `case` block in branch (3); the code is the
+# authority. It used to enumerate the WRITE side and drifted out of date the
+# moment an arm was added (your-org/nexus-code#568 D12 catalogued seven omitted
+# arms). It now enumerates the READ side, which is the side the code enumerates
+# too — so the two cannot disagree about what the default is.
+#
+#   READ (pass through to the OPERATOR, untouched) — ONLY these:
+#            whole groups: auth, alias, config, extension, completion, help,
+#            version, status, search, browse  (read-only, or purely local gh
+#            state; `gh auth token` is the user-PAT path `ng fetch-asset`
+#            depends on);
+#            per group: pr list|view|diff|checks|status|checkout ·
+#            issue list|view|status · release list|view|download ·
+#            repo list|view|clone|license|gitignore and deploy-key|autolink
+#            list|view · label list · gist list|view|clone ·
+#            secret|variable list · workflow list|view ·
+#            run list|view|watch|download · cache list · gpg-key|ssh-key list ·
+#            codespace list|view|logs|ports|code|ssh|jupyter ·
+#            project list|view|item-list|field-list · org list ·
+#            ruleset list|view|check · agent-task list|view ·
+#            attestation verify|download|trusted-root;
+#            `gh <group>` with no subcommand (prints help);
+#            `gh` bare / flags only (`gh --version`);
+#            `api` without a mutation signal (no --method/-X in
+#            {POST,PATCH,PUT,DELETE}, not `graphql`, and no request body via
+#            -f/-F/--field/--raw-field/--input) — i.e. a plain GET.
+#   WRITE  → EVERYTHING ELSE, including any subcommand not listed above, any
+#            command group this shim does not know, and `api graphql` (default
+#            graphql to the bot — mutations are hard to tell from queries; the
+#            bot is the safe call). Auto-injects the bot token, minted via
+#            monitor/mint-token.sh — the SAME source `ng` uses; no token logic
+#            is reimplemented. Ambiguous → WRITE, now by construction rather
+#            than by enumeration.
 #   GH_TOKEN already set → PASS THROUGH unchanged. The watcher and correct
 #            callers set it explicitly; never double-inject or override.
 #
@@ -206,30 +224,76 @@ gh() {
         _ghs_opcfg "$@"; return $?
     fi
 
-    # (3) Classify the verb. Find the command GROUP (first token matching a
-    #     known group, so a leading `--repo X`/`-R X` is skipped) and the
-    #     SUBCOMMAND (next non-flag token after it).
-    _ghs_grp=""; _ghs_sub=""; _ghs_seen=0
+    # (3) Classify the verb — FAIL-CLOSED (your-org/nexus-code#568 A3).
+    #
+    #     THE INVERSION, and why it matters. This block used to default
+    #     `_ghs_write=0` and set it to 1 only from an explicit per-group list of
+    #     write subcommands. That is fail-OPEN: any command group with no arm,
+    #     and any subcommand a group's arm did not enumerate, silently routed
+    #     through the OPERATOR's ambient credentials — the exact opposite of the
+    #     header's stated "Ambiguous → WRITE" policy (which was implemented only
+    #     inside the `api` arm). Confirmed empirically by an independent probe:
+    #     `gh project item-create|item-add|item-delete|item-edit|close|
+    #     field-delete`, `gh codespace create|delete`, `gh release delete-asset`,
+    #     `gh repo deploy-key add` and `gh agent-task create` all posted as the
+    #     operator, making CLAUDE.md's "bare `gh <write>` already posts as the
+    #     bot" false for those surfaces. `codespace` was the sharpest case: it
+    #     sat in the group-recognition list with NO `case` arm at all, so it read
+    #     as covered and could never be classified WRITE.
+    #
+    #     So the polarity is now reversed: each known group declares what is
+    #     READ-ONLY, and everything else — an unenumerated subcommand, a
+    #     subcommand a future gh adds, an entire group this shim has never heard
+    #     of — is a WRITE. New gh surface area now defaults to the bot instead of
+    #     defaulting to the operator, which is the property that stops this class
+    #     of gap from re-opening.
+    #
+    #     Cost of the inversion, stated honestly: a READ mis-classified as a
+    #     WRITE runs under the bot's installation token, so it can 404 on a repo
+    #     where the bot is not installed. That failure is LOUD and immediate. The
+    #     failure it replaces was silent by construction (the write succeeded,
+    #     GitHub muted the operator's self-notification, and the thread went
+    #     dark — the #497 signature). Loud-and-wrong beats silent-and-wrong on a
+    #     security boundary. The documented remedy for both is the same:
+    #     GH_IMPERSONATE=1 GH_IMPERSONATE_REASON='…'.
+    #
+    #     Note also that some groups are USER-scoped (`codespace`), where a bot
+    #     installation token has no authority at all. Fail-closed there surfaces
+    #     as a loud auth error rather than an unannounced operator action; the
+    #     impersonation hatch is the intended path.
+    #
+    #     GROUP is the first token matching a known group (so a leading
+    #     `--repo X` / `-R X` is skipped); SUB is the next non-flag token; SUB2
+    #     the one after it (needed for two-level groups like `repo deploy-key
+    #     list`, where SUB alone cannot separate the read from the write).
+    _ghs_grp=""; _ghs_sub=""; _ghs_sub2=""; _ghs_seen=0
     for _ghs_a in "$@"; do
         if [ "$_ghs_seen" = 0 ]; then
-            case " pr issue release repo label gist secret variable api workflow run cache codespace gpg-key ssh-key " in
+            case " pr issue release repo label gist secret variable api workflow run cache codespace gpg-key ssh-key project org ruleset agent-task attestation auth alias config extension completion help version status search browse " in
                 *" $_ghs_a "*) _ghs_grp="$_ghs_a"; _ghs_seen=1 ;;
             esac
         else
             case "$_ghs_a" in
                 -*) continue ;;
             esac
-            _ghs_sub="$_ghs_a"; break
+            if [ -z "$_ghs_sub" ]; then _ghs_sub="$_ghs_a"; else _ghs_sub2="$_ghs_a"; break; fi
         fi
     done
 
-    _ghs_write=0
+    # Default WRITE. `_ghs_fc` records that the verdict came from the
+    # fail-closed default rather than an explicit read allowlist, so the
+    # classification can announce itself instead of surprising the caller.
+    _ghs_write=1; _ghs_fc=1
     case "$_ghs_grp" in
         api)
             # `gh api` defaults to GET, POSTs when a request body is supplied
             # (-f/-F/--field/--raw-field, OR --input <file>), and takes
             # --method/-X for everything else. graphql → treat as a mutation
-            # by default (bot is the safe call).
+            # by default (bot is the safe call). This arm was already
+            # fail-closed on ambiguity, so it keeps its own polarity: start
+            # from READ (a bare `gh api <path>` is a GET) and raise to WRITE
+            # on any of the mutation signals.
+            _ghs_write=0; _ghs_fc=0
             _ghs_method=""; _ghs_hasfield=0; _ghs_expect=0
             for _ghs_a in "$@"; do
                 if [ "$_ghs_expect" = 1 ]; then _ghs_method="$_ghs_a"; _ghs_expect=0; continue; fi
@@ -251,68 +315,173 @@ gh() {
                 esac
             fi
             ;;
+        # --- Groups that are read-only or purely LOCAL state. Pass through to
+        #     the operator as a whole. `gh auth …` is load-bearing: it is the
+        #     user-PAT path `ng fetch-asset` depends on. `alias`/`config`/
+        #     `extension` do mutate, but only the operator's own gh config.
+        auth|alias|config|extension|completion|help|version|status|search|browse)
+            _ghs_write=0; _ghs_fc=0
+            ;;
+        # --- Remote-mutating groups: enumerate the READS, everything else WRITE.
+        #     An empty SUB means `gh <group>` with no subcommand, which prints
+        #     help — always a read.
         pr)
             case "$_ghs_sub" in
-                create|edit|merge|comment|close|reopen|ready|review) _ghs_write=1 ;;
+                ''|list|view|diff|checks|status|checkout) _ghs_write=0; _ghs_fc=0 ;;
             esac
             ;;
         issue)
             case "$_ghs_sub" in
-                create|edit|comment|close|reopen|lock|unlock|delete|transfer|pin|unpin|develop) _ghs_write=1 ;;
+                ''|list|view|status) _ghs_write=0; _ghs_fc=0 ;;
             esac
             ;;
         release)
+            # `delete-asset` is the concrete surface the #568 probe caught
+            # routing to the operator; it is a write by omission from this list.
             case "$_ghs_sub" in
-                create|edit|delete|upload) _ghs_write=1 ;;
+                ''|list|view|download) _ghs_write=0; _ghs_fc=0 ;;
             esac
             ;;
         repo)
             case "$_ghs_sub" in
-                create|edit|delete|archive|unarchive|rename|fork|sync|set-default) _ghs_write=1 ;;
+                ''|list|view|clone|license|gitignore) _ghs_write=0; _ghs_fc=0 ;;
+                deploy-key|autolink)
+                    # Two-level: `… deploy-key list` reads, `… deploy-key add`
+                    # writes (the second surface the probe caught).
+                    case "$_ghs_sub2" in
+                        ''|list|view) _ghs_write=0; _ghs_fc=0 ;;
+                    esac
+                    ;;
             esac
             ;;
         label)
             case "$_ghs_sub" in
-                create|edit|delete|clone) _ghs_write=1 ;;
+                ''|list) _ghs_write=0; _ghs_fc=0 ;;
             esac
             ;;
         gist)
             case "$_ghs_sub" in
-                create|edit|delete|rename) _ghs_write=1 ;;
+                ''|list|view|clone) _ghs_write=0; _ghs_fc=0 ;;
             esac
             ;;
         secret|variable)
             case "$_ghs_sub" in
-                set|delete|remove) _ghs_write=1 ;;
+                ''|list) _ghs_write=0; _ghs_fc=0 ;;
             esac
             ;;
         workflow)
             case "$_ghs_sub" in
-                run|enable|disable) _ghs_write=1 ;;
+                ''|list|view) _ghs_write=0; _ghs_fc=0 ;;
             esac
             ;;
         run)
             case "$_ghs_sub" in
-                cancel|rerun|delete) _ghs_write=1 ;;
+                ''|list|view|watch|download) _ghs_write=0; _ghs_fc=0 ;;
             esac
             ;;
         cache)
             case "$_ghs_sub" in
-                delete) _ghs_write=1 ;;
+                ''|list) _ghs_write=0; _ghs_fc=0 ;;
             esac
             ;;
         gpg-key|ssh-key)
             case "$_ghs_sub" in
-                add|delete) _ghs_write=1 ;;
+                ''|list) _ghs_write=0; _ghs_fc=0 ;;
             esac
+            ;;
+        codespace)
+            # Previously in the recognition list with NO arm at all — the
+            # dead-entry-that-reads-as-covered case. USER-scoped: see the note
+            # above on why a WRITE verdict here fails loudly by design.
+            case "$_ghs_sub" in
+                ''|list|view|logs|ports|code|ssh|jupyter) _ghs_write=0; _ghs_fc=0 ;;
+            esac
+            ;;
+        project)
+            # `item-create`/`item-add`/`item-delete`/`item-edit`/`close`/
+            # `field-delete` were the largest confirmed operator-routing set.
+            case "$_ghs_sub" in
+                ''|list|view|item-list|field-list) _ghs_write=0; _ghs_fc=0 ;;
+            esac
+            ;;
+        org)
+            case "$_ghs_sub" in
+                ''|list) _ghs_write=0; _ghs_fc=0 ;;
+            esac
+            ;;
+        ruleset)
+            case "$_ghs_sub" in
+                ''|list|view|check) _ghs_write=0; _ghs_fc=0 ;;
+            esac
+            ;;
+        agent-task)
+            case "$_ghs_sub" in
+                ''|list|view) _ghs_write=0; _ghs_fc=0 ;;
+            esac
+            ;;
+        attestation)
+            case "$_ghs_sub" in
+                ''|verify|download|trusted-root) _ghs_write=0; _ghs_fc=0 ;;
+            esac
+            ;;
+        *)
+            # No recognised group token. Two cases, and they must not be
+            # conflated: a bare/flags-only invocation (`gh`, `gh --version`,
+            # `gh --help`) is a READ, while an unrecognised command GROUP — a
+            # newer gh, a user alias — is a WRITE under the inverted default.
+            # Skip the values of the global flags that take one, so
+            # `gh --repo o/r <newgroup>` still classifies on <newgroup>.
+            _ghs_first=""; _ghs_skip=0
+            for _ghs_a in "$@"; do
+                if [ "$_ghs_skip" = 1 ]; then _ghs_skip=0; continue; fi
+                case "$_ghs_a" in
+                    -R|--repo|--hostname) _ghs_skip=1; continue ;;
+                    -*) continue ;;
+                esac
+                _ghs_first="$_ghs_a"; break
+            done
+            if [ -z "$_ghs_first" ]; then _ghs_write=0; _ghs_fc=0; fi
             ;;
     esac
 
-    # (4) Reads, `gh auth …`, and everything unrecognised pass through — with
-    #     the operator's config dir restored, since locals-env.sh scoped the
-    #     ambient one away. Writes never reach here.
+    # The familiar, long-classified writes. This list has NO bearing on
+    # identity — it only says "this WRITE verdict is unsurprising, stay quiet".
+    # It is the enumeration the old classifier used for identity; demoting it to
+    # a messaging concern is what makes its drift harmless. Everything reaching
+    # a WRITE verdict WITHOUT being in here is novel surface, and says so.
+    if [ "$_ghs_write" = 1 ]; then
+        case "$_ghs_grp:$_ghs_sub" in
+            pr:create|pr:edit|pr:merge|pr:comment|pr:close|pr:reopen|pr:ready|pr:review) _ghs_fc=0 ;;
+            issue:create|issue:edit|issue:comment|issue:close|issue:reopen|issue:lock|issue:unlock|issue:delete|issue:transfer|issue:pin|issue:unpin|issue:develop) _ghs_fc=0 ;;
+            release:create|release:edit|release:delete|release:upload) _ghs_fc=0 ;;
+            repo:create|repo:edit|repo:delete|repo:archive|repo:unarchive|repo:rename|repo:fork|repo:sync|repo:set-default) _ghs_fc=0 ;;
+            label:create|label:edit|label:delete|label:clone) _ghs_fc=0 ;;
+            gist:create|gist:edit|gist:delete|gist:rename) _ghs_fc=0 ;;
+            secret:set|secret:delete|secret:remove|variable:set|variable:delete|variable:remove) _ghs_fc=0 ;;
+            workflow:run|workflow:enable|workflow:disable) _ghs_fc=0 ;;
+            run:cancel|run:rerun|run:delete) _ghs_fc=0 ;;
+            cache:delete) _ghs_fc=0 ;;
+            gpg-key:add|gpg-key:delete|ssh-key:add|ssh-key:delete) _ghs_fc=0 ;;
+        esac
+    fi
+
+    # (4) Reads and `gh auth …` pass through — with the operator's config dir
+    #     restored, since locals-env.sh scoped the ambient one away. Writes
+    #     never reach here. Nothing reaches here by default any more: an
+    #     unclassified command is a WRITE, not a passthrough.
     if [ "$_ghs_write" = 0 ]; then
         _ghs_opcfg "$@"; return $?
+    fi
+
+    # A fail-closed verdict is announced rather than assumed. The point of the
+    # inversion is that new surface area lands on the bot; the point of this
+    # line is that the caller can tell when that happened, instead of
+    # discovering it from a puzzling 404. Suppressible for callers that parse
+    # stderr (GH_SHIM_QUIET=1).
+    if [ "$_ghs_fc" = 1 ] && [ -z "${GH_SHIM_QUIET:-}" ]; then
+        printf 'gh-shim: `gh %s%s` is not on any read allowlist — classified WRITE (fail-closed), using the BOT identity.\n' \
+            "${_ghs_grp:-${_ghs_first:-?}}" "${_ghs_sub:+ $_ghs_sub}" >&2
+        printf 'gh-shim: for the operator identity: GH_IMPERSONATE=1 GH_IMPERSONATE_REASON="why" gh …\n' >&2
     fi
 
     # (5) WRITE → inject the bot token. Single-source via mint-token.sh
@@ -342,5 +511,13 @@ gh() {
         printf 'gh-shim: mint-token.sh returned empty — refusing WRITE `gh %s`.\n' "$*" >&2
         return 1
     fi
-    GH_TOKEN="$_ghs_tok" _ghs_realgh "$@"
+    # An explicit subshell, NOT a `VAR=… func` prefix assignment (#568, skeptic
+    # finding). A prefix assignment on a FUNCTION call is only scoped to that
+    # call under zsh/bash; POSIX-conformant shells (dash) PERSIST it after the
+    # call returns. Under `sh` the old form leaked GH_TOKEN into the rest of the
+    # shell, where branch (1) above would then short-circuit every later `gh` —
+    # silently pinning the whole session to one minted token. Inert under the
+    # shells this runs on today, but this is a security-critical path and the
+    # scoping should not depend on which shell sourced the shim.
+    ( GH_TOKEN="$_ghs_tok"; export GH_TOKEN; _ghs_realgh "$@" )
 }

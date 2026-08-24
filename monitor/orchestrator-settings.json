@@ -31,6 +31,16 @@
         ]
       }
     ],
+    "Notification": [
+      {
+        "hooks": [
+          { "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/notification-record.sh" },
+          { "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/notify-permission.sh" }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

@@ -60,7 +60,7 @@ _chan_apply_utf8_locale() {
     esac
     local _cand
     for _cand in C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8; do
-        if locale -a 2>/dev/null | grep -qxF "$_cand"; then
+        if grep -qxF "$_cand" <<<"$(locale -a 2>/dev/null)"; then
             export LC_ALL="$_cand" LANG="$_cand"
             return 0
         fi

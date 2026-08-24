@@ -25,8 +25,12 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
+    # Dump the ACTUAL haystack on failure, not just the expected needle:
+    # when this exact assertion reddened dev under fork pressure
+    # (your-org/nexus-code#638), the missing `actual:` line hid WHICH wrong
+    # project slug was emitted, costing a debugging cycle.
     if grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
-    else printf '  FAIL: %s\n           expected: %s\n' "$label" "$needle" >&2; FAIL=$(( FAIL + 1 )); fi
+    else printf '  FAIL: %s\n           expected: %s\n           actual:   %s\n' "$label" "$needle" "$hay" >&2; FAIL=$(( FAIL + 1 )); fi
 }
 assert_not_contains() {
     local label="$1" hay="$2" needle="$3"
@@ -47,6 +51,10 @@ trap 'rm -rf "$WORK"' EXIT
 FAKE_NEXUS="$WORK/nexus"
 mkdir -p "$FAKE_NEXUS/monitor" "$FAKE_NEXUS/config" "$FAKE_NEXUS/reports"
 cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
+# `ng` sources monitor/_bookkeeping.sh and REFUSES TO START without
+# it (your-org/nexus-code#601/#605: degrading to the silent-coercion
+# behaviour it replaces is worse than refusing). Copy it alongside.
+cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
 NG="$FAKE_NEXUS/monitor/ng"
 
 cat > "$FAKE_NEXUS/config/load.sh" <<'STUB'

@@ -10,3 +10,14 @@
 # the template (services.registry.example) is tracked; the real file
 # lists deployment-specific paths/ports.
 services.registry
+# Operator-local Claude Code settings overlays (your-org/nexus-code#614).
+# The tracked `*-settings.json` files carry the SHARED defaults (hooks,
+# guards); these untracked siblings carry per-operator keys such as the
+# `model` pin and `tui` mode. Keeping them out of git is the whole
+# point: before this split every pull conflicted on the tracked files,
+# and resolving the conflict the obvious way (take upstream) silently
+# downgraded every worker off the operator's chosen model.
+# `monitor/resolve-settings.sh` merges these over the tracked defaults
+# at spawn time.
+worker-settings.local.json
+orchestrator-settings.local.json

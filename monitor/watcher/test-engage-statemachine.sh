@@ -394,7 +394,16 @@ run_probe_capture out rc 'render_idle_section'
 assert_contains "render names the failure and the fix" "$out" \
     'lostpaste paste-unconfirmed (paste '
 assert_contains "render points at the canonical paste path" "$out" \
-    're-paste via monitor/paste-followup.sh'
+    'monitor/paste-followup.sh'
+# your-org/nexus-code#568 A9: this class has false positives (a paste consumed
+# via the retry-Enter path stamps nothing), and its old remedy — a bare
+# "re-paste" — is DESTRUCTIVE when it fires wrongly: it re-delivers an already-
+# executed instruction. The render must lead with verification, not with the
+# re-paste, and must say the re-paste is conditional.
+assert_contains "render demands verification BEFORE the re-paste" "$out" \
+    'VERIFY CONSUMPTION FIRST'
+assert_contains "render marks the re-paste as conditional" "$out" \
+    'ONLY if it demonstrably was not'
 # The orchestrator re-pastes; this time the hook fires → the stamp
 # covers the paste and the window returns to the normal class.
 printf 'lostpaste\t%s\tpaste-followup\n' "$(( NOW - 5 ))" >> "$STATE_DIR/machine-input.tsv"

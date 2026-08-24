@@ -26,10 +26,13 @@ cd /path/to/nexus && agent-sandbox tmux new-session ./watcher
 ```
 
 `./watcher` and `./nexus` are equivalent symlinks to
-`monitor/watcher/entry.sh`. Add `--continue` to resume the pinned
-orchestrator session instead of booting a fresh one. The command is
-idempotent — re-running it against a healthy stack launches nothing
-new and just lands you in the cockpit.
+`monitor/watcher/entry.sh`. Bare, it is a genuinely **cold** boot of the
+whole workspace: a fresh orchestrator AND no worker agent resurrected —
+you are handed a manifest of what was dropped instead. Add `--continue`
+to resume the prior workspace: the pinned orchestrator session plus every
+worker that was alive. The command is idempotent — re-running it against
+a healthy stack launches nothing new, drops nothing, and just lands you
+in the cockpit.
 
 Everything else under `monitor/` that can start things is a
 lower-level helper the entry point (or automated recovery) calls for
@@ -74,8 +77,12 @@ Three pieces:
      the pin → fresh boot; `--continue` keeps it → the watcher
      resumes that exact session via `claude --resume <sid>`, or
      spawns fresh when the pin is missing/stale — never
-     `claude --continue`), brings the stack up via `monitor/svc.sh
-     up`, then renames the invoking window to `services` and execs
+     `claude --continue`) **and onto the boot-intent file**
+     (`monitor/.state/boot-intent`, `mode=fresh|continue`) that
+     governs the WORKER walk (<your-org>/nexus-code#651 — see
+     "Cold boot drops workers" below), brings the stack up via
+     `monitor/svc.sh up`, then renames the invoking window to
+     `services` and execs
      the read-only `svc.sh` cockpit. `svc.sh up` delegates to
      `bootstrap-recover.sh`, which brings the orchestrator up
      **directly and FIRST** — before respawning workers — and pins
@@ -150,10 +157,10 @@ Three pieces:
      | `wrapped-but-stub` | `<window> wrapped-but-stub (<missing-fields>)` | Paste finish-and-expand template; re-check next wake. |
      | `no-wrap-up` | `<window> idle <age> WITHOUT wrap-up — consider follow-up paste` | Paste wrap-up-missing template; re-check next wake. |
      | `idle-too-long` | `<window> idle-too-long <age> (exceeds close threshold; consider close)` | Strong default-to-close at ≥ `monitor.idle_close_hours` (default 24h); retention overrides still apply. |
-     | `pane-absent` | `<window> pane-absent (claude process gone or unresponsive; relaunch or close)` | Inner Claude Code process is gone (pane fell back to shell), the renderer is in an ambiguous state, or the pane is sitting on a stalled overlay. Relaunch via `monitor/spawn-worker.sh` or close. Inviolable — never suppressed by `window-retain`. |
+     | `pane-absent` | `<window> pane-absent (<advisory>)` — the advisory is **per pane-state**, not fixed: `absent` → `claude process gone or unresponsive; relaunch or close`; `blocked` → `overlay awaiting the operator (blocked) — ANSWER it in the pane; do NOT relaunch or close` | One class, two states, two opposite actions (<your-org>/nexus-code#808). `absent` = the inner Claude Code process is gone (pane fell back to shell / no input chevron) → relaunch via `monitor/spawn-worker.sh` or close. `blocked` = the process is **alive** and rendering a modal (permission prompt, AskUserQuestion, rate-limit) that only a human clears → **answer it**; relaunching destroys a live agent's context and discards the question it is asking. Observed in production 2026-08-07 against a worker displaying an AskUserQuestion, which the fixed advisory told the operator to relaunch. The kill gate held (`bk_pane_kill_authorized` refuses `blocked`, and `retire-preflight.sh` carries an explicit do-not-kill arm), so the cost is operator trust in a surface documented as inviolable — not a lost worker. `empty` is **not** in this class. Inviolable — never suppressed by `window-retain`. Note `N pane-absent` in the summary line still counts both states into one number. |
      | `over-limit` | `<window> OVER-LIMIT (resets <reset_at>; weekly Opus limit hit — schedule resume)` | Worker's claude session hit the weekly Opus limit and is functionally suspended. Do NOT close. The **watcher** owns the wake-loop (issue #87): stamps a row in `monitor/.state/over-limit-state.tsv`, retries on exponential backoff (60s → 300s cap, default 10 attempts), pastes a resume brief into the pane the moment `pane-state.sh` reports the suspension cleared. While the orchestrator's own pane is in this state, the watcher also suppresses routine emit-pastes to it (they'd queue uselessly in an inert input box) — archives still write. `reset_at` is a single token (spaces→`_`, parens stripped). Inviolable — never suppressed by `window-retain`. |
      | `operator-engaged` | `<window> operator-engaged (src=<submit\|submit-after-wrap>; idle <age> — operator driving; idle/retire handling suppressed while engaged)` | None — the operator drives this window (issues #196, #201), wrapped or never-wrapped. Do NOT close, do NOT paste follow-ups. One informational row per engagement episode; while the mark is valid the window's `idle_prompt` decisions are also withheld. Seed: the worker's `UserPromptSubmit` hook stamped a prompt submit (`.state/user-prompt/<window>`, written by `worker-heartbeat.sh` — a deterministic Claude Code contract event, immune to the TUI character-rewriting that distorts pane reads) with NO machine-input stamp (`paste-followup` action-log event, `machine-input.tsv` row, or spawn event) covering it, AND corroborated by observed pane-content change within `monitor.operator_engaged_change_ttl_seconds` (default 600 — the <your-org>/<your-nexus>#205 follow-up: a fragile one-frame bright-text read no longer gates the mark; sustained transcript change does). Orchestrator follow-ups MUST still go through `monitor/paste-followup.sh` (an unstamped paste fires the hook with no machine stamp and, if the agent then changes the pane, briefly engages the window and mutes its stall-nag). The mark is **self-expiring**: the moment the pane goes static past that TTL it lapses and the window returns to normal retire-eligibility — a window is never pinned open indefinitely on a stale or false mark. An `engaged-done` finished-signal (`ng engaged-done`), a newer spawn, or window close also ends it; a wrap-up does NOT — interactive sessions stay engaged across their own hand-off (the <your-org>/<your-nexus>#205 state-machine follow-up), and `ng wrap-up` prompts the agent to signal `engaged-done` when finished. Full lifecycle diagram: `monitor/docs/agent-state-machine.md`. |
-     | `paste-unconfirmed` | `<window> paste-unconfirmed (paste <age>s ago; no UserPromptSubmit fired — the nudge silently failed; re-paste via monitor/paste-followup.sh)` | Injection↔hook pairing validation (the <your-org>/<your-nexus>#205 state-machine follow-up): a `paste-followup` older than `monitor.paste_confirm_grace_seconds` (default 180) fired no `UserPromptSubmit` on a hook-live window — the paste never submitted. Re-paste via `monitor/paste-followup.sh`. Not retain-suppressible. |
+     | `paste-unconfirmed` | `<window> paste-unconfirmed (paste <age>s ago; no UserPromptSubmit fired — the nudge silently failed; re-paste via monitor/paste-followup.sh)` | Injection↔hook pairing validation (the <your-org>/<your-nexus>#205 state-machine follow-up): a `paste-followup` older than `monitor.paste_confirm_grace_seconds` (default 180) fired no `UserPromptSubmit` on a hook-live window. **VERIFY CONSUMPTION FIRST, then re-paste only if needed.** This class has FALSE POSITIVES (<your-org>/nexus-code#568 A9): `machine-submit/<window>` is stamped only by the watcher's `UserPromptSubmit` path, so a paste delivered via `paste-followup.sh`'s RETRY-ENTER path is fully consumed and still leaves the stamp unchanged — and because the worker then goes idle, the row never self-heals. Acting on it blindly re-delivers an already-executed instruction (duplicate comments/commits). Read the pane or transcript for evidence the pasted content was acted on; re-paste via `monitor/paste-followup.sh` only if it demonstrably was not. Not retain-suppressible. |
      | `engaged-close-reminder` | `<window> operator-engaged but operator away <age> (src=<seed>) — consider closing this window; reminder re-fires once per period until the operator returns or it closes` | The away phase's only surface (issue #201): emitted at most once per `monitor.operator_engaged_close_reminder_seconds` (default 86400 = 24 h) once the operator has been away that long. Relay to the operator / nudge on the overview routing thread; do NOT auto-close — the window still belongs to the operator. |
      | `interrupted` | `<window> interrupted <age> — turn crashed (<category>); …` (the tail names the verb: `process alive, PASTE a resume nudge` for `transient`; `a resume would re-fail, RESPAWN via claude --continue or fresh spawn` for `config`/`conversation`; `needs operator` for `auth`) | The worker's last turn died to an API/model error: Claude Code fired the **`StopFailure`** hook (NOT `Stop`), so no state-clear ran and the idle/empty pane was previously mis-nagged as `no-wrap-up`. `monitor/hooks/turn-failure-emit.sh` (StopFailure) wrote `monitor/.state/turn-failure/<window>.json` with a `(category, recovery)` classification (`monitor/hooks/_cause_classify.sh`); a fresh marker (freshness-gated by `MONITOR_TURN_FAILURE_STALENESS_SECONDS`, default 1800) on an alive idle pane reclassifies to `interrupted`. The recovery verb is load-bearing — **PASTE** for `transient` (server 5xx blip; same turn succeeds on resume), **RESPAWN** for `config`/`conversation` (a paste re-runs the doomed turn), **operator** for `auth`. The Stop hook clears the marker on the next successful turn. End-to-end coverage: `monitor/watcher/test-integration/test-realmodel-apispoof.sh`. Full lifecycle: `monitor/docs/agent-state-machine.md`. |
      | Suppressed (retained) | `(N retained windows suppressed: <w1> (<reason1>), <w2> (<reason2>), …)` footer | None — the orchestrator already decided to keep these open via `ng log-action ... --event window-retain ...`. The footer is auditability only. |
@@ -352,6 +359,47 @@ Three pieces:
    never double-spawned; respawns are capped at `recover.max_workers`
    (default 12); an unresolvable session is skipped with a loud log
    line, never fatal.
+
+   **Cold boot drops workers** (<your-org>/nexus-code#651). All of the
+   above is the `--continue` contract. When the operator starts the
+   nexus WITHOUT `--continue`, `entry.sh` leaves a `mode=fresh`
+   record at `.state/boot-intent` and this step is replaced wholesale
+   by a deliberate drop: **no worker is resurrected**, `last-snapshot.txt`
+   is ARCHIVED (`.archived.<epoch>`, mirroring the session pin — never
+   deleted), and a **dropped-worker manifest** is written to
+   `.state/cold-boot-dropped-workers.md` listing every worker that
+   would have come back, each with the session-id and workdir resolved
+   by the canonical resolver (`spawn-worker.sh --resume <w> --dry-run`),
+   its most recent report, and the exact re-spawn command. Archiving the
+   snapshot is load-bearing, not tidiness: it is the only input to the
+   worker walk, so removing it closes the window in which a
+   SessionStart-triggered recovery could still read the pre-boot window
+   list. The intent is **one-shot** — archived the moment it is acted on
+   — so the mid-life recoveries that share this script (SessionStart,
+   `bootstrap.sh`'s per-turn refresh, a manual `svc.sh up`) keep
+   resuming workers, which for a crash is exactly right; and it expires
+   after `recover.boot_intent_ttl_seconds` (default 900) so an intent
+   whose boot never reached the walk can never fire against an unrelated
+   recovery days later. `--dry-run` resolves the intent but never
+   consumes it (`boot-recover.sh` runs it as a pure health probe).
+
+   Why this matters: on 2026-07-30 the sandbox died roughly every three
+   minutes for a quarter of an hour, and each death ran recovery, which
+   faithfully resurrected the worker whose own activity was killing the
+   sandbox. Unconditional resurrection is an amplifier — it turns a
+   single fault into a self-sustaining outage loop — and the operator's
+   only escape hatch (boot cold) did not previously reach the workers.
+
+   The manifest is **delivered**, not merely written, through two
+   surfaces that share `monitor/_dropped_manifest.sh` (once-only, marked
+   by `.state/cold-boot-dropped-workers.delivered`, re-armed whenever a
+   newer manifest is written): `spawn-fresh-orchestrator.sh` inlines it
+   verbatim into the situation report pasted into the freshly spawned
+   orchestrator (the normal cold-boot path — that report IS turn 1), and
+   `watcher/bootstrap.sh` prints it on stdout at the start of every
+   orchestrator wake (the backstop for the watcher's own absent-target
+   respawn, an operator-started session, or a spawn whose paste failed).
+   The manifest file itself survives delivery as the audit record.
 
    Flag matrix (watcher / orchestrator / services / workers): default =
    all four; `--no-services` (= `--watcher-only`) is core-only =
@@ -595,7 +643,9 @@ leader pid.
   `durable: true` flag is silently ignored, so on-disk state is the
   workaround.
 - **Watcher → agent (window absent).** If the orchestrator's tmux
-  window disappears entirely (claude crashed, window closed), the
+  window disappears entirely (window closed) OR is left behind as a
+  `remain-on-exit` corpse — claude crashed, the window stays listed,
+  every pane in it reports `#{pane_dead}` — the
   watcher's poll-level `_target_window_present` check fires
   `respawn_agent` after `monitor.agent_missing_respawn_delay`
   confirming polls (default 3 — ~8 s of confirmed absence at the
@@ -748,10 +798,53 @@ Ack channel — two shapes with different semantics:
   worker's life (e.g. retained-idle workers whose `idle_prompt`
   carries no real question).
 
-The `Stop` hook stamps `unresolved=true` on any decision file
-still present at turn-end so the watcher can flag it more
-loudly. Tombstones are skipped by both the Stop hook and the
-watcher's reader — they are terminal.
+The `Stop` hook rules on each decision file at turn-end, **by
+kind** (<your-org>/nexus-code#824):
+
+- `permission_prompt` → stamped `resolved: true` + `resolved_at`.
+  A permission modal **suspends** the turn, so `Stop` cannot fire
+  while it is on screen: its arrival is positive evidence the
+  modal is gone. The hook used to stamp `unresolved: true` here,
+  i.e. declare the prompt unanswered using the one event that
+  proves it was answered. Measured on window `spawnpath`: emitted
+  `11:50:39Z`, stamped `11:54:56Z` — the turn ran 4m17s past the
+  prompt and then reached `Stop`. The row then re-fired every
+  cooldown for ~5 h (13 firings) on byte-identical pane content.
+- everything else → `unresolved: true`, exactly as before.
+  `idle_prompt` genuinely lingers past turn-end. An
+  **unrecognised** kind takes this arm too: this is an
+  operator-attention channel and the harm it must never do is go
+  quiet, so anything unruled stays loud.
+
+`resolved` rows are skipped by `render_pending_decisions` but the
+file is **not** deleted — it is the audit record that the prompt
+happened, and only the ack channel retires a fingerprint.
+Resolution is not permanent suppression: a genuine re-fire
+rewrites `<fp>.json` wholesale with no `resolved` key, so the same
+fingerprint surfaces again. Tombstones are skipped by both the
+Stop hook and the watcher's reader — they are terminal.
+
+**Why the decision channel and `pane-state.sh` are NOT merged.**
+The obvious reading of `#824` is that two components classify the
+same pane and disagree, and that the fix is to merge them. That
+reading is wrong, and acting on it would break both.
+`hooks/decision-emit.sh` is a Claude Code **Notification** hook:
+its `kind` comes from the payload's `notification_type`, and it
+never opens the pane or consults SGR. So there is no second
+renderer-reading classifier inventing a thirteenth state. There is
+an **event record** — "a permission prompt fired at 11:50:39Z",
+authoritative at that instant and unobtainable from any later pane
+read — and a **state reading** — "the pane is `autosuggest-only`
+now", authoritative now and unobtainable from the event. Neither
+can be derived from the other, which is exactly why both exist.
+
+What was broken was the **bridge**: `unresolved` was presented as
+a live property while being derived from an event with no
+liveness check. The fix is to make the field mean what it says,
+not to collapse two instruments that measure different things.
+`bk_decision_row_actionable` remains the separate question of
+whether a human's answer is what unblocks the pane *right now*,
+and is deliberately untouched.
 
 **Watcher-synthesized records — the blocked-question relay (Case
 W).** The Notification-hook path above only covers panes spawned
@@ -810,7 +903,30 @@ per the mode.
 `wrap-up` carries the full skeptic flag set:
 `--skeptic-decision`, `--skeptic-rationale`, `--skeptic-waive`,
 `--skeptic-role`, `--skeptic-verdict`, `--skeptic-target`,
-`--skeptic-depth`, `--skeptic-findings`.
+`--skeptic-depth`, `--skeptic-findings`, `--not-a-skeptic-verdict`.
+
+**`--skeptic-findings` is optional, and its absence is recorded AS
+absence** (<your-org>/nexus-code#881). An omitted count prints
+`new findings : not stated`, logs `findings-stated=false` with **no**
+`findings` key, and never reaches the threshold comparison — where it
+used to be defaulted to `0`, making "measured zero new issues" and
+"never said" one indistinguishable record. There is no sentinel number:
+a `-1` would be the same defect wearing a disguise. With **neither** a
+count nor a readable `disposition:` in the report, nothing is on record
+saying the chain may end, so wrap-up escalates rather than terminating
+on a value nobody supplied. Either statement terminates it honestly —
+`--skeptic-findings 0` or `disposition: no-further-pass`.
+
+**`--not-a-skeptic-verdict "<why>"`** is for a window whose *provenance*
+carries `skeptic_role: true` but whose current wrap-up is ordinary worker
+work (<your-org>/nexus-code#879). Windows are stamped for their lifetime,
+not per task, so a retained skeptic that later authors a patch was
+otherwise forced to supply a `--skeptic-verdict` on its own diff — a
+self-review indistinguishable downstream from an independent clearance.
+The flag takes the ordinary producer path and records the reason (which
+must be substantive, >=20 chars, like `--skeptic-rearm`). It **clears no
+skeptic marker**: a verdict the window owes is still owed. It is mutually
+exclusive with `--skeptic-role` and `--skeptic-verdict`.
 
 ### Comms channel
 
@@ -877,6 +993,17 @@ live children* by construction (`ng wrap-up` writes the marker; the `await`
 loop is the child), so the `wrapped-with-children` inconsistency check must,
 and does, consult the park signal first (`_idle_probe.sh`, case (c)).
 Otherwise such a worker would be flagged inconsistent the moment it wrapped.
+The park signal is not sufficient on its own, though: a **returned verdict
+clears the marker** while the prescribed `await` child keeps polling to its
+own timeout, so the exemption lapses with the child still alive and the
+window used to resurface as an inconsistency minutes later — routinely, on
+every skeptic-gated worker (<your-org>/nexus-code#590). `pane-state.sh` now
+also reports `bg_infra=<n>` (live background-shell roots that are nexus
+protocol waits) and `bg_cmd=<comm>:<cmd>` (naming one child), and both
+classifiers — `list_really_idle_workers` and `render_full_state_snapshot`,
+which classify independently — treat a protocol-wait-only child set as the
+benign prescribed shape rather than an inconsistency, bounded by the same
+absolute ceiling as case (a).
 (A *foreground* `await` — what `ng wrap-up` prints — renders the pane `busy`
 and never reaches the background-children path, so it was never affected.) The watcher auto-respawns only the
 orchestrator; worker windows are flagged, never auto-respawned on
@@ -899,7 +1026,10 @@ A skeptic ends its pass by recording exactly one verdict via
 
 The verdict is logged as a `skeptic-verdict` action-log event and (on
 `suspect`/`refuted`, or `--skeptic-findings >= findings_threshold`)
-drives the bounded recursion below.
+drives the bounded recursion below. The event carries
+`findings-stated=<true|false>`, and `findings=<n>` only when a count was
+actually supplied — so a defaulted zero can no longer masquerade as a
+measured one (<your-org>/nexus-code#881).
 
 ### Recursion
 
@@ -1209,6 +1339,89 @@ monitor/.state/watcher-alerts.log` for `WARN <surface>
 graphql_rate_limit reset=...` (rate-limit fires) or
 `graphql_failure ...` (other failure classes).
 
+### The backoff is BOUNDED, and reconciles (`#594`)
+
+`_graphql_backoff_active` decides whether to **withhold the operator's
+comments from the orchestrator**. It used to decide that from a stored
+future instant alone — the same defect `#592`/`#593` fixed on the
+egress gate. A stored instant is a *prediction*; it is never an
+*observation*. If it is wrong (miscomputed, clock-skewed, ratcheted by
+a bad `reset_at`, or simply never cleared) the channel closes and stays
+closed, silently. Nothing bounded it: `reset` came straight from the
+payload and was never range-checked.
+
+Three properties now close it:
+
+- **Bound.** No armed backoff suppresses longer than
+  `monitor.graphql.backoff_max_seconds` (default 900), measured from
+  the **observation** that armed it, not from the predicted reset. The
+  epoch is clamped on write too, so the on-disk state is honest.
+- **Reconcile.** Every call repairs rather than waits out bad state: a
+  malformed reset, a missing observation, an elapsed window and a
+  ceiling breach all clear the state and re-open the gate, each with a
+  distinct `graphql_backoff_reconciled reason=…` log line. A backwards
+  clock jump reconciles rather than suppresses.
+- **Announce.** A suppression persisting past
+  `monitor.graphql.backoff_announce_seconds` (default 300) emits a
+  `watcher_alert=graphql-backoff` sentinel out-of-band — a condition
+  that mutes operator communication must not be reportable only
+  through the channel it mutes.
+
+The backoff file is now two lines (reset, then observation epoch);
+legacy single-line files recover the observation from the file mtime.
+
+**Third instance.** The same audit found `_unstick.sh`'s case-B
+cascade deferring on an unvalidated cached reset epoch; it is now
+clamped to the heuristic window, with a `reset-epoch-clamped` /
+`reset-epoch-reconciled` line.
+
+### `issue_comments` is paginated (`#595`)
+
+The single-shot `search(first: 100)` fetched every open issue's last 50
+comments in one query. Measured against `<your-org>/<your-nexus>` it
+returned **HTTP 200 with 2,933 `RESOURCE_LIMITS_EXCEEDED` field
+errors**: GitHub resolved the query partially and nulled fields to stay
+in budget — `author` null on all 1,247 comments, `body`/`reactions`
+null on 439. `gh` exits 1 when errors are present, so the entire 2.59 MB
+response was discarded and the surface produced **nothing on ~80% of
+polls** for hours, visible only as a `WARN` nobody read.
+
+Node count was **not** the driver: `rateLimit.nodeCount` fell 255,100 →
+55,100 → 10,100 as `reactions(first:)` went 50 → 10 → 1 and the query
+failed identically at all three. The limiter tracks the work of
+materialising comment **bodies**.
+
+The walk now pages the search at `monitor.graphql.search_page_size`
+(default 10) with `sort:created-asc` — creation time is the only
+ordering here that is immutable for a fixed set, so a ~15 s walk cannot
+skip an issue that gets touched mid-walk. Comment depth stays at
+`last: 50`: narrowing it would let an un-acked comment scroll
+permanently out of view, since eligibility has no time bound. Measured
+after: 6 pages, largest 794 KB, 3.08 MB total (≈0.48 MB *more* real
+content than the failing query returned), zero errors.
+
+A page whose payload carries `errors` is **discarded, not salvaged** —
+`reactions` is exactly the field the EYES/ROCKET filter reads, so
+consuming nulls would make the whole acked backlog look eligible and
+re-emit. A failed page degrades its own ten issues; the rest still
+surface. Truncation from the page cap or the wall-clock budget writes a
+`graphql_partial_walk reason=…` line rather than passing silently for
+full coverage.
+
+**Coverage boundary:** cost-safe for up to `search_max_pages ×
+search_page_size` open issues (default 400) whose individual
+last-50-comment payload fits one page's budget. Past the cap the walk
+stops and says so; a single issue whose own last 50 comments exceed one
+page's budget fails that page every cycle, degrading its ten issues,
+never the whole ingest.
+
+**Sustained failure escalates** (`#595`, "also required"): a surface
+failing continuously past `monitor.graphql.degraded_escalate_seconds`
+(default 1800) emits `watcher_alert=ingest-degraded` out-of-band,
+re-nagging on `degraded_remind_seconds` (3600), and announces its own
+recovery. No fetch on the operator-communication path may fail on the
+strength of a log line alone.
+
 ## Compact GitHub helper (`ng`)
 
 `monitor/ng` is the agent-facing wrapper around the operations the
@@ -1296,7 +1509,15 @@ unique to `ng`.
      the skeleton; `ng dashboard validate` is the strict checker;
      `ng dashboard put` warns (doesn't block) on missing sections. The
      `## Identity` section is a **pointer** to the identity block above,
-     not a copy. See `skills/nexus.dashboard/SKILL.md`.
+     not a copy — and the identity block's own `## Nexus Identity`
+     heading **also satisfies** that requirement, so a body built as
+     `ng nexus-identity > body.md` + the other five sections validates
+     clean. It used to be reported missing, which asked the operator to
+     hand-edit a block stamped "do not edit by hand"
+     (<your-org>/nexus-code#886). One literal (`IDENTITY_HEADING` in
+     `monitor/ng`) feeds the generator, the pointer prose and the
+     validator's accepted set, so a rename moves all three.
+     See `skills/nexus.dashboard/SKILL.md`.
 
          <!-- NEXUS_DASHBOARD_START -->
          ...dashboard: the six required sections...
@@ -1666,10 +1887,10 @@ every resolved key.
 
 Components the monitor depends on, ordered by criticality:
 
-- **`agent-sandbox`** (`$HOME/.linuxbrew/Cellar/agent-sandbox/`)
+- **`agent-sandbox`** (`/home/<operator>/.linuxbrew/Cellar/agent-sandbox/`)
   — kernel-enforced filesystem sandbox every Claude Code session
   runs inside; limits writes to the project dir and `~/.claude/`.
-- **`<hpc-skills>`** (`work/<hpc-skills>/`) — skill library the
+- **`hpc-skills`** (`work/hpc-skills/`) — skill library the
   agents surface when handling <your-institution> HPC tasks (Slurm, storage
   tiers, modules, etc.).
 - **`labsh`** (`work/labsh/`) — project-local JupyterLab for
@@ -1871,6 +2092,116 @@ the fully manual discipline above.
 anything, so the *first* deploy of this feature is itself still the
 manual pull-then-restart.
 
+### Deployment drift — "did the pull ever happen?" (`#614`)
+
+Version-restart answers *did the files change*. It cannot answer *did
+the pull happen at all*, because it compares the running instance
+against **the same clone's** disk. Between 2026-07-25 and 2026-07-30
+the primary sat 31 commits and 8 merged PRs behind `dev` and nothing
+anywhere reported it: every PR was reviewed, CI'd, skeptic-validated
+and merged, and merging was treated as terminal. For a repo that is
+simultaneously the source *and* the running system, it is not — a
+green merge is a **proxy** for "the fix is in effect"; the property is
+"the code the watcher and spawner execute contains the fix".
+
+`monitor/watcher/_clone_drift.sh` (task `clone_drift`, hourly) measures
+at that boundary. One `git ls-remote` — which writes no ref and touches
+no working tree — establishes the live remote tip; the margin comes
+from a local `rev-list` when the tip is already present, otherwise from
+`gh api …/compare`. Past either threshold it writes a `drift-clone` ask
+record, surfaced through the existing component-drift emit path.
+
+**Detection only.** It never pulls, fetches or checks out. Deploying
+swaps helper libraries under the running watcher and under in-flight
+workers, so it stays a human-timed orchestrator action.
+
+**Three verdicts, never two.** `up-to-date` / `behind` / **`unknown`**.
+`unknown` is loud and never collapses into `up-to-date`: a detector
+that reports green when it cannot see is worse than none, because it
+converts an unmonitored condition into a monitored-and-believed-healthy
+one. (Note for anyone reading `#614`'s text: its claim that plain `git
+fetch` fails silently here on an expired baked-in installation token
+was checked and is **false** for this clone — `origin` is SSH and both
+`ls-remote` and `fetch --dry-run` return rc=0. The real trap is
+narrower and survives a working fetch: reading `origin/dev` *without*
+having fetched. At the time of writing the primary's `origin/dev` was
+stale at `1315412`, so `git rev-list --count HEAD..origin/dev` answered
+**31** while the true distance to the tip was **59**.)
+
+| Config | Default | Meaning |
+|---|---|---|
+| `monitor.clone_drift.enabled` | `true` | Master switch |
+| `monitor.clone_drift.interval_seconds` | `3600` | Check cadence |
+| `monitor.integration_branch` | `dev` | Deployment branch tracked — see below |
+| `monitor.clone_drift.branch` | — | **DEPRECATED** alias of the above; read until **2026-11-07** |
+| `monitor.clone_drift.commits` | `5` | Commit threshold (OR-ed) |
+| `monitor.clone_drift.hours` | `24` | Age of the OLDEST undeployed commit (OR-ed) |
+
+#### `monitor.integration_branch` — one property, one claimant (`#763`)
+
+"The branch merged fixes land on" is a **repo-wide** property with two
+consumers: this drift detector and `cc-auto-update-apply.sh`'s deployment
+gate (`#754`). It used to be recorded under `monitor.clone_drift.branch`,
+a name scoped to one of them, and each consumer looked it up on its own.
+Both now call the single resolver `monitor/_integration_branch.sh`, so
+"exactly one claimant" is enforced by construction rather than by a
+comment asking the next author not to mint a second key.
+
+Resolution order, first hit wins:
+
+1. `$MONITOR_INTEGRATION_BRANCH` (env, canonical)
+2. `$MONITOR_CLONE_DRIFT_BRANCH` (env, **deprecated**)
+3. `monitor.integration_branch` (config, canonical)
+4. `monitor.clone_drift.branch` (config, **deprecated** — honoured with a
+   one-line note on stderr naming the drop date)
+5. `dev`
+
+**Migrating.** `config/nexus.yml` is per-operator and not tracked here, so
+a bare rename would land on every clone as a silent default-fallback: the
+new key absent, the default applied, and an operator who deliberately set
+`release` silently getting `dev` — invisibly, on the surface `#754` had
+just finished making trustworthy. Hence the read-both transition. Rename
+the key in your `config/nexus.yml`:
+
+```yaml
+monitor:
+  integration_branch: dev      # was: monitor.clone_drift.branch
+```
+
+**Step 4 is removed on 2026-11-07.** After that date an unrenamed key
+resolves to `dev`. If both keys are present with different values the
+resolver uses the new one and says so loudly — do not leave that state
+sitting; two records of one property drift apart, which is the outcome
+`#754` declined to create.
+
+### Operator-local settings overlay (`#614`, second defect)
+
+`monitor/worker-settings.json` and `monitor/orchestrator-settings.json`
+are **tracked** yet every operator must add local keys to them (this
+nexus pins `"model"` and `"tui"`). That meant a pull conflict on both
+files forever — and, worse, the obvious resolution (take upstream)
+**silently downgraded every worker and skeptic off the operator's
+chosen model**, with no error anywhere.
+
+Split them: the tracked file carries the shared defaults (hooks,
+guards), and an **untracked** sibling carries the operator's keys.
+
+    monitor/worker-settings.json          tracked   — hooks, defaults
+    monitor/worker-settings.local.json    UNTRACKED — your model pin, tui, …
+
+`monitor/resolve-settings.sh` merges the overlay over the defaults
+(recursive object merge, local wins; arrays replace wholesale) into
+`monitor/.state/settings/<name>.effective.json`, and that is what
+`spawn-worker.sh` and the orchestrator respawn path hand to
+`claude --settings`. With no overlay present it is a pure pass-through.
+
+It **fails loud** — malformed overlay JSON, missing `jq`, unwritable
+state dir all block the spawn rather than falling back to the tracked
+defaults, because falling back *is* the silent downgrade being fixed.
+(Note the sandbox ships jq 1.5, which exits 0 on a *truncated*
+document while printing nothing, so the validator checks the parsed
+type rather than jq's exit status.)
+
 **PID-identity check (post-restart deadlock fix, 2026-06-07).** The
 "is the recorded pid alive?" test in `launcher.sh`,
 `main.sh`'s `acquire_lock`, and `_watcher_alive` is not a bare
@@ -1935,8 +2266,8 @@ within. Pick one, edited from outside the sandbox:
 
   ```sh
   # nexus cold-boot recovery (idempotent, debounced, non-blocking)
-  [ -x $NEXUS_ROOT/monitor/boot-recover.sh ] && \
-      $NEXUS_ROOT/monitor/boot-recover.sh >/dev/null 2>&1 || true
+  [ -x /shared/your-lab-m/user/<operator>/nexus/monitor/boot-recover.sh ] && \
+      /shared/your-lab-m/user/<operator>/nexus/monitor/boot-recover.sh >/dev/null 2>&1 || true
   ```
 
 - Or a `sandbox.conf` on-start entry that runs the same one-liner when
@@ -2175,7 +2506,9 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `watcher/_version_restart.sh` | Version-aware component auto-restart (issue #186): per-component source-set hashing, the adopt→pending→drift stability state machine (torn-pull safe), per-component cooldowns, the watcher self-restart loop guard, restart orchestration (self via detached `launcher.sh --replace`, services via `svc.sh restart`, cockpit via an emit ask), and the `--- component drift ---` emit section. Also sourced by `bootstrap-recover.sh` for the launch-time version stamp. | yes |
 | `watcher/test-version-restart.sh` | Unit tests for `_version_restart.sh`: hashing/source-set/torn detection, the drift state machine, per-component isolation, cooldown + loop guard, advise-fallback channels, service restart-once via a stubbed `svc.sh`, emit-section re-nag guard (run: `bash monitor/watcher/test-version-restart.sh`) | yes |
 | `watcher/test-version-restart-self.sh` | Integration test: a confirmed watcher self-drift drives the REAL `launcher.sh --replace` against a fixture watcher — old pid dies, exactly one successor publishes the pidfile, cooldown blocks an immediate second trigger (run: `bash monitor/watcher/test-version-restart-self.sh`) | yes |
+| `watcher/test-paste-dead-pane-guard.sh` | The `#745` dead-pane paste guard: real-tmux predicate, a MANIFEST of every `tmux paste-buffer` call site (so a fifth cannot appear unguarded), stub-tmux parsing contract, and an end-to-end check that the helpers survive a real corpse with an unguarded positive control (run: `SLOW_TESTS=1 bash monitor/watcher/test-paste-dead-pane-guard.sh`) | yes |
 | `watcher/test-lib.sh`        | Mock-tmux unit tests for the standalone classifiers in `_lib.sh` (e.g. `_target_window_present`) (run: `bash monitor/watcher/test-lib.sh`) | yes |
+| `watcher/test-target-window-live.sh` | REAL-tmux tests for `_target_window_present`: a `remain-on-exit` corpse must read ABSENT, a live same-named window in another session must not read PRESENT, and a dead server must read can't-classify (`#741`) (run: `SLOW_TESTS=1 bash monitor/watcher/test-target-window-live.sh`) | yes |
 | `watcher/test-unstick.sh`    | Mock-tmux unit tests for `_unstick.sh` (run: `bash monitor/watcher/test-unstick.sh`) | yes |
 | `watcher/test-snapshot-github.sh` | Mock-gh unit tests for `_github.sh` (run: `bash monitor/watcher/test-snapshot-github.sh`) | yes |
 | `watcher/test-snapshot-github-failure.sh` | Mock-gh unit tests for the detect-and-react path in `_github.sh` (rate-limit sentinel, backoff, expiry) (run: `bash monitor/watcher/test-snapshot-github-failure.sh`) | yes |
@@ -2183,7 +2516,7 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `watcher/test-cc-version.sh` | Unit tests for the effective-version resolver `_cc-version.sh` (floor-plus-local-pin, #226): floor extraction, local-pin path resolution / trim / blank-handling, `effective = local-pin else floor`, atomic write round-trip, and gate-baseline wiring (the gate fires against the effective version, not the lagging floor) (run: `bash monitor/watcher/test-cc-version.sh`) | yes |
 | `_cc-version.sh`             | Shared resolver for the EFFECTIVE Claude Code version (floor-plus-local-pin, #226). `effective = local-pin (monitor/.state/cc-version-local) else package.json floor`. Read by `install-claude-local.sh` (install + verify) and the watcher gate baseline (`_v2_task_cc_version_check`). Atomic local-pin write. | yes |
 | `install-claude-local.sh`    | Installs the project-local Claude Code into `node_modules/.bin/claude` at the EFFECTIVE version (local pin if present — installed via `npm install --no-save <pkg>@<ver>` so the shared floor is untouched — else the package.json floor via bare `npm install`). Idempotent; fail-loud verify that the binary runs and reports the effective version. | yes |
-| `paste-followup.sh`          | THE canonical follow-up paste into a worker window (issue #201): stamps `.state/machine-input.tsv` BEFORE pasting (so the watcher attributes the submitted prompt — the paste fires the worker's `UserPromptSubmit` hook — to the orchestrator, not the operator), performs the VI-safe `i BSpace` → `set-buffer` → `paste-buffer` → `Enter` sequence, appends a `paste-followup` action-log audit event. Raw `tmux paste-buffer` follow-ups falsely mark the window `operator-engaged` and mute its stall-nag — always use this helper. | yes |
+| `paste-followup.sh`          | THE canonical follow-up paste into a worker window (issue #201): stamps `.state/machine-input.tsv` BEFORE pasting (so the watcher attributes the submitted prompt — the paste fires the worker's `UserPromptSubmit` hook — to the orchestrator, not the operator), performs the VI-safe `i BSpace` → `set-buffer` → `paste-buffer` → `Enter` sequence, appends a `paste-followup` action-log audit event, and persists its own confirmation verdict to `.state/paste-verdicts/<window>.<epoch>` so the watcher's `paste-unconfirmed` detector reads what the sender established rather than re-deriving it from a possibly-rotated session-id (issue #665). Raw `tmux paste-buffer` follow-ups falsely mark the window `operator-engaged` and mute its stall-nag — always use this helper. | yes |
 | `mint-token.sh`              | Mints / caches the bot's installation token | yes |
 | `git-https-setup`            | **Opt-in per-repo helper** (niche). Configures a single clone for bot-identity git commit + push via a fresh installation token on every challenge. Use only where the user's `gh auth setup-git` path isn't available (e.g. inside agent-sandbox with a read-only `~/.gitconfig`) — note that bot-authored commits make later attribution of work back to a human harder, which matters for projects intended to go public. Not auto-invoked. | yes |
 | `ng`                         | Compact GitHub / watcher helper (`process`, `react`, `reply`, `close`, `dashboard get|put|scaffold|validate`, `nexus-identity`, `issue`, `upload`, `watcher-status`, `log-action`) | yes |
@@ -2206,9 +2539,13 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `.state/watcher.log`         | Append-only watcher log (startup, emits, paste failures, respawns) | no |
 | `.state/last-ack.txt`        | ISO timestamp of the newest diff the monitor agent has acknowledged | no |
 | `.state/action-log.jsonl`    | Append-only JSONL action trace: `{ts,agent,event,...}` per meaningful action | no |
-| `.state/last-snapshot.txt`   | Persistent snapshot baseline (carries across watcher restarts) | no |
+| `.state/last-snapshot.txt`   | Persistent snapshot baseline (carries across watcher restarts). ALSO the sole input to `bootstrap-recover.sh`'s worker walk, which is why a cold boot archives it to `last-snapshot.txt.archived.<epoch>` (<your-org>/nexus-code#651) | no |
+| `.state/boot-intent`         | The operator's fresh-vs-`--continue` intent, written by `entry.sh` and consumed ONCE by `bootstrap-recover.sh`'s worker walk (`mode=fresh` ⇒ resurrect nothing; `mode=continue` ⇒ resume as usual). Archived to `boot-intent.archived.<epoch>` the moment it is acted on, and ignored past `recover.boot_intent_ttl_seconds`, so it can never fire against a later mid-life recovery. NOT written when the orchestrator window is already alive (that is an idempotent bring-up, not a boot). <your-org>/nexus-code#651 | no |
+| `.state/cold-boot-dropped-workers.md` | Manifest of the worker agents a cold boot declined to resurrect: window, session-id, workdir, last report, exact re-spawn command. Delivered once into the orchestrator's first turn (situation report, or `bootstrap.sh` stdout as backstop) and kept afterwards as the audit record. <your-org>/nexus-code#651 | no |
+| `.state/cold-boot-dropped-workers.delivered` | Delivery marker for the manifest above. Delivery is gated on the manifest being strictly NEWER than this marker, so a later cold boot re-arms it with no bookkeeping to reset. | no |
 | `.state/engagement-log.tsv`  | One row per worker window the watcher has ever observed in `busy` / `user-typing` state: `<window>\t<last-engagement-epoch>`. Consulted by `_idle_probe.sh` for both the idle-pool entry gate (`now - engagement_epoch` is the worker's idle age when a row exists; otherwise fall back to `now - #{window_activity}`) and the retain-consume gate (engagement past `retain.ts` consumes the retain). Replaces direct comparisons against `tmux #{window_activity}` in both places; see issue #111. Append-mostly; at-most-one row per window. | no |
 | `.state/user-prompt/`        | Per-window "last user-prompt submitted" stamp `<window>` (`<epoch>\t<session-id>`), written by `worker-heartbeat.sh` from the worker's `UserPromptSubmit` hook. THE operator-engagement trigger (issues #196, #201): `_idle_probe.sh` attributes each new stamp to the operator or the orchestrator via the machine-input rule — no pane content involved. Pruned with the window by the per-cycle disappearance pruner. | no |
+| `.state/paste-verdicts/`     | Per-paste sidecar `<window>.<paste-epoch>` (`rc=`/`window=`/`epoch=`/`outcome=`), written by `paste-followup.sh` step 3b and read by `_idle_probe.sh`'s `paste-unconfirmed` detector (issue #665). Carries the SENDER's own confirmation verdict forward — `rc=0` submitted (a transcript submission was OBSERVED at paste time), `rc=3` could not establish either (text plausibly QUEUED behind an in-flight turn), `rc=4` established non-submission (the #507 defect, the true positive). Keyed by the SAME epoch stamped into `machine-input.tsv`, so sender and watcher cannot disagree about which paste a verdict belongs to; a sidecar rather than a fourth TSV column because that ledger is positional and its >200-line compaction keeps one row per window. Without it the watcher re-derived consumption minutes later through a session-id that may have rotated, and told the operator "no submission found in the transcript" about pastes the sender had watched submit — 11 false positives / 0 true positives on 2026-08-02. Only `rc=0` suppresses the flag; `rc=3` and a missing sidecar degrade to `unknown` (never `no`), so a genuinely lost paste stays catchable. Pruned with the window by the per-cycle disappearance pruner, plus a 7-day age sweep. | no |
 | `.state/watcher-unstick.log` | Auto-unstick action log (one line per detection / send-Enter / backoff / cascade / heads-up / ack) | no |
 | `.state/unstick/`            | Per-window-per-case fingerprint + retry counters + pre-action pane captures (audit trail) AND case-B session state: `ratelimit.reset.epoch`, `ratelimit.cascade.epoch`, `ratelimit.last-wait.epoch` | no |
 | `.state/decisions/`          | One file per pending decision: `<window>.<fp>.json` (issue #129). Written atomically by `hooks/decision-emit.sh` on every Notification. Each file carries `{ts, window, session_id, kind, prompt_excerpt, tool_context, fingerprint, unresolved?}`. The orchestrator removes the file once the prompt has been answered; `Stop` hook stamps `unresolved=true` on anything still present at turn-end. `*.handled.json` siblings are honoured as tombstones (audit copy after answering). | no |
@@ -2222,7 +2559,12 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `.state/dashboard-updated.ts`| ISO timestamp of the last successful `ng dashboard put` | no |
 | `.state/processed-comments.txt` | Local cache of comment IDs already reacted on (propagation-lag guard) | no |
 | `.state/watcher-alerts.log`  | Append-only `[iso] WARN <surface> <classification> ...` log written by `_watcher_handle_graphql_failure` (`graphql_rate_limit`, `graphql_failure`, `empty_stderr`) | no |
-| `.state/graphql-backoff-<surface>` | Per-surface GraphQL rate-limit reset epoch; `_snapshot_<surface>` short-circuits while present + 30 s grace | no |
+| `.state/graphql-backoff-<surface>` | Two lines: the reset epoch, then the epoch at which the rate-limit response was OBSERVED (`#594`). `_snapshot_<surface>` short-circuits while present + 30 s grace, but never past `monitor.graphql.backoff_max_seconds` measured from the OBSERVATION — the ceiling overrides the stored prediction. Legacy single-line files recover the observation from the file mtime. | no |
+| `.state/graphql-backoff-announced-<surface>` | Announcement guard for a live suppression: holds the armed epoch, so one `watcher_alert=graphql-backoff` per hold rather than one per poll | no |
+| `.state/graphql-degraded-<surface>` | `first`/`count`/`announced` for a surface failing CONTINUOUSLY (`#595`). Past `monitor.graphql.degraded_escalate_seconds` it emits `watcher_alert=ingest-degraded` out-of-band; a later success emits `ingest-recovered` and removes the file | no |
+| `.state/graphql-partial-last-log-<surface>-<reason>` | 10-min throttle marker for `graphql_partial_walk` lines (page cap / wall-clock budget / discarded partial page) — coverage gaps are logged, never silent | no |
+| `.state/settings/<name>.effective.json` | Generated merge of `monitor/<name>.json` with the untracked operator overlay `monitor/<name>.local.json` (`#614`); this is the path handed to `claude --settings`. Absent when no overlay exists (the tracked file is passed directly) | no |
+| `.state/version/drift-clone` | Deployment-drift ask record: the primary clone is behind the remote branch, or its state could not be determined (`#614`). Rendered by `_version_emit_section` | no |
 | `.state/graphql-alert-emitted-<surface>-<epoch>` | Flag file: `watcher_alert=rate-limit ...` sentinel already emitted for this (surface, reset) pair — one alert per exhaustion event, not per poll | no |
 | `.state/deliveries-queue.lines` | Durable queue of deliveries-channel emit blocks. Each `_v2_task_deliveries_poll` fire (15 s cadence) appends new blocks under flock; `compose_emit` (`MONITOR_INTERVAL` cadence, default 60 s) drains via rename + read + rm. Decouples the producer's 15 s ticks from the consumer's drain reads so a delivery emitted at tick T is not wiped by the empty tick T+1 — pre-fix, the scheduler's atomic-replace of `<stage>/deliveries_poll.out` overwrote the previous tick's output, losing three of every four ticks' events to the 600 s GraphQL backstop. Mtime advances on every append; `_compose_emit_nudge_check` reads it to pull compose_emit forward (see "Compose-emit nudge" below). | no |
 | `.state/deliveries-queue.lock` | flock target serializing appenders against the drainer of `.state/deliveries-queue.lines`. Append/drain hold an exclusive lock; the rename-then-read drain ensures concurrent appenders write to a fresh file after rename. | no |

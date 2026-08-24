@@ -94,7 +94,7 @@ case "$sub" in
                 echo $((c + 1)) > "$STUB_STATE_CURSOR"
                 line=$(sed -n "${c}p" "$STUB_STATE_STEPS")
                 [ -z "$line" ] && line=$(sed -n '$p' "$STUB_STATE_STEPS")
-                if printf '%s' "$line" | grep -q $'\t'; then
+                if grep -q $'\t' <<<"$line"; then
                     rc=${line%%$'\t'*}; word=${line#*$'\t'}
                 else
                     rc=0; word=$line

@@ -1349,6 +1349,96 @@ else
 fi
 rm -f "$SID_LAUNCHER"
 
+# --- Test 15c: your-org/nexus-code#741 — a remain-on-exit corpse is
+#     NOT an "unclassified occupant"
+#
+# `_respawn_spawn_window` sets `remain-on-exit on`, so a crashed agent
+# leaves the target window LISTED with a dead pane. tmux keeps
+# reporting that pane's `#{pane_pid}`, but the process is GONE, so
+# `/proc/<pid>/cmdline` is unreadable and the occupant scan could not
+# classify it — and "unclassified" routed to the refuse arm. The gate
+# therefore vetoed the respawn of an orchestrator that had already
+# died, permanently. Measured against a real tmux corpse before the
+# fix: rc=1, "window-reappeared (unclassified occupant; refusing to
+# kill)".
+#
+# The stub's pane rows gain a 4th field, `#{pane_dead}`. Rows written
+# with three fields (every case above) leave it EMPTY, which must
+# continue to mean LIVE — a tmux too old to know the format must not
+# have its windows read as corpses.
+
+echo '=== your-org/nexus-code#741: remain-on-exit corpse in the target slot ==='
+
+# (m) The corpse itself: window listed, sole pane dead, pid unreadable.
+touch "$WORK/verify-window-present"
+printf '999999|@7|orchestrator|1\n' > "$WORK/verify-panes"
+verify_out=$(
+    PATH="$TMUX_STUB_VERIFY_BIN:$PATH" bash -c "
+        . '$_test_dir/_respawn.sh'
+        _respawn_verify_target_absent orchestrator
+    "
+)
+verify_rc=$?
+assert_eq "(m) dead pane in the target slot → verify proceeds (rc=0)" "$verify_rc" "0"
+assert_contains "(m) reason names the corpse" "$verify_out" "remain-on-exit corpse"
+
+# (n) pane_dead EMPTY (a tmux that does not support the format) must
+# NOT be read as a corpse. This is the fail-safe direction: absent
+# evidence of death is not evidence of death, and the wrong call here
+# spawns a second orchestrator beside a live one.
+printf '999999|@7|orchestrator|\n' > "$WORK/verify-panes"
+verify_out=$(
+    PATH="$TMUX_STUB_VERIFY_BIN:$PATH" bash -c "
+        . '$_test_dir/_respawn.sh'
+        _respawn_verify_target_absent orchestrator
+    "
+)
+verify_rc=$?
+assert_eq "(n) empty pane_dead → NOT a corpse; verify still aborts (rc=1)" "$verify_rc" "1"
+assert_contains "(n) reason is the conservative refusal" "$verify_out" "unclassified occupant"
+
+# (o) A live pane sharing the window with a corpse is still an
+# occupant: one dead pane must not condemn its live sibling.
+printf '%s|@7|orchestrator|1\n' 999999 > "$WORK/verify-panes"
+printf '%s|@7|orchestrator|0\n' "$$" >> "$WORK/verify-panes"
+verify_out=$(
+    PATH="$TMUX_STUB_VERIFY_BIN:$PATH" bash -c "
+        . '$_test_dir/_respawn.sh'
+        _respawn_verify_target_absent orchestrator
+    "
+)
+verify_rc=$?
+assert_contains "(o) live sibling of a corpse is classified, not a corpse" \
+                "$verify_out" "impostor-in-slot"
+
+# (p) THE STALE-PID HAZARD. tmux reports a dead pane's `#{pane_pid}`
+# forever, and the kernel recycles pids. Point a DEAD row at a pid that
+# is very much alive AND carries the orchestrator marker: read
+# credulously, that corpse becomes a live orchestrator and vetoes every
+# future respawn. The dead-pane skip in the marked-pane scan is what
+# stops it — without that skip this returns rc=1
+# "orchestrator-process-alive".
+NEXUS_IS_ORCHESTRATOR=1 NEXUS_ORCH_SESSION_ID="$SID_A" sleep 30 &
+RECYCLED_PID=$!
+if [[ -r "/proc/$RECYCLED_PID/environ" ]]; then
+    printf '%s|@7|orchestrator|1\n' "$RECYCLED_PID" > "$WORK/verify-panes"
+    verify_out=$(
+        PATH="$TMUX_STUB_VERIFY_BIN:$PATH" bash -c "
+            . '$_test_dir/_respawn.sh'
+            _respawn_verify_target_absent orchestrator
+        "
+    )
+    verify_rc=$?
+    assert_eq "(p) dead pane whose pid was RECYCLED by a live orchestrator-marked process → still a corpse (rc=0)" \
+              "$verify_rc" "0"
+    assert_contains "(p) reason names the corpse, not a live orchestrator" \
+                    "$verify_out" "remain-on-exit corpse"
+else
+    pass "(p) skipped: /proc environ unreadable"
+fi
+kill "$RECYCLED_PID" 2>/dev/null; wait "$RECYCLED_PID" 2>/dev/null
+rm -f "$WORK/verify-window-present" "$WORK/verify-panes"
+
 # --- Test 16: incident 2026-06-02 — recovery prompt never instructs
 #     killing the watcher (root cause 2)
 #

@@ -222,6 +222,29 @@ if grep -q "hit your" <<<"$pane_text"; then
     else
         echo "  FAIL: real pane paints the notice but renderer scrape says '$ps2_state'" >&2
         FAIL=$((FAIL+1))
+        # A renderer-scrape failure is unreadable without the frame it
+        # scraped. `_detect_over_limit` bottom-anchors on `tail -n 15`, so
+        # show where the notice actually landed relative to that window —
+        # a notice pushed above row 15 by extra TUI chrome looks identical
+        # to no notice at all from the assertion's side.
+        {
+            echo "  --- diagnostic: where is the notice relative to the 15-row scan window? ---"
+            printf '  total rows captured: %s\n' "$(wc -l <<<"$pane_text")"
+            printf '  notice on row(s) (1=bottom): %s\n' \
+                "$(printf '%s\n' "$pane_text" | tac | grep -n 'hit your' | cut -d: -f1 | tr '\n' ' ')"
+            printf '  "resets" on row(s) (1=bottom): %s\n' \
+                "$(printf '%s\n' "$pane_text" | tac | grep -n 'resets' | cut -d: -f1 | tr '\n' ' ')"
+            # Same distances counting NON-BLANK rows only. Fullscreen pads the
+            # gap between transcript and input box with blank rows, so the raw
+            # and non-blank distances diverge sharply — that divergence is the
+            # whole diagnosis, and it is invisible in the raw number alone.
+            printf '  non-blank rows: %s; notice at non-blank row(s) (1=bottom): %s\n' \
+                "$(printf '%s\n' "$pane_text" | grep -cv '^[[:space:]]*$')" \
+                "$(printf '%s\n' "$pane_text" | grep -v '^[[:space:]]*$' | tac \
+                     | grep -n 'hit your' | cut -d: -f1 | tr '\n' ' ')"
+            echo "  --- bottom 20 rows ---"
+            printf '%s\n' "$pane_text" | tail -n 20 | cat -v | sed 's/^/  | /'
+        } >&2
     fi
 else
     echo "  note: TUI frame blank (known render gap) — renderer-scrape sub-check not exercisable this run; fixture coverage in test-pane-state.sh"
@@ -259,7 +282,7 @@ else
 fi
 _over_limit_record_held "2026-07-15_11-00-00_held1.md" "poll-resurface"
 _over_limit_record_held "2026-07-15_11-01-00_held2.md" "poll-full-state"
-held_n=$(grep -c $'\theld\t' "$HELD_LOG" 2>/dev/null || echo 0)
+held_n=$(grep -c $'\theld\t' "$HELD_LOG" 2>/dev/null) || held_n=0
 if [[ "$held_n" == "2" ]]; then
     echo "  PASS: held emits recorded in off-time log (n=$held_n)"; PASS=$((PASS+1))
 else

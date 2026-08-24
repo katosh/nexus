@@ -94,8 +94,8 @@ eval "$(_pluck_fn _gh_filter_dedup_pipeline_file "$_test_dir/main.sh")"
 # decoder never engages and these tests would be vacuous.
 AMBIENT_UTF8=""
 for _loc in en_US.UTF-8 en_US.utf8 C.UTF-8; do
-    if locale -a 2>/dev/null | grep -qixF "${_loc/UTF-8/utf8}" \
-       || locale -a 2>/dev/null | grep -qixF "$_loc"; then
+    if grep -qixF "${_loc/UTF-8/utf8}" <<<"$(locale -a 2>/dev/null)" \
+       || grep -qixF "$_loc" <<<"$(locale -a 2>/dev/null)"; then
         AMBIENT_UTF8="$_loc"; break
     fi
 done

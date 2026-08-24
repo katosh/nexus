@@ -17,6 +17,27 @@ set -uo pipefail
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SCRIPT_REAL="$_test_dir/../spawn-worker.sh"
 
+# ---- HERMETIC ENV (your-org/nexus-code#655) -----------------------------
+#
+# This suite builds a FIXTURE nexus and invokes the fixture's copy of
+# spawn-worker.sh. But #577's root resolution honours a VALID INHERITED
+# $NEXUS_ROOT over its own script-relative root -- correctly, that is the
+# whole point of #577 -- so an ambient NEXUS_ROOT silently redirects every
+# prompt-composition assertion at the PRIMARY's floor, worker-settings and
+# reports dir instead of the fixture's.
+#
+# Every nexus-spawned agent has NEXUS_ROOT exported, and CI does not: its
+# cell is literally named `unit suite (NEXUS_ROOT unset)`. That single
+# variable is #655's "dev red locally / green in CI", measured:
+#
+#     test-spawn-worker.sh          75 pass / 24 fail  ->  101 / 0
+#     test-spawn-worker-resume.sh   55 pass / 48 fail  ->  103 / 0
+#
+# It is NOT the bash 4.4 vs 5.2 axis -- CI's dedicated 4.4 cell is green.
+# Scrub it here so the suite means the same thing in both environments; a
+# test whose verdict depends on the caller's exported env is not a test.
+unset NEXUS_ROOT
+
 PASS=0
 FAIL=0
 
@@ -63,6 +84,12 @@ mkdir -p "$FAKE_NEXUS/monitor/.state/spawn-prompts" \
          "$FAKE_NEXUS/skills/nexus.worker-defaults" \
          "$FAKE_NEXUS/reports"
 cp "$SCRIPT_REAL" "$FAKE_NEXUS/monitor/spawn-worker.sh"
+# The shim-guard TEMPLATE (your-org/nexus-code#589). spawn-worker.sh emits its
+# launcher guard from monitor/guard-block.sh.in and REFUSES (exit 78) rather
+# than emitting an empty block — an empty block is a guard that does not run.
+# A hard dependency of any fake tree that RUNS spawn-worker.sh.
+cp "$_test_dir/../guard-block.sh.in" "$FAKE_NEXUS/monitor/guard-block.sh.in"
+
 chmod +x "$FAKE_NEXUS/monitor/spawn-worker.sh"
 SCRIPT="$FAKE_NEXUS/monitor/spawn-worker.sh"
 cp "$_test_dir/../_claude-bin.sh" "$FAKE_NEXUS/monitor/_claude-bin.sh"
@@ -137,7 +164,10 @@ case "\$1" in
         for a in "\$@"; do [ "\$prev" = "-F" ] && fmt="\$a"; prev="\$a"; done
         if [ -n "\${STUB_TMUX_WINDOWS:-}" ]; then
             case "\$fmt" in
-                *window_id*) for w in \${STUB_TMUX_WINDOWS}; do printf '@9\t%s\n' "\$w"; done ;;
+                *window_id*)
+                    # Delimiter EXTRACTED from the requested format (your-org/nexus-code#699).
+                    d="\${fmt#*'#{window_id}'}"; d="\${d%%'#{window_name}'*}"
+                    for w in \${STUB_TMUX_WINDOWS}; do printf '@9%s%s\n' "\$d" "\$w"; done ;;
                 *)           printf '%s\n' \${STUB_TMUX_WINDOWS} ;;
             esac
         fi

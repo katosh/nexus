@@ -121,6 +121,15 @@ Then read `/tmp/infra-extracts.md` in 600-line chunks (the Read tool
 caps around there). The `<<< FILENAME >>>` markers preserve the
 provenance of each extract.
 
+The `find … -print0 | xargs -0 grep` form above is also what keeps the
+corpus VISIBLE: a bare `grep -r … reports/` is a shell function wrapping
+`ugrep --ignore-files`, and `reports/.gitignore` is a bare `*`, so it
+returns a SILENT zero over the whole corpus (`<your-org>/nexus-code#618`).
+`find … | xargs grep` passes explicit file arguments, which are never
+suppressed. For any ad-hoc "has this come up before?" corpus grep during
+the review, use `monitor/ng report-grep <pattern>` — it fails loud
+(exit 3 + diagnostic) instead of returning a false zero.
+
 ## Theme clustering
 
 Pattern-match symptoms across reports. A theme = a set of reports

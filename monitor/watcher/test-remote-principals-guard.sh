@@ -203,29 +203,90 @@ missing_owner=$(bash -c "source '$LIB'; _remote_owner_of '$WORK/no-such-file' ||
 assert_empty "_remote_owner_of yields nothing for a missing path" "$missing_owner"
 
 # Ground the seam in reality: on a REAL foreign-owned path the reader must
-# report a foreign uid, not our own. We cannot CREATE such a path in-sandbox (no
-# second uid), but we can OBSERVE one read-only. Without this, the stub above
-# could be testing a decision the real reader can never trigger.
+# report a foreign uid, not our own. We cannot CREATE such a path here — that
+# needs a second uid, which neither the sandbox's bwrap userns nor an
+# unprivileged CI runner grants — so we OBSERVE one read-only. Without this,
+# the stub above could be testing a decision the real reader can never trigger.
 #
-# Do NOT assert uid 0 here: inside the agent-sandbox's bwrap user namespace, the
-# root-owned host /etc is unmapped and `stat` reports the kernel overflowuid
-# (65534, "nobody") — which is precisely the foreign uid the guard would meet in
-# production. Assert the property that matters (foreign ≠ ours), not the number.
-if [[ -d /etc ]]; then
-    etc_owner=$(bash -c "source '$LIB'; _remote_owner_of /etc")
-    if [[ "$etc_owner" =~ ^[0-9]+$ ]] && [[ "$etc_owner" != "$ME_UID" ]]; then
-        printf '  PASS: the reader reports a real FOREIGN uid (%s) for /etc, ≠ our uid (%s)\n' "$etc_owner" "$ME_UID"
+# `/etc` alone used to stand in for "somebody else owns this", and it is NOT a
+# reliable stand-in (your-org/nexus-code#584): on a GitHub runner
+# `stat -c %u /etc` reports 1001 — the runner's OWN uid — so the fixture was
+# not foreign at all, the guard CORRECTLY declined to refuse it, and two
+# assertions went red while nothing whatsoever was wrong with the guard. The
+# test was asserting a property of the host that the host does not promise.
+#
+# So DISCOVER the fixture instead of assuming it: scan candidate paths for one
+# whose owner genuinely differs from ours, most-likely-foreign first, and fall
+# back to a sweep of /proc/<pid> (each is owned by the uid running that
+# process, so any daemon not ours supplies one). Discovery uses `stat`
+# directly — finding a foreign-owned path is FIXTURE CONSTRUCTION, and must
+# not be done with the very function under test.
+#
+# Do NOT assert uid 0 for any candidate: inside the agent-sandbox's bwrap user
+# namespace the root-owned host paths are unmapped and `stat` reports the
+# kernel overflowuid (65534, "nobody") — which is precisely the foreign uid
+# the guard would meet in production. Assert the property that matters
+# (foreign ≠ ours), never the number.
+#
+# If nothing foreign is reachable, SKIP LOUDLY and print every uid we probed.
+# Of the three possible outcomes a silent pass is by far the worst: this is
+# the one fail-closed condition of a security boundary whose real reader would
+# then be covered by nothing at all, with the footer still saying ALL TESTS
+# PASSED. A red is better than that, and a counted skip that names the numbers
+# is better than a red for a property the host cannot provide.
+scan_uid() { stat -c '%u' "$1" 2>/dev/null || stat -f '%u' "$1" 2>/dev/null; }
+
+foreign_path=""; foreign_uid=""; probed=""
+for cand in /proc/1 /root /etc/shadow /usr/bin/sudo /etc /usr /var /bin /lib / /dev; do
+    [[ -e "$cand" ]] || continue
+    u=$(scan_uid "$cand")
+    [[ "$u" =~ ^[0-9]+$ ]] || continue
+    probed="$probed $cand=$u"
+    if [[ "$u" != "$ME_UID" ]]; then foreign_path="$cand"; foreign_uid="$u"; break; fi
+done
+if [[ -z "$foreign_path" ]]; then
+    # Bounded sweep: first 64 process dirs is plenty to find a non-ours owner
+    # wherever one exists, and keeps a 500-process host from stat'ing forever.
+    n=0
+    for cand in /proc/[0-9]*; do
+        (( n++ < 64 )) || break
+        u=$(scan_uid "$cand")
+        [[ "$u" =~ ^[0-9]+$ ]] || continue
+        if [[ "$u" != "$ME_UID" ]]; then
+            foreign_path="$cand"; foreign_uid="$u"; probed="$probed $cand=$u"; break
+        fi
+    done
+fi
+
+if [[ -n "$foreign_path" ]]; then
+    # (a) the real, unstubbed reader distinguishes a foreign owner…
+    real_foreign=$(bash -c "source '$LIB'; _remote_owner_of '$foreign_path'")
+    if [[ "$real_foreign" =~ ^[0-9]+$ ]] && [[ "$real_foreign" != "$ME_UID" ]]; then
+        printf '  PASS: the reader reports a real FOREIGN uid (%s) for %s, ≠ our uid (%s)\n' \
+            "$real_foreign" "$foreign_path" "$ME_UID"
         PASS=$((PASS+1))
     else
-        printf '  FAIL: reader cannot distinguish a foreign owner (got %s, our uid %s)\n' "$etc_owner" "$ME_UID" >&2
+        printf '  FAIL: reader cannot distinguish a foreign owner (got %s for %s, our uid %s)\n' \
+            "$real_foreign" "$foreign_path" "$ME_UID" >&2
         FAIL=$((FAIL+1))
     fi
-    # …and the guard REFUSES when handed that real foreign uid (no stub involved
-    # in producing it — only in placing it where the guard looks).
+    # (b) …and it agrees with the uid discovery saw for the same path. Being
+    #     precise about what this is worth (skeptic finding N4 on #597): it is
+    #     NOT an independent oracle — `_remote_owner_of` is literally
+    #     `stat -c '%u'`, which is what scan_uid runs. It catches a STUB left
+    #     in scope and a future refactor that stops reading st_uid faithfully.
+    #     That is worth an assertion; it is not corroboration by a second
+    #     mechanism, and calling it that would be the same overclaim this
+    #     suite exists to punish.
+    assert_eq "…and that uid matches what discovery read for the same path" \
+        "$real_foreign" "$foreign_uid"
+    # (c) …and the guard REFUSES when handed that real foreign uid (no stub
+    #     involved in PRODUCING it — only in placing it where the guard looks).
     assert_eq "guard REFUSES a principals_dir carrying that real foreign uid" \
-        "$(guard_owned_by "$etc_owner")" "REFUSE"
+        "$(guard_owned_by "$real_foreign")" "REFUSE"
 else
-    printf '  SKIP: no /etc — real foreign-owner reader check not exercised\n'
+    th_skip "real foreign-owner reader check (3 cases)" \
+        "no reachable path is owned by a uid other than ours ($ME_UID); probed:${probed:- <nothing readable>}"
 fi
 
 # Belt and braces: with NO stub at all, the real dir we really own still passes,
@@ -384,7 +445,7 @@ if command -v ssh-keygen >/dev/null 2>&1; then
         printf '  PASS: the plaintext token never reached disk\n'; PASS=$((PASS+1))
     fi
 else
-    printf '  SKIP: ssh-keygen absent — redeem-path locks (10/11) not exercised\n'
+    th_skip "redeem-path locks (10/11)" "ssh-keygen absent — the redeem path could not be exercised"
 fi
 
 th_summary_and_exit

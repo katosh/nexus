@@ -73,9 +73,13 @@ cat monitor/.state/watcher-target  # what the watcher thinks the target is
 If they don't match, restart the watcher with the right target:
 
 ```bash
-monitor/svc.sh stop watcher
-monitor/watcher/launcher.sh --target <actual-orchestrator-window>
+monitor/svc.sh restart watcher
 ```
+
+Fix the TARGET in config (`monitor.target_window` in `config/nexus.yml`, or
+`MONITOR_TARGET`) — do not pass `--target <window>` on the command line. That
+is the `#459` anti-pattern; the launcher derives the target from config and
+now exits 2 on a hard-coded one.
 
 **Prevention.** Don't rename the orchestrator's window. The default name `orchestrator` is what the launcher and the watcher both expect; if you must rename, override consistently via `MONITOR_TARGET` or `monitor.target_window` in `config/nexus.yml`.
 
@@ -178,7 +182,7 @@ Once fixed, the crash-loop guard clears on the next successful paste-to-target �
 
 **Symptom.** `monitor/notify.sh "test" "test"` exits 0. No vibration on the phone, no email, no ntfy push.
 
-**Cause.** `notify.sh` is silent-no-op by design when no backend is configured — so the watcher's `notify.sh` call inside a tight loop doesn't error every cycle in a half-configured deployment. The flip side: misconfigured perms or paths look identical to "no backend".
+**Cause.** `notify.sh` is silent-no-op by design when no backend is configured — so a repeated caller doesn't error every invocation in a half-configured deployment. (The watcher's own out-of-band alerts go through `sandbox-notify` — `monitor/notifywrap/sandbox-notify`, guarded with `command -v sandbox-notify … || true` — not `notify.sh`, and likewise fail silent when the tool is absent.) The flip side: misconfigured perms or paths look identical to "no backend".
 
 **Fix.** Re-run with `--require-delivery` to make the helper fail loud:
 

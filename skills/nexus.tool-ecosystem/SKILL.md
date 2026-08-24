@@ -154,7 +154,7 @@ nexus asset repo below.
 | **genextf** | Associate transcription factors to genes via accessible sites | `<your-org>/genextf` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **jupyter_kernel_inspector** | Inspect & list Jupyter kernels | `<your-org>/jupyter_kernel_inspector` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **unprintable** | Find & remove hidden characters in text files | `<your-org>/unprintable` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
-| **fh-hpc-skills** | Claude Code skills for <your-institution> HPC usage | `<your-org>/hpc-skills` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
+| **hpc-skills** | Claude Code skills for <your-institution> HPC usage | `<your-org>/hpc-skills` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **agent_container** | Responsible-usage tooling for AI coding agents | `<your-org>/agent_container` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **otheruser_annotation** | Utilities to ease cell-type annotation | `<your-org>/otheruser_annotation` | **otheruser (`@<other-nexus>`)** — operator-confirmed owner (`@<operator>` committed on her behalf) | `<your-org>/<other-nexus>` |
 | **scEcho** (a.k.a. "echo") | Statistical framework for desynchronized cell states + driver genes/REs from paired scRNA + scATAC | `<your-org>/scEcho` | otheruser (`@otheruser`) | `<your-org>/<other-nexus>` |

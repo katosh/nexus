@@ -102,6 +102,17 @@ class H(http.server.BaseHTTPRequestHandler):
 http.server.HTTPServer(('127.0.0.1', PORT), H).serve_forever()
 PY
 
+# Per-test-process port band (your-org/nexus-code#558) — this file uses the
+# 40000-band, DISJOINT from test-jupyter-service.sh's 20000-band, so the two
+# jupyter-family stubs can never contend for the same port window when the
+# runner schedules them concurrently. See the fuller note in that file.
+# fixture-port-lint: allow-scan-base  as in test-jupyter-service.sh, the stub
+# bind-probes [base, base+40); this is a scan START (your-org/nexus-code#800).
+# NOTE: this band (40000-47999) sits INSIDE the kernel ephemeral range
+# (32768-60999), unlike the 20000-band. The scan tolerates that — it retries
+# on EADDRINUSE — but it is why the scan, not the arithmetic, is load bearing.
+LABSH_STUB_BASE_PORT=$(( 40000 + ($$ % 8000) ))
+
 # Stub labsh. Contract for the surface the supervisor touches, PLUS the
 # jpserver-*.json runtime-record scan that drove the incident.
 cat > "$STUBS/labsh" <<STUB
@@ -125,16 +136,16 @@ case "\${1:-}" in
         echo "labsh: server is already running (pid \${pid:-?}, \${url:-?})" >&2
         exit 1
     fi
-    port=8888
+    port=${LABSH_STUB_BASE_PORT}
     while (( \$# > 0 )); do case "\$1" in --port) port="\$2"; shift 2 ;; *) shift ;; esac; done
     mkdir -p "\$J" "\$RT"
     [[ -f "\$J/token" ]] || printf 'stubtok-%s' "\$RANDOM" > "\$J/token"
     tok=\$(cat "\$J/token")
-    # labsh auto-increment: first free port in [port, port+9].
+    # labsh auto-increment: first free port in [port, port+39] (widened for #558).
     port=\$(python3 - "\$port" <<'EOF'
 import socket, sys
 p = int(sys.argv[1])
-for q in range(p, p + 10):
+for q in range(p, p + 40):
     s = socket.socket()
     try: s.bind(('127.0.0.1', q)); s.close(); print(q); break
     except OSError: s.close()
@@ -194,7 +205,9 @@ export PATH="$STUBS:$PATH"
 DL="${LABSH_TEST_DEADLINE:-$(( ${LABSH_TEST_START_GRACE:-4} * 8 + 30 ))}"
 
 wait_for() {  # wait_for <label> <deadline-s> -- cmd...
-    local label="$1" deadline="$2"; shift 3
+    # Deadline is in UNLOADED seconds; th_deadline scales it for the
+    # parallelism this run competes with (your-org/nexus-code#558).
+    local label="$1" deadline; deadline=$(th_deadline "$2"); shift 3
     local t=0
     while (( t < deadline * 4 )); do
         "$@" >/dev/null 2>&1 && { printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 )); return 0; }

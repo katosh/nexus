@@ -1,0 +1,68 @@
+# guard-populations.manifest — the coverage boundary of the `--population`
+# reverse index (your-org/nexus-code#803), recorded as DATA rather than prose,
+# because prose cannot be made to fail.
+#
+# Enforced by:  bash monitor/watcher/test-guards-for-diff.sh
+# Consumed by:  bash monitor/guards-for-diff.sh
+# Protocol:     monitor/_guard_population.sh
+#
+# THE AXIS is HOW A GUARD DECLARES WHAT IT READS — the axis the mechanism
+# varies on, not the axis a search varied on. A guard is in this index iff it
+# implements the protocol; there are exactly two ways it does so, and column 3
+# says which, because they fail differently:
+#
+#   classifier  the suite forwards to its own generator's `--population`
+#               (`bash "$CLASSIFIER" --population`). The declaration IS the
+#               enumeration the classifier walks, so it cannot drift from it.
+#   inline      the suite declares by calling its own in-file enumerator. Same
+#               rule, one level closer: `gp_population` must CALL that function,
+#               never restate what it currently returns.
+#
+# THE CLAIM THIS FILE MAKES IS STRUCTURAL, NOT BEHAVIOURAL. A row does not
+# assert that the listed guard would catch any particular defect. It asserts
+# the checkable things: this guard declares a population, that population is at
+# least `floor` files, every path in it EXISTS, and the set of declaring guards
+# is exactly these rows. Existence and not tracked-ness, deliberately: a
+# population is computed from the WORKING TREE, so a file written and not yet
+# committed is legitimately in it — asserting tracked-ness would red the suite
+# for the ordinary act of adding a file. A guard that starts or stops
+# declaring lands RED here rather than silently changing what the index covers.
+#
+# THE FLOOR IS A NON-VACUITY RATCHET, not a size assertion. It is set well
+# under the live count so ordinary growth or pruning never trips it, and it
+# exists because an enumerator broken into returning NOTHING makes the index
+# report "this guard does not read your diff" — indistinguishable, downstream,
+# from a correct exclusion. That is this repo's dominant defect class (silence
+# read as absence), and it has produced three confident wrong answers here
+# already: `mapfile` in zsh, `grep -r` over `reports/`, `git ls-tree` with a
+# glob pathspec.
+#
+# HOW THIS FILE IS MEANT TO CHANGE. It should only ever GROW. Teaching another
+# guard `gp_population` adds a row and shrinks the invisible residual that
+# `guards-for-diff.sh` prints on every run. Removing a row means a guard
+# stopped declaring, which is a regression in coverage and should be argued for
+# in the commit message, not absorbed by regenerating this file.
+#
+# WHAT IS DELIBERATELY NOT HERE. The other tracked test suites — the residual —
+# are not listed. Listing 291 rows of "does not declare" would be a list of
+# what has not been done yet, which rots on every added suite and asserts
+# nothing; the residual is COUNTED from the live enumeration instead, printed
+# by guards-for-diff.sh and asserted by test-guards-for-diff.sh, so it cannot
+# be stale. What is claimed here is the boundary's near side, measured.
+#
+# Columns (TAB-separated):
+#   1 suite   repo-relative path — the thing a worker runs
+#   2 floor   minimum population size; refuse below it
+#   3 kind    classifier | inline
+#   4 reason  what this guard reads, and why that is its population
+#
+monitor/watcher/test-ambient-shell-option-scope.sh	300	inline	every shell file under monitor/ via _aso_shell_files — P1 and P2 both walk it, and #803's first occurrence was monitor/ng entering P2's population
+monitor/watcher/test-claude-md-guards-for-diff.sh	5	inline	the CLAUDE.md bullet it pins, the index whose exit-code contract it pins, the ng dispatcher the documented spelling goes through, the protocol library its fail-closed fixture sources, and the guard whose own --population supplies its independent hit/miss controls — it declares because its Control D plants a complete protocol fixture, so its bytes carry both discovery tokens while only quoting them
+monitor/watcher/test-guards-for-diff.sh	5	inline	the index, the protocol library, this manifest, and every guard the manifest names — it runs each of their probes, so an edit to any of them can change its verdict; also the honest resolution of the planted-fixture discovery ambiguity, since no text predicate separates quoting the protocol from implementing it
+monitor/watcher/test-early-exit-reader-manifest.sh	300	classifier	early-exit-readers.sh --population: git-tracked monitor/** filtered by the shared shf_is_shell predicate, BEFORE the pipefail-axis narrowing
+monitor/watcher/test-spawn-shape-manifest.sh	400	classifier	spawn-shapes.sh --population: every tracked file, because the classifier greps them all for new-window — the narrowing to matches is a speed optimisation, not the read set
+monitor/watcher/test-stub-claude-manifest.sh	200	classifier	stub-claude-fixtures.sh --population: every test-*.sh under monitor/ plus every shell file in a test-integration/ tree (the clause a filename-shaped guess omits)
+monitor/watcher/test-summary-honesty-manifest.sh	200	inline	the git ls-files '*test-*.sh' corpus it classifies — a suite that prints no banner today is exactly the one that acquires one
+monitor/watcher/test-tmux-window-resolver.sh	100	inline	production shell under monitor/ via _resolver_scan_files — D1 enumerates it twice (by name, by behaviour) and F1 greps it for tmux format strings; #803's third occurrence reddened both
+monitor/watcher/test-run-tests-empty-outfile.sh	2	inline	run-tests.sh plus this suite's own source — the guard asserts a property of the RUNNER (that an empty out_file base is refused rather than written into $PWD), so an edit to run-tests.sh is exactly what can change its verdict; gp_handle adds the suite itself
+monitor/watcher/test-run-tests-accounting-verdict.sh	2	inline	run-tests.sh plus this suite's own source — every assertion is a property of the RUNNER (that a verdict is refused when the record disagrees with what was dispatched, and that the nproc cap is soft-only), so an edit to run-tests.sh is exactly what can change its verdict; gp_handle adds the suite itself

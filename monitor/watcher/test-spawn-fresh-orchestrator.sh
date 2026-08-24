@@ -786,6 +786,173 @@ else
     fail "situation-report file missing at $REPORT for the non-coordinator-target run"
 fi
 
+# --- Test 10: cold-boot dropped-worker manifest lands in the report ------
+#
+# your-org/nexus-code#651. A cold boot (`./watcher` without `--continue`)
+# resurrects no workers and leaves a manifest of what it dropped. This
+# report IS the incoming orchestrator's first turn, so it is the primary
+# delivery surface — and delivery must be once-only, or a wedge respawn
+# next week re-opens a settled question with a list of workers that have
+# been irrelevant for days.
+
+echo '=== cold-boot dropped-worker manifest: inlined verbatim into the situation report, exactly once ==='
+
+# Guard the guard: the helpers are sourced from monitor/_dropped_manifest.sh,
+# and a source that silently fails would leave the `if` below calling an
+# undefined function — which is rc 127, which reads as "nothing pending",
+# which is indistinguishable from a working no-op. Assert they EXIST
+# before asserting on what they do.
+if bash -c 'source "'"$_test_dir"'/../_dropped_manifest.sh" \
+            && declare -F _dropped_manifest_pending >/dev/null \
+            && declare -F _dropped_manifest_mark_delivered >/dev/null'; then
+    pass "manifest helpers are really sourceable (not a silently-degraded rc-127 no-op)"
+else
+    fail "monitor/_dropped_manifest.sh did not define the delivery helpers"
+fi
+
+MANIFEST="$STATE_DIR/cold-boot-dropped-workers.md"
+MANIFEST_MARKER="$STATE_DIR/cold-boot-dropped-workers.delivered"
+rm -f "$MANIFEST_MARKER"
+cat > "$MANIFEST" <<'EOF'
+# Cold boot dropped 1 worker agent(s)
+
+### `worker-foo`
+- session-id: `feedface-0000-1111-2222-333344445555`
+- workdir: `/fake/work/worker-foo`
+- re-spawn with: `monitor/spawn-worker.sh --resume worker-foo`
+EOF
+
+NEXUS_ROOT="$FAKE_NEXUS" \
+STATE_DIR="$STATE_DIR" \
+FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+PANE_STATE_BIN="$PANE_STATE_STUB" \
+PATH="$TMUX_STUB_BIN:$PATH" \
+    bash "$SCRIPT" --target orchestrator --reason "test: cold-boot manifest" \
+                   2>"$WORK/stderr-10.log"
+report_10=$(cat "$REPORT" 2>/dev/null)
+assert_contains "report inlines the manifest heading" \
+                "$report_10" "Cold boot dropped 1 worker agent(s)"
+assert_contains "report inlines the dropped worker's session-id (actionable, not a pointer to a file)" \
+                "$report_10" "feedface-0000-1111-2222-333344445555"
+assert_contains "report inlines the exact re-spawn command" \
+                "$report_10" "monitor/spawn-worker.sh --resume worker-foo"
+if [[ -f "$MANIFEST_MARKER" ]]; then
+    pass "delivery marker written after inlining"
+else
+    fail "no delivery marker at $MANIFEST_MARKER"
+fi
+if [[ -s "$MANIFEST" ]]; then
+    pass "manifest itself survives delivery (audit record, not consumed)"
+else
+    fail "manifest deleted by delivery"
+fi
+
+# Second spawn, same manifest: already delivered → must NOT reappear.
+NEXUS_ROOT="$FAKE_NEXUS" \
+STATE_DIR="$STATE_DIR" \
+FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+PANE_STATE_BIN="$PANE_STATE_STUB" \
+PATH="$TMUX_STUB_BIN:$PATH" \
+    bash "$SCRIPT" --target orchestrator --reason "test: manifest already delivered" \
+                   2>"$WORK/stderr-10b.log"
+assert_not_contains "a later respawn does NOT re-deliver an already-delivered manifest" \
+                    "$(cat "$REPORT" 2>/dev/null)" "Cold boot dropped 1 worker agent(s)"
+
+# …and with no manifest at all the report is unchanged (the common case
+# must stay silent — every non-cold-boot respawn goes through here).
+rm -f "$MANIFEST" "$MANIFEST_MARKER"
+NEXUS_ROOT="$FAKE_NEXUS" \
+STATE_DIR="$STATE_DIR" \
+FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+PANE_STATE_BIN="$PANE_STATE_STUB" \
+PATH="$TMUX_STUB_BIN:$PATH" \
+    bash "$SCRIPT" --target orchestrator --reason "test: no manifest" \
+                   2>"$WORK/stderr-10c.log"
+report_10c=$(cat "$REPORT" 2>/dev/null)
+assert_not_contains "no manifest → report carries no drop section" \
+                    "$report_10c" "Cold boot dropped"
+assert_contains "no manifest → the report is otherwise intact" \
+                "$report_10c" "## Recent reports (top 5 by mtime)"
+
+# --- Test 11: a FAILED spawn must not consume the manifest ---------------
+#
+# your-org/nexus-code#651 skeptic, finding 2 — blocking. Marking the manifest
+# delivered during report COMPOSITION meant a single failed `tmux new-window`
+# (rc 3) consumed it anyway: both documented surfaces went dead, and the retry
+# that the cooldown machinery exists to make — which succeeds — handed the new
+# orchestrator a situation report with no manifest at all. Composing a report
+# is not delivering one. Consumption is now gated on the respawn helper
+# returning 0.
+
+echo '=== failed spawn must leave the manifest PENDING for the retry / the bootstrap.sh backstop ==='
+
+rm -f "$MANIFEST_MARKER"
+cat > "$MANIFEST" <<'EOF'
+# Cold boot dropped 1 worker agent(s)
+
+### `worker-swallowed`
+- session-id: `deadbeef-1111-2222-3333-444455556666`
+EOF
+
+# Force `tmux new-window` to fail (rc 1) → the respawn helper returns 3.
+FAILING_TMUX_BIN="$WORK/failing-tmux-bin"
+mkdir -p "$FAILING_TMUX_BIN"
+sed 's|^    kill-window|    new-window) exit 1 ;;\n    kill-window|' \
+    "$TMUX_STUB_BIN/tmux" > "$FAILING_TMUX_BIN/tmux"
+chmod +x "$FAILING_TMUX_BIN/tmux"
+
+NEXUS_ROOT="$FAKE_NEXUS" \
+STATE_DIR="$STATE_DIR" \
+FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+PANE_STATE_BIN="$PANE_STATE_STUB" \
+PATH="$FAILING_TMUX_BIN:$PATH" \
+    bash "$SCRIPT" --target orchestrator --reason "test: spawn fails with a pending manifest" \
+                   2>"$WORK/stderr-11.log"
+spawn_rc=$?
+
+if (( spawn_rc != 0 )); then
+    pass "fixture is real: the spawn genuinely failed (rc=$spawn_rc)"
+else
+    fail "spawn unexpectedly succeeded — the failing-tmux fixture did not take effect"
+fi
+if [[ ! -f "$MANIFEST_MARKER" ]]; then
+    pass "failed spawn did NOT mark the manifest delivered (consumption is gated on confirmed delivery, not on attempt)"
+else
+    fail "manifest consumed by a failed spawn — swallowed exactly as before"
+fi
+
+# The decisive assertion: the RETRY, which succeeds, must still carry it.
+NEXUS_ROOT="$FAKE_NEXUS" \
+STATE_DIR="$STATE_DIR" \
+FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+PANE_STATE_BIN="$PANE_STATE_STUB" \
+PATH="$TMUX_STUB_BIN:$PATH" \
+    bash "$SCRIPT" --target orchestrator --reason "test: retry after a failed spawn" \
+                   2>"$WORK/stderr-11b.log"
+assert_contains "the successful RETRY still delivers the manifest (nothing was permanently lost)" \
+                "$(cat "$REPORT" 2>/dev/null)" "worker-swallowed"
+if [[ -f "$MANIFEST_MARKER" ]]; then
+    pass "the retry — which actually reached the agent — is what marks it delivered"
+else
+    fail "successful retry did not mark delivery"
+fi
+rm -f "$MANIFEST" "$MANIFEST_MARKER"
+
 # --- summary ------------------------------------------------------------
 
 echo

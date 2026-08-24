@@ -16,11 +16,11 @@ GitHub's mobile push channel fires when the bot reacts to or replies to your com
 
 A representative arc, lightly fictionalised, on a host that's been running for weeks.
 
-**Morning — phone, before standup.** Open the overview issue from a push notification, glance at the dashboard body. The *Active Agents* table shows three windows still open from yesterday: one wrapped (waiting for cleanup), one in a long-running Slurm job, one idle on a stale draft PR. *Decisions Needed* is empty. Tap into the stale draft PR's tracking issue, read the worker's last report (the link comment was posted automatically on wrap-up), comment `@worker-foo: this looks ready, please open the PR`. Lock the phone.
+**Morning — phone, before standup.** Open the overview issue from a push notification, glance at the dashboard body. The *In-flight* table shows three windows still open from yesterday: one wrapped (waiting for cleanup), one in a long-running Slurm job, one idle on a stale draft PR. *Awaiting operator* is empty. Tap into the stale draft PR's tracking issue, read the worker's last report (the link comment was posted automatically on wrap-up), comment `@worker-foo: this looks ready, please open the PR`. Lock the phone.
 
 **Five minutes later.** Push notification: the bot rocketed the comment and posted "routed to `worker-foo`". The orchestrator pasted your directive into the worker's tmux pane via [`monitor/paste-followup.sh`](spawning-workers.md#follow-up-messages). Another push a minute later — the bot says the worker is wrapping up. A third push: `worker-foo` filed its final report and the orchestrator closed the window.
 
-**Afternoon — laptop, between meetings.** Open a fresh question on the overview issue: *"Can you start a new run of the eligibility-filter benchmark on Slurm?"* The orchestrator spawns a `bench-eligibility` worker (you see this in the dashboard's *Active Agents* on the next refresh, ~30 seconds), the worker writes the sbatch script and submits it, posts a comment with the job ID, and goes idle. Squeue notifications would normally page you when the job finishes, but the worker has already committed a `## Infrastructure Issues` note saying the squeue→complete transition isn't wired into [push notifications](notifications.md) yet — you'll see the completion on the next dashboard refresh.
+**Afternoon — laptop, between meetings.** Open a fresh question on the overview issue: *"Can you start a new run of the eligibility-filter benchmark on Slurm?"* The orchestrator spawns a `bench-eligibility` worker (you see this in the dashboard's *In-flight* section on the next refresh, ~30 seconds), the worker writes the sbatch script and submits it, posts a comment with the job ID, and goes idle. Squeue notifications would normally page you when the job finishes, but the worker has already committed a `## Infrastructure Issues` note saying the squeue→complete transition isn't wired into [push notifications](notifications.md) yet — you'll see the completion on the next dashboard refresh.
 
 **Evening — only if needed.** If something is wedged (rate-limit cascade, watcher crash-loop, bot token revoked), an emergency-tier push fires with a click-through URL to the relevant issue. Most days no such push arrives.
 
@@ -45,8 +45,8 @@ Don't open tmux for routine status. The dashboard, the action log, and the per-i
 | Cadence | What you do | Where |
 |---|---|---|
 | Per-comment | Read bot reactions, follow link comments, post follow-ups | Phone, issue thread |
-| Per-session start | Skim the dashboard, check the *Decisions Needed* and *Active Agents* sections | Overview issue |
-| Per-day | Glance at *Recently Completed* to catch up on overnight work; spot-check the action log if something looks off | Overview issue, `monitor/.state/action-log.jsonl` |
+| Per-session start | Skim the dashboard, check the *Awaiting operator* and *In-flight* sections | Overview issue |
+| Per-day | Glance at *Recent landings* to catch up on overnight work; spot-check the action log if something looks off | Overview issue, `monitor/.state/action-log.jsonl` |
 | Per-week | [Run a periodic infra-review](reports.md#the-infrastructure-issues-feedback-loop) over the `## Infrastructure Issues` sections in recent reports | Orchestrator window |
 | Per-incident | Reach into tmux only when push pages | Host terminal |
 

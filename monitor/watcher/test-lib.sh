@@ -30,32 +30,66 @@ assert_eq() {
     fi
 }
 
-WINDOWS_LIST=""
+# Pane table the mock serves, one `<window_name>|<pane_dead>` row
+# per line — the exact shape `_target_window_present` asks tmux for.
+# `set_live_windows` is the convenience for the common case (every
+# named window holds one live pane); tests that care about
+# `#{pane_dead}` set PANES_LIST directly.
+PANES_LIST=""
+set_live_windows() {
+    local n out=''
+    for n in "$@"; do out+="${out:+$'\n'}${n}|0"; done
+    PANES_LIST="$out"
+}
 
-# When non-zero, the mock `tmux list-windows` simulates a COMMAND
+# When non-zero, the mock `tmux list-panes` simulates a COMMAND
 # FAILURE (no server running, or a client/server protocol-version
 # mismatch): it emits the error text to stderr — which the function's
 # `2>/dev/null` swallows, exactly as in production — and exits with
 # this code, producing empty stdout. Reset to 0 for the normal path.
 TMUX_LIST_RC=0
 
-# Mock tmux: implements only `list-windows -F '#{window_name}'`, the
-# one verb _target_window_present cares about.
-tmux() {
-    local sub="$1"; shift
-    case "$sub" in
-        list-windows)
-            if (( TMUX_LIST_RC != 0 )); then
-                echo 'protocol version mismatch (client 8, server 7)' >&2
-                return "$TMUX_LIST_RC"
-            fi
-            printf '%s\n' "$WINDOWS_LIST"
-            return 0
-            ;;
-        *) return 0 ;;
-    esac
+# Mock tmux: implements only `list-panes -s -F '<name>|<pane_dead>'`,
+# the one verb _target_window_present cares about.
+#
+# THE DEFAULT ARM REFUSES, LOUDLY (your-org/nexus-code#741). It used to
+# be `*) return 0 ;;` — a permissive arm that answered every
+# unimplemented verb with "success, no output". When #741 moved the
+# probe from `list-windows` to `list-panes`, that arm did not report an
+# unmocked verb; it fed the function an EMPTY pane table, which is a
+# perfectly well-formed answer meaning "absent". Three present-cases
+# flipped to rc=2 and two fail-closed cases flipped from rc=1 to rc=2 —
+# a mock silently manufacturing the exact false-ABSENT verdict this
+# suite exists to prevent. Here that was loud, because the assertions
+# were watching. In a suite where they were not, it is a green.
+#
+# Defined ONCE, via an installer, because the "tmux query fails" block
+# below needs to reinstate it after a no-tmux test unsets it. That
+# block used to carry its own verbatim copy of the body, and the copy
+# is what made the #741 verb change land as two DIFFERENT failures in
+# one file. A mock with two definitions has two contracts.
+install_mock_tmux() {
+    tmux() {
+        local sub="$1"; shift
+        case "$sub" in
+            list-panes)
+                if (( TMUX_LIST_RC != 0 )); then
+                    echo 'protocol version mismatch (client 8, server 7)' >&2
+                    return "$TMUX_LIST_RC"
+                fi
+                printf '%s\n' "$PANES_LIST"
+                return 0
+                ;;
+            *)
+                printf 'mock tmux: unimplemented verb %q — refusing rather than answering "success, no output" (see #741)\n' \
+                    "$sub" >&2
+                return 3
+                ;;
+        esac
+    }
+    export -f tmux
 }
-export -f tmux
+install_mock_tmux
 
 # Real-looking tmux shim so `command -v tmux` succeeds. The bash
 # function shadows the binary at call-time, but `command -v` walks
@@ -80,7 +114,7 @@ install_tmux_shim
 # ---- _target_window_present: window present (rc=0) ----------------
 
 echo '=== _target_window_present: target present ==='
-WINDOWS_LIST=$'orchestrator\nwatcher\nworker-1'
+set_live_windows orchestrator watcher worker-1
 _target_window_present "orchestrator"; rc=$?
 assert_eq "orchestrator window present -> rc=0" "$rc" "0"
 _target_window_present "watcher"; rc=$?
@@ -91,19 +125,77 @@ assert_eq "worker-1 window present -> rc=0" "$rc" "0"
 # ---- _target_window_present: window absent (rc=2) -----------------
 
 echo '=== _target_window_present: target absent ==='
-WINDOWS_LIST=$'watcher\nworker-1'
+set_live_windows watcher worker-1
 _target_window_present "orchestrator"; rc=$?
 assert_eq "orchestrator absent in non-empty list -> rc=2" "$rc" "2"
 
-WINDOWS_LIST=""
+PANES_LIST=""
 _target_window_present "orchestrator"; rc=$?
 assert_eq "orchestrator absent in empty list -> rc=2" "$rc" "2"
 
-# Match must be exact (the underlying grep uses -x). Substring matches
-# against existing windows must NOT count as present.
-WINDOWS_LIST=$'orchestrator-extra\norchestrato\norchestratord'
+# Match must be exact. Substring matches against existing windows must
+# NOT count as present.
+set_live_windows orchestrator-extra orchestrato orchestratord
 _target_window_present "orchestrator"; rc=$?
 assert_eq "no exact match -> rc=2" "$rc" "2"
+
+# ---- _target_window_present: remain-on-exit corpse (rc=2) ---------
+# your-org/nexus-code#741. THE regression: `_respawn.sh` sets
+# `remain-on-exit on` on the window it spawns, so a crashed agent
+# leaves the window LISTED with a dead pane. Answering PRESENT there
+# is what stopped the absent branch from ever firing a second time —
+# one respawn, one crash, and a crash-loop guard that needs three.
+# The window is still in the table in every case below; only
+# `#{pane_dead}` distinguishes them.
+
+echo '=== _target_window_present: dead pane (remain-on-exit corpse) ==='
+PANES_LIST='orchestrator|1'
+_target_window_present "orchestrator"; rc=$?
+assert_eq "listed window, sole pane dead -> rc=2 (corpse, not present)" "$rc" "2"
+
+PANES_LIST=$'watcher|0\norchestrator|1\nworker-1|0'
+_target_window_present "orchestrator"; rc=$?
+assert_eq "corpse among live siblings -> rc=2" "$rc" "2"
+# ...and the siblings are unaffected: one window's corpse must not
+# condemn another's live pane.
+_target_window_present "watcher"; rc=$?
+assert_eq "live sibling of a corpse -> rc=0" "$rc" "0"
+
+# A window with several panes is present if ANY pane is live —
+# `remain-on-exit` kills panes one at a time, and a split window whose
+# second pane still runs the agent is not a corpse.
+PANES_LIST=$'orchestrator|1\norchestrator|0'
+_target_window_present "orchestrator"; rc=$?
+assert_eq "multi-pane, one dead one live -> rc=0 (present)" "$rc" "0"
+PANES_LIST=$'orchestrator|1\norchestrator|1'
+_target_window_present "orchestrator"; rc=$?
+assert_eq "multi-pane, ALL dead -> rc=2 (corpse)" "$rc" "2"
+
+# ---- _target_window_present: pane_dead allowlist ------------------
+# ONLY the literal `1` is dead. Every other reading — a tmux too old
+# to know the format (empty expansion), a garbled row, an unexpected
+# value — must fall back to PRESENT, i.e. to the pre-#741 verdict.
+# The asymmetry is deliberate and is the whole safety argument: a
+# false ABSENT respawns a live orchestrator (decapitation-duplicate,
+# expensive), a false PRESENT misses a respawn (recoverable). Evidence
+# short of proof must never buy the expensive one.
+
+echo '=== _target_window_present: pane_dead allowlist (default-deny on "dead") ==='
+PANES_LIST='orchestrator|'
+_target_window_present "orchestrator"; rc=$?
+assert_eq "pane_dead unsupported (empty field) -> rc=0, NOT a respawn" "$rc" "0"
+PANES_LIST='orchestrator'
+_target_window_present "orchestrator"; rc=$?
+assert_eq "row with no delimiter at all -> rc=0, NOT a respawn" "$rc" "0"
+PANES_LIST='orchestrator|yes'
+_target_window_present "orchestrator"; rc=$?
+assert_eq "pane_dead garbage 'yes' -> rc=0, NOT a respawn" "$rc" "0"
+PANES_LIST='orchestrator|11'
+_target_window_present "orchestrator"; rc=$?
+assert_eq "pane_dead '11' is not '1' -> rc=0, NOT a respawn" "$rc" "0"
+PANES_LIST='orchestrator|0'
+_target_window_present "orchestrator"; rc=$?
+assert_eq "pane_dead 0 -> rc=0 (present)" "$rc" "0"
 
 # ---- _target_window_present: no tmux on PATH (rc=1) ---------------
 
@@ -121,36 +213,28 @@ PATH="$saved_path"
 rm -rf "$empty_dir"
 
 # ---- _target_window_present: tmux query FAILS (rc=1, fail-closed) -
-# Regression for the U1 respawn-storm: a `tmux list-windows` that
+# Regression for the U1 respawn-storm: a tmux window/pane query that
 # FAILS (dead server, or a stale-client/newer-server protocol-version
 # mismatch whose stderr is swallowed) must classify as "can't
 # classify" (rc=1) — NEVER "absent" (rc=2), which main.sh would count
 # toward the fast-respawn streak. Restore the mock tmux first (the
 # no-tmux block above unset it), then make its query fail.
-eval "$(declare -f tmux 2>/dev/null)" 2>/dev/null || true
-tmux() {
-    local sub="$1"; shift
-    case "$sub" in
-        list-windows)
-            if (( TMUX_LIST_RC != 0 )); then
-                echo 'protocol version mismatch (client 8, server 7)' >&2
-                return "$TMUX_LIST_RC"
-            fi
-            printf '%s\n' "$WINDOWS_LIST"
-            return 0
-            ;;
-        *) return 0 ;;
-    esac
-}
+install_mock_tmux
 echo '=== _target_window_present: tmux query fails (version mismatch) ==='
 TMUX_LIST_RC=1
-WINDOWS_LIST=$'orchestrator\nwatcher'   # target WOULD be present if queryable
+set_live_windows orchestrator watcher   # target WOULD be present if queryable
 _target_window_present "orchestrator"; rc=$?
 assert_eq "tmux query failure -> rc=1 (not absent)" "$rc" "1"
 # Even with an empty would-be list, a failed query is still rc=1.
-WINDOWS_LIST=""
+PANES_LIST=""
 _target_window_present "orchestrator"; rc=$?
 assert_eq "tmux query failure, empty list -> rc=1 (not absent)" "$rc" "1"
+# ...and a failed query on a window whose panes ARE all dead is still
+# rc=1, not the new corpse verdict: the corpse arm must be reachable
+# only by positively OBSERVING `pane_dead`, never by failing to look.
+PANES_LIST='orchestrator|1'
+_target_window_present "orchestrator"; rc=$?
+assert_eq "tmux query failure over a would-be corpse -> rc=1 (not 2)" "$rc" "1"
 TMUX_LIST_RC=0
 
 # ---- _classify_diff: helpers --------------------------------------

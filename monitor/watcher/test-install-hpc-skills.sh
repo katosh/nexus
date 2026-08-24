@@ -35,11 +35,9 @@ REAL_GIT=$(command -v git) || { echo "FATAL: real git not found"; exit 1; }
 
 PASS=0
 FAIL=0
-assert_eq() {
-    local label="$1" got="$2" want="$3"
-    if [[ "$got" == "$want" ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
-    else printf '  FAIL: %s — got %q want %q\n' "$label" "$got" "$want" >&2; FAIL=$(( FAIL + 1 )); fi
-}
+# assert_eq / assert_contains come from _test_helpers.sh (sourced above).
+# A byte-identical local copy used to shadow the helper here — dead code by
+# definition, and the kind that quietly diverges (your-org/nexus-code#568 D8).
 assert_contains() {
     local label="$1" haystack="$2" needle="$3"
     if [[ "$haystack" == *"$needle"* ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
@@ -62,7 +60,7 @@ if [[ "\${1-}" == "clone" ]]; then
     mkdir -p "\$target/skills/hpc.cluster-overview" "\$target/skills/hpc.slurm"
     echo "# skill" > "\$target/skills/hpc.cluster-overview/SKILL.md"
     "\$REAL_GIT" -C "\$target" init -q
-    "\$REAL_GIT" -C "\$target" remote add origin "https://github.com/your-org/hpc-skills.git"
+    "\$REAL_GIT" -C "\$target" remote add origin https://github.com/your-org/hpc-skills.git
     exit 0
 fi
 exec "\$REAL_GIT" "\$@"
@@ -117,9 +115,28 @@ assert_eq "--check passes on complete install" "$LAST_RC" "0"
 # --- Test 2: idempotent re-run (no re-clone) ---------------------------
 echo '=== idempotent re-run → exit 0, git clone NOT called ==='
 rm -f "$WORK/clone-attempts"
-before=$(ls -la "$HOME1/.claude/skills" | sort)
+# your-org/nexus-code#655 — compare the SYMLINK SET, which is what the label
+# says, not `ls -la`, which is a RENDERING that embeds mtimes. The install
+# re-creates the symlinks (idempotently, to identical targets), so whenever a
+# re-run straddled a minute tick the two `ls -la` blocks differed in the
+# timestamp column alone and this assertion failed for the clock rather than
+# for anything about the install. Observed in CI: 18:48 vs 18:49, identical
+# names and identical targets, red.
+#
+# This is the third instance this round of the same shape: a proxy asserted in
+# place of the property it stands for. name -> target IS the property.
+_symlink_set() {   # <dir> -> "name -> target" per entry, sorted, clock-free
+    local d="$1" f out=""
+    shopt -s nullglob dotglob
+    for f in "$d"/*; do
+        out+="${f##*/} -> $(readlink "$f" 2>/dev/null || printf '<regular-file>')"$'\n'
+    done
+    shopt -u nullglob dotglob
+    printf '%s' "$out" | sort
+}
+before=$(_symlink_set "$HOME1/.claude/skills")
 run_install "$HOME1" "$NOCLONE"
-after=$(ls -la "$HOME1/.claude/skills" | sort)
+after=$(_symlink_set "$HOME1/.claude/skills")
 assert_eq "idempotent exit 0" "$LAST_RC" "0"
 assert_no "no clone attempted on re-run" test -f "$WORK/clone-attempts"
 assert_eq "symlink set unchanged" "$before" "$after"

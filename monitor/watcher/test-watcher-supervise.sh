@@ -65,7 +65,7 @@ PIDFILE="\$STATE/watcher.pid"; HB="\$STATE/watcher-heartbeat"; ILOCK="\$STATE/ne
 peer=\$(cat "\$PIDFILE" 2>/dev/null || true)
 if [[ "\$peer" =~ ^[0-9]+\$ ]] && (( peer != \$\$ )) && kill -0 "\$peer" 2>/dev/null; then
     cl="/proc/\$peer/cmdline"
-    if [[ ! -r "\$cl" ]] || tr '\0' ' ' < "\$cl" 2>/dev/null | grep -q main.sh; then exit 1; fi
+    if [[ ! -r "\$cl" ]] || grep -q main.sh <<<"\$(tr '\0' ' ' < "\$cl" 2>/dev/null)"; then exit 1; fi
 fi
 exec {ILFD}<>"\$ILOCK" || exit 5
 flock -n "\$ILFD" || exit 4
@@ -184,7 +184,7 @@ for _i in 1 2 3 4 5 6; do
     MONITOR_WATCHER_SUPERVISOR_LOOP_LIMIT=3 MONITOR_WATCHER_SUPERVISOR_LOOP_WINDOW_SECONDS=3600 \
     "$MON/revive-watcher.sh" >>"$WORK/revive.log" 2>&1 || true
 done
-GCALLS=$(grep -c '^call' "$WORK/guard-svc.log" 2>/dev/null || echo 0)
+GCALLS=$(grep -c '^call' "$WORK/guard-svc.log" 2>/dev/null) || GCALLS=0
 if (( GCALLS >= 1 && GCALLS <= 3 )); then printf '  PASS: revive guard capped restart calls at %d (limit 3)\n' "$GCALLS"; PASS=$((PASS+1)); else printf '  FAIL: guard did not cap (got %s, want 1..3)\n' "$GCALLS" >&2; FAIL=$((FAIL+1)); fi
 
 echo '=== E: double-restart race — concurrent --replace + --ensure leave one ==='

@@ -48,7 +48,7 @@ interval is `> 0`.
 
 | Task | Cadence | Class | Role |
 |---|---|---|---|
-| `target_window` | 2 s | cheap | `_target_window_present`; orchestrator-absence detection + respawn trigger. Force-fires `compose_emit` on rc=2. |
+| `target_window` | 2 s | cheap | `_target_window_present`; orchestrator-absence detection + respawn trigger. Force-fires `compose_emit` on rc=2. Presence means a LIVE pane, not a listed name — a `remain-on-exit` corpse is rc=2 (`#741`). |
 | `heartbeat` | 5 s | cheap | Bump `monitor/.state/watcher-heartbeat` (pid + ISO ts). |
 | `orchestrator_liveness` | 5 s | cheap | `_orchestrator_liveness_step`: pid / pin / last-paste wedge detection. |
 | `over_limit_wakes` | 5 s | cheap | `_over_limit_process_wakes`: act on due over-limit wake epochs. |
@@ -270,7 +270,7 @@ infrastructure health the operator must not miss.
 | `<local diff>` | a signal local-state diff | Unified diff, ≤ 120 lines. |
 | `--- eligible github comments ---` | non-empty eligible-comment list | Per-cycle; resurfaces while non-empty. |
 | `--- standing bells ---` | non-empty bell list | Per-cycle; cleared after emit. |
-| `--- pending decisions ---` | a worker/relay wrote a decision record | Structured per-decision channel (issue `#129`), sourced from `monitor/.state/decisions/*.json`. Ack = orchestrator removes the cited file once answered. Also the relay sink for Case W (see [Auto-unstick](#auto-unstick)). |
+| `--- pending decisions ---` | a worker/relay wrote a decision record **and its pane is not already being driven forward** | Structured per-decision channel (issue `#129`), sourced from `monitor/.state/decisions/*.json`. Ack = **`ng decision-ack <window> <fp>`**, cited on the row itself; `rm`ing the file does NOT stick (`#790`). Rows are gated on live `pane-state.sh` classification: `busy` / `working-background` / `working-self-paced` / `user-typing` / any `queued=1` pane withholds, everything else — including `blocked`, `idle`, `absent` and every indeterminate reading — emits. Also the relay sink for Case W (see [Auto-unstick](#auto-unstick)). |
 | `--- idle workers ---` | non-empty idle-transition list | Per-cycle; emitted on transitions only. |
 | `--- workspace snapshot ---` | periodic full-state cadence | Cumulative view between transition emits. |
 | `--- dashboard ---` | always | Footer; "stale" advisory only at age ≥ 2 h. |

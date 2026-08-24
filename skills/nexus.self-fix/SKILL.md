@@ -55,7 +55,7 @@ self-fix PR.
    | Upstream surface | Symptoms misread as nexus-bugs |
    |---|---|
    | Claude Code Bash tool | cwd persistence between calls, pane render, autosuggest, `settings.json` semantics |
-   | `gh` CLI version drift | `gh 1.13.0` (base image) missing flags / different error messages than `gh 2.x` |
+   | `gh` CLI version drift | `gh 1.13.0` (base image) missing flags / different error messages than `gh 2.x`. **But WHICH client the wrapper selects is ours** — that half is `#755`, and it is a nexus-code bug, not an upstream one |
    | tmux platform quirks | window-name parsing, `remain-on-exit`, `automatic-rename` interactions |
    | Anthropic API behavior | rate limits, token counting, prompt cache hits, cache TTL |
    | Linux kernel | Landlock ABI, user namespaces, seccomp filters |
@@ -99,6 +99,61 @@ authoring agent self-merge removes the one human checkpoint
 that catches a plausible-but-wrong infra change before it fans
 out. Open it, link it, and stop; the code owner or operator
 pulls the trigger.
+
+### Merge-time gotchas
+
+- **CI red because of infra, not code, is an operator-override case —
+  not a self-merge license.** When the `dev → main` (or PR) CI is red
+  because GitHub Actions is *blocked before any step runs* (billing cap
+  hit → jobs rejected in 2–7 s, log shows only "Waiting for a runner…";
+  or a runner outage / scoped-token expiry), a **fresh clone of the head
+  SHA** run through `monitor/watcher/run-tests.sh --jobs 2` showing a full
+  green (e.g. 72/72) is sufficient evidence for the operator to authorise
+  the merge. Clone fresh (never the primary clone the watcher reads),
+  verify HEAD matches the PR's `headRefOid`, surface the SHA + X/Y
+  assertion count, and merge **only** after explicit operator
+  authorisation — local-green is evidence, not a self-authorising
+  override. Document it in the report's `## What Was Done` +
+  `## Infrastructure Issues`. **Never** use this for *code-side* CI
+  failures — those need a real fix.
+
+- **A stacked PR whose base already merged does NOT auto-retarget to
+  `dev`.** GitHub only auto-retargets an OPEN stacked PR when its base
+  merges; if the base (Phase-1) merged to `dev` *before* the stacked
+  (Phase-2) commits were pushed onto it, merging the stack lands its
+  commits on the already-merged base branch — they never reach `dev`
+  (observed: `#379` stranded 4-ahead/14-behind `dev`; recovery was a
+  fresh cherry-pick PR). Always verify a stacked PR's commits actually
+  reached `dev` after merge:
+  `gh api repos/<owner>/<repo>/compare/dev...<stacked-branch> --jq .ahead_by`
+  (>0 with the expected commits = stranded). Prefer not stacking on a
+  base that may merge first, or land the stack as one PR.
+
+## Watch for sandbox-only test passes
+
+A test that references a nexus-exported env var (`NEXUS_ROOT`, …) **bare
+under `set -u`** passes in the sandbox (where the var is exported) but
+FAILS on a clean CI runner where it's unset — `set -u` aborts a fixture
+heredoc *after* `>` already truncated the target, so emit-body fixtures
+render EMPTY and hash to the empty-string SHA-256, silently defeating the
+discriminating assertion (sandbox 32/32, CI 31/32). Pin the default in
+the harness: `NEXUS_ROOT="${NEXUS_ROOT:-/nexus}"; export NEXUS_ROOT`.
+Debugging rule: when a nexus/nexus-code test is green in the sandbox but
+red on a clean runner, reproduce with `env -u <VAR> bash test-X.sh`
+**before** suspecting a code bug or tool-version drift.
+
+## Upstream-tool defects don't belong in nexus core docs
+
+Distinguish a *nexus-code defect* (fix it here) from an *upstream-tool
+defect surfacing in a nexus context* (Claude Code Bash-tool cwd
+persistence, `gh` CLI version artifacts, tmux platform quirks). The
+latter's home is upstream (file with Anthropic / gh / tmux) plus a
+host-side fix if applicable (`brew install gh` for a stale binary) — NOT
+a doc PR bolting the workaround into the worker floor, `nexus.bot`, or
+other always-loaded core skills, which only dilutes their load-bearing
+nexus-specific content. When triaging an issue or a fix proposal, decline
+upstream-issue band-aid patches to core docs and explain the root cause +
+the upstream/host fix.
 
 ## Cross-fork pings (`nexus-fork` topic) — legacy
 
@@ -179,6 +234,8 @@ documented now so the eventual implementation has a target.
   nexus-bug findings get recorded for the periodic infra meta-review.
 - `nexus.infra-review` — the periodic review that turns infra-issue
   reports into a ranked backlog of nexus self-fixes.
+- `nexus.watcher` — *operating* the running watcher (liveness, recovery
+  recipes); this skill is for *changing* watcher code.
 - `monitor/README.md` — runtime architecture, watcher liveness,
   env-var precedence; the canonical reference when investigating a
   watcher-side bug.

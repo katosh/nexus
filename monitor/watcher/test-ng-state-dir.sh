@@ -53,6 +53,10 @@ trap 'rm -rf "$WORK"' EXIT
 WORKTREE="$WORK/worktree"
 mkdir -p "$WORKTREE/monitor" "$WORKTREE/config"
 cp "$NG_REAL" "$WORKTREE/monitor/ng"
+# `ng` sources monitor/_bookkeeping.sh and REFUSES TO START without
+# it (your-org/nexus-code#601/#605: degrading to the silent-coercion
+# behaviour it replaces is worse than refusing). Copy it alongside.
+cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$WORKTREE/monitor/_bookkeeping.sh"
 WORKTREE_NG="$WORKTREE/monitor/ng"
 
 # Primary-clone-shape: where the watcher reads from. Has its

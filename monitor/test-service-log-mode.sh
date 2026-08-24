@@ -204,7 +204,16 @@ fi
 # `_ensure_service_log` in front of it and this goes red. The issue named
 # two sites; the eleven outside monitor/watcher/ landed with #484/PR #508,
 # and the monitor/watcher/ residual (deferred there because a concurrent
-# agent owned the tree) landed with nexus-code#509 — the set is closed.
+# agent owned the tree) landed with nexus-code#509.
+#
+# CAVEAT on "the set is closed": this array is CURATED, so it is closed only
+# over what someone remembered to add. It stayed green while
+# guard-block.sh.in created a group-writable evidence log, because that file
+# was not on the list — the lint cannot fail for a site it does not know
+# about. Adding a site is therefore a required step, not a courtesy; if you
+# add a service-log redirect anywhere under monitor/, add it here too. A
+# derived (grep-based) enumeration would close it properly and is worth
+# doing — see nexus-code#589's fixture manifest for the pattern.
 echo "## 10. each owned service-log redirect is preceded by the helper"
 SITES=(
     "bootstrap-recover.sh"          # every registry service log (fleet-wide)
@@ -216,6 +225,10 @@ SITES=(
     "node-forensics.sh"             # node-forensics.log (incl. post-rotation)
     "gh-shim.sh"                    # impersonate.log  (audit)
     "hooks/gh-write-guard.sh"       # gh-bypass-warnings.log (audit)
+    "guard-block.sh.in"             # guard-unverified.log (audit, #589 F2) —
+                                    # a TEMPLATE, not a script: emitted into
+                                    # every agent launcher, so its redirect
+                                    # runs in the launcher's shell
     "remote-forced-command.sh"      # forced-command.log (audit)
     "remote-enroll-session.sh"      # self-enroll.log (audit)
     # -- the monitor/watcher/ residual (nexus-code#509) --

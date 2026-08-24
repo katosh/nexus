@@ -439,6 +439,87 @@ write_resurface_body "$body_a" "2026-06-08T21:58:00-07:00" "f767aa" 0 0
 _compose_emit_apply_dedup "$body_a" "poll-resurface"; rc3=$?
 assert_rc "real workspace transition (pane-absent 1→0) still emits" 0 "$rc3"
 
+# ---- concurrency: the ring survives overlapping async recorders -------------
+#
+# CHARACTERIZATION TEST for your-org/nexus-code#568 A1. Every other case in
+# this file drives the recorder SERIALLY, which is precisely why the race went
+# unnoticed: `_compose_emit_record_emit` is reached from two scheduler tasks
+# that fire as concurrent `( … ) &` subshells (compose_emit and
+# comment_surface, both `--async`, whose in-flight guard is per-task), and the
+# body is a read-modify-write over one file. Before the fix this lost 34 of 40
+# updates and collapsed the ring from 8 entries to 1 — silently, because the
+# reader drops torn lines with `[[ =~ ^[0-9]+$ ]] || continue`.
+#
+# The assertion is deliberately about the RING CONTENTS, not about the
+# absence of a crash: a lost update is invisible in every other signal.
+echo "--- concurrent recorders (A1) ---"
+conc_state="$WORK/conc"
+mkdir -p "$conc_state"
+(
+    # Isolated ring/slot files so this section cannot perturb the cases above.
+    EMIT_DEDUP_HASH_FILE="$conc_state/last-emit-stable-hash"
+    EMIT_DEDUP_TS_FILE="$conc_state/last-emit-stable-ts"
+    EMIT_DEDUP_RING_FILE="$conc_state/last-emit-stable-hash.ring"
+    MONITOR_EMIT_DEDUP_RING_SIZE=8
+    export EMIT_DEDUP_HASH_FILE EMIT_DEDUP_TS_FILE EMIT_DEDUP_RING_FILE MONITOR_EMIT_DEDUP_RING_SIZE
+
+    # 8 distinct bodies recorded as 4 concurrent PAIRS — the real shape (two
+    # async tasks overlapping), repeated so a single lucky interleaving cannot
+    # pass. Each pair is forked, then reaped, mirroring _scheduler_fire_async.
+    for round in 0 1 2 3; do
+        for half in 0 1; do
+            n=$(( round * 2 + half ))
+            bf="$conc_state/body-$n"
+            write_body_quiet_full_state "$bf" "2026-07-27T0${n}:00:00-07:00" "nonce${n}"
+            # Distinct, stable content per body: the timestamp is normalized
+            # OUT of the stable hash, so vary a real workspace row instead.
+            printf '  - worker-conc-%s idle 10s (state=idle)\n' "$n" >> "$bf"
+            ( _compose_emit_record_emit "$bf" ) &
+        done
+        wait
+    done
+
+    ring="$conc_state/last-emit-stable-hash.ring"
+    lines=$(wc -l < "$ring" 2>/dev/null || echo 0)
+    uniq_hashes=$(awk -F'\t' '{print $2}' "$ring" 2>/dev/null | sort -u | wc -l)
+    malformed=$(awk -F'\t' '$1 !~ /^[0-9]+$/ || $2 == "" {c++} END{print c+0}' "$ring" 2>/dev/null)
+    orphans=$(find "$conc_state" -maxdepth 1 -name '*.tmp.*' 2>/dev/null | wc -l)
+    printf 'CONC\t%s\t%s\t%s\t%s\n' "$lines" "$uniq_hashes" "$malformed" "$orphans" \
+        > "$conc_state/result"
+) 2>/dev/null
+conc_result=$(cat "$conc_state/result" 2>/dev/null || printf 'CONC\t0\t0\t0\t0\n')
+IFS=$'\t' read -r _ c_lines c_uniq c_malformed c_orphans <<< "$conc_result"
+
+# Every one of the 8 concurrent records must be present. This is the assertion
+# that was red before the flock: lost updates show up here and nowhere else.
+assert_eq "concurrent recorders: all 8 hashes survive in the ring" "$c_uniq" "8"
+assert_eq "concurrent recorders: ring holds exactly ring_size entries" "$c_lines" "8"
+# A torn line is silently discarded by the reader, shortening the effective
+# dedup window without any error — assert none is ever written.
+assert_eq "concurrent recorders: no torn/malformed ring lines" "$c_malformed" "0"
+# The `$BASHPID`-in-a-pipeline trap leaves the tmp file behind and never
+# creates the ring. An orphan here is that failure mode's fingerprint.
+assert_eq "concurrent recorders: no orphaned .tmp. files left behind" "$c_orphans" "0"
+
+# The ring must exist AT ALL after a single call — the specific silent
+# regression a mechanical `$$`→`$BASHPID` substitution would have introduced
+# (redirect and `mv` expanding different pids across the pipeline boundary).
+solo_state="$WORK/solo"; mkdir -p "$solo_state"
+(
+    EMIT_DEDUP_HASH_FILE="$solo_state/last-emit-stable-hash"
+    EMIT_DEDUP_TS_FILE="$solo_state/last-emit-stable-ts"
+    EMIT_DEDUP_RING_FILE="$solo_state/last-emit-stable-hash.ring"
+    export EMIT_DEDUP_HASH_FILE EMIT_DEDUP_TS_FILE EMIT_DEDUP_RING_FILE
+    write_body_quiet_full_state "$solo_state/body" "2026-07-27T09:00:00-07:00" "solo"
+    _compose_emit_record_emit "$solo_state/body"
+) >/dev/null 2>&1
+if [[ -s "$solo_state/last-emit-stable-hash.ring" ]]; then
+    printf '  PASS: %s\n' "one record creates the ring (no pipeline-pid orphan)"; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: ring absent after a single record — the pipeline-pid regression\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
 # ---- summary ---------------------------------------------------------------
 echo
 if (( FAIL == 0 )); then

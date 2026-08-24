@@ -47,7 +47,7 @@ pane=$(cch_capture "$win")
 assert_contains "mock response rendered in pane" "$pane" "MOCK BUSY DONE"
 
 # 5. Mock actually served the turn (boot warm-up + this prompt).
-req_count=$(grep -c 'POST /v1/messages' "$CCH_LOG" 2>/dev/null || echo 0)
+req_count=$(grep -c 'POST /v1/messages' "$CCH_LOG" 2>/dev/null) || req_count=0
 if (( req_count >= 1 )); then
     echo "  PASS: mock served $req_count /v1/messages request(s)"
     PASS=$(( PASS + 1 ))

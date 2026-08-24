@@ -143,11 +143,31 @@ chmod +x "$HARNESS_BIN/gh"
 # $NEXUS_ROOT/monitor/pane-state.sh.
 # ---------------------------------------------------------------------------
 mkdir -p "$HARNESS_DIR/monitor/watcher"
-for f in main.sh _lib.sh _github.sh _deliveries.sh _mentions.sh \
-         _unstick.sh _idle_probe.sh _over_limit.sh; do
-    cp "$HARNESS_REPO_ROOT/monitor/watcher/$f" \
-       "$HARNESS_DIR/monitor/watcher/$f"
+# Mirror EVERY watcher module, not a hand-maintained subset
+# (your-org/nexus-code#568 A8). main.sh sources its helpers from
+# `$_script_dir/`, and the enumerated list had drifted far behind the module
+# set: of 28 `_*.sh` modules only 8 were copied, so the spawned watcher died
+# at startup on `_target_absent.sh: No such file or directory` and then on
+# `INTERVAL: unbound variable` (the missing `_config.sh` never ran its
+# lookups). The scenario then waited out its deadline against a watcher that
+# had never been alive, and reported a failure that had nothing to do with the
+# behaviour under test. A glob cannot drift: every future extraction is
+# mirrored automatically.
+cp "$HARNESS_REPO_ROOT/monitor/watcher/main.sh" "$HARNESS_DIR/monitor/watcher/main.sh"
+for f in "$HARNESS_REPO_ROOT"/monitor/watcher/_*.sh; do
+    cp "$f" "$HARNESS_DIR/monitor/watcher/$(basename "$f")"
 done
+# ...and the SIBLING helpers the watcher sources from `monitor/` one level up
+# (`_log-mode.sh`, `_tmux-window.sh`, `_cc-version.sh`, `_channel_lib.sh`,
+# `_fs_probe.sh`), plus `reports-roll.sh`. Missing `_log-mode.sh` in particular
+# is not silent-but-harmless: `source` of an absent file returns non-zero
+# WITHOUT aborting, so the watcher ran on with `_ensure_service_log: command
+# not found` spraying from every scheduler tick and every alert. Same glob
+# discipline as above -- enumerate by pattern, never by hand.
+for f in "$HARNESS_REPO_ROOT"/monitor/_*.sh; do
+    cp "$f" "$HARNESS_DIR/monitor/$(basename "$f")"
+done
+cp "$HARNESS_REPO_ROOT/monitor/reports-roll.sh" "$HARNESS_DIR/monitor/reports-roll.sh" 2>/dev/null || true
 cp "$HARNESS_REPO_ROOT/monitor/pane-state.sh" "$HARNESS_DIR/monitor/pane-state.sh"
 
 # ---------------------------------------------------------------------------
@@ -171,10 +191,7 @@ echo "=== spawn worker ==="
 win=$(harness_spawn_worker "$WORKER_NAME" \
     "STUB_CLAUDE_BUSY_SECONDS=3" \
     "STUB_CLAUDE_HOLD_SECONDS=60")
-[[ "$win" =~ ^[0-9]+$ ]] || {
-    echo "  FAIL: spawn returned non-numeric window index: $win" >&2
-    th_summary_and_exit
-}
+[[ "$win" =~ ^[0-9]+$ ]] || th_abort "spawn returned non-numeric window index: $win"
 echo "  worker at window=$win"
 
 # ---------------------------------------------------------------------------
@@ -249,8 +266,8 @@ emits_contain() {
 }
 
 worker_window_absent() {
-    ! "$HARNESS_TMUX" list-windows -t "$HARNESS_SESSION" \
-        -F '#{window_name}' 2>/dev/null | grep -qxF "$WORKER_NAME"
+    ! grep -qxF "$WORKER_NAME" <<<"$("$HARNESS_TMUX" list-windows -t "$HARNESS_SESSION" \
+        -F '#{window_name}' 2>/dev/null)"
 }
 
 # ---------------------------------------------------------------------------

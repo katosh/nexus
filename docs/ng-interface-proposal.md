@@ -200,8 +200,10 @@ No edits made here — this is the exact change-set a follow-up would touch:
 4. **`monitor/agent-prompt.md`** — references `mint-token.sh`,
    `paste-followup.sh`, `notify.sh`, `bootstrap-recover.sh`, `boot-recover.sh`
    by path; add `ng` aliases where a wrap exists.
-5. **Worker floor** (`## Worker floor` in `monitor/spawn-worker.sh`, injected
-   into every spawn prompt) — references `write-probe.sh`, `declare-wait.sh`,
+5. **Worker floor** (the `## Worker floor` section of
+   `skills/nexus.worker-defaults/SKILL.md`, which `spawn-worker.sh:497` READS
+   and injects verbatim into every spawn prompt — the text does not live in
+   `spawn-worker.sh`; <your-org>/nexus-code#568 C8) — references `write-probe.sh`, `declare-wait.sh`,
    `declare-no-wait.sh`. Surface the `ng` alias so spawned workers discover it.
 6. **Skill `SKILL.md` files** with bare-script paths:
    `nexus.window-cleanup` (`retire-preflight.sh`), `nexus.skeptic`

@@ -47,7 +47,14 @@ trap 'chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 _can_test_ro=1
 [[ "$(id -u)" == "0" ]] && _can_test_ro=0
 if (( ! _can_test_ro )); then
-    echo "SKIP: running as root — 0555 fixtures cannot model a read-only mount" >&2
+    # `th_skip`, not a bare echo (your-org/nexus-code#783). The hand-rolled form
+    # printed `SKIP:` but bumped NO counter, so this path reached
+    # `th_summary_and_exit` with PASS=FAIL=SKIP=0 and announced an unqualified
+    # `=== summary: 0 passed, 0 failed ===` / `ALL TESTS PASSED` at rc 0 — a
+    # clean sweep over a suite that asserted nothing. Same defect class as the
+    # uncounted FAIL aborts, one counter over.
+    th_skip "read-only-mount fixtures" \
+            "running as root — root ignores mode bits, so a 0555 dir is still writable and cannot model a read-only mount"
     th_summary_and_exit
 fi
 

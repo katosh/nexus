@@ -1,0 +1,77 @@
+# The SLOW band's tolerated-red set — ENUMERATED, so it is checkable.
+#
+# your-org/nexus-code#737: a band that is both non-blocking AND carries a
+# known-red set is the configuration in which a genuine new red is
+# indistinguishable from the accepted ones. #559 named the tolerated set but
+# never wrote it down, and a tolerated-red list that is cultural cannot be
+# checked. This file is that list as data; monitor/slow-band-drift.sh is what
+# checks it, in BOTH directions:
+#
+#   a red NOT listed here          -> NEW-RED, the job fails. This is the whole
+#                                     point: a new regression is loud again.
+#   a listed test that now PASSES  -> STALE-TOLERATION, the job fails. Without
+#                                     this direction the list only ever grows
+#                                     and becomes a permanent excuse; a red that
+#                                     was fixed must cost someone one deletion.
+#
+# THE SELF-CLEANING PROPERTY ABOVE IS INHERITED, NOT INTRINSIC. STALE-TOLERATION
+# only ever fires on a run that actually HAPPENS. It is the per-PR/per-push
+# triggers in .github/workflows/tests-slow-integration.yml that make those runs
+# happen; the checker cannot notice that nobody is calling it. Revert that band
+# to schedule-only, or narrow its `paths:` until it stops matching, and this file
+# rots exactly as a cultural tolerated set did — entries intact, checker still
+# correct, enforcement silently gone, nothing red to say so. lint-workflows.py's
+# SR001 guards the schedule-only half; nothing guards the `paths:` half. Read the
+# banner above that workflow's `on:` block before changing either.
+#   a listed test not in the ledger-> UNACCOUNTED, the job fails. A tolerated
+#                                     test that silently stopped being RUN is
+#                                     how the list rots into fiction.
+#
+# This file could not be written before 2026-08-06: #737 established that
+# tests-slow-integration.yml had never once executed (schedule-only, and the
+# file never reached the default branch, so GitHub 404s the workflow), so no
+# ledger existed to enumerate FROM. Pinning a tolerated set requires having
+# measured one — the first entry came from the first SLOW-band ledger ever
+# produced, run locally on 2026-08-06.
+#
+# Format: <test-path><TAB><issue-ref><TAB><one-line reason>
+# Adding a line REQUIRES an issue ref: an entry with nobody's name on it is how
+# a toleration outlives the reason for it.
+#
+# THE SET IS CURRENTLY EMPTY, AND THAT IS THE INTENDED RESTING STATE — not a
+# disabled check. An empty tolerated set means every SLOW scenario is expected
+# to PASS, so slow-band-drift.sh's NEW-RED arm covers the whole band with
+# nothing exempted. Do not read the absence of entries as "nothing is being
+# checked"; read it as "nothing is being excused".
+#
+# The one entry this file ever held, and why it is gone:
+#
+#   monitor/watcher/test-respawn-loop-integration.sh — tolerated
+#   2026-08-06 under your-org/nexus-code#738 for the product bug
+#   your-org/nexus-code#741 (`_target_window_present` decided presence by
+#   WINDOW NAME ALONE, so a `remain-on-exit` corpse read as PRESENT and the
+#   absent branch never fired a second time: 1 respawn, 1 stub crash, guard
+#   needs 3). #741 is FIXED — the probe now reads `#{pane_dead}`, and
+#   `_respawn_verify_target_absent` no longer mistakes a corpse for an
+#   unclassifiable occupant — so the toleration became exactly the
+#   STALE-TOLERATION this file's second direction exists to reject, and it
+#   cost the deletion it was designed to cost.
+#
+#   The entry recorded one deliberately OPEN question: why the test ever
+#   passed LOCALLY, with a prior race hypothesis marked refuted. That question
+#   is now CLOSED, measured rather than argued. The corpse forms if and only if
+#   `remain-on-exit` is in effect at the instant the spawned child exits, and
+#   `_respawn_spawn_window` sets the option AFTER `new-window`. Four arms, 12
+#   trials each, deterministic in every arm: fast pane + instant-exit child ->
+#   VANISHED 12/12; the same with the option preset -> corpse 12/12; the same
+#   with a child that sleeps 1s -> corpse 12/12; a slow pane (login-shell rc
+#   chain) + instant-exit child -> corpse 12/12. The earlier refutation ran its
+#   control only in the arm where the option always wins, which is why it
+#   measured 12/12 PERSISTED and concluded there was no race. The historical
+#   green was then reproduced directly: re-creating the pre-#737 fixture drift
+#   (dropping the `monitor/_*.sh` copy line) makes the spawned launcher die
+#   instantly, it loses the race, no corpse forms, and the crash-loop guard
+#   TRIPS — the test passed while never once running the stub, which is the
+#   very thing its crash-log assertion was later added to catch. In production
+#   the margin is not close: the launcher execs claude, which outlives
+#   `set-window-option` by orders of magnitude, so the corpse always forms.

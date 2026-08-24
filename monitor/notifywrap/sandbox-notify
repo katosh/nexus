@@ -1,113 +1,555 @@
 #!/usr/bin/env bash
-# monitor/notifywrap/sandbox-notify — PATH-FRONT engagement gate for the
-# terminal bell (your-org/nexus-code).
+# monitor/notifywrap/sandbox-notify — PATH-FRONT SEVERITY + COOLDOWN + BATCH
+# gate for the terminal bell (your-org/nexus-code).
 #
-# THE PROBLEM. agent-sandbox ships a global Claude Code `Notification` hook
-# (agents/claude/settings.json: `sandbox-notify 'Needs attention'`). The claude
-# overlay MERGES that hook into every sandbox session's read-only config-dir
-# settings, so EVERY agent — the orchestrator AND every spawned background
-# worker/skeptic — fires `sandbox-notify 'Needs attention'` on EVERY
-# `Notification` event (idle_prompt "Claude is waiting for your input", and
-# permission_prompt). With many parallel background workers each ringing on
-# every turn-end-and-idle, that is a flood: ~99% of bells in the live data are
-# routine background-worker idle prompts the operator does not act on (the
-# watcher already surfaces parked / idle-without-wrap workers). Worse, each ring
-# from a hook subprocess (no controlling tty) makes `sandbox-notify` fall to its
-# Try-2 path — `tmux new-window -d -n '•bell'` — so every bell spawns a
-# transient `•bell` window that pollutes the watcher's workspace snapshot.
+# ─── WHY THIS EXISTS (and why v1/v2 did not fully hold) ──────────────────────
 #
-# THE GATE. The agent-sandbox hook lives in the read-only merged config-dir
-# settings, so the nexus cannot edit it. Instead we SHADOW `sandbox-notify` with
-# a PATH-front wrapper (the ghwrap precedent: a real executable first on PATH, so
-# it is inherited by every child an agent spawns — bash subshells, hook
-# subprocesses, `python subprocess`). The wrapper rings only for events that
-# warrant operator attention:
+# agent-sandbox ships a global Claude Code `Notification` hook
+# (agents/claude/settings.json: `sandbox-notify 'Needs attention'`) merged into
+# every session's read-only config. The nexus cannot edit the hook, so it
+# SHADOWS `sandbox-notify` with this PATH-front wrapper (the ghwrap precedent).
 #
-#   * ORCHESTRATOR (user-engaged) — NEXUS_WORKER_WINDOW is UNSET. Pass every
-#     call through: its idle/permission bells are exactly the "operator needs to
-#     act" signal.
-#   * BACKGROUND worker/skeptic — NEXUS_WORKER_WINDOW is SET (spawn-worker.sh
-#     exports it). Suppress ONLY the agent-sandbox hook default ("Needs
-#     attention"); pass EXPLICIT worker calls (blocker / ready / done — the
-#     worker floor's escalation contract) through, since those are intentional
-#     and a task-done bell is on the operator's bar.
+#   v1 (PR #373) gated on IDENTITY (suppress iff worker + exact "Needs
+#     attention"). Left the CLASS open — a test suite driving the real
+#     cc-auto-update alert paths rang ~3.4 real bells/second.
+#   v2 (this PR, round 1) added SEVERITY CLASS + a per-class COOLDOWN + a
+#     hard-off for test harnesses + a decision log.
+#   v2 round 1.5 added a one-shot `failure` class after the skeptic showed the
+#     class-keyed cooldown could MASK a one-shot terminal failure behind routine
+#     same-class chatter (the masked bell was LOST, since those callers `exit`).
 #
-# So a busy background worker's routine turn-end no longer bells (no `•bell`
-# window), while orchestrator-idle, orchestrator-permission, explicit
-# worker done/ready/blocker, and the watcher/cc-restart alert bells all survive.
+# ─── ROUND 2 — AGGREGATE + BATCH ON RELEASE (this file) ──────────────────────
 #
-# DISCRIMINATOR ROBUSTNESS. The suppressed message is the agent-sandbox hook's
-# fixed text. If a future agent-sandbox bumps that string this gate fails OPEN
-# (bells return — noisy, not broken); the watcher's `^•`-row drop on the
-# snapshot/standing-bells paths is the belt-and-suspenders that keeps the snapshot
-# clean regardless. Override the matched text with NEXUS_NOTIFY_SUPPRESS_MSG if
-# the upstream default changes. The genuinely-upstream fix (a SANDBOX_NOTIFY_QUIET
-# env honoured by sandbox-notify itself, and a less-intrusive Try-2 ring) is a
-# proposal to operator/agent_sandbox — see the bells report.
+# The operator's spec: "aggregate messages between cooldowns, and batch them on
+# release … reconsider which notify sites are truly helpful … a cascade of
+# bells runs for one event — trace it and collapse." Three mechanisms:
 #
-# RECURSION-SAFE. This wrapper is first on PATH, so resolving `sandbox-notify`
-# by name would re-invoke US. We resolve the REAL sandbox-notify (first on PATH
-# that is not this wrapper, by realpath) and exec its ABSOLUTE path.
+#   (A) BATCH ON RELEASE. A message suppressed by a cooldown is NOT dropped — it
+#       is CAPTURED into a per-class batch (identical strings deduped with a
+#       count). When a real bell next rings it DRAINS all pending batches into
+#       its message ("… — [batched: 3× X; 1× Y]"); and independently the watcher
+#       tick FLUSHES batches whose class cooldown expired, as a standalone digest
+#       bell. So nothing vanishes — the once-masked one-shot `install FAILED`
+#       surfaces in a digest instead of being lost. The flush does NOT depend on
+#       the notifying process (those `exit` immediately) — it is owned by the
+#       already-supervised, self-healing watcher (60 s tick) with an
+#       opportunistic drain-on-any-bell for timeliness.
+#
+#   (B) NOTIFY-SITE AUDIT → a digest-only `routine` class. Routine progress /
+#       success pings the watcher already surfaces (reconciling, restart handed
+#       off, clone-behind, DEFERRED, self-restart verified, fresh-spawn fired)
+#       never fire their OWN bell — they go straight to the batch and surface
+#       only in the release digest. Visible, never a flood, never lost.
+#
+#   (C) CASCADE DE-DUP via an INCIDENT WINDOW. One logical incident fans out
+#       across recovery layers (apply.sh "restart aborted / version-split" →
+#       cc-restart-watchdog "self-restart FAILED" → main.sh "functional check
+#       stale" → revive-watcher "watcher down") — up to 4 bells for one event
+#       (fan-out, not recursion: the bell is a terminal/tmux emission, never a
+#       Claude Notification event). When a critical/failure bell rings it opens
+#       an incident window (default 6 s); further bells of ANY class within it
+#       are COALESCED into the batch instead of ringing, so the cascade collapses
+#       to ONE bell + a digest naming the rest. A genuinely SECOND distinct event
+#       after the window rings on its own, and any coalesced message is delivered
+#       in the digest (never swallowed). Set NEXUS_NOTIFY_INCIDENT_WINDOW=0 to
+#       disable (per-class independence, e.g. in unit tests).
+#
+# ─── FAIL-SAFE DIRECTION (deliberate, per class) ─────────────────────────────
+#
+# The inverted risk is a bell (or now, a BATCH) the operator NEEDED that never
+# arrives. So the infrastructure defaults RING / DELIVER:
+#   * UNRECOGNISED message → rings (rate-limited). Fail-OPEN, bounded.
+#   * unwritable state dir / unacquirable lock → RING. A wedged cooldown must
+#     never deafen the workspace.
+#   * one-shot terminal failures are their own short-cooldown `failure` class
+#     AND captured to the batch — delivered two independent ways, never lost.
+# The ONE deliberate fail-CLOSED case is the agent-sandbox default ("Needs
+# attention"): suppressed for every agent (both orchestrator and workers run
+# `--dangerously-skip-permissions`; 15/4008 events over 71 d were permission).
+# The residual permission case is re-emitted classified by notify-permission.sh.
+#
+# ─── OVERRIDES ───────────────────────────────────────────────────────────────
+#
+#   NEXUS_NOTIFY_QUIET=1            hard off — suppress everything (test harness)
+#   NEXUS_NOTIFY_FORCE=1            hard on  — bypass class/cooldown/incident
+#   NEXUS_NOTIFY_FLUSH=1           flush mode — sweep+emit due batch digests, exit
+#   NEXUS_NOTIFY_ANCESTRY_SCAN=0    disable the test-harness ancestry probe
+#   NEXUS_NOTIFY_STATE_DIR=DIR      relocate cooldown/batch/decision state
+#   NEXUS_NOTIFY_INCIDENT_WINDOW=N  cascade-coalesce window seconds (0 = off)
+#   NEXUS_NOTIFY_CD_CRITICAL|CD_FAILURE|CD_PERMISSION|CD_TASK|CD_INFRA|CD_ROUTINE=N
+#                                  per-class cooldown / digest-cadence seconds
+#   NEXUS_NOTIFY_SUPPRESS_MSG      agent-sandbox default text to fail-closed on
+#
+# ─── OBSERVABILITY ───────────────────────────────────────────────────────────
+#
+# EVERY decision — ring / suppress-* / batch / digest — is appended to
+# $STATE_DIR/notify-decisions.jsonl (bounded, self-rotating).
+#
+# RECURSION-SAFE. This wrapper is first on PATH; we resolve the REAL
+# sandbox-notify (first on PATH that is not this wrapper, by realpath) and hand
+# off to its ABSOLUTE path.
 
 set -u
 
-# --- The agent-sandbox hook default we gate on (overridable) -----------------
-_nw_suppress_msg="${NEXUS_NOTIFY_SUPPRESS_MSG:-Needs attention}"
+_nw_msg="$*"
+_nw_state_dir="${NEXUS_NOTIFY_STATE_DIR:-${NEXUS_ROOT:-}/monitor/.state}"
+_nw_decisions="$_nw_state_dir/notify-decisions.jsonl"
+_nw_cd_dir="$_nw_state_dir/notify-cooldown"
+_nw_incident_window="${NEXUS_NOTIFY_INCIDENT_WINDOW:-6}"
 
-# --- (1) Background-worker routine-idle suppression --------------------------
-# NEXUS_WORKER_WINDOW set ⟺ spawned background worker/skeptic (spawn-worker.sh).
-# Suppress ONLY the agent-sandbox hook default; let explicit messages through.
-if [ -n "${NEXUS_WORKER_WINDOW:-}" ] && [ "$*" = "$_nw_suppress_msg" ]; then
-    exit 0
-fi
+# --- mtime helper (GNU stat, BSD stat, else 0) -------------------------------
+_nw_mtime() {
+    stat -c %Y "$1" 2>/dev/null && return 0
+    stat -f %m "$1" 2>/dev/null && return 0
+    echo 0
+}
 
-# --- (2) Locate this wrapper's own directory (to exclude when resolving) -----
-_nw_arg0="$0"
-case "$_nw_arg0" in
-    */*) _nw_dir=$(CDPATH= cd "$(dirname "$_nw_arg0")" 2>/dev/null && pwd || true) ;;
-    *)
-        _nw_cv=$(command -v "$_nw_arg0" 2>/dev/null || true)
-        case "$_nw_cv" in
-            */*) _nw_dir=$(CDPATH= cd "$(dirname "$_nw_cv")" 2>/dev/null && pwd || true) ;;
-            *)   _nw_dir="" ;;
-        esac
-        ;;
-esac
+# --- Per-class interval (cooldown / digest cadence) — used by flush + decide --
+_nw_batch_interval() {
+    case "$1" in
+        critical)   echo "${NEXUS_NOTIFY_CD_CRITICAL:-60}" ;;
+        failure)    echo "${NEXUS_NOTIFY_CD_FAILURE:-120}" ;;
+        permission) echo "${NEXUS_NOTIFY_CD_PERMISSION:-600}" ;;
+        task)       echo "${NEXUS_NOTIFY_CD_TASK:-300}" ;;
+        infra)      echo "${NEXUS_NOTIFY_CD_INFRA:-1800}" ;;
+        routine)    echo "${NEXUS_NOTIFY_CD_ROUTINE:-1800}" ;;
+        *)          echo 300 ;;
+    esac
+}
 
+# --- Decision record. Best-effort: observability must never break a bell. ----
+_nw_record() {
+    [ -n "${NEXUS_ROOT:-}${NEXUS_NOTIFY_STATE_DIR:-}" ] || return 0
+    mkdir -p "$_nw_state_dir" 2>/dev/null || return 0
+    if [ -f "$_nw_decisions" ]; then
+        _nw_lines=$(wc -l < "$_nw_decisions" 2>/dev/null || echo 0)
+        if [ "${_nw_lines:-0}" -gt 5000 ] 2>/dev/null; then
+            tail -n 2500 "$_nw_decisions" > "$_nw_decisions.rot" 2>/dev/null \
+                && mv -f "$_nw_decisions.rot" "$_nw_decisions" 2>/dev/null
+        fi
+    fi
+    _nw_esc=$(printf '%s' "${3:-$_nw_msg}" | cut -c1-200 \
+        | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037')
+    printf '{"ts":%s,"class":"%s","verdict":"%s","window":"%s","msg":"%s"}\n' \
+        "$(date +%s)" "$1" "$2" \
+        "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:--}}" \
+        "$_nw_esc" >> "$_nw_decisions" 2>/dev/null || true
+}
+
+# --- Generic lock (atomic mkdir + stale reclaim). Returns 0 always usable: ----
+# on failure to lock we proceed unlocked rather than deafen (fail-open).
+_nw_lock() {   # $1 = lock path
+    _nwl_now=$(date +%s); _nwl_try=0
+    while [ "$_nwl_try" -lt 20 ]; do
+        if mkdir "$1" 2>/dev/null; then return 0; fi
+        _nwl_mt=$(_nw_mtime "$1")
+        if [ "${_nwl_mt:-0}" -gt 0 ] 2>/dev/null \
+           && [ $((_nwl_now - _nwl_mt)) -gt 10 ]; then
+            rmdir "$1" 2>/dev/null || rm -rf "$1" 2>/dev/null
+            continue
+        fi
+        sleep 0.05; _nwl_try=$((_nwl_try + 1))
+    done
+    return 1
+}
+_nw_unlock() { rmdir "$1" 2>/dev/null || true; }
+
+# --- Batch store: APPEND-ONLY lines "<count>\t<message>" ---------------------
+# Capture a suppressed/coalesced message so it is NEVER lost — the load-bearing
+# invariant (skeptic round 2). Concurrency design:
+#   * ADD is append-only. No read-rewrite-mv (which would clobber a concurrent
+#     writer). Under the batch lock we append to <class>.batch (the lock
+#     serialises appends — needed for NFS, where O_APPEND is not atomic). If the
+#     lock cannot be acquired (≥dozens of simultaneous distinct suppressed
+#     events exhausting the retry budget), we FAIL OPEN toward delivery: append
+#     to a UNIQUE per-writer overflow file <class>.batch.of.<pid> that no other
+#     writer and no `mv` can clobber. Every lock failure fails toward delivery,
+#     never toward silence — the same direction as _nw_decide.
+#   * DEDUP happens at DRAIN, not add — so add never rewrites the file.
+#   * DRAIN atomically claims the current content (rename the main file, sweep
+#     the overflow files) so a concurrent append is deferred to the next drain,
+#     never lost.
+_nw_batch_add() {   # $1 = class, $2 = message
+    [ -n "${NEXUS_ROOT:-}${NEXUS_NOTIFY_STATE_DIR:-}" ] || return 0
+    mkdir -p "$_nw_cd_dir" 2>/dev/null || return 0
+    _nwb_file="$_nw_cd_dir/$1.batch"
+    _nwb_lock="$_nw_cd_dir/.lock.batch.$1"
+    _nwb_msg=$(printf '%s' "$2" | tr '\t\n' '  ' | cut -c1-200)
+    # Best-effort growth bound (racy, deliberately loose): drop only when the
+    # spool is already absurdly large — a flood we have clearly captured enough
+    # of. Never applies in the realistic envelope (failures are rare).
+    # `<class>.batch` does not exist until the FIRST notification of that
+    # class, and `wc -l < missing` fails at the REDIRECTION. A redirection
+    # failure is reported by the SHELL, not by the command — so the
+    # `2>/dev/null` here, which redirects `wc`'s stderr, could never suppress
+    # it, and every class emitted one spurious
+    #   sandbox-notify: line NNN: …/<class>.batch: No such file or directory
+    # on its first use. The append below then created the file, so the
+    # notification WAS delivered — but two agents independently read that line
+    # as "the alert path is dead" and investigated. Issue #723.
+    #
+    # Guard on existence rather than on `wc`'s stderr: same `[ -f ]` shape
+    # `_nw_record` already uses for its own spool, and it opens nothing that
+    # is not there. A missing spool means zero lines, which is never `-ge 500`.
+    if [ -f "$_nwb_file" ] \
+       && [ "$(wc -l < "$_nwb_file" 2>/dev/null)" -ge 500 ] 2>/dev/null; then
+        return 0
+    fi
+    if _nw_lock "$_nwb_lock"; then
+        printf '1\t%s\n' "$_nwb_msg" >> "$_nwb_file" 2>/dev/null || true
+        _nw_unlock "$_nwb_lock"
+    else
+        printf '1\t%s\n' "$_nwb_msg" >> "$_nwb_file.of.$$" 2>/dev/null || true
+    fi
+}
+
+# Aggregate a class's spool (main + overflow) as "3× A; 1× B (+N deferred)",
+# summing counts per distinct message and preserving first-seen order, then
+# CLEAR it. Atomic claim: rename the main file and sweep the overflow files
+# under the lock so a concurrent append lands in a fresh spool (deferred, never
+# lost).
+#
+# RENDER CAP vs THE NEVER-LOST INVARIANT (your-org/nexus-code#572). One bell
+# cannot carry an unbounded message, so only the first 6 distinct messages are
+# rendered. The cap used to *drop* the remainder — it counted them as "(+N
+# more)" and then deleted the claim file, so N distinct failure IDENTITIES were
+# destroyed: absent from the bell (only a tally survived) and absent from disk.
+# That is silent loss in the one path where silence is most expensive, and it
+# needs no concurrency at all — 20 pending + one ring loses 14.
+# The cap is now a DEFERRAL, not a drop: whatever does not fit is written back
+# to a unique per-writer overflow file, which the NEXT drain or flush digest
+# picks up. Bounded message, zero loss. The write-back goes to
+# "<class>.batch.of.carry.<pid>" via an atomic rename, so it cannot clobber a
+# concurrent writer and cannot be half-swept by a concurrent drain — the same
+# fail-open overflow mechanism _nw_batch_add already relies on. It lands AFTER
+# this call's own sweep, so it is deferred to the next drain rather than being
+# re-consumed (and re-deferred) in an unterminating loop here.
+_nw_batch_drain() {   # $1 = class
+    _nwd_file="$_nw_cd_dir/$1.batch"
+    _nwd_lock="$_nw_cd_dir/.lock.batch.$1"
+    # Quick check: anything to do at all?
+    set -- "$_nwd_file" "$_nwd_file".of.*
+    _nwd_any=0
+    for _nwd_f in "$@"; do [ -s "$_nwd_f" ] && { _nwd_any=1; break; }; done
+    [ "$_nwd_any" = 1 ] || return 0
+    _nw_lock "$_nwd_lock" || return 0
+    _nwd_claim="$_nwd_file.draining.$$"
+    : > "$_nwd_claim"
+    # DRAIN ORDER = AGE ORDER (your-org/nexus-code#572 follow-up). The render
+    # cap keeps only the first 6 distinct messages of the claim; the rest is
+    # re-deferred. So the claim must present the OLDEST pending messages first,
+    # or the cap starves them. The carry files (".of.carry.*", written by a
+    # PRIOR drain's write-back below) hold exactly those oldest, re-deferred
+    # messages — cat them FIRST. Then this interval's fresh arrivals: the main
+    # spool, then the non-carry per-writer overflow. Draining main-first (the
+    # original order) let a sustained ≥6-new-per-drain regime seize every slot
+    # and re-defer the carried oldest forever; carry-first bounds a deferred
+    # message's wait to ceil(backlog/6) drains. This only reorders the claim —
+    # everything still gets claimed and removed under the lock, so no message is
+    # lost (T26/T27) and nothing loops (the new carry lands after this sweep).
+    for _nwd_f in "$_nwd_file".of.carry.*; do
+        [ -s "$_nwd_f" ] || continue
+        cat "$_nwd_f" >> "$_nwd_claim" 2>/dev/null
+        rm -f "$_nwd_f" 2>/dev/null || true
+    done
+    [ -s "$_nwd_file" ] && cat "$_nwd_file" >> "$_nwd_claim" 2>/dev/null
+    rm -f "$_nwd_file" 2>/dev/null || true
+    for _nwd_f in "$_nwd_file".of.*; do
+        [ -s "$_nwd_f" ] || continue
+        case "$_nwd_f" in *.of.carry.*) continue ;; esac   # already drained above
+        cat "$_nwd_f" >> "$_nwd_claim" 2>/dev/null
+        rm -f "$_nwd_f" 2>/dev/null || true
+    done
+    _nw_unlock "$_nwd_lock"
+    [ -s "$_nwd_claim" ] || { rm -f "$_nwd_claim" 2>/dev/null; return 0; }
+    # The carry file must NOT match the "<file>.of.*" sweep glob while it is
+    # being written — it is moved into place atomically below.
+    _nwd_carry="$_nwd_claim.carry"
+    rm -f "$_nwd_carry" 2>/dev/null || true
+    _nwd_out=$(awk -F'\t' -v carry="$_nwd_carry" '
+        { cnt[$2]+=($1==""?1:$1); if(!seen[$2]++){order[++n]=$2} }
+        END{ shown=0; extra=0; out="";
+             for(i=1;i<=n;i++){ m=order[i];
+                 if(shown<6){ if(out!="")out=out"; "; out=out cnt[m]"× "m; shown++ }
+                 else { printf("%d\t%s\n", cnt[m], m) >> carry; extra++ } }
+             if(extra>0) out=out" (+"extra" deferred)";
+             printf "%s", out }' "$_nwd_claim" 2>/dev/null)
+    rm -f "$_nwd_claim" 2>/dev/null || true
+    # Write back the un-rendered remainder so the next drain/digest surfaces it.
+    if [ -s "$_nwd_carry" ]; then
+        # Same pid draining the same class twice must ACCUMULATE, not clobber.
+        _nwd_dest="$_nwd_file.of.carry.$$"
+        if [ -e "$_nwd_dest" ]; then
+            cat "$_nwd_carry" >> "$_nwd_dest" 2>/dev/null || true
+            rm -f "$_nwd_carry" 2>/dev/null || true
+        else
+            mv -f "$_nwd_carry" "$_nwd_dest" 2>/dev/null \
+                || rm -f "$_nwd_carry" 2>/dev/null || true
+        fi
+    else
+        rm -f "$_nwd_carry" 2>/dev/null || true
+    fi
+    printf '%s' "$_nwd_out"
+}
+
+# --- Resolve the REAL sandbox-notify (first on PATH that is not this wrapper) --
+_nw_resolve_real() {
+    _nwr_arg0="$0"
+    case "$_nwr_arg0" in
+        */*) _nwr_dir=$(CDPATH= cd "$(dirname "$_nwr_arg0")" 2>/dev/null && pwd || true) ;;
+        *)
+            _nwr_cv=$(command -v "$_nwr_arg0" 2>/dev/null || true)
+            case "$_nwr_cv" in
+                */*) _nwr_dir=$(CDPATH= cd "$(dirname "$_nwr_cv")" 2>/dev/null && pwd || true) ;;
+                *)   _nwr_dir="" ;;
+            esac ;;
+    esac
+    _nwr_self=""
+    [ -n "$_nwr_dir" ] && _nwr_self=$(_nw_rp "$_nwr_dir/sandbox-notify" 2>/dev/null || true)
+    _nw_real=""
+    _nwr_oifs=$IFS; IFS=:
+    for _nwr_p in $PATH; do
+        [ -n "$_nwr_p" ] || continue
+        _nwr_cand="$_nwr_p/sandbox-notify"
+        [ -x "$_nwr_cand" ] || continue
+        [ -n "$_nwr_dir" ] && [ "$_nwr_p" = "$_nwr_dir" ] && continue
+        if [ -n "$_nwr_self" ]; then
+            _nwr_crp=$(_nw_rp "$_nwr_cand" 2>/dev/null || true)
+            [ "$_nwr_crp" = "$_nwr_self" ] && continue
+        fi
+        _nw_real="$_nwr_cand"; break
+    done
+    IFS=$_nwr_oifs
+}
 _nw_rp() {
     if readlink -f / >/dev/null 2>&1; then
         readlink -f "$1" 2>/dev/null && return 0
     fi
-    _nw_rp_d=$(CDPATH= cd "$(dirname "$1")" 2>/dev/null && pwd) || return 1
-    printf '%s/%s\n' "$_nw_rp_d" "$(basename "$1")"
+    _nwrp_d=$(CDPATH= cd "$(dirname "$1")" 2>/dev/null && pwd) || return 1
+    printf '%s/%s\n' "$_nwrp_d" "$(basename "$1")"
 }
 
-_nw_self_rp=""
-[ -n "$_nw_dir" ] && _nw_self_rp=$(_nw_rp "$_nw_dir/sandbox-notify" 2>/dev/null || true)
+# Emit ONE real bell (best-effort). Used by flush digests; the primary ring path
+# exec's instead (below) so the hook subprocess is replaced, not forked.
+_nw_emit() {   # $1 = message
+    [ -n "${_nw_real:-}" ] || _nw_resolve_real
+    [ -n "${_nw_real:-}" ] || return 0
+    "$_nw_real" "$1" >/dev/null 2>&1 || true
+}
 
-# --- (3) Resolve the REAL sandbox-notify: first on PATH that is not US --------
-_nw_real=""
-_nw_oldifs=$IFS
-IFS=:
-for _nw_p in $PATH; do
-    [ -n "$_nw_p" ] || continue
-    _nw_cand="$_nw_p/sandbox-notify"
-    [ -x "$_nw_cand" ] || continue
-    if [ -n "$_nw_dir" ] && [ "$_nw_p" = "$_nw_dir" ]; then continue; fi
-    if [ -n "$_nw_self_rp" ]; then
-        _nw_cand_rp=$(_nw_rp "$_nw_cand" 2>/dev/null || true)
-        [ "$_nw_cand_rp" = "$_nw_self_rp" ] && continue
-    fi
-    _nw_real="$_nw_cand"
-    break
-done
-IFS=$_nw_oldifs
-
-# --- (4) Pass through (or fail silent) ---------------------------------------
-# sandbox-notify is best-effort by design (its own no-path branch exits 0). If
-# the real one is unresolvable, do the same — a missed bell is non-fatal and a
-# hook must never spew. Otherwise hand off with an absolute path (no recursion).
-if [ -z "$_nw_real" ]; then
+# ─── FLUSH MODE ──────────────────────────────────────────────────────────────
+# NEXUS_NOTIFY_FLUSH=1: for each class whose window has elapsed and which has
+# pending content (main OR overflow spool), emit one standalone digest bell and
+# clear it (stamping the class so digests are themselves rate-limited).
+# Idempotent and lock-safe, so a died flush is simply retried next tick — it
+# cannot wedge. Iterate the FIXED class list (not a *.batch glob) so a class
+# that has only overflow files — the fail-open path, with no main .batch — is
+# still flushed. The watcher calls this each tick.
+if [ "${NEXUS_NOTIFY_FLUSH:-0}" = "1" ]; then
+    [ -d "$_nw_cd_dir" ] || exit 0
+    _nw_now=$(date +%s)
+    for _nwf_class in critical failure permission infra task routine; do
+        # Anything pending for this class (main or overflow)?
+        _nwf_any=0
+        for _nwf_f in "$_nw_cd_dir/$_nwf_class.batch" "$_nw_cd_dir/$_nwf_class.batch".of.*; do
+            [ -s "$_nwf_f" ] && { _nwf_any=1; break; }
+        done
+        [ "$_nwf_any" = 1 ] || continue
+        _nwf_stamp="$_nw_cd_dir/$_nwf_class"
+        _nwf_iv=$(_nw_batch_interval "$_nwf_class")
+        _nwf_last=$(_nw_mtime "$_nwf_stamp")
+        # Flush when the class window has elapsed since its last emission (or it
+        # never emitted). Routine (digest-only) uses the same cadence.
+        if [ "${_nwf_last:-0}" -le 0 ] 2>/dev/null \
+           || [ $((_nw_now - _nwf_last)) -ge "$_nwf_iv" ]; then
+            _nwf_sum=$(_nw_batch_drain "$_nwf_class")
+            if [ -n "$_nwf_sum" ]; then
+                : > "$_nwf_stamp" 2>/dev/null || true
+                _nw_emit "batched ($_nwf_class): $_nwf_sum"
+                _nw_record "$_nwf_class" "digest" "batched ($_nwf_class): $_nwf_sum"
+            fi
+        fi
+    done
     exit 0
 fi
-exec "$_nw_real" "$@"
+
+# --- (0) Hard off ------------------------------------------------------------
+if [ "${NEXUS_NOTIFY_QUIET:-0}" = "1" ]; then
+    _nw_record "quiet" "suppress-quiet"
+    exit 0
+fi
+
+# --- (1) Test-harness detection ----------------------------------------------
+# A test suite must never ring a real bell. Primary mechanism is
+# NEXUS_NOTIFY_QUIET=1 (run-tests.sh + the bell-touching tests). This ancestry
+# probe is defence in depth for a test invoked DIRECTLY. CAREFUL: inspect only
+# the first 3 argv tokens of each ancestor and STOP at the claude frame — a
+# Claude Code process carries its whole prompt in argv, so a worker whose prompt
+# merely names a test file must not go deaf.
+_nw_under_test() {
+    [ "${NEXUS_NOTIFY_ANCESTRY_SCAN:-1}" = "1" ] || return 1
+    [ -r /proc/self/stat ] || return 1
+    _nw_p=$$; _nw_d=0
+    while [ "$_nw_d" -lt 12 ] && [ -n "$_nw_p" ] && [ "$_nw_p" != "0" ] \
+          && [ "$_nw_p" != "1" ]; do
+        _nw_cl=$(tr '\0' ' ' < "/proc/$_nw_p/cmdline" 2>/dev/null \
+                 | cut -d' ' -f1-3) || break
+        case "$_nw_cl" in
+            */claude|*/claude\ *|*node_modules/.bin/claude*) return 1 ;;
+        esac
+        case "$_nw_cl" in
+            *run-tests.sh*|*test-*.sh*) return 0 ;;
+        esac
+        _nw_p=$(sed -e 's/^[0-9]* (.*) //' "/proc/$_nw_p/stat" 2>/dev/null \
+                | awk '{print $2}') || break
+        _nw_d=$((_nw_d + 1))
+    done
+    return 1
+}
+
+if [ "${NEXUS_NOTIFY_FORCE:-0}" != "1" ] && _nw_under_test; then
+    _nw_record "test" "suppress-test-harness"
+    exit 0
+fi
+
+# --- (2) Severity classification ---------------------------------------------
+# Emits "<class> <interval>". Special interval "never" = class-suppress (no bell,
+# no batch). Class "routine" = digest-only (never its own bell; batched; surfaced
+# only by the release digest). Order matters: most specific first.
+_nw_suppress_msg="${NEXUS_NOTIFY_SUPPRESS_MSG:-Needs attention}"
+
+_nw_classify() {
+    case "$_nw_msg" in
+        "$_nw_suppress_msg")
+            echo "agent-default never" ;;
+
+        # Genuinely BLOCKED awaiting operator approval (from notify-permission.sh).
+        "permission needed"*)
+            echo "permission $(_nw_batch_interval permission)" ;;
+
+        # Genuine emergencies. Matched before routine/failure/infra.
+        CRITICAL:*|"watcher ALERT:"*|revive-watcher*)
+            echo "critical $(_nw_batch_interval critical)" ;;
+        "cc-update self-restart FAILED:"*)
+            echo "critical $(_nw_batch_interval critical)" ;;
+        *crash-loop*|*slow-grind*|*"pausing respawns"*)
+            echo "critical $(_nw_batch_interval critical)" ;;
+
+        # ── AUDIT DEMOTIONS → digest-only `routine` ──────────────────────────
+        # Routine progress / success pings the watcher already surfaces. They
+        # never fire their OWN bell; they are captured and surface only in the
+        # release digest. Matched BEFORE `failure` so a "handed off … version-
+        # split until it restarts" progress note is NOT mistaken for a terminal
+        # version-split failure. Each is a keep→demote call from the notify-site
+        # audit (see the PR); the genuinely terminal outcomes fall through to
+        # `failure` below.
+        *"handed off"*|*reconciling*|*"commits behind"*|*DEFERRED*|*"self-restart verified"*|*"fresh-spawn fired"*|*"will retry"*)
+            echo "routine $(_nw_batch_interval routine)" ;;
+
+        # ── ONE-SHOT, operator-actionable FAILURES (round 1.5) ───────────────
+        # Their own short-cooldown tier so routine chatter can never mask them,
+        # and — round 2 — they are ALSO captured to the batch, so even a burst
+        # collapsed within the window is delivered in the digest, never lost.
+        # …and a "restart aborted" that reached here is terminal: the routine
+        # matcher above already claimed the non-terminal "… will retry" form, so
+        # what remains (watchdog template missing / spawn failed / never armed —
+        # skeptic round-2 judgment call) is a real abort, not progress.
+        *FAILED*|*"version-split"*|*VIOLATED*|*"rolled back"*|*"manual:"*|*"needs attention"*|*"restart aborted"*|*BLOCKED*|*blocker*)
+            echo "failure $(_nw_batch_interval failure)" ;;
+
+        # Remaining routine infrastructure chatter (first rings, rest batch).
+        "cc-auto-update:"*|"cc-update self-restart"*|"watcher:"*)
+            echo "infra $(_nw_batch_interval infra)" ;;
+
+        # Explicit agent escalation (worker floor: ready / done) + unknown.
+        *)
+            echo "task $(_nw_batch_interval task)" ;;
+    esac
+}
+
+read -r _nw_class _nw_interval <<EOF
+$(_nw_classify)
+EOF
+
+# agent-default: never rings, never batched — pure idle noise.
+if [ "${NEXUS_NOTIFY_FORCE:-0}" != "1" ] && [ "$_nw_interval" = "never" ]; then
+    _nw_record "$_nw_class" "suppress-class"
+    exit 0
+fi
+
+# routine: digest-only — capture and surface via the flush digest, never a bell.
+if [ "${NEXUS_NOTIFY_FORCE:-0}" != "1" ] && [ "$_nw_class" = "routine" ]; then
+    _nw_batch_add "$_nw_class" "$_nw_msg"
+    _nw_record "$_nw_class" "batch-routine"
+    exit 0
+fi
+
+# --- (3) Cascade incident window ---------------------------------------------
+# If a critical/failure bell rang within the incident window, COALESCE this bell
+# (any class) into the batch instead of ringing — collapsing a multi-layer
+# cascade to one bell + a digest. Disabled when NEXUS_NOTIFY_INCIDENT_WINDOW=0.
+if [ "${NEXUS_NOTIFY_FORCE:-0}" != "1" ] \
+   && [ "${_nw_incident_window:-0}" -gt 0 ] 2>/dev/null; then
+    _nw_inc=$(_nw_mtime "$_nw_cd_dir/.incident")
+    _nw_now=$(date +%s)
+    if [ "${_nw_inc:-0}" -gt 0 ] 2>/dev/null \
+       && [ $((_nw_now - _nw_inc)) -lt "$_nw_incident_window" ]; then
+        _nw_batch_add "$_nw_class" "$_nw_msg"
+        _nw_record "$_nw_class" "suppress-incident"
+        exit 0
+    fi
+fi
+
+# --- (4) Cross-window cooldown -----------------------------------------------
+# Shared state so N windows share ONE rate limit. Ring iff the class window has
+# elapsed; otherwise CAPTURE to the batch (never drop). Lock is stale-reclaiming
+# and fail-open (cannot lock ⇒ ring).
+_nw_decide() {
+    [ -n "${NEXUS_ROOT:-}${NEXUS_NOTIFY_STATE_DIR:-}" ] || return 0   # no state ⇒ ring
+    mkdir -p "$_nw_cd_dir" 2>/dev/null || return 0                    # unwritable ⇒ ring
+    _nw_stamp="$_nw_cd_dir/$_nw_class"
+    _nw_lockp="$_nw_cd_dir/.lock.$_nw_class"
+    _nw_lock "$_nw_lockp" || return 0                                 # cannot lock ⇒ ring
+    _nw_now=$(date +%s)
+    _nw_last=$(_nw_mtime "$_nw_stamp")
+    _nw_rc=1
+    if [ "${_nw_last:-0}" -le 0 ] 2>/dev/null \
+       || [ $((_nw_now - _nw_last)) -ge "$_nw_interval" ]; then
+        : > "$_nw_stamp" 2>/dev/null || true
+        _nw_rc=0
+    fi
+    _nw_unlock "$_nw_lockp"
+    return $_nw_rc
+}
+
+if [ "${NEXUS_NOTIFY_FORCE:-0}" != "1" ] && ! _nw_decide; then
+    _nw_batch_add "$_nw_class" "$_nw_msg"
+    _nw_record "$_nw_class" "suppress-cooldown"
+    exit 0
+fi
+
+# --- (5) RING. Open an incident if this is critical/failure; drain pending ----
+# batches into the outgoing message so nothing waits for the next tick.
+if [ "$_nw_class" = "critical" ] || [ "$_nw_class" = "failure" ]; then
+    mkdir -p "$_nw_cd_dir" 2>/dev/null && : > "$_nw_cd_dir/.incident" 2>/dev/null || true
+fi
+
+_nw_final="$_nw_msg"
+if [ -d "$_nw_cd_dir" ]; then
+    # Drain EVERY class's pending batch (including this ring's own class — the
+    # batch holds only PRIOR suppressed messages, never the one now ringing).
+    # Skipping the own class would strand a same-class coalesced cascade layer.
+    _nw_dig=""
+    for _nwc in critical failure permission infra task routine; do
+        _nws=$(_nw_batch_drain "$_nwc")
+        [ -n "$_nws" ] && _nw_dig="$_nw_dig${_nw_dig:+; }$_nwc: $_nws"
+    done
+    [ -n "$_nw_dig" ] && _nw_final="$_nw_msg — [batched: $_nw_dig]"
+fi
+
+_nw_record "$_nw_class" "ring" "$_nw_final"
+
+# --- (6) Hand off to the REAL sandbox-notify (or fail silent) ----------------
+_nw_resolve_real
+[ -n "${_nw_real:-}" ] || exit 0
+exec "$_nw_real" "$_nw_final"

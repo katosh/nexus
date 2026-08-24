@@ -241,22 +241,22 @@ else
     fi
 
     # Per-cell assertions.
-    if echo "$matrix" | grep -qE '^\| yes \| yes \|.*Offer'; then
+    if grep -qE '^\| yes \| yes \|.*Offer' <<<"$matrix"; then
         pass "matrix row (your-org=yes, HPC=yes) → Offer"
     else
         fail "matrix row (your-org=yes, HPC=yes) missing 'Offer' keyword"
     fi
-    if echo "$matrix" | grep -qE '^\| yes \| no .*\|.*[Ss]kip install|^\| yes \| no .*\|.*[Hh]PC contexts'; then
+    if grep -qE '^\| yes \| no .*\|.*[Ss]kip install|^\| yes \| no .*\|.*[Hh]PC contexts' <<<"$matrix"; then
         pass "matrix row (your-org=yes, HPC=no) → note / skip install"
     else
         fail "matrix row (your-org=yes, HPC=no) missing note/skip keyword"
     fi
-    if echo "$matrix" | grep -qE '^\| no  \| yes \|.*[Ss]kip silently'; then
+    if grep -qE '^\| no  \| yes \|.*[Ss]kip silently' <<<"$matrix"; then
         pass "matrix row (your-org=no, HPC=yes) → Skip silently"
     else
         fail "matrix row (your-org=no, HPC=yes) missing 'Skip silently' keyword"
     fi
-    if echo "$matrix" | grep -qE '^\| no  \| no  \|.*[Ss]kip silently'; then
+    if grep -qE '^\| no  \| no  \|.*[Ss]kip silently' <<<"$matrix"; then
         pass "matrix row (your-org=no, HPC=no) → Skip silently"
     else
         fail "matrix row (your-org=no, HPC=no) missing 'Skip silently' keyword"

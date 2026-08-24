@@ -15,6 +15,10 @@ on:
       - 'docs/requirements.txt'
       - '.github/workflows/docs.yml'
   pull_request:
+    # `edited` so a base retarget re-runs this gate — the base change emits no
+    # other event (<your-org>/nexus-code#604). Gated below on the base having
+    # actually changed, so title/body edits cost nothing.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
     branches: [main, dev]
     paths:
       - 'docs/**'
@@ -23,16 +27,35 @@ on:
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
+# Allow only one concurrent deploy: skip queued runs in-between, but
+# don't cancel an in-progress run so a half-deployed site never lands.
+#
+# `cancel-in-progress: false` is NOT immunity from the #628/#736 eviction, which
+# is why the event class is in the key here too. GitHub keeps only the most
+# recently QUEUED run pending per group: "Any previously pending job or workflow
+# in the concurrency group will be canceled." So with a run in flight, a real
+# code run queued behind it is cancelled by a later title-edit run that queues
+# after it — and a title edit does not move the head, so the cancelled code run
+# and the skipped meta run share a head sha. Same cancelled+skipped end state as
+# cc-harness's in-progress eviction, reached through the queue instead; rarer
+# (it needs three events in one window), same one-line remedy, no cost.
+#
+# Pushes and PR events whose jobs RUN — including a base retarget, whose `if:`
+# is true (#604) — all land in `-code`, so serialisation on
+# refs/heads/main is unchanged: `github.event_name` is never `pull_request` on a
+# push. Asserted for every workflow by
+# monitor/lint-workflows.py (rules MC001/MC002).
 concurrency:
-  group: docs-check-${{ github.ref }}
-  cancel-in-progress: true
+  group: docs-${{ github.ref }}-${{ (github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.base.ref.from) && 'meta' || 'code' }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build docs site (verify it renders)
+    name: Build docs site
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

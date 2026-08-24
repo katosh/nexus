@@ -212,7 +212,10 @@ case "$timeout" in ''|*[!0-9]*) die_usage "--timeout must be a non-negative inte
 [ "$timeout" -gt "$TIMEOUT_MAX" ] && timeout=$TIMEOUT_MAX
 
 # ---- ssh identity ------------------------------------------------------
-resolve_ssh_id
+# rc 1 = the endpoint could not be resolved (no port, and none derivable —
+# nexus-code#893 F1). Exit 64 like any other configuration fault rather than
+# proceeding with an unset port, which would connect to whatever holds it.
+resolve_ssh_id || exit 64
 
 # ---- idempotency sentinel (crash-restart double-emit guard) ------------
 # Written BEFORE the visible TERMINAL emit. If a prior instance crashed AFTER

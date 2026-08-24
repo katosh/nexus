@@ -49,11 +49,6 @@ debug the bootstrap.
   `python3` with `pyyaml`, `curl`.
 - ~15–30 minutes, most of which is letting the bootstrap drive.
 
-!!! note "<your-lab> operators"
-    See the [<your-lab> addendum](../admin/site-addendum.md) for
-    the lab-specific filesystem path (`<hpc-mount>/...`) and the shared-
-    node coordination pattern (`<login-node>` → `<shared-node-tool>` → shared HPC node).
-
 ## Step 1 — clone `<your-org>/nexus-code`
 
 You clone the upstream code repo directly — there is no fork to make.

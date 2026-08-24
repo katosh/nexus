@@ -113,7 +113,7 @@ _pick_port() {
         p=$(( 49152 + (RANDOM % 16000) ))       # IANA ephemeral range
         (( p >= 9700 && p <= 9799 )) && { tries=$((tries+1)); continue; }   # labsh range
         if command -v ss >/dev/null 2>&1; then
-            ss -ltn 2>/dev/null | grep -qE "[:.]${p}[[:space:]]" && { tries=$((tries+1)); continue; }
+            grep -qE "[:.]${p}[[:space:]]" <<<"$(ss -ltn 2>/dev/null)" && { tries=$((tries+1)); continue; }
         fi
         printf '%s' "$p"; return 0
     done
@@ -170,9 +170,33 @@ declare -F labsh_build_is_ours >/dev/null && HAVE_FIX=1
 # it `-c 'sleep 120; true'` plus the decoy argv.
 cp "$(command -v bash)" "$WORK/uv"    # exe basename → uv
 cp "$(command -v bash)" "$WORK/zsh"   # exe basename → zsh (an agent shell)
-# Short-lived on purpose: if this suite is SIGKILLed its trap never runs, and a
-# long-sleeping fixture would outlive it. 25s covers the suite many times over.
-_STAY='sleep 25; true'
+# The decoy must outlive the TEST and not outlive it by much: if this suite is
+# SIGKILLed its trap never runs, so a long flat `sleep` would leak.
+#
+# A FIXED duration cannot satisfy both, because it has to guess how long the
+# test takes. `sleep 25` was that guess, with the rationale "25s covers the
+# suite many times over" — true on an idle host, false the moment the suite is
+# oversubscribed. Measured at `--jobs 4` on a 36-core box at loadavg ~60 this
+# file takes 26.1s, so every decoy expired of natural causes BEFORE section H
+# asserted on it, and all seven of H's decoy-survival rows went red claiming
+# the reaper had "killed" an agent shell it never touched. Deterministic under
+# load (3/3 trials), green standalone — a false accusation against production
+# code, which is worse than a plain red. Same family as
+# your-org/nexus-code#584/#585: the fixture stopped providing the precondition
+# and the assertion misreported the cause.
+#
+# So TRACK the test instead of guessing its duration: hold while our parent is
+# alive, with a hard ceiling so a PID reuse after a SIGKILL cannot leak
+# unboundedly. `$$` interpolates the TEST's pid here; `\$SECONDS` stays literal
+# for the child. This also removes a confound in the OTHER direction — sections
+# F and H assert a build DIED after a reap pass, which a short-lived decoy
+# could satisfy by expiring on its own.
+#
+# NOTE the `; true` and the loop both matter for `exe`: bash exec()s a lone
+# simple command in place of itself, which would make exe `sleep` instead of
+# `uv` (see the numbered traps above). A `while` compound is not a lone simple
+# command, so exe survives.
+_STAY="while kill -0 $$ 2>/dev/null && (( \$SECONDS < 900 )); do sleep 1; done; true"
 
 # Every fixture runs with cwd = the throwaway workdir, which is what makes it
 # our build under the fixed predicate — and what makes it impossible for the
@@ -338,6 +362,16 @@ for _ in $(seq 1 60); do [[ -r "/proc/$FRESH2/cmdline" ]] && break; sleep 0.05; 
 printf '%s' "$FRESH2" > "$BG_PID_FILE"
 
 if (( HAVE_FIX )); then
+    # FIXTURE PRECONDITION. "X survived the reaper" is unfalsifiable unless X
+    # was ALIVE going in, and a decoy that died on its own gets misattributed to
+    # the reaper — which is exactly what a 25s decoy lifetime produced here
+    # under load. Check first, and say which it was.
+    for _decoy in "FRESH2=$FRESH2" "SHELL_PID=$SHELL_PID" \
+                  "ZOTERO_PID=$ZOTERO_PID" "IMPOSTOR_PID=$IMPOSTOR_PID"; do
+        kill -0 "${_decoy#*=}" 2>/dev/null \
+            || bad "H: FIXTURE decoy ${_decoy%%=*} alive before the reap" \
+                   "already dead at ${SECONDS}s — it EXPIRED; the reaper never saw it"
+    done
     COLD_BUILD_BUDGET=3600      # nothing is an orphan by this budget
     reap_stale_builds "$PORT" >/dev/null 2>&1
     kill -0 "$FRESH2"       2>/dev/null && ok "H: fresh bg.pid build survives a reap pass" || bad "H: fresh bg.pid build survives" "killed"

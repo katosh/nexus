@@ -266,9 +266,45 @@ _sh_parse_registry() {
 # IDENTICAL semantics to bootstrap-recover.sh's `_recover_service_healthy`
 # — replicated inline (3 lines, no logic to drift) to avoid sourcing that
 # script into the watcher process. See the module header.
+# Captured DIAGNOSTIC — the failing healthcheck's stderr tail (your-org/nexus-code
+# #637). Populated by _sh_service_healthy, consumed on the unhealthy path so the
+# orchestrator emit can DISTINGUISH failure causes a bare "unhealthy" hides. The
+# motivating case: remote-ssh-health.sh already classifies "OUR daemon is down"
+# vs "the port is held by a FOREIGN listener" (the #609 identity gate) and writes
+# that verdict to stderr — but this module discarded stderr, so the emit could not
+# tell the operator which one it was. Empty on the healthy path (and for any
+# healthcheck that stays silent on failure — most curl/pgrep checks).
+_SH_HEALTH_DETAIL=""
 _sh_service_healthy() {
     local workdir="$1" health="$2"
-    ( cd "$workdir" 2>/dev/null && bash -c "$health" ) >/dev/null 2>&1
+    _SH_HEALTH_DETAIL=""
+    # ONE run — no extra probe (the #431/#434 sshd-starvation history forbids
+    # double-probing). Inside $(...), `2>&1 1>/dev/null` routes fd2 to the capture
+    # pipe and then fd1 to /dev/null, so stdout is dropped exactly as before and
+    # only stderr is retained. `local err; err=...; rc=$?` — NOT `local err=$(...)`,
+    # which would mask the command's rc behind `local`'s own exit status.
+    local err rc
+    err=$( ( cd "$workdir" 2>/dev/null && bash -c "$health" ) 2>&1 1>/dev/null )
+    rc=$?
+    if (( rc != 0 )) && [[ -n "$err" ]]; then
+        # Select the VERDICT line by CONTENT, not by POSITION. The failing
+        # healthcheck's verdict is not reliably first or last: remote-ssh-health.sh
+        # writes its `UNHEALTHY — …` verdict on the FIRST of three lines, then
+        # indented detail (the socket attribution) on the last — so a `tail -n1`
+        # captures the attribution and DROPS the foreign-vs-down verdict that is
+        # the entire point of this field (your-org/nexus-code#637 skeptic finding).
+        # Keying on position is the fragility, so do not just take the first line
+        # either: prefer the first non-blank line carrying a failure-VERDICT
+        # keyword, and fall back to the first non-blank line only when none match
+        # (a curl/pgrep check whose single line has no such keyword). Bounded to one
+        # line — the emit is a human section, not a log dump.
+        local nb verdict
+        nb=$(printf '%s\n' "$err" | grep -vE '^[[:space:]]*$')
+        verdict=$(printf '%s\n' "$nb" | grep -iE 'unhealthy|foreign|no listener|not sshd|refused|timed out|timeout|unreachable|no route|fatal' | head -n1)
+        [[ -n "$verdict" ]] || verdict=$(printf '%s\n' "$nb" | head -n1)
+        _SH_HEALTH_DETAIL=$(printf '%s' "$verdict" | cut -c1-300)
+    fi
+    return $rc
 }
 
 # ---- supervisor record (reuse of _recover_supervisor_state) --------------
@@ -282,13 +318,45 @@ _sh_service_healthy() {
 _sh_services_dir() { printf '%s/services' "${SERVICE_HEALTH_STATE_DIR%/service-health}"; }
 _sh_pidfile()      { printf '%s/%s.pid' "$(_sh_services_dir)" "$1"; }
 
+#
+# IDENTITY (your-org/nexus-code#606): mirrors the `ns=`/`start=` verification
+# added to _recover_supervisor_probe. Kept in lockstep deliberately — if the
+# watcher and svc.sh disagree about whether a record is stale, the watcher
+# emits an inconsistency that svc.sh then declines to see (or the reverse).
+# A record with neither key (written before that change) degrades to the
+# previous pid+cmdline behaviour.
+_sh_starttime() {
+    local pid="$1" sr
+    sr=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    sr=${sr#*") "}
+    # shellcheck disable=SC2086  # deliberate word-splitting of stat fields
+    set -- $sr
+    printf '%s' "${20:-}"
+}
+
 _sh_supervisor_state() {
     local name="$1" launch="$2"
     local pf; pf="$(_sh_pidfile "$name")"
     [[ -f "$pf" ]] || { printf 'absent'; return 0; }
-    local pid; read -r pid < "$pf" 2>/dev/null
+    local pid='' rec_ns='' rec_start='' line n=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n+1))
+        if (( n == 1 )); then pid="$line"; continue; fi
+        case "$line" in
+            ns=*)    rec_ns="${line#ns=}" ;;
+            start=*) rec_start="${line#start=}" ;;
+        esac
+    done < "$pf"
     [[ "$pid" =~ ^[0-9]+$ ]] || { printf 'stale:%s' "${pid:-?}"; return 0; }
+    local cur_ns; cur_ns=$(readlink "/proc/$$/ns/pid" 2>/dev/null || true)
+    if [[ -n "$rec_ns" && "$rec_ns" != unknown && -n "$cur_ns" && "$rec_ns" != "$cur_ns" ]]; then
+        printf 'stale:%s' "$pid"; return 0
+    fi
     kill -0 "$pid" 2>/dev/null || { printf 'stale:%s' "$pid"; return 0; }
+    if [[ -n "$rec_start" && "$rec_start" != unknown ]]; then
+        local cur_start; cur_start=$(_sh_starttime "$pid")
+        [[ -z "$cur_start" || "$cur_start" == "$rec_start" ]] || { printf 'stale:%s' "$pid"; return 0; }
+    fi
     local cmdline_file="/proc/$pid/cmdline"
     if [[ -r "$cmdline_file" ]]; then
         local cmdline tok
@@ -966,6 +1034,7 @@ _service_health_check_tick() {
             "last_check_iso=$(_sh_iso)" \
             "grace_seconds=${grace}" \
             "health_cmd=${health}" \
+            "health_detail=${_SH_HEALTH_DETAIL}" \
             "workdir=${workdir}" \
             "logfile=${logfile}" \
             "note=${note}"
@@ -1001,7 +1070,7 @@ _service_health_check_tick() {
 _service_health_emit_section() {
     local state_dir="${1:-$SERVICE_HEALTH_STATE_DIR}" nexus_root="${2:-${NEXUS_ROOT:-}}"
     [[ -n "$state_dir" && -d "$state_dir" ]] || return 1
-    local emitted=1 sf name status policy attempts first_iso recovered_iso recovered_via grace_seconds health logfile note key last surfaced_file
+    local emitted=1 sf name status policy attempts first_iso recovered_iso recovered_via grace_seconds health health_detail logfile note key last surfaced_file
     local supervisor sup_pidfile incon_polls incon_iso recovered_by escalated renag_bucket sup_kind
     for sf in "$state_dir"/*.state; do
         [[ -f "$sf" ]] || continue
@@ -1015,6 +1084,7 @@ _service_health_emit_section() {
         recovered_via=$(_sh_field "$sf" recovered_via 2>/dev/null || echo '')
         grace_seconds=$(_sh_field "$sf" grace_seconds 2>/dev/null || echo '?')
         health=$(_sh_field "$sf" health_cmd 2>/dev/null || echo '?')
+        health_detail=$(_sh_field "$sf" health_detail 2>/dev/null || echo '')
         logfile=$(_sh_field "$sf" logfile 2>/dev/null || echo '')
         note=$(_sh_field "$sf" note 2>/dev/null || echo '')
         supervisor=$(_sh_field "$sf" supervisor 2>/dev/null || echo '?')
@@ -1145,6 +1215,7 @@ _service_health_emit_section() {
                 printf 'service %s unhealthy since %s — within the %ss grace window; deferring to its supervisor before the watcher acts.\n' \
                     "'$name'" "$first_iso" "$grace_seconds"
                 printf '  failing healthcheck: %s\n' "$health"
+                [[ -n "$health_detail" ]] && printf '  diagnostic: %s\n' "$health_detail"
                 if [[ "$policy" == "emit-only" ]]; then
                     printf '  policy: emit-only — if still unhealthy after grace the watcher will escalate (no auto-restart).\n'
                 else
@@ -1163,6 +1234,7 @@ _service_health_emit_section() {
                 printf 'service %s DOWN since %s — policy emit-only: the watcher will NOT auto-restart; this needs your judgment.\n' \
                     "'$name'" "$first_iso"
                 printf '  failing healthcheck: %s\n' "$health"
+                [[ -n "$health_detail" ]] && printf '  diagnostic: %s\n' "$health_detail"
                 printf '  policy: emit-only\n'
                 [[ -n "$logfile" ]] && printf '  logfile: %s\n' "$logfile"
                 printf '  incident state: %s   (history: %s)\n' "$sf" "$state_dir/$name.events"
@@ -1188,6 +1260,7 @@ _service_health_emit_section() {
                             "'$name'" "$first_iso" ;;
                 esac
                 printf '  failing healthcheck: %s\n' "$health"
+                [[ -n "$health_detail" ]] && printf '  diagnostic: %s\n' "$health_detail"
                 printf '  policy: %s\n' "$policy"
                 [[ -n "$note" ]] && printf '  auto-restart: %s\n' "$note"
                 [[ -n "$logfile" ]] && printf '  logfile: %s\n' "$logfile"

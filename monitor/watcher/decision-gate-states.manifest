@@ -1,0 +1,52 @@
+# decision-gate-states.manifest — the CHECKED coverage boundary for
+# your-org/nexus-code#790.
+#
+# Enforced by:  bash monitor/watcher/test-decision-gate-states.sh
+# Axis:         `monitor/pane-state.sh --states` — the pane-state vocabulary
+#               the pending-decisions gate classifies on.
+#
+# WHY THIS FILE EXISTS. `bk_decision_row_actionable`
+# (monitor/_bookkeeping.sh) has a permissive default arm: a state it does
+# not recognise EMITS. That is the correct polarity — silencing a genuine
+# block is the harm this channel must never do — but a permissive default
+# also means a NEW pane state gets a ruling by accident instead of by
+# decision. This manifest is what turns that accident into a red suite:
+# every member of the vocabulary carries an explicit disposition here, and
+# the test asserts (a) the two sets are equal and (b) the predicate agrees
+# with each row. Adding a state to pane-state.sh without ruling on it here
+# fails; changing the predicate without updating a row fails.
+#
+# The axis is the MECHANISM's axis, not a search's. The gate's behaviour
+# varies on which pane state comes back, so that is what is enumerated —
+# not "the states I happened to observe in the incident", which was four
+# of the twelve.
+#
+# REGENERATING THIS FILE IS NOT A FIX. If the suite goes red, decide which
+# happened and say so in the commit message:
+#   * a NEW pane state — rule on it. Would an operator's answer unblock a
+#     pane in that state? `emit` if yes or if you cannot tell; `withhold`
+#     only if the state positively asserts something else is already
+#     driving the pane forward.
+#   * a disposition FLIP — that is a behaviour change to an operator
+#     attention channel. It needs the incident or measurement that
+#     justifies it, in the commit message.
+#
+# `queued` is deliberately NOT a row: `queued=1` is an orthogonal token on
+# the same pane-state line, not a member of the state vocabulary, and it
+# withholds in combination with ANY state. The test exercises it
+# separately against `blocked` — the state most likely to be wrongly
+# assumed unconditional.
+#
+# state<TAB>disposition<TAB>why
+absent	emit	agent died with a decision outstanding — unanswerable in-pane but emphatically an action item
+autosuggest-only	emit	`idle` wearing ghost text; withholding would silence real idles to quiet parked ones
+blocked	emit	THE case the channel exists for — a modal only a human clears; the negative control
+busy	withhold	a turn is running; the pane is being driven forward, not waiting on an operator
+empty	emit	indeterminate reading ("don't know yet", nexus-code#603) — never a licence to go quiet
+idle	emit	waiting for input is precisely what the row reports
+idle-orphan-async	emit	async work the agent launched has been orphaned; the operator decides what happens next
+over-limit	emit	no human shortens a quota reset, but the pane is suspended and the work may need re-routing
+unknown	emit	could not classify at all; an unclassifiable pane must never silence a pending decision
+user-typing	withhold	a human is demonstrably at this keyboard already
+working-background	withhold	a background shell or handle is doing the work
+working-self-paced	withhold	the agent scheduled its own next wake-up

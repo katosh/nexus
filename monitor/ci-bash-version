@@ -1,0 +1,12 @@
+# The bash major.minor that CI runs the suite under.
+#
+# This file exists so that a LOCAL run can state, truthfully and without
+# guessing, which interpreter it did NOT test (your-org/nexus-code#610). A
+# declaration nobody checks would drift the first time GitHub bumps its runner
+# image, so tests.yml asserts the runner's actual bash matches this pin and
+# goes RED when it does not — the pin cannot quietly become a lie.
+#
+# Bump procedure: when that assertion fails, change the value here, rebuild
+# the local toolchain (`monitor/toolchain-bash.sh --version <new>` — add the
+# upstream sha256 to sha_for() first), and re-run the suite under it.
+5.2

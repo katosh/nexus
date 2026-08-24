@@ -57,12 +57,6 @@ Optional but recommended:
 - **A phone-push channel** — Pushover (preferred), ntfy (fallback), or email (emergency tier). Configured under `notifications.*` in `config/nexus.yml`. See [Operating → Notifications](../operating/notifications.md).
 - **[`labsh`](https://github.com/katosh/labsh)** — project-local JupyterLab with persistent kernels. Worth installing if any of your projects load slow-to-build state (large DataFrames, fitted models) that agents would otherwise rebuild every turn.
 
-!!! note "<your-lab> operators"
-    See the [<your-lab> addendum](../admin/site-addendum.md) for
-    the lab-specific persistent-host pattern (`<login-node>` → `<shared-node-tool>` →
-    shared HPC node), the `<hpc-mount>` filesystem path, and the
-    `<hpc-skills>` add-on.
-
 ## Where to next
 
 - Working install: [Install](install.md) — the recommended path is a Claude-Code-driven bootstrap (`agent-sandbox tmux new-session ./monitor/bootstrap-install.sh`); a fully manual fallback is preserved on the same page.

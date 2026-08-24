@@ -57,7 +57,7 @@ case "$_cmd" in
 esac
 
 # Coarse write-verb match (advisory; err toward warning).
-if printf '%s' "$_cmd" | grep -Eq 'gh ([^|;&]*\b)?(pr (create|edit|merge|comment|close|reopen|ready|review)|issue (create|edit|comment|close|reopen|lock|delete)|release (create|edit|delete|upload)|api [^|;&]*(graphql|--input|--field|--raw-field|-F |-f |(-X|--method)[= ]*(POST|PATCH|PUT|DELETE)))'; then
+if grep -Eq 'gh ([^|;&]*\b)?(pr (create|edit|merge|comment|close|reopen|ready|review)|issue (create|edit|comment|close|reopen|lock|delete)|release (create|edit|delete|upload)|api [^|;&]*(graphql|--input|--field|--raw-field|-F |-f |(-X|--method)[= ]*(POST|PATCH|PUT|DELETE)))' <<<"$_cmd"; then
     mkdir -p "$_state_dir" 2>/dev/null || true
     _ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown-ts)
     # Explicit mode at creation (your-org/nexus-code#484). An audit trail of

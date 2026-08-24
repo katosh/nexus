@@ -4,9 +4,12 @@
 #
 # Output (single line, key=value, machine-parseable):
 #   state=<idle|busy|user-typing|autosuggest-only|empty|blocked|absent|over-limit|
-#          working-background|working-self-paced|idle-orphan-async> \
-#     active=<0|1> window=<idx> name=<windowname> [reset_at=<token>] \
-#     [orphan_kinds=<csv>] [bg_shells=<count> bg_reliable=<0|1> bg_cpu=<jiffies>]
+#          working-background|working-self-paced|idle-orphan-async|unknown> \
+#     active=<0|1> window=<idx> name=<windowname> [input=<typed|ghost|blank|?>] \
+#     [queued=1] [reset_at=<token>] \
+#     [evidence=<token>] [reason=<token> site=<label> [capture=failed]] \
+#     [orphan_kinds=<csv>] [bg_shells=<count> bg_reliable=<0|1> bg_cpu=<jiffies> \
+#      bg_oldest_start=<epoch> bg_infra=<count> bg_cmd=<comm:cmd-tail>]
 #
 # A background SHELL is detected from the kernel PROCESS TREE — claude's
 # live background-shell child subtrees (your-org/nexus-code#445, made the
@@ -38,10 +41,40 @@
 # detector; when `bg_reliable=0` it must not make reap decisions on the
 # count and keeps the legacy #445 flat-grace behaviour.
 #
+# `bg_infra` and `bg_cmd` ride along on the same line
+# (your-org/nexus-code#590). `bg_infra` is how many of those `bg_shells`
+# roots are NEXUS PROTOCOL WAIT loops — the `skeptic-channel await` /
+# `request … await` re-check loops `ng wrap-up` itself tells a worker to
+# hold — rather than task work. `bg_cmd` is a space-free
+# `<comm>:<cmd-tail>` label naming ONE representative root, preferring a
+# non-infra one. Both are ADDITIVE: `bg_shells` is unchanged, so the
+# `working-background` verdict and the `parked-awaiting-skeptic` exemption
+# that keys off it are untouched. The idle probe uses them to stop
+# reporting a protocol-prescribed await loop as a
+# `wrapped-with-children` inconsistency (it fired on every skeptic-gated
+# worker, which trains the operator to dismiss the genuine orphaned-job
+# case) and to NAME the child instead of demanding a decision on a bare
+# count.
+#
 # `reset_at` is appended only when state=over-limit, and carries the
 # extracted reset-time string (spaces collapsed to `_`, parens stripped,
 # capped at 40 chars). Value is `unknown` when the canonical "resets
 # <time>" suffix wasn't extractable.
+#
+# `overlay` is appended only when state=blocked, and names WHICH overlay is
+# waiting on a human: `rate-limit` | `permission` | `bypass-permissions` |
+# `askuq` | `workspace-trust` | `dialog`. The first four are TEXT-KEYED arms;
+# the last two come from the STRUCTURAL arm (`_has_menu_dialog_frame`,
+# your-org/nexus-code#896) that catches any select-dialog Claude Code renders,
+# named or not — `dialog` is the honest generic kind for one nobody has
+# enumerated yet, and it is a NAME, not a detection precondition.
+# `blocked` alone answers "should I wait?"; the kind answers "what do
+# I do about it?", and for `bypass-permissions` those are different actions —
+# it is a CONFIGURATION fault (a `settings.json` rewritten between boots
+# without `skipDangerousModePermissionPrompt`), not a decision anyone should
+# answer at the pane. Before this field that case reached no overlay arm at
+# all and fell through to `empty` — "don't know yet" — so a deterministic
+# config fault presented as a slow boot (your-org/nexus-code#768).
 #
 # `orphan_kinds` is appended only when state=idle-orphan-async, and
 # carries a comma-separated dedup'd list of `kind:id` pairs from the
@@ -68,20 +101,111 @@
 # implicit change.
 #
 # State semantics:
-#   absent           - window exists in tmux but no live `claude`
-#                      process in its pane's process tree (the inner
-#                      REPL has truly exited; rendered bytes may
-#                      linger via tmux's `remain-on-exit on`). A
+#   absent           - window exists in tmux, no live `claude` process
+#                      in its pane's process tree, AND nothing else is
+#                      alive under the pane either (the inner REPL has
+#                      truly exited; rendered bytes may linger via
+#                      tmux's `remain-on-exit on`). The second
+#                      conjunct is load-bearing and was added by
+#                      your-org/nexus-code#643: without it a window
+#                      still running its spawn launcher's preamble —
+#                      healthy, seconds old, `exec claude` imminent —
+#                      reported `absent`, the one KILL-AUTHORISING
+#                      state. That case now reports `unknown`. Read
+#                      this state as "nothing is running here", which
+#                      is the claim it can actually support.
+#                      your-org/nexus-code#777 added two more
+#                      conjuncts, both for cases where the old rule
+#                      asserted death from a NON-observation:
+#                      the process view must have been PROVEN able to
+#                      see processes at all (a `ps`/`pgrep` that
+#                      cannot find a child we just forked is blind,
+#                      and its silence about the pane means nothing),
+#                      and the pane must be older than
+#                      `NEXUS_PANE_BOOT_GRACE_SECONDS` (default 90)
+#                      unless tmux's own `#{pane_dead}` confirms the
+#                      exit. Production spawns with `tmux new-window`
+#                      carrying NO command, so for the first seconds
+#                      the pane shell has no descendants AT ALL and
+#                      #643's descendant test cannot separate booting
+#                      from dead — elapsed time is the only axis that
+#                      differs. Withholding `absent` inside that
+#                      window delays a genuine reap by at most the
+#                      grace, and only ever in a pane's opening
+#                      seconds; emitting it there authorises killing
+#                      a live worker. A
+
 #                      `state=absent` row always carries a populated
 #                      `name=<window>` because a non-existent window
 #                      index is treated as a caller error and exits
 #                      3 — see Exit codes below (issue #140).
-#   blocked          - permission overlay or rate-limit menu present;
-#                      mirrors monitor/watcher/_unstick.sh detection.
+#                      your-org/nexus-code#788 made this a DECISION
+#                      rather than a fall-through. `absent` now has
+#                      exactly ONE emitter, `_emit_absent_or_unknown`,
+#                      which refuses unless it can NAME positive
+#                      evidence — so every `state=absent` row carries
+#                      `evidence=<pane_dead|pid-gone|
+#                      tree-empty-past-grace|fixture-no-process>` and
+#                      every refusal carries `reason=<live-claude|
+#                      live-descendant|proc-view-blind|boot-grace|
+#                      no-pane-pid> site=<label>`, plus
+#                      `capture=failed` when `tmux capture-pane`
+#                      itself failed. Two further sites reached
+#                      `absent` by NOT deciding and are now routed
+#                      through that door: the renderer's
+#                      no-input-row fallback, and `[[ -z "$pane_ansi"
+#                      ]]` — the latter measured emitting the
+#                      kill-authorising state for a pane whose ROOT
+#                      PROCESS was a live `claude` the moment one
+#                      `capture-pane` call returned rc≠0.
+#   blocked          - an overlay is waiting on a human: permission
+#                      prompt, rate-limit menu, AskUserQuestion
+#                      chip-bar, the Bypass Permissions warning
+#                      modal, or ANY other select-dialog Claude Code
+#                      renders — the last of those detected
+#                      STRUCTURALLY (a numbered-option menu with a `❯`
+#                      cursor and an Enter/Esc footer, and no REPL row
+#                      below it), so a dialog nobody enumerated is
+#                      still seen (your-org/nexus-code#896; the
+#                      motivating instance is the workspace-trust
+#                      dialog that 2.1.232 started showing every
+#                      nested-repo worker spawn). Mirrors
+#                      monitor/watcher/_unstick.sh detection for the
+#                      text-keyed arms — but only those: nothing in
+#                      `_unstick.sh` auto-answers the structurally
+#                      detected ones, which is deliberate for a
+#                      security prompt. Always carries
+#                      `overlay=<kind>` naming which — see the field
+#                      notes above; the `bypass-permissions` kind is a
+#                      CONFIGURATION fault, not a question to answer
+#                      at the pane (your-org/nexus-code#768).
 #   busy             - spinner row shows an active token counter
 #                      (`↓ N tokens` / `↑ N tokens`); agent is working.
+#                      ALSO emitted, with an extra `queued=1` field,
+#                      when the input row has been replaced by Claude
+#                      Code's `Press up to edit queued messages`
+#                      placeholder. That placeholder is positive
+#                      evidence of BOTH facts — input pending AND a
+#                      turn in flight — since Claude Code only queues
+#                      while a turn is running and flushes the queue
+#                      when it ends. It previously rendered as `empty`,
+#                      the most ambiguous value available, for the one
+#                      situation an orchestrator most needs to read
+#                      correctly (#603, #607). Reported as `busy`
+#                      rather than a new state token deliberately:
+#                      every existing consumer already treats `busy` as
+#                      never-kill / never-paste, so the safe behaviour
+#                      needed no consumer audit and no permissive
+#                      default could be inherited.
 #   user-typing      - input row carries the bright-text marker
-#                      (`\x1b[38;5;231m`); user has typed real input.
+#                      (`\x1b[38;5;231m`), OR the pane is in vim
+#                      INSERT mode (`-- INSERT --` in the status line)
+#                      with a non-blank input row. The vim clause is
+#                      your-org/nexus-code#603: Claude Code's vim mode
+#                      does not reliably emit the bright SGR, so two
+#                      panes holding VISIBLE unsubmitted operator text
+#                      classified `empty` and became kill candidates.
+#                      user has typed real input.
 #                      Detected on BOTH the renderer-fallback path
 #                      and the heartbeat path (issue #196): a fresh
 #                      `idle_prompt` heartbeat proves the agent's
@@ -92,10 +216,31 @@
 #                      bright marker. Autosuggest ghost text renders
 #                      dim (`\x1b[7m.\x1b[0;2m`, never bright), so it
 #                      cannot false-trigger this refinement.
-#   autosuggest-only - input row matches the dim-cursor pattern
-#                      (`\x1b[7m.\x1b[0;2m`) with no user-typed prefix;
-#                      cosmetic suggestion only — orchestrator should
-#                      ignore.
+#   autosuggest-only - input row carries an autosuggest GHOST with no
+#                      user-typed prefix; cosmetic suggestion only —
+#                      orchestrator should ignore. TWO renderings count,
+#                      and missing the second was #626: the dim-CURSOR
+#                      pattern (`\x1b[7m.\x1b[0;2m`), and a BARE DIM RUN
+#                      (`\x1b[2m` + text, no reverse-video cursor at
+#                      all). Only the first was matched, so nineteen
+#                      ghost panes at once fell through to `empty` and
+#                      an orchestrator with no discriminator left read
+#                      them as unsubmitted operator drafts.
+#
+# `input=` field — the GHOST-vs-DRAFT question, answered directly
+# (your-org/nexus-code#626). CLAUDE.md is right that autosuggest
+# "renders identically to user input in PLAIN text"; the point is that
+# it does NOT render identically in SGR. Typed input carries bright
+# white (`38;5;231`), a ghost carries faint (SGR 2 as a whole
+# parameter — `\x1b[2m`, `\x1b[0;2m`, but never `\x1b[22m`/`\x1b[32m`).
+# So `tmux capture-pane -e` separates them mechanically:
+#   typed | ghost | blank | ?
+# `?` is a non-blank row matching NEITHER marker, reported rather than
+# guessed. That residue is the only case that would need an
+# input-EVENT channel; everything else is decided from bytes. The field
+# is deliberately SEPARATE from `state=` so a consumer can ask "is this
+# an operator draft?" without going through a token that also carries
+# kill-authorisation meaning.
 #   idle             - empty input box, no busy spinner; safe to paste.
 #   empty            - the renderer is in an ambiguous state (no input
 #                      row matches any of the positive regexes) BUT the
@@ -104,6 +249,25 @@
 #                      state-swap transitions. Callers should treat
 #                      `empty` as "don't know yet, try again next
 #                      cycle" — NOT as "claude is gone".
+#
+#                      THIS CONTRACT IS NOW ENFORCED, not merely
+#                      documented (your-org/nexus-code#603). It was
+#                      stated here in these exact terms while the
+#                      retirement path treated `empty` as evidence a
+#                      window was finished and killed on it — a pane
+#                      4m38s into a verification pass, mid-`git fetch`,
+#                      with a message queued behind it, read `empty`.
+#                      `monitor/_bookkeeping.sh:bk_pane_kill_authorized`
+#                      is the machine-readable form of the rule: an
+#                      ALLOWLIST of states that authorise a kill, with a
+#                      default-DENY arm, so `empty` — and any state
+#                      added to this file later — refuses rather than
+#                      falling through a permissive default.
+#   unknown          - the classifier could not look at all (e.g. tmux
+#                      is not installed). Distinct from `absent`, which
+#                      is a POSITIVE finding about a window we did
+#                      inspect. Emitting `absent` for "we did not look"
+#                      is the #603 defect in miniature.
 #   over-limit       - the canonical "You've hit your <flavor> limit ·
 #                      resets <time>" notice (flavor: "weekly",
 #                      "5-hour", …, or none) is rendered at the bottom
@@ -202,6 +366,13 @@
 # pane emits `absent` whether the heartbeat is fresh, stale, missing,
 # or unmapped — the heartbeat path only runs when claude is alive.
 #
+# Env knobs:
+#   NEXUS_PANE_BOOT_GRACE_SECONDS   default 90; 0 disables. How long
+#       after a pane is CREATED `absent` is withheld from a pane with
+#       nothing running under it (your-org/nexus-code#777). Only the
+#       tests set it: 0 where an assertion is about the process-tree
+#       rule and the fixture pid happens to be seconds old.
+#
 # Inputs:
 #   $1   <window-index>  (e.g. `3`)        — assumed session 0
 #        <session>:<window>  (e.g. `0:3`)
@@ -242,6 +413,39 @@
 
 set -u
 
+# ---- the declared state vocabulary (your-org/nexus-code#790) -------------
+#
+# Every value this script can print for `state=`, ONCE, as data. It exists
+# because CONSUMERS classify on this axis and there was previously no way
+# for one to declare "I have considered every state" and be checked on it.
+#
+# The consumer that forced the issue is the watcher's pending-decisions
+# gate (`bk_decision_row_actionable`, monitor/_bookkeeping.sh): it decides
+# whether an operator-facing row is still worth the operator's attention
+# by asking what the pane is doing RIGHT NOW. A state added here and not
+# considered there silently lands in that gate's default arm. So the gate
+# pins its disposition for every member of this array as data
+# (`monitor/watcher/decision-gate-states.manifest`) and
+# `monitor/watcher/test-decision-gate-states.sh` fails when the two sets
+# diverge — adding a state below without ruling on it turns the suite red.
+#
+# `--states` prints one per line: the machine-readable form that test
+# consumes, so the boundary is CHECKED against this array rather than
+# re-derived by grepping for `emit` (which cannot see the states
+# `_finalize_idle_verdict` / `_refine_idle_with_async_signals` return
+# through a variable — `idle`, `working-background`, `working-self-paced`,
+# `idle-orphan-async` are all invisible to such a grep, so a grep-derived
+# vocabulary is a confident under-count of exactly the states the gate
+# most needs to rule on).
+#
+# Keep in sync with the `state=` line in this file's header block; the
+# same test asserts the two agree, so the prose cannot drift from the data.
+_PS_STATES=(
+    idle busy user-typing autosuggest-only empty blocked absent
+    over-limit working-background working-self-paced idle-orphan-async
+    unknown
+)
+
 usage() {
     cat <<'EOF' >&2
 usage: pane-state.sh <window-index|session:window>
@@ -254,9 +458,27 @@ usage: pane-state.sh <window-index|session:window>
                      [--over-limit-file <path>]
                      [--pane-pid <pid>] [--bg-cpu <jiffies>]
                      [--bg-shells <count>] [--bg-oldest-start <epoch>]
+       pane-state.sh --mcp-shell-risk
+       pane-state.sh --states
+
+  --mcp-shell-risk  Diagnostic. Could a configured MCP server be counted as a
+                    background task shell? Prints `none`, `shell:<names>`, or
+                    `unknown:<reason>` — `unknown` is NOT `none`. Use when a
+                    background-shell count has no obvious owner.
+  --states          Print the declared `state=` vocabulary, one per line.
+                    The machine-readable axis a consumer classifies on; see
+                    monitor/watcher/decision-gate-states.manifest for the
+                    checked example of a consumer pinning its coverage.
 EOF
     exit 2
 }
+
+# `--states` is answered before anything else: it reads no pane, needs no
+# tmux, and must stay usable from a test harness with no session at all.
+if [[ "${1:-}" == "--states" ]]; then
+    printf '%s\n' "${_PS_STATES[@]}"
+    exit 0
+fi
 
 # ---- arg parsing ----------------------------------------------------------
 fixture=
@@ -265,6 +487,7 @@ fix_name=fixture
 fix_active=0
 all_session=
 target=
+mcp_risk_only=0
 hb_file_override=
 now_override=
 staleness_override=
@@ -272,9 +495,30 @@ turn_end_staleness_override=
 async_staleness_override=
 over_limit_file_override=
 pane_pid_override=
+# tmux's `#{pane_dead}`; empty on the fixture path, where there is no pane.
+pane_dead=
+# Did `tmux capture-pane` SUCCEED? Distinct from "was the capture empty"
+# (your-org/nexus-code#788). Defaults to 1 because the fixture path reads its
+# bytes from a file that was already proved readable; only the tmux path can
+# fail to look.
+pane_capture_ok=1
+# How long after a pane is created `absent` is withheld from a pane with
+# nothing running under it, because a spawn in progress looks exactly like a
+# dead one until the launcher is forked (your-org/nexus-code#777).
+#
+# 90 s is ~3x the worst boot ever reported (#643 recorded ~20-30 s in
+# production; a fixture with the real guards measured 2.86 s, and this host's
+# zsh rc alone runs 1.1-2.2 s under load 48). It bounds a DELAY, not a
+# decision, so erring long costs only reap latency in a pane's first seconds.
+# 0 disables the grace entirely, which is how the negative-control tests prove
+# a genuinely dead pane is still reapable.
+PANE_BOOT_GRACE_SECONDS="${NEXUS_PANE_BOOT_GRACE_SECONDS:-90}"
+[[ "$PANE_BOOT_GRACE_SECONDS" =~ ^[0-9]+$ ]] || PANE_BOOT_GRACE_SECONDS=90
 bg_cpu_override=
 bg_shells_override=
 bg_oldest_start_override=
+bg_infra_override=
+bg_cmd_override=
 while (( $# > 0 )); do
     case "$1" in
         --fixture) fixture="$2"; shift 2;;
@@ -291,6 +535,8 @@ while (( $# > 0 )); do
         --bg-cpu)                      bg_cpu_override="$2"; shift 2;;
         --bg-shells)                   bg_shells_override="$2"; shift 2;;
         --bg-oldest-start)             bg_oldest_start_override="$2"; shift 2;;
+        --bg-infra)                    bg_infra_override="$2"; shift 2;;
+        --bg-cmd)                      bg_cmd_override="$2"; shift 2;;
         --all)
             shift
             if (( $# > 0 )) && [[ "$1" != -* ]]; then
@@ -299,6 +545,7 @@ while (( $# > 0 )); do
                 all_session=0
             fi
             ;;
+        --mcp-shell-risk) mcp_risk_only=1; shift;;
         -h|--help) usage;;
         --) shift; target="${1:-}"; break;;
         -*) usage;;
@@ -323,24 +570,338 @@ fi
 NBSP=$'\xc2\xa0'
 
 _strip_ansi() {
-    # Strip CSI escape sequences for plain-text greps.
-    sed -E $'s/\x1b\\[[0-9;?]*[a-zA-Z]//g'
+    # Strip OSC sequences FIRST, then CSI, for plain-text greps.
+    #
+    # Why OSC matters (cc-update rigor fix). Claude Code's status line can
+    # emit OSC 8 hyperlinks — `ESC ] 8 ; ; <url> ESC \ <anchor> ESC ] 8 ; ;
+    # ESC \` — e.g. a clickable PR badge. A CSI-only strip leaves those raw
+    # bytes inline, immediately adjacent to the footer tokens
+    # _footer_handle_counts anchors on (` · N shell[s] · `, ` · N monitor ·`).
+    # The URL payload can itself carry digits and separators, so surviving
+    # OSC bytes can both HIDE a real handle count (by breaking the ` · `
+    # boundary the regex needs) and FAKE one (by contributing digits).
+    #
+    # Ordering is load-bearing: an OSC payload may legally contain `[`, so
+    # running the CSI pass first would chew a hole in the URL and strand the
+    # terminator.
+    #
+    # MEASURED REACHABILITY (record it, don't assume it): on THIS host
+    # tmux is 2.6, which predates tmux's hyperlink support (added in 3.2)
+    # — it consumes OSC 8 and does NOT re-emit it from `capture-pane -e`,
+    # so these bytes do not currently reach the parser via the live-pane
+    # path (verified 2026-08-06: painted an OSC 8 anchor into an isolated
+    # pane, captured with the same `-p -e` flags used at lines 1153/1394;
+    # anchor text survived, escape bytes did not; 0 of the 28
+    # PRE-EXISTING committed fixtures and 0 of 5 live panes carried OSC
+    # bytes, measured at dc4c76f — the only 2 carrying them at HEAD are
+    # the differential pair added alongside this change). That proof is
+    # VERSION-SCOPED, not structural: on tmux >= 3.2 capture-pane -e does
+    # re-emit hyperlinks, so a host or container upgrade silently makes
+    # them reachable. This strip is the cheap, always-correct guard for
+    # that day; the fixture
+    # monitor/watcher/fixtures/working-background-osc8-prbadge-synthetic.ansi
+    # exercises it independently of the local tmux version.
+    sed -E -e $'s/\x1b\\][^\x07\x1b]*(\x07|\x1b\\\\)//g' \
+           -e $'s/\x1b\\\\//g' \
+           -e $'s/\x1b\\[[0-9;?]*[a-zA-Z]//g'
 }
+
+# Set by `_has_blocked_overlay` to the arm that matched, and emitted as
+# `overlay=<kind>` alongside `state=blocked`. `blocked` alone says "a human
+# decision is pending"; the kind says WHICH, which is the difference between a
+# diagnosis and a shrug — see the bypass-permissions arm below.
+BLOCKED_OVERLAY_KIND=""
 
 _has_blocked_overlay() {
     local plain="$1"
+    BLOCKED_OVERLAY_KIND=""
     if grep -qE 'What do you want to do\?' <<<"$plain" \
        && grep -qE 'Stop and wait for limit' <<<"$plain"; then
+        BLOCKED_OVERLAY_KIND=rate-limit
         return 0
     fi
     if grep -qE 'Do you want to proceed\?' <<<"$plain" \
        && grep -qE $'❯[[:space:]]+[0-9]+\\.' <<<"$plain"; then
+        BLOCKED_OVERLAY_KIND=permission
+        return 0
+    fi
+    if _has_bypass_permissions_modal "$plain"; then
+        BLOCKED_OVERLAY_KIND=bypass-permissions
         return 0
     fi
     if _has_askuq_overlay "$plain"; then
+        BLOCKED_OVERLAY_KIND=askuq
+        return 0
+    fi
+    # LAST arm, deliberately: the four above are TEXT-KEYED and name a specific
+    # decision, so they get first refusal and keep their precise kind. This one
+    # is STRUCTURAL and catches the residue — any select-dialog Claude Code
+    # renders that nobody has enumerated yet (your-org/nexus-code#896).
+    if _has_menu_dialog_frame "$plain"; then
+        BLOCKED_OVERLAY_KIND=$(_name_menu_dialog_kind "$plain")
         return 0
     fi
     return 1
+}
+
+# ---- the structural select-dialog arm (your-org/nexus-code#896) -----------
+#
+# WHAT THIS IS FOR. Claude Code 2.1.232 stopped letting a nested git repo
+# inherit workspace trust from its parent, so every `work/<project>` worker
+# spawn now boots into the folder-trust dialog:
+#
+#   Accessing workspace:
+#   /path/to/work/proj
+#   Quick safety check: Is this a project you created or one you trust? …
+#   ❯ 1. Yes, I trust this folder
+#     2. No, exit
+#   Enter to confirm · Esc to cancel
+#
+# That frame matched NO arm above, so it fell through to the input-row logic,
+# found no `❯<NBSP>` chevron, and landed on `empty` — which means "don't know
+# yet". A worker that will NEVER proceed became indistinguishable from one that
+# had merely not started, for as long as it hung: `_unstick.sh` never fired
+# (its case_B needs `state=blocked`) and the watcher saw an idle-looking window.
+#
+# WHY THIS ARM IS NOT KEYED ON "Yes, I trust this folder". The trust dialog is
+# ONE INSTANCE. Every full-screen dialog Claude Code has ever added lands in the
+# same blind spot, and the next release that adds a modal reopens it — the
+# bypass-permissions modal (#768) was the previous instance and was closed the
+# narrow way, which is why this one still cost a release cycle. A detector that
+# pattern-matches this dialog's WORDING closes the demonstrated repro and leaves
+# the class live. So the test below asks what is true of the RENDERED PANE in
+# the general case, not what is true of this dialog's subject matter, and the
+# `overlay=<kind>` seam carries the naming separately (`_name_menu_dialog_kind`)
+# — the kind is a DIAGNOSTIC, never a precondition for detection.
+#
+# THE THREE CONDITIONS, and what each one is holding off:
+#
+#   (a) NAVIGATION FOOTER in the bottom slice — `Enter to …` / `Esc to …`, the
+#       keyboard-affordance chrome every interactive overlay paints under its
+#       options. Case-SENSITIVE, as a cheap hedge rather than against a measured
+#       hazard, and the distinction is stated because the first draft of this
+#       comment asserted the hazard as fact: a lowercase `(esc to interrupt)`
+#       spinner hint appears in `test-integration/stub-claude.sh` and
+#       `test-engage-long-exchange.sh`, so some Claude Code rendering paints it —
+#       but MEASURED against the real 2.1.224 binary over a 30 s busy window
+#       (samples at 5/10/20 s), a live busy pane contains **zero** occurrences of
+#       `esc to …` OR `Esc to …`: the row is `✻ Smooshing… (16s · ↓ 3 tokens)`,
+#       with no interrupt hint at all. So the lowercase collision is a
+#       possibility this guard is cheap insurance against, NOT something
+#       currently observed. What actually keeps live busy panes out is (c) — see
+#       the measurement recorded there.
+#   (b) A CHEVRON-SELECTED NUMBERED OPTION above that footer, plus at least one
+#       sibling option row — i.e. a menu with a highlighted choice, which is
+#       what makes it a DECISION rather than a notice. The chevron must be
+#       followed by an ASCII space; the REPL input row is `❯` + NBSP, so this
+#       cannot match a user who typed "1. foo" at the prompt.
+#   (c) LIVE, NOT QUOTED: no `❯<NBSP>` REPL input row below the footer. This is
+#       the same structural test `_has_bypass_permissions_modal` settled on
+#       under #776 adversarial review, and for the same reason — a live dialog
+#       REPLACES the REPL, while a pane merely DISCUSSING one is still a running
+#       REPL and keeps its input row underneath. It is a property of what the
+#       two panes ARE, not of how many rows happen to trail the quote.
+#
+#       SCOPE, because the first version of this paragraph over-claimed and the
+#       #896 skeptic refuted it with this repo's own corpus. What was measured:
+#       against the real 2.1.224 binary in a 30 s hang, a live busy pane keeps
+#       its `❯<NBSP>` row below the spinner. What that supports: STEADY-STATE
+#       busy, with the chevron painted. What it does NOT support, and what the
+#       first version asserted, is "every working pane is rejected here" — 5 of
+#       the 7 committed `busy-*` fixtures carry no `❯<NBSP>` at all, including
+#       `busy-mid-render-no-chevron-synthetic.ansi`, a regime this repo has had
+#       a named fixture for since #47. A 30 s steady-state hang samples ONE
+#       regime; the chevron-absent ones are exactly the regimes the claim needed
+#       to cover. Condition (d) below is what actually covers them.
+#
+# DIRECTION-2 (can it stay silent?) is the direction that matters here, because
+# `empty` is load-bearing: `monitor/_bookkeeping.sh:bk_pane_kill_authorized`
+# treats `empty` as INDETERMINATE and already refuses the kill, while `blocked`
+# is in `_BK_ACTIVE_STATES` and refuses it too — so widening `blocked` at the
+# expense of `empty` removes nothing from the kill allowlist and adds nothing to
+# it. The cost of a false positive is therefore NOT a retired live worker; it is
+# the orchestrator chasing a decision that is not pending — and, worse, reading
+# "a human must decide" over a pane that is MID-TURN, losing `queued=1` with it.
+# That is what condition (d) exists for; see the measurement recorded there.
+#
+# It is NOT, as an earlier version of this comment claimed, `_unstick.sh` Case W
+# relaying a phantom `blocked_question`. Case W cannot fire on it: `_unstick.sh`
+# contains no reference to pane-state at all — it takes its own `capture-pane`
+# and gates every arm on co-occurring literals — so nothing here reaches it.
+# Corrected after the #896 skeptic checked the code rather than the story; the
+# suite now drives these panes through `_handle_unstick_window` and asserts it
+# selects no arm, with a rate-limit control proving that silence is a
+# measurement rather than a broken probe.
+#
+# WHAT THIS ARM DOES NOT AUTO-ANSWER. `_unstick.sh` runs its OWN text-keyed
+# detection (`Do you want to proceed?`, `Stop and wait for limit`, the AskUQ
+# chip-bar literals); none of them match the trust dialog, so nothing presses
+# Enter on it. That is the intended posture for a security prompt: SURFACE it,
+# do not silently confirm it. Making the pane visible is this change's whole
+# job; answering it stays a human's.
+#
+# DECLARED COVERAGE BOUNDARY, stated rather than implied. Caught: any dialog
+# rendered in Claude Code's select idiom — numbered options, `❯` cursor,
+# Enter/Esc footer — whatever it asks about. NOT caught: a dialog with a
+# different footer literal, one with no numbered options (a free-text or
+# yes/no-keypress prompt), or one that leaves the REPL row painted underneath.
+# For those the state stays `empty`, i.e. exactly as blind as before this change
+# — no regression, but no coverage either. Closing them needs a new capture from
+# the live binary, not a wider regex guessed at from here.
+_has_menu_dialog_frame() {
+    local plain="$1"
+    local footer_re='(Enter|Esc) to [a-z]'
+
+    # (a) navigation footer within the last 3 non-blank rows.
+    grep -qE "$footer_re" \
+        <<<"$(printf '%s\n' "$plain" | grep -v '^[[:space:]]*$' | tail -n 3)" || return 1
+
+    # Anchor on the LAST footer occurrence, so a pane that quotes a dialog and
+    # is ALSO wedged on one resolves to the live one.
+    local footer_ln
+    footer_ln=$(grep -nE "$footer_re" <<<"$plain" | tail -1 | cut -d: -f1)
+    [[ -n "$footer_ln" ]] || return 1
+
+    # (b) a highlighted numbered option, plus a sibling, ABOVE the footer.
+    local above
+    above=$(head -n "$(( footer_ln - 1 ))" <<<"$plain")
+    grep -qE '^[[:space:]]*❯ +[0-9]+\.[[:space:]]' <<<"$above" || return 1
+    local options
+    options=$(grep -cE '^[[:space:]]*(❯ +)?[0-9]+\.[[:space:]]' <<<"$above")
+    (( options >= 2 )) || return 1
+
+    # (c) no REPL input row below the footer ⇒ the dialog replaced the REPL.
+    if grep -qF "❯${NBSP}" <<<"$(tail -n +"$(( footer_ln + 1 ))" <<<"$plain")"; then
+        return 1
+    fi
+
+    # (d) THE AGENT IS NOT DEMONSTRABLY WORKING. (c) asks whether a REPL row is
+    # PRESENT, which is an absence test, and this repo documents TWO regimes in
+    # which a live REPL paints no `❯<NBSP>` row at all:
+    #
+    #   * the queued-message placeholder — `❯` + ASCII space, deliberately not
+    #     matched by `_find_input_row` (`_detect_queued_message`, #603/#607);
+    #   * the #47 mid-render window, which ships its own fixture
+    #     (`busy-mid-render-no-chevron-synthetic.ansi`).
+    #
+    # In both, (c) is inert, and (a)/(b) are satisfied by any pane QUOTING a
+    # dialog — a shape workers here render constantly, since the trust dialog's
+    # text lives in the issue, in this comment, in `synthesize.sh` and in the
+    # test file. Measured before this condition existed: a busy pane quoting the
+    # dialog went `busy` → `blocked`, and a pane with a queued message went
+    # `busy queued=1` → `blocked overlay=workspace-trust`, swallowing the
+    # do-not-paste signal `#603`/`#607` added. `_has_blocked_overlay` runs FIRST
+    # in the chain — ahead of the over-limit stamp, the queued-message check and
+    # `_detect_busy` — so the false positive preempted every busy signal
+    # downstream. Found by the `#896` skeptic; this is their remedy.
+    #
+    # So the live-ness question is answered with POSITIVE evidence of work in
+    # flight, not only with the absence of a chevron. A real dialog has replaced
+    # the REPL: nothing is streaming, so neither test can fire on one. The
+    # failure direction is back to `empty` — exactly as blind as before `#896`,
+    # never a phantom decision on a working pane.
+    if _detect_busy "$plain" "$(wc -l <<<"$plain")" \
+       || _detect_queued_message "$plain"; then
+        return 1
+    fi
+    return 0
+}
+
+# Name the dialog `_has_menu_dialog_frame` just detected. NAMING ONLY — the
+# detection above never consults this, so an unrecognised dialog is still
+# `blocked`, just under the honest generic kind `dialog` rather than a
+# borrowed one. Add an arm here when a new dialog is worth naming; do NOT add
+# one to make a new dialog detectable, because it already is.
+_name_menu_dialog_kind() {
+    local plain="$1"
+    if grep -qF 'trust this folder' <<<"$plain" \
+       || grep -qE 'Is this a project you created or one you trust\?' <<<"$plain"; then
+        printf 'workspace-trust'; return 0
+    fi
+    printf 'dialog'
+}
+
+# Bypass Permissions warning modal (your-org/nexus-code#768).
+#
+#   WARNING: Claude Code running in Bypass Permissions mode
+#   ❯ 1. No, exit
+#     2. Yes, I accept
+#   Enter to confirm · Esc to cancel
+#
+# WHY THIS NEEDS A NAME OF ITS OWN. On its first boot the binary MIGRATES
+# `.claude.json`'s `bypassPermissionsModeAccepted` into `settings.json` as
+# `skipDangerousModePermissionPrompt: true` and DELETES the original key
+# (measured on 2.1.224). After any boot, the only thing suppressing this modal
+# lives in `settings.json` — so anything that rewrites that file between boots
+# without re-supplying the key wedges the NEXT boot here.
+#
+# Before this arm the modal matched nothing. It has a `❯ N.` menu but not `Do
+# you want to proceed?`, so it fell past every overlay arm to the input-row
+# logic, which finds no `❯<NBSP>` chevron and lands on the tail of case 2:
+#
+#   * production (claude alive, rendering the modal) → `empty`, which means
+#     "don't know yet" and reads as a SLOW BOOT. That mis-signposting is the
+#     entire cost of #768: it burned a probe run of three cells reported as
+#     "VI mode is unreachable", which was nothing of the kind.
+# This arm addresses that path, and ONLY that path.
+#
+# A pane whose pid yields no live claude reports `absent` instead — the ONE
+# kill-authorising state. THIS ARM CANNOT REACH THAT CASE and does not claim to:
+# the liveness gate near the top of the classification chain `exit 0`s a couple
+# of hundred lines before the overlay check below ever runs. Measured (#776
+# skeptic): the live-modal fixture with a dead pane-pid still classifies
+# `absent`, not `blocked`. In production the distinction is moot — a pane wedged
+# on this modal has a live claude rendering it, so the gate is skipped and this
+# arm IS reached — but the `absent` side is upstream territory (`#780`), not
+# something the naming here covers. An earlier version of this comment implied
+# it did.
+#
+# LIVE-vs-QUOTED, and the reason is sharper here than for the AskUserQuestion
+# arm: the modal's text is QUOTED IN THE ISSUE, so any agent reading #768 — or
+# this comment — has all of it on screen. Two option literals gate the shape.
+# Live-ness is gated by TWO tests, and the second is the load-bearing one.
+#
+# WHY NOT A BOTTOM-SLICE MARGIN ALONE. The first version gated live-ness only on
+# `Enter to confirm` landing in the last 3 non-blank rows. The #776 skeptic
+# CONSTRUCTED the pane that defeats it — an idle agent quoting the modal with
+# just two chrome rows below the footer classified `blocked` — leaving a 2-row
+# margin as the only thing separating a wedged worker from one merely discussing
+# the wedge. Their proposed fix was to tighten the window to `tail -n 1`, since
+# the live footer is the last non-blank row. That widens the margin but keeps the
+# margin as the discriminator, and it trades a SAFE-direction error for an
+# UNSAFE one: any trailing chrome on a real wedged pane (a status row, a redraw
+# artefact) would push the footer out of a 1-row window and drop the case back to
+# `empty` — the exact mis-signposting #768 exists to end. Neither of us has a
+# capture of a real wedged pane, so tuning a margin against an unmeasured layout
+# is guessing in the direction that fails silently.
+#
+# So the margin stays generous (3), and a STRUCTURAL test carries the weight: a
+# live modal REPLACES the REPL, so no `❯<NBSP>` input row can appear BELOW the
+# footer. A pane discussing the modal is still a running REPL and keeps its
+# input row underneath. That is a property of what the two panes ARE, not of how
+# many rows happen to trail the quote, so it holds at every margin.
+#
+# RESIDUAL, stated rather than papered over: a pane quoting the modal whose own
+# REPL row has scrolled out of the 25-row capture has no input row below the
+# footer and would still classify `blocked`. The direction is safe — `blocked`
+# is in _BK_ACTIVE_STATES so it is never kill-authorised, and no `_unstick.sh`
+# arm fires on this modal — but the orchestrator would chase a configuration
+# fault that is not there.
+_has_bypass_permissions_modal() {
+    local plain="$1"
+    grep -qF 'Bypass Permissions mode' <<<"$plain" || return 1
+    grep -qF 'Yes, I accept' <<<"$plain" || return 1
+    grep -qF 'Enter to confirm' \
+        <<<"$(printf '%s\n' "$plain" | grep -v '^[[:space:]]*$' | tail -n 3)" || return 1
+    # The structural test. Anchor on the LAST footer occurrence so a pane that
+    # quotes the modal and is *also* wedged on it resolves to the live one.
+    local footer_ln
+    footer_ln=$(grep -nF 'Enter to confirm' <<<"$plain" | tail -1 | cut -d: -f1)
+    [[ -n "$footer_ln" ]] || return 1
+    if grep -qF "❯${NBSP}" <<<"$(tail -n +"$(( footer_ln + 1 ))" <<<"$plain")"; then
+        return 1   # a REPL input row lives below the footer ⇒ the pane is quoting
+    fi
+    return 0
 }
 
 # AskUserQuestion chip-bar overlay (Case D — dialog-guard). Claude
@@ -380,22 +941,82 @@ _has_askuq_overlay() {
 # apostrophe glyph (the TUI has rendered both ' and ’ historically —
 # the pattern anchors on "ve" and skips the apostrophe entirely).
 #
-# Detection still requires BOTH the headline AND a "resets <time>"
-# companion within the bottom 15 rows. The position anchor is
-# load-bearing: a transcript scrollback that paraphrases or quotes
-# the notice elsewhere in the pane would otherwise false-trigger
-# (issue #87 edge case). The companion-line requirement defends
-# against a half-rendered notice (e.g. only the headline visible
-# mid-redraw) and matches the canonical two-line shape. A quoted
-# verbatim notice inside the bottom 15 rows CAN still false-trigger
-# (positional defense only); the consequence is bounded by design —
-# the watcher's hold is capped by the parsed reset time (6h fallback)
-# and fails open with a paste, never latching (_over_limit.sh).
+# Detection tests the banner's STRUCTURE, not substring presence
+# (your-org/nexus-code#571). Three anchors gate it, all on ONE row:
+#
+#   1. POSITION — bottom-15 non-blank rows, so a paraphrase or quote
+#      up in scrollback stays out of the window (issue #87 edge case).
+#   2. CLEAN LEAD-IN — what precedes the headline on its line must be
+#      only whitespace (the subscription banner paints at column 0) OR
+#      the client's own error decoration `● API Error: Request
+#      rejected (<code>) · ` (the retry-exhaustion render, the form
+#      cc-harness/test-realmodel-overlimit pins). A relay or paste
+#      that REPRODUCES the notice renders it as MESSAGE content —
+#      markdown-quoted (`> You've …`), bulleted (`● user pasted:
+#      "You've …"`), or embedded mid-sentence — so the headline is NOT
+#      at a clean lead-in and is rejected.
+#   3. CONTIGUOUS COMPANION — `resets <time>` must follow the headline
+#      on the SAME line (the `· resets` shape both genuine renders
+#      share). This defends against a half-rendered notice (headline
+#      only, mid-redraw) AND against prose that mentions "hit your
+#      limit" and "resets" on separate lines — the loose two-grep form
+#      this replaced false-parked on exactly that.
+#
+# Why NOT a bare `^[[:space:]]*` line-start anchor (the reverted
+# your-org/nexus-code#591): the retry-exhaustion banner paints the
+# headline MID-LINE, prefixed by `● API Error: Request rejected (429)
+# · `. `^[[:space:]]*` does not match that row, so it would have
+# silently BLINDED the detector to the render the repo's own
+# real-binary test treats as a true positive — an invisible miss,
+# strictly worse than a noticed false-park. Verified against the exact
+# CI-captured row; the negative control (strip the prefix → line-start
+# match) isolates the anchor as the cause.
+#
+# Coverage boundary: this matches the two client-EMITTED render forms
+# observed as of 2026-07-30 — the subscription line-start banner and
+# the `API Error` retry-exhaustion line — and rejects markdown /
+# bulleted / prose reproductions. A verbatim quote that reproduces the
+# EXACT client structure at a clean lead-in still matches; that
+# residue is bounded by design — this scrape is the FALLBACK for panes
+# without the StopFailure hook stamp (1b), which is format-independent
+# and the primary signal, and the hold is capped by the parsed reset
+# time and fails open with a paste, never latching (_over_limit.sh).
+# Last N NON-BLANK rows of a captured pane.
+#
+# Every bottom-anchored scan in this file wants "the most recent N rows of
+# CONTENT". `tail -n N` conflates that with "the last N rows of the grid", and
+# the two are the same thing only in the inline renderer, where the transcript
+# abuts the input box.
+#
+# In fullscreen (alternate-screen) rendering the input box is pinned to the
+# bottom of a full-height screen and the gap above it is padded with blank
+# rows. Measured against the real binary via `monitor/cc-harness` at the moment
+# the over-limit notice was painted: 40 rows captured, **10 non-blank**, notice
+# at raw row 32 from the bottom but non-blank row **6**. So `tail -n 15` saw
+# nothing but padding and `_detect_over_limit` returned "no notice" for a pane
+# that was visibly painting one — the renderer fallback silently degrading to
+# `idle` on a rate-limited worker.
+#
+# Stripping blanks keeps both properties the raw form was chosen for: still
+# bottom-anchored (a scrollback mention further up stays out of the window) and
+# still bounded. It only stops blank padding from consuming the budget.
+# your-org/nexus-code#568, TUI-fullscreen item 4.
+_bottom_rows() {
+    grep -v '^[[:space:]]*$' <<<"$1" | tail -n "${2:-15}"
+}
+
 _detect_over_limit() {
     local plain="$1" bottom
-    bottom=$(tail -n 15 <<<"$plain")
-    grep -qE "You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit" <<<"$bottom" || return 1
-    grep -qE 'resets[[:space:]]+[^[:space:]]' <<<"$bottom" || return 1
+    bottom=$(_bottom_rows "$plain" 15)
+    # ONE row must carry the whole banner structure: a clean lead-in
+    # (line-start OR the client `● API Error: Request rejected (<code>)
+    # · ` decoration), the flavor-tolerant headline, and a contiguous
+    # `resets <time>` companion. See the block comment above for why a
+    # bare line-start anchor (#591) is wrong and why the companion is
+    # folded onto the same line. The `·` separators are the literal
+    # U+00B7 middot the TUI paints; the class after each keeps spacing
+    # lenient without loosening adjacency.
+    grep -qE "^[[:space:]]*(● API Error: Request rejected \([0-9]+\)[[:space:]]*·[[:space:]]*)?You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit[[:space:]]*(·[[:space:]]*)?resets[[:space:]]+[^[:space:]]" <<<"$bottom" || return 1
     return 0
 }
 
@@ -409,7 +1030,7 @@ _detect_over_limit() {
 # shape — caller substitutes `unknown`.
 _extract_over_limit_reset() {
     local plain="$1" bottom raw
-    bottom=$(tail -n 15 <<<"$plain")
+    bottom=$(_bottom_rows "$plain" 15)
     # Grab the suffix on the "resets " line, CUT at the next `·`
     # separator — the renderer appends live decoration after the reset
     # time ("… resets 3am (America/Los_Angeles) · Retrying in 8s"
@@ -431,7 +1052,7 @@ _extract_over_limit_reset() {
 # ABOVE the last `❯<NBSP>` input row — emitted as `content_hash=` so
 # the watcher can tell a changing pane from a static one across cycles
 # (your-org/your-nexus#205 follow-up: self-expiring, change-corroborated
-# operator-engaged mark). Two regions are deliberately excluded /
+# operator-engaged mark). Three regions are deliberately excluded /
 # neutralised because they mutate WITHOUT any interaction and would
 # otherwise read as "changing":
 #
@@ -444,6 +1065,14 @@ _extract_over_limit_reset() {
 #     token counters (`↓ 5.7k tokens`), and `+N lines` badges advance
 #     on their own. Stripping every digit neutralises them in one
 #     stroke.
+#   - right-aligned composer NUDGES (`● <tip> · /<cmd>`): under
+#     `tui: fullscreen` these blink in and out of the padded gap ABOVE
+#     the input row on their own timer (your-org/nexus-code#573). They
+#     are non-numeric, so the digit-strip missed them; the fix keys on
+#     RIGHT-JUSTIFICATION — a `●` pushed to the right edge by a LARGE
+#     leading-space run (≥32) is chrome, while a `●` at column 0 or any
+#     small indent is a real assistant response and is preserved. See
+#     the strip below.
 #
 # Trade-off (the "simplest robust definition" — cleanly isolating only
 # the timer/token spans is brittle against renderer churn): output
@@ -466,7 +1095,49 @@ _content_hash() {
     else
         region="$plain"                # no chevron — digest the whole capture
     fi
+    # Drop the fullscreen composer NUDGE lines before hashing
+    # (your-org/nexus-code#573). Under `tui: fullscreen` the input box is
+    # pinned to the bottom of the alternate screen and the gap above it is
+    # padded with blank rows; into that gap Claude Code periodically flashes a
+    # RIGHT-ALIGNED contextual nudge (`● high · /effort`, `● <tip> · /<cmd>`, …)
+    # that appears and vanishes on its own timer. It lands ABOVE the `❯<NBSP>`
+    # input row, so it falls INSIDE this transcript region, and its text is
+    # non-numeric, so the digit-strip below never neutralised it: an
+    # otherwise-idle fullscreen pane's hash churned every time a nudge blinked,
+    # which kept the watcher's change-corroborated engagement mark alive
+    # forever — a window pinned open on a stale mark, the whole of #573.
+    # (Measured against the real binary via monitor/cc-harness on tmux 3.4: over
+    # 60 s of a genuinely-idle fullscreen pane the ONLY moving bytes in this
+    # region were exactly this nudge blinking in and out.)
+    #
+    # The discriminator is RIGHT-JUSTIFICATION, not the bare glyph: every
+    # genuine transcript bullet (an assistant `● …` response) is LEFT-anchored
+    # near column 0, while these nudges are right-justified against the
+    # composer's right edge — pushed there by a long leading-space run. So we
+    # strip a `●` line ONLY when it carries a LARGE leading-space run
+    # (`_NUDGE_MIN_INDENT`, default 32). This is what keeps the strip SAFE on
+    # the UNRECOVERABLE axis (eating real content blinds change-detection and
+    # authorises a kill): a `●` at ANY small indent — a code-fence line, a
+    # pasted TUI capture, `systemctl`-style output, a nested-list bullet — is
+    # PRESERVED. Measured separation is decisive and gives wide margin: real
+    # content sits at ~2–4 leading spaces (deep markdown nesting rarely > ~16),
+    # while the right-justified nudge sits at ~64 spaces on an 80-col pane,
+    # ~103 on 120-col, ~170 on the 187-col panes real workers run — so 32
+    # cleanly splits [≤16] … 32 … [≥64] (your-org/nexus-code#573, skeptic
+    # req-001). An ABSOLUTE space count (not a width-relative midpoint) is
+    # deliberate: it is ASCII-only and so locale-safe, whereas measuring the
+    # row's display width would have to count the multibyte `─` box border and
+    # `●`/`·` glyphs, which awk/`wc` size differently under C vs UTF-8.
+    # Residual error is biased to the RECOVERABLE side: on an implausibly
+    # narrow pane (< ~48 cols) the nudge could fall under the threshold and
+    # leak, merely holding a window open one cycle too long — never a kill.
+    # In the inline renderer the same nudges render BELOW the input row (out of
+    # region), so this filter is a no-op there: one code path, both renderers.
+    local bullet=$'\xe2\x97\x8f'       # ● U+25CF, the nudge's status dot
+    local min_indent="${_NUDGE_MIN_INDENT:-32}"
+    [[ "$min_indent" =~ ^[0-9]+$ ]] || min_indent=32
     printf '%s' "$region" \
+        | grep -vE "^[[:blank:]]{${min_indent},}${bullet}" \
         | tr -d '0-9' \
         | tr -s '[:space:]' ' ' \
         | cksum | cut -d' ' -f1
@@ -482,10 +1153,153 @@ _find_input_row() {
 }
 
 _detect_autosuggest() {
-    # Dim-cursor signature on the input row: reverse-video first char of
-    # the suggestion, immediately followed by faint/dim on the rest.
+    # TWO renderings, both real. Either one is an autosuggest ghost.
     local input_row="$1"
-    grep -qP $'\x1b\\[7m.\x1b\\[0;2m' <<<"$input_row"
+    # (a) Dim-CURSOR signature: reverse-video first char of the
+    #     suggestion, immediately followed by faint/dim on the rest.
+    grep -qP $'\x1b\\[7m.\x1b\\[0;2m' <<<"$input_row" && return 0
+    # (b) Bare DIM RUN after the chevron, with no reverse-video cursor at
+    #     all (your-org/nexus-code#626). The actual bytes, captured live
+    #     on 2026-07-30 from window 0:33:
+    #
+    #         \x1b[39m❯<NBSP>\x1b[2muse (d)
+    #
+    #     Signature (a) requires the `\x1b[7m` cursor, so it does not
+    #     match this at all — which is why NINETEEN windows rendering
+    #     ghost text simultaneously all classified `empty`, the "don't
+    #     know" value. The orchestrator was then left with only the
+    #     unsound `-- INSERT -- + non-blank row ⇒ operator draft`
+    #     heuristic, read the ghosts as unsubmitted drafts, and withheld
+    #     messages for ~30 minutes rather than risk pasting over real
+    #     input. Both arms of that choice cost something; only a
+    #     discriminator resolves it, and SGR 2 is one.
+    _detect_dim_run "$input_row"
+}
+
+# ---- dim CHROME vs dim TEXT (your-org/nexus-code#801) --------------------
+#
+# Erase every dim (SGR 2) segment whose entire visible content is BOX
+# CHROME — the composer's own border — leaving dim segments that carry
+# TEXT untouched. Both dim-keyed readers below run through it first, so
+# "faint" means "the model wrote this", never "the renderer drew a box".
+#
+# WHY. `_detect_dim_run` asks whether a faint run carries a visible
+# character, over `${input_row#*❯}` — everything after the chevron TO END
+# OF LINE. A right-hand box border is dim and it is visible, so it
+# satisfies that test exactly as ghost text does. Measured, not reasoned:
+# an EMPTY input box rendered `…❯<NBSP>\x1b[7m \x1b[0m   \x1b[2m│\x1b[0m`
+# classified `autosuggest-only input=ghost` for 28 s of deterministic
+# polling — `state=idle` was UNREACHABLE for that renderer
+# (monitor/watcher/test-integration/stub-claude.sh, fixed in `#798`).
+#
+# Claude Code does not draw that border TODAY: 9 of 9 idle captures under
+# monitor/watcher/fixtures/ carry no dim run after the chevron, and the
+# rules it does draw are 256-colour grey (`\x1b[38;5;244m`), which is not
+# a whole-parameter 2 and never matched. So this is not a live
+# misclassification — it is a guard resting on a cosmetic property of
+# somebody else's renderer that nothing checked and nobody owns. One
+# border glyph moving inside the captured row flips EVERY idle pane on
+# the board at once.
+#
+# THE SECOND CALLER IS THE DANGEROUS ONE. `_input_row_typed_text` cuts the
+# row at its first dim run and judges only the head. A dim LEFT border
+# sits BEFORE the chevron, so the cut removes the chevron along with it —
+# and a vim-INSERT pane carrying REAL OPERATOR TEXT then reads as empty,
+# which is the exact failure `#603` added that refinement to close. Not a
+# kill (`empty` is not on `bk_pane_kill_authorized`'s allowlist) but an
+# absorbing board-stall, `#657`'s shape. One normaliser, both callers, so
+# the two cannot drift.
+#
+# FAIL DIRECTION IS DELIBERATE. If `sed` is missing or errors, the row is
+# returned UNCHANGED — i.e. the pre-`#801` over-detecting behaviour. A
+# spurious ghost costs the idle/ghost distinction (both states are
+# kill-authorised, and `input=ghost` only ever says "safe to paste", which
+# an empty box also is). A LOST ghost costs `input=?`, which the
+# orchestrator must treat as an operator draft — that is the thirty-minute
+# nineteen-pane stall of `#626`. So the degraded mode is the noisy one.
+#
+# COVERAGE BOUNDARY, AS DATA. Which glyphs count as chrome is
+# monitor/watcher/input-box-chrome.manifest, executed by
+# test-input-box-chrome.sh — one row per glyph with its disposition, so
+# the boundary is a checked fact rather than a claim in this comment. The
+# byte ranges below ARE that boundary: U+2500–U+257F (box drawing) and
+# U+2580–U+259F (block elements). ASCII `|`/`+` are deliberately NOT
+# chrome — they are ordinary characters a suggestion may open with — and
+# the manifest says so, so a renderer that ever draws an ASCII border is a
+# known, recorded gap rather than a surprise.
+#
+# LC_ALL=C is load-bearing: the ranges are BYTE ranges over UTF-8, and the
+# same expression in a UTF-8 locale would be read as codepoints.
+_ESC=$'\x1b'
+# One box-chrome BYTE SEQUENCE. U+2500–U+257F (box drawing) is E2 94 80 …
+# E2 95 BF; U+2580–U+259F (block elements) is E2 96 80 … E2 96 9F.
+_CHROME_BYTES=$'(\xe2\x94[\x80-\xbf]|\xe2\x95[\x80-\xbf]|\xe2\x96[\x80-\x9f])'
+# A whole-parameter SGR 2 introducer — the same anchoring `_detect_dim_run`
+# uses, so the two cannot disagree about what "dim" means.
+_DIM_SGR="${_ESC}\[([0-9]+;)*2(;[0-9]+)*m"
+_strip_dim_box_chrome() {
+    local row="$1" out
+    # <dim introducer><blanks><AT LEAST ONE chrome glyph><blanks/chrome>
+    # <ESC | end-of-row>   →   <ESC | ø>
+    #
+    # The run must contain a chrome glyph. An EMPTY dim run must survive
+    # untouched: `\x1b[7mw\x1b[0;2m\x1b[39m…` — dim introducer immediately
+    # followed by another SGR — is the reverse-video ghost CURSOR signature
+    # that `_detect_autosuggest` arm (a) and `_input_row_typed_text` both key
+    # on. A first draft dropped every content-free dim segment and flipped
+    # all three real autosuggest fixtures to `user-typing`; the suite caught
+    # it, which is why the `at least one chrome glyph` term is written as a
+    # separate mandatory element rather than folded into the `*`.
+    #
+    # No backreference: branch 1's terminator is always the single ESC byte,
+    # so the replacement is that literal byte and the group numbering (which
+    # shifts with every alternation added to _CHROME_BYTES) stops mattering.
+    #
+    # LABEL LOOP, NOT `g` (your-org/nexus-code#801, skeptic F1). Branch 1
+    # CONSUMES the terminating ESC and re-emits it, and `g` resumes scanning
+    # AFTER the emitted byte — so when a dim run's terminator is the NEXT dim
+    # introducer, that next run is never re-examined and ADJACENT runs are
+    # stripped alternately. Measured on this host:
+    #
+    #   \x1b[2m│\x1b[0m               → \x1b[0m           stripped
+    #   \x1b[2m│\x1b[2m│\x1b[0m       → \x1b[2m│\x1b[0m    ONE SURVIVES  ← the gap
+    #   \x1b[2m│\x1b[2m│\x1b[2m│…     → \x1b[2m│\x1b[0m    ONE SURVIVES
+    #
+    # A survivor is a dim run carrying a visible character, so BOTH halves of
+    # `#801` come straight back on a doubled border: `state=idle` unreachable,
+    # and a vim-INSERT pane holding real operator text reading `empty`/`?`.
+    # `:a … ;ta` substitutes ONE occurrence and re-runs from the start of the
+    # line until nothing more matches, so adjacency cannot hide a run.
+    #
+    # Not live today — 0 of 36 checked-in captures carry adjacent DIM
+    # introducers — but 22 of 36 carry back-to-back SGR sequences generally,
+    # so adjacent emission is ordinary in this renderer and only the dimness
+    # is accidental. That is the same standing this whole guard rests on.
+    out=$(printf '%s' "$row" | LC_ALL=C sed -E \
+        -e ":a" \
+        -e "s/${_DIM_SGR}[ \t]*${_CHROME_BYTES}([ \t]|${_CHROME_BYTES})*${_ESC}/${_ESC}/;ta" \
+        -e "s/${_DIM_SGR}[ \t]*${_CHROME_BYTES}([ \t]|${_CHROME_BYTES})*$//" \
+        2>/dev/null) || { printf '%s' "$row"; return 0; }
+    printf '%s' "$out"
+}
+
+# A faint/dim (SGR 2) run carrying visible TEXT on the input row.
+#
+# The parameter match is anchored so `2` must be a WHOLE SGR parameter:
+# `\x1b[2m` and `\x1b[0;2m` match, while `\x1b[22m` (normal intensity)
+# and `\x1b[32m` (green) do not. Getting that wrong would classify
+# ordinary coloured text as a ghost.
+#
+# Requires a visible character AFTER the dim introducer, so a dim run
+# with nothing in it — or an empty input box — does not match. Box chrome
+# is erased first (`_strip_dim_box_chrome`, your-org/nexus-code#801), so a
+# dim closing border is not mistaken for a suggestion.
+_detect_dim_run() {
+    local input_row="$1"
+    local tail_text="${input_row#*❯}"
+    [[ "$tail_text" != "$input_row" ]] || return 1
+    tail_text=$(_strip_dim_box_chrome "$tail_text")
+    grep -qP $'\x1b\\[(?:\\d+;)*2(?:;\\d+)*m[ \t]*[^\x1b \t]' <<<"$tail_text"
 }
 
 _detect_user_typing() {
@@ -514,6 +1328,87 @@ _detect_busy() {
     grep -qE '[↓↑] +[0-9]+(\.[0-9]+)?[kKmM]? +tokens' <<<"$window"
 }
 
+_detect_queued_message() {
+    # Claude Code REPLACES the input row with a queued-message
+    # placeholder while a turn is in flight and the operator (or
+    # orchestrator) has submitted text behind it:
+    #
+    #     ❯ Press up to edit queued messages
+    #
+    # Note the ASCII space, NOT the `❯<NBSP>` of the real input row —
+    # so `_find_input_row` does not match it and classification used to
+    # fall through to `empty`, the most ambiguous value available, for
+    # the ONE situation an orchestrator most needs to read correctly:
+    # input is pending AND the agent is occupied (your-org/nexus-code
+    # #603, #607).
+    #
+    # A queued message is POSITIVE evidence of both facts, so it is
+    # never ambiguous. Callers see it as `busy` (every existing consumer
+    # already treats `busy` as never-kill, never-paste — no consumer
+    # audit required, and no permissive default can be inherited by a
+    # brand-new state token) plus a `queued=1` field carrying the extra
+    # bit. `busy` is not a euphemism here: Claude Code only queues while
+    # a turn is running, and the queue flushes the moment it ends, so
+    # "a message is queued" ENTAILS "a turn is in flight".
+    local plain="$1"
+    grep -qF 'Press up to edit queued messages' <<<"$(_bottom_rows "$plain" 15)"
+}
+
+_detect_vim_insert() {
+    # Claude Code's vim input mode renders a `-- INSERT --` indicator in
+    # the status line. In that mode the operator's typed text does NOT
+    # reliably carry the bright-white SGR (`\x1b[38;5;231m`) that
+    # `_detect_user_typing` keys on — which is how two panes sitting in
+    # `-- INSERT --` WITH VISIBLE OPERATOR TEXT were classified
+    # `empty active=0` on 2026-07-29 and became kill candidates.
+    local plain="$1"
+    grep -qE -- '--[[:space:]]*INSERT[[:space:]]*--' <<<"$(_bottom_rows "$plain" 15)"
+}
+
+_input_row_typed_text() {
+    # Does the input row carry text the OPERATOR typed, as opposed to an
+    # autosuggest ghost? Takes the RAW (ANSI-bearing) row, because the
+    # discriminator is an escape sequence.
+    #
+    # A first cut of this deliberately did not exclude ghost text, on
+    # the reasoning that mistaking a ghost for real input is the
+    # recoverable error. That reasoning was WRONG, and the existing
+    # pane-state fixtures caught it: the autosuggest fixtures also
+    # render `-- INSERT --`, so every ghost became `user-typing`. And
+    # `autosuggest-only` is itself a kill-authorising state — so the
+    # "safe" direction was not safe, it just moved which well-tested
+    # distinction got destroyed.
+    #
+    # The precise discriminator: the ghost BEGINS at the reverse-video/
+    # dim pair (`\x1b[7m.\x1b[0;2m`). Anything before that on the row is
+    # what the operator actually typed. So cut the row there and judge
+    # only the head — which handles the case a naive test cannot: vim
+    # INSERT mode with a typed prefix AND a ghost completion after it.
+    local raw="$1" head
+    # Box chrome first (your-org/nexus-code#801). Both cuts below truncate
+    # the row at a dim run, and a dim LEFT border precedes the chevron — so
+    # without this the cut takes the chevron with it and a vim-INSERT pane
+    # holding real operator text reads as empty, the very reading `#603`
+    # added this function to prevent.
+    raw=$(_strip_dim_box_chrome "$raw")
+    head=$(printf '%s' "$raw" | sed -E $'s/\x1b\\[7m.\x1b\\[0;2m.*$//') || head="$raw"
+    # …and the bare-dim rendering of the same thing (#626): everything
+    # from the first whole-parameter SGR 2 onward is ghost. Without this
+    # the vim-INSERT refinement promotes a ghost to `user-typing`, which
+    # is the SECOND direction of the same root cause — the first being
+    # `empty` treated as authorising a kill.
+    head=$(printf '%s' "$head" | sed -E $'s/\x1b\\[([0-9]+;)*2(;[0-9]+)*m.*$//')
+    head=$(printf '%s' "$head" | _strip_ansi)
+    local tail_text="${head#*❯}"
+    # The chevron is followed by a NON-BREAKING space (U+00A0), which
+    # `[[:space:]]` does NOT match in the C locale this script runs
+    # under — leaving it in would make every EMPTY vim-mode input box
+    # read as "has text" and pin such panes open forever. Drop it
+    # explicitly, then judge on ordinary whitespace.
+    tail_text="${tail_text//$NBSP/}"
+    [[ -n "${tail_text//[[:space:]]/}" ]]
+}
+
 _detect_empty_input() {
     # Empty box: cursor is the first reverse-video cell, contains a
     # space, no autosuggest tail, no bright user text.
@@ -533,7 +1428,53 @@ _detect_empty_input() {
     # order (user-typing > busy > autosuggest > empty) has already ruled
     # out the bright-text and dim-autosuggest cases, so a bare trailing
     # `\x1b[7m ` is unambiguously the empty cursor.
-    grep -qP $'\x1b\\[7m $' <<<"$input_row"
+    grep -qP $'\x1b\\[7m $' <<<"$input_row" && return 0
+    # NOTHING AFTER THE CHEVRON — your-org/nexus-code#657.
+    #
+    # Both arms above require a reverse-video cursor cell (`\x1b[7m`).
+    # Claude Code 2.1.220 renders the idle input box of a pane nobody is
+    # looking at as a BARE CHEVRON — the row simply ends at `❯<NBSP>`,
+    # with no cursor cell at all. Captured live, the whole row:
+    #
+    #     \x1b[39m❯<NBSP>
+    #
+    # So neither arm matches, and the row equally carries no dim run and
+    # no bright-white marker: every detector returns false, `input=`
+    # falls through to `?`, and the pane emits `empty`.
+    #
+    # That is ABSORBING, which is what makes it a board-stopper rather
+    # than a blemish. The classification depends on chrome that is
+    # always rendered, never on transient content, so no amount of
+    # waiting clears it: ten wrapped workers sat in `empty`/`input=?`
+    # simultaneously for up to 68 h, every one of them refused by
+    # `retire-preflight.sh` (correctly — it was told INDETERMINATE) and
+    # therefore unretirable through the sanctioned path.
+    #
+    # The fix is deliberately in CLASSIFICATION, not authorisation.
+    # `empty` still means "don't know yet" and the kill allowlist is
+    # untouched; this makes a pane that was never actually ambiguous
+    # report what it is. "Nothing follows the chevron" is an
+    # OBSERVATION, not an inference — it is the definition of an empty
+    # input box, and it is the same predicate `_input_row_typed_text`
+    # already trusts in the other direction to decide a vim-mode box is
+    # empty.
+    #
+    # This subsumes both arms above (their reverse-video cursor cell
+    # strips to a lone space, which is whitespace). They are kept
+    # because they are cheap, they document the renderings that
+    # motivated them, and a narrow byte-exact match failing open into a
+    # general one is the right layering — not the reverse.
+    #
+    # NBSP is dropped explicitly: the chevron is followed by U+00A0,
+    # which `[[:space:]]` does NOT match in the C locale this script
+    # runs under, so leaving it in would make every empty box read as
+    # "has content" — the precise trap `_input_row_typed_text` documents
+    # at its own tail.
+    local after
+    after=$(printf '%s' "$input_row" | _strip_ansi)
+    after="${after##*❯}"
+    after="${after//$NBSP/}"
+    [[ -z "${after//[[:space:]]/}" ]]
 }
 
 # Walk the pane's process tree for a live `claude` (or `claude-code`)
@@ -581,9 +1522,151 @@ _pane_has_live_claude() {
     return 1
 }
 
+# Does pane_pid have ANY live (non-zombie) descendant? — your-org/nexus-code#643
+#
+# This is the discriminator between the two situations `_pane_has_live_claude`
+# returning false cannot tell apart:
+#
+#   * NOT YET BORN — the window was just spawned and the generated
+#     /tmp/spawn-launcher-*.sh is still running its preamble (shim precondition,
+#     write probe, guard block) and has not reached `exec claude`. Measured at
+#     2.86 s in a fixture with the real guards; longer in production, where the
+#     reporter observed ~20-30 s.
+#   * TRULY DEAD — the inner REPL exited and the pane is back at a bare shell,
+#     with tmux's `remain-on-exit on` leaving stale bytes on screen.
+#
+# Both have no `claude` in the tree. Only the first has anything RUNNING under
+# the pane shell, so descendant-liveness separates them — and it separates them
+# on the axis the mechanism actually varies on, which a grace period does not.
+# A timer would have to guess a duration; this asks the question directly, so it
+# is still correct for a launcher slower than any threshold anyone would pick,
+# and it needs no tuning when the preamble gains a step.
+#
+# Deliberately generic ("any descendant") rather than pattern-matching the
+# launcher name: a matcher keyed on `spawn-launcher-*` would silently regress to
+# the old behaviour the day the launcher is renamed or an intermediate wrapper
+# is added — a guard whose coverage boundary is drawn on a name nobody
+# re-checks. The cost of being generic is that a pane whose agent died while
+# some unrelated background process lingers reports `unknown` instead of
+# `absent`. That is the SAFE direction and it is also the HONEST one: something
+# is running there, so "positively dead" is not a claim this classifier can
+# make.
+#
+# CORRECTION (your-org/nexus-code#777): this comment used to justify "SAFE" with
+# the parenthetical "(both are off the kill allowlist)". That is false, and
+# false in the direction that matters — `absent` IS on
+# `_bookkeeping.sh:bk_pane_kill_authorized`'s allowlist; it is the whole reason
+# the state exists. Only `unknown` is off it. The DIRECTION the sentence argues
+# for is right (downgrading toward `unknown` is safe); the reason given was
+# backwards, and a reader checking the claim would have concluded the gate was
+# harmless in both directions when a wrong `absent` is precisely the one that
+# is not.
+_pane_has_live_descendant() {
+    local pane_pid="$1"
+    [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 1
+    command -v pgrep >/dev/null 2>&1 || return 1
+    local depth queue next pid pstate
+    queue="$pane_pid"
+    for depth in 0 1 2 3 4 5; do
+        next=""
+        for pid in $queue; do
+            next+=" $(pgrep -P "$pid" 2>/dev/null | tr '\n' ' ')"
+        done
+        queue=$(printf '%s' "$next" | tr -s ' ')
+        # A queue of nothing but whitespace means this layer had no children.
+        [[ -n "$(printf '%s' "$queue" | tr -d '[:space:]')" ]] || return 1
+        for pid in $queue; do
+            # Zombies do NOT count as live, for the same reason they do not in
+            # _pane_has_live_claude: an unreaped table entry is an exited
+            # process, and treating it as running would hold a genuinely dead
+            # pane out of `absent` for as long as the reap is delayed.
+            pstate=$(ps -o state= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+            [[ -n "$pstate" && "$pstate" != Z* ]] && return 0
+        done
+    done
+    return 1
+}
+
+# Can this process even SEE processes? — your-org/nexus-code#777
+#
+# `_pane_has_live_claude` and `_pane_has_live_descendant` both answer "no" two
+# ways that are indistinguishable at their return value: the tree really is
+# empty, or `ps`/`pgrep` could not tell us. The second is not a negative
+# observation, it is the ABSENCE of one — and the gate below converts it into
+# `absent`, the ONE kill-authorising state. That is `#612`'s "exit 79 NOT
+# CHECKED, never 0" reproduced inside this file: the tmux-missing arm already
+# reasons correctly ("we have not looked ⇒ `unknown`") barely thirty lines
+# away, and this is the same reasoning with the opposite conclusion.
+#
+# Measured, both on this host, against a fixture whose bytes classify alive:
+#   pgrep stubbed to `exit 1` → state=absent
+#   ps    stubbed to `exit 1` → state=absent
+#
+# So probe the capability DIRECTLY, on ourselves, where the answer is known in
+# advance: `ps` must see this very shell, and `pgrep -P` must find a child we
+# just forked. A tool that cannot find a process we KNOW exists is blind, and
+# its silence about the pane tells us nothing.
+#
+# Deliberately a self-probe rather than a probe of pane_pid: "ps cannot see
+# pane_pid" is the CORRECT reading when the pane process is genuinely gone
+# (the fixture-mode `--pane-pid <dead-pid>` contract depends on it), so
+# conflating the two would trade this defect for its mirror image and make a
+# dead pane unreapable. One extra fork, only on the path about to assert
+# `absent`.
+_proc_view_functional() {
+    command -v pgrep >/dev/null 2>&1 || return 1
+    command -v ps >/dev/null 2>&1 || return 1
+    # `ps` must see the process asking the question.
+    [[ -n "$(ps -o comm= -p "${BASHPID:-$$}" 2>/dev/null | tr -d '[:space:]')" ]] || return 1
+    # `pgrep -P` must find a child we know exists. Reaped immediately; the
+    # sleep duration only has to outlive the pgrep.
+    local kid=""
+    # `$BASHPID`, NOT `$$`. `$$` is the ORIGINAL shell's pid and does not change
+    # inside a subshell, so a caller that invokes this from a command
+    # substitution forks the probe child under the SUBSHELL while `pgrep -P $$`
+    # asks about the top-level script — zero matches, and this function then
+    # reports the very blindness it exists to detect. Deterministic, not flaky:
+    # measured 5/5 on the first draft of `#788`'s `_absent_evidence`, which
+    # called it from `tok=$(…)` and turned a dead-pid fixture from `absent` into
+    # `unknown reason=proc-view-blind`. `$BASHPID` is the CURRENT shell's pid and
+    # is correct in both positions (bash 4.0+; this file already requires 4.4).
+    local me="${BASHPID:-$$}"
+    sleep 30 &
+    # `$!` is UNSET — not empty — when the background fork FAILED, and this
+    # file runs `set -u`, so a bare `kid=$!` aborts pane-state.sh outright and
+    # it emits NOTHING. That would happen in precisely the fork-starved
+    # condition this probe exists to detect (the worker RLIMIT_NPROC ceiling,
+    # your-org/nexus-code#487), turning "we could not look" into a crash
+    # instead of the `unknown` this whole function exists to produce.
+    # Measured: `bash -c 'set -u; echo $!'` is "unbound variable" on both 4.4
+    # and 5.2.
+    set +u; kid=$!; set -u
+    [[ -n "$kid" ]] || return 1
+    local seen
+    seen=$(pgrep -P "$me" 2>/dev/null | grep -c "^${kid}\$")
+    kill "$kid" 2>/dev/null      # pid-scoped: a child this function just forked
+    wait "$kid" 2>/dev/null
+    [[ "$seen" == 1 ]]
+}
+
+# Age of the pane's own process, in whole seconds. Prints nothing when it
+# cannot be determined (no ps, or the pid is gone). your-org/nexus-code#777.
+#
+# tmux forks the pane process when it CREATES the pane, so this process's
+# elapsed time IS the pane's age — no tmux format string exposes it directly,
+# and `#{window_activity}` tracks output, not creation.
+_pane_age_seconds() {
+    local pane_pid="$1" age
+    [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 1
+    age=$(ps -o etimes= -p "$pane_pid" 2>/dev/null | tr -d '[:space:]')
+    [[ "$age" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$age"
+}
+
 # Walk the BACKGROUND-SHELL subtrees living under claude in the pane's
-# process tree (your-org/nexus-code#445, extended for #455). ONE walk,
-# three space-separated fields on stdout: `<count> <cpu> <reliable>`.
+# process tree (your-org/nexus-code#445, extended for #455 and #590). ONE
+# walk, six space-separated fields on stdout:
+#     `<count> <cpu> <reliable> <oldest_epoch> <infra> <descriptor>`
 #
 #   count    number of top-level background-shell subtrees rooted
 #            DIRECTLY under claude — the process-truth analogue of the
@@ -618,29 +1701,209 @@ _pane_has_live_claude() {
 #            to the footer/heartbeat signal rather than trust a possibly
 #            blind `0`.
 #
+#   infra    how many of those `count` roots are NEXUS PROTOCOL WAIT LOOPS
+#            rather than task work (your-org/nexus-code#590). See the
+#            classification note below. Purely additional information: it
+#            does NOT change `count`, `cpu`, `reliable` or the resulting
+#            pane state, so the `working-background` verdict and the
+#            `parked-awaiting-skeptic` exemption that keys off it are
+#            unaffected. Only the wrapped-with-children INCONSISTENCY
+#            decision in the watcher's idle probe consumes it.
+#
+#   descriptor a space-free `<comm>:<cmd-tail>` label for ONE representative
+#            root, so an emit can NAME the live child instead of reporting a
+#            bare count. A non-infra root is preferred (that is the
+#            actionable one); `-` when there are no roots at all.
+#
+# CLASSIFYING A ROOT AS PROTOCOL INFRASTRUCTURE (#590).
+# The wrapped-with-children inconsistency fired routinely on every
+# skeptic-gated worker, which trains the operator to dismiss it — and then
+# the genuine case (a real orphaned `sbatch`/`nohup`) arrives looking like
+# the twenty false ones before it. The cause is NOT the MCP server it was
+# blamed on: an `mcpServers` entry whose `command` is a non-shell (`uvx`,
+# `npx`, `node`, `python` — every server this nexus configures) is spawned by
+# claude directly and so is already excluded by the is-a-shell test. Verified
+# on the live tree, where the zotero server appears as comm=`uv` with a
+# `python` child and contributes 0 to `count`.
+#   SCOPE, precisely — the first version of this comment overclaimed that an
+#   MCP server can never reach the count, and a reviewer built the
+#   counterexample. The retraction, and the reasoning behind it, live ONCE in
+#   the "MCP servers:" note below, next to the is-a-shell allow-list that
+#   actually implements the exclusion; do not restate it here. The short of
+#   it: `command` is an ARBITRARY executable, so a legal `command: "sh"` entry
+#   DOES yield a persistent shell child of claude and is counted, classified
+#   non-infra. No such server is configured here, and the process tree cannot
+#   distinguish it from a task shell (see the foreground-tool-shell note
+#   below), so this is a known residual rather than a closed case, guarded by
+#   `_pane_mcp_shell_risk` (`pane-state.sh --mcp-shell-risk`). What is
+#   verified is narrower and still sufficient: excluded for every MCP server
+#   configured with a non-shell `command`, which is all of them today.
+#
+#   (Two independent fixes for the same finding landed on this file —
+#   your-org/nexus-code#598 here and #612 below — and the merge carried both,
+#   so the retraction appeared twice and the refuted phrase read as a claim
+#   the file still makes. #612's own test caught it. One retraction, beside
+#   the mechanism; this paragraph points at it.)
+# The actual
+# routine child is the worker's own `skeptic-channel await` re-check loop:
+# `ng wrap-up` is what tells the worker to hold it in a background shell,
+# and it keeps polling for up to its await timeout AFTER a returned verdict
+# has cleared the pending marker — so the `parked-awaiting-skeptic`
+# exemption lapses while the prescribed child is still alive.
+# The discriminator is therefore what the shell is RUNNING, matched against
+# the nexus's OWN protocol commands — a structural property of this
+# codebase, not a third-party package name (matching e.g. `zotero` would be
+# exactly the brittle, package-specific test #590 rules out). The match runs
+# over every process in the subtree, not just the root shell, so it holds
+# whether the protocol command sits in the shell's own argv (an eval'd
+# `zsh -c` tool shell) or in a descendant process.
+#
 # What counts, and why the scoping matters: we walk the pane tree and
 # tally shell subtrees rooted UNDER claude. This EXCLUDES claude/node
 # itself (its idle event loop always ticks, which would defeat a progress
-# test) and EXCLUDES MCP-server subprocesses (spawned by claude directly
-# as `node`/`python`/`uv`, never through a shell) — an MCP server's steady
-# idle CPU must not masquerade as background-compute progress, nor inflate
-# the shell count. The launcher shell hosting claude (the pane's own pid)
-# is likewise excluded because it sits ABOVE claude, not under it.
+# test). The launcher shell hosting claude (the pane's own pid) is likewise
+# excluded because it sits ABOVE claude, not under it.
+#
+# MCP servers: excluded by the is-a-shell allow-list below, for every MCP
+# server whose configured `command` is not a shell. That is a CONFIGURATION
+# property, NOT a structural invariant, and the distinction is load-bearing.
+# This comment previously read "spawned by claude directly as
+# `node`/`python`/`uv`, NEVER through a shell", which is false as written: an
+# `mcpServers` entry's `command` is an arbitrary executable, and
+# `command: "sh"` (the ordinary idiom for env setup or a pipeline) is legal.
+# A skeptic built exactly that entry and observed it enter the count as a
+# non-infra background shell — reopening the false positive the exclusion is
+# credited with closing. Every server configured HERE today is safe
+# (`npx`, `uvx`, and an HTTP entry with no `command` at all, so they surface
+# as `node`/`uv` and cannot match), but "has never entered the count" and
+# "cannot enter the count" are different claims and only the first is true.
+#
+# The gap is guarded rather than papered over: `_pane_mcp_shell_risk` reads
+# the configured MCP commands and reports `shell:<names>` when one of them
+# WOULD be counted. Run it (`pane-state.sh --mcp-shell-risk`) when a
+# background-shell count has no obvious owner. It reports `unknown` — never
+# `none` — when it cannot read the configuration, because a probe that
+# answers "clean" because it failed to look is the same defect one level up.
+#
 # Verified against the live process tree (your-org/nexus-code#455): an
 # idle claude with no background job has zero shell children; a real
 # `run_in_background` shell (e.g. a supervisor until-loop) is a direct
-# claude child and counts; an MCP server is a `uv`/`python` child and does
-# not.
+# claude child and counts; a `uv`/`python` MCP child does not.
 #
 # Bounded BFS (depth cap) so a pathological tree can't run away. Prints
-# `0 0 0` when there is no live claude, no readable /proc, or pgrep is
+# `0 0 0 0 0 -` when there is no live claude, no readable /proc, or pgrep is
 # unavailable.
+# The is-a-shell allow-list, in ONE place. Both the /proc walk (against
+# `comm`) and the MCP-config probe (against a configured `command`'s
+# basename) ask through this predicate, so the two cannot drift into
+# disagreeing about what a shell is — which is the only way the probe below
+# could certify a configuration the walk would then count.
+_pane_comm_is_shell() {
+    case "${1:-}" in
+        bash|sh|zsh|dash|ksh|fish|-bash|-zsh|-sh) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# _pane_mcp_shell_risk
+#
+# Answer the question the comment above no longer asserts away: could a
+# configured MCP server be counted as a background task shell?
+#
+# Prints exactly one of:
+#   none              no configured MCP server has a shell `command`
+#   shell:<names>     at least one does — comma-separated server names.
+#                     A background-shell count on this host may include it.
+#   unknown:<reason>  the question could not be answered
+#
+# It NEVER prints `none` because it failed to look. `unknown` is a distinct
+# outcome from `none` for the same reason `#584`'s skipped case is distinct
+# from a pass: a check that did not run must not be reported as a check that
+# came back clean.
+#
+# Config surfaces are enumerated explicitly (Claude Code reads MCP config
+# from several), and the enumeration itself is the fragile part — a server
+# configured somewhere not listed here is invisible. That is why an
+# unreadable-or-unparsable file degrades to `unknown` rather than being
+# skipped: the failure is at least visible. NEXUS_MCP_CONFIGS (colon-
+# separated) overrides the list, for tests and for an operator whose harness
+# stores config elsewhere.
+_pane_mcp_shell_risk() {
+    local -a files=()
+    if [[ -n "${NEXUS_MCP_CONFIGS:-}" ]]; then
+        local IFS=:
+        read -r -a files <<<"$NEXUS_MCP_CONFIGS"
+    else
+        files=(
+            "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+            "$HOME/.claude/settings.json"
+            "$HOME/.claude.json"
+            "${NEXUS_ROOT:-.}/.mcp.json"
+            "./.mcp.json"
+        )
+    fi
+
+    local -a present=()
+    local f
+    for f in "${files[@]}"; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        if [[ ! -r "$f" ]]; then printf 'unknown:unreadable:%s' "$f"; return 0; fi
+        present+=("$f")
+    done
+    (( ${#present[@]} )) || { printf 'none'; return 0; }
+
+    command -v jq >/dev/null 2>&1 || { printf 'unknown:no-jq'; return 0; }
+
+    local -a hits=()
+    local cmds name base line
+    for f in "${present[@]}"; do
+        # Both the top-level `mcpServers` map and the per-project ones. An
+        # entry with no `command` (an HTTP/SSE server) yields nothing and is
+        # correctly not a risk — it spawns no local process at all.
+        cmds=$(jq -r '
+            [ (.mcpServers // {}) ,
+              ( (.projects // {}) | to_entries | map(.value.mcpServers // {}) )
+            ] | flatten
+              | map(to_entries) | flatten
+              | map(select(.value.command != null))
+              | .[] | "\(.key)\t\(.value.command)"
+        ' -- "$f" 2>/dev/null) || { printf 'unknown:unparsable:%s' "$f"; return 0; }
+        # jq exiting 0 with empty output is a legitimate "no entries"; jq
+        # failing is caught above. A malformed file makes jq fail, so it
+        # cannot be mistaken for an empty one.
+        while IFS=$'\t' read -r name cmd; do
+            [[ -n "${cmd:-}" ]] || continue
+            base="${cmd##*/}"
+            _pane_comm_is_shell "$base" && hits+=("$name")
+        done <<<"$cmds"
+    done
+
+    if (( ${#hits[@]} )); then
+        local joined; printf -v joined '%s,' "${hits[@]}"
+        printf 'shell:%s' "${joined%,}"
+    else
+        printf 'none'
+    fi
+}
+
+# Diagnostic dispatch (--mcp-shell-risk). Placed here rather than in the
+# option loop because the loop runs before these definitions exist.
+if (( ${mcp_risk_only:-0} )); then
+    printf '%s\n' "$(_pane_mcp_shell_risk)"
+    exit 0
+fi
+
 _pane_background_shells() {
     local pane_pid="$1"
     if ! [[ "$pane_pid" =~ ^[0-9]+$ ]] || ! command -v pgrep >/dev/null 2>&1; then
-        printf '0 0 0'; return 0
+        printf '0 0 0 0 0 -'; return 0
     fi
     local total=0 count=0 proc_ok=0 claude_found=0
+    # #590 bookkeeping, keyed on the ROOT pid of each background-shell subtree:
+    #   infra_roots  space-delimited " pid " list of roots proven to be nexus
+    #                protocol wait loops (matched anywhere in their subtree)
+    #   root_descs   newline-delimited "<pid>\t<descriptor>" for every root
+    local infra_roots=" " root_descs=""
     # Oldest background-shell subtree ROOT start time, in clock ticks since
     # boot (`/proc/<pid>/stat` field 22). Converted to an epoch by the caller
     # side of this function. This is what makes the with-children episode age
@@ -648,14 +1911,18 @@ _pane_background_shells() {
     # count, by a pane rendering, or by a watcher restart (#455 follow-up, the
     # round-2 skeptic's finding). 0 = no background shell / unknown.
     local oldest_ticks=0
-    # Queue entries: "pid:below_claude:parent_in_bgshell".
-    local queue="${pane_pid}:0:0" depth
+    # Queue entries: "pid:below_claude:parent_in_bgshell:bgshell_root_pid".
+    # The 4th field (#590) attributes every node inside a background-shell
+    # subtree back to the ROOT that owns it, so a protocol command found on a
+    # DESCENDANT (not just in the root shell's own argv) classifies that root.
+    local queue="${pane_pid}:0:0:0" depth
     for depth in 0 1 2 3 4 5 6 7 8 9; do
         [[ -n "$queue" ]] || break
-        local next="" entry pid below pinbg
+        local next="" entry pid below pinbg bgroot
         for entry in $queue; do
-            IFS=: read -r pid below pinbg <<<"$entry"
+            IFS=: read -r pid below pinbg bgroot <<<"$entry"
             [[ "$pid" =~ ^[0-9]+$ ]] || continue
+            [[ "$bgroot" =~ ^[0-9]+$ ]] || bgroot=0
             # Parse /proc/<pid>/stat: `pid (comm) state ppid ... utime stime`.
             # comm may contain spaces/parens — split on the LAST ') '.
             # Read via `read <` (NOT `$(< file)` — that command-substitution
@@ -676,15 +1943,21 @@ _pane_background_shells() {
             # starttime (stat field 22) = idx19.
             local utime="${f[11]:-}" stime="${f[12]:-}" starttime="${f[19]:-}"
             local is_shell=0 is_claude=0 in_bg=0
+            # Shared predicate — see _pane_comm_is_shell. Kept in one place so
+            # the MCP-config probe cannot certify a `command` this walk would
+            # then count.
+            _pane_comm_is_shell "$comm" && is_shell=1
             case "$comm" in
-                bash|sh|zsh|dash|ksh|fish|-bash|-zsh|-sh) is_shell=1 ;;
                 claude|claude.exe|claude-code) is_claude=1 ;;
             esac
             (( is_claude == 1 )) && claude_found=1
             # A background-shell subtree ROOT: a shell directly under claude
             # whose parent was NOT already inside a bg-shell subtree (so a
             # nested subshell of the same job doesn't double-count).
+            local is_root=0
             if (( below == 1 )) && (( is_shell == 1 )) && (( pinbg == 0 )); then
+                is_root=1
+                bgroot="$pid"           # this node owns its own subtree (#590)
                 count=$(( count + 1 ))
                 # Track the OLDEST such root: the episode began when the
                 # longest-lived background shell started. Shells coming and
@@ -692,6 +1965,27 @@ _pane_background_shells() {
                 if [[ "$starttime" =~ ^[0-9]+$ ]] \
                    && { (( oldest_ticks == 0 )) || (( starttime < oldest_ticks )); }; then
                     oldest_ticks="$starttime"
+                fi
+            fi
+            # #590: read the cmdline for any node inside a background-shell
+            # subtree — the root gets a human-readable descriptor, and ANY node
+            # matching a nexus protocol wait marks its owning root as
+            # infrastructure. Bounded: only inside bg subtrees, so an idle
+            # worker with no background children reads no cmdlines at all.
+            if (( is_root == 1 )) || { (( below == 1 )) && (( pinbg == 1 )); }; then
+                # /proc/<pid>/cmdline is NUL-delimited, so `tr` (not `read`,
+                # which would stop at the first argument) is what yields the
+                # whole command. A pid that exits mid-walk just yields empty.
+                local cmdl=""
+                cmdl=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | head -c 4096)
+                if [[ -n "$cmdl" ]] && _pane_cmd_is_protocol_wait "$cmdl"; then
+                    case "$infra_roots" in
+                        *" $bgroot "*) : ;;
+                        *) (( bgroot > 0 )) && infra_roots="${infra_roots}${bgroot} " ;;
+                    esac
+                fi
+                if (( is_root == 1 )); then
+                    root_descs+="${pid}"$'\t'"$(_pane_cmd_descriptor "$comm" "$cmdl")"$'\n'
                 fi
             fi
             # This node's CPU counts iff it is under claude AND (it is a
@@ -709,7 +2003,7 @@ _pane_background_shells() {
             kids=$(pgrep -P "$pid" 2>/dev/null | tr '\n' ' ')
             for kid in $kids; do
                 [[ "$kid" =~ ^[0-9]+$ ]] || continue
-                next+=" ${kid}:${child_below}:${in_bg}"
+                next+=" ${kid}:${child_below}:${in_bg}:${bgroot}"
             done
         done
         queue=$(printf '%s' "$next" | tr -s ' ')
@@ -718,7 +2012,108 @@ _pane_background_shells() {
     (( proc_ok == 1 && claude_found == 1 )) && reliable=1
     local oldest_epoch=0
     (( oldest_ticks > 0 )) && oldest_epoch=$(_pane_ticks_to_epoch "$oldest_ticks")
-    printf '%d %d %d %d' "$count" "$total" "$reliable" "$oldest_epoch"
+    # #590: infra tally + ONE representative descriptor. A NON-infra root is
+    # preferred — that is the child an operator has to make a decision about;
+    # naming an await loop while a stray `sbatch` hides behind it would defeat
+    # the point of naming anything.
+    local infra=0 desc="-" first_infra_desc="" rp rd
+    while IFS=$'\t' read -r rp rd; do
+        [[ -n "$rp" ]] || continue
+        case "$infra_roots" in
+            *" $rp "*)
+                infra=$(( infra + 1 ))
+                [[ -n "$first_infra_desc" ]] || first_infra_desc="$rd" ;;
+            *)
+                [[ "$desc" == "-" ]] && desc="$rd" ;;
+        esac
+    done <<< "$root_descs"
+    [[ "$desc" == "-" && -n "$first_infra_desc" ]] && desc="$first_infra_desc"
+    [[ -n "$desc" ]] || desc="-"
+    printf '%d %d %d %d %d %s' "$count" "$total" "$reliable" "$oldest_epoch" \
+        "$infra" "$desc"
+}
+
+# Does this command line belong to a NEXUS PROTOCOL WAIT LOOP rather than to
+# task work (your-org/nexus-code#590)? These are the background shells the nexus
+# ITSELF prescribes: `ng wrap-up` instructs a skeptic-gated worker to hold a
+# `skeptic-channel await` re-check loop, and the request/reply channel has the
+# symmetric `request … await`. They are the routine "live child after wrap-up"
+# and must not be reported as the same kind of finding as an orphaned
+# `sbatch`/`nohup`.
+#
+# Matched on the nexus's own command surface — NOT on third-party package names.
+# A `zotero`/`uvx`-style match would be brittle and endless (a new MCP server
+# would reopen the bug), and it would be aimed at the wrong thing anyway: no
+# MCP server this nexus configures reaches this function's count at all, since
+# each is spawned from a non-shell `command` and fails the is-a-shell test.
+# (A hypothetical `command: "sh"` entry would be counted — as a task shell, not
+# as a protocol wait — which is a residual noted in the scope block above and
+# not something a package-name filter here would fix either.)
+_pane_cmd_is_protocol_wait() {
+    local c="${1:-}"
+    case "$c" in
+        *skeptic-channel.sh*await*)   return 0 ;;
+        *"skeptic await"*)            return 0 ;;   # `ng skeptic await …`
+        *request-channel.sh*await*)   return 0 ;;
+        *"request await"*)            return 0 ;;   # `ng request await …`
+        *skeptic-channel.sh*poll*)    return 0 ;;
+    esac
+    return 1
+}
+
+# A compact, SPACE-FREE `<comm>:<tail>` label for one background-shell root, so
+# an emit can name the child. Space-free because the pane-state emit line is
+# `key=value` separated by spaces; stable across cycles (no pids, no clocks) so
+# it cannot churn the watcher's emit-dedup hash and re-alert every cycle.
+#
+# The interesting part of a Claude Code tool shell is the END of the argv (the
+# eval'd command), not the start (a long shell-snapshot `source`), so the tail
+# is what is kept.
+_pane_cmd_descriptor() {
+    local comm="${1:-?}" cmd="${2:-}" tail=""
+    if [[ -n "$cmd" ]]; then
+        # Peel Claude Code's Bash-tool wrapper off both ends. A tool shell is
+        #   zsh -c source <snapshot> … && eval '<COMMAND>' < /dev/null && pwd -P >| <cwdfile>
+        # so the payload sits in the MIDDLE: neither head- nor tail-truncation
+        # of the raw argv keeps it (head keeps the snapshot path, tail keeps the
+        # `pwd -P` trailer). Strip the preamble at the last `eval `, then the
+        # trailer at `< /dev/null`, then the eval quoting, then a leading
+        # `cd <abs-path> &&` — what remains is the actual command.
+        tail="${cmd##*eval }"
+        tail="${tail%%< /dev/null*}"
+        tail="${tail#\'}"
+        tail="${tail%\'*}"
+        # Drop a leading `cd <path>` and the operator joining it to the real
+        # command. Done token-wise rather than with a `cd * && ` glob because the
+        # joining operator is not reliably `space && space` — a real worker's
+        # await loop reads `cd <root> &&\nwhile true; do …`, and a `&& `-anchored
+        # pattern silently left the whole `cd`-plus-path prefix in place, which
+        # then ate the 60-char budget and truncated away the actual command.
+        case "$tail" in
+            "cd "*)
+                tail="${tail#cd }"
+                case "$tail" in
+                    *[[:space:]]*) tail="${tail#*[[:space:]]}" ;;   # the path token
+                esac
+                while :; do
+                    case "$tail" in
+                        [[:space:]]*) tail="${tail#?}" ;;
+                        "&&"*)        tail="${tail#&&}" ;;
+                        ";"*)         tail="${tail#;}" ;;
+                        *) break ;;
+                    esac
+                done
+                ;;
+        esac
+        # Collapse whitespace and strip characters that would break a
+        # key=value emit field or a downstream awk split.
+        tail=$(printf '%s' "$tail" \
+                | tr -c 'A-Za-z0-9._/=:+-' '_' \
+                | sed -e 's/__*/_/g' -e 's/^_//' -e 's/_$//')
+        tail="${tail:0:60}"
+    fi
+    [[ -n "$tail" ]] || tail="?"
+    printf '%s:%s' "$comm" "$tail"
 }
 
 # Convert a `/proc/<pid>/stat` starttime (clock ticks since boot) to a unix
@@ -935,7 +2330,7 @@ _heartbeat_handle_counts() {
 _footer_handle_counts() {
     local plain="$1"
     local bottom mon=0 bg=0
-    bottom=$(tail -n 15 <<<"$plain")
+    bottom=$(_bottom_rows "$plain" 15)
     if [[ "$bottom" =~ ([0-9]+)[[:space:]]+monitor[s]?[[:space:]]+still[[:space:]]+running ]]; then
         mon="${BASH_REMATCH[1]}"
     elif [[ "$bottom" =~ [·,][[:space:]]+([0-9]+)[[:space:]]+monitor[s]?[[:space:]]*[·,] ]]; then
@@ -1118,7 +2513,15 @@ else
         usage
     fi
     if ! command -v tmux >/dev/null 2>&1; then
-        echo "state=absent active=0 window=${win_index} name="
+        # `absent` is a DEFINITE claim — "the window exists and no live
+        # claude is in its process tree" — and it is the claim that
+        # authorises a kill. Without tmux we have not looked at
+        # anything, so asserting it is the #603 defect in its purest
+        # form: a definite state reported for a condition the emitter
+        # cannot distinguish. Report the indeterminacy instead; the
+        # kill gate default-denies every state not on its allowlist,
+        # so `unknown` is refused without needing to be enumerated.
+        echo "state=unknown active=0 window=${win_index} name="
         exit 0
     fi
     # Bogus-index fail-loud (issue #140). We previously emitted
@@ -1148,9 +2551,34 @@ else
     # from `absent` when no input row matches. `display-message -p -t
     # <win>` targets the window's active pane.
     pane_pid=$(tmux display-message -p -t "$win" '#{pane_pid}' 2>/dev/null) || pane_pid=
+    # `#{pane_dead}` is tmux's OWN assertion that the pane process exited
+    # (the pane survives only because `remain-on-exit on`). It is the one
+    # positive, first-party signal of death available here, so the gate
+    # below trusts it ahead of any process-tree inference
+    # (your-org/nexus-code#777).
+    pane_dead=$(tmux display-message -p -t "$win" '#{pane_dead}' 2>/dev/null) || pane_dead=
     # -J joins wrapped lines so a multi-line autosuggest renders on one
     # logical row, matching the regexes below.
-    pane_ansi=$(tmux capture-pane -t "$win" -p -e -J -S -25 2>/dev/null) || pane_ansi=
+    #
+    # your-org/nexus-code#788: "the capture FAILED" and "the pane is genuinely
+    # blank" are different facts and must not share a representation. They did —
+    # `|| pane_ansi=` discarded the rc — and that conflation is what made the
+    # downstream `[[ -z "$pane_ansi" ]] ⇒ absent` arm look reasonable at its call
+    # site. Measured on a real private-socket server, same pane, same instant,
+    # live `claude` at the pane root and `pane_dead=0`:
+    #
+    #     healthy tmux         -> state=idle
+    #     capture-pane rc=1    -> state=absent      <-- kill-authorising
+    #
+    # One transient failure of one tmux subcommand flipped a healthy worker into
+    # the one state that authorises killing it. The rc is now kept so the verdict
+    # can say WHICH fact it saw.
+    if pane_ansi=$(tmux capture-pane -t "$win" -p -e -J -S -25 2>/dev/null); then
+        pane_capture_ok=1
+    else
+        pane_ansi=
+        pane_capture_ok=0
+    fi
 fi
 # Fixture path: no live process to inspect by default, so the pid check
 # is bypassed (callers asserting on `state=empty` against a fixture file
@@ -1180,6 +2608,144 @@ emit() {
         "$state" "$win_active" "$win_index" "$win_name" "$extra"
 }
 
+# ===========================================================================
+# THE ONE DOOR TO `absent` — your-org/nexus-code#788
+# ===========================================================================
+#
+# `absent` is the ONE kill-authorising state (`_bookkeeping.sh:
+# bk_pane_kill_authorized` allowlists it; CLAUDE.md calls it "the state that
+# positively asserts a dead agent"). Its contract was enforced NOWHERE. Each
+# emit site re-derived it, and THREE of them reached it by FALLING THROUGH
+# rather than by deciding:
+#
+#   * the hoisted process gate            — closed by `#780`
+#   * the renderer's no-input-row fallback — `#776`'s modal lands here
+#   * `[[ -z "$pane_ansi" ]] ⇒ absent`     — closed by NEITHER, and measured on
+#     a real private-socket server to emit the kill-authorising state for a pane
+#     whose ROOT PROCESS WAS A LIVE `claude` with `pane_dead=0`, the moment one
+#     `tmux capture-pane` call returned rc≠0.
+#
+# Three sites, three independent fixes, and the class kept regenerating — `#777`
+# and `#776` landed on it from unrelated directions within the same day. So the
+# fix is not a third patch: it is an INVERSION. Today `absent` is what you get by
+# NOT deciding. From here it is the only verdict that must NAME ITS EVIDENCE, and
+# everything else degrades to `unknown` — already off the kill allowlist, and
+# already handled by `retire-preflight.sh` as a deferral.
+#
+# This is the same default-deny inversion `bk_pane_kill_authorized` applies one
+# layer down, and which cannot help while the wrong answer arrives on the ALLOW
+# side. Putting it here, at the emitter, is what makes it reachable at all.
+#
+# THE TRADE, STATED PLAINLY AND IT IS ONE-SIDED: a false `absent` kills a live
+# worker; a false `unknown` postpones a cleanup. But a deferral that never lapses
+# is an unreapable pane — the mirror-image failure — so every refusal below is
+# either self-clearing (the boot grace lapses with the pane's own age) or
+# self-diagnosing (the tool blindness and the capture failure name themselves in
+# `reason=`). `test-pane-state-boot-absent.sh` asserts the LAPSE, not just the
+# refusal, and reddens if the deferral ever becomes permanent.
+
+# _absent_evidence <pane-pid>
+#
+# Prints an evidence/refusal token. Exit 0 => `absent` is JUSTIFIED and the token
+# names the positive evidence. Exit 1 => refuse; the token says why.
+#
+# It establishes its own evidence from scratch rather than trusting the caller.
+# That costs a few extra `ps`/`pgrep` calls on the one path about to authorise a
+# kill, and it is the entire point: a door that believes what it is told is not a
+# door. Order matters — each arm is tried only after the more definite ones have
+# declined.
+_absent_evidence() {
+    local pid="${1:-}"
+
+    # (0) Fixture mode. `--fixture` is a TEST SURFACE with no `-t` target and no
+    #     process to inspect; supplying a fixture and declining `--pane-pid` is
+    #     the caller DECLARING there is no process, which is the contract every
+    #     renderer-path fixture assertion already rests on. This is a
+    #     declaration, not an observation, and it is admitted here for exactly
+    #     one reason: `--fixture` is unreachable from production. The watcher
+    #     never passes it. Guard it on the flag so it can never widen.
+    if [[ -n "$fixture" && -z "$pid" ]]; then
+        printf 'fixture-no-process'; return 0
+    fi
+
+    # (1) tmux's OWN assertion that the pane process exited (the pane survives
+    #     only because `remain-on-exit on`). First-party and definite — and it
+    #     must be checked BEFORE any process probe, since a dead pane_pid is
+    #     legitimately invisible to `ps`.
+    if [[ "$pane_dead" == 1 ]]; then
+        printf 'pane_dead'; return 0
+    fi
+
+    # (2) No pid at all: a window that resolved but whose pane process tmux would
+    #     not name. That is a failure to LOOK, not a negative observation.
+    if [[ -z "$pid" ]]; then
+        printf 'no-pane-pid'; return 1
+    fi
+
+    # (3) A live claude in the tree. The classifier ALREADY KNOWS the agent is
+    #     alive — this is the arm that the `-z pane_ansi` site short-circuited
+    #     past, which is how a healthy worker got the kill-authorising verdict.
+    if _pane_has_live_claude "$pid"; then
+        printf 'live-claude'; return 1
+    fi
+
+    # (4) Something is still running under the pane — a launcher preamble that
+    #     has not reached `exec claude` yet (`#643`). "A launcher is running but
+    #     the agent has not started" is not a dead agent.
+    if _pane_has_live_descendant "$pid"; then
+        printf 'live-descendant'; return 1
+    fi
+
+    # (5) Can this process even SEE processes? `ps`/`pgrep` answering "no" and
+    #     being BLIND are indistinguishable at their return values (`#777`).
+    if ! _proc_view_functional; then
+        printf 'proc-view-blind'; return 1
+    fi
+
+    # (6) `ps` works (just proved) and does not see pane_pid: the pane process is
+    #     genuinely gone. Definite, and the fixture-mode `--pane-pid <dead-pid>`
+    #     contract rests on it.
+    local age
+    if ! age=$(_pane_age_seconds "$pid"); then
+        printf 'pid-gone'; return 0
+    fi
+
+    # (7) Nothing alive under a pane too young to have booted yet. Indis-
+    #     tinguishable from a spawn in progress (`#777`: 3 of 5 production-shaped
+    #     spawns reported `absent` 1.37-2.05 s in, on panes with `pane_dead=0`
+    #     and perfectly healthy shells). SELF-CLEARING: the same probe returns
+    #     `absent` the moment the grace lapses, so the deferral is bounded by the
+    #     pane's own age and cannot become permanent.
+    if (( age < PANE_BOOT_GRACE_SECONDS )); then
+        printf 'boot-grace'; return 1
+    fi
+
+    # (8) Everything stronger has declined: a pane old enough to have booted,
+    #     whose process view works, with no claude and nothing else alive
+    #     underneath it. THIS is a dead agent.
+    printf 'tree-empty-past-grace'; return 0
+}
+
+# _emit_absent_or_unknown <site-label>
+#
+# The only permitted way to reach `absent`. Emits it with the evidence named, or
+# emits `unknown` with the refusal reason and the SITE that asked — so an
+# operator reading a deferral can tell which arm of the classifier deferred, and
+# a future reviewer can tell at a glance that no site invents its own verdict.
+_emit_absent_or_unknown() {
+    local site="$1" tok
+    if tok=$(_absent_evidence "$pane_pid"); then
+        emit absent "evidence=$tok"
+    else
+        # Surface the capture rc too: `#788`'s live hazard is a FAILED capture
+        # being read as a blank pane, and an operator seeing `capture=failed`
+        # knows the classifier was working from nothing.
+        local cap=""
+        (( pane_capture_ok )) || cap=" capture=failed"
+        emit unknown "reason=$tok" "site=$site${cap}"
+    fi
+}
+
 # 0a. Process-liveness gate (hoisted). Runs before the heartbeat path
 #     and before any renderer matching. tmux's `remain-on-exit on`
 #     keeps the dead pane visible with stale bytes — the chevron, dim
@@ -1194,7 +2760,53 @@ emit() {
 #     pane_pid yet" path both fall through to the existing
 #     classification chain.
 if [[ -n "$pane_pid" ]] && ! _pane_has_live_claude "$pane_pid"; then
-    emit absent
+    # your-org/nexus-code#643. "No claude in the tree" is NOT the same claim as
+    # "this agent is dead", and `absent` asserts the second. It is the ONE
+    # kill-authorising state — CLAUDE.md calls it "the state that positively
+    # asserts a dead agent" and bk_pane_kill_authorized allowlists it — so the
+    # whole default-deny design downstream rests on it never being wrong when
+    # asserted. Default-deny cannot help when the wrong answer is on the ALLOW
+    # side.
+    #
+    # A freshly spawned window spends its first seconds running the generated
+    # launcher's preamble before `exec claude`, with no claude in the tree yet.
+    # Emitting `absent` there told an orchestrator to "relaunch or close" a
+    # healthy agent — during precisely the interval when it is most likely to
+    # ask, right after spawning, to check the spawn took.
+    #
+    # So downgrade to `unknown` when something is still running under the pane:
+    # `unknown` already means "could not answer" and is NOT on the kill
+    # allowlist, which is the correct reading of "a launcher is running but the
+    # agent has not started yet". `absent` is reserved for a pane with nothing
+    # alive underneath it at all — strictly stronger than before, which is what
+    # makes it worth trusting.
+    # your-org/nexus-code#777. #643 closed the sub-case where the launcher is
+    # ALREADY a descendant. It does not close the one before that: production
+    # spawns with `tmux new-window -d` carrying NO command (verified: the live
+    # server runs default-shell=/usr/bin/zsh, default-command=""), so tmux
+    # execs the login shell AS the pane process, and the launcher only becomes
+    # a descendant once that shell has finished its rc chain and read the
+    # `send-keys` bytes. Until then pane_pid has no descendants AT ALL, and
+    # descendant-liveness — the axis #643 chose precisely because it beats a
+    # timer — carries no information whatsoever.
+    #
+    # Measured in a private-socket fixture reproducing that exact shape
+    # (`new-window` with no command, `send-keys` fired immediately as
+    # spawn-worker.sh does), zsh pane shell, ambient load 47 on 36 cores:
+    # 3 of 5 spawns reported `absent` on the FIRST probe, 1.37-2.05 s in, on a
+    # pane with `pane_dead=0` and a perfectly healthy shell.
+    #
+    # So #643's "a timer would have to guess a duration" is right about the
+    # case it was written for and wrong here: while nothing is running under
+    # the pane, elapsed time since the pane was created is the ONLY axis on
+    # which booting and dead differ. The grace is not a substitute for the
+    # real discriminator, it IS the real discriminator for this sub-case.
+    #
+    # your-org/nexus-code#788. The decision ladder that used to live inline here
+    # is now `_emit_absent_or_unknown`, the ONE door to `absent` — see its header.
+    # Lifting it out is the whole point: three separate sites reached `absent` by
+    # falling through, and #780 fixed only this one.
+    _emit_absent_or_unknown liveness-gate
     exit 0
 fi
 
@@ -1306,16 +2918,20 @@ _finalize_idle_verdict() {
     #                    bg (preserves pre-#455 fixture semantics).
     #   --bg-oldest-start EPOCH → inject the oldest background-shell start
     #                    epoch (the DERIVED episode start) for fixtures.
-    local pt_count=0 pt_cpu=0 pt_reliable=0 pt_oldest=0
+    local pt_count=0 pt_cpu=0 pt_reliable=0 pt_oldest=0 pt_infra=0 pt_desc="-"
     if [[ -n "$bg_shells_override" ]]; then
         pt_count="$bg_shells_override"; pt_reliable=1
         pt_cpu="${bg_cpu_override:-0}"
         pt_oldest="${bg_oldest_start_override:-0}"
+        pt_infra="${bg_infra_override:-0}"
+        pt_desc="${bg_cmd_override:--}"
     elif [[ -n "$bg_cpu_override" ]]; then
         pt_cpu="$bg_cpu_override"; pt_reliable=0
         pt_oldest="${bg_oldest_start_override:-0}"
+        pt_infra="${bg_infra_override:-0}"
+        pt_desc="${bg_cmd_override:--}"
     else
-        read -r pt_count pt_cpu pt_reliable pt_oldest \
+        read -r pt_count pt_cpu pt_reliable pt_oldest pt_infra pt_desc \
             < <(_pane_background_shells "${pane_pid:-}")
     fi
     local out
@@ -1368,7 +2984,17 @@ _finalize_idle_verdict() {
         # `autosuggest-only` ghost cycle), and no watcher restart can reset
         # the absolute ceiling (#455 follow-up, round-2 skeptic finding).
         [[ "$pt_oldest" =~ ^[0-9]+$ ]] || pt_oldest=0
-        refined_extra="${refined_extra:+$refined_extra }bg_shells=$pt_count bg_reliable=$pt_reliable bg_cpu=$pt_cpu bg_oldest_start=$pt_oldest"
+        # `bg_infra` / `bg_cmd` (your-org/nexus-code#590): how many of the
+        # counted roots are nexus PROTOCOL WAIT loops, and a space-free label
+        # naming one representative child. Additive only — `bg_shells` is
+        # unchanged, so the `working-background` verdict and the
+        # `parked-awaiting-skeptic` exemption keyed off it behave exactly as
+        # before; the watcher's idle probe consumes these two to stop calling a
+        # protocol-prescribed await loop an "inconsistency", and to NAME the
+        # child in the emit instead of reporting a bare count.
+        [[ "$pt_infra" =~ ^[0-9]+$ ]] || pt_infra=0
+        [[ -n "$pt_desc" ]] || pt_desc="-"
+        refined_extra="${refined_extra:+$refined_extra }bg_shells=$pt_count bg_reliable=$pt_reliable bg_cpu=$pt_cpu bg_oldest_start=$pt_oldest bg_infra=$pt_infra bg_cmd=$pt_desc"
     fi
 }
 
@@ -1424,7 +3050,26 @@ if [[ -n "$win_name" ]] || [[ -n "$hb_file_override" ]]; then
 fi
 
 if [[ -z "$pane_ansi" ]]; then
-    emit absent
+    # your-org/nexus-code#788, THE THIRD SITE — and the live one. `pane_ansi` is
+    # empty for two unrelated reasons: `tmux capture-pane` FAILED (its rc was
+    # discarded here until #788), or the pane genuinely rendered nothing. Neither
+    # is evidence about the PROCESS, and this arm sits AFTER the liveness gate
+    # has already run — so when the gate found a live `claude` and let the pane
+    # through, this line then emitted the kill-authorising state anyway.
+    #
+    # Measured on a real private-socket tmux server, same pane, same instant,
+    # `claude` at the pane root, `pane_dead=0`:
+    #     healthy tmux       -> state=idle
+    #     capture-pane rc=1  -> state=absent
+    # The repo had already noticed the empty-capture half from the other end:
+    # `test-integration/test-same-name-recycle.sh:344` documents the ~250 ms
+    # post-`new-window` window where "capture-pane briefly returns nothing —
+    # pane-state emits `state=absent` then because the renderer signal is empty",
+    # and works around it with a `wait_for`.
+    #
+    # Route it through the one door, which re-derives the process facts instead
+    # of inheriting an emptiness that says nothing about them.
+    _emit_absent_or_unknown empty-capture
     exit 0
 fi
 
@@ -1442,7 +3087,15 @@ pane_content_hash=$(_content_hash "$pane_plain")
 #    fires the auto-Enter that dismisses it. The hook-driven
 #    over-limit stamp (1b) takes over once the menu is gone.
 if _has_blocked_overlay "$pane_plain"; then
-    emit blocked
+    # `overlay=<kind>` names WHICH decision is pending. `blocked` is already
+    # correct for all four (a human must answer; the state is in
+    # _BK_ACTIVE_STATES, so it is never kill-authorised, and no `_unstick.sh`
+    # arm fires on the bypass modal — every arm there requires two
+    # co-occurring literals the modal does not carry, so nothing auto-answers
+    # a security prompt). The kind is what turns "something is blocked" into a
+    # diagnosis. Appended as an extra field, so consumers reading `state=`
+    # are unaffected (your-org/nexus-code#768).
+    emit blocked "overlay=${BLOCKED_OVERLAY_KIND}"
     exit 0
 fi
 
@@ -1498,7 +3151,20 @@ if [[ -z "$input_row" ]]; then
     #   (c) No live claude in the pane's process tree: the inner
     #       REPL has truly exited (or this pane never hosted one).
     #       Emit `absent`.
+    #   (a0) A QUEUED MESSAGE placeholder has replaced the input row
+    #        (your-org/nexus-code#603). This is checked FIRST because it
+    #        is the strongest and least ambiguous evidence available:
+    #        input pending AND a turn in flight. It is also why the
+    #        spinner scan below missed a VISIBLE spinner in the
+    #        motivating incident — the placeholder plus the status bar
+    #        displaced the spinner out of `_detect_busy`'s 10-row window
+    #        anchored on the last line, so a pane 4m38s into a
+    #        verification pass read `empty`.
     bottom_ln=$(wc -l <<<"$pane_plain")
+    if _detect_queued_message "$pane_plain"; then
+        emit busy queued=1
+        exit 0
+    fi
     if _detect_busy "$pane_plain" "$bottom_ln"; then
         emit busy
         exit 0
@@ -1507,7 +3173,11 @@ if [[ -z "$input_row" ]]; then
         emit empty
         exit 0
     fi
-    emit absent
+    # your-org/nexus-code#788, THE SECOND SITE. `emit absent` used to be the
+    # DEFAULT here — what you got when `_pane_has_live_claude` could not confirm
+    # life, which includes "there was no pid to ask about" and "the tools were
+    # blind". `#776`'s bypass-permissions modal lands on this arm. Same door.
+    _emit_absent_or_unknown renderer-no-input-row
     exit 0
 fi
 input_ln=$(grep -nF "❯${NBSP}" <<<"$pane_plain" | tail -1 | cut -d: -f1)
@@ -1524,6 +3194,66 @@ _detect_user_typing "$input_row" && has_bright=1
 _detect_autosuggest "$input_row" && has_autosuggest=1
 _detect_empty_input "$input_row" && empty_input=1
 
+# `input=` — the GHOST-vs-DRAFT answer, stated explicitly
+# (your-org/nexus-code#626). The orchestrator's question is not "what
+# state is this pane in" but "is that text at the prompt something the
+# operator typed, which I must never paste over?". That question had no
+# mechanical answer: CLAUDE.md says autosuggest "renders identically to
+# user input in plain text", which is true, and the sanctioned tool
+# answered `empty` for nineteen ghost panes at once. So it is answered
+# here, as its own field, rather than left to be inferred from a state
+# token that also carries kill-authorisation meaning.
+#
+#   typed  bright-white SGR — Claude Code's marker for typed input.
+#   ghost  a dim (SGR 2) run: model-generated completion.
+#   blank  the empty-box cursor, nothing pending.
+#   ?      a non-blank row matching NEITHER marker. Reported honestly
+#          rather than guessed: this is the residue #626 describes, and
+#          it is where an input-event channel would be needed.
+input_kind='?'
+if   (( has_bright ));      then input_kind=typed
+elif (( has_autosuggest )); then input_kind=ghost
+elif (( empty_input ));     then input_kind=blank
+fi
+input_field="input=$input_kind"
+
+# Vim-mode refinement (your-org/nexus-code#603). `_detect_user_typing`
+# keys on the bright-white SGR Claude Code emits for typed text; in vim
+# INSERT mode that marker is not reliably present, so real operator
+# input rendered as `empty` — twice in one night, on panes that were
+# then kill candidates. `-- INSERT --` PLUS a non-blank input row is
+# operator input, unconditionally: the indicator only appears when the
+# pane is accepting keystrokes into the box, and there is no rendering
+# in which a non-blank box under it means anything else.
+if (( has_bright == 0 )); then
+    if _detect_vim_insert "$pane_plain" && _input_row_typed_text "$input_row"; then
+        has_bright=1
+        # …and say so on the `input=` axis too. These two answers are read by
+        # DIFFERENT consumers — `state=` gates retirement, `input=` gates
+        # PASTING — so leaving `input=` at whatever the pre-refinement
+        # detectors said publishes `state=user-typing input=blank`: "a human
+        # is at this keyboard" and "the box is empty, paste away" in the same
+        # line. `blank` and `ghost` both mean safe-to-paste; the refinement
+        # has just established the opposite. Narrows a permissive answer,
+        # never widens one. Surfaced by the `#801` kill-axis fixture
+        # (user-typing-vim-dim-box-border-synthetic), which is the first
+        # fixture to exercise vim INSERT + real text + NO bright marker.
+        input_kind=typed
+        input_field="input=$input_kind"
+    fi
+fi
+
+# A queued message outranks every renderer reading below: it is direct
+# evidence that a turn is running and text is waiting behind it.
+# Checked after `has_bright` so a pane that ALSO shows fresh operator
+# typing still reports `user-typing` (the input the orchestrator must
+# never trample), and before the busy/idle ladder so the queued fact
+# cannot be lost to an idle-looking box.
+if _detect_queued_message "$pane_plain" && (( has_bright == 0 )); then
+    emit busy queued=1
+    exit 0
+fi
+
 # 4. Decide. Order matters — bright user text supersedes everything
 #    (orchestrator must never trample real user input). Busy comes
 #    next so an autosuggest visible during a long-running step is not
@@ -1535,9 +3265,9 @@ _detect_empty_input "$input_row" && empty_input=1
 # through. `extra_fields` carries `orphan_kinds=…` when the refine
 # picks idle-orphan-async (only emit-extra populated in this file).
 if (( has_bright )); then
-    emit user-typing
+    emit user-typing "$input_field"
 elif (( busy )); then
-    emit busy
+    emit busy "$input_field"
 elif (( has_autosuggest )); then
     # An autosuggest ghost is a RENDERING of the input row. It says nothing
     # about whether the process tree has live children, and ghost text renders
@@ -1557,13 +3287,13 @@ elif (( has_autosuggest )); then
     # pane read `autosuggest-only`, its original meaning: idle, ready to paste.
     _finalize_idle_verdict idle
     if [[ "$refined_state" == "idle" ]]; then
-        emit autosuggest-only
+        emit autosuggest-only "$input_field"
     else
-        emit "$refined_state" ${refined_extra:+"$refined_extra"}
+        emit "$refined_state" "$input_field" ${refined_extra:+"$refined_extra"}
     fi
 elif (( empty_input )); then
     _finalize_idle_verdict idle
-    emit "$refined_state" ${refined_extra:+"$refined_extra"}
+    emit "$refined_state" "$input_field" ${refined_extra:+"$refined_extra"}
 else
-    emit empty
+    emit empty "$input_field"
 fi

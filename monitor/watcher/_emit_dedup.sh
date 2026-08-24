@@ -39,11 +39,49 @@
 #   - `interrupted Ns` / `interrupted NhNNm` crash ages
 #   - the `N awaiting-input` prelude scalar (a since-last-render delta
 #     that toggles 1↔0 every cycle a worker re-pings — issue #152)
+#   - the `idle` / `idle-too-long` split on the `workspace:` tally line,
+#     folded into their sum (your-org/nexus-code#658)
 #   - the trailing `--- nexus-emit-sig <iso> <nonce> ---` footer
-# Everything else — workspace counts, eligible-comments rows,
-# pending-decisions rows, the local-diff payload, bell entries —
-# flows through untouched, so a genuinely new decision / comment /
-# count shift still produces a distinct form and surfaces promptly.
+# Everything else — eligible-comments rows, pending-decisions rows, the
+# local-diff payload, bell entries — flows through untouched, so a
+# genuinely new decision or comment still produces a distinct form and
+# surfaces promptly.
+#
+# On the tally line specifically (your-org/nexus-code#658): the counts are
+# a DERIVED SUMMARY of the per-window snapshot rows, and some of the
+# buckets they summarise are functions of the clock alone. A window
+# crossing MONITOR_IDLE_CLOSE_HOURS moves one unit from `idle` to
+# `idle-too-long` while nothing whatsoever happens on the board — no
+# window created, retired, renamed or re-stated. That flipped a canonical
+# the change detector treats as a genuine change, so it both emitted
+# immediately (bypassing the adaptive idle backoff) and RESET the
+# idle-streak anchor, discarding an accumulated floor that had climbed to
+# 28800 s and forcing the whole doubling ladder to re-climb. The anchor
+# reset is the worse half: one clock crossing does not cost one emit, it
+# costs the entire backoff, and several parked windows crossing at
+# different times knock the floor back to base repeatedly on a board that
+# has been static for days.
+#
+# Genuinely actionable transitions still punch through, because they
+# change the per-window ROWS (`<window> … (state=<s>)`), which carry
+# identity and are not stripped. `pane-absent`, `over-limit` and
+# `interrupted` all move a row's `state=`; a 24-hour clock crossing moves
+# nothing but an age, which was already stripped. The distinguishing
+# property is not "did a count change" but "did anything change that is
+# not a function of elapsed time alone" — and the rows answer that, while
+# the tally cannot.
+#
+# ONLY the `idle` / `idle-too-long` pair is folded, and only into its
+# sum. Every other counter keeps its value, so a counter this filter has
+# never heard of lands on the SAFE side by default — where safe means
+# "still emits". The asymmetry is the whole point: an unlisted
+# clock-derived counter costs a noisy emit, an unlisted event-derived one
+# costs a SILENT MISS, and only one of those is recoverable.
+#
+# `pane-absent` is the case that proves it. A `poll-resurface` body
+# carries NO per-window rows — the tally line is the only place that
+# count appears — so `pane-absent 1→0`, a worker dying, is visible there
+# and nowhere else.
 #
 # This filter is shared by BOTH change-detection layers: the
 # content-hash dedup gate below AND main.sh's `full_state_canonical`
@@ -66,6 +104,60 @@ _emit_volatile_strip() {
         s/interrupted [0-9]+s/interrupted/g
         s/[0-9]+ awaiting-input/awaiting-input/g
         /^--- nexus-emit-sig /d
+    ' | awk '
+        # your-org/nexus-code#658 — fold the CLOCK-DRIVEN half of the
+        # workspace tally, and ONLY that half.
+        #
+        # `idle` and `idle-too-long` are one population under two labels.
+        # The boundary between them is MONITOR_IDLE_CLOSE_HOURS, so a
+        # window crossing it moves one unit from the first to the second
+        # while NOTHING happens on the board. Their SUM is invariant under
+        # that crossing and changes only when a window genuinely enters or
+        # leaves the idle population — which is an event, not a clock tick.
+        # So fold the pair into its sum: the crossing becomes invisible,
+        # "a worker went idle" stays visible.
+        #
+        # Every other counter keeps its value. That is the whole design:
+        # a counter this filter has never heard of lands on the SAFE side
+        # by DEFAULT, where safe means "still emits". The first version of
+        # this fix stripped every count on the line generically, which was
+        # too broad for exactly the reason #658 named in advance —
+        # `pane-absent 1→0` is a worker dying, and in a `poll-resurface`
+        # body the tally line is the ONLY place it appears (that shape
+        # carries no per-window rows at all, which is what made the
+        # "the rows still carry it" argument wrong). Caught by
+        # test-emit-dedup.sh, which had asserted it since #152.
+        #
+        # A denylist of clock-derived labels would be the same mistake
+        # rotated: the twelfth counter would be added by someone who never
+        # reads this file, and an unlisted clock-derived counter is a
+        # NOISY emit, while an unlisted event-derived one is a SILENT
+        # miss. Enumerate the pair we can prove is clock-driven; default
+        # to keeping everything else.
+        /^workspace: / {
+            line = $0
+            sub(/^workspace: /, "", line)
+            # " \\| " — awk treats a multi-char separator as a REGEX, so a
+            # bare "|" would be alternation and split on every space.
+            n = split(line, f, " \\| ")
+            idle = -1; too_long = -1; idle_i = 0; tl_i = 0
+            for (i = 1; i <= n; i++) {
+                if (f[i] ~ /^[0-9]+ idle$/)                { idle = f[i] + 0; idle_i = i }
+                else if (f[i] ~ /^[0-9]+ idle-too-long$/)  { too_long = f[i] + 0; tl_i = i }
+            }
+            # Both must be present to fold. If a renderer drops or renames
+            # either one, leave the line ALONE rather than guess — an
+            # unfolded line is noisy, never silent.
+            if (idle_i > 0 && tl_i > 0) {
+                f[idle_i] = (idle + too_long) " idle-incl-too-long"
+                f[tl_i]   = "idle-too-long"
+            }
+            out = "workspace: "
+            for (i = 1; i <= n; i++) out = out f[i] (i < n ? " | " : "")
+            print out
+            next
+        }
+        { print }
     '
 }
 
@@ -77,8 +169,23 @@ _emit_volatile_strip() {
 #
 # Rule: start at the base floor; double it each time sustained idle crosses
 # the next power-of-two multiple of the base, capped at the max. With
-# base=900 / max=3600 that is 900 (idle < 30m) → 1800 (30m ≤ idle < 60m) →
-# 3600 (idle ≥ 60m). A genuine change resets idle_duration to ~0 (the caller
+# base=900 / max=7200 that is 900 (idle < 30m) → 1800 (30m ≤ idle < 60m) →
+# 3600 (60m ≤ idle < 120m) → 7200 (idle ≥ 120m).
+#
+# `max` is a TRUE CAP — any positive value is honoured exactly, not only
+# the rungs `base * 2^k` (your-org/nexus-code#659). Worked example with a
+# max that is deliberately NOT a rung, base=900 / max=43200: 900 → … →
+# 28800 (8h ≤ idle < 16h) → 43200 (idle ≥ 16h). The old loop guard
+# (`eff * 2 <= max`) refused the step that would overshoot instead of
+# taking it and clamping, so `eff` could never exceed `max`, which made
+# the trailing clamp — the only line that actually clamps TO max —
+# unreachable. `43200` silently delivered `28800` for ever, and the
+# worked example above could not exhibit it because 7200 IS a rung of
+# 900. The example is kept alongside precisely so the two shapes are
+# both pinned.
+#
+# A genuine change resets
+# idle_duration to ~0 (the caller
 # re-anchors), so the floor snaps back to base and the heartbeat is
 # responsive again. Disabled (enabled=false, base<=0, or max<=base) returns
 # the base unchanged — exactly the pre-backoff fixed-floor behaviour.
@@ -96,11 +203,16 @@ _full_state_effective_floor() {
     if [[ "$enabled" != "true" ]] || (( base <= 0 )); then
         printf '%s\n' "$base"; return 0
     fi
-    local max="${MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS:-3600}"
-    [[ "$max" =~ ^[0-9]+$ ]] || max=3600
+    local max="${MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS:-7200}"
+    [[ "$max" =~ ^[0-9]+$ ]] || max=7200
     (( max <= base )) && { printf '%s\n' "$base"; return 0; }
     local eff="$base" thresh="$base"
-    while (( idle_s >= thresh * 2 && eff * 2 <= max )); do
+    # `eff < max`, NOT `eff * 2 <= max` (your-org/nexus-code#659). The
+    # second form refuses the step that would overshoot; this one takes it
+    # and lets the clamp below do its job. That is what makes the clamp
+    # LIVE rather than dead code, and it is what makes `max` a cap rather
+    # than a ladder terminator.
+    while (( idle_s >= thresh * 2 && eff < max )); do
         eff=$(( eff * 2 )); thresh=$(( thresh * 2 ))
     done
     (( eff > max )) && eff="$max"
@@ -292,19 +404,71 @@ _compose_emit_record_emit() {
     now_ts=$(date +%s)
     ring_file=$(_emit_dedup_ring_file)
     ring_size=$(_emit_dedup_ring_size)
+
+    # SERIALISE THE READ-MODIFY-WRITE (your-org/nexus-code#568 A1). This
+    # function is reached from two tasks the scheduler fires as concurrent
+    # `( … ) &` subshells — compose_emit (main.sh:4411 --async) and
+    # comment_surface (main.sh:4420 --async), whose in-flight guard is
+    # PER-TASK, so they genuinely overlap. The body below is read-modify-write
+    # over one file: both subshells read the ring, both append their own hash,
+    # and the loser's entry vanishes. Measured on the real function driven from
+    # two concurrent subshells: 34 of 40 iterations lost one of the two hashes,
+    # with the ring repeatedly collapsing from 8 entries to 1 — which shortens
+    # the dedup window and re-creates the duplicate-paste symptom the ring was
+    # built to fix.
+    #
+    # THE LOCK IS THE FIX; unique tmp names are only hygiene. With correctly
+    # unique names and no lock, an independent measurement still recorded 23/40
+    # lost updates. Bounded fail-open, exactly as `_emit_filters.sh:278-286`
+    # does it: a lock we cannot take within 5s falls through to an unlocked
+    # write rather than stalling an emit path.
+    if command -v flock >/dev/null 2>&1; then
+        local _rd_fd
+        if { exec {_rd_fd}>"${ring_file}.lock"; } 2>/dev/null; then
+            flock -w 5 "$_rd_fd" 2>/dev/null || true
+            _compose_emit_record_emit_write "$ring_file" "$ring_size" "$new_hash" "$now_ts"
+            exec {_rd_fd}>&-
+            return 0
+        fi
+    fi
+    _compose_emit_record_emit_write "$ring_file" "$ring_size" "$new_hash" "$now_ts"
+    return 0
+}
+
+# The unguarded write core of `_compose_emit_record_emit` — rewrite the ring
+# and refresh the legacy single-slot pair. Callers own any locking.
+#
+# NOTE ON THE TMP SUFFIX, because the obvious fix here is wrong. The names were
+# `$$`-based, which is not unique across the async subshells that reach this
+# code ($$ stays the parent watcher pid in a subshell). The mechanical remedy —
+# substituting `$BASHPID` — SILENTLY DISABLES THE RING: the ring write is a
+# PIPELINE, so the redirection is expanded in the last pipeline element's
+# subshell while the `mv` on the next line expands a DIFFERENT `$BASHPID` in
+# this function's own shell. The `mv` then names a file that does not exist,
+# fails, and is swallowed by `|| true` — leaving an orphaned tmp file, no ring,
+# and a dedup gate permanently degraded to the legacy single-slot path with no
+# error anywhere. (The three sibling call sites cited as models — main.sh:921,
+# _emit_filters.sh:313, _pane_cache.sh:148 — are all the non-pipeline
+# `printf > f.tmp && mv` form, which is why `$BASHPID` is correct there.)
+# So the suffix is computed ONCE, here, before the pipeline, and both the
+# redirect and the `mv` observe that one string.
+_compose_emit_record_emit_write() {
+    local ring_file="$1" ring_size="$2" new_hash="$3" now_ts="$4"
+    local _uniq="$$.${BASHPID:-$$}.$RANDOM"
     {
         if [[ -f "$ring_file" ]]; then
             grep -v $'\t'"${new_hash}\$" "$ring_file" 2>/dev/null || true
         fi
         printf '%s\t%s\n' "$now_ts" "$new_hash"
-    } | tail -n "$ring_size" > "${ring_file}.tmp.$$" \
-        && mv "${ring_file}.tmp.$$" "$ring_file" 2>/dev/null \
+    } | tail -n "$ring_size" > "${ring_file}.tmp.${_uniq}" \
+        && mv "${ring_file}.tmp.${_uniq}" "$ring_file" 2>/dev/null \
         || true
-    printf '%s\n' "$new_hash" > "${EMIT_DEDUP_HASH_FILE}.tmp.$$" \
-        && mv "${EMIT_DEDUP_HASH_FILE}.tmp.$$" "$EMIT_DEDUP_HASH_FILE" 2>/dev/null \
+    rm -f "${ring_file}.tmp.${_uniq}" 2>/dev/null || true
+    printf '%s\n' "$new_hash" > "${EMIT_DEDUP_HASH_FILE}.tmp.${_uniq}" \
+        && mv "${EMIT_DEDUP_HASH_FILE}.tmp.${_uniq}" "$EMIT_DEDUP_HASH_FILE" 2>/dev/null \
         || true
-    printf '%s\n' "$now_ts"   > "${EMIT_DEDUP_TS_FILE}.tmp.$$" \
-        && mv "${EMIT_DEDUP_TS_FILE}.tmp.$$"   "$EMIT_DEDUP_TS_FILE"   2>/dev/null \
+    printf '%s\n' "$now_ts"   > "${EMIT_DEDUP_TS_FILE}.tmp.${_uniq}" \
+        && mv "${EMIT_DEDUP_TS_FILE}.tmp.${_uniq}"   "$EMIT_DEDUP_TS_FILE"   2>/dev/null \
         || true
     return 0
 }

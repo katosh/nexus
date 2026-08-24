@@ -755,6 +755,168 @@ assert_file "wrap-up require -> prior DONE ARCHIVED (recoverable)" "$aarch/DONE"
 assert_file "wrap-up require -> fresh pending marker set" "$PEND/$ATASK"
 
 # ============================================================
+echo '=== #881: an unstated count is carried to the ORCHESTRATOR as absence ==='
+# ============================================================
+#
+# The terminal text is for the skeptic; the filed spawn-skeptic request is
+# what the ORCHESTRATOR adjudicates from. Both must say the same true
+# thing, or the fix stops at the surface nobody acts on. The request
+# carries a `findings-not-stated` reason token — orthogonal to the
+# disposition-derived label, because every combination occurs and folding
+# them into one label space would make the corpus unqueryable on either.
+W881REP="$WORK/r881.md"
+printf -- '---\nproject: p\ndate: 2026-08-14\n---\n\n## Summary\nNo disposition line anywhere in this report.\n' > "$W881REP"
+mk_prov w881 auto 1 true w881-target
+_SK_REPORT_PATH="$W881REP"
+# Redirected to a FILE, not captured with `$(...)`: command substitution
+# runs the function in a SUBSHELL, so the `_SK_SPAWN_*` globals it sets
+# die with it and every assertion below would read an empty string and
+# "pass" or "fail" for the wrong reason. Same subshell hazard the suite
+# header warns about, in the READING direction.
+_wrapup_skeptic_step 881 w881 your-org/your-nexus 1 "" "" "" credible w881-target 1 "" \
+    > "$WORK/o881" 2>&1
+out=$(cat "$WORK/o881")
+assert_contains "#881 an unstated count + no disposition escalates" \
+    "$out" "SECOND-PASS SKEPTIC RECOMMENDED"
+assert_contains "#881 …and the FILED REQUEST carries the absence as a reason token" \
+    "$_SK_SPAWN_REASONS" "findings-not-stated"
+# The primary label still names the disposition state, so the two axes
+# stay separately queryable in the request corpus.
+assert_contains "#881 …alongside the disposition-derived primary label" \
+    "$_SK_SPAWN_REASONS" "second-pass-no-disposition-stated"
+# CONTROL — a stated count must NOT carry the token, or it means nothing.
+# Guarded the same way: an empty `_SK_SPAWN_REASONS` would satisfy this
+# assertion vacuously, so assert the request was FILED before asserting
+# what it does not say.
+_wrapup_skeptic_step 881 w881 your-org/your-nexus 1 "" "" "" credible w881-target 1 3 \
+    > "$WORK/o881b" 2>&1
+assert_eq "#881 CONTROL: the stated-count run still files a request" \
+    "${_SK_SPAWN_REQ:-0}" "1"
+assert_contains "#881 CONTROL: …with a non-empty reason label" \
+    "$_SK_SPAWN_REASONS" "second-pass"
+assert_not_contains "#881 CONTROL: …and NO absence token" \
+    "$_SK_SPAWN_REASONS" "findings-not-stated"
+unset _SK_REPORT_PATH
+
+# ============================================================
+echo '=== #879: a skeptic-stamped window doing WORKER work ==='
+# ============================================================
+#
+# The role is derived from PROVENANCE, not the command line, and a window
+# is stamped for its lifetime rather than for one task. So a retained
+# skeptic that later authors a patch was forced to supply a
+# `--skeptic-verdict` for work it wrote itself — a self-review, written
+# against another window's markers and indistinguishable downstream from
+# an independent clearance. The alternative was to skip wrap-up (losing
+# report-check, the link comment and the action-log event the
+# window-cleanup loop reads), so the window looked un-wrapped.
+#
+# The property under test: it must be impossible to complete this
+# hand-off by asserting something untrue, AND impossible to skip the
+# bookkeeping silently.
+
+# The DEFECT, still refused — a stamped window with no verdict cannot
+# just proceed. That half was never wrong and must not regress.
+mk_prov w879 auto 1 true w879-target
+out=$(_wrapup_skeptic_step 879 w879 your-org/your-nexus 0 "" "" "" "" "" "" "" 2>&1); rc=$?
+assert_eq "#879 a provenance-stamped skeptic with no verdict is still refused" "$rc" "1"
+# …but the refusal must NAME THE ESCAPE HATCH. A refusal whose only open
+# path is the false one is what manufactured the fabricated verdicts.
+assert_contains "#879 …and the refusal names the honest way out" \
+    "$out" "--not-a-skeptic-verdict"
+assert_contains "#879 …and says explicitly not to invent a verdict" \
+    "$out" "do NOT invent a verdict"
+
+# THE FIX — declaring it is not a verdict takes the ORDINARY producer
+# path. Spawn mode here is `require`, so the producer path is reached and
+# observable by its own banner.
+mk_prov w879b require 1 true w879b-target
+out=$(_wrapup_skeptic_step 879 w879b your-org/your-nexus 0 "" "" "" "" "" "" "" "" "" "" \
+        "authored the #862 patch in this window; this wrap-up is that work"); rc=$?
+assert_eq "#879 --not-a-skeptic-verdict completes the hand-off (rc 0)" "$rc" "0"
+assert_contains "#879 …and says the role was NOT asserted" \
+    "$out" "SKEPTIC ROLE NOT ASSERTED"
+assert_contains "#879 …and echoes the recorded reason" \
+    "$out" "authored the #862 patch"
+# It took the producer path, i.e. the window's OWN work now gets the
+# skeptic decision. Without this the flag would just be a way out of the
+# gate rather than a route to the correct one.
+assert_contains "#879 …and runs the ORDINARY worker wrap-up from there" \
+    "$out" "SKEPTIC REQUIRED"
+# NO verdict is recorded. This is the whole point: the artefact the
+# protocol rests on must not be manufactured.
+assert_not_contains "#879 …and records NO verdict" "$out" "SKEPTIC VERDICT"
+avlog="$NEXUS_STATE_DIR/action-log.jsonl"
+assert_eq "#879 …and writes no skeptic-verdict event for this window" \
+    "$(jq -r 'select(.event=="skeptic-verdict" and .window=="w879b")|.window' "$avlog" 2>/dev/null | wc -l | tr -d ' ')" "0"
+# It IS on the record, though — the bookkeeping must not be skippable
+# silently, which is the other half of the property.
+assert_eq "#879 …and DOES log the opt-out, with its reason" \
+    "$(jq -r 'select(.event=="skeptic-role-not-asserted" and .window=="w879b")|.reason' "$avlog" 2>/dev/null)" \
+    "authored the #862 patch in this window; this wrap-up is that work"
+
+# The opt-out DISCHARGES NOTHING. A window that owes a verdict still owes
+# it, and its target stays blocked — otherwise the flag becomes a way to
+# retire a target without ever validating it.
+mkdir -p "$PEND"; printf '1' > "$PEND/w879c-target"
+mk_prov w879c require 1 true w879c-target
+_wrapup_skeptic_step 879 w879c your-org/your-nexus 0 "" "" "" "" "" "" "" "" "" "" \
+    "did unrelated worker work in this window while retained as a skeptic" >/dev/null 2>&1
+assert_file "#879 the opt-out clears NO skeptic marker on the stamped target" \
+    "$PEND/w879c-target"
+
+# A substantive reason is REQUIRED. Without it the flag is a one-word
+# dodge, which is the failure mode the reason exists to price in (the
+# GH_IMPERSONATE_REASON shape).
+mk_prov w879d require 1 true w879d-target
+out=$(_wrapup_skeptic_step 879 w879d your-org/your-nexus 0 "" "" "" "" "" "" "" "" "" "" "oops" 2>&1); rc=$?
+assert_eq "#879 a token reason is REFUSED" "$rc" "1"
+assert_contains "#879 …naming the substantive-reason requirement" \
+    "$out" "substantive reason"
+
+# INERT ON A NON-SKEPTIC WINDOW — refused rather than accepted-and-ignored,
+# so a mistaken belief about this window's role fails at the caller (#605's
+# rule: a verb that ignores a supplied argument must fail loudly).
+mk_prov w879e auto 0 false ""
+out=$(_wrapup_skeptic_step 879 w879e your-org/your-nexus 0 "" "" "" "" "" "" "" "" "" "" \
+        "this window was never stamped as a skeptic at all, so this is inert" 2>&1); rc=$?
+assert_eq "#879 the flag is REFUSED on a window that is not stamped" "$rc" "1"
+assert_contains "#879 …saying why (not stamped), not a generic usage dump" \
+    "$out" "stamped as a skeptic (provenance says skeptic_role: false)"
+
+# The contradiction is refused at the FUNCTION too, not only in the CLI
+# arg parser. The unit suites drive this helper directly, so a guard that
+# lives only in `cmd_wrap_up` is a guard the tested surface does not have.
+mk_prov w879g require 1 true w879g-target
+out=$(_wrapup_skeptic_step 879 w879g your-org/your-nexus 1 "" "" "" "" "" "" "" "" "" "" \
+        "claiming both a role and not-a-verdict at once, which cannot be true" 2>&1); rc=$?
+assert_eq "#879 --not-a-skeptic-verdict + an asserted role is REFUSED in the helper" "$rc" "1"
+assert_contains "#879 …naming the contradiction" "$out" "contradicts an asserted skeptic role/verdict"
+out=$(_wrapup_skeptic_step 879 w879g your-org/your-nexus 0 "" "" "" credible w879g-target 1 0 "" "" "" \
+        "claiming both a verdict and not-a-verdict at once, which cannot be true" 2>&1); rc=$?
+assert_eq "#879 …and likewise alongside a supplied verdict" "$rc" "1"
+
+# CONTROL — a REAL verdict still works unchanged. The fix must not make
+# the honest path harder; wrap-up is on every agent's exit path.
+mk_prov w879f auto 1 true w879f-target
+out=$(_wrapup_skeptic_step 879 w879f your-org/your-nexus 0 "" "" "" credible w879f-target 1 0); rc=$?
+assert_eq "#879 CONTROL: a genuine verdict still completes" "$rc" "0"
+assert_contains "#879 CONTROL: …and still records the verdict" "$out" "SKEPTIC VERDICT"
+
+# ---- assertion-count floor ---------------------------------------------
+#
+# A missing assert_* helper exits rc 127 and is counted by NOTHING: the
+# file runs, prints nothing alarming, and reports success for checks that
+# never ran. Asserting the COUNT is what makes green mean "they ran".
+MIN_ASSERTIONS=190
+if (( PASS + FAIL < MIN_ASSERTIONS )); then
+    echo "FAIL: only $((PASS + FAIL)) assertions executed; expected >= $MIN_ASSERTIONS." >&2
+    echo "      A green run with too few assertions means checks were SKIPPED," >&2
+    echo "      not that they passed (a missing assert_* helper exits 127 silently)." >&2
+    FAIL=$((FAIL + 1))
+fi
+
+# ============================================================
 echo
 if (( FAIL == 0 )); then
     printf 'ALL TESTS PASSED (%d assertions)\n' "$PASS"

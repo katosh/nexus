@@ -1,0 +1,43 @@
+# FIXTURE — verbatim excerpt of monitor/watcher/test-spawn-liveness.sh as it
+# stood when it tore the agent-sandbox down five times on 2026-07-30
+# (your-org/nexus-code#644). NOT executable, NOT sourced: it is the negative
+# control corpus for lint-no-tmux-server-kill.sh. A guard for this incident
+# that does not fire on THIS file is asserting a proxy, so the selftest
+# pins which rules fire on which lines here.
+#
+# Line numbers below are the FIXTURE's own, not the original file's.
+
+# --- the EXIT trap that did the killing (orig line 95) ---
+cleanup() {
+    if [[ -n "$REAL_TMUX" ]]; then
+        TMUX_TMPDIR="$TSOCK" "$REAL_TMUX" kill-server >/dev/null 2>&1 || true
+    fi
+    rm -rf "$WORK"
+
+# --- the isolating shim that got it RIGHT (orig lines 274-283) ---
+    cat > "$RT_BIN/tmux" <<RT
+#!/bin/bash
+export TMUX_TMPDIR="$TSOCK"
+unset TMUX
+if [ "\$1" = "info" ]; then
+    exec "$REAL_TMUX" list-sessions >/dev/null 2>&1
+fi
+exec "$REAL_TMUX" "\$@"
+RT
+    chmod +x "$RT_BIN/tmux"
+
+# --- creates a session on the operator's server (orig line 284) ---
+    TMUX_TMPDIR="$TSOCK" "$REAL_TMUX" -f /dev/null new-session -d \
+        -s live -x 80 -y 24 'sleep 36000' >/dev/null 2>&1
+
+# --- reads/kills windows on the operator's server (orig 314,340,367-369) ---
+    win_left=$(TMUX_TMPDIR="$TSOCK" "$REAL_TMUX" list-windows -t live -F '#{window_name}' 2>/dev/null | grep -c '^live-dead$' || true)
+    TMUX_TMPDIR="$TSOCK" "$REAL_TMUX" kill-window -t live:live-ok >/dev/null 2>&1 || true
+    win_slow=$(TMUX_TMPDIR="$TSOCK" "$REAL_TMUX" list-windows -t live -F '#{window_name}' 2>/dev/null | grep -c '^live-slow$' || true)
+    TMUX_TMPDIR="$TSOCK" "$REAL_TMUX" kill-window -t live:live-slow >/dev/null 2>&1 || true
+
+# --- the timing-trial loop (orig 402-404, 424) ---
+        TMUX_TMPDIR="$TSOCK" "$REAL_TMUX" new-window -d -t live -n "$wname" \
+            "$WORK/boot.sh" >/dev/null 2>&1
+        idx=$(TMUX_TMPDIR="$TSOCK" "$REAL_TMUX" list-windows -t live \
+        TMUX_TMPDIR="$TSOCK" "$REAL_TMUX" kill-window -t "live:$idx" >/dev/null 2>&1 || true

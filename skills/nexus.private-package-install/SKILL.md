@@ -108,9 +108,9 @@ Any tool that authenticates a private-repo `git clone` under the hood follows th
 
 Tools that don't go through GitHub auth (CRAN via `install.packages`, Bioconductor via `BiocManager::install`, PyPI via `uv pip install <name>`, conda-forge / bioconda via mamba) are unaffected by this skill — install them the normal way per `hpc.r` / `hpc.python`.
 
-## Cross-check with <hpc-skills>
+## Cross-check with hpc-skills
 
-This skill **does not** restate the general packaging conventions on <your-institution> infrastructure: uv vs Lmod-module Python, virtual-env placement, `fhR` / `renv`, Apptainer pull mechanics, the conda-forge mirror, NFS-metadata latency behind the `pip` hang. Those live in `hpc.python`, `hpc.r`, `hpc.containers`, `hpc.reproducibility`, and `<your-org>.sandbox-gotchas` respectively — read them for the underlying mechanics. This skill scopes specifically to the **nexus-bot-context auth layer**: bot installation token 404s on private installs, user OAuth via `gh auth token` works, and the fail-loud rule that prevents silent fallback between the two. When in doubt about packaging mechanics, defer to the `fh.*` skill; when in doubt about which token to pass, this skill is canonical.
+This skill **does not** restate the general packaging conventions on <your-institution> infrastructure: uv vs Lmod-module Python, virtual-env placement, `fhR` / `renv`, Apptainer pull mechanics, the conda-forge mirror, NFS-metadata latency behind the `pip` hang. Those live in `hpc.python`, `hpc.r`, `hpc.containers`, `hpc.reproducibility`, and `<your-org>.sandbox-gotchas` respectively — read them for the underlying mechanics. This skill scopes specifically to the **nexus-bot-context auth layer**: bot installation token 404s on private installs, user OAuth via `gh auth token` works, and the fail-loud rule that prevents silent fallback between the two. When in doubt about packaging mechanics, defer to the `hpc.*` skill; when in doubt about which token to pass, this skill is canonical.
 
 ## Documented field example
 

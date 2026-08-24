@@ -30,7 +30,21 @@ trap 'rm -rf "$WORK"' EXIT
 FAKE_NEXUS="$WORK/nexus"
 mkdir -p "$FAKE_NEXUS/monitor" "$FAKE_NEXUS/config"
 cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
+# `ng` sources monitor/_bookkeeping.sh and REFUSES TO START without
+# it (your-org/nexus-code#601/#605: degrading to the silent-coercion
+# behaviour it replaces is worse than refusing). Copy it alongside.
+cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
 NG="$FAKE_NEXUS/monitor/ng"
+
+# Pin the state dir into the fixture (your-org/nexus-code#833). This suite does
+# NOT use `setup_fake_nexus` — see the note below — so it does not inherit that
+# helper's pin and needs its own. `_resolve_state_dir` prefers the INHERITED
+# `$NEXUS_ROOT` over this fixture, so from an agent shell this suite appended to
+# the OPERATOR'S canonical `ng-usage.jsonl`: 40 rows, measured on the primary.
+# Created as well as named, because the usage tap no-ops without the directory
+# and a fixture that stops exercising the write path is a green proving nothing.
+mkdir -p "$FAKE_NEXUS/monitor/.state"
+export NEXUS_STATE_DIR="$FAKE_NEXUS/monitor/.state"
 
 # Stubbed config: only github.repo / github.user_login are read at
 # top-level. Other keys yield exit 2 — load.sh's "key not found".

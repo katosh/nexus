@@ -274,14 +274,18 @@ assert_contains "live-recheck: operator self-eye does NOT count as ack" "$(cat "
 MONITOR_REEMIT_LIVE_RECHECK=false; export MONITOR_REEMIT_LIVE_RECHECK
 unset MONITOR_REEMIT_GH_CMD
 
-echo '=== 6d. _reemit_acked_live predicate rcs ==='
-MONITOR_REEMIT_GH_CMD=ghstub_acked; export MONITOR_REEMIT_GH_CMD
-_reemit_acked_live "your-org/nexus-code" "$CR_ID"; assert_rc "bot reaction ⇒ rc 0" "0" "$?"
-MONITOR_REEMIT_GH_CMD=ghstub_selfonly; export MONITOR_REEMIT_GH_CMD
-_reemit_acked_live "your-org/nexus-code" "$CR_ID"; assert_rc "only self-eye ⇒ rc 1" "1" "$?"
+echo '=== 6d. GC live-recheck: gh failure ⇒ unknown, entry KEPT (not evicted) ==='
+# The reactions query failing (rc 2 from _reemit_reaction_state ⇒ st="") must
+# NOT evict — an unknown ack state leaves the entry on its normal cadence.
+# Exercised through the production path (_reemit_gc), not a boolean shim.
+reset_state
+printf '%s\n' "$CR_BLOCK" | _reemit_register
 ghstub_fail() { return 7; }; export -f ghstub_fail
-MONITOR_REEMIT_GH_CMD=ghstub_fail; export MONITOR_REEMIT_GH_CMD
-_reemit_acked_live "your-org/nexus-code" "$CR_ID"; assert_rc "gh failure ⇒ rc 2 (unknown, don't evict)" "2" "$?"
+MONITOR_REEMIT_LIVE_RECHECK=true; MONITOR_REEMIT_GH_CMD=ghstub_fail
+export MONITOR_REEMIT_LIVE_RECHECK MONITOR_REEMIT_GH_CMD
+_reemit_gc
+assert_contains "gh failure: entry KEPT (unknown ⇒ don't evict)" "$(cat "$reg" 2>/dev/null)" "id=$CR_ID"
+MONITOR_REEMIT_LIVE_RECHECK=false; export MONITOR_REEMIT_LIVE_RECHECK
 unset MONITOR_REEMIT_GH_CMD
 
 # ===================================================================

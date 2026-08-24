@@ -258,11 +258,13 @@ watcher, which reads from `/app/hook/deliveries` directly.)
 ## Step 12 — Start the watcher
 
 ```bash
-monitor/watcher/launcher.sh --target <TARGET_WINDOW>
+monitor/watcher/launcher.sh
 ```
 
-`<TARGET_WINDOW>` is the tmux window the watcher pastes reports into;
-the workspace convention is `orchestrator`. The watcher runs
+The target — the tmux window the watcher pastes reports into — comes from
+config `monitor.target_window` (workspace convention: `orchestrator`). Set it
+there, not with a `--target` flag: hard-coding it is the `#459` anti-pattern
+that `launcher.sh:97-118` documents as a bug, and it now exits 2. The watcher runs
 **headless** — `setsid`-detached, with **no tmux window of its own**;
 its output goes to `monitor/.state/watcher.log` and its liveness is
 anchored by the pidfile `monitor/.state/watcher.pid` + heartbeat. The

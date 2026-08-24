@@ -86,6 +86,13 @@ _nexus_root_default=$(cd "$_monitor_dir/.." && pwd)
 # shellcheck source=../_log-mode.sh
 source "$_monitor_dir/_log-mode.sh"
 
+# Cold-boot dropped-worker manifest (nexus-code#651). The situation report
+# below is the incoming orchestrator's FIRST TURN, which makes it the one
+# place a cold boot's "here is the work I did not bring back" list is
+# guaranteed to be read. Side-effect-free on source.
+# shellcheck source=../_dropped_manifest.sh
+source "$_monitor_dir/_dropped_manifest.sh"
+
 NEXUS_ROOT="${NEXUS_ROOT:-$_nexus_root_default}"
 TARGET=""
 REASON=""
@@ -258,6 +265,25 @@ _compose_situation_report() {
     fi
     printf '\n'
 
+    # Cold-boot drop manifest (nexus-code#651). Inlined VERBATIM rather
+    # than referenced by path: a pointer to a file is a pointer an agent
+    # can decline to follow, and the whole point of the manifest is that a
+    # cold boot's dropped work is otherwise invisible — the windows are
+    # gone from tmux, so the cross-reference above lists nothing.
+    #
+    # We only RECORD that it went into the report here. Marking it delivered
+    # happens after the spawn+paste actually succeeds — composing a report is
+    # not delivering one (skeptic finding 2: marking here meant a single
+    # failed `tmux new-window` consumed the manifest, killing both surfaces,
+    # and the successful retry then handed the new orchestrator a report with
+    # no manifest at all).
+    if _dropped_manifest_pending "$STATE_DIR"; then
+        printf -- '---\n\n'
+        cat -- "$(_dropped_manifest_path "$STATE_DIR")" 2>/dev/null
+        printf '\n---\n\n'
+        MANIFEST_IN_REPORT=1
+    fi
+
     printf '## Recent reports (top 5 by mtime)\n\n'
     if [[ -d "$reports_dir" ]]; then
         local entries
@@ -313,6 +339,10 @@ _compose_situation_report() {
     fi
 }
 
+# Set by _compose_situation_report when it inlined a pending cold-boot
+# manifest. `_compose_situation_report > file` redirects but does NOT
+# subshell, so the assignment is visible here.
+MANIFEST_IN_REPORT=0
 _compose_situation_report > "$REPORT_FILE"
 
 # Issue #161: route through the shared `_respawn_orchestrator` helper.
@@ -363,6 +393,23 @@ esac
 # Cooldown marker — written even on paste failure so the caller's
 # throttle gate engages. The marker's mtime IS the cooldown anchor.
 date +%s > "$COOLDOWN_FILE"
+
+# NOW mark the cold-boot manifest delivered — only on a spawn that actually
+# landed the paste (helper rc 0). rc 4 means the window came up but the paste
+# failed, so nothing reached the agent; rc 2/3 exited above without marking.
+# In every non-0 case the manifest stays PENDING, so `bootstrap.sh`'s on-wake
+# surface and the next spawn attempt can still deliver it. Consuming on
+# ATTEMPT rather than on delivery is what let one failed `new-window`
+# permanently swallow the record of everything a cold boot dropped
+# (your-org/nexus-code#651 skeptic, finding 2).
+if (( MANIFEST_IN_REPORT == 1 )); then
+    if (( helper_rc == 0 )); then
+        _dropped_manifest_mark_delivered "$STATE_DIR"
+        log "cold-boot dropped-worker manifest DELIVERED in the situation report"
+    else
+        log "cold-boot dropped-worker manifest was composed but NOT delivered (respawn helper rc=$helper_rc) — left PENDING for bootstrap.sh / the next spawn"
+    fi
+fi
 
 # Structured event line for post-hoc inspection. Stays on one line
 # so grep / awk pipelines downstream don't have to do multi-line

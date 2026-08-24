@@ -59,29 +59,106 @@ _gw_rp() {
 _gw_self_rp=""
 [ -n "$_gw_dir" ] && _gw_self_rp=$(_gw_rp "$_gw_dir/gh" 2>/dev/null || true)
 
-# --- (1) Resolve the REAL gh: first `gh` on PATH that is not THIS wrapper -----
-_gw_real=""
-_gw_oldifs=$IFS
-IFS=:
-for _gw_p in $PATH; do
-    [ -n "$_gw_p" ] || continue
-    _gw_cand="$_gw_p/gh"
-    [ -x "$_gw_cand" ] || continue
-    # Skip our own dir (path equality) and any path resolving to this wrapper.
-    if [ -n "$_gw_dir" ] && [ "$_gw_p" = "$_gw_dir" ]; then continue; fi
-    if [ -n "$_gw_self_rp" ]; then
-        _gw_cand_rp=$(_gw_rp "$_gw_cand" 2>/dev/null || true)
-        [ "$_gw_cand_rp" = "$_gw_self_rp" ] && continue
-    fi
-    _gw_real="$_gw_cand"
-    break
-done
-IFS=$_gw_oldifs
+# --- (1) Resolve the REAL gh: the first CAPABLE `gh` on PATH -----------------
+#
+# This step used to take "the first `gh` on PATH that is not THIS wrapper" —
+# an IDENTITY criterion carrying a CAPABILITY guarantee it never made
+# (your-org/nexus-code#755). On the operator's host that silently selected
+# /app/bin/gh 1.13.0 (2021) over an installed 2.89.0 whenever PATH happened to
+# order them that way, and 1.13.0 returns ZERO lines at rc 0 for
+# `run view --job --log`, TWO of TEN jobs for `run view --log`, and prints
+# `pass` for a check whose REST conclusion is `skipped`.
+#
+# Resolution now prefers the first candidate meeting the declared floor
+# (monitor/gh-capable.sh; NEXUS_GH_MIN_VERSION, default 2.86.0 — the oldest
+# version MEASURED correct on this host; 2.0.0 was the first, wrong, guess and
+# would have vouched for a 2.14.7 that returns 2 of 10 jobs). PATH order is
+# still honoured among capable candidates, so a deliberately-fronted client
+# keeps precedence.
+#
+# It does NOT refuse when nothing meets the floor. This wrapper is on the path
+# of every agent AND the watcher, on a nexus that cannot be restarted; a
+# mid-flight refusal here halts the board (PR #670 documents that blast radius
+# for the sibling gate). Below-floor resolution therefore degrades to the OLD
+# behaviour plus a durable breadcrumb, and ENFORCEMENT lives at the spawn gate
+# `monitor/assert-shims-wrapped.sh`, where a refusal is a controlled event.
+_gw_capable="${NEXUS_ROOT:-}/monitor/gh-capable.sh"
+if [ ! -r "$_gw_capable" ] && [ -n "$_gw_dir" ]; then
+    _gw_capable="$_gw_dir/../gh-capable.sh"
+fi
 
-if [ -z "$_gw_real" ]; then
+_gw_real=""
+_gw_status=""
+_gw_ver=""
+_gw_skipped=""
+
+if [ -r "$_gw_capable" ]; then
+    # shellcheck disable=SC1090
+    . "$_gw_capable"
+    _gw_line=$(_ghc_resolve "$_gw_self_rp" "$PATH")
+    _gw_real=$(printf '%s' "$_gw_line" | cut -f1)
+    _gw_status=$(printf '%s' "$_gw_line" | cut -f2)
+    _gw_ver=$(printf '%s' "$_gw_line" | cut -f3)
+    _gw_skipped=$(printf '%s' "$_gw_line" | cut -f4)
+else
+    # Degraded fallback: gh-capable.sh missing (an older checkout, or a fork
+    # that has not pulled #755). Reproduce the pre-#755 identity resolution
+    # exactly rather than refusing — availability first, same as above.
+    _gw_oldifs=$IFS
+    IFS=:
+    for _gw_p in $PATH; do
+        [ -n "$_gw_p" ] || continue
+        _gw_cand="$_gw_p/gh"
+        [ -x "$_gw_cand" ] || continue
+        if [ -n "$_gw_dir" ] && [ "$_gw_p" = "$_gw_dir" ]; then continue; fi
+        if [ -n "$_gw_self_rp" ]; then
+            _gw_cand_rp=$(_gw_rp "$_gw_cand" 2>/dev/null || true)
+            [ "$_gw_cand_rp" = "$_gw_self_rp" ] && continue
+        fi
+        _gw_real="$_gw_cand"
+        break
+    done
+    IFS=$_gw_oldifs
+    [ -n "$_gw_real" ] && _gw_status=ok || _gw_status=none
+fi
+
+if [ -z "$_gw_real" ] || [ "$_gw_status" = none ]; then
     printf 'gh-wrapper: could not find the real `gh` on PATH (excluding the wrapper dir %s).\n' "${_gw_dir:-<unresolved>}" >&2
     printf 'gh-wrapper: refusing to run to avoid a recursive / unguarded gh call.\n' >&2
     exit 127
+fi
+
+# --- (1b) Below-floor breadcrumb ---------------------------------------------
+# THROTTLED ON PURPOSE, and the throttle is the interesting decision. A banner
+# on stderr for EVERY call would be the loudest option and the wrong one: this
+# corpus is full of `gh api … 2>&1` and `$(gh … 2>&1)` capture sites, so a
+# per-call banner would be parsed as DATA and corrupt the caller — the warning
+# would become a defect of exactly the kind it is warning about. So stderr is
+# rate-limited to once per NEXUS_GH_STALE_NAG_SECS (default 300) via the marker
+# file's own mtime, while the DURABLE record is refreshed unconditionally and
+# is what the spawn gate and the operator actually read.
+if [ "$_gw_status" = degraded ]; then
+    _gw_mark="${NEXUS_ROOT:-}/monitor/.state/gh-below-floor"
+    _gw_nag=1
+    if [ -n "${NEXUS_ROOT:-}" ] && [ -d "${NEXUS_ROOT}/monitor/.state" ]; then
+        _gw_now=$(date +%s 2>/dev/null || echo 0)
+        _gw_prev=0
+        [ -f "$_gw_mark" ] && _gw_prev=$(stat -c %Y -- "$_gw_mark" 2>/dev/null || stat -f %m -- "$_gw_mark" 2>/dev/null || echo 0)
+        if [ "$_gw_now" -gt 0 ] 2>/dev/null && [ "$_gw_prev" -gt 0 ] 2>/dev/null; then
+            if [ $((_gw_now - _gw_prev)) -lt "${NEXUS_GH_STALE_NAG_SECS:-300}" ]; then _gw_nag=0; fi
+        fi
+        {
+            printf 'ts=%s\nchosen=%s\nversion=%s\nfloor=%s\nskipped=%s\npath_head=%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" \
+                "$_gw_real" "${_gw_ver:-unknown}" "$(_ghc_floor 2>/dev/null || echo '?')" \
+                "${_gw_skipped:-none}" \
+                "$(printf '%s' "$PATH" | tr ':' '\n' | head -4 | tr '\n' ' ')"
+        } > "$_gw_mark" 2>/dev/null || true
+    fi
+    if [ "$_gw_nag" = 1 ]; then
+        printf 'gh-wrapper: WARNING — no `gh` on PATH meets the declared floor %s; using %s (version %s). Silent-degradation risk on `run view --log` and `pr checks` (your-org/nexus-code#755).\n' \
+            "$(_ghc_floor 2>/dev/null || echo '?')" "$_gw_real" "${_gw_ver:-unknown}" >&2
+    fi
 fi
 
 # --- (2) Inject the resolved real-gh into the shared policy logic ------------

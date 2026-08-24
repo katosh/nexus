@@ -47,6 +47,74 @@ if [ -n "${NEXUS_LOCALS_PATH_ONLY:-}" ]; then
     return 0 2>/dev/null || exit 0
 fi
 
+# MOVE-TO-FRONT, not prepend-if-absent (your-org/nexus-code#578 repair).
+#
+# The blocks below used to guard each prepend on `case ":$PATH:" in *":$dir:"*)`
+# — i.e. "already present, skip". That tests PRESENCE and ignores POSITION, so a
+# wrapper dir sitting ANYWHERE in PATH — including buried behind linuxbrew —
+# made this file decline to re-front it. That is the whole #578 failure:
+#
+#   1. `tmux new-window` hands the worker's login zsh an environment that ALREADY
+#      carries the front block (tmux's own env was captured from a shell that had
+#      sourced this file), at positions 1-4.
+#   2. That login zsh runs ~/.zshrc -> ~/.localrc, which re-prepends linuxbrew +
+#      ~/Projects/utilities, BURYING the block to position ~13.
+#   3. The launcher (`/bin/bash /tmp/spawn-launcher-*.sh`) sources this file. The
+#      presence guard sees ghwrap in PATH and skips -> the block stays buried.
+#   4. `claude` inherits that PATH, and Claude Code FREEZES it verbatim into
+#      shell-snapshots/snapshot-zsh-*.sh as the final `export PATH=` line.
+#   5. Every Bash-tool command runs `zsh -c "source <snapshot> && <cmd>"`. Our
+#      ZDOTDIR .zshenv re-fronts correctly, and then the snapshot's `export PATH=`
+#      CLOBBERS it. So the per-command re-front (front-path.zsh) can never repair
+#      a bad snapshot — the launcher's PATH is the only one that matters.
+#
+# Whether step 1 happened at all is what made this look like a "race that flips":
+# if the ancestor env did NOT already carry the block, the presence guard missed
+# and the prepend landed at position 1 (the pre-2026-07-30 "good" snapshots).
+#
+# So: strip every existing copy of $1, then prepend it. Idempotent, corrects a
+# buried entry, and cannot accumulate duplicates. POSIX shell only (no bashisms,
+# no subprocess) — this file is sourced by bash AND zsh. Empty PATH elements are
+# preserved verbatim: an empty element means "cwd", and silently dropping it
+# would change resolution semantics for whoever set it.
+_le_front_dir() {
+    [ -n "${1:-}" ] || return 0
+    if [ -z "${PATH:-}" ]; then
+        export PATH="$1"
+        return 0
+    fi
+    _le_fd_dir="$1"
+    _le_fd_out=""
+    _le_fd_empty=1          # 1 until the first surviving element is collected
+    _le_fd_rest="$PATH"
+    while :; do
+        case "$_le_fd_rest" in
+            *:*) _le_fd_head="${_le_fd_rest%%:*}"; _le_fd_rest="${_le_fd_rest#*:}"; _le_fd_more=1 ;;
+            *)   _le_fd_head="$_le_fd_rest";       _le_fd_rest="";                  _le_fd_more=0 ;;
+        esac
+        if [ "$_le_fd_head" != "$_le_fd_dir" ]; then
+            if [ "$_le_fd_empty" = 1 ]; then
+                _le_fd_out="$_le_fd_head"; _le_fd_empty=0
+            else
+                _le_fd_out="$_le_fd_out:$_le_fd_head"
+            fi
+        fi
+        [ "$_le_fd_more" = 1 ] || break
+    done
+    if [ "$_le_fd_empty" = 1 ]; then
+        export PATH="$_le_fd_dir"
+    else
+        export PATH="$_le_fd_dir:$_le_fd_out"
+    fi
+    unset _le_fd_dir _le_fd_out _le_fd_empty _le_fd_rest _le_fd_head _le_fd_more 2>/dev/null
+    return 0
+}
+
+# Re-front locals/bin. The prepend-if-absent above (shared with PATH-ONLY mode,
+# whose operator-interactive semantics are deliberately left alone) is not enough
+# in full mode for the same reason the wrapper dirs were not: it can be buried.
+[ -d "$_le_locals/bin" ] && _le_front_dir "$_le_locals/bin"
+
 # Redirect ALL of uv's $HOME/XDG-derived state into the nexus-wide tree.
 export UV_PYTHON_INSTALL_DIR="$_le_locals/uv/python"
 export UV_CACHE_DIR="$_le_locals/uv/cache"
@@ -101,26 +169,13 @@ export UV_LINK_MODE="${UV_LINK_MODE:-hardlink}"
 # operator's interactive shells (PATH-ONLY mode, returned above) never
 # see it. Prepended BEFORE notifywrap/ghwrap so those keep the very-front
 # slots (established invariant: ghwrap leads).
-if [ -d "$_le_root/monitor/pipwrap" ]; then
-    case ":${PATH:-}:" in
-        *":$_le_root/monitor/pipwrap:"*) : ;;           # already present
-        *) export PATH="$_le_root/monitor/pipwrap:${PATH:-}" ;;
-    esac
-fi
-
-if [ -d "$_le_root/monitor/notifywrap" ]; then
-    case ":${PATH:-}:" in
-        *":$_le_root/monitor/notifywrap:"*) : ;;        # already present
-        *) export PATH="$_le_root/monitor/notifywrap:${PATH:-}" ;;
-    esac
-fi
-
-if [ -d "$_le_root/monitor/ghwrap" ]; then
-    case ":${PATH:-}:" in
-        *":$_le_root/monitor/ghwrap:"*) : ;;            # already present
-        *) export PATH="$_le_root/monitor/ghwrap:${PATH:-}" ;;
-    esac
-fi
+# Fronted in reverse of the desired final order, so the LAST call wins the
+# very-front slot. Final order: ghwrap : notifywrap : pipwrap : locals/bin : …
+# (established invariant: ghwrap leads). Same order as front-path.zsh and
+# bash_env.sh, both of which already move-to-front correctly.
+[ -d "$_le_root/monitor/pipwrap" ]    && _le_front_dir "$_le_root/monitor/pipwrap"
+[ -d "$_le_root/monitor/notifywrap" ] && _le_front_dir "$_le_root/monitor/notifywrap"
+[ -d "$_le_root/monitor/ghwrap" ]     && _le_front_dir "$_le_root/monitor/ghwrap"
 
 # Fail-CLOSED bot identity. The PATH-front wrapper above is a SHADOW, not a
 # boundary. Any shell rc that re-prepends its own bin dir (linuxbrew, /app/bin)
@@ -193,4 +248,7 @@ if [ -f "$_le_root/monitor/shellenv/bash_env.sh" ] \
     export BASH_ENV="$_le_root/monitor/shellenv/bash_env.sh"
 fi
 
+# Do not leak the helper into the sourcing shell (it is an implementation
+# detail of this file, and agents' interactive shells source it).
+unset -f _le_front_dir 2>/dev/null || :
 unset _le_src _le_root _le_locals 2>/dev/null

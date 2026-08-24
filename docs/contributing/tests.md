@@ -36,6 +36,82 @@ Several scripts are also `chmod +x` and can be invoked directly
 (`./monitor/watcher/test-ng-wrap-up.sh`); the `bash` form works
 for either.
 
+### Which bash you are testing under
+
+Every run ends with a line stating the interpreter it took its
+evidence under, and whether that matches CI's:
+
+```
+=== COVERAGE BOUNDARY: this run took its evidence under bash 4.4; CI runs bash 5.2 ===
+```
+
+This is not decoration. No host in this workspace ships bash
+5.x; CI runs only 5.2. That asymmetry has already hidden two
+real defects, and it hides them in *both* directions:
+
+- **5.2-only, invisible locally.** `run-tests.sh`'s fork-floor
+  probe used `( ulimit -Su N; /bin/true )`. Bash may exec the
+  last simple command of a subshell in place of the subshell,
+  and 5.2 does so where 4.4 does not — so no child was created,
+  `RLIMIT_NPROC` was never exercised, every candidate
+  "succeeded", and the binary search collapsed to its lower
+  bound. CI capped forks at 87 against a real floor of 566 and
+  every test then died of `EAGAIN`. It could not be reproduced
+  on 4.4 even in principle (`#597`).
+- **4.4-only, invisible in CI.** 4.4 is what every host here,
+  including the one running the live watcher, actually executes.
+  The `bash-legacy` job in `tests.yml` exists for this half.
+
+To run any suite under CI's interpreter, build it once and point
+`NEXUS_TEST_SHELL` at it:
+
+```bash
+monitor/toolchain-bash.sh --version 5.2          # ~2 min, cached, sha256-pinned
+NEXUS_TEST_SHELL=$(monitor/toolchain-bash.sh --print-path) \
+    monitor/watcher/run-tests.sh --jobs 4 monitor/test-*.sh
+```
+
+The parity line then reads `interpreter parity: bash 5.2`. Add
+`--require-ci-parity` to make a mismatch a hard refusal rather
+than a declaration — worth it before pushing anything that
+touches shell-version-sensitive behaviour (subshell/fork
+semantics, parameter expansion, `patsub_replacement`).
+
+`monitor/ci-bash-version` holds the pin, and `tests.yml` asserts
+the runner's actual bash matches it — so the boundary local runs
+declare cannot quietly become a lie when GitHub bumps its image.
+
+### Do not assert with `printf … | grep -q`
+
+`grep -q` exits the moment it matches, without draining its
+input; the writer upstream then takes EPIPE, and under
+`set -o pipefail` that becomes the pipeline's status. The
+assertion reports **failure at the exact moment the thing it
+tested turned out to be true**. This produced a red `dev` on a
+~90-byte payload where the code under test was correct. Write
+it as a redirection instead — no pipe, no reader to close it:
+
+```bash
+grep -q 'needle' <<<"$haystack"      # yes
+printf '%s' "$haystack" | grep -q 'needle'   # no
+```
+
+`monitor/watcher/test-sigpipe-assertion-lint.sh` enforces this
+for `printf` and `echo` — the builtins where the rewrite is
+mechanical — and demonstrates the mechanism executably.
+
+The same hazard exists when the producer is a **process**. The
+`tmux` half — `tmux list-windows … | grep -qxF "$WINDOW"` and
+friends, where a spurious 141 reads as "the window does not
+exist" when it does — is owned by
+`monitor/watcher/test-tmux-lookup-sigpipe.sh`, which also proves
+the rewrite is behaviour-preserving. The remaining producers
+(`tr`, `ls`, `locale`, `ss`, `sed`, `cat`, `python`) are not
+linted yet and are **not** safe; they are tracked with a full
+enumeration at
+[`#622`](https://github.com/<your-org>/nexus-code/issues/622).
+The drop-in is `grep -q PAT <<<"$(cmd)"`.
+
 ## What each file covers
 
 The scripts split into three groups: `ng` verb unit tests,
@@ -59,6 +135,7 @@ the table below summarises but the source is canonical.
 | File | Helper under test | Style |
 |---|---|---|
 | [`test-lib.sh`](https://github.com/<your-org>/nexus-code/blob/main/monitor/watcher/test-lib.sh) | `_target_window_present`, `_classify_diff` (from `_lib.sh`) | mock-`tmux` |
+| [`test-target-window-live.sh`](https://github.com/<your-org>/nexus-code/blob/main/monitor/watcher/test-target-window-live.sh) | `_target_window_present` against a REAL `remain-on-exit` corpse — the two claims a mock cannot check: that `#{pane_dead}` means what we think on the installed tmux, and that `list-panes -s` did not widen the probe's session scope (`#741`) | real `tmux`, `SLOW_TESTS=1` |
 | [`test-snapshot-github.sh`](https://github.com/<your-org>/nexus-code/blob/main/monitor/watcher/test-snapshot-github.sh) | `snapshot_github` happy path (`_github.sh`) | mock-`gh` |
 | [`test-snapshot-github-failure.sh`](https://github.com/<your-org>/nexus-code/blob/main/monitor/watcher/test-snapshot-github-failure.sh) | GraphQL rate-limit detect-and-react: sentinel emit, per-surface backoff, expiry, unknown-error logging | mock-`gh` + shadowed `date` |
 | [`test-graphql-gate.sh`](https://github.com/<your-org>/nexus-code/blob/main/monitor/watcher/test-graphql-gate.sh) | `_graphql_polling_gate` + alert rate-limit (`_github.sh`) | mock-`gh /rate_limit` + stub `mint-token.sh` |
@@ -187,15 +264,83 @@ and every `push` to `main` whose paths touch `monitor/**`,
 What runs vs. what self-skips:
 
 - **Fast unit tests** — all of `monitor/watcher/test-*.sh` runs.
-- **Slow tests** (`test-respawn-loop-integration.sh`) self-skip
-  unless `SLOW_TESTS=1` is set. CI does not set it.
+- **Slow tests** (`test-respawn-loop-integration.sh` and the
+  `SLOW_TESTS`-gated files) self-skip in the fast gate — it does
+  not set `SLOW_TESTS=1`. They are **not** unguarded: since
+  <your-org>/nexus-code#737 they run as their own blocking check in
+  `tests-slow-integration.yml` (below), which is where their
+  verdict now comes from.
 - **Integration tests** (`monitor/watcher/test-integration/*`)
-  self-skip unless `RUN_INTEGRATION=1` is set. CI does not set
-  it. Bringing integration tests into CI is a follow-up — they
-  spin up a real tmux server per scenario and need their own
-  job design.
+  self-skip in the fast gate — it does not set `RUN_INTEGRATION=1`.
+  They spin up a real tmux server per scenario.
 
-To reproduce a CI failure locally, mirror the runner invocation:
+### SLOW + integration band
+
+[`.github/workflows/tests-slow-integration.yml`](https://github.com/<your-org>/nexus-code/blob/main/.github/workflows/tests-slow-integration.yml)
+carries **two** jobs, split by cost (<your-org>/nexus-code#737):
+
+- **`SLOW band vs enumerated tolerance`** — the seven
+  `SLOW_TESTS=1` scenarios, no integration suite, ~7 min. Runs on
+  every PR and push touching `monitor/**` / `config/**`, and it
+  **blocks**. This is the band `#729`'s three broken assertions
+  lived in, and the one the fast gate is silent about.
+- **`SLOW + integration band (scheduled)`** — the **full** suite
+  with both gates on (`SLOW_TESTS=1 RUN_INTEGRATION=1`), nightly
+  (`cron: '0 7 * * *'`) plus `workflow_dispatch`. Deliberately not
+  a per-PR gate: dozens of multi-minute tests plus per-scenario
+  tmux bring-up, order 30-60 min wall.
+
+**Why the cheap half became blocking.** "Not blocking" was never
+the defect. The defect was non-blocking **and** known-red, under
+which a genuine new red is indistinguishable from the accepted
+ones — the mechanism that let `#729` sit red for an unknown
+period. The fix is that the tolerated set is now **data**
+(`monitor/slow-band-known-red.tsv`) and the verdict is a diff
+against it (`monitor/slow-band-drift.sh`), in both directions: a
+new red fails, a tolerated red that starts passing fails
+(`STALE-TOLERATION`, so the list cannot grow monotonically into an
+excuse), and a tolerated red the ledger never mentions fails
+(`UNACCOUNTED`). That is what lets the band block while a known
+red is outstanding.
+
+**Why it also grew `pull_request:` and `push:` triggers.** Until
+2026-08-06 this workflow had only `schedule` + `workflow_dispatch`.
+GitHub registers and schedules cron from the **default branch**;
+the file was added to `dev` on 2026-07-24 and `main` is hundreds of
+commits behind, so it never reached the default branch and the
+Actions API returned **404** for it — not "runless", *unknown*. It
+produced zero runs in the thirteen days it read as coverage. The
+control that isolates the variable: `ci-signal.yml` is also
+`dev`-only and had 151 runs, because a `pull_request` trigger fires
+from the PR head ref. `monitor/lint-workflows.py` rule `SR001` now
+fails any workflow that declares `schedule` and nothing that fires
+off the default branch, so this cannot recur silently.
+
+It exists to keep slow + integration rot VISIBLE and report it red,
+the gap that let `#554` sit unguarded on `dev`
+(<your-org>/nexus-code#559).
+
+Mechanics worth knowing:
+
+- Drives the bounded/resumable runner (`--state … --resume
+  --max-seconds …`, <your-org>/nexus-code#499) in a loop until the
+  ledger is complete (exit `!= 3`), so the ~175-test band
+  terminates with an honest PASS/FAIL/TIMEOUT ledger instead of
+  timing out unaccounted. `env -u NEXUS_ROOT -u NEXUS_LOCALS` is
+  the canonical clean-env drive.
+- Two **anti-vacuous-pass guards** run before the band: one asserts
+  the integration suite is actually selected (kills the "green
+  because it ran nothing" mode of `#484`); the other plants an
+  always-failing gated test and asserts the runner goes RED on it
+  and self-skips green when the gate is unset (proves the harness
+  both runs gated tests and reports their failures).
+- The band is honestly red until the residual integration defects
+  (unmasked by PR `#561`'s `#554` comm fix) are burned down; per
+  `#559` the job is promoted to a required check only once green.
+  The ledger + per-test logs upload as a build artifact for
+  post-mortem.
+
+To reproduce the fast gate locally, mirror the runner invocation:
 
 ```bash
 bash monitor/watcher/run-tests.sh --jobs 2

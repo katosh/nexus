@@ -50,16 +50,41 @@ case "$_pw_arg0" in
         ;;
 esac
 
-# --- resolve the real binary: first PATH hit that is not in our dir -------
+# realpath helper: prefer `readlink -f`; fall back to dirname-cd + basename
+# (enough to compare two paths pointing at the same file). Byte-for-byte the
+# same shape as ghwrap/gh's `_gw_rp` and notifywrap/sandbox-notify's `_nw_rp`.
+_pw_rp() {
+    if readlink -f / >/dev/null 2>&1; then
+        readlink -f "$1" 2>/dev/null && return 0
+    fi
+    _pw_rp_d=$(CDPATH= cd "$(dirname "$1")" 2>/dev/null && pwd) || return 1
+    printf '%s/%s\n' "$_pw_rp_d" "$(basename "$1")"
+}
+
+_pw_self_rp=""
+[ -n "$_pw_dir" ] && _pw_self_rp=$(_pw_rp "$_pw_dir/$_pw_name" 2>/dev/null || true)
+
+# --- resolve the real binary: first PATH hit that is not THIS wrapper ------
+# your-org/nexus-code#568 A5. This used to compare DIRECTORY STRINGS only, while
+# both sibling wrappers (ghwrap/gh, notifywrap/sandbox-notify) also compare
+# resolved realpaths. A wrapper dir reachable under a second name — a symlink,
+# a bind mount, `/shared/...` vs its automount alias — fails the string test,
+# so the wrapper resolves ITSELF as "the real pip" and re-execs forever. That
+# is an unbounded fork loop inside the very shim that exists to stop the #487
+# pip fork storm, which is why this divergence is the one worth closing.
 _pw_real=""
 _pw_ifs="$IFS"; IFS=:
 for _pw_d in ${PATH:-}; do
     [ -n "$_pw_d" ] || continue
     [ "$_pw_d" = "$_pw_dir" ] && continue
-    if [ -x "$_pw_d/$_pw_name" ] && [ ! -d "$_pw_d/$_pw_name" ]; then
-        _pw_real="$_pw_d/$_pw_name"
-        break
+    [ -x "$_pw_d/$_pw_name" ] && [ ! -d "$_pw_d/$_pw_name" ] || continue
+    # Second gate: same file reached by a different path.
+    if [ -n "$_pw_self_rp" ]; then
+        _pw_cand_rp=$(_pw_rp "$_pw_d/$_pw_name" 2>/dev/null || true)
+        [ "$_pw_cand_rp" = "$_pw_self_rp" ] && continue
     fi
+    _pw_real="$_pw_d/$_pw_name"
+    break
 done
 IFS="$_pw_ifs"
 

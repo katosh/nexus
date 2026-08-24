@@ -127,7 +127,7 @@ eng_observe "$W2" bystander
 # Predicate: the canned marker for a turn has rendered in the pane.
 pane_has() {
     local idx="$1" marker="$2"
-    cch_capture "$idx" | grep -qF "$marker"
+    grep -qF "$marker" <<<"$(cch_capture "$idx")"
 }
 
 TURNS=5

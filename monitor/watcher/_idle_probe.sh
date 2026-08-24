@@ -127,12 +127,31 @@
 # "operator-engaged marks" section below.
 #
 # `pane-absent` fires when `monitor/pane-state.sh` reports
-# `state ∈ {absent, empty, blocked}` for a worker window — i.e.
-# the inner Claude Code process has died (pane fell back to shell
-# / no input chevron), the renderer landed in an ambiguous state,
-# or the pane is blocked on an unhandled overlay. Inviolable like
+# `state ∈ {absent, blocked}` for a worker window. Inviolable like
 # `idle-too-long`: never suppressed by `window-retain`. The whole
 # point is to surface a crash that nothing else surfaces.
+#
+# `empty` is NOT in that set and has not been since the post-rethink
+# split — pane-state.sh distinguishes it (alive claude, transient
+# render state) from `absent` (no live claude in the pane). This
+# comment said `{absent, empty, blocked}` long after the code stopped
+# agreeing; corrected with your-org/nexus-code#808, whose whole subject
+# is a description of this class drifting from what it does.
+#
+# ONE CLASS, TWO ADVISORIES (your-org/nexus-code#808). Both member
+# states need the operator, which is why they share the surface, but
+# they need OPPOSITE actions:
+#
+#   absent    the inner Claude process is gone (pane fell back to
+#             shell / no input chevron)  → "relaunch or close"
+#   blocked   the process is ALIVE and rendering a modal it is waiting
+#             for a human to answer      → "ANSWER it; do NOT relaunch"
+#
+# The detail column carries whichever applies and `render_idle_section`
+# prints it verbatim. `n_pane_absent` in the summary line still counts
+# both into one number — deliberately out of scope here, and called out
+# in `#808` as the wider judgement it is; the per-row advisory is what
+# an operator acts on.
 #
 # `retained` is a post-classification override applied when the
 # orchestrator has logged a recent `window-retain` event for the
@@ -553,8 +572,25 @@ _idle_pane_state_get() {
 # (state + active + window + name [+ reset_at when over-limit]) so the
 # caller can pull additional fields (issue #87: `reset_at` plumbing for
 # over-limit classification). Empty stdout on resolver failure.
+#
+# Shared-recording chokepoint (your-org/nexus-code#562): when
+# `_pane_cache.sh` is loaded (main.sh sources it; standalone test
+# sourcing may not), a fresh recording of this window from the current
+# sweep loop is served instead of re-forking pane-state.sh, and a
+# direct fork's result is recorded for the other assessments to reuse.
+# Optional $2 is the expected window NAME — guards against a reused
+# window index serving another window's recording. Fail-open on every
+# cache condition; MONITOR_PANE_CACHE_MODE=record (the authoritative
+# idle sweep) always forks fresh.
 _idle_pane_state_line() {
-    local window_index="$1"
+    local window_index="$1" expected_name="${2:-}"
+    if declare -F _pane_cache_read >/dev/null 2>&1; then
+        local _pc_line
+        if _pc_line=$(_pane_cache_read "$window_index" "$expected_name"); then
+            printf '%s\n' "$_pc_line"
+            return 0
+        fi
+    fi
     local pane_state_script
     if [[ -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/monitor/pane-state.sh" ]]; then
         pane_state_script="$NEXUS_ROOT/monitor/pane-state.sh"
@@ -568,7 +604,13 @@ _idle_pane_state_line() {
         && [[ "$MONITOR_HEARTBEAT_STALENESS_SECONDS" =~ ^[0-9]+$ ]]; then
         hb_args+=(--heartbeat-staleness "$MONITOR_HEARTBEAT_STALENESS_SECONDS")
     fi
-    "$pane_state_script" "${hb_args[@]}" "$window_index" 2>/dev/null
+    local _ps_line
+    _ps_line=$("$pane_state_script" "${hb_args[@]}" "$window_index" 2>/dev/null) || true
+    if [[ -n "$_ps_line" ]] && declare -F _pane_cache_write >/dev/null 2>&1; then
+        _pane_cache_write "$window_index" "$_ps_line"
+    fi
+    [[ -n "$_ps_line" ]] && printf '%s\n' "$_ps_line"
+    return 0
 }
 
 # Extract `field=<token>` from a pane-state emit line. Empty stdout on
@@ -1231,6 +1273,15 @@ _openg_machine_input_epoch() {
         e=$(awk -F'\t' -v w="$window" \
             '$1 == w && $2 ~ /^[0-9]+$/ && ($2 + 0) > m { m = $2 + 0 } END { print m + 0 }' \
             "$mi" 2>/dev/null)
+        # SECONDS. This function is pure comparison — it never keys a
+        # sidecar — and it takes a MAX across three sources, the other
+        # two of which are ISO timestamps in seconds. Letting a raw
+        # microsecond key in would make `best` ~1e6x every clock reading
+        # it is mixed with and, at the call site, put EVERY operator
+        # submit inside the machine-input window: the attribution rule
+        # would silently reclassify the operator's own typing as a
+        # machine paste (your-org/nexus-code#679).
+        e=$(_paste_epoch_seconds "$e")
         [[ "$e" =~ ^[0-9]+$ ]] && (( e > best )) && best=$e
     fi
     ts=$(_idle_window_spawn_ts "$window")
@@ -1239,6 +1290,47 @@ _openg_machine_input_epoch() {
         [[ "$e" =~ ^[0-9]+$ ]] && (( e > best )) && best=$e
     fi
     printf '%s' "$best"
+}
+
+# ---- your-org/nexus-code#683: is the newest machine input ADMINISTRATIVE? --
+#
+# Prints `1` when the machine input covering `epoch_sec` was pasted with
+# `--administrative`, else nothing. An administrative follow-up asks for
+# no new work, so it must not consume the window's standing
+# `window-retain` and must not supersede an older wrap-up.
+#
+# Keyed off the ledger's column 4, compared at SECONDS granularity
+# because that is the unit the caller's `machine` epoch is in (`#679`).
+# The `>=` is deliberate: `_openg_machine_input_epoch` takes a MAX
+# across three sources and the TSV row that WON that max is the one
+# whose marker applies. A row strictly newer than the resolved epoch
+# cannot exist (the resolver would have returned it), so `>=` selects
+# exactly the winning row and ties resolve to administrative.
+#
+# FAIL-SAFE DIRECTION. Absence of a marker — a pre-#683 3-column row, a
+# row from any other writer, an unreadable ledger — yields nothing, i.e.
+# RE-TASK, which is today's behaviour. So this can only ever stop
+# consuming a retain that a genuine re-task would have consumed; it can
+# never manufacture a superseded wrap-up. Getting it wrong in the other
+# direction would HIDE a real re-task, which is the failure `#683`'s own
+# test note warns about ("a fix that only suppresses is a fix that hides
+# real re-tasks").
+_openg_machine_input_administrative() {
+    local window="$1" epoch_sec="$2" mi hit
+    [[ -n "$window" && "$epoch_sec" =~ ^[0-9]+$ ]] || return 0
+    (( epoch_sec > 0 )) || return 0
+    mi=$(_machine_input_path)
+    [[ -f "$mi" ]] || return 0
+    hit=$(awk -F'\t' -v w="$window" -v e="$epoch_sec" \
+        '$1 == w && $2 ~ /^[0-9]+$/ && $4 == "admin" {
+             v = $2 + 0
+             if (v >= 10000000000000) v = int(v / 1000000)
+             if (v >= e) { found = 1 }
+         }
+         END { if (found) print "1" }' \
+        "$mi" 2>/dev/null)
+    [[ "$hit" == "1" ]] && printf '1'
+    return 0
 }
 
 # ---- injection ↔ hook pairing validation (the #205 state-machine
@@ -1284,6 +1376,47 @@ _paste_confirm_grace_seconds() {
 # or `0` when every paste is confirmed (or out of scope per the guards
 # above, or simply too recent to judge). `now` is supplied by the
 # caller's sweep so one cycle shares one clock.
+# How far the action-log `paste-followup` timestamp trails the moment the
+# paste actually began (your-org/nexus-code#665). The event is appended
+# after the paste completes and its outcome is known; measured at 1-2s on
+# this operator. Only used on the fallback path, where the pre-paste TSV
+# stamp is unavailable — the TSV needs no correction because it is taken
+# before the keystrokes go out.
+: "${_PASTE_LOG_LAG_SECONDS:=5}"
+
+# ---- your-org/nexus-code#679: two granularities, one recorded value ---
+#
+# `machine-input.tsv` column 2 and the `#676` verdict sidecar name are a
+# KEY: they must be unique per paste, so since `#679` they are recorded
+# in MICROSECONDS. Every other consumer compares the value against a
+# different clock reading — the hook stamp, the transcript's submission
+# records, the window's spawn timestamp, the "paste NNNs ago" the emit
+# renders — and all of those are SECONDS.
+#
+# So a raw key must never reach an arithmetic comparison. It fails in the
+# quiet direction: a microsecond key is ~1e6x any seconds value, so
+# `(( best < spawn_epoch ))` goes permanently false and the lifecycle
+# scope guard stops rejecting pastes from a prior life of the window
+# name, while `(( now >= epoch ))` goes permanently false and the age
+# note silently vanishes. Nothing errors; the guards just stop guarding.
+#
+# Normalising by MAGNITUDE rather than by a format flag is what keeps the
+# append-only ledger readable across the change: rows written before
+# `#679` are seconds and live in the same file forever. The two ranges
+# are five orders of magnitude apart with no plausible overlap — a
+# seconds epoch stays under 1e10 until the year 2286, a microseconds
+# epoch passed 1e15 in 2001 — so 1e13 sits in empty space between them.
+_PASTE_EPOCH_US_FLOOR=10000000000000
+_paste_epoch_seconds() {
+    local v="$1"
+    [[ "$v" =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
+    if (( v >= _PASTE_EPOCH_US_FLOOR )); then
+        printf '%s' "$(( v / 1000000 ))"
+    else
+        printf '%s' "$v"
+    fi
+}
+
 _idle_unconfirmed_paste_epoch() {
     local window="$1" now="$2" best=0 e ts
     [[ -n "$window" && "$now" =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
@@ -1292,7 +1425,36 @@ _idle_unconfirmed_paste_epoch() {
     # user-prompt stamp, so its absence means "cannot confirm",
     # not "unconfirmed".
     [[ -f "${STATE_DIR:-.}/heartbeat/$window.json" ]] || { printf '0'; return 0; }
-    # Newest guaranteed-submit paste epoch across both stamp surfaces.
+    # Newest guaranteed-submit paste epoch.
+    #
+    # The TWO surfaces are NOT interchangeable, and treating them as such
+    # is your-org/nexus-code#665. `machine-input.tsv` is stamped BEFORE
+    # the keystrokes go out (paste-followup.sh:418, immediately before the
+    # send-keys); the `action-log.jsonl` event is appended AFTER the paste
+    # has completed and its outcome is known (step 4, ~1-2s later).
+    #
+    # The old code took the MAX of the two, which deliberately selects the
+    # post-paste one — and the target's own submission record lands
+    # BETWEEN them. So every check on the most recent paste compared the
+    # submission against an epoch later than the submission itself:
+    #
+    #   submission record   2026-08-02T23:53:58.439Z   (transcript)
+    #   action-log ts       2026-08-02T23:53:59Z       (max → chosen)
+    #                       ^ 0.56s later, so `>= epoch` rejects the
+    #                         paste's OWN record and the detector fires
+    #
+    # Measured that way on 2026-08-02: `nexus-dashboard-prune` -0.56s,
+    # `nexus-dashsk` -0.24s, and `nexuscode-burndown2` -1.2s. Older pastes
+    # looked confirmed only because some LATER submission cleared the bar
+    # for them, which is why the false positive always lands on the most
+    # recent paste — the one an operator is most likely to be waiting on.
+    #
+    # So: the TSV is AUTHORITATIVE for attribution. paste-followup.sh says
+    # so in as many words at its own action-log append — "the TSV stamp
+    # above is what the attribution rule keys on". The action-log is an
+    # audit trail; it is consulted ONLY as a fallback when the TSV has no
+    # row for this window, and it can no longer push the epoch later than
+    # the moment the paste actually began.
     local mi
     mi=$(_machine_input_path)
     if [[ -f "$mi" ]]; then
@@ -1301,26 +1463,44 @@ _idle_unconfirmed_paste_epoch() {
             "$mi" 2>/dev/null)
         [[ "$e" =~ ^[0-9]+$ ]] && (( e > best )) && best=$e
     fi
-    local log_file="${STATE_DIR:-.}/action-log.jsonl"
-    if [[ -f "$log_file" ]] && command -v jq >/dev/null 2>&1; then
-        ts=$(grep '"event":"paste-followup"' "$log_file" 2>/dev/null \
-            | tac \
-            | jq -r --arg w "$window" \
-                'select(.window == $w) | select((.no_enter // "") != "1") | .ts' 2>/dev/null \
-            | head -1)
-        if [[ -n "$ts" ]]; then
-            e=$(_idle_iso_to_epoch "$ts")
-            [[ "$e" =~ ^[0-9]+$ ]] && (( e > best )) && best=$e
+    if (( best == 0 )); then
+        local log_file="${STATE_DIR:-.}/action-log.jsonl"
+        if [[ -f "$log_file" ]] && command -v jq >/dev/null 2>&1; then
+            ts=$(grep '"event":"paste-followup"' "$log_file" 2>/dev/null \
+                | tac \
+                | jq -r --arg w "$window" \
+                    'select(.window == $w) | select((.no_enter // "") != "1") | .ts' 2>/dev/null \
+                | head -1)
+            if [[ -n "$ts" ]]; then
+                e=$(_idle_iso_to_epoch "$ts")
+                # POST-paste by construction, so it overstates the start
+                # instant. Back it off by the observed paste duration
+                # before using it for attribution — an epoch that is too
+                # LATE manufactures exactly the false positive above,
+                # while one that is slightly too early can only ever
+                # accept a submission that really did follow this paste.
+                [[ "$e" =~ ^[0-9]+$ ]] && (( e > _PASTE_LOG_LAG_SECONDS )) \
+                    && e=$(( e - _PASTE_LOG_LAG_SECONDS ))
+                [[ "$e" =~ ^[0-9]+$ ]] && (( e > best )) && best=$e
+            fi
         fi
     fi
     (( best > 0 )) || { printf '0'; return 0; }
+    # `best` stays the RAW recorded value from here on, because that is
+    # the sidecar key and `#676` rests on sender and watcher deriving
+    # the name from the same recorded value. `best_sec` is the seconds
+    # view for every comparison against another clock. See
+    # `_paste_epoch_seconds` above for why both are needed.
+    local best_sec
+    best_sec=$(_paste_epoch_seconds "$best")
+    (( best_sec > 0 )) || { printf '0'; return 0; }
     # Lifecycle scope: a paste older than the current spawn belongs to
     # a prior life of the window-name.
     local spawn_ts spawn_epoch
     spawn_ts=$(_idle_window_spawn_ts "$window")
     if [[ -n "$spawn_ts" ]]; then
         spawn_epoch=$(_idle_iso_to_epoch "$spawn_ts")
-        if [[ "$spawn_epoch" =~ ^[0-9]+$ ]] && (( best < spawn_epoch )); then
+        if [[ "$spawn_epoch" =~ ^[0-9]+$ ]] && (( best_sec < spawn_epoch )); then
             printf '0'; return 0
         fi
     fi
@@ -1328,12 +1508,327 @@ _idle_unconfirmed_paste_epoch() {
     # stamp lands at-or-after the ledger epoch (same host, same clock).
     local prompt_epoch
     prompt_epoch=$(_openg_user_prompt_epoch "$window")
-    (( prompt_epoch >= best )) && { printf '0'; return 0; }
+    (( prompt_epoch >= best_sec )) && { printf '0'; return 0; }
     # Too recent to judge — the hook may still be about to fire.
     local grace
     grace=$(_paste_confirm_grace_seconds)
-    (( now - best >= grace )) || { printf '0'; return 0; }
+    (( now - best_sec >= grace )) || { printf '0'; return 0; }
+
+    # ---- second evidence surface (your-org/nexus-code#607) ------------
+    #
+    # Everything above rests on ONE surface: the UserPromptSubmit hook
+    # stamp. That surface cannot distinguish "the paste was lost" from
+    # "the paste was QUEUED behind an in-flight turn", because a queued
+    # message fires no submit event until the running turn drains — and
+    # turns here routinely exceed the 180s grace. The emit that follows
+    # a false positive advises a RE-PASTE, which duplicates completed
+    # work: on 2026-07-29 a four-part verification brief that the target
+    # had demonstrably answered in full (four report sections, titled to
+    # match, appended after the paste) was flagged `paste-unconfirmed`,
+    # and re-pasting would have re-run a finished adversarial pass.
+    #
+    # `paste-followup.sh` has always judged against a SECOND surface —
+    # the target's own transcript, Claude Code's authoritative ledger.
+    # Consult it here too, so the sender and the watcher reach the same
+    # verdict from the same evidence.
+    #
+    # Three-valued on purpose. `unknown` (no transcript, no jq, or a
+    # file larger than the scan bound) must NOT be read as "not
+    # submitted": that would be the same over-claim in a new place. It
+    # falls through to the hook-stamp verdict, i.e. today's behaviour,
+    # so this can only ever REMOVE false positives — never add one, and
+    # never suppress the genuine-loss path that is the reason this
+    # detector exists.
+    # ---- the SENDER's own recorded verdict (your-org/nexus-code#665) --
+    #
+    # Consulted BEFORE the transcript re-scan, because it is better
+    # evidence and it is free. paste-followup.sh polled the target's
+    # transcript at paste time, while the turn was fresh and the
+    # session-id was known-current; we are reading the same transcript
+    # minutes later through `heartbeat/<window>.json`, whose session-id
+    # can have rotated under a resume or a compaction. When the sender
+    # says rc 0 it OBSERVED a submission record. Evidence of presence
+    # does not expire — a later failure to re-find it is our problem,
+    # not proof the submission never happened.
+    #
+    # This is the fix for the shape #668 left open. On 2026-08-02 the
+    # detector fired 11 times with 0 true positives; both fully
+    # documented decisive cases (a dashboard rewritten 10s after the
+    # paste, a freshness stamp whose four specified corrections all
+    # landed) were pastes the sender had recorded as `submitted`.
+    #
+    # Only rc 0 suppresses. rc 3 ("could not establish either" — the
+    # plausibly-QUEUED case) deliberately does NOT: a paste genuinely
+    # lost during an in-flight turn must still be catchable, so it
+    # falls through to the surfaces below and is reported with hedged
+    # wording (see _idle_paste_verdict_note). rc 4 is the established
+    # negative this detector exists for and must never suppress.
+    #
+    # A missing/unreadable sidecar is `unknown` and changes nothing.
+    # ---- the CONTENT MARKER (your-org/nexus-code#665 item 1) ----------
+    #
+    # Every surface above and below asks a question that is ADJACENT to
+    # the one being decided. The sender's verdict is about a 20s window;
+    # `_idle_paste_consumed` is about an epoch ordering. Neither is about
+    # THESE BYTES. So a paste that was genuinely lost, in a window whose
+    # worker submitted anything else afterwards, was suppressed — the
+    # residual `#665` named, and this issue's own defect class (a check
+    # that asserts a proxy rather than the property) living inside its
+    # own fix.
+    #
+    # The sender now stamps the digest of the exact canonical bytes beside
+    # the paste record; this resolves consumption by MATCHING it in the
+    # target's transcript. Both delivery spellings are searched, because a
+    # queued paste writes only the `queue-operation` one — see
+    # monitor/_submit_evidence.sh, where both the shapes and the one
+    # channel transform (TAB → four spaces) are recorded as measurements.
+    #
+    # Recorded ON DISK for the emit renderer, NOT in a shell global. The
+    # emit site calls this function through `$(…)`, so everything it
+    # assigns dies with the command-substitution subshell — a global
+    # would have read empty in production while testing green in-process.
+    # A file survives the subshell, and the scan reads up to 8 MB of
+    # transcript, so recomputing in the renderer would double the cost of
+    # every cycle a `paste-unconfirmed` row persists.
+    local marker marker_verdict=""
+    marker=$(_idle_paste_marker "$window" "$best")
+    if [[ -n "$marker" ]]; then
+        marker_verdict=$(_idle_paste_content_consumed "$window" "$best_sec" "$marker")
+    fi
+    _idle_paste_scan_write "$window" "$best" "$marker_verdict" ""
+    # PROOF of arrival: sha256 over the canonical bytes cannot be
+    # satisfied by unrelated content.
+    [[ "$marker_verdict" == "yes" ]] && { printf '0'; return 0; }
+
+    local sender_rc
+    sender_rc=$(_idle_paste_verdict "$window" "$best")
+    # ORDERING, deliberate: the sender's rc 0 still suppresses even when
+    # the marker did not match. It is not the proxy #665 indicts — it is a
+    # 20s observation taken at paste time, against a known-current
+    # session-id, and `#676`'s argument applies unchanged (evidence of
+    # presence does not expire; a later failure to re-find it is our
+    # problem). The marker replaces the LOOSE minutes-later temporal scan
+    # below, which is where the false negative actually lived. What would
+    # change this: a demonstrated case of rc 0 being recorded for a paste
+    # whose bytes never arrived.
+    [[ "$sender_rc" == "0" ]] && { printf '0'; return 0; }
+
+    # A marker was recorded and the scan COMPLETED without finding it.
+    # Do NOT fall through to the temporal proxy: its `yes` on unrelated
+    # traffic is precisely the false negative this block exists to
+    # remove, and consulting it here would reinstate it. Record what the
+    # proxy would have said, because "the window submitted something
+    # else, but not this" is the single most informative thing the emit
+    # can tell an operator, and it is newly knowable.
+    if [[ "$marker_verdict" == "no" ]]; then
+        _idle_paste_scan_write "$window" "$best" "$marker_verdict" \
+            "$(_idle_paste_consumed "$window" "$best_sec")"
+        printf '%s' "$best"
+        return 0
+    fi
+
+    local consumed
+    # SECONDS: se_submission_since compares against `date -d "$ts" +%s`
+    # off the transcript, so a raw microsecond key here would make every
+    # submission look older than the paste and the surface would answer
+    # `no` for a paste that was demonstrably consumed — a false positive
+    # manufactured by a unit, in the one surface that exists to remove them.
+    consumed=$(_idle_paste_consumed "$window" "$best_sec")
+    [[ "$consumed" == "yes" ]] && { printf '0'; return 0; }
     printf '%s' "$best"
+}
+
+# The content-scan record `_idle_unconfirmed_paste_epoch` leaves for the
+# emit renderer, keyed by the same (window, epoch) as the sidecar so it
+# can never be read for a different paste. Lives in `paste-verdicts/` on
+# purpose: `_paste_verdict_drop` already sweeps `<window>.*`, so this
+# inherits both the disappearance prune and the retention bound rather
+# than growing a second unpruned directory.
+#
+# REWRITTEN EVERY CYCLE the marker block is reached, and DELETED when
+# there is no marker — a stale `no` from a previous cycle would render an
+# emit clause about a scan nobody ran.
+_idle_paste_scan_path() {
+    printf '%s/paste-verdicts/%s.%s.scan' "${STATE_DIR:-.}" "$1" "$2"
+}
+
+_idle_paste_scan_write() {
+    local window="$1" epoch="$2" verdict="$3" other="$4" path tmp
+    [[ -n "$window" && "$epoch" =~ ^[0-9]+$ ]] || return 0
+    path=$(_idle_paste_scan_path "$window" "$epoch")
+    if [[ -z "$verdict" ]]; then
+        rm -f "$path" 2>/dev/null
+        return 0
+    fi
+    mkdir -p "$(dirname "$path")" 2>/dev/null || return 0
+    tmp="$path.$$.tmp"
+    if printf 'verdict=%s\nother=%s\n' "$verdict" "$other" > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+    return 0
+}
+
+_idle_paste_scan_field() {
+    local path
+    path=$(_idle_paste_scan_path "$1" "$2")
+    [[ -r "$path" ]] || return 0
+    awk -F= -v k="$3" '$1 == k { print $2; exit }' "$path" 2>/dev/null
+}
+
+# One clause for the emit's detail field, naming what the CONTENT surface
+# established. Empty when there is nothing new to say — no marker, or a
+# marker whose scan could not complete, in which case the pre-#665 wording
+# is still the honest one.
+#
+# Never asserts non-delivery. `no` means "these bytes are not in the part
+# of the transcript we could read", which is a stronger statement than the
+# old surface could make and still not proof that the paste was lost.
+_idle_paste_marker_note() {
+    local window="$1" epoch="$2" verdict other
+    verdict=$(_idle_paste_scan_field "$window" "$epoch" verdict)
+    case "$verdict" in
+        no)
+            other=$(_idle_paste_scan_field "$window" "$epoch" other)
+            if [[ "$other" == "yes" ]]; then
+                printf 'content marker: this window DID submit other content after the paste, but the pasted bytes themselves appear in no delivery record — the two are no longer conflated, and this is the shape a genuinely lost paste takes'
+            else
+                printf 'content marker: the pasted bytes appear in no delivery record in the scanned transcript, and neither does any other submission'
+            fi
+            ;;
+        *) : ;;
+    esac
+}
+
+# Sidecar written by paste-followup.sh step 3b, keyed by the same epoch
+# it stamped into machine-input.tsv. Prints the recorded exit code
+# (0 submitted / 3 unconfirmed / 4 established-negative), or NOTHING
+# when there is no verdict to read — absence is `unknown`, never `no`.
+_idle_paste_verdict_path() {
+    printf '%s/paste-verdicts/%s.%s' "${STATE_DIR:-.}" "$1" "$2"
+}
+
+_idle_paste_verdict() {
+    local window="$1" epoch="$2" path rc
+    [[ -n "$window" && "$epoch" =~ ^[0-9]+$ ]] || return 0
+    path=$(_idle_paste_verdict_path "$window" "$epoch")
+    [[ -r "$path" ]] || return 0
+    rc=$(awk -F= '$1 == "rc" { print $2; exit }' "$path" 2>/dev/null)
+    [[ "$rc" =~ ^[0-9]+$ ]] || return 0
+    printf '%s' "$rc"
+}
+
+# The CONTENT MARKER the sender stamped beside the paste
+# (your-org/nexus-code#665 item 1). Same sidecar, same key, written
+# BEFORE the paste — so a sender that died mid-poll still leaves one,
+# and the `rc` line may legitimately be absent while this is present.
+# Prints nothing when there is no marker to read; absence is `unknown`,
+# and the caller must fall back rather than conclude anything.
+_idle_paste_marker() {
+    local window="$1" epoch="$2" path d
+    [[ -n "$window" && "$epoch" =~ ^[0-9]+$ ]] || return 0
+    path=$(_idle_paste_verdict_path "$window" "$epoch")
+    [[ -r "$path" ]] || return 0
+    d=$(awk -F= '$1 == "digest" { print $2; exit }' "$path" 2>/dev/null)
+    [[ "$d" =~ ^[0-9a-f]{64}$ ]] || return 0
+    printf '%s' "$d"
+}
+
+# Human-readable provenance for the emit's detail field, so the
+# operator sees WHICH surface is uncertain rather than a flat
+# assertion. Empty when the sender left no verdict.
+#
+# TENSE IS LOAD-BEARING (#676 skeptic F1). The argument this whole
+# change rests on — evidence of presence does not expire — is
+# ASYMMETRIC. Evidence of ABSENCE does expire: it says nothing about
+# any later instant. A verdict established at paste time is rendered
+# here at ≥ the confirm grace (180s) and usually far later, and in
+# between the retry-Enter path, the operator, or a drained turn may
+# have submitted the text. So every note is stamped with WHEN the
+# sender looked, and says only what it looked at.
+#
+# The first draft of the rc=4 note read "the text is sitting unsent in
+# the input box", appended to an emit reworded specifically to STOP
+# asserting a negative — asserting an established non-delivery and
+# denying one in the same sentence. It also over-reached: rc=4
+# establishes no submission record, no transcript growth and an
+# unchanged session-id. It measures the TRANSCRIPT. It never observed
+# where the bytes are, and the input box is a claim about pane
+# contents that nothing in the verdict looked at.
+#
+# `now` is optional and supplied by the caller's sweep so one cycle
+# shares one clock; when given, the note states how long ago the
+# sender's observation was taken.
+_idle_paste_verdict_note() {
+    local window="$1" epoch="$2" now="${3:-}" rc age="" epoch_sec
+    # `epoch` is dual-use in this one function: the RAW key names the
+    # sidecar, the SECONDS view drives the age. Reading the raw key as
+    # seconds sends `now >= epoch` permanently false and the age note
+    # silently disappears — no error, just a quieter message
+    # (your-org/nexus-code#679).
+    rc=$(_idle_paste_verdict "$window" "$epoch")
+    [[ -n "$rc" ]] || return 0
+    epoch_sec=$(_paste_epoch_seconds "$epoch")
+    if [[ "$now" =~ ^[0-9]+$ ]] && (( now >= epoch_sec )) && (( epoch_sec > 0 )); then
+        age=" ($(( now - epoch_sec ))s ago)"
+    fi
+    case "$rc" in
+        3) printf 'sender could not establish either outcome when it pasted%s — the transcript grew with no submission record, so the text was plausibly QUEUED behind an in-flight turn; not re-checked since' "$age" ;;
+        4) printf 'sender observed no submission in the transcript when it pasted%s and the session stayed inert; NOT re-checked since, so this says nothing about whether it submitted afterwards' "$age" ;;
+        *) : ;;
+    esac
+}
+
+# Drop paste verdicts for `window` (disappearance prune), and sweep
+# entries older than the retention bound so the directory cannot grow
+# without limit. Mirrors the other per-window `_*_drop` helpers.
+: "${_PASTE_VERDICT_RETAIN_DAYS:=7}"
+_paste_verdict_drop() {
+    local window="$1" dir="${STATE_DIR:-.}/paste-verdicts"
+    [[ -d "$dir" ]] || return 0
+    if [[ -n "$window" ]]; then
+        rm -f -- "$dir/$window".* 2>/dev/null || true
+    fi
+    find "$dir" -maxdepth 1 -type f -mtime "+$_PASTE_VERDICT_RETAIN_DAYS" \
+        -delete 2>/dev/null || true
+}
+
+# Transcript-evidence probe, resolved through the shared
+# monitor/_submit_evidence.sh so the watcher and paste-followup.sh
+# cannot disagree about what a TUI submission is. Degrades to `unknown`
+# (never to `no`) whenever the library or its inputs are unavailable —
+# an unreadable surface is not evidence of absence.
+_idle_load_submit_evidence() {
+    declare -F se_submission_since >/dev/null 2>&1 && return 0
+    local se_lib=""
+    if [[ -n "${NEXUS_ROOT:-}" && -r "$NEXUS_ROOT/monitor/_submit_evidence.sh" ]]; then
+        se_lib="$NEXUS_ROOT/monitor/_submit_evidence.sh"
+    elif [[ -r "$(dirname "${BASH_SOURCE[0]}")/../_submit_evidence.sh" ]]; then
+        se_lib=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/_submit_evidence.sh
+    fi
+    [[ -n "$se_lib" ]] || return 1
+    # shellcheck source=monitor/_submit_evidence.sh
+    source "$se_lib" || return 1
+    return 0
+}
+
+_idle_paste_consumed() {
+    local window="$1" epoch="$2"
+    _idle_load_submit_evidence || { printf 'unknown'; return 0; }
+    se_submission_since "$window" "${STATE_DIR:-.}" "$epoch"
+}
+
+# CONTENT-identity probe: are the exact bytes this paste carried present
+# in the target's transcript at or after it? `yes` / `no` / `unknown`,
+# with the same degrade-never-lie posture as _idle_paste_consumed.
+_idle_paste_content_consumed() {
+    local window="$1" epoch="$2" digest="$3"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || { printf 'unknown'; return 0; }
+    _idle_load_submit_evidence || { printf 'unknown'; return 0; }
+    declare -F se_submission_with_digest >/dev/null 2>&1 \
+        || { printf 'unknown'; return 0; }
+    se_submission_with_digest "$window" "${STATE_DIR:-.}" "$epoch" "$digest"
 }
 
 # Drop machine-input rows for `window` (disappearance prune), and
@@ -1341,6 +1836,85 @@ _idle_unconfirmed_paste_epoch() {
 # row per window once it grows past 200 lines. Single writer (the
 # watcher cycle), so the rewrite is race-free in practice; atomic
 # rename keeps concurrent readers consistent.
+# ---- your-org/nexus-code#677: persist the classification emits ---------
+#
+# Every classification this probe computes — `paste-unconfirmed`, `no-wrap-up`,
+# `wrapped`, `idle-too-long`, `retained`, … — was rendered into the row the
+# watcher prints to the orchestrator and then DISCARDED. Nothing wrote it to
+# `action-log.jsonl` or to `watcher.log`. So the accuracy of every detector in
+# this file was unmeasurable after the fact: the only way to establish a base
+# rate was for an operator to watch emits scroll past and tally by hand, which
+# is literally how `#665` was found (11 false positives, 0 true, counted live).
+# Two agents have since needed emit history to answer a question about a
+# detector and neither could get it — the `#676` skeptic could prove that PR's
+# mechanism but not its frequency, because the emits it needed left no trace.
+#
+# TRANSITION-ONLY, and that is load-bearing rather than an optimisation. A
+# window sitting `no-wrap-up` for six hours would otherwise write thousands of
+# identical rows; the log would then answer "what was the state" while being
+# useless for "how often did this FIRE", which is the question both agents
+# actually had. One row per state CHANGE makes firings countable.
+#
+# Cheap and additive by construction: it changes no decision, only makes the
+# decisions reviewable.
+_idle_class_stamp_path() {
+    printf '%s/idle-class/%s' "${STATE_DIR:-.}" "$1"
+}
+
+_idle_class_stamp_drop() {
+    local window="$1"
+    [[ -n "$window" ]] || return 0
+    rm -f "$(_idle_class_stamp_path "$window")" 2>/dev/null || true
+}
+
+# Record a classification IF it differs from the last one recorded for this
+# window. Best-effort: never flips the caller's exit code and never gates the
+# row that is being rendered — a probe that stopped emitting rows because its
+# audit trail failed would be a far worse defect than the missing trail.
+#
+# That best-effort posture is exactly what `#685` warns about (a broken emit is
+# indistinguishable from a working one), so this is covered by a BEHAVIOURAL
+# test that the row reaches disk with its fields — `test-idle-classification.sh`
+# — not by a source assertion.
+_idle_record_classification() {
+    local window="$1" cls="$2" detail="${3:-}"
+    [[ -n "$window" && -n "$cls" ]] || return 0
+    local log_file="${STATE_DIR:-}/action-log.jsonl"
+    [[ -n "${STATE_DIR:-}" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    local stamp prev=""
+    stamp=$(_idle_class_stamp_path "$window")
+    [[ -f "$stamp" ]] && prev=$(cat "$stamp" 2>/dev/null)
+    # No transition -> no row. This is the whole point; see the header.
+    [[ "$prev" == "$cls" ]] && return 0
+
+    local json
+    json=$(jq -cn \
+        --arg ts "$(date -Is)" \
+        --arg window "$window" \
+        --arg cls "$cls" \
+        --arg prev "$prev" \
+        --arg detail "$detail" \
+        '{ts:$ts, agent:"watcher", event:"idle-classification",
+          window:$window, cls:$cls,
+          prev:(if $prev == "" then "-" else $prev end)}
+         + (if $detail != "" then {detail:$detail} else {} end)' 2>/dev/null) || return 0
+    [[ -n "$json" ]] || return 0
+
+    mkdir -p "$(dirname "$stamp")" 2>/dev/null || return 0
+    # NB the subshell: a REDIRECTION failure is reported by the SHELL, not by
+    # `printf`, so a bare `>> "$f" 2>/dev/null` still leaks "Permission denied"
+    # to stderr — which in the watcher is operator-visible noise from a path
+    # that is supposed to be silent. Caught by the unwritable-log assertion.
+    ( printf '%s\n' "$json" >> "$log_file" ) 2>/dev/null || return 0
+    # Advance the stamp ONLY after the row is on disk. If the append failed,
+    # the next cycle retries rather than silently recording a transition that
+    # was never written — the failure mode this issue exists to prevent.
+    printf '%s' "$cls" > "$stamp" 2>/dev/null || true
+    return 0
+}
+
 _machine_input_prune() {
     local window="$1" path tmp
     path=$(_machine_input_path)
@@ -1352,9 +1926,25 @@ _machine_input_prune() {
         cat "$path" > "$tmp"
     fi
     if (( $(wc -l < "$tmp") > 200 )); then
+        # Column 4 (the your-org/nexus-code#683 administrative marker)
+        # MUST survive compaction. Dropping it silently reverts the
+        # window to re-task behaviour — the retain gets consumed and the
+        # wrap-up reads as superseded — and it would happen only on a
+        # BUSY board, past 200 rows, which is both the hardest case to
+        # reproduce and the one where a mis-retired window costs most.
+        #
+        # `#676` declined a fourth column for the verdict sidecar with
+        # the argument that compaction "keeps one max-epoch row per
+        # window, which would silently drop a verdict row". That
+        # reasoning is correct for a VERDICT, which is per-paste and
+        # needs history. It does not transfer here: the administrative
+        # marker is only ever consulted for the window's NEWEST machine
+        # input, and the max-epoch row compaction keeps IS that row. So
+        # the marker survives as long as the field is carried, which is
+        # what this does and what test D2 asserts.
         awk -F'\t' -v OFS='\t' \
-            '$2 ~ /^[0-9]+$/ && ($2 + 0) > m[$1] { m[$1] = $2 + 0; s[$1] = $3 }
-             END { for (w in m) print w, m[w], s[w] }' \
+            '$2 ~ /^[0-9]+$/ && ($2 + 0) > m[$1] { m[$1] = $2 + 0; s[$1] = $3; a[$1] = $4 }
+             END { for (w in m) print w, m[w], s[w], a[w] }' \
             "$tmp" > "${tmp}.compact" && mv "${tmp}.compact" "$tmp"
     fi
     mv "$tmp" "$path"
@@ -1610,13 +2200,30 @@ _openg_observe() {
             # between probe cycles — and record the machine-submit
             # stamp so a wrap-up older than this follow-up reads as
             # superseded in the classifier.
-            local prior_engagement
-            prior_engagement=$(_engagement_log_lookup "$window")
-            [[ "$prior_engagement" =~ ^[0-9]+$ ]] || prior_engagement=0
-            if (( prompt_epoch > prior_engagement )); then
-                _engagement_log_stamp "$window" "$prompt_epoch"
+            # your-org/nexus-code#683: an ADMINISTRATIVE follow-up is
+            # machine-attributed but is NOT a re-task, so it must not
+            # take the two actions that regress the window to busy —
+            # resetting the idle-age anchor (which consumes the standing
+            # `window-retain`) and writing the machine-submit stamp
+            # (which makes an older wrap-up read as superseded). It still
+            # consumes `prompt_seen` and still clears a stale
+            # operator-engaged mark below, exactly like the SELF branch:
+            # the submit happened and attribution must not re-run.
+            #
+            # The DEFAULT is re-task. Only a paste that explicitly said
+            # so takes this path, so nothing changes for the re-tasks
+            # this premise was written for.
+            local _mi_admin
+            _mi_admin=$(_openg_machine_input_administrative "$window" "$machine")
+            if [[ "$_mi_admin" != "1" ]]; then
+                local prior_engagement
+                prior_engagement=$(_engagement_log_lookup "$window")
+                [[ "$prior_engagement" =~ ^[0-9]+$ ]] || prior_engagement=0
+                if (( prompt_epoch > prior_engagement )); then
+                    _engagement_log_stamp "$window" "$prompt_epoch"
+                fi
+                _machine_submit_stamp_write "$window" "$prompt_epoch"
             fi
-            _machine_submit_stamp_write "$window" "$prompt_epoch"
             # REGRESS any PRE-EXISTING operator-engaged mark to busy (bug
             # B; live incident 2026-06-18 watcher-robustness). A
             # machine-attributed submit means the orchestrator (re-)drove
@@ -1908,13 +2515,34 @@ _idle_previous_windows_path() {
 #                         MONITOR_PASTE_CONFIRM_GRACE_SECONDS
 #                         (default 180) fired NO UserPromptSubmit
 #                         hook on a window with live hooks — the
-#                         nudge silently failed (Enter swallowed by
-#                         VI mode / overlay / redraw race). Replaces
-#                         the wrapped/no-wrap-up row so the
-#                         orchestrator re-pastes via
-#                         monitor/paste-followup.sh. Never suppressed
-#                         by `window-retain`; idle-too-long still
-#                         overrides it. Detail carries the paste age.
+#                         nudge MAY have silently failed (Enter
+#                         swallowed by VI mode / overlay / redraw
+#                         race). Replaces the wrapped/no-wrap-up row.
+#                         Never suppressed by `window-retain`;
+#                         idle-too-long still overrides it. Detail
+#                         carries the paste age.
+#
+#                         THIS CLASS HAS FALSE POSITIVES, AND ITS
+#                         REMEDY IS DESTRUCTIVE (#568 A9). The
+#                         `machine-submit/<window>` stamp is written
+#                         ONLY by this file's UserPromptSubmit path;
+#                         `paste-followup.sh` never writes it. So a
+#                         paste delivered via the RETRY-ENTER path is
+#                         fully consumed by the worker and still
+#                         leaves the stamp at its pre-paste value —
+#                         indistinguishable from a lost paste. The
+#                         worker then goes idle with no further turn,
+#                         so the stamp never self-heals and the emit
+#                         persists indefinitely. Observed end-to-end
+#                         on 2026-07-26: a 6,448-char correction list
+#                         was executed in full and the emit still
+#                         fired. Acting on it literally would have
+#                         re-pasted that list into a COMPLETED
+#                         fix-pass — duplicate comments, duplicate
+#                         commits, or a confused re-do. The emit text
+#                         therefore leads with VERIFY CONSUMPTION
+#                         FIRST; an orchestrator must not treat this
+#                         class as an instruction to re-paste.
 #
 # Side effect: as part of each cycle this function stamps
 # engagement-log.tsv twice for each observed window:
@@ -2541,18 +3169,27 @@ _bg_children_decide() {
 }
 
 # Case (b): compose the wrapped-with-children detail (health-aware).
+#
+# $3 NAMES the child (your-org/nexus-code#590). The pre-#590 message reported a
+# COUNT and demanded a decision — "1 live child process(es) after wrap-up — ask
+# for clarification or close" — which is not enough to act on: identifying the
+# process took a manual walk of the pane's tree, and it was misidentified in
+# practice (blamed on an MCP server, which is never even counted). Naming it
+# lets anyone dismiss or escalate in seconds.
 _bg_wrapped_children_detail() {
-    local window="$1" child_count="$2"
+    local window="$1" child_count="$2" child_name="${3:-}"
+    local who=""
+    [[ -n "$child_name" && "$child_name" != "-" ]] && who=" [child: $child_name]"
     local h_health h_expected h_written h_kind h_id health_row
     if health_row=$(_worker_health_read "$window"); then
         IFS=$'\t' read -r h_health h_expected h_written h_kind h_id <<<"$health_row"
         case "$h_health" in
-            running) printf '%d live child(ren) after wrap-up; worker declares job still RUNNING (wrapped prematurely) — extend or close' "$child_count"; return 0 ;;
-            done)    printf '%d live child(ren) after wrap-up; worker declares job DONE — leftover, safe to close' "$child_count"; return 0 ;;
-            stuck)   printf '%d live child(ren) after wrap-up; worker reports STUCK — resume or close' "$child_count"; return 0 ;;
+            running) printf '%d live child(ren) after wrap-up%s; worker declares job still RUNNING (wrapped prematurely) — extend or close' "$child_count" "$who"; return 0 ;;
+            done)    printf '%d live child(ren) after wrap-up%s; worker declares job DONE — leftover, safe to close' "$child_count" "$who"; return 0 ;;
+            stuck)   printf '%d live child(ren) after wrap-up%s; worker reports STUCK — resume or close' "$child_count" "$who"; return 0 ;;
         esac
     fi
-    printf '%d live child process(es) after wrap-up — ask for clarification (monitor/worker-health.sh) or close' "$child_count"
+    printf '%d live child process(es) after wrap-up%s — ask for clarification (monitor/worker-health.sh) or close' "$child_count" "$who"
 }
 
 list_really_idle_workers() {
@@ -2622,10 +3259,12 @@ list_really_idle_workers() {
             _engagement_log_drop "$stale"
             _openg_drop "$stale"
             _machine_input_prune "$stale"
+            _paste_verdict_drop "$stale"
             _user_prompt_stamp_drop "$stale"
             _openg_change_drop "$stale"
             _machine_submit_stamp_drop "$stale"
             _bg_progress_drop "$stale"
+            _idle_class_stamp_drop "$stale"
             _bg_backoff_drop "$stale"
             _worker_health_drop "$stale"
         done < <(comm -23 \
@@ -2666,7 +3305,7 @@ list_really_idle_workers() {
         # spawning a second subprocess.
         local probe_target="${window_index:-$name}"
         local pane_orphan_kinds="" pane_content_hash="" pane_bg_cpu=""
-        pane_line=$(_idle_pane_state_line "$probe_target")
+        pane_line=$(_idle_pane_state_line "$probe_target" "$name")
         if [[ -z "$pane_line" ]]; then
             pane_state=unknown
             pane_reset_at=""
@@ -2720,11 +3359,32 @@ list_really_idle_workers() {
         pane_bg_reliable=$(_idle_pane_line_field "$pane_line" bg_reliable)
         [[ "$pane_bg_shells" =~ ^[0-9]+$ ]] || pane_bg_shells=0
         [[ "$pane_bg_reliable" =~ ^[0-9]+$ ]] || pane_bg_reliable=0
+        local pane_bg_infra=0 pane_bg_cmd="-" pane_bg_task_shells=0
         local has_live_children=0 bg_wrapped=0 bg_surface=0
         local bg_child_class="" bg_child_detail=""
         if [[ "$pane_state" == "working-background" ]] \
            && (( pane_bg_reliable == 1 )) && (( pane_bg_shells >= 1 )); then
             has_live_children=1
+            # #590: `bg_infra` counts the roots that are nexus PROTOCOL WAIT
+            # loops (skeptic/request `await`), `bg_cmd` names one representative
+            # child, and `pane_bg_task_shells` is what remains once the protocol
+            # waits are set aside — the children an operator actually has to
+            # decide about. Absent fields (an older pane-state.sh, a fixture)
+            # leave infra at 0, so task_shells == bg_shells and pre-#590
+            # behaviour is preserved exactly.
+            #
+            # Read HERE, not with bg_shells/bg_reliable above: each field costs a
+            # `sed` subshell per window per cycle, and only this branch can use
+            # them. Reading them unconditionally added ~50% to the idle probe's
+            # per-cycle cost for every window in the session — measured, after it
+            # pushed a wall-clock-sensitive fixture in test-idle-probe.sh over its
+            # 60s grace.
+            pane_bg_infra=$(_idle_pane_line_field "$pane_line" bg_infra)
+            pane_bg_cmd=$(_idle_pane_line_field "$pane_line" bg_cmd)
+            [[ "$pane_bg_infra" =~ ^[0-9]+$ ]] || pane_bg_infra=0
+            [[ -n "$pane_bg_cmd" ]] || pane_bg_cmd="-"
+            pane_bg_task_shells=$(( pane_bg_shells - pane_bg_infra ))
+            (( pane_bg_task_shells >= 0 )) || pane_bg_task_shells=0
             # Episode age, DERIVED from the process tree (no state file).
             # A missing/zero `bg_oldest_start` means "unknown" — treat the
             # episode as brand new rather than instantly past the ceiling.
@@ -2755,16 +3415,55 @@ list_really_idle_workers() {
                     bg_surface=1
                     bg_child_class="orphaned-skeptic-pending"
                     bg_child_detail="skeptic-pending marker but no live skeptic past grace — spawn the skeptic or clear the marker"
+                elif (( pane_bg_task_shells <= 0 )) && (( pane_bg_infra >= 1 )) \
+                     && (( bg_child_age < bg_ceiling )); then
+                    # Case (b0): wrapped, marker already cleared, and EVERY live
+                    # child is a nexus PROTOCOL WAIT loop rather than task work
+                    # (your-org/nexus-code#590). This is the routine shape, not
+                    # an inconsistency: `ng wrap-up` is what tells a
+                    # skeptic-gated worker to hold a `skeptic-channel await`
+                    # re-check loop in a background shell, and a RETURNED
+                    # verdict clears the pending marker while that prescribed
+                    # child keeps polling until its own await timeout. So the
+                    # `parked-awaiting-skeptic` exemption lapses with the
+                    # prescribed child still alive, and the window used to
+                    # resurface as `wrapped-with-children` — every skeptic-gated
+                    # worker, every time. Firing routinely TRAINS the operator
+                    # to dismiss it, and then a genuine orphaned `sbatch`/`nohup`
+                    # arrives looking like the twenty false ones before it.
+                    # Do NOT surface: fall through to normal wrapped handling,
+                    # which correctly treats the window as retire-eligible (the
+                    # await loop dies with the window). A NON-protocol child in
+                    # the same set still surfaces below, now NAMED.
+                    #
+                    # BOUNDED, never a permanent mute. The exemption holds only
+                    # while the episode is younger than the ABSOLUTE ceiling
+                    # (`bg_child_age < bg_ceiling`, the same #455-follow-up
+                    # bound case (a) uses). A single `await` is self-limiting —
+                    # it returns at its own timeout — but a worker that wraps it
+                    # in an `until` loop would otherwise hold the window exempt
+                    # forever, silently. Past the ceiling the window falls
+                    # through to case (b) below and surfaces WITH the loop named,
+                    # so "no child may buy silence indefinitely" still holds.
+                    bg_surface=0
                 else
-                    # Case (b): wrapped, no skeptic pending, children still
-                    # live. Surface always, regardless of CPU (a wrapped worker
-                    # whose child is still computing is the strongest form of
-                    # the inconsistency). A STALE marker fails both checks
-                    # above and lands here, so a died-mid-await worker still
-                    # surfaces rather than staying muted forever.
+                    # Case (b): wrapped, no skeptic pending, and at least one
+                    # live child that is NOT a protocol wait loop. Surface
+                    # always, regardless of CPU (a wrapped worker whose child is
+                    # still computing is the strongest form of the
+                    # inconsistency). A STALE marker fails both checks above and
+                    # lands here, so a died-mid-await worker still surfaces
+                    # rather than staying muted forever.
                     bg_wrapped=1; bg_surface=1
                     bg_child_class="wrapped-with-children"
-                    bg_child_detail=$(_bg_wrapped_children_detail "$name" "$pane_bg_shells")
+                    # Report the count of children that need a DECISION (the
+                    # non-protocol ones), falling back to the raw count for the
+                    # past-the-ceiling protocol-only case reached from (b0) —
+                    # where task_shells is 0 but there IS something to report.
+                    local bg_report_count="$pane_bg_task_shells"
+                    (( bg_report_count > 0 )) || bg_report_count="$pane_bg_shells"
+                    bg_child_detail=$(_bg_wrapped_children_detail "$name" \
+                        "$bg_report_count" "$pane_bg_cmd")
                 fi
             else
                 # Case (a): idle worker waiting on a background job. Surface
@@ -2906,9 +3605,46 @@ list_really_idle_workers() {
                 # (no live claude in pane), so only `absent` and
                 # `blocked` warrant the inviolable pane-absent
                 # surface.
+                #
+                # ONE CLASS, TWO STATES — SO TWO ADVISORIES
+                # (your-org/nexus-code#808). Both states need the
+                # operator, which is why they share the inviolable
+                # surface; but they need OPPOSITE actions, and the
+                # detail used to describe only the `absent` half:
+                #
+                #   absent   "process gone"  true    "relaunch or close"  right
+                #   blocked  "process gone"  FALSE   "relaunch or close"  HARMFUL
+                #
+                # A `blocked` pane is ALIVE and rendering a modal it is
+                # waiting for a human to answer. Observed in production
+                # 2026-08-07 22:49 against window `idflake`, which was
+                # displaying an AskUserQuestion: the operator probed it
+                # five times (`state=blocked active=0 overlay=askuq`,
+                # `pane_pid` unchanged throughout) and was told the
+                # process was gone and to relaunch it. Relaunching would
+                # have destroyed a live agent's context and discarded
+                # the question it was asking.
+                #
+                # The kill gate held — `bk_pane_kill_authorized` refuses
+                # `blocked`, and retire-preflight.sh carries an explicit
+                # do-not-kill arm for it — so this is a TRUST defect,
+                # not a safety one, and it is stated at that severity.
+                # The expensive outcome is not the operator acting on it
+                # (they get refused); it is the operator learning to
+                # discount `pane-absent`, a surface documented as
+                # inviolable and never suppressed.
                 cls=pane-absent
-                detail="claude process gone or unresponsive; relaunch or close"
-                printf '%s\t%s\t%s\t%s\n' "$name" "$cls" "$age" "$detail"
+                if [[ "$pane_state" == blocked ]]; then
+                    detail="overlay awaiting the operator (blocked) — ANSWER it in the pane; do NOT relaunch or close"
+                else
+                    detail="claude process gone or unresponsive; relaunch or close"
+                fi
+                # #677 — the audit trail. Placed at the render CHOKEPOINT rather than
+        # in each `cls=` arm: every classification passes through here exactly
+        # once, so no arm can be added later that silently escapes the log.
+        _idle_record_classification "$name" "$cls" "$detail" || true
+
+        printf '%s\t%s\t%s\t%s\n' "$name" "$cls" "$age" "$detail"
                 continue
                 ;;
             idle|autosuggest-only)
@@ -3141,7 +3877,24 @@ list_really_idle_workers() {
             unconfirmed_paste=$(_idle_unconfirmed_paste_epoch "$name" "$now")
             if (( unconfirmed_paste > 0 )); then
                 cls=paste-unconfirmed
-                detail="paste $(( now - unconfirmed_paste ))s ago"
+                # The RAW key comes back (it names the sidecar that
+                # _idle_paste_verdict_note reads); the rendered age needs
+                # the seconds view (your-org/nexus-code#679).
+                local _up_sec
+                _up_sec=$(_paste_epoch_seconds "$unconfirmed_paste")
+                detail="paste $(( now - _up_sec ))s ago"
+                # Carry the sender's own verdict into the emit so the
+                # operator sees WHICH surface is uncertain rather than a
+                # flat assertion (your-org/nexus-code#665).
+                local _pv_note
+                _pv_note=$(_idle_paste_verdict_note "$name" "$unconfirmed_paste" "$now")
+                [[ -n "$_pv_note" ]] && detail="$detail; $_pv_note"
+                # What the CONTENT surface established, if anything
+                # (your-org/nexus-code#665 item 1). Reads the globals the
+                # call above published — adjacency is the contract.
+                local _pm_note
+                _pm_note=$(_idle_paste_marker_note "$name" "$unconfirmed_paste")
+                [[ -n "$_pm_note" ]] && detail="$detail; $_pm_note"
             fi
         fi
 
@@ -3531,7 +4284,7 @@ render_full_state_snapshot() {
         [[ -n "$name" ]] || continue
         local probe_target="${window_index:-$name}"
         local pane_line pane_reset_at
-        pane_line=$(_idle_pane_state_line "$probe_target")
+        pane_line=$(_idle_pane_state_line "$probe_target" "$name")
         pane_state=$(printf '%s' "$pane_line" \
             | sed -n 's/.*state=\([a-z-]*\).*/\1/p')
         [[ -n "$pane_state" ]] || pane_state=unknown
@@ -3560,15 +4313,35 @@ render_full_state_snapshot() {
         # full-state cadence so the operator sees them even after the
         # per-transition row has deduped out.
         if [[ "$pane_state" == "working-background" ]]; then
-            local snap_bg_shells snap_bg_reliable
+            local snap_bg_shells snap_bg_reliable snap_bg_infra snap_bg_cmd snap_bg_task
             snap_bg_shells=$(_idle_pane_line_field "$pane_line" bg_shells)
             snap_bg_reliable=$(_idle_pane_line_field "$pane_line" bg_reliable)
             [[ "$snap_bg_shells" =~ ^[0-9]+$ ]] || snap_bg_shells=0
             [[ "$snap_bg_reliable" =~ ^[0-9]+$ ]] || snap_bg_reliable=0
+            # #590: this renderer classifies INDEPENDENTLY of
+            # list_really_idle_workers, so the protocol-wait exclusion has to be
+            # applied here too — otherwise the false positive that was fixed for
+            # the per-transition emit simply reappears at the full-state cadence.
+            snap_bg_infra=$(_idle_pane_line_field "$pane_line" bg_infra)
+            snap_bg_cmd=$(_idle_pane_line_field "$pane_line" bg_cmd)
+            [[ "$snap_bg_infra" =~ ^[0-9]+$ ]] || snap_bg_infra=0
+            [[ -n "$snap_bg_cmd" && "$snap_bg_cmd" != "-" ]] || snap_bg_cmd=""
+            snap_bg_task=$(( snap_bg_shells - snap_bg_infra ))
+            (( snap_bg_task >= 0 )) || snap_bg_task=0
             if (( snap_bg_reliable == 1 )) && (( snap_bg_shells >= 1 )); then
                 if _bg_window_is_wrapped "$name"; then
-                    printf '  - %s wrapped-with-children (%d live child(ren) after wrap-up — inconsistency; clarify or close)\n' \
-                        "$name" "$snap_bg_shells"
+                    if (( snap_bg_task <= 0 )) && (( snap_bg_infra >= 1 )); then
+                        # Every live child is a nexus protocol wait loop — the
+                        # prescribed post-wrap-up shape, not an inconsistency.
+                        # Still SHOW it (this is the cumulative snapshot, whose
+                        # job is to account for every window) but as the benign
+                        # state it is, and without demanding a decision.
+                        printf '  - %s wrapped-awaiting-protocol (%d protocol wait child(ren)%s — prescribed by wrap-up; retire-eligible)\n' \
+                            "$name" "$snap_bg_infra" "${snap_bg_cmd:+ [child: $snap_bg_cmd]}"
+                        continue
+                    fi
+                    printf '  - %s wrapped-with-children (%d live child(ren) after wrap-up%s — inconsistency; clarify or close)\n' \
+                        "$name" "$snap_bg_task" "${snap_bg_cmd:+ [child: $snap_bg_cmd]}"
                 else
                     printf '  - %s idle-awaiting-job (state=working-background; %d live background child(ren) — long-timeout backoff)\n' \
                         "$name" "$snap_bg_shells"
@@ -3622,6 +4395,44 @@ render_full_state_snapshot() {
     done <<<"$raw"
 }
 
+# Re-stat a rendered full-state `--- workspace snapshot ---` body against
+# the CURRENT tmux window set, dropping window rows whose window no longer
+# exists (watcher-emit-noise, Class 1). The snapshot is served from the
+# async-staged full_state_snap.out (600s cadence), so a window killed
+# between async renders lingers as a live "idle Ns (state=...)" row until
+# the next pass — actively misleading (the 2026-07-21 00:37 emit listed
+# two kill-window'd windows as live while its own fresh prelude header
+# already counted them gone). Filtering at compose time makes the
+# heartbeat snapshot reflect the live window set, and — because the
+# canonical is built from the filtered body — a kill promptly changes the
+# canonical and the correction emits at the next cadence instead of
+# waiting a full async cycle.
+#
+# Only `^  - <name> …` rows are candidates for dropping; every other line
+# (the `(full snapshot; …)` footer, blanks) passes through untouched. The
+# window name is the token after the leading `  - `. Pass-through when the
+# live set is empty (tmux transient / unavailable) so a real snapshot is
+# never nuked by a momentary probe failure.
+#   $1  live tmux window names (newline-separated; queried if empty)
+# Reads snapshot text on stdin, writes filtered text on stdout.
+_full_state_restat_live_windows() {
+    local live="${1:-}"
+    if [[ -z "$live" ]]; then
+        live=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
+    fi
+    # Empty live set ⇒ can't distinguish "no windows" from "tmux failed";
+    # pass through unchanged rather than risk dropping a valid snapshot.
+    [[ -n "$live" ]] || { cat; return 0; }
+    awk -v live="$live" '
+        BEGIN {
+            n = split(live, a, "\n")
+            for (i = 1; i <= n; i++) if (a[i] != "") L[a[i]] = 1
+        }
+        /^  - / { if (!($2 in L)) next }
+        { print }
+    '
+}
+
 # Render the idle-workers section body for inclusion in the watcher
 # emit. Empty stdout if no transitions this cycle. Six shapes:
 # five per-row formats (one per non-retained class, matching the
@@ -3662,7 +4473,7 @@ render_idle_section() {
         }
         $2 == "paste-unconfirmed" {
             detail = ($4 == "" ? "paste unconfirmed" : $4)
-            printf "  - %s paste-unconfirmed (%s; no UserPromptSubmit fired — the nudge silently failed; re-paste via monitor/paste-followup.sh)\n", $1, detail
+            printf "  - %s paste-unconfirmed (%s; no UserPromptSubmit fired and consumption COULD NOT BE CONFIRMED from the transcript — this is an unresolved question, not an established non-delivery). VERIFY CONSUMPTION FIRST — re-pasting duplicates completed work, so this advice is deliberately not self-executing. A paste whose sender recorded `submitted` no longer reaches you at all; what remains are shapes neither side could settle: a paste that landed via the retry-Enter path is delivered yet stamps nothing, and a paste QUEUED behind an in-flight turn fires no submit until that turn drains (monitor/pane-state.sh %s reporting `queued=1`, or `busy`, means delivered-and-pending — do NOT re-paste). Read the pane and the report filed by that worker for the pasted content having been acted on; re-paste via monitor/paste-followup.sh ONLY if it demonstrably was not.\n", $1, detail, $1
         }
         $2 == "parked-awaiting-skeptic" {
             # PR #285: worker is parked in the skeptic-channel await
@@ -3714,7 +4525,28 @@ render_idle_section() {
             printf "  - %s idle-too-long %s (exceeds close threshold; consider close)\n", $1, fmt_age($3)
         }
         $2 == "pane-absent" {
-            printf "  - %s pane-absent (claude process gone or unresponsive; relaunch or close)\n", $1
+            # your-org/nexus-code#808 — RENDER THE DETAIL THIS ROW CARRIES.
+            # This arm used to print a fixed string and DISCARD $4, so the
+            # classifier could compute a per-state advisory (it does, one
+            # class covering `absent` and `blocked`) and the operator would
+            # never see it: the advisory was decided in one file and
+            # overwritten in another. A `blocked` pane — alive, rendering a
+            # modal, waiting for a human — was told to relaunch it.
+            #
+            # NOTE FOR EDITORS: this awk program is SINGLE-QUOTED. An
+            # apostrophe anywhere in these comments (the possessive that was
+            # here first) terminates the quote and the file stops parsing —
+            # a BASH syntax error at this line, which manifests as
+            # `render_idle_section: command not found` and every render
+            # assertion in test-idle-probe.sh failing at once. Keep the
+            # prose apostrophe-free.
+            #
+            # Every other class in this renderer already reads $4. The
+            # fallback keeps the historical text for a row written before this
+            # change (or by any producer that leaves the column empty), so an
+            # empty detail degrades to the old wording rather than to silence.
+            detail = ($4 == "" ? "claude process gone or unresponsive; relaunch or close" : $4)
+            printf "  - %s pane-absent (%s)\n", $1, detail
         }
         $2 == "over-limit" {
             reset_at = ($4 == "" ? "unknown" : $4)
@@ -3785,6 +4617,26 @@ render_idle_section() {
 #   window=<W> fp=<FP> kind=<K> unresolved=<true|false>
 #               prompt-excerpt=<first non-empty line>
 #               file=<absolute path to the JSON>
+#               ack=ng decision-ack <W> <FP>
+#
+# The `ack=` line is not decoration (your-org/nexus-code#790, defect 2).
+# The ack this channel documented for a year was "remove the cited file",
+# and against `idle_prompt` that is a NO-OP: the fingerprint is
+# sha1(window | kind | message) and `idle_prompt`'s message is the
+# constant "Claude is waiting for your input", so the fingerprint is a
+# function of the window alone. Remove the file, stay idle 60s, and the
+# hook writes back a byte-identical name. Measured on the live nexus:
+# `civerdict.bb0f332f628a.json` removed at 15:41, present again at
+# 16:09:32 with the same fingerprint; `guardgap.672915acaad8` acked three
+# times. The reader could not tell "fired again because something
+# changed" from "fired again because I deleted a file" — and neither
+# could the writer.
+#
+# The durable ack already existed: `<w>.<fp>.handled.json`, honoured by
+# BOTH the hook's write path and this reader. Nothing pointed at it. So
+# the row now carries the verb, and `ng decision-ack` performs the
+# tombstone move — the fix is to stop asking a human to type the correct
+# rename, not to document the rename harder.
 #
 # Cooldown: re-emit when the fingerprint is new OR when
 # DECISION_REEMIT_COOLDOWN_SECONDS (default 300) has elapsed since
@@ -3800,6 +4652,203 @@ render_idle_section() {
 
 _decisions_dir() {
     printf '%s/decisions' "${STATE_DIR:-.}"
+}
+
+# ---- the pane gate (your-org/nexus-code#790, defect 1) ------------------
+#
+# A decision file records that a Notification FIRED. It does not record
+# that the condition still HOLDS, and nothing rewrites it when the
+# condition clears: the operator pastes an answer, the pane goes busy, and
+# the file sits there re-surfacing every cooldown. Measured over one
+# working session: ten consecutive `idle_prompt` rows, and the panes
+# behind them read `working-background` (×3), `busy` (×3), `busy queued=1`
+# (×1) and `autosuggest-only` (×3) — i.e. every row said "Claude is
+# waiting for your input" about a pane that was not waiting for input.
+#
+# The discriminator already existed and was not being asked.
+# `pane-state.sh` has classified these panes for a year; the emitter's
+# only suppressions were `_openg_marked` and `_idle_skeptic_parked`,
+# neither of which looks at the pane. So the gate is a READ of the
+# existing classifier, not a new heuristic:
+#
+#   bk_decision_row_actionable <state> <queued>   (monitor/_bookkeeping.sh)
+#
+# DIRECTION OF ERROR — stated because a guard that silences everything is
+# not an improvement over one that cries wolf. This gate errs LOUD at
+# every seam:
+#   * default-EMIT arm, so an unrecognised state surfaces;
+#   * `unknown`/`empty` (the "could not tell" readings) surface;
+#   * an unresolvable window index, an unreadable pane-state.sh, an empty
+#     emit line — every failure path surfaces;
+#   * `blocked` is not in the withhold set at all, so a pane genuinely
+#     stuck on a permission modal keeps emitting. That is the negative
+#     control, and test-pending-decisions.sh asserts it directly.
+# What it buys is the seven of ten rows whose panes POSITIVELY asserted
+# they were being driven forward already.
+#
+# COST, stated accurately (an earlier version of this comment claimed
+# "normally zero forks per cycle" and that was optimistic — skeptic
+# finding, #790). `pane-state.sh` forks `tmux capture-pane` plus a
+# process-tree walk; this renderer runs at 10s. The gate is evaluated ONLY
+# for rows that have already passed the cooldown check, which is what
+# bounds it — but that is NOT the same as "rarely". A row the gate
+# withholds keeps its previous cooldown stamp (see the withhold branch),
+# so once past cooldown it is re-evaluated on EVERY 10s cycle for as long
+# as its pane stays busy. The real bound is one layer down: the call goes
+# through `_idle_pane_state_line`, the shared-recording chokepoint (#562),
+# whose recordings are served for MONITOR_PANE_CACHE_TTL_SECONDS (90s by
+# default). So the worst case is ~1 fork per window per 90s, not per 10s —
+# bounded by the cache, not by the cooldown.
+MONITOR_PENDING_PANE_GATE="${MONITOR_PENDING_PANE_GATE:-true}"
+
+# _pd_resolve_window_index <window-name> <live-rows>
+#
+# THREE-STATE, per the contract `test-tmux-window-resolver.sh` D1 enforces:
+#   rc 0  resolved — the index is on stdout
+#   rc 1  NOT PRESENT — the snapshot was read and this name is not in it
+#   rc 3  COULD NOT LOOK — there was no snapshot to read
+#
+# The first draft was two-valued (empty stdout for both failure arms) and
+# named `_pd_window_index`, which matches NEITHER discovery axis of that
+# guard — so a conflating resolver would have sat in this file permanently
+# invisible to the manifest. Splitting the arms and renaming to the
+# conventional `*resolve*window*` shape is the point: the guard exists to
+# stop exactly that, and hiding from it by accident is no better than
+# hiding from it on purpose.
+#
+# Both failure arms currently lead the caller to EMIT, so the split changes
+# no behaviour today. It is still worth having: "tmux told me this window
+# is gone" and "I never got to ask tmux" are different facts, and the next
+# consumer of this helper must not have to rediscover that they were merged.
+# <live-rows> holds `<name>|<index>` rows — see the delimiter note above.
+_pd_resolve_window_index() {
+    local want="$1" live="$2"
+    [[ -n "$live" ]] || return 3          # no snapshot: could not look
+    [[ -n "$want" ]] || return 1
+    local idx
+    idx=$(awk -F'|' -v w="$want" '$1 == w { print $2; exit }' <<<"$live")
+    [[ -n "$idx" ]] || return 1           # snapshot read, name absent
+    printf '%s' "$idx"
+    return 0
+}
+
+# _pd_row_actionable <window-name> <live-tsv>
+#   rc 0 → emit (including every could-not-tell path)
+#   rc 1 → withhold; $BK_ERR carries the reason.
+# Fail-open is the whole contract here: see the direction note above.
+_pd_row_actionable() {
+    local win="$1" live="$2"
+    [[ "${MONITOR_PENDING_PANE_GATE:-true}" == "true" ]] || return 0
+    # The predicate lives in _bookkeeping.sh so the ruling is one
+    # default-arm decision shared with the kill/dead gates, and so the
+    # manifest test can drive it directly. Not sourced (a test may source
+    # this file alone) ⇒ no gate.
+    declare -F bk_decision_row_actionable >/dev/null 2>&1 || return 0
+    local idx line state queued
+    # BOTH failure arms of the three-state resolver lead here to EMIT, and
+    # that is deliberate rather than a conflation surviving the split.
+    # rc 3 (could not look) is an indeterminate reading, and the whole
+    # polarity of this gate is that indeterminacy surfaces. rc 1 (window
+    # genuinely absent from tmux) means the decision is unanswerable
+    # in-pane — but the dead-window SKIP above already dropped that row on
+    # its own authority, so reaching here with rc 1 means the skip is
+    # disabled by its knob, and silently re-suppressing what the operator
+    # just switched off would be its own defect.
+    idx=$(_pd_resolve_window_index "$win" "$live") || return 0
+    line=$(_idle_pane_state_line "$idx" "$win")
+    [[ -n "$line" ]] || return 0                # probe said nothing → emit
+    state=$(_idle_pane_line_field "$line" state)
+    [[ -n "$state" ]] || return 0               # malformed line → emit
+    queued=""
+    [[ "$line" == *" queued=1"* ]] && queued=1
+    bk_decision_row_actionable "$state" "$queued"
+}
+
+# ---- reaping dead windows' decisions (nexus-code#790, defect 3) ---------
+#
+# `ng retire-window` already prunes `decisions/<w>.*` — `prefix:decisions/{w}.`
+# has been in BK_RETIRE_SURFACES since #602. The leak is every OTHER way a
+# window ends: an agent that exits on its own, a window closed by hand, a
+# session that churns. None of those runs the teardown, and nothing else
+# ever looks. Measured on the live nexus while writing this: 19 decision
+# files on disk, 19 for windows absent from tmux, the oldest 11 hours old,
+# and not one of their windows carried a `window-close` action-log entry —
+# so the filed premise ("nothing removes a window's decisions when it is
+# retired") is not quite right, and the accurate one is worse: the
+# retirement path is fine and the un-retired path is unbounded.
+#
+# The dead-window emit SKIP added earlier keeps those rows out of the
+# operator's face, which is why this went unnoticed — but skipping is not
+# reaping. Two costs remain. The directory grows without bound, so `ls` on
+# it (a thing an orchestrator does when reconstructing state) reports
+# mostly fiction. And a window name is REUSED: spawn a worker into a name
+# a dead one held and its predecessor's decisions become live rows again,
+# attributed to an agent that never fired them.
+#
+# Safety. Reaping is gated on the SAME non-empty live-window snapshot the
+# emit skip uses (an empty query is tmux being transient, never evidence
+# of death), plus a minimum age so a window that tmux failed to list for
+# one cycle cannot lose state it is still using. Decisions are not the
+# audit trail — the action log and the reports corpus are, and
+# BK_RETIRE_SURFACES already excludes those two by name while including
+# this directory. Reaping here therefore applies the policy that already
+# governs the retirement path to the deaths that never reach it.
+MONITOR_PENDING_REAP_DEAD_WINDOWS="${MONITOR_PENDING_REAP_DEAD_WINDOWS:-true}"
+MONITOR_PENDING_REAP_MIN_AGE_SECONDS="${MONITOR_PENDING_REAP_MIN_AGE_SECONDS:-900}"
+
+# _reap_dead_window_decisions <dir> <live-names> <now>
+# Prints the number of files removed. No-op on an empty live set.
+_reap_dead_window_decisions() {
+    local dir="$1" live="$2" now="$3"
+    local reaped=0 failed=0
+    [[ "${MONITOR_PENDING_REAP_DEAD_WINDOWS:-true}" == "true" ]] || { printf '0'; return 0; }
+    [[ -d "$dir" && -n "$live" ]] || { printf '0'; return 0; }
+    local min_age="${MONITOR_PENDING_REAP_MIN_AGE_SECONDS:-900}"
+    [[ "$min_age" =~ ^[0-9]+$ ]] || min_age=900
+    local _reap_restore_nullglob
+    _reap_restore_nullglob=$(shopt -p nullglob)
+    shopt -s nullglob 2>/dev/null
+    local f bn win mtime
+    # Both `<w>.<fp>.json` and `<w>.<fp>.handled.json` go: a tombstone for
+    # a window that no longer exists suppresses nothing.
+    for f in "$dir"/*.json; do
+        [[ -e "$f" ]] || continue
+        bn=$(basename "$f")
+        # Window name = everything before the final `.<12hex>[.handled].json`.
+        if [[ "$bn" =~ ^(.+)\.[0-9a-f]{12}(\.handled)?\.json$ ]]; then
+            win="${BASH_REMATCH[1]}"
+        else
+            continue        # malformed name: leave it for a human to look at
+        fi
+        grep -qxF -- "$win" <<<"$live" && continue      # window is live
+        mtime=$(date +%s -r "$f" 2>/dev/null || echo 0)
+        [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+        (( mtime > 0 )) || continue
+        (( now - mtime >= min_age )) || continue
+        # Do NOT swallow the removal's failure (skeptic finding, #790). The
+        # first draft was `rm -f … 2>/dev/null && reaped=$(( reaped + 1 ))`
+        # with the count discarded by the caller, so a reap that could never
+        # remove anything — a read-only state dir, a permissions change, an
+        # immutable bit — looked exactly like a reap with nothing to do. That
+        # is silence-as-a-proxy-for-success, the defect class this whole
+        # change is about, reproduced inside the change. The directory would
+        # grow without bound and the only symptom would be its absence of
+        # symptoms.
+        if rm -f "$f" 2>/dev/null && [[ ! -e "$f" ]]; then
+            reaped=$(( reaped + 1 ))
+        else
+            failed=$(( failed + 1 ))
+        fi
+    done
+    eval "$_reap_restore_nullglob"
+    # stderr, never stdout: stdout of the enclosing renderer IS the operator
+    # emit channel, and a diagnostic there would be parsed as a decision row.
+    # The watcher captures stderr into monitor/.state/watcher.log.
+    if (( failed > 0 )); then
+        printf 'render_pending_decisions: reap FAILED to remove %d dead-window decision file(s) in %s — the directory will grow without bound; check permissions\n' \
+            "$failed" "$dir" >&2
+    fi
+    printf '%s' "$reaped"
 }
 
 _pending_decisions_emit_state_path() {
@@ -3826,15 +4875,106 @@ render_pending_decisions() {
     now=$(date +%s)
     cooldown=$(_decision_reemit_cooldown_seconds)
 
+    # Dead-window skip (watcher-emit-noise, Class 3). A decision is only
+    # actionable in a LIVE window — the operator answers the prompt IN the
+    # window. A decision file for a killed window is unactionable garbage
+    # that re-nags the orchestrator every cooldown (observed: 2026-07-21
+    # 00:33/00:34 pubfork-skills[-skeptic] idle_prompt rows, both windows
+    # kill-window'd ~00:34 — the skeptic-park suppression below had already
+    # lapsed because the skeptic window was gone). Snapshot the live window
+    # set once so rows for absent windows drop from both the emit and the
+    # cooldown state. Empty query (tmux transient) ⇒ pass-through so a real
+    # decision is never lost. Knob-guarded, default on.
+    #
+    # One snapshot, three consumers (#790): the dead-window emit skip
+    # below, the dead-window REAP, and the pane gate's name→index lookup.
+    # `#{window_index}` rides along in a second field so the gate does not
+    # need a second tmux call — the emit skip reads field 1 only, exactly
+    # as it did when this was a bare name list.
+    #
+    # Delimiter is `|`, matching `_idle_list_worker_windows` above, and it
+    # is NOT a style choice. The first draft used a literal TAB and
+    # `test-tmux-window-resolver.sh` F1/F3 caught it: in a non-UTF-8
+    # locale with `$TMUX` unset, tmux REWRITES that byte to `_`, the row
+    # never splits, and the consumer reads one mangled field instead of
+    # two. Here that failure would have been silent AND self-concealing —
+    # no index parses, so the pane gate fails open on every row and the
+    # channel quietly reverts to the pre-#790 behaviour this whole change
+    # exists to fix, in exactly the locales nobody tests. `|` is
+    # printable, so no locale rewrites it, and `validate_window_name`
+    # forbids it inside a minted window name, so it cannot appear in
+    # field 1.
+    local _pd_live="" _pd_live_tsv="" _pd_skip_dead="${MONITOR_PENDING_SKIP_DEAD_WINDOWS:-true}"
+    if [[ "$_pd_skip_dead" == "true" || "${MONITOR_PENDING_PANE_GATE:-true}" == "true" \
+          || "${MONITOR_PENDING_REAP_DEAD_WINDOWS:-true}" == "true" ]]; then
+        _pd_live_tsv=$(tmux list-windows -F '#{window_name}|#{window_index}' 2>/dev/null || true)
+        [[ -n "$_pd_live_tsv" ]] && _pd_live=$(cut -d'|' -f1 <<<"$_pd_live_tsv")
+    fi
+    # The emit skip is knob-scoped, but the snapshot above is now shared,
+    # so re-blank the name list when only the other two consumers asked
+    # for it — otherwise turning skip_dead_windows off would stop
+    # suppressing dead rows *and* keep suppressing them.
+    [[ "$_pd_skip_dead" == "true" ]] || _pd_live=""
+
+    # Reap before the scan, so a file removed here never produces a row.
+    _reap_dead_window_decisions "$dir" "$(cut -d'|' -f1 <<<"$_pd_live_tsv")" "$now" >/dev/null
+
     # Gather current pending set into a TSV: window\tfp\tfile\tkind\texcerpt\tunresolved
     # We skip *.handled.json tombstones — those are terminal.
     local current=""
     local f bn win_fp win fp kind excerpt unresolved
+    # Ambient-shell-state independence (issue #721). Two distinct properties
+    # here, both MEASURED rather than argued — see test-pending-decisions.sh
+    # "Test 14".
+    #
+    #  (a) The scan must not enter its body for the UNEXPANDED literal when
+    #      `$dir` holds no `*.json`. `nullglob` is one way; `[[ -e "$f" ]]` is
+    #      the structural backstop every sibling loop in this repo already
+    #      carries (`_requests.sh:180,196`, `remote-enroll.sh:470`,
+    #      `paste-followup.sh:415`) and it holds against ANY ambient option,
+    #      not `nullglob` in particular. Without either, the loop stats and
+    #      jq-forks a nonexistent path twice per cycle; the OUTPUT still came
+    #      out right, but only because `[[ -n "$win" ]]` below happens to
+    #      reject the phantom row — an emergent guarantee, which is exactly
+    #      why the deletion mutant survived the whole suite.
+    #
+    #  (b) The caller's `nullglob` must survive the call. The tail used to be
+    #      an unconditional `shopt -u`, which turns the option OFF for a
+    #      caller that had it ON. Inert today — both watcher call sites
+    #      isolate in a subshell (`_run_bounded`'s `( … ) &` at main.sh:1177,
+    #      and `_v2_task_pending_decisions`' pipeline LHS at main.sh:3243) —
+    #      so this closes a latent hazard rather than a live bug. Save and
+    #      restore, as `main.sh:2272,2399` already does.
+    local _rpd_restore_nullglob
+    _rpd_restore_nullglob=$(shopt -p nullglob)
     shopt -s nullglob 2>/dev/null
     for f in "$dir"/*.json; do
+        # Structural no-match guard — see (a) above. Also skips a file that
+        # vanished between glob expansion and this iteration.
+        [[ -e "$f" ]] || continue
         case "$f" in
             *.handled.json) continue ;;
         esac
+        # Tombstone SIBLING gate (your-org/nexus-code#790, found while
+        # fixing it). `decision-emit.sh` treats `<w>.<fp>.handled.json` as
+        # terminal on the WRITE path and has since #129; this reader only
+        # ever skipped the tombstone FILE, never a live `<fp>.json`
+        # standing next to one. The two halves of one contract disagreed,
+        # and the disagreement is load-bearing: the tombstone recipe in
+        # `skills/nexus.window-cleanup` ("Tombstone rule — every
+        # resurfaced `idle_prompt` decision MUST be acked") writes the
+        # `.handled.json` with `jq -n … > …` and leaves the original
+        # `.json` in place, so an orchestrator following the documented
+        # remedy EXACTLY got no suppression at all — the row kept
+        # re-emitting every cooldown and the tombstone did nothing but
+        # stop future hook writes. Measured on dev@16728e7 and on this
+        # branch before this line existed.
+        #
+        # `ng decision-ack` renames rather than copies, so it never
+        # produces this shape — but every tombstone written by hand over
+        # the life of that recipe did, and honouring the sibling here is
+        # what makes those acks retroactively real.
+        [[ -e "${f%.json}.handled.json" ]] && continue
         # Filename convention: <window>.<fp>.json. Split on the LAST
         # dot before .json to tolerate window names with dots (the
         # CLAUDE.md gotcha says workspace conventions disallow dots
@@ -3862,10 +5002,23 @@ render_pending_decisions() {
         if (( ${#excerpt} > 160 )); then
             excerpt="${excerpt:0:157}…"
         fi
+        # RESOLVED rows are not pending decisions (your-org/nexus-code#824).
+        # The Stop hook stamps `resolved: true` on a `permission_prompt` at
+        # turn-end, because a permission modal suspends the turn and so
+        # `Stop` is positive evidence the modal is gone. Such a file stays
+        # on disk as the audit record that the prompt HAPPENED; it is not an
+        # action item, and re-emitting it every cooldown for hours is what
+        # `#824` measured (13 firings on one window, byte-identical pane
+        # content throughout). A genuine re-fire of the same fingerprint
+        # rewrites the file wholesale via `decision-emit.sh`, with no
+        # `resolved` key — so this is not permanent suppression.
+        if jq -e '.resolved == true' "$f" >/dev/null 2>&1; then
+            continue
+        fi
         unresolved=$(jq -r 'if .unresolved == true then "true" else "false" end' "$f" 2>/dev/null)
         current+="$win"$'\t'"$fp"$'\t'"$f"$'\t'"$kind"$'\t'"$excerpt"$'\t'"$unresolved"$'\n'
     done
-    shopt -u nullglob 2>/dev/null
+    eval "$_rpd_restore_nullglob"   # NOT `shopt -u` — see (b) above.
 
     [[ -n "$current" ]] || {
         # No pending decisions — clear stale state so a future row's
@@ -3889,6 +5042,15 @@ render_pending_decisions() {
     local next_state=""
     while IFS=$'\t' read -r win fp file kind excerpt unresolved; do
         [[ -n "$win" ]] || continue
+        # Dead-window skip (watcher-emit-noise, Class 3). Drop the row —
+        # from both the emit and the cooldown state — when its window is
+        # no longer live in tmux (see the snapshot rationale above). A
+        # genuine LIVE parked worker whose verdict posts still resurfaces
+        # (window present, marker cleared); only the killed-window tail is
+        # suppressed. Pass-through when the live query was empty.
+        if [[ -n "$_pd_live" ]] && ! grep -qxF -- "$win" <<<"$_pd_live"; then
+            continue
+        fi
         # Operator-engaged suppression (issues #196, #201). The
         # `idle_prompt` pings of a window the operator drives are
         # ordinary turn-end notifications, not decisions to ack — drop
@@ -3928,10 +5090,32 @@ render_pending_decisions() {
                 last_emit_ts="$last"
             fi
         fi
+        # Pane gate (#790 defect 1). Evaluated LAST, and only for a row
+        # that would otherwise print, so the pane-state fork is paid for
+        # at most once per emitted row rather than once per file per 10s
+        # cycle. `blocked` passes; `busy`/`working-*`/`user-typing` and
+        # any `queued=1` pane do not. See the direction-of-error note at
+        # `_pd_row_actionable`.
+        if (( should_emit == 1 )) && ! _pd_row_actionable "$win" "$_pd_live_tsv"; then
+            should_emit=0
+            if [[ -z "$last" ]]; then
+                # Never emitted before: keep the row OUT of the cooldown
+                # state so it fires the instant the pane stops asserting
+                # otherwise, instead of being made to wait a full cooldown
+                # for a suppression that was never an emit.
+                continue
+            fi
+            # Already emitted once: hold the previous stamp so the clock
+            # keeps running. A pane that flips busy/idle every few seconds
+            # then re-emits on the cooldown boundary, not on every flip —
+            # withholding must not become its own noise source.
+            last_emit_ts="$last"
+        fi
         if (( should_emit == 1 )); then
             emit_lines+="window=$win fp=$fp kind=$kind unresolved=$unresolved"$'\n'
             emit_lines+="    prompt-excerpt=$excerpt"$'\n'
             emit_lines+="    file=$file"$'\n'
+            emit_lines+="    ack=ng decision-ack $win $fp   (durable; \`rm\` does NOT stick)"$'\n'
         fi
         next_state+="$win"$'\t'"$fp"$'\t'"$last_emit_ts"$'\n'
     done <<<"$current"

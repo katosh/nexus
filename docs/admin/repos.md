@@ -194,8 +194,11 @@ Recommended settings on the asset+issue repo:
 - **Branch protection on `main`**:
     - Allow direct pushes from the bot identity (`<bot-slug>[bot]`).
     - Discourage force-pushes (workspace rule: `nexus.worker-defaults`
-      forbids `--force` in worker scripts; protect the branch to make
-      the rule structural).
+      forbids force-pushing a *shared* branch; protect the branch to
+      make the rule structural). Protection belongs on the shared
+      branches precisely so the rule need not be blanket — workers
+      still rebase and force-push their own PR branches, which the
+      merge gate requires.
     - You generally don't need PR-only merges here, since the only
       writer is your bot and there are no human collaborators.
 - **Collaborators**: just you (and any co-operator who actively works

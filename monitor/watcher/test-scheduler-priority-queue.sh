@@ -613,11 +613,18 @@ EOF
     out=$(cat /tmp/scheduler-sigterm.out.$$ 2>/dev/null || true)
     rm -f "$sleep_test" /tmp/scheduler-sigterm.out.$$
 
-    # Must exit cleanly within MAX_SLEEP + a small margin.
-    if (( elapsed_wall <= 4 )); then
+    # Must exit cleanly within MAX_SLEEP + margin. Bound raised 4 s → 30 s
+    # (the your-org/nexus-code#557 class review). The regression this
+    # catches is "SIGTERM is not observed until the 120 s far-future timer
+    # fires", so any ceiling well under 120 s discriminates identically;
+    # 4 s merely added a wall-clock race against a loaded scheduler on top.
+    # shutdown=1 and sleep-rc=99, asserted just below, are the real
+    # behavioural evidence — this bound only rules out sleeping the full
+    # 120 s.
+    if (( elapsed_wall <= 30 )); then
         pass "SIGTERM observed within MAX_SLEEP window (${elapsed_wall}s)"
     else
-        fail "SIGTERM took ${elapsed_wall}s (expected <= 4s)" "$out"
+        fail "SIGTERM took ${elapsed_wall}s (expected <= 30s)" "$out"
     fi
     # Must observe shutdown=1 in the child output (the trap set the
     # flag; the post-sleep return propagated rc=99).

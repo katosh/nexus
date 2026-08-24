@@ -88,9 +88,10 @@ verb-specific codes documented per verb (e.g.
 | `ng dashboard validate` | strict check: required sections present? | [→](#ng-dashboard-validate) |
 | `ng nexus-identity` | render + upsert the auto-generated identity block | [→](#ng-nexus-identity) |
 | `ng watcher-status` | heartbeat age + target + liveness | [→](#ng-watcher-status) |
+| `ng decision-ack <w> <fp>` | durably ack a `--- pending decisions ---` row | [→](#ng-decision-ack) |
 | `ng log-action <agent>` | append a JSONL event to the action log | [→](#ng-log-action) |
 | `ng mint-jwt` | print an App-level JWT (for `/app/*` endpoints) | [→](#ng-mint-jwt) |
-| `ng lit search "<q>"` | content-relevance paper discovery (S2 + ASTA) | [→](#ng-lit) |
+| `ng lit search "<q>"` | content-relevance paper discovery (S2 + ASTA + OpenAlex) | [→](#ng-lit) |
 | `ng lit add <doi>` | fetch metadata + add a paper to the library | [→](#ng-lit) |
 | `ng lit status` | keys / library / setup readiness | [→](#ng-lit) |
 
@@ -1129,6 +1130,55 @@ heartbeat age, no window check):
 | `2` | Very stale (> 5×), or heartbeat pid dead / recycled to a non-watcher process |
 | `3` | No heartbeat file |
 
+### `ng decision-ack`
+
+Durably ack a `--- pending decisions ---` row (<your-org>/nexus-code`#790`).
+
+**Usage**
+
+```
+ng decision-ack <window> <fingerprint> [--reason <text>]
+ng decision-ack <path-to-decision-json>  [--reason <text>]
+ng decision-ack <window> --all           [--reason <text>]
+```
+
+The emit row cites the exact invocation on its `ack=` line, and the
+`file=` path is accepted verbatim so nothing has to be re-split by hand
+(a mistyped fingerprint tombstones nothing while reporting success).
+
+**Why not just `rm` the file.** That was the documented ack for a year
+and it is a **no-op**. The fingerprint is `sha1(window | kind | message)`,
+and `idle_prompt`'s message is the constant `Claude is waiting for your
+input` — so for that kind the fingerprint is a pure function of the
+window. Remove the file, let the worker sit idle another minute, and the
+hook writes back a byte-identical name. Measured on a live nexus:
+`civerdict.bb0f332f628a.json` removed at 15:41, present again at
+16:09:32 with the same fingerprint; `guardgap.672915acaad8` acked three
+times over one session. The reader could not distinguish "fired again
+because something changed" from "fired again because I deleted a file".
+
+This verb performs the durable move instead — `<w>.<fp>.json` →
+`<w>.<fp>.handled.json` — which **both** the hook's write path and the
+watcher's reader have always honoured as terminal. It then verifies the
+property (tombstone present *and* live file gone) rather than trusting
+`mv`'s exit status, and logs a `decision-ack` action-log event.
+
+**Scope of the suppression.** Terminal for that fingerprint until the
+window is retired (`ng retire-window` prunes `decisions/<w>.*`) or reaped
+(the watcher drops decisions for windows absent from tmux past
+`MONITOR_PENDING_REAP_MIN_AGE_SECONDS`, default 900 s). For
+`idle_prompt` that means this window's idle pings stop being *decision*
+rows — which is correct: `--- idle workers ---` is the surface that
+tracks idle workers, it cannot be tombstoned, and two channels nagging
+about the same fact is what made this one skimmable. A
+`permission_prompt` embeds the tool and its arguments in the message, so
+a *different* prompt is a different fingerprint and surfaces normally;
+only the identical prompt is muted.
+
+**Exit codes**: `0` acked (or already acked — idempotent); non-zero on a
+malformed fingerprint, a missing decision, or a tombstone that could not
+be written.
+
 ### `ng log-action`
 
 Append one line to `monitor/.state/action-log.jsonl`. Used by
@@ -1244,21 +1294,35 @@ convention: [Literature research](literature.md) and the
 
 ```console
 $ ng lit status                                          # readiness
-$ ng lit search "<query>" [--source s2|asta|both] [--limit N] [--year A:B] [--human]
-$ ng lit add <DOI|S2-id> [--human]                       # grow the library
+$ ng lit search "<query>" [--source s2|asta|openalex|both|all] [--limit N] [--year A:B] [--human]
+$ ng lit add <DOI|S2-id|openalex:Wid> [--human]          # grow the library
 $ ng lit setup                                           # key-acquisition refs
 ```
 
-- **`search`** queries Semantic Scholar and ASTA by relevance, dedups
-  against the reference library, and annotates each hit `in_library`. A
-  backend with no key is **skipped with a note** (never a hang). Default
-  output is JSON; `--human` is readable.
-- **`add`** fetches a paper by DOI or S2 id and appends a schema-compatible
-  record to the library (`<nexus.root>/.bipartite/refs.jsonl` by default, or
-  `lit.library_path`). Dedup-checked by DOI.
+- **`search`** queries Semantic Scholar, ASTA, and OpenAlex by relevance
+  (default `--source all` — the three are complementary, not redundant),
+  dedups against the reference library, and annotates each hit
+  `in_library`. A keyed backend (S2/ASTA) with no key is **skipped with a
+  note** (never a hang); OpenAlex needs no key so it's never skipped for
+  that reason. Default output is JSON; `--human` is readable.
+  Every response leads with **`status`** — `ok` (every requested backend
+  searched; a `count` of 0 means nothing matched the query as asked, which
+  is not the same as a verified absence), `partial` (a backend failed
+  or was skipped; a 0 establishes nothing), or `error` (the query itself
+  failed — exit 2, and **no `count`/`results` key at all**, so a broken
+  search can never be read as an empty literature). See
+  [Literature research](literature.md#the-three-result-states).
+- **`add`** fetches a paper by DOI, S2 id, or OpenAlex work id and appends a
+  schema-compatible record to the library (`<nexus.root>/.bipartite/refs.jsonl`
+  by default, or `lit.library_path`). Dedup-checked by DOI. Works with zero
+  keys configured via the OpenAlex DOI fallback; an S2 key is only needed
+  for non-DOI ids.
 - **`status` / `setup`** report configured backends (env / `config/nexus.yml`
-  `lit.*` / legacy `bip` config — never the key itself) and, when nothing is
-  configured, print key-acquisition references and exit non-zero.
+  `lit.*` / legacy `bip` config — never the key itself). OpenAlex always
+  reports available (no key required), so the tool is never fully
+  "unconfigured"; `status` prints key-acquisition references as a hint when
+  S2/ASTA are both unconfigured, but only exits non-zero when a specific
+  `--source` request (`s2`/`asta`/`both`) has no matching key.
 
 ---
 

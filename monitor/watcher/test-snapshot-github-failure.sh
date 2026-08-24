@@ -190,7 +190,25 @@ export -f date
 
 echo '=== rate-limit response: emits sentinel, writes state ==='
 MOCK_GH_MODE=fail-rate-limit
-unset MOCK_DATE_NOW
+# CLOCK COHERENCE (your-org/nexus-code#594). This block used to ARM the
+# backoff at real wall-clock (`unset MOCK_DATE_NOW`) and then READ it
+# with the clock pinned to 2030, so the gate was asked to honour an
+# observation ~4 years stale. Under the old unbounded gate that still
+# "worked" — which is the whole complaint of #594: a stored instant
+# suppressed the operator channel no matter how old the observation
+# behind it was. Now the ceiling reconciles such a state, so the
+# scenario has to be internally consistent to test anything. Pin the
+# clock across arm AND read, and keep the API-supplied reset inside the
+# ceiling so this block continues to exercise the ORDINARY path; the
+# out-of-range reset gets its own test below.
+T0=1893450000
+MOCK_DATE_NOW=$T0
+# The mock's payload carries reset_at_epoch=1893456000 (T0 + 6000). Keep
+# the ceiling above that so these three blocks still exercise the
+# ORDINARY arm/suppress/expire path with the raw API epoch intact; the
+# clamp and the stale-observation reconcile are tested separately below.
+MONITOR_GRAPHQL_BACKOFF_MAX_SECONDS=100000
+MONITOR_GRAPHQL_BACKOFF_ANNOUNCE_SECONDS=100000   # not the subject here
 
 out=$(_snapshot_issue_comments "" 2>/dev/null)
 rc=$?
@@ -207,8 +225,13 @@ sentinel_count=$(grep -c '^watcher_alert=rate-limit ' <<<"$out" || true)
 assert_eq "exactly one watcher_alert= line emitted"              "$sentinel_count" "1"
 
 assert_file_exists "backoff state file written"                  "$STATE_DIR/graphql-backoff-issue_comments"
-backoff_epoch=$(<"$STATE_DIR/graphql-backoff-issue_comments")
+# Line 1 is the reset (unchanged format, so an in-flight watcher reading
+# an older file still works); line 2 is the OBSERVATION epoch added by
+# #594 — the ceiling is measured from it, never from the prediction.
+backoff_epoch=$(head -n1 "$STATE_DIR/graphql-backoff-issue_comments")
 assert_eq "backoff file holds parsed reset epoch"                "$backoff_epoch" "1893456000"
+backoff_armed=$(sed -n 2p "$STATE_DIR/graphql-backoff-issue_comments")
+assert_eq "backoff file records the OBSERVATION epoch on line 2"  "$backoff_armed" "$T0"
 
 assert_file_exists "alert-emitted flag file written"             "$STATE_DIR/graphql-alert-emitted-issue_comments-1893456000"
 
@@ -253,6 +276,49 @@ assert_eq "stdout empty (mock returned no eligible nodes)"       "$out3" ""
 assert_eq "gh was called once after expiry"                      "$calls_after" "$(( calls_before + 1 ))"
 assert_file_absent "backoff file removed after expiry"           "$STATE_DIR/graphql-backoff-issue_comments"
 assert_file_absent "alert-emitted flag removed after expiry"     "$STATE_DIR/graphql-alert-emitted-issue_comments-1893456000"
+
+# ---- Test 3b: the bound (your-org/nexus-code#594) ------------------------
+#
+# The two properties the ordinary path above cannot show: an
+# out-of-range API reset never reaches disk, and a stale OBSERVATION
+# re-opens the gate however far away the prediction is. Both assert on
+# the REASON in the log, not on rc — the plain expiry branch produces
+# the same rc, and conflating them is how an unbounded gate passes for
+# a bounded one.
+
+echo '=== out-of-range API reset is clamped at arm time, loudly ==='
+rm -f "$STATE_DIR"/graphql-* "$STATE_DIR/watcher-alerts.log"
+MOCK_GH_MODE=fail-rate-limit
+MOCK_DATE_NOW=$T0
+MONITOR_GRAPHQL_BACKOFF_MAX_SECONDS=900       # payload wants T0+6000
+_snapshot_issue_comments "" >/dev/null 2>&1
+assert_eq "stored reset clamped to now+ceiling" \
+    "$(head -n1 "$STATE_DIR/graphql-backoff-issue_comments")" "$(( T0 + 900 ))"
+assert_contains "clamp is logged, never silent" \
+    "$(<"$STATE_DIR/watcher-alerts.log")" "graphql_backoff_clamped"
+
+echo '=== a stale OBSERVATION re-opens the gate despite a future reset ==='
+rm -f "$STATE_DIR"/graphql-* "$STATE_DIR/watcher-alerts.log"
+MONITOR_GRAPHQL_BACKOFF_MAX_SECONDS=900
+# reset far in the future, observation 5000 s old: the pre-#594 gate
+# suppressed here forever.
+printf '%s\n%s\n' "$(( T0 + 999999 ))" "$(( T0 - 5000 ))" \
+    > "$STATE_DIR/graphql-backoff-issue_comments"
+MOCK_GH_MODE=ok
+MOCK_DATE_NOW=$T0
+calls_before=$(gh_call_count)
+_snapshot_issue_comments "" >/dev/null 2>&1
+assert_eq "gh IS called — the surface reopened" \
+    "$(gh_call_count)" "$(( calls_before + 1 ))"
+assert_contains "reconciled for the CEILING reason (not plain expiry)" \
+    "$(<"$STATE_DIR/watcher-alerts.log")" "graphql_backoff_reconciled reason=ceiling"
+assert_file_absent "stale backoff state cleared" \
+    "$STATE_DIR/graphql-backoff-issue_comments"
+
+# Restore the file-wide defaults for the blocks that follow.
+rm -f "$STATE_DIR"/graphql-* "$STATE_DIR/watcher-alerts.log"
+unset MONITOR_GRAPHQL_BACKOFF_MAX_SECONDS MONITOR_GRAPHQL_BACKOFF_ANNOUNCE_SECONDS
+unset MOCK_DATE_NOW
 
 # ---- Test 4: transient (non-rate-limit) failure: log only, no sentinel --
 

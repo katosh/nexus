@@ -261,7 +261,7 @@ grep -q '_nexus_instance_beacon_loop_step "\$INSTANCE_HEARTBEAT_FILE"' "$MAIN" &
 grep -q 'INSTANCE_SUPERSEDED=1' "$MAIN" && pass "J loop sets INSTANCE_SUPERSEDED on a fence verdict" || fail "J loop never sets INSTANCE_SUPERSEDED"
 grep -q 'SELF-FENCE' "$MAIN" && pass "J stand-down is logged loudly (SELF-FENCE)" || fail "J no SELF-FENCE log line"
 grep -q 'NEXUS_INSTANCE_NONCE="\$(_nexus_instance_gen_nonce)"' "$MAIN" && pass "J main.sh pins a per-instance nonce" || fail "J main.sh does not pin NEXUS_INSTANCE_NONCE"
-sed -n '/^release_instance_lock()/,/^}/p' "$MAIN" | grep -q 'INSTANCE_SUPERSEDED' && pass "J release_instance_lock spares the successor beacon when superseded" || fail "J release_instance_lock does not guard the beacon rm"
+grep -q 'INSTANCE_SUPERSEDED' <<<"$(sed -n '/^release_instance_lock()/,/^}/p' "$MAIN")" && pass "J release_instance_lock spares the successor beacon when superseded" || fail "J release_instance_lock does not guard the beacon rm"
 
 # ============================================================================
 echo '=== K. release_instance_lock — behavioral: superseded stand-down spares the beacon ==='

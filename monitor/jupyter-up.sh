@@ -112,7 +112,25 @@ if (( ROOT_MODE )); then
 else
     PROJECT_DIR="${PROJECT_DIR:-$PWD}"
 fi
-PROJECT_DIR=$(cd "$PROJECT_DIR" 2>/dev/null && pwd) || die "project dir not found: $PROJECT_DIR"
+# Save the argument BEFORE the assignment (your-org/nexus-code#660, the
+# rule from #642). A failed command substitution assigns the EMPTY STRING
+# and only THEN runs the `||` arm, so reading `$PROJECT_DIR` there printed
+# `project dir not found: ` with nothing after the colon — a refusal that
+# does not say what it refused. Worse than it sounds: PROJECT_DIR defaults
+# to $PWD (or $NEXUS_ROOT/work under --root), so in the common case the
+# operator gets no argument on the command line to reconstruct it from.
+#
+# `CDPATH=` is the same defect one level down: a CDPATH in the operator's
+# environment makes `cd <relative>` resolve against a search path nothing
+# else consulted, so the directory entered is not the one checked.
+#
+# NB the `--venv` site in ensure_kernel below is already correct and must
+# stay as it is — its `||` arm reports `$OPT_VENV`, a DIFFERENT variable
+# the assignment does not touch. That the correct and the broken form sat
+# twelve lines apart, looking alike, is why this survived review.
+_ju_project_arg="$PROJECT_DIR"
+PROJECT_DIR=$(CDPATH= cd "$_ju_project_arg" 2>/dev/null && pwd) \
+    || die "project dir not found: $_ju_project_arg"
 
 # --- registry helpers -------------------------------------------------------
 
@@ -279,7 +297,12 @@ stop_supervisor() {
         [[ -f "$pf" ]] && { rm -f "$pf"; say "removed stale pidfile for $name"; }
         return 0
     fi
-    read -r pid < "$pf" 2>/dev/null
+    # `[[ -r ]]` first: the redirection failure is the SHELL's, so this
+    # `2>/dev/null` never reached it (#723). Latent here — the
+    # `_recover_service_running` above means the pidfile is present — but the
+    # #729 sweep fixed this shape in four readers and left three behind; a
+    # rule applied to the sites you happened to touch is not applied.
+    pid=""; [[ -r "$pf" ]] && read -r pid < "$pf"
     say "stopping supervisor pid $pid (TERM to its process group)"
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
     for i in $(seq 1 10); do
@@ -333,7 +356,9 @@ _await_health_or_converge() {
         if (( waited >= UP_TIMEOUT )); then
             "$HEALTH_BIN" "$PROJECT_DIR" >/dev/null 2>&1 && return 0
             if _recover_service_running "$name" "$LAUNCH_BIN"; then
-                local sup_pid; read -r sup_pid < "$(_recover_pidfile "$name")" 2>/dev/null
+                # `[[ -r ]]` first — redirection failure is the SHELL's (#723).
+                local sup_pid="" _spf; _spf=$(_recover_pidfile "$name")
+                [[ -r "$_spf" ]] && read -r sup_pid < "$_spf"
                 local recheck="monitor/jupyter-up.sh --status"
                 (( ROOT_MODE )) && recheck="monitor/jupyter-up.sh --root --status"
                 say "not healthy yet after ${UP_TIMEOUT}s, but the supervisor (pid ${sup_pid:-?}) is alive and still converging."
@@ -380,6 +405,11 @@ cmd_up() {
         "$HEALTH_BIN" "$PROJECT_DIR/.jupyter/labsh-service.log")
     case "$outcome" in
         healthy|supervisor-alive|relaunched|window-present) ;;
+        # Serving, but nothing supervises it (your-org/nexus-code#606) —
+        # activation cannot claim success, and the fix is a reconcile, not a
+        # relaunch on top of the live daemon.
+        healthy-unsupervised)
+            die "already serving but UNSUPERVISED (stale supervisor record) — reconcile first: monitor/svc.sh restart $name" ;;
         *) die "service launch failed (outcome: $outcome) — see $PROJECT_DIR/.jupyter/labsh-service.log" ;;
     esac
 
@@ -459,7 +489,16 @@ cmd_status() {
     name=$(_registry_name_for_workdir "$PROJECT_DIR") || name='(unregistered)'
     if "$HEALTH_BIN" "$PROJECT_DIR" >/dev/null 2>&1; then health=healthy; else health=unhealthy; fi
     if [[ "$name" != '(unregistered)' ]] && _recover_service_running "$name" "$LAUNCH_BIN"; then
-        sup="pid:$(cat "$(_recover_pidfile "$name")" 2>/dev/null)"
+        # First line only. The pidfile is a three-line identity record
+        # (pid / ns= / start=) since bcf9e3a; `cat` splattered all three into
+        # this one-line status, stranding $PROJECT_DIR on a third line
+        # (your-org/nexus-code#729, same reader defect as the one found in
+        # test-jupyter-service.sh).
+        # `[[ -r ]]` first: a redirection failure is the SHELL's, so a
+        # `2>/dev/null` on `read` could not suppress it (#723).
+        local _sp="" _pf; _pf=$(_recover_pidfile "$name")
+        [[ -r "$_pf" ]] && read -r _sp < "$_pf"
+        sup="pid:$_sp"
     else
         sup='-'
     fi

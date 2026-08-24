@@ -1,5 +1,5 @@
 ---
-description: "Always-applies workspace defaults for any nexus-spawned worker: bot identity for GitHub writes, no --no-verify/force-push, sandbox-notify, report convention. The ## Worker floor section is injected verbatim into every spawn prompt by monitor/spawn-worker.sh."
+description: "Always-applies workspace defaults for any nexus-spawned worker: bot identity for GitHub writes, no --no-verify, no force-push to a shared branch, sandbox-notify, report convention. The ## Worker floor section is injected verbatim into every spawn prompt by monitor/spawn-worker.sh."
 ---
 
 # nexus.worker-defaults — every-worker safety floor
@@ -48,6 +48,102 @@ wrap time rather than front-loading it. See `## Just-in-time hooks`
 below for the mechanisms and `reports/nexus-code-workerfloor_*.md`
 for the full taxonomy + research.
 
+**Worked example of that split — the force-push rule
+(<your-org>/nexus-code#835).** The floor used to say *"never
+force-push"*, flat. That contradicted the merge gate, which
+*requires* a rebase onto the current base before merge: a
+`pull_request` run is computed against a merge ref built at run
+creation, and `rerun-failed-jobs` reuses that same stale ref — so a
+later green can describe a base that has moved, and rebasing onto the
+current base makes the push non-fast-forward.
+
+**Do not say "only a new head re-evaluates" — that was REFUTED by
+experiment.** The merge ref is **demand-triggered**: `refs/pull/N/merge`
+is recomputed when something asks GitHub for the PR's mergeability, and
+not otherwise. Measured: two refs sat stale for **26 and 36 hours**
+across many base advances, while one refreshed to the base's current tip
+**within two minutes of a single `GET /pulls/{n}`** and an untouched
+control did not move. Two consequences, and the second is the sharp one:
+"it has been a while, it must have refreshed" is false; and **querying
+the PR refreshes it, so the act of checking changes what you are
+checking.** Never read a green, then query the PR, then treat that green
+as describing what you just queried. Safe order: **GET the PR** to force
+the refresh, **then create a new run**, **then enumerate** it. `#823` merged on a green
+computed against a stale merge ref and turned `dev` red. The floor
+now carries only the **boundary** (shared branch vs your own PR
+branch, one sentence); the checkable precondition, the
+`--force-with-lease` caveat, and the merge-ref rationale live in the
+`force-push` rows of `bash-footgun-patterns.conf`, delivered by
+`bash-footgun-guard.sh` at the instant the worker runs `git push`.
+Don't restore the blanket ban here: it reads as correct, and it
+tells every worker to refuse a rebase the merge gate demands.
+
+**And do not re-key the boundary on AUTHORSHIP.** The first version of
+this rule shipped `git log --format='%an' origin/dev..HEAD | sort -u`
+as the precondition, glossed as "if this lists only you, no other agent
+has commits here". That is **false in this workspace, and this very
+floor is why** — it mandates *"`git commit` / `git push` use your
+identity"*, so every agent commits as the operator and the author check
+can never see a sibling. Measured on a purpose-built two-agent branch,
+it returned one name and read SAFE while a sibling's commit sat on the
+branch; the force-push then destroyed that commit and its file.
+`--force-with-lease` did **not** save it, because the lease is satisfied
+by the very `git fetch` that rebasing onto current `dev` requires.
+The boundary must key on the **property** — commits on the remote you
+would destroy. Caught by the `#835` skeptic pass; it is the workspace's
+dominant defect class (a proxy asserted in place of the property)
+re-instantiated inside the fix.
+
+**And the property check must FAIL CLOSED, which the first correction
+did not.** Shipped as prose — *"`git fetch origin <branch>`, then
+`git log --oneline <branch>..origin/<branch>`"* — it was right whenever
+it could look and **silently safe whenever it could not**. Three states
+print empty: the branch is not on the remote yet, the fetch **failed**,
+or the tracking ref is stale because the fetch was skipped. The first
+two are byte-identical at the terminal (same empty stdout, same
+`rc 128`), so the failure renders as the clearance. It is now one
+command that fetches and compares together and cannot be half-run —
+`monitor/force-push-check.sh`, exit codes `0` safe / `1` UNSAFE / `2`
+REFUSED / `3` no such remote branch, mirroring `guards-for-diff.sh`'s
+`#803` shape where "could not check" and "nothing found" are separate
+codes and neither is a pass.
+
+**And it must compare the ref the push MOVES, not `HEAD`** — the third
+correction, and a false SAFE rather than a refusal. A push updates
+`refs/heads/<dst>` on the remote from `<src>` locally, and neither is
+necessarily the checked-out branch. Measured: local `feature` lacking a
+sibling commit while HEAD sat on `integration` which contained it
+printed `SAFE rc 0`, and the push then reported `(forced update)` with
+the sibling gone. The script now resolves `<branch>` / `<src>:<dst>` /
+`push.default` the way git does, and refuses (never guesses) for
+`matching`, `nothing`, and a detached HEAD with no ref given.
+
+**And a fourth: it compared the wrong REMOTE.** `remote.pushDefault` and
+`branch.<n>.pushRemote` select the push remote; the check assumed
+`origin`, said SAFE, and the push destroyed a commit on the other remote.
+
+Four false clearances on four distinct axes — authorship, cannot-tell-
+failure-from-clearance, wrong ref, wrong remote — and **every one found
+by BUILDING the failing case, never by reading the code**. The diagnosis
+that ended it is not any of the four fixes: each round was
+**re-implementing a piece of git's own push-target resolution**, and that
+surface (`push.default`, `remote.pushDefault`, `branch.<n>.remote`,
+`branch.<n>.merge`, `branch.<n>.pushRemote`, explicit refspecs, `+`
+markers, `--all`, `--mirror`, per-remote push refspecs) is larger than
+anyone enumerates in advance. Fixing one axis per round only relocates
+the hole.
+
+So the check now **asks git instead of modelling it** —
+`git push --dry-run --porcelain --force <your args>` reports exactly
+which refs move on which remote, authoritative by construction because it
+IS the resolution. That deleted the class rather than adding a fifth
+axis, and as a side effect multi-ref pushes became answerable instead of
+refused.
+
+Two transferable rules: **an answer you cannot vouch for must not look
+like a good one**, and **when a check keeps re-deriving something a tool
+already computes, stop deriving and ask the tool.**
+
 ## How injection works
 
 `monitor/spawn-worker.sh` resolves `NEXUS_ROOT` from its own
@@ -72,9 +168,30 @@ Then `claude` launches in a tmux window. Missing file or empty
 section → exit non-zero with a clear error; the spawn never
 proceeds without the floor.
 
+**Conditional fourth block — `--reply-to`.** When (and only when) the
+spawn carries `--reply-to <request-id>`, the launcher extracts the
+`## Reply-to wrap-up override` section the same awk way, substitutes
+the literal `<REQUEST_ID>` token with the validated id, and inserts it
+between block 2 and block 3. Without the flag the section is never
+read and the composed prompt is byte-identical to the pre-flag
+behaviour — regression-pinned in
+`monitor/watcher/test-spawn-worker-reply-to.sh` T1, which compares the
+no-flag prompt against an independent reference composition rather
+than a checked-in golden (a golden churns on every legitimate floor
+edit and gets rubber-stamped). This is the
+orchestrator's dispatch-time choice of delivery surface — channel vs
+GitHub — never something parsed out of a remote client's prose. See
+`## Reply-to wrap-up override` below for the injected text and
+`skills/nexus.remote-access` for the channel itself.
+
 H2 boundaries are load-bearing for the awk extraction. Don't
 introduce H2s inside the floor section, and don't use level-1
 headers anywhere except the document title above.
+
+`## Reply-to wrap-up override` is, like `## Worker floor`, a
+**pure injectable body** — every byte of it lands in the worker's
+prompt, so keep orchestrator-facing meta-prose out of it (it
+belongs here instead).
 
 `--print-prompt` emits the composed prompt to stdout and exits
 without spawning a tmux window — useful when validating that
@@ -105,9 +222,36 @@ a hook or your task prompt points you there.
   `"$NEXUS_ROOT"/monitor/assert-bot-author.sh <url-of-your-write>`
   — an operator-authored write SUCCEEDS but GitHub mutes
   self-notifications, so the thread silently goes dark; the
-  assertion is the only loud failure. Never `--no-verify`, never
-  force-push; fix the root cause. `git commit` / `git push` use
-  your identity, everything else the bot's.
+  assertion is the only loud failure. Never `--no-verify`; never
+  force-push a **shared** branch (`dev`, `main`, or any branch
+  someone else has pushed commits to) — force-pushing your **own**
+  PR branch after rebasing it onto the current base is expected.
+  `git commit` / `git push` use your identity, everything else
+  the bot's.
+- **A negative claim about a repository is only as old as its
+  last fetch.** `git branch -a`, `git log --all`, `git cat-file
+  -e` and friends read the LOCAL object store — a commit that was
+  never fetched is not "absent from the repo", it is absent from
+  your copy, and every follow-up check agrees with the wrong
+  answer. `## Worker environment` above prints your clone's
+  remote-tracking date; if a `no such branch / no newer design /
+  nobody has done this` answer is going into a report or a
+  comment, `git fetch` first or scope the claim to a sha and a
+  date. Same family as the `grep -r … reports/` and `git ls-tree`
+  glob silent zeros (`#618`, `#707`, `#770`, `#814`).
+
+  **The trap is that LOCAL operations advance REMOTE-knowledge
+  indicators.** Two measured instances, both of which read *fresher*
+  than your clone actually is:
+  - a **FAILED** `git fetch` truncates `.git/FETCH_HEAD` to zero
+    bytes and updates its mtime;
+  - **your own `git push`** writes `refs/remotes/origin/<branch>`
+    locally without fetching anything, so any date derived from
+    remote-tracking refs jumps to *now* — and pushing your branch is
+    something this floor tells you to do.
+
+  Neither is a fetch time. The only thing that makes a negative claim
+  current is an actual successful `git fetch`.
 - **`sandbox-notify "<msg>"`** on blocker / ready / done.
 - **Never invoke `pip` in ANY form — `uv pip` only.** That means
   bare `pip`, `pip3`, AND `python -m pip`, every verb (`install`,
@@ -148,6 +292,32 @@ push-author verify), `skills/nexus.report/SKILL.md` (section
 semantics, append-only, Infrastructure Issues loop). Resolve by
 absolute path via the spawn prompt.
 
+## Reply-to wrap-up override
+
+**Wrap-up override — this spawn answers a CHANNEL request, not a
+GitHub issue.** Request `<REQUEST_ID>` sits in the nexus request inbox
+and its author is blocked on the channel waiting for your answer. The
+floor's `ng wrap-up <issue> <report-path>` form does NOT apply to you.
+Write your `reports/` report exactly as the floor describes (it is
+still your crash-resumption surface), then hand off with:
+
+    monitor/ng wrap-up --reply-to <REQUEST_ID> <report-path>
+
+That delivers your answer over the request/reply channel: no GitHub
+issue is opened, no issue comment is posted, no trigger is rocketed.
+
+**The answer that reaches the requester is your report's `## Summary`
+section, verbatim.** Write `## Summary` as the ANSWER to the request —
+the finding, the number, the recommendation — not as a narration of
+your process. If the answer is an artifact that does not belong in
+`## Summary` (a table, a dataset, a code listing, a diff), write it to
+a file and pass `--answer-file <path>` instead; that file's bytes
+become the reply body.
+
+If the orchestrator ALSO gave you a GitHub issue number for this task,
+add `--issue <n>` — wrap-up then does both (channel reply AND the
+normal upload + link comment).
+
 ## Just-in-time hooks
 
 These hooks (wired in `monitor/worker-settings.json`) deliver the
@@ -157,10 +327,25 @@ session** (per-window dedup) so it informs without nagging.
 
 | Hook (PreToolUse/PostToolUse) | Fires when… | Delivers |
 |---|---|---|
-| `hooks/bash-footgun-guard.sh` (Bash, data-driven by `bash-footgun-patterns.conf`) | a Bash command matches a footgun pattern: `pkill/pgrep -f`, `kill $(jobs -p)`, `git push`, `scancel --name/--partition`, foreground `sleep`, `python…\| tail`, `ml…\| tail` | the specific self-kill / wrong-remote / sibling-job / buffering reminder as `additionalContext` |
+| `hooks/bash-footgun-guard.sh` (Bash, data-driven by `bash-footgun-patterns.conf`) | a Bash command matches a footgun pattern: `pkill/pgrep -f`, `kill $(jobs -p)`, `git push`, `git push --force`/`-f`, `scancel --name/--partition`, foreground `sleep`, `python…\| tail`, `ml…\| tail` | the specific self-kill / wrong-remote / force-push-boundary / sibling-job / buffering reminder as `additionalContext` |
 | `hooks/gh-write-guard.sh` (Bash) | a `gh` write is attempted | bot-identity guidance (`ng` verbs, `GH_TOKEN` mint for cross-repo); already warns on a bypass that would post as the operator |
 | `hooks/async-launch-detect.sh` (Bash) | `sbatch` / `srun --no-block` / `nohup &` is launched | the async-ownership rule + the three resume mechanisms; records the wait for the watcher's `idle-orphan-async` |
-| `hooks/context-poison-guard.sh` (Read/WebFetch — **proposed**) | a `user-attachments` URL is about to be read | BLOCKS (exit 2) and redirects to `ng fetch-asset` before the session is poisoned |
+
+**Proposed, NOT wired.** The following is a design note, not a
+guard that exists. It sat inside the table above, under a heading
+asserting the hooks are wired in `monitor/worker-settings.json`, and
+the heading wins on a skim — so this text shipped in every worker
+prompt promising a blocking guard against the irrecoverable
+`user-attachments` poisoning. The worker who believes it exists is
+exactly the worker who will test it (<your-org>/nexus-code#568 C5).
+
+| Proposed hook | Would fire when… | Would deliver |
+|---|---|---|
+| `hooks/context-poison-guard.sh` (Read/WebFetch) | a `user-attachments` URL is about to be read | BLOCK (exit 2) and redirect to `ng fetch-asset` before the session is poisoned |
+
+Until it is written and wired, the `user-attachments` rule is
+enforced by convention only: never hand such a URL to Read or to a
+sub-agent; use `monitor/ng fetch-asset <url>` and read the local file.
 
 Adding a footgun to `bash-footgun-guard` is a **data edit** to
 `bash-footgun-patterns.conf` (row `tag\|severity\|command_regex\|message`),

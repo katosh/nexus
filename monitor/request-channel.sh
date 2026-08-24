@@ -510,7 +510,14 @@ cmd_fetch() {
                 tail -c "$n" -- "$path"
                 return 0
             fi
-            local nhdr; nhdr=$(grep -c '^## Reply$' -- "$path" 2>/dev/null || echo 0)
+            # `grep -c` PRINTS `0` on no match and ALSO exits 1, so the old
+            # `|| echo 0` appended a second `0` and nhdr became "0\n0" —
+            # which `[[ -eq ]]` cannot evaluate: bash raises "syntax error in
+            # expression" on stderr and BOTH branches below test false, so a
+            # reply file with no `## Reply` header fell through the header
+            # route silently. Issue #725.
+            local nhdr; nhdr=$(grep -c '^## Reply$' -- "$path" 2>/dev/null) || nhdr=0
+            [[ "$nhdr" =~ ^[0-9]+$ ]] || nhdr=0
             if [[ "$nhdr" -eq 1 ]]; then
                 local rl; rl=$(grep -n '^## Reply$' -- "$path" | cut -d: -f1)
                 tail -n +"$((rl + 2))" -- "$path"

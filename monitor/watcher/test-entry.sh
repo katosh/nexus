@@ -21,6 +21,12 @@
 #      invoked with NEXUS_ROOT exported, invoking window renamed to
 #      `services`, cockpit exec'd, claude NEVER invoked directly.
 #   4. Cold start (default) without a pin: no archive, still boots.
+#  4b. Cold start writes the WORKER-side handoff — a `mode=fresh`
+#      boot-intent file, before `svc.sh up`, so bootstrap-recover's
+#      worker walk resurrects nothing (your-org/nexus-code#651).
+#  4c. --continue writes `mode=continue` instead.
+#  4d. A live orchestrator window writes NO intent at all: re-running
+#      ./watcher on a live stack is an idempotent bring-up, not a boot.
 #   5. --continue + valid pin → pin retained; resume messaging names
 #      the exact sid.
 #   6. --continue + stale pin (no jsonl) → pin retained; fresh-spawn
@@ -46,6 +52,16 @@ PASS=0
 FAIL=0
 fail() { echo "FAIL: $*" >&2; FAIL=$(( FAIL + 1 )); }
 pass() { echo "ok:   $*"; PASS=$(( PASS + 1 )); }
+
+# Truncation sentinel. `run_entry` ends with `set -e` (it brackets the entry.sh
+# invocation in `set +e` / `set -e`), so from the first case onward ANY
+# top-level command returning non-zero aborts the script — mid-suite, with no
+# summary and **exit 0**. A half-run that exits green is worse than a failing
+# one: nothing downstream can tell it apart from a pass. Found by a mutant that
+# made a `ls …archived.*` probe fail and silently truncated the suite after
+# case 4d. The trap converts that class into a loud failure.
+_SUITE_COMPLETED=0
+trap '(( _SUITE_COMPLETED == 1 )) || { echo "FAIL: SUITE TRUNCATED — aborted after $(( PASS + FAIL )) assertions without reaching the summary (a non-zero command under the set -e that run_entry leaves enabled). Exit code forced non-zero." >&2; exit 1; }' EXIT
 
 # --- shared fixture builder ----------------------------------------------
 
@@ -206,10 +222,40 @@ case "$1" in
         esac
         ;;
     list-panes)
-        # Serve a canned pane table (pane_id|pane_pid|window_id|
-        # window_name) for the peer-cockpit scan; absent file → no
-        # panes (the scan finds nothing and fails open).
-        cat "$state/tmux-panes.txt" 2>/dev/null
+        # Canned pane table, one row per pane, pipe-separated:
+        #   pane_id|pane_pid|window_id|window_name[|pane_dead]
+        # The 5th field is optional and defaults to 0, so the pre-existing
+        # 4-field fixtures (the peer-cockpit scan) are unchanged.
+        #
+        # Rendered THROUGH the requested `-F` format rather than dumped
+        # verbatim: entry.sh's liveness probe asks for a different field
+        # order (`#{window_name}|#{pane_dead}|#{pane_pid}`), and a stub that
+        # ignores -F would silently hand it the cockpit scan's layout —
+        # a fixture that answers a question nobody asked. Absent file → no
+        # panes (callers fail open).
+        fmt=""
+        shift
+        while (( $# > 0 )); do
+            case "$1" in
+                -F) fmt="$2"; shift 2 ;;
+                *)  shift ;;
+            esac
+        done
+        [[ -f "$state/tmux-panes.txt" ]] || exit 0
+        while IFS='|' read -r p_id p_pid w_id w_name p_dead; do
+            [[ -n "$p_id" ]] || continue
+            if [[ -z "$fmt" ]]; then
+                printf '%s|%s|%s|%s\n' "$p_id" "$p_pid" "$w_id" "$w_name"
+                continue
+            fi
+            line="$fmt"
+            line="${line//'#{pane_id}'/$p_id}"
+            line="${line//'#{pane_pid}'/$p_pid}"
+            line="${line//'#{window_id}'/$w_id}"
+            line="${line//'#{window_name}'/$w_name}"
+            line="${line//'#{pane_dead}'/${p_dead:-0}}"
+            printf '%s\n' "$line"
+        done < "$state/tmux-panes.txt"
         ;;
     *) ;;  # ignore anything else (set-window-option, select-window, …)
 esac
@@ -392,6 +438,291 @@ if (( ENTRY_RC == 0 )) \
     pass "cold start without pin: no archive attempted, stack up + cockpit still run"
 else
     fail "cold start no-pin: rc=$ENTRY_RC svc='$ENTRY_SVC_LOG' err='$ENTRY_ERR'"
+fi
+rm -rf "$ROOT"
+
+# --- 4b: cold start hands the WORKER walk a fresh boot-intent -------------
+# your-org/nexus-code#651. The pin above governs the orchestrator and
+# nothing else; the worker agents are resurrected by bootstrap-recover's
+# own walk, which runs after entry.sh has exited. The boot-intent file is
+# how the operator's flag reaches it — and it must be written BEFORE
+# `svc.sh up`, or the walk it is meant to govern has already happened.
+
+ROOT=$(make_fixture)
+PRESEED_WINDOWS="some-other-window" run_entry "$ROOT"
+intent="$ROOT/monitor/.state/boot-intent"
+if (( ENTRY_RC == 0 )) \
+   && [[ -f "$intent" ]] \
+   && grep -qx 'mode=fresh' "$intent" \
+   && grep -qE '^ts=[0-9]+$' "$intent" \
+   && grep -qx 'source=entry.sh' "$intent" \
+   && [[ "$ENTRY_ERR" == *"NO worker agent will be resumed"* ]]; then
+    pass "cold start: boot-intent written as mode=fresh with a timestamp (worker walk told to resurrect nothing)"
+else
+    fail "cold-start boot-intent: rc=$ENTRY_RC intent='$(cat "$intent" 2>/dev/null)' err='$ENTRY_ERR'"
+fi
+# Ordering: the intent must predate the bring-up it governs. The svc.sh
+# stub records each call, so an intent that exists by the time `up` ran
+# is provable rather than assumed.
+if [[ -f "$intent" ]] && [[ "$ENTRY_SVC_LOG" == *"svc.sh called: up"* ]] \
+   && [[ "$(stat -c '%Y' "$intent")" -le "$(stat -c '%Y' "$ENTRY_STATE_DIR/svc-log.txt")" ]]; then
+    pass "cold start: boot-intent written BEFORE svc.sh up (the walk it governs cannot outrun it)"
+else
+    fail "boot-intent ordering vs svc.sh up"
+fi
+rm -rf "$ROOT"
+
+# --- 4c: --continue hands over mode=continue ------------------------------
+
+ROOT=$(make_fixture)
+PRESEED_WINDOWS="some-other-window" run_entry "$ROOT" --continue
+intent="$ROOT/monitor/.state/boot-intent"
+if (( ENTRY_RC == 0 )) \
+   && [[ -f "$intent" ]] \
+   && grep -qx 'mode=continue' "$intent" \
+   && [[ "$ENTRY_ERR" == *"will be resumed by the stack bring-up"* ]]; then
+    pass "--continue: boot-intent written as mode=continue (prior workers resumed)"
+else
+    fail "--continue boot-intent: rc=$ENTRY_RC intent='$(cat "$intent" 2>/dev/null)' err='$ENTRY_ERR'"
+fi
+rm -rf "$ROOT"
+
+# --- 4d: live orchestrator → no boot-intent written -----------------------
+# Re-running ./watcher against a live orchestrator is an idempotent
+# bring-up, not a boot. Writing mode=fresh here would tear the worker
+# board out from under a running supervisor — a destructive reading of a
+# no-op. Mirrors the pin, which is likewise left untouched in this branch.
+
+ROOT=$(make_fixture)
+PRESEED_WINDOWS=$'shell\norchestrator' run_entry "$ROOT"
+intent="$ROOT/monitor/.state/boot-intent"
+if (( ENTRY_RC == 0 )) \
+   && [[ ! -f "$intent" ]] \
+   && [[ "$ENTRY_ERR" == *"worker resume behaviour unchanged"* ]]; then
+    pass "live orchestrator: NO boot-intent written (idempotent bring-up never drops a live worker board)"
+else
+    fail "live-orch boot-intent: rc=$ENTRY_RC intent='$(cat "$intent" 2>/dev/null)' err='$ENTRY_ERR'"
+fi
+rm -rf "$ROOT"
+
+# --- 4e: a `remain-on-exit` CORPSE window is a boot, not a live stack ------
+# your-org/nexus-code#651 skeptic, finding 1 — the blocking one. `_respawn.sh`
+# sets `remain-on-exit on`, so a claude that segfaults / OOMs / is `/exit`ed
+# leaves its window LISTED with a dead pane. Deciding "is this a boot?" from
+# the window NAME therefore took the already-alive branch in the commonest
+# crash shape: no boot-intent written, whole board resurrected, escape hatch
+# inoperative exactly when the operator reaches for it. Same class as `#643`
+# (a pane's rendered existence mistaken for liveness).
+#
+# Two panes deliberately: the corpse AND an unrelated live window, so the test
+# fails if the probe merely asks "are any panes dead anywhere".
+
+#
+# THE FIXTURE IS THE TEST. An earlier version pinned the corpse pane to
+# `pane_pid=1` and appeared to pin the `pane_dead` guard — but only on this
+# host, where pid 1 is `bwrap` with `/home/operator/.claude` in its argv 28 times.
+# On CI (pid 1 = init/systemd, no `claude`, and `kill -0 1` EPERMs) deleting
+# the guard changed nothing and the mutant SURVIVED: a test passing for an
+# environment-specific accident, which is worse than no test because it reads
+# as evidence. Never build a fixture on a pid you do not control.
+#
+# The discriminating shape is not the obvious one — a non-claude pid passes
+# either way, because the tree walk also says "no agent". What isolates the
+# guard is a DEAD pane whose pid DOES resolve to a claude-named process (the
+# pid-reuse / lingering-child shape that makes `pane_dead` load-bearing):
+# with the guard, dead wins and this is a boot; without it, the tree walk
+# finds an agent and calls it alive.
+ROOT=$(make_fixture)
+PIN_SID="7234e315-5847-480c-a3d8-71478c6dc271"
+printf '%s\n' "$PIN_SID" > "$ROOT/monitor/.state/orchestrator-session-id"
+setsid bash -c 'exec -a claude-corpse-pid sleep 30' >/dev/null 2>&1 &
+CORPSE_PID=$!
+setsid bash -c 'exec -a plain-shell-fixture sleep 30' >/dev/null 2>&1 &
+OTHER_PID=$!
+sleep 0.3
+PRESEED_WINDOWS=$'shell\norchestrator' \
+PRESEED_PANES="%9|$OTHER_PID|@1|shell|0"$'\n'"%8|$CORPSE_PID|@2|orchestrator|1" \
+    run_entry "$ROOT"
+intent="$ROOT/monitor/.state/boot-intent"
+# `|| true`: run_entry leaves errexit ON, and this glob legitimately matches
+# nothing when the code under test misbehaves. Without the guard a REGRESSION
+# aborts the whole suite here instead of reporting — which is exactly how a
+# mutant truncated this file at case 4d and still exited 0.
+archived=$(ls "$ROOT/monitor/.state/"orchestrator-session-id.archived.* 2>/dev/null | head -1 || true)
+if (( ENTRY_RC == 0 )) \
+   && [[ -f "$intent" ]] && grep -qx 'mode=fresh' "$intent" \
+   && [[ "$ENTRY_ERR" == *"holds NO live agent"* ]] \
+   && [[ "$ENTRY_ERR" == *"NO worker agent will be resumed"* ]]; then
+    pass "dead-pane corpse window: treated as a BOOT — fresh boot-intent written (escape hatch works in the commonest crash shape)"
+else
+    fail "corpse-window intent: rc=$ENTRY_RC intent='$(cat "$intent" 2>/dev/null)' err='$ENTRY_ERR'"
+fi
+# "Is this a boot?" is one question: the pin follows the same answer, or the
+# operator gets a fresh worker board under a resumed orchestrator session.
+if [[ ! -f "$ROOT/monitor/.state/orchestrator-session-id" ]] \
+   && [[ -n "$archived" ]] \
+   && [[ "$(tr -d '[:space:]' < "$archived")" == "$PIN_SID" ]]; then
+    pass "dead-pane corpse window: the session pin follows the same verdict (archived, content intact)"
+else
+    fail "corpse-window pin: archived='$archived' still=$([[ -f "$ROOT/monitor/.state/orchestrator-session-id" ]] && echo yes || echo no)"
+fi
+for _p in "$CORPSE_PID" "$OTHER_PID"; do
+    if kill -0 "$_p" 2>/dev/null \
+       && grep -qE 'claude-corpse-pid|plain-shell-fixture' \
+          <<<"$(tr '\0' ' ' < "/proc/$_p/cmdline" 2>/dev/null)"; then
+        kill "$_p" 2>/dev/null
+    fi
+done
+rm -rf "$ROOT"
+
+# --- 4f: a LIVE claude in the pane tree still suppresses the intent --------
+# The converse, and the one that protects a running board: a pane that is NOT
+# dead and has a live `claude` in its process tree must still read as alive.
+# Uses a real process whose argv contains `claude`, so the probe's /proc walk
+# is genuinely exercised rather than short-circuited.
+
+ROOT=$(make_fixture)
+setsid bash -c 'exec -a claude-fixture sleep 30' >/dev/null 2>&1 &
+LIVE_PID=$!
+sleep 0.3
+PRESEED_WINDOWS=$'shell\norchestrator' \
+PRESEED_PANES="%9|1|@1|shell|0"$'\n'"%8|$LIVE_PID|@2|orchestrator|0" \
+    run_entry "$ROOT"
+intent="$ROOT/monitor/.state/boot-intent"
+if (( ENTRY_RC == 0 )) \
+   && [[ ! -f "$intent" ]] \
+   && [[ "$ENTRY_ERR" != *"holds NO live agent"* ]] \
+   && [[ "$ENTRY_ERR" == *"already alive"* ]]; then
+    pass "live claude in the pane tree: NO intent written (a running board is never torn down by an idempotent bring-up)"
+else
+    fail "live-pane: rc=$ENTRY_RC intent='$(cat "$intent" 2>/dev/null)' err='$ENTRY_ERR'"
+fi
+# Identity-checked kill: after a PID-space wrap a blind kill would signal
+# whatever innocent process recycled the number.
+if kill -0 "$LIVE_PID" 2>/dev/null \
+   && grep -q claude-fixture \
+      <<<"$(tr '\0' ' ' < "/proc/$LIVE_PID/cmdline" 2>/dev/null)"; then
+    kill "$LIVE_PID" 2>/dev/null
+fi
+rm -rf "$ROOT"
+
+# --- 4i: pane ALIVE but no agent in its process tree → still a boot -------
+# The other half of the liveness test, and a distinct line from 4f. A mutant
+# that bypassed the process-tree check entirely (`_pid_tree_has_claude … &&
+# return 0` → bare `return 0`) SURVIVED with only 4f present, because 4f's pane
+# genuinely does host a claude — it passes either way. What discriminates is a
+# pane that is NOT dead and hosts NO agent: a plain shell left in the window, a
+# launcher whose claude exited without remain-on-exit, an operator shell that
+# happens to carry the name. There is no orchestrator there, so a default
+# `./watcher` is a boot.
+
+ROOT=$(make_fixture)
+setsid bash -c 'exec -a not-an-agent sleep 30' >/dev/null 2>&1 &
+BARE_PID=$!
+sleep 0.3
+PRESEED_WINDOWS=$'shell\norchestrator' \
+PRESEED_PANES="%9|1|@1|shell|0"$'\n'"%8|$BARE_PID|@2|orchestrator|0" \
+    run_entry "$ROOT"
+intent="$ROOT/monitor/.state/boot-intent"
+if (( ENTRY_RC == 0 )) \
+   && [[ -f "$intent" ]] && grep -qx 'mode=fresh' "$intent" \
+   && [[ "$ENTRY_ERR" == *"holds NO live agent"* ]]; then
+    pass "live pane hosting NO claude: treated as a BOOT (pane liveness alone is not agent liveness)"
+else
+    fail "bare-pane: rc=$ENTRY_RC intent='$(cat "$intent" 2>/dev/null)' err='$ENTRY_ERR'"
+fi
+if kill -0 "$BARE_PID" 2>/dev/null \
+   && grep -q not-an-agent \
+      <<<"$(tr '\0' ' ' < "/proc/$BARE_PID/cmdline" 2>/dev/null)"; then
+    kill "$BARE_PID" 2>/dev/null
+fi
+rm -rf "$ROOT"
+
+# --- 4j: a respawn in flight is ALIVE, not dead --------------------------
+# your-org/nexus-code#651 skeptic r2, finding 4. Between `tmux new-window` and
+# the launcher's `exec claude` the orchestrator pane is alive and hosts NO
+# claude — measured at ~1.7 s on this host, dominated by
+# `assert-shims-wrapped.sh` (~2.2 s). A bare claude-in-the-tree test calls that
+# DEAD, so `./watcher` would archive the pin and declare a boot mid-respawn.
+#
+# Bounded (nothing is killed) but NOT rare: the trigger is correlated, not
+# independent — the operator reaches for `./watcher` precisely when the
+# orchestrator has just died, which is precisely when the watcher is respawning
+# it. `_nexus_pid_is_spawning_agent` recognises the launcher by name, which
+# closes the window exactly and with no polling: `exec` is atomic, so there is
+# no gap between "launcher running" and "claude running".
+
+ROOT=$(make_fixture)
+LAUNCHER="$ROOT/nexus-respawn-launch-fixture.sh"
+printf '#!/usr/bin/env bash\nsleep 30\n' > "$LAUNCHER"
+chmod +x "$LAUNCHER"
+setsid bash "$LAUNCHER" >/dev/null 2>&1 &
+SPAWNING_PID=$!
+sleep 0.3
+PRESEED_WINDOWS=$'shell\norchestrator' \
+PRESEED_PANES="%8|$SPAWNING_PID|@2|orchestrator|0" \
+    run_entry "$ROOT"
+intent="$ROOT/monitor/.state/boot-intent"
+if (( ENTRY_RC == 0 )) && [[ ! -f "$intent" ]] \
+   && [[ "$ENTRY_ERR" != *"holds NO live agent"* ]]; then
+    pass "respawn in flight (launcher running, claude not yet exec'd): reads as ALIVE — no false boot mid-respawn"
+else
+    fail "respawn-race: rc=$ENTRY_RC intent='$(cat "$intent" 2>/dev/null)' err='$ENTRY_ERR'"
+fi
+if kill -0 "$SPAWNING_PID" 2>/dev/null \
+   && grep -q nexus-respawn-launch \
+      <<<"$(tr '\0' ' ' < "/proc/$SPAWNING_PID/cmdline" 2>/dev/null)"; then
+    kill "$SPAWNING_PID" 2>/dev/null
+fi
+rm -rf "$ROOT"
+
+# --- 4g: undeterminable liveness reads as ALIVE (fail-safe direction) ------
+# No pane rows at all for a window we know exists — tmux too old for the
+# format, a racing kill, a stub that answers nothing. A false "dead" tears
+# down a live worker board; a false "alive" only declines to, and the
+# operator can re-run. The default must be ALIVE, and it must be asserted,
+# because it is the arm nobody exercises by accident.
+
+ROOT=$(make_fixture)
+PRESEED_WINDOWS=$'shell\norchestrator' run_entry "$ROOT"   # no PRESEED_PANES
+intent="$ROOT/monitor/.state/boot-intent"
+if (( ENTRY_RC == 0 )) && [[ ! -f "$intent" ]] \
+   && [[ "$ENTRY_ERR" == *"already alive"* ]]; then
+    pass "undeterminable liveness (NO pane rows at all): reads as ALIVE — never drops a board it cannot prove is dead"
+else
+    fail "undeterminable liveness: rc=$ENTRY_RC intent='$(cat "$intent" 2>/dev/null)' err='$ENTRY_ERR'"
+fi
+rm -rf "$ROOT"
+
+# --- 4h: pane rows exist but NONE for the target → still ALIVE ------------
+# The SAME fail-safe arm as 4g (`(( saw == 1 )) || return 0`), reached by a
+# different INPUT SHAPE — not a distinct line, and the comment here used to
+# claim otherwise. The probe once carried a separate `[[ -n "$rows" ]] ||
+# return 0` early return that 4g was said to pin; deleting that line reddened
+# NOTHING, because an empty `$rows` still yields one non-matching iteration and
+# falls through to this same arm. It was behaviourally redundant and has been
+# removed (your-org/nexus-code#651 skeptic r2, finding 3).
+#
+# Both cases stay: two input shapes into one fail-safe is worth having, and
+# 4g is the shape a caller is most likely to hit. The accounting is what was
+# wrong, not the coverage — and mis-stated coverage is exactly the failure
+# this PR keeps re-learning.
+#
+# Shape here: tmux reports panes, but none belongs to the orchestrator window —
+# a racing kill, a format the running tmux renders differently, a window whose
+# panes tmux declined to list. We cannot judge, so we must not drop.
+
+ROOT=$(make_fixture)
+PRESEED_WINDOWS=$'shell\norchestrator' \
+PRESEED_PANES='%9|1|@1|shell|0' \
+    run_entry "$ROOT"
+intent="$ROOT/monitor/.state/boot-intent"
+if (( ENTRY_RC == 0 )) && [[ ! -f "$intent" ]] \
+   && [[ "$ENTRY_ERR" == *"already alive"* ]] \
+   && [[ "$ENTRY_ERR" != *"holds NO live agent"* ]]; then
+    pass "pane rows exist but none for the target window: reads as ALIVE (the second fail-safe arm, distinct from 4g)"
+else
+    fail "saw-arm: rc=$ENTRY_RC intent='$(cat "$intent" 2>/dev/null)' err='$ENTRY_ERR'"
 fi
 rm -rf "$ROOT"
 
@@ -592,6 +923,9 @@ rm -rf "$ROOT"
 
 # --- summary --------------------------------------------------------------
 
+# Reaching here is what makes the run legitimate; the EXIT trap turns anything
+# short of it into a loud non-zero.
+_SUITE_COMPLETED=1
 echo
 echo "passed=$PASS failed=$FAIL"
 (( FAIL == 0 ))

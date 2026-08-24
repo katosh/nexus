@@ -61,7 +61,7 @@ SID="0f9c1a2b-3d4e-5f60-8712-9a3b4c5d6e7f"
 # that has nothing to do with the code under test. Skip loudly instead.
 if ! /usr/bin/python3 -c 'import yaml' 2>/dev/null; then
     echo "skipped: /usr/bin/python3 lacks pyyaml (config/load.sh cannot resolve keys)"
-    exit 0
+    exit 77   # SKIP, not PASS (your-org/nexus-code#568 A6)
 fi
 
 # ---- fixtures -------------------------------------------------------------

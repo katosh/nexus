@@ -2,47 +2,170 @@ name: tests
 
 on:
   pull_request:
+    # `types:` includes `edited` for ONE reason: retargeting a PR's base emits
+    # only the `edited` event — never `synchronize` — so with the default
+    # types a PR moved off a feature branch onto `dev` does NOT re-run CI, and
+    # keeps whatever verdict (often none at all) it had on the old base. That
+    # is the compounding half of <your-org>/nexus-code#604: the remedy for the
+    # trigger gap silently failed to trigger. Every job below is gated on
+    # `edited` ⇒ the BASE changed, so title/body edits cost no runner minutes.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
     branches: [main, dev]
     paths:
       - 'monitor/**'
       - 'config/**'
-      - '.github/workflows/tests.yml'
+      # EVERY workflow file, not just this one (<your-org>/nexus-code#736). The
+      # suite now EXECUTES the workflow corpus as a fixture:
+      # test-lint-workflows.sh lints every file in this
+      # directory for the #628 meta-edit-eviction property and mutates the real
+      # files to prove the lint still watches them. Under the old
+      # `.github/workflows/tests.yml` filter that guard was BLIND TO THE FILES
+      # IT GUARDS — a PR editing only cc-harness.yml or docs.yml matched no
+      # `paths:` here, so the property went unchecked on exactly the PRs that
+      # can break it. Same reasoning as the CLAUDE.md line below, and the same
+      # reasoning that left #736 undetected for as long as it was: the rule was
+      # applied to the file someone happened to touch.
+      - '.github/workflows/**'
+      # CLAUDE.md is EXECUTED by this suite, not merely read:
+      # test-claude-md-618-remedies.sh runs every ignore-file-blind search
+      # form CLAUDE.md recommends against a planted fixture, so the doc's
+      # fenced remedy block is a tested surface. Seven suites read the file.
+      # Without this path the guard is BLIND TO THE FILE IT GUARDS — a
+      # CLAUDE.md edit that breaks a documented remedy produces no run at
+      # all, and `gh pr checks` shows only the by-construction-green
+      # ci-signal, which reads identically to "all checks passed" (#604).
+      # Found by ci-trigger-audit.py on the PR that added this line: it
+      # reported "gating workflows for this PR: NONE".
+      - 'CLAUDE.md'
+      # skills/** for the SAME reason as CLAUDE.md above (<your-org>/nexus-code#835).
+      # test-spawn-worker.sh EXECUTES skills/nexus.worker-defaults/SKILL.md as a
+      # fixture — it extracts the `## Worker floor` body and asserts its content,
+      # because that body is injected verbatim into every worker prompt. Without
+      # this path the guard is BLIND TO THE FILE IT GUARDS: a PR that edits ONLY
+      # the floor — the highest-blast-radius edit in the repo, reaching every
+      # future worker — matches no `paths:` here and runs NO tests at all, while
+      # `gh pr checks` shows the by-construction-green ci-signal and reads as
+      # "all checks passed" (#604). Same class as #736; found while adding the
+      # floor's own force-push assertions, which were themselves unreachable.
+      - 'skills/**'
   push:
     branches: [main, dev]
     paths:
       - 'monitor/**'
       - 'config/**'
-      - '.github/workflows/tests.yml'
+      # EVERY workflow file, not just this one (<your-org>/nexus-code#736). The
+      # suite now EXECUTES the workflow corpus as a fixture:
+      # test-lint-workflows.sh lints every file in this
+      # directory for the #628 meta-edit-eviction property and mutates the real
+      # files to prove the lint still watches them. Under the old
+      # `.github/workflows/tests.yml` filter that guard was BLIND TO THE FILES
+      # IT GUARDS — a PR editing only cc-harness.yml or docs.yml matched no
+      # `paths:` here, so the property went unchecked on exactly the PRs that
+      # can break it. Same reasoning as the CLAUDE.md line below, and the same
+      # reasoning that left #736 undetected for as long as it was: the rule was
+      # applied to the file someone happened to touch.
+      - '.github/workflows/**'
+      # CLAUDE.md is EXECUTED by this suite, not merely read:
+      # test-claude-md-618-remedies.sh runs every ignore-file-blind search
+      # form CLAUDE.md recommends against a planted fixture, so the doc's
+      # fenced remedy block is a tested surface. Seven suites read the file.
+      # Without this path the guard is BLIND TO THE FILE IT GUARDS — a
+      # CLAUDE.md edit that breaks a documented remedy produces no run at
+      # all, and `gh pr checks` shows only the by-construction-green
+      # ci-signal, which reads identically to "all checks passed" (#604).
+      # Found by ci-trigger-audit.py on the PR that added this line: it
+      # reported "gating workflows for this PR: NONE".
+      - 'CLAUDE.md'
+      # skills/** for the SAME reason as CLAUDE.md above (<your-org>/nexus-code#835).
+      # test-spawn-worker.sh EXECUTES skills/nexus.worker-defaults/SKILL.md as a
+      # fixture — it extracts the `## Worker floor` body and asserts its content,
+      # because that body is injected verbatim into every worker prompt. Without
+      # this path the guard is BLIND TO THE FILE IT GUARDS: a PR that edits ONLY
+      # the floor — the highest-blast-radius edit in the repo, reaching every
+      # future worker — matches no `paths:` here and runs NO tests at all, while
+      # `gh pr checks` shows the by-construction-green ci-signal and reads as
+      # "all checks passed" (#604). Same class as #736; found while adding the
+      # floor's own force-push assertions, which were themselves unreachable.
+      - 'skills/**'
   workflow_dispatch:
 
-# Cancel queued runs on the same ref when a new push lands; an
-# in-progress run keeps going so its pass/fail signal is preserved.
+# Supersede an older run on the same ref when a newer event of the SAME class
+# lands — `cancel-in-progress: true` cancels the in-progress run, it does not
+# spare it (<your-org>/nexus-code#628: the previous comment claimed the opposite,
+# and nothing checked the claim). The class is in the group key, and it is
+# load-bearing: a run whose jobs SKIP (a pure title/body edit) MUST NOT share a
+# group with a run whose jobs RUN, or the cheap skip-run evicts the expensive
+# real run and the head is left with cancelled+skipped and zero test evidence —
+# the exact #627 hole.
+#
+# The `-meta` predicate must mirror the job-level skip condition EXACTLY, or it
+# re-instantiates the very hole it closes. A base RETARGET is also an `edited`
+# event — but per #604 its jobs RUN (the job `if:` keys on
+# `changes.base.ref.from`), so it is NOT cheap and belongs in `-code`. Keying
+# `-meta` on `action == 'edited'` alone would drop a job-executing retarget into
+# `-meta` next to title-edit skip-runs, and a title edit landing mid-retarget
+# would cancel it → cancelled(retarget)+skipped(title-edit), #627 reborn inside
+# `-meta` (caught by <your-org>/nexus-code#628's skeptic). So `-meta` fires ONLY
+# for a PR `edited` with NO base change — the exact set of runs whose jobs skip.
+# Everything whose jobs run — `synchronize`/`push`/reopen/ready_for_review,
+# dispatch (empty `action`), AND a base-retarget `edited` — lands in `-code` and
+# supersedes there. Job `if:` skips iff (pull_request && edited && !base.ref.from);
+# this key must stay its negation. That closes #627's cancelled+skipped form —
+# both the synchronize and the base-retarget sub-case — AT SOURCE; ci-signal's
+# verdict invariant remains the backstop for the forms this cannot reach (a run
+# absent entirely, or a terminal non-verdict).
 concurrency:
-  group: tests-${{ github.ref }}
+  group: tests-${{ github.ref }}-${{ (github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.base.ref.from) && 'meta' || 'code' }}
   cancel-in-progress: true
 
 jobs:
-  watcher-tests:
-    name: monitor/watcher unit suite
+  # ---------------------------------------------------------------------------
+  # Cheap gate: syntax-check every shell file once, before spending minutes on
+  # the matrix. Split out of the suite job so it is not paid N times over.
+  # ---------------------------------------------------------------------------
+  syntax:
+    name: bash -n (all monitor/ shell)
+    # Run unless this is a title/body-only `edited` event. `changes.base` is
+    # present in the payload ONLY when the base branch changed, so the bare
+    # (truthiness) test is true exactly when the retarget happened: a branch
+    # name is a non-empty string, an absent property is null. Written as
+    # truthiness rather than `!= ''` on purpose — GitHub's loose equality
+    # casts ACROSS types to number, and `'dev' != ''` vs `null != ''` would
+    # then depend on rules that are easy to misremember. See the `types:`
+    # note above. If this ever evaluates wrongly it fails LOUD, not silent:
+    # a skipped run is not counted as signal by ci-signal.yml, which then
+    # reports MISSING-RUN.
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
 
-      - name: install runtime deps (jq + tmux + zsh)
-        # ubuntu-latest ships bash + curl + openssl + jq + gh by default;
-        # tmux is needed because several tests install a real tmux shim
-        # on PATH for `command -v tmux` to succeed (see test-lib.sh and
-        # test-full-state-suppression.sh). zsh is needed so the zsh spawn-shell
-        # half of test-spawn-pathfront.sh actually runs (it auto-skips when zsh
-        # is absent, which on a bare runner would silently drop that coverage).
+      - name: assert CI's bash matches monitor/ci-bash-version
+        # <your-org>/nexus-code#610. A local run declares which interpreter it
+        # did NOT test by reading monitor/ci-bash-version. A declaration
+        # nobody checks becomes a lie the first time GitHub bumps its runner
+        # image — silently, and in the direction that makes a local green look
+        # broader than it is. So the pin is asserted against the runner here:
+        # when it drifts, this goes RED and someone updates the pin (and the
+        # local toolchain) deliberately.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends jq tmux zsh
+          set -euo pipefail
+          pin=$(grep -v '^[[:space:]]*#' monitor/ci-bash-version \
+                | grep -v '^[[:space:]]*$' | head -1 | tr -d '[:space:]')
+          got="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+          echo "pinned=$pin runner=$got ($(bash --version | head -1))"
+          if [[ "$pin" != "$got" ]]; then
+            echo "::error::monitor/ci-bash-version says '$pin' but this runner is '$got'."
+            echo "Every local run has been declaring a coverage boundary against the wrong"
+            echo "version. Update monitor/ci-bash-version to '$got', add the upstream"
+            echo "sha256 for the matching tarball to monitor/toolchain-bash.sh sha_for(),"
+            echo "and rebuild the local toolchain."
+            exit 1
+          fi
+          echo "OK — the coverage-boundary declaration local runs print is truthful."
 
       - name: syntax check (bash -n) on every shell file under monitor/
-        # Catches accidental syntax breakage cheaply before we spend
-        # minutes running the suite.
         run: |
           set -e
           shopt -s globstar nullglob
@@ -56,81 +179,129 @@ jobs:
           done
           exit $fail
 
+  # ---------------------------------------------------------------------------
+  # Fast unit band, now a MATRIX over the two environment axes that used to be
+  # single-valued (<your-org>/nexus-code#557/#558 and the #555 login-shell RCA):
+  #
+  #   * jobs  — parallelism. #558 (jupyter-service) failed DETERMINISTICALLY at
+  #     `--jobs 4` and passed at `--jobs 2`; a suite that only ever ran at 2
+  #     could not have caught it. The deadline-class fixes are only meaningful
+  #     if CI actually oversubscribes, so 4 is now a first-class cell.
+  #   * login_shell — the SHELL the fixtures' tmux panes inherit. #555's root
+  #     cause was fixtures built from the operator's LOGIN shell (zsh) running
+  #     its whole rc chain before the stub rendered. CI installed zsh but never
+  #     ran the suite with SHELL=zsh, so the fix was regression-guarded only by
+  #     assumption. Setting SHELL drives tmux's default-shell derivation — the
+  #     exact #555 surface — so a fixture that ever forgot to pin its shell
+  #     (th_tmux_fixture_conf) would surface here, under load, as a timeout.
+  #
+  # The cross-product is 4; the `include` list trims it to the 3 cells that
+  # each add signal (bash@2 = today's baseline; bash@4 = deadline class;
+  # zsh@4 = login-shell axis under the same load), keeping runner minutes
+  # proportional to the coverage gained.
+  # ---------------------------------------------------------------------------
+  unit:
+    name: unit suite (${{ matrix.login_shell }}, jobs ${{ matrix.jobs }})
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - login_shell: bash
+            jobs: 2
+          - login_shell: bash
+            jobs: 4
+          - login_shell: zsh
+            jobs: 4
+    env:
+      # tmux derives an unpinned pane's shell from $SHELL (<your-org>/nexus-code
+      # #555). Pointing it at the matrix shell exercises the login-shell axis
+      # for every fixture that does NOT pin its own (the ones that DO, via
+      # th_tmux_fixture_conf, must stay immune — that is what this proves).
+      MATRIX_SHELL: ${{ matrix.login_shell }}
+      # th_deadline scales polled deadlines by ceil(NEXUS_TEST_JOBS / nproc).
+      # ubuntu-latest is 2-vCPU, so the `jobs: 2` matrix cell computes
+      # ceil(2/2) = 1 and gets NO scaling at all — identical to passing no
+      # `--jobs`, and the same inertness #749 found in the SLOW band. Only the
+      # `jobs: 4` cell was ever protected. Stated explicitly so both cells are,
+      # and so the value does not silently depend on the runner's core count.
+      # Enforced by lint-workflows.py TD001 (<your-org>/nexus-code#751).
+      NEXUS_TEST_DEADLINE_SCALE: 2
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: install runtime deps (jq + tmux + zsh)
+        # ubuntu-latest ships bash + curl + openssl + jq + gh by default;
+        # tmux is needed because several tests install a real tmux shim on
+        # PATH for `command -v tmux` to succeed. zsh is needed both for the
+        # zsh spawn-shell half of test-spawn-pathfront.sh AND, now, as the
+        # login shell for the zsh matrix cell.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq tmux zsh
+
+      - name: resolve SHELL for the login-shell axis
+        # Export SHELL for every subsequent step so tmux fixtures inherit it.
+        run: |
+          set -euo pipefail
+          case "$MATRIX_SHELL" in
+            zsh)  sh_path=$(command -v zsh) ;;
+            bash) sh_path=$(command -v bash) ;;
+            *)    echo "::error::unknown login_shell '$MATRIX_SHELL'"; exit 1 ;;
+          esac
+          echo "SHELL=$sh_path" >> "$GITHUB_ENV"
+          echo "using SHELL=$sh_path for the fixture login-shell axis"
+
       - name: run unit suite
-        # The runner auto-skips:
-        #   - slow tests (require SLOW_TESTS=1)
-        #   - integration tests under test-integration/ (require RUN_INTEGRATION=1)
-        # Per docs/contributing/tests.md "CI" section: the v1 gate is the
-        # fast unit suite only. Slow + integration coverage is a follow-up.
+        # The runner auto-skips slow (SLOW_TESTS=1) and integration
+        # (RUN_INTEGRATION=1) tests — those get their own coverage in the
+        # tmux-matrix job here and, systemically, in the scheduled full-suite
+        # job proposed in the coverage-gap issue. This band is the fast unit
+        # suite, now run at the matrix's parallelism and login shell.
         id: unit_suite
+        env:
+          NEXUS_TEST_JOBS: ${{ matrix.jobs }}
         run: |
           set -uo pipefail
           # Both directories. `monitor/` holds the suites for the NON-watcher
-          # scripts — test-retire-preflight.sh, test-interactive-sessions.sh,
-          # and the #507/#484 regression suites. This step discovered only
-          # monitor/watcher/ and handed the result to run-tests.sh as EXPLICIT
-          # paths, which override the runner's own glob — so those four ran
-          # nowhere, and green here meant "the tests I happened to look for
-          # passed" (<your-org>/nexus-code#484). `-maxdepth 1` applies per root,
-          # so `monitor` contributes only its direct children, not watcher's.
+          # scripts; `-maxdepth 1` applies per root so `monitor` contributes
+          # only its direct children, not watcher's (<your-org>/nexus-code#484 —
+          # discovering only monitor/watcher/ once meant those four ran
+          # nowhere and green meant "the tests I happened to look for passed").
           mapfile -t tests < <(find monitor monitor/watcher -maxdepth 1 -name 'test-*.sh' -type f | sort)
           if (( ${#tests[@]} == 0 )); then
             echo "::error::no tests selected — refusing to report green on an empty run"
             exit 1
           fi
-          echo "Discovered ${#tests[@]} tests."
+          echo "Discovered ${#tests[@]} tests. SHELL=$SHELL jobs=${{ matrix.jobs }}"
           echo
-          # --keep-logs: persist every test's first-run stdout/stderr
-          # into the failure-artifact tree. The collect step's serial
-          # re-run often PASSES a test that flaked under --jobs
-          # parallelism, so without these logs the original failing
-          # assertion is unrecoverable from CI.
-          bash monitor/watcher/run-tests.sh --jobs 2 \
+          bash monitor/watcher/run-tests.sh --jobs ${{ matrix.jobs }} \
               --keep-logs "${RUNNER_TEMP}/test-failure-artifacts/first-run-logs" \
               "${tests[@]}"
 
       - name: collect failure artifacts
-        # On failure, re-run each failing test serially with `bash -x`
-        # plus full stderr/stdout capture into a per-test artifact dir.
-        # Also snapshot the env (bash/jq/gh/coreutils versions, locale,
-        # PATH) so post-mortem can attribute ubuntu-latest-only failures.
-        # The runner's own truncated tail goes through xargs and isn't
-        # always orderly — this step is the canonical diagnostic surface.
+        # On failure, re-run each failing test serially with `bash -x` plus
+        # full capture, and snapshot the env for post-mortem attribution.
         if: failure() && steps.unit_suite.outcome == 'failure'
-        # `set +e` is critical: GH Actions wraps every step in
-        # `bash -e`, so the first failing `bash $test_path` would
-        # abort the loop after one iteration. We capture rc manually.
+        # `set +e` is critical: GH Actions wraps every step in `bash -e`, so
+        # the first failing `bash $test_path` would abort the loop after one
+        # iteration. We capture rc manually.
         run: |
           set +e
           set -uo pipefail
           ART_DIR="${RUNNER_TEMP:-/tmp}/test-failure-artifacts"
           mkdir -p "$ART_DIR"
-
-          # Environment snapshot — diff against a local known-good run.
           {
-            echo "=== bash ==="
-            bash --version
-            echo
-            echo "=== jq ==="
-            jq --version
-            echo
-            echo "=== gh ==="
-            gh --version 2>&1 | head -3
-            echo
-            echo "=== tmux ==="
-            tmux -V
-            echo
-            echo "=== coreutils ==="
-            dpkg -l coreutils 2>/dev/null | tail -1
-            echo
-            echo "=== locale ==="
-            locale
-            echo
-            echo "=== uname ==="
-            uname -a
-            echo
-            echo "=== mount-relevant env ==="
-            env | LC_ALL=C sort | grep -Ev '^(GITHUB_TOKEN|SECRET_)' || true
+            echo "=== matrix ==="; echo "login_shell=$MATRIX_SHELL jobs=${{ matrix.jobs }} SHELL=$SHELL"
+            echo; echo "=== bash ==="; bash --version
+            echo; echo "=== jq ==="; jq --version
+            echo; echo "=== tmux ==="; tmux -V
+            echo; echo "=== locale ==="; locale
+            echo; echo "=== uname ==="; uname -a
+            echo; echo "=== nproc ==="; nproc
+            echo; echo "=== env ==="; env | LC_ALL=C sort | grep -Ev '^(GITHUB_TOKEN|SECRET_)' || true
           } > "$ART_DIR/_env.txt" 2>&1 || true
 
           failed_file="${NEXUS_TEST_STATE_DIR:-$HOME/.cache/nexus-test-runner}/last-failures.txt"
@@ -138,48 +309,608 @@ jobs:
             echo "::warning::no failure list at $failed_file — nothing to dump"
             exit 1
           fi
-
           echo "=== re-running failing tests with full output capture ==="
           while IFS= read -r test_path; do
             [ -n "$test_path" ] || continue
-            name=$(basename "$test_path")
-            slot="$ART_DIR/$name"
-            mkdir -p "$slot"
-
-            # Plain re-run: stdout + stderr both captured AND echoed.
-            echo
-            echo "::group::$name — plain re-run"
-            bash "$test_path" \
-                >"$slot/stdout.log" \
-                2>"$slot/stderr.log"
-            rc=$?
-            echo "rc=$rc" > "$slot/rc.txt"
-            echo "--- stdout ---"
-            sed 's/^/  /' "$slot/stdout.log"
-            echo "--- stderr ---"
-            sed 's/^/  /' "$slot/stderr.log"
+            name=$(basename "$test_path"); slot="$ART_DIR/$name"; mkdir -p "$slot"
+            echo; echo "::group::$name — plain re-run"
+            bash "$test_path" >"$slot/stdout.log" 2>"$slot/stderr.log"
+            echo "rc=$?" > "$slot/rc.txt"
+            echo "--- stdout ---"; sed 's/^/  /' "$slot/stdout.log"
+            echo "--- stderr ---"; sed 's/^/  /' "$slot/stderr.log"
             echo "::endgroup::"
-
-            # `bash -x` trace re-run — captures every command for the
-            # subset where assertion logs aren't enough.
             echo "::group::$name — bash -x trace"
             bash -x "$test_path" >"$slot/trace-stdout.log" 2>"$slot/trace-stderr.log" || true
-            # Tail the trace so we don't spam the log with thousands of
-            # set-x lines from passing assertions — the failure is at
-            # the tail.
             echo "--- last 120 lines of trace stderr ---"
             tail -n 120 "$slot/trace-stderr.log" | sed 's/^/  /'
             echo "::endgroup::"
           done < "$failed_file"
-
-          # Re-exit nonzero so the workflow stays red.
           exit 1
 
-      - name: upload failure artifacts
-        if: failure() && steps.unit_suite.outcome == 'failure'
+      - name: upload per-suite logs (on GREEN runs too)
+        # <your-org>/nexus-code#693, proposal item 1. This used to be
+        # `if: failure()`, so a green run discarded every suite's stream and
+        # "which assertions executed" became unrecoverable the moment the job
+        # went green. That is the one direction where the question is actually
+        # asked: closing `#675` needed to know whether its case had executed
+        # non-vacuously in the 8 green `dev` runs since the fix, and grepping a
+        # 624 KB run log for all three of its terminal labels returned 0, 0, 0.
+        #
+        # `--keep-logs` already captures the streams on every run; only the
+        # upload was gated. `!cancelled()` rather than `always()`: a cancelled
+        # run has partial logs whose absence would otherwise read as a finding.
+        # Retention stays 7 days — the question is always asked about a recent
+        # run, and the assertion COUNT now lives in the job summary regardless.
+        if: '!cancelled()'
         uses: actions/upload-artifact@v7
         with:
-          name: test-failure-artifacts-${{ github.run_attempt }}
+          name: test-logs-${{ matrix.login_shell }}-j${{ matrix.jobs }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/test-failure-artifacts/
           if-no-files-found: warn
           retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Clean-env job: the suite with NEXUS_ROOT UNSET.
+  #
+  # A test that references $NEXUS_ROOT bare under `set -u` passes in the
+  # sandbox (where the operator exports it) and aborts on a clean runner where
+  # it is unset — `set -u` kills a fixture heredoc AFTER `>` already truncated
+  # the target, so an emit-body fixture renders EMPTY, hashes to the empty
+  # string, and silently defeats the discriminating assertion (sandbox 32/32,
+  # CI 31/32; <your-org>/nexus-code self-fix skill "sandbox-only test passes").
+  # The other matrix cells run on runners that also lack NEXUS_ROOT, but this
+  # job makes the guarantee EXPLICIT and unmissable, and `env -u` here matches
+  # the documented local repro `env -u NEXUS_ROOT bash test-X.sh`.
+  # ---------------------------------------------------------------------------
+  clean-env:
+    name: unit suite (NEXUS_ROOT unset)
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: install runtime deps (jq + tmux + zsh)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq tmux zsh
+      - name: run unit suite with NEXUS_ROOT and NEXUS_LOCALS unset
+        run: |
+          set -uo pipefail
+          mapfile -t tests < <(find monitor monitor/watcher -maxdepth 1 -name 'test-*.sh' -type f | sort)
+          (( ${#tests[@]} > 0 )) || { echo "::error::no tests selected"; exit 1; }
+          echo "Discovered ${#tests[@]} tests (NEXUS_ROOT/NEXUS_LOCALS scrubbed)."
+          env -u NEXUS_ROOT -u NEXUS_LOCALS \
+            bash monitor/watcher/run-tests.sh --jobs 4 "${tests[@]}"
+
+  # ---------------------------------------------------------------------------
+  # INHERITED-ROOT job: the suite with NEXUS_ROOT EXPORTED — the MIRROR of
+  # clean-env above, and the half CI has never run (<your-org>/nexus-code#655).
+  #
+  # `clean-env` and the three matrix cells all run on runners where NEXUS_ROOT
+  # is unset. That is ONE side of the variable. Every nexus-spawned agent runs
+  # on the OTHER side: monitor/spawn-worker.sh exports NEXUS_ROOT into every
+  # worker process, so the environment a suite meets in the sandbox is the one
+  # CI never reproduced. A suite that leaks the ambient root is therefore green
+  # in CI and red on every developer's machine — the "dev red locally / green
+  # in CI" half of #655, whose first diagnosis blamed the bash 4.4/5.2 boundary
+  # and was refuted (both verdicts obtained from 4.4.20, interpreter held
+  # constant).
+  #
+  # Three suites have been fixed by hand on this variable, each found only
+  # because a human ran the band twice and diffed:
+  #   * test-spawn-worker.sh, test-spawn-worker-resume.sh — an inherited root
+  #     overrode the suite's own FIXTURE root (#706);
+  #   * test-erofs-escalation.sh — no fixture and no mention of NEXUS_ROOT at
+  #     all: it PATH-shadows `sandbox-notify` with a recording stub, and
+  #     monitor/locals-env.sh fronts `$NEXUS_ROOT/monitor/notifywrap` AHEAD of
+  #     that stub, so the real wrapper services the alarm and the stub's log
+  #     stays empty (#708).
+  # The second leak path is why a static "does it build a fixture nexus?" sweep
+  # cannot enumerate this class — that sweep returns 36 files and does not
+  # include the erofs suite. The class has to be enumerated by MEASUREMENT, and
+  # this job is that measurement, run on every push instead of once by hand.
+  #
+  # WHY THE CHECKOUT IS A SUFFICIENT DECOY ROOT. The leak surfaces are the
+  # PATH-front wrapper dirs locals-env.sh prepends, and all three are TRACKED
+  # files present in a bare checkout: monitor/ghwrap/gh,
+  # monitor/notifywrap/sandbox-notify, monitor/pipwrap/pip{,3}. An empty decoy
+  # would make the erofs leak invisible (fronting a nonexistent dir is a no-op);
+  # $GITHUB_WORKSPACE fronts a REAL sandbox-notify, which is exactly the
+  # sandbox's shape. Verified 3x3 before this job was written, on the erofs
+  # suite with its `unset NEXUS_ROOT` scrub reverted:
+  #
+  #     scrub removed, NEXUS_ROOT=<checkout>  ->  FAIL x3  (34-35/36)
+  #     scrub removed, NEXUS_ROOT unset       ->  PASS x3   <- today's CI
+  #     scrub present, NEXUS_ROOT=<checkout>  ->  PASS x3   <- this job, fixed
+  #
+  # The middle row is the point: today's CI cannot fail on this class at all.
+  # ---------------------------------------------------------------------------
+  inherited-root:
+    name: unit suite (NEXUS_ROOT exported — the agent's environment)
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
+    runs-on: ubuntu-latest
+    # 30, not 20: this job now runs the ~250-suite band AND the fixture-band
+    # gate (46 suites, each against a freshly built decoy tree).
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: install runtime deps (jq + tmux + zsh)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq tmux zsh
+      # The zero baseline the assertion below depends on, established BEFORE
+      # the band rather than asserted after it. The first version of this
+      # checked `[ -e monitor/.state ]` in the post-band step and called its
+      # own finding "exists in a FRESH CHECKOUT" — the precondition and the
+      # measurement were the same test, run once, after the thing that changes
+      # it. Separate steps, or the assertion cannot tell a dirty checkout from
+      # a leak.
+      - name: baseline — no monitor/.state before the band
+        run: |
+          set -uo pipefail
+          if [ -e monitor/.state ]; then
+            echo "::error::monitor/.state exists in a fresh checkout. It is gitignored"
+            echo "::error::(monitor/.gitignore:1) and never committed, so the leak"
+            echo "::error::assertion after the band has no zero to measure against."
+            find monitor/.state | head -50
+            exit 1
+          fi
+          echo "baseline OK — no monitor/.state before the band."
+
+      - name: run unit suite with NEXUS_ROOT exported to the checkout
+        env:
+          # The one variable this job exists for. Set at job scope rather than
+          # inline so every step below — including any future diagnostic step —
+          # sees the same environment the suites do.
+          NEXUS_ROOT: ${{ github.workspace }}
+        run: |
+          set -uo pipefail
+          mapfile -t tests < <(find monitor monitor/watcher -maxdepth 1 -name 'test-*.sh' -type f | sort)
+          (( ${#tests[@]} > 0 )) || { echo "::error::no tests selected"; exit 1; }
+          # Fail LOUD if the decoy is not actually a decoy. A checkout missing
+          # the wrapper dirs would make this job green for the wrong reason —
+          # the same vacuity the job exists to retire, one level up.
+          for d in ghwrap notifywrap pipwrap; do
+            [ -d "$NEXUS_ROOT/monitor/$d" ] || {
+              echo "::error::NEXUS_ROOT=$NEXUS_ROOT has no monitor/$d — this job would be vacuous"
+              exit 1
+            }
+          done
+          echo "Discovered ${#tests[@]} tests (NEXUS_ROOT=$NEXUS_ROOT exported)."
+          bash monitor/watcher/run-tests.sh --jobs 4 "${tests[@]}"
+
+      # -------------------------------------------------------------------
+      # SIDE-EFFECT gate (<your-org>/nexus-code#655). The step above is
+      # OUTPUT-based: it reddens when a leak changes a suite's assertions.
+      # The class's dominant form does NOT — measured on
+      # test-worker-nproc-bound.sh with its scrub reverted, the re-root fires,
+      # twelve paths are written into the inherited root, and the suite still
+      # exits 0 with `8 passed, 0 failed`. A PASS/FAIL diff cannot see that,
+      # which is why the fourth member reached `main` and why 616 fixture spawn
+      # rows (23% of every spawn event it holds) are sitting in the operator's
+      # canonical action log.
+      #
+      # $GITHUB_WORKSPACE is both the decoy root AND a git checkout, so the
+      # side effect is one `git status` away.
+      #
+      # WHY THE HARD GATE IS SCOPED TO monitor/.state/ AND THE REST ONLY WARNS.
+      # monitor/.state/ is the canonical state surface — where all 616 rows
+      # landed, and where no test has any business writing in the workspace.
+      # That half is verified: the 45 fixture-building suites were probed
+      # individually and none writes there today. The BROADER claim ("no suite
+      # writes anywhere in the workspace") is unverified across the full
+      # ~250-suite band, so it is surfaced as an annotation rather than
+      # gated on. Promote it once real runs show it clean; do not promote it
+      # on the strength of this comment.
+      # HARD GATE over the fixture-building population. Every suite that builds
+      # a fixture nexus is probed against its own decoy root, and a write into
+      # that decoy fails the job. This half is MEASURED: the band has been run
+      # over the population three times and is clean (45 hermetic / 1 SKIP /
+      # 0 leaks), so gating it cannot redden CI for an unattributed reason.
+      #
+      # 77 is a FAILURE here on purpose: it means the band measured NOTHING,
+      # which is a vacuous gate wearing a green.
+      - name: gate — the fixture-building band must write nothing into its decoy
+        run: |
+          set -uo pipefail
+          rc=0
+          bash monitor/nexus-root-sensitivity.sh band --timeout 300 || rc=$?
+          case "$rc" in
+            0)  echo "gate PASSED — every fixture-building suite is hermetic." ;;
+            3)  echo "::notice::some suites produced no evidence; the measured ones are clean." ;;
+            1)  echo "::error::a fixture-building suite wrote into its decoy root (<your-org>/nexus-code#655)."
+                exit 1 ;;
+            77) echo "::error::the band measured NOTHING — this gate is vacuous, not green."
+                exit 1 ;;
+            *)  echo "::error::band exited $rc"; exit "$rc" ;;
+          esac
+
+      # REPORTS, DOES NOT GATE — the rest of the ~250-suite band, which is
+      # outside the population gated above. On its first real run this found
+      # canonical state in the checkout after a fully GREEN band:
+      #
+      #     monitor/.state/ng-usage.jsonl
+      #     monitor/.state/.trash/claude-<stamp>
+      #
+      # That is the class, in CI, invisible to the band's own verdict. The
+      # producing suite is NOT ATTRIBUTED, and the reason is POPULATION, not
+      # environment: `fixture_suites()` requires a
+      # spawn-worker|launcher|bootstrap-recover reference, which excludes the
+      # 30 `ng`-calling suites and test-install-claude-local.sh (whose
+      # install-claude-local.sh:242 is the `.trash/claude-<stamp>` producer,
+      # via launcher.sh). All 31 excluded suites were probed and NONE was
+      # attributed — 17 hermetic, 14 TIMEOUT, 0 leaks. That is a reported
+      # NEGATIVE, not coverage.
+      #
+      # Attribution has to happen IN CI, by bisecting the band inside this job:
+      # a workstation resolves `claude` and node_modules where a runner does
+      # not, so a local probe structurally cannot settle it.
+      #
+      # `--ignored` is not optional in the breadth check: `git status
+      # --porcelain` alone CANNOT SEE monitor/.state (monitor/.gitignore:1),
+      # which is how the first draft of this step managed to be blind to
+      # exactly the surface it was written to guard.
+      # <your-org>/nexus-code#720 — this step used to `find` the leaked tree and
+      # stop there, which names the ARTIFACT but not its PRODUCER. Two passes
+      # then declined to attribute it, correctly: a workstation resolves
+      # `claude` and node_modules where a runner does not, so a local probe
+      # republishes the negative instead of advancing it, and re-probing the
+      # excluded population locally cost CI-shaped evidence nothing.
+      #
+      # But the artifacts SELF-ATTRIBUTE, and nobody had read them. An
+      # `ng-usage.jsonl` row carries `verb`/`sub`/`origin`/`win`/`pid`/`ts`
+      # — the ng verb that ran, and when — and `.trash/claude-<stamp>` is
+      # produced by exactly one call path (install-claude-local.sh:242, via
+      # launcher.sh). So the cheap move is not to bisect the band: it is to
+      # PRINT THE ROWS the next occurrence leaves behind, beside each file's
+      # mtime, which places it in the band's own timeline.
+      #
+      # This is deliberately not a gate. #720's population question stays open
+      # — `nexus-root-sensitivity.sh`'s probe is blind to these files by
+      # construction (it matches rows that RECORD A PATH, and these record a
+      # window and a verb instead; see the AXIS note in probe_one). This step
+      # is the instrument that makes the NEXT occurrence attributable, which is
+      # not the same thing as having attributed it, and must not be reported as
+      # if it were.
+      #
+      # WHAT CHANGED SINCE THAT PARAGRAPH WAS WRITTEN. Printing the rows made
+      # the `d1cc62b` occurrence NARROWABLE and not ATTRIBUTABLE: `win` is
+      # empty on a runner (no tmux), `ts` has one-second resolution, the band
+      # runs at `--jobs 4`, so 23 rows placed the producer among four
+      # concurrent `ng`-verb suites and the verb histogram pointed within them
+      # without settling it. #720's own comment named two remedies and called
+      # the second better; it is now built. `watcher/run-tests.sh` sets
+      # `NEXUS_TEST_SUITE` per child and `_usage_tap` writes it as `src`, so a
+      # leaked row NAMES ITS PRODUCING SUITE with no second run, no bisect and
+      # no runner minutes — and survives any future `--jobs` value, which
+      # serialising the band would not.
+      #
+      # The closing condition is UNCHANGED and is still not met by building an
+      # instrument: it is a CI occurrence classified to a producing suite. Read
+      # `src` in the rows below when one appears. An `OK — no canonical state`
+      # line means the leak did not reproduce on THIS run; that is information,
+      # not attribution, and not evidence the leak is fixed.
+      - name: report canonical state written into the inherited root
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -e "$GITHUB_WORKSPACE/monitor/.state" ]; then
+            echo "::warning::a suite wrote canonical state into the inherited root (<your-org>/nexus-code#655)."
+            echo "The band was green while doing this — no PASS/FAIL diff can see it."
+            echo "--- inventory (path, mtime) ---"
+            find "$GITHUB_WORKSPACE/monitor/.state" -printf '%T+  %p\n' 2>/dev/null \
+              | sort | head -50
+            echo "--- contents: these rows name the SUITE, verb and pid that wrote them (#720) ---"
+            find "$GITHUB_WORKSPACE/monitor/.state" -type f -size -256k 2>/dev/null \
+              | head -20 | while IFS= read -r f; do
+                  echo "===== ${f#"$GITHUB_WORKSPACE"/}"
+                  head -c 8192 "$f" 2>/dev/null || echo "(unreadable)"
+                  echo
+                done
+            echo "Cross-check the ts values against the band's suite ordering above."
+            echo "Population-level sweep (separate question): monitor/nexus-root-sensitivity.sh band"
+          else
+            echo "OK — no canonical state was written into the inherited root."
+          fi
+          dirty=$(git status --porcelain --ignored 2>/dev/null || true)
+          if [ -n "$dirty" ]; then
+            echo "::warning::workspace otherwise modified during the band:"
+            printf '%s\n' "$dirty" | head -50
+          fi
+
+      # The detector's own non-vacuity proof, run where it is cheap. The nproc
+      # suite takes 0.18s on a runner against >2min on a loaded workstation, so
+      # what is a 5-minute local check is seconds here. It builds a KNOWN
+      # POSITIVE (that suite with its scrub reverted, green while leaking) and
+      # asserts the detector fires on it and stays quiet on the unmodified one.
+      # Without this, a future change could silently blind the gate above and
+      # every subsequent green would be worthless — the exact failure #655
+      # round 12 shipped and had to retract.
+      - name: nexus-root-sensitivity self-test (known positive + known negative)
+        # Exit 77 is the repo's SKIP convention (#568 A6) and is EXPECTED here.
+        # This runner cannot stage the case: with no node_modules/ (gitignored)
+        # and no `claude` on PATH, the mutant's spawn fails before it can leak,
+        # so the known positive lands in the RED cell of #655's 2x2 and there
+        # is no signal to miss. Measured — it exited 77 with
+        # `5 passed, 3 failed` on the first run of this step.
+        #
+        # It is kept anyway because it fails LOUD on the two outcomes that
+        # matter: a green known positive the detector missed (blind), and a
+        # VACUOUS probe (decoy incomplete). The environment-independent
+        # non-vacuity proof runs in the unit band via
+        # test-nexus-root-sensitivity.sh, whose synthetic fixtures leak
+        # regardless of what is installed.
+        run: |
+          set -uo pipefail
+          # `|| rc=$?`, not a bare call followed by `rc=$?`. GitHub runs `run:`
+          # blocks under `bash -e {0}`, and `set -uo pipefail` does NOT clear
+          # the inherited `-e` — so a bare call returning 77 aborts the step
+          # before the exit code can be read, and the whole case block below
+          # is unreachable. Measured: the self-test printed INCONCLUSIVE and
+          # the step still died with "Process completed with exit code 77".
+          rc=0
+          bash monitor/nexus-root-sensitivity.sh self-test || rc=$?
+          case "$rc" in
+            0)  echo "self-test PASSED — detector validated against a green known positive." ;;
+            77) echo "::notice::self-test INCONCLUSIVE on this runner (exit 77, expected here)."
+                echo "See the step comment; the synthetic non-vacuity proof runs in the unit band." ;;
+            *)  echo "::error::self-test FAILED (rc=$rc) — the detector is blind or the decoy is incomplete."
+                exit "$rc" ;;
+          esac
+
+  # ---------------------------------------------------------------------------
+  # BASH-LEGACY: the suite under bash 4.4 — the mirror of <your-org>/nexus-code
+  # #610's blind spot.
+  #
+  # #610 is symmetric and both halves have teeth. Locally nobody can run 5.2,
+  # so a 5.2-only defect is invisible until CI (that half cost #597: a fork
+  # floor of 23 against a real 566, every test dying of EAGAIN). But CI runs
+  # ONLY 5.2, so a regression that breaks 4.4 — the version every host in this
+  # lab, including the one running the live watcher, actually executes — is
+  # invisible to CI entirely. That direction is the more dangerous one.
+  #
+  # This job closes it by building the pinned 4.4.18 with the SAME script
+  # workers use locally (monitor/toolchain-bash.sh), so the script is exercised
+  # by CI rather than trusted, and a rot in it turns this job red instead of
+  # sitting undiscovered until someone needs it.
+  # ---------------------------------------------------------------------------
+  bash-legacy:
+    name: unit suite (bash 4.4, the version this lab runs)
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: install runtime deps (jq + tmux + zsh + toolchain)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq tmux zsh build-essential
+
+      - name: restore built bash 4.4.18
+        id: bash_cache
+        uses: actions/cache@v4
+        with:
+          path: monitor/.state/toolchain/bash-4.4.18
+          key: bash-4.4.18-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('monitor/toolchain-bash.sh') }}
+
+      - name: build bash 4.4.18 via monitor/toolchain-bash.sh
+        run: |
+          set -euo pipefail
+          # Idempotent: a cache hit makes this a version check and nothing more.
+          # Run unconditionally anyway, so the script's already-built path is
+          # exercised too and a cache hit cannot mask a broken builder.
+          bash monitor/toolchain-bash.sh --version 4.4.18
+          "$(bash monitor/toolchain-bash.sh --version 4.4.18 --print-path)" --version | head -1
+
+      - name: run unit suite under bash 4.4.18
+        run: |
+          set -uo pipefail
+          legacy=$(bash monitor/toolchain-bash.sh --version 4.4.18 --print-path)
+          mapfile -t tests < <(find monitor monitor/watcher -maxdepth 1 -name 'test-*.sh' -type f | sort)
+          if (( ${#tests[@]} == 0 )); then
+            echo "::error::no tests selected — refusing to report green on an empty run"
+            exit 1
+          fi
+          echo "Discovered ${#tests[@]} tests; interpreter: $legacy"
+          NEXUS_TEST_SHELL="$legacy" \
+            bash monitor/watcher/run-tests.sh --jobs 4 "${tests[@]}"
+
+  # ---------------------------------------------------------------------------
+  # tmux-version matrix: prove the `paste-buffer -p` capability probe
+  # (<your-org>/nexus-code#556, which replaced a version threshold) discriminates
+  # on REAL tmux, not by assumption.
+  #
+  # #556's probe was "correct by assumption" here: CI only ever ran
+  # ubuntu-latest's ~3.x, so it had never run against a real OLD tmux. The
+  # sandbox FLOOR is tmux 2.6. We build 2.5 and 2.6 from source (cached), plus
+  # modern apt tmux. Build deps are the standard tmux recipe: libevent +
+  # ncurses + a C toolchain.
+  #
+  # The discrimination property is a BICONDITIONAL: the probe must RUN its
+  # assertions iff tmux supports `paste-buffer -p`, and SKIP (degrade honestly,
+  # source-guard still green) iff it does not. Rather than hard-code which
+  # version has `-p` (an earlier revision guessed 2.5 lacked it — it does NOT;
+  # empirically 2.5 and 2.6 both support it), each cell DISCOVERS `-p` support
+  # independently (the same probe tmux itself uses) and asserts the test's
+  # behaviour matches. This is correct on any tmux and cannot be wrong-footed by
+  # a mis-remembered boundary. On the real tmux we can build (>=2.5), `-p` is
+  # present, so these cells exercise the RUN branch on genuinely old tmux — which
+  # is exactly what #556 needed. The SKIP branch is proven DETERMINISTICALLY in
+  # the modern cell via a tmux shim that strips `-p`, so it does not depend on
+  # locating (and cleanly building) an ancient enough tmux.
+  # ---------------------------------------------------------------------------
+  tmux-matrix:
+    name: tmux ${{ matrix.tmux }} probe
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - tmux: '2.5'
+            source: build    # real old tmux (has -p → RUN branch)
+          - tmux: '2.6'
+            source: build    # the sandbox FLOOR (has -p → RUN branch)
+          - tmux: modern
+            source: apt      # ubuntu-latest's ~3.x (+ deterministic SKIP proof)
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: install base deps (jq + build toolchain)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            jq build-essential libevent-dev libncurses-dev pkg-config bison
+
+      - name: restore built tmux ${{ matrix.tmux }}
+        if: matrix.source == 'build'
+        id: tmux_cache
+        uses: actions/cache@v4
+        with:
+          path: /opt/tmux-${{ matrix.tmux }}
+          # Rebuild only when the version or the runner image changes.
+          key: tmux-${{ matrix.tmux }}-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: build tmux ${{ matrix.tmux }} from source
+        if: matrix.source == 'build' && steps.tmux_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          ver='${{ matrix.tmux }}'
+          work=$(mktemp -d)
+          cd "$work"
+          curl -fsSL "https://github.com/tmux/tmux/releases/download/${ver}/tmux-${ver}.tar.gz" \
+            -o tmux.tar.gz
+          tar xzf tmux.tar.gz
+          cd "tmux-${ver}"
+          # Old tmux (2.5/2.6, 2017) predates modern gcc's stricter default
+          # diagnostics; -Wno-error keeps a warning from a new toolchain from
+          # failing an otherwise-fine build. Harmless if configure sets no
+          # -Werror. If a HARD compile error still surfaces here, this job is
+          # the one to split to the coverage issue per the PR's pragmatism
+          # gate — the probe is already proven on real 2.6.
+          ./configure --prefix="/opt/tmux-${ver}" CFLAGS="-O2 -Wno-error -Wno-implicit-function-declaration"
+          make -j"$(nproc)"
+          sudo make install
+          "/opt/tmux-${ver}/bin/tmux" -V
+
+      - name: install modern tmux from apt
+        if: matrix.source == 'apt'
+        run: |
+          sudo apt-get install -y --no-install-recommends tmux zsh
+          mkdir -p /opt/tmux-modern/bin
+          ln -sf "$(command -v tmux)" /opt/tmux-modern/bin/tmux
+
+      - name: put the selected tmux first on PATH
+        run: |
+          set -euo pipefail
+          case "${{ matrix.source }}" in
+            build) tdir="/opt/tmux-${{ matrix.tmux }}/bin" ;;
+            apt)   tdir="/opt/tmux-modern/bin" ;;
+          esac
+          echo "$tdir" >> "$GITHUB_PATH"
+          # zsh is needed by a couple of tests regardless of the tmux axis.
+          command -v zsh >/dev/null || sudo apt-get install -y --no-install-recommends zsh
+
+      - name: show tmux version
+        run: |
+          echo "tmux on PATH: $(command -v tmux)"
+          tmux -V
+
+      - name: probe RUNS iff tmux supports paste-buffer -p (self-discovering)
+        run: |
+          set -uo pipefail
+          # Independently detect -p support, the SAME way the probe does: a tmux
+          # that lacks the flag rejects it with `unknown option`/`usage:`; one
+          # that has it reaches the buffer lookup (`no buffer`/empty).
+          sock="cap-ci-$$-$RANDOM"
+          tmux -L "$sock" new-session -d -x 80 -y 24 'sleep 30' 2>/dev/null || true
+          cap=$(tmux -L "$sock" paste-buffer -p -b __cap_probe__ 2>&1 || true)
+          tmux -L "$sock" kill-server 2>/dev/null || true
+          if [[ "$cap" == *"unknown option"* || "$cap" == *"usage:"* ]]; then
+            supported=0
+          else
+            supported=1
+          fi
+          echo "tmux $(tmux -V): paste-buffer -p supported=$supported"
+
+          # `|| rc=$?`, NOT `…; rc=$?` (<your-org>/nexus-code#784, instance 4).
+          # GitHub runs `run:` bodies under `bash -e {0}` and `set -uo
+          # pipefail` above does NOT clear `-e`. An assignment whose command
+          # substitution exits non-zero IS a failing command, so the bare
+          # form aborted the step here — and because `out` captures the
+          # probe's stdout AND stderr, it died before `printf '%s\n' "$out"`.
+          # A red therefore carried ZERO diagnostic: not the failing
+          # assertion, not the enumerated `::error::` below. Measured under
+          # bash 5.2 against this exact body by
+          # monitor/test-paste-probe-step-contract.sh.
+          rc=0
+          out=$(bash monitor/watcher/test-paste-bracketed.sh 2>&1) || rc=$?
+          printf '%s\n' "$out"
+          ran=0;     grep -q 'app requested mode ?2004' <<<"$out" && ran=1
+          skipped=0; grep -q 'has no .paste-buffer -p'  <<<"$out" && skipped=1
+
+          # The biconditional: RUN iff supported, SKIP iff not; source guard
+          # (rc 0) holds either way.
+          if (( supported == 1 )); then
+            if (( ran == 1 && skipped == 0 && rc == 0 )); then
+              echo "OK: -p present → probe RAN its 4 real assertions and they passed"
+            else
+              echo "::error::-p is present on $(tmux -V) but the probe did not RUN (ran=$ran skipped=$skipped rc=$rc)"
+              exit 1
+            fi
+          else
+            if (( skipped == 1 && ran == 0 && rc == 0 )); then
+              echo "OK: -p absent → probe correctly SKIPPED, source guard still green"
+            else
+              echo "::error::-p is absent on $(tmux -V) but the probe did not SKIP (ran=$ran skipped=$skipped rc=$rc)"
+              exit 1
+            fi
+          fi
+
+      - name: SKIP branch — deterministic proof via a -p-stripping tmux shim
+        # Does NOT depend on locating an ancient tmux without `-p`. A PATH-front
+        # shim forwards every tmux call to the real binary EXCEPT `paste-buffer
+        # … -p`, which it rejects with a `usage:` line exactly as a tmux lacking
+        # the flag would. The probe's capability detection must then take the
+        # SKIP path, and the version-independent source guard must still pass.
+        # Runs once (modern cell) — the branch is tmux-version-independent.
+        if: matrix.source == 'apt'
+        run: |
+          set -uo pipefail
+          real_tmux=$(type -P tmux)   # -P: the binary path, never an alias/function
+          shimdir=$(mktemp -d)
+          cat > "$shimdir/tmux" <<SHIM
+          #!/usr/bin/env bash
+          # Forward to the real tmux, but pretend `paste-buffer … -p` is unknown.
+          # Scan ALL args (the real call is \`tmux -L <sock> paste-buffer -p …\`,
+          # so paste-buffer is not \$1), gate the strip on paste-buffer being the
+          # subcommand so an unrelated -p (capture-pane -p, display -p) passes.
+          has_pb=0; has_p=0
+          for a in "\$@"; do
+            [[ "\$a" == "paste-buffer" ]] && has_pb=1
+            [[ "\$a" == "-p" ]] && has_p=1
+          done
+          if (( has_pb == 1 && has_p == 1 )); then
+            echo "usage: paste-buffer [-dpr] [-b buffer-name] [-s separator] [-t target-pane]" >&2
+            exit 1
+          fi
+          exec "$real_tmux" "\$@"
+          SHIM
+          chmod +x "$shimdir/tmux"
+          # `|| rc=$?` for the same reason as the sibling step above
+          # (<your-org>/nexus-code#784, instance 5). Same shape, same file, and
+          # neither was in #784's own enumeration — which is the argument for
+          # the EB lint family rather than a sixth hand-fix.
+          rc=0
+          out=$(PATH="$shimdir:$PATH" bash monitor/watcher/test-paste-bracketed.sh 2>&1) || rc=$?
+          printf '%s\n' "$out"
+          if grep -q 'has no .paste-buffer -p' <<<"$out" \
+             && ! grep -q 'app requested mode ?2004' <<<"$out" \
+             && (( rc == 0 )); then
+            echo "OK: with -p stripped, the probe SKIPPED and the source guard still passed"
+          else
+            echo "::error::-p-stripped shim did not drive the probe down its SKIP branch (rc=$rc)"
+            exit 1
+          fi

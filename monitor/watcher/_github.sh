@@ -204,22 +204,141 @@ _graphql_gate_alert() {
     printf '%s\n' "$now" > "$marker" 2>/dev/null || true
 }
 
+# ---- backoff ceiling + reconciliation (your-org/nexus-code#594) ----------
+#
+# `_graphql_backoff_active` decides whether to WITHHOLD the operator's
+# comments from the orchestrator. Before #594 it decided that from a
+# stored future instant alone — the same defect `#592`/`#593` fixed on
+# the egress gate `_over_limit_orchestrator_paused`. A stored instant is
+# a PREDICTION ("the bucket will still be exhausted at T"); it is never
+# an OBSERVATION ("the bucket is exhausted"). When the prediction is
+# wrong — miscomputed, clock-skewed, ratcheted by a bad `reset_at`, or
+# simply never cleared — the channel closes and stays closed, silently.
+# It was strictly worse than the gate `#593` fixed, because nothing
+# bounded it: `reset` came straight from the API payload (or a 15-min
+# fallback) and was never range-checked, so a single absurd value could
+# suppress a surface indefinitely.
+#
+# Three properties close it, mirroring `#593`:
+#
+#   BOUND       No armed backoff may suppress a surface for longer than
+#               `MONITOR_GRAPHQL_BACKOFF_MAX_SECONDS` (default 900),
+#               measured from the OBSERVATION that armed it — not from
+#               the predicted reset. Past the ceiling the gate opens
+#               regardless of what the stored instant says. The worst
+#               case is now a number in this file, not whatever GitHub
+#               put in a payload.
+#   RECONCILE   Every call repairs rather than waits out a bad file:
+#               a malformed reset, a missing armed stamp, an expired
+#               window and a ceiling breach all CLEAR the state and
+#               re-open the gate. A stale epoch cannot outlive one poll.
+#   ANNOUNCE    A suppression that persists past
+#               `MONITOR_GRAPHQL_BACKOFF_ANNOUNCE_SECONDS` emits an
+#               out-of-band `watcher_alert=` sentinel on stdout (which
+#               rides compose_report to the orchestrator) in addition to
+#               the log line. A condition that mutes operator
+#               communication must not be reportable only through the
+#               channel it mutes.
+#
+# On-disk format is backward compatible: line 1 is the reset epoch
+# (unchanged, so an in-flight watcher reading an old file still works),
+# line 2 is the epoch at which the rate-limit response was OBSERVED. A
+# legacy single-line file gets its observation from the file's mtime —
+# a real observation, since the file is written at arm time.
+_graphql_backoff_ceiling() {
+    local v="${MONITOR_GRAPHQL_BACKOFF_MAX_SECONDS:-900}"
+    [[ "$v" =~ ^[0-9]+$ && "$v" -gt 0 ]] || v=900
+    printf '%s' "$v"
+}
+
+# Clear every state file for one surface's armed backoff.
+_graphql_backoff_clear() {
+    local surface="$1"
+    rm -f "${STATE_DIR}/graphql-backoff-${surface}" \
+          "${STATE_DIR}/graphql-alert-emitted-${surface}-"* \
+          "${STATE_DIR}/graphql-backoff-announced-${surface}" 2>/dev/null || true
+}
+
+# Throttled WARN row for a reconciliation (the gate opening itself back
+# up). Distinct `reason` per cause so the log distinguishes "the window
+# simply elapsed" from "we refused to honour a bad epoch".
+_graphql_backoff_reconcile_log() {
+    local surface="$1" reason="$2" detail="$3"
+    [[ -d "${STATE_DIR:-}" ]] || return 0
+    local iso; iso=$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    _ensure_service_log "${STATE_DIR}/watcher-alerts.log"
+    printf '[%s] WARN %s graphql_backoff_reconciled reason=%s %s\n' \
+        "$iso" "$surface" "$reason" "$detail" \
+        >> "${STATE_DIR}/watcher-alerts.log" 2>/dev/null || true
+}
+
 _graphql_backoff_active() {
     local surface="$1"
     local file="${STATE_DIR}/graphql-backoff-${surface}"
     [[ -f "$file" ]] || return 1
-    local reset
-    reset=$(<"$file")
-    if [[ ! "$reset" =~ ^[0-9]+$ ]]; then
-        rm -f "$file" "${STATE_DIR}/graphql-alert-emitted-${surface}-"*
-        return 1
-    fi
+    local reset armed
+    { read -r reset; read -r armed; } < "$file" 2>/dev/null || true
     local now; now=$(date +%s)
-    if (( now >= reset + 30 )); then
-        rm -f "$file" "${STATE_DIR}/graphql-alert-emitted-${surface}-"*
+
+    # RECONCILE — a reset we cannot parse is not evidence of anything.
+    if [[ ! "$reset" =~ ^[0-9]+$ ]]; then
+        _graphql_backoff_clear "$surface"
+        _graphql_backoff_reconcile_log "$surface" malformed_reset \
+            "stored reset=${reset:-<empty>} is not an epoch; refusing to withhold on an unparseable instant"
         return 1
     fi
+    # Legacy single-line file (or a torn write): recover the observation
+    # from the file's mtime, which IS when the backoff was armed.
+    if [[ ! "$armed" =~ ^[0-9]+$ ]]; then
+        armed=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo "$now")
+        [[ "$armed" =~ ^[0-9]+$ ]] || armed="$now"
+    fi
+
+    # BOUND — the ceiling is measured from the observation, and it wins
+    # over the stored prediction unconditionally. A clock that jumped
+    # backwards yields a negative age; treat that as "cannot trust this
+    # stamp" and reconcile rather than suppress.
+    local ceiling; ceiling=$(_graphql_backoff_ceiling)
+    if (( now - armed >= ceiling || now < armed )); then
+        _graphql_backoff_clear "$surface"
+        _graphql_backoff_reconcile_log "$surface" ceiling \
+            "suppression reached the ${ceiling}s ceiling (armed=${armed} reset=${reset} now=${now}); re-opening the surface — the next call re-arms only on a FRESH rate-limit response"
+        return 1
+    fi
+
+    # The ordinary expiry, unchanged (30 s grace past the reset).
+    if (( now >= reset + 30 )); then
+        _graphql_backoff_clear "$surface"
+        return 1
+    fi
+
+    # ANNOUNCE — still suppressing. Past the announce delay, say so
+    # somewhere that does not depend on the surface we are muting.
+    _graphql_backoff_announce "$surface" "$armed" "$reset" "$now"
     return 0
+}
+
+# Out-of-band announcement for a live suppression. One sentinel per
+# (surface, armed-epoch), so an ongoing hold announces ONCE rather than
+# every poll — the `#593` announcement model. stdout rides the caller's
+# emit stream to the orchestrator.
+_graphql_backoff_announce() {
+    local surface="$1" armed="$2" reset="$3" now="$4"
+    local delay="${MONITOR_GRAPHQL_BACKOFF_ANNOUNCE_SECONDS:-300}"
+    [[ "$delay" =~ ^[0-9]+$ ]] || delay=300
+    (( now - armed >= delay )) || return 0
+    local flag="${STATE_DIR}/graphql-backoff-announced-${surface}"
+    [[ -f "$flag" && "$(cat "$flag" 2>/dev/null)" == "$armed" ]] && return 0
+    printf '%s\n' "$armed" > "$flag" 2>/dev/null || true
+    local ceiling; ceiling=$(_graphql_backoff_ceiling)
+    local iso; iso=$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    _ensure_service_log "${STATE_DIR}/watcher-alerts.log"
+    printf '[%s] WARN %s graphql_backoff_suppressing armed=%s reset=%s ceiling=%s\n' \
+        "$iso" "$surface" "$armed" "$reset" "$ceiling" \
+        >> "${STATE_DIR}/watcher-alerts.log" 2>/dev/null || true
+    printf 'watcher_alert=graphql-backoff surface=%s held_s=%s ceiling_s=%s\n  body: The %s snapshot has been suppressed for %s min after a rate-limit response. Operator comments on that surface are NOT reaching this emit while it holds. It reconciles automatically at the %ss ceiling even if the API-supplied reset says otherwise.\n' \
+        "$surface" "$(( now - armed ))" "$ceiling" \
+        "$surface" "$(( (now - armed) / 60 ))" "$ceiling"
 }
 
 _watcher_handle_graphql_failure() {
@@ -260,7 +379,29 @@ _watcher_handle_graphql_failure() {
         fi
         [[ "$reset" =~ ^[0-9]+$ ]] || reset=$(( now + 900 ))
 
-        printf '%s\n' "$reset" > "${STATE_DIR}/graphql-backoff-${surface}"
+        # your-org/nexus-code#594 — clamp the API-supplied prediction at
+        # arm time as well as at read time. `reset` here is whatever
+        # GitHub put in the payload; nothing validated its range before,
+        # so one absurd `reset_at` (or a clock skew) could park the
+        # surface far into the future. The read-side ceiling in
+        # `_graphql_backoff_active` would still rescue it, but clamping
+        # on write keeps the on-disk state honest — a human reading the
+        # file sees the horizon actually in force. A reset already in
+        # the past collapses to `now`, which the read side then expires
+        # on its next call.
+        local ceiling; ceiling=$(_graphql_backoff_ceiling)
+        if (( reset > now + ceiling )); then
+            printf '[%s] WARN %s graphql_backoff_clamped api_reset=%s clamped_to=%s ceiling=%s\n' \
+                "$iso" "$surface" "$reset" "$(( now + ceiling ))" "$ceiling" >> "$alerts"
+            reset=$(( now + ceiling ))
+        fi
+        (( reset < now )) && reset="$now"
+
+        # Line 1 reset (unchanged, backward compatible), line 2 the
+        # epoch we OBSERVED the rate-limit response — the ceiling is
+        # measured from the observation, never from the prediction.
+        printf '%s\n%s\n' "$reset" "$now" > "${STATE_DIR}/graphql-backoff-${surface}"
+        rm -f "${STATE_DIR}/graphql-backoff-announced-${surface}" 2>/dev/null || true
 
         local flag="${STATE_DIR}/graphql-alert-emitted-${surface}-${reset}"
         if [[ ! -f "$flag" ]]; then
@@ -294,6 +435,117 @@ _watcher_handle_graphql_failure() {
         printf '[%s] WARN %s graphql_failure %s\n' "$iso" "$surface" "$detail" >> "$alerts"
         printf '%s\n' "$now" > "$marker"
     fi
+    return 0
+}
+
+# ---- sustained-degradation escalation (your-org/nexus-code#595) -----------
+#
+# The non-rate-limit branch above throttles to one WARN per 10 min per
+# surface and emits NOTHING out-of-band. That is exactly how `#595`
+# stayed invisible: `issue_comments` failed with
+# `RESOURCE_LIMITS_EXCEEDED` on ~80% of polls for hours, logging
+# faithfully to `watcher-alerts.log`, and no human read the file. The
+# rule the `#592`/`#594`/`#595` cluster converges on is that no fetch on
+# the operator-communication path may fail on the strength of a log line
+# alone.
+#
+# So: track how long a surface has been CONTINUOUSLY failing and, past
+# `MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS` (default 1800), emit a
+# `watcher_alert=` sentinel that rides compose_report to the
+# orchestrator, re-nagging on the slower
+# `MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS` (default 3600) cadence. A
+# recovery after an escalation announces itself too — an alert that
+# never retracts trains the reader to ignore it.
+#
+# State: `graphql-degraded-<surface>` holding `first`/`count`/`announced`.
+_graphql_degraded_path() { printf '%s/graphql-degraded-%s' "${STATE_DIR:-.}" "$1"; }
+
+_graphql_degraded_field() {
+    local f="$1" key="$2"
+    [[ -f "$f" ]] || return 1
+    awk -F= -v k="$key" '$1==k{print $2; exit}' "$f" 2>/dev/null
+}
+
+# Record one FAILED fetch of <surface>. stdout: an escalation sentinel
+# when one is due (empty otherwise).
+# <kind> distinguishes a surface that returned NOTHING (`total`) from one
+# that delivered some pages but stopped early (`truncated`). Both are
+# degradation — a truncated walk withholds an unknown tail — but the
+# operator needs to know which, because the remedies differ (a total
+# failure is usually transport or rate limit; a truncation usually means
+# the page size is too large for one issue's comment history).
+_graphql_note_failure() {
+    local surface="$1" kind="${2:-total}"
+    [[ -d "${STATE_DIR:-}" ]] || return 0
+    local now; now=$(date +%s)
+    local f; f=$(_graphql_degraded_path "$surface")
+    local first count announced
+    first=$(_graphql_degraded_field "$f" first 2>/dev/null || true)
+    count=$(_graphql_degraded_field "$f" count 2>/dev/null || true)
+    announced=$(_graphql_degraded_field "$f" announced 2>/dev/null || true)
+    [[ "$first" =~ ^[0-9]+$ ]] || first="$now"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    [[ "$announced" =~ ^[0-9]+$ ]] || announced=0
+    count=$(( count + 1 ))
+    # A clock that moved backwards must not manufacture a huge outage.
+    (( now < first )) && first="$now"
+
+    local escalate="${MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS:-1800}"
+    [[ "$escalate" =~ ^[0-9]+$ ]] || escalate=1800
+    local remind="${MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS:-3600}"
+    [[ "$remind" =~ ^[0-9]+$ ]] || remind=3600
+
+    local due=0 held=$(( now - first ))
+    if (( held >= escalate )); then
+        if (( announced == 0 )) || (( now - announced >= remind )); then
+            due=1; announced="$now"
+        fi
+    fi
+    printf 'first=%s\ncount=%s\nannounced=%s\n' "$first" "$count" "$announced" \
+        > "$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
+    (( due == 1 )) || return 0
+
+    local iso; iso=$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    _ensure_service_log "${STATE_DIR}/watcher-alerts.log"
+    printf '[%s] WARN %s graphql_degraded_escalated kind=%s held_s=%s consecutive_failures=%s\n' \
+        "$iso" "$surface" "$kind" "$held" "$count" >> "${STATE_DIR}/watcher-alerts.log" 2>/dev/null || true
+    if [[ "$kind" == "partial" ]]; then
+        printf 'watcher_alert=ingest-degraded surface=%s kind=partial held_s=%s occurrences=%s\n  body: The %s fetch has discarded at least one page on every attempt for %s min (%s consecutive). The walk completes, but the issues on the discarded page are NOT being surfaced. Most likely a single issue has a comment history too large for the current page size: lower monitor.graphql.search_page_size. See %s/watcher-alerts.log for the graphql_partial_walk line naming the cause.\n' \
+            "$surface" "$held" "$count" \
+            "$surface" "$(( held / 60 ))" "$count" "${STATE_DIR}"
+    elif [[ "$kind" == "truncated" ]]; then
+        printf 'watcher_alert=ingest-degraded surface=%s kind=truncated held_s=%s occurrences=%s\n  body: The %s fetch has been TRUNCATED on every attempt for %s min (%s consecutive). Some pages land, but the walk stops early every cycle, so the issues after the stopping point are NOT being surfaced at all — an unknown tail, not a slow one. Most likely a single issue has a comment history too large for the current page size: lower monitor.graphql.search_page_size. See %s/watcher-alerts.log for the graphql_partial_walk line naming the cause.\n' \
+            "$surface" "$held" "$count" \
+            "$surface" "$(( held / 60 ))" "$count" "${STATE_DIR}"
+    else
+        printf 'watcher_alert=ingest-degraded surface=%s kind=total held_s=%s failures=%s\n  body: The %s fetch has failed on EVERY attempt for %s min (%s consecutive failures). This is the ingest side of the operator channel: comments on that surface are not being surfaced while it fails. They are not lost — an un-acked comment resurfaces on the first successful fetch — but freshness is degraded until this clears. See %s/watcher-alerts.log for the underlying error.\n' \
+            "$surface" "$held" "$count" \
+            "$surface" "$(( held / 60 ))" "$count" "${STATE_DIR}"
+    fi
+    return 0
+}
+
+# Record one SUCCESSFUL fetch of <surface>. stdout: a recovery line when
+# the surface had previously escalated (empty otherwise).
+_graphql_note_success() {
+    local surface="$1"
+    [[ -d "${STATE_DIR:-}" ]] || return 0
+    local f; f=$(_graphql_degraded_path "$surface")
+    [[ -f "$f" ]] || return 0
+    local first count announced now
+    now=$(date +%s)
+    first=$(_graphql_degraded_field "$f" first 2>/dev/null || true)
+    count=$(_graphql_degraded_field "$f" count 2>/dev/null || true)
+    announced=$(_graphql_degraded_field "$f" announced 2>/dev/null || true)
+    rm -f "$f" 2>/dev/null || true
+    [[ "$announced" =~ ^[0-9]+$ && "$announced" -gt 0 ]] || return 0
+    local iso; iso=$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    _ensure_service_log "${STATE_DIR}/watcher-alerts.log"
+    printf '[%s] INFO %s graphql_degraded_recovered after_s=%s failures=%s\n' \
+        "$iso" "$surface" "$(( now - ${first:-$now} ))" "${count:-?}" \
+        >> "${STATE_DIR}/watcher-alerts.log" 2>/dev/null || true
+    printf 'watcher_alert=ingest-recovered surface=%s\n  body: The %s fetch is succeeding again after %s min degraded (%s consecutive failures). Any comment withheld during the outage surfaces on this cycle.\n' \
+        "$surface" "$surface" "$(( (now - ${first:-$now}) / 60 ))" "${count:-?}"
     return 0
 }
 
@@ -686,15 +938,241 @@ _snapshot_graphql() {
     return "$rc"
 }
 
+# ---- paginated search (your-org/nexus-code#595) --------------------------
+#
+# WHY. The single-shot `search(first: 100)` shape below used to fetch
+# every open issue's last 50 comments in ONE query. Measured against
+# your-org/your-nexus on 2026-07-30 that query returned HTTP 200 with a
+# 2.59 MB body carrying **2,933 `RESOURCE_LIMITS_EXCEEDED` field errors**
+# — GitHub had resolved the query PARTIALLY and nulled fields to stay
+# inside its budget: `author` was null on all 1,247 comments, `body` and
+# `reactions` null on 439 of them, and some `databaseId`s null too. `gh`
+# exits 1 when errors are present, so the whole response was discarded
+# and the surface produced nothing on ~80% of polls for hours.
+#
+# WHAT ACTUALLY DRIVES THE COST. Not node count: `rateLimit.nodeCount`
+# fell from 255,100 to 55,100 to 10,100 as `reactions(first:)` went
+# 50 → 10 → 1, and the query failed IDENTICALLY at all three (same 2,933
+# errors, same 2,592,723-byte body). The limiter tracks the work of
+# materialising comment BODIES. Ablation on the same repo:
+#
+#   search first:100, comments last:50, reactions first:50 → FAIL 2.59 MB
+#   search first:100, comments last:50, reactions first:10 → FAIL 2.59 MB
+#   search first:100, comments last:50, reactions first:1  → FAIL 2.59 MB
+#   search first:100, comments last:20, reactions first:50 → ok   1.86 MB
+#   search first:25,  comments last:50, reactions first:50 → ok   1.40 MB
+#
+# So the trip point sits between 1.86 MB and the ~3.07 MB the full set
+# actually weighs. Paging the SEARCH (rather than shrinking
+# `comments(last:)`) is the fix that costs no coverage: narrowing the
+# comment window would let an un-acked comment scroll permanently out of
+# view, because eligibility has no time bound — a comment stays eligible
+# until it is ROCKET-ed or processed.
+#
+# Measured after, same repo, page size 10: 6 pages, largest page
+# 794,073 B, total 3,075,347 B (i.e. ~0.48 MB MORE real content than the
+# failing query returned — the difference is what GitHub was silently
+# nulling), 15.1 s wall, zero errors on every page.
+#
+# WHY PARTIAL PAGES ARE DISCARDED, NOT SALVAGED. A partially-resolved
+# page nulls `reactions`. The EYES/ROCKET filter reads exactly that
+# field to decide a comment was already acked, so consuming partial data
+# would make every acked comment look eligible and re-emit the backlog.
+# Discarding the page and retrying next cycle is the only safe reading.
+#
+# WHY `sort:created-asc`. Cursor pagination over an unstable ordering can
+# SKIP an item when the set reorders mid-walk. Default search relevance
+# and `sort:updated` both reorder whenever an issue is touched — and the
+# walk takes ~15 s, during which a comment arriving on page 5's issue
+# would move it to page 1 and shift a page-6 issue out of view.
+# Creation time never changes, so `created-asc` is the only ordering
+# here that is immutable for a fixed result set.
+#
+# COVERAGE BOUNDARY (one sentence, on the axis the mechanism varies on —
+# the SIZE OF THE RESULT SET, since that is what pagination bounds):
+# this makes the fetch cost-safe for up to
+# `MONITOR_GRAPHQL_SEARCH_MAX_PAGES` × `MONITOR_GRAPHQL_SEARCH_PAGE_SIZE`
+# open issues (default 40 × 10 = 400) whose individual last-50-comment
+# payload fits one page's budget; beyond that page cap the walk stops
+# and says so loudly, and a SINGLE issue whose own last 50 comments
+# exceed the per-query budget fails its page every cycle — degrading
+# that page's ten issues, and, ONLY if that page also yields no usable
+# cursor, every LATER page with it.
+#
+# That second clause is load-bearing and was absent from the first
+# version of this comment (found by the #595 skeptic, req-001). The
+# original code `break`-ed on a partial page, so one bad page withheld
+# the entire TAIL — pages 2..N, not ten issues — and because earlier
+# pages HAD landed, the caller then recorded a SUCCESS, clearing the
+# degradation counter and leaving a throttled WARN as the only trace.
+# That is precisely the log-only invisibility this issue exists to
+# kill, reproduced one level down. Now a partial page is SKIPPED (its
+# `pageInfo` is shallow and normally survives the nulling that hits
+# deep `comments.nodes[].*` paths, so the walk continues from its
+# cursor), and any walk that still ends early sets
+# `_SEARCH_PAGES_TRUNCATED`, which the caller treats as degradation
+# rather than success — so a PERSISTENT truncation escalates
+# out-of-band like any other failing fetch on the operator channel.
+#
+# _snapshot_search_paged <surface> <query> <q> <out_file>
+#   <query> must declare ($q: String!, $first: Int!, $after: String) and
+#   select `search(... first: $first, after: $after)` with a
+#   `pageInfo { hasNextPage endCursor }`.
+# <out_file> receives one COMPACT JSON page per line — successful,
+#   COMPLETE pages only. It is a FILE and not stdout on purpose: this
+#   function must run in the CALLER's shell so its page-count globals
+#   survive (a `$(...)` capture would fork a subshell and silently
+#   discard them), and the caller's stdout is the live emit stream.
+# globals: _SEARCH_PAGES_TOTAL _SEARCH_PAGES_OK _SEARCH_PAGES_FAILED
+# return: 0 if at least one page succeeded, 1 if every page failed.
+_snapshot_search_paged() {
+    local surface="$1" query="$2" q="$3" out="$4"
+    # Set the counters BEFORE any early return: the caller reads them
+    # unconditionally, and under `set -u` an unset global is a hard
+    # error that would take the whole snapshot down on a condition as
+    # mundane as an unwritable temp file.
+    _SEARCH_PAGES_TOTAL=0; _SEARCH_PAGES_OK=0; _SEARCH_PAGES_FAILED=0
+    # Set when the walk ends EARLY — pages after this point were never
+    # fetched. Distinct from a failed page: a truncated walk withholds an
+    # unknown number of issues, so the caller must treat it as degradation
+    # rather than success (your-org/nexus-code#595 skeptic req-001).
+    _SEARCH_PAGES_TRUNCATED=0
+    : > "$out" 2>/dev/null || return 1
+    local page_size="${MONITOR_GRAPHQL_SEARCH_PAGE_SIZE:-10}"
+    [[ "$page_size" =~ ^[0-9]+$ && "$page_size" -gt 0 && "$page_size" -le 100 ]] || page_size=10
+    local max_pages="${MONITOR_GRAPHQL_SEARCH_MAX_PAGES:-40}"
+    [[ "$max_pages" =~ ^[0-9]+$ && "$max_pages" -gt 0 ]] || max_pages=40
+    local budget="${MONITOR_GRAPHQL_SEARCH_BUDGET_SECONDS:-180}"
+    [[ "$budget" =~ ^[0-9]+$ && "$budget" -gt 0 ]] || budget=180
+
+    local started; started=$(date +%s)
+    local cursor="" _err _stdout rc nerr hasnext
+    local -a argv
+    while (( _SEARCH_PAGES_TOTAL < max_pages )); do
+        # Wall-clock budget for the WHOLE walk. `_snapshot_graphql`
+        # bounds each individual call, but N bounded calls are still
+        # N×timeout unbounded in aggregate — and this runs on the async
+        # scheduler slot the wedge guard (#367) exists to protect.
+        if (( $(date +%s) - started >= budget )); then
+            _snapshot_progress "snapshot-github: ${surface} page walk hit ${budget}s budget after ${_SEARCH_PAGES_TOTAL} pages"
+            _SEARCH_PAGES_TRUNCATED=1
+            _graphql_search_partial_log "$surface" budget_exhausted \
+                "walk stopped after ${_SEARCH_PAGES_TOTAL} pages / ${budget}s; remaining issues not fetched this cycle"
+            break
+        fi
+        _SEARCH_PAGES_TOTAL=$(( _SEARCH_PAGES_TOTAL + 1 ))
+        _err=$(mktemp)
+        argv=(api graphql -f query="$query" -f q="$q" -F first="$page_size")
+        # An OMITTED nullable variable is null in GraphQL, which is what
+        # `after:` wants for the first page — so no cursor interpolation
+        # into the query string is ever needed.
+        [[ -n "$cursor" ]] && argv+=(-f after="$cursor")
+        _stdout=$(_snapshot_graphql "$_err" "${argv[@]}"); rc=$?
+        if (( rc != 0 )); then
+            _SEARCH_PAGES_FAILED=$(( _SEARCH_PAGES_FAILED + 1 ))
+            _SEARCH_PAGES_TRUNCATED=1
+            _watcher_handle_graphql_failure "$_err" "$surface"
+            rm -f "$_err"
+            break
+        fi
+        rm -f "$_err"
+        # CHECK THE PROPERTY, NOT THE PROXY. rc=0 means "gh was happy",
+        # not "this page is complete". GitHub returns HTTP 200 with a
+        # populated `data` AND a top-level `errors` array when it
+        # partially resolves; a page carrying any error has null fields
+        # (see the partial-page note above) and must not be consumed.
+        nerr=$(printf '%s' "$_stdout" | jq '(.errors // []) | length' 2>/dev/null)
+        [[ "$nerr" =~ ^[0-9]+$ ]] || nerr=0
+        if (( nerr > 0 )); then
+            _SEARCH_PAGES_FAILED=$(( _SEARCH_PAGES_FAILED + 1 ))
+            # SKIP THE PAGE, DO NOT ABANDON THE WALK. Breaking here
+            # would discard every LATER page too, so one pathological
+            # issue on page 2 would withhold pages 2..N — the whole tail
+            # — not its own ten issues. `pageInfo` is a shallow, cheap
+            # field and survives the nulling that hits deep
+            # `comments.nodes[].*` paths, so the cursor is normally
+            # still usable: take it and carry on, losing only this page.
+            # If it is NOT usable we genuinely cannot continue, and that
+            # is a TRUNCATED walk, flagged so the caller can escalate.
+            hasnext=$(printf '%s' "$_stdout" | jq -r '.data.search.pageInfo.hasNextPage // false' 2>/dev/null)
+            cursor=$(printf '%s' "$_stdout" | jq -r '.data.search.pageInfo.endCursor // empty' 2>/dev/null)
+            if [[ "$hasnext" == "true" && -n "$cursor" ]]; then
+                _graphql_search_partial_log "$surface" partial_resolution \
+                    "page ${_SEARCH_PAGES_TOTAL} returned ${nerr} field errors (fields nulled); page DISCARDED, walk CONTINUES from its cursor — reduce MONITOR_GRAPHQL_SEARCH_PAGE_SIZE (now ${page_size})"
+                continue
+            fi
+            if [[ "$hasnext" == "true" ]]; then
+                # More pages exist but we have no cursor to reach them:
+                # the TAIL is withheld, not just this page.
+                _SEARCH_PAGES_TRUNCATED=1
+                _graphql_search_partial_log "$surface" partial_resolution \
+                    "page ${_SEARCH_PAGES_TOTAL} returned ${nerr} field errors AND no usable cursor; walk TRUNCATED — every later page withheld this cycle. Reduce MONITOR_GRAPHQL_SEARCH_PAGE_SIZE (now ${page_size})"
+            else
+                # It was the LAST page: its own issues are withheld, but
+                # there is no tail behind it. Do NOT call that truncated
+                # — an accurate blast radius is the whole point of these
+                # messages.
+                _graphql_search_partial_log "$surface" partial_resolution \
+                    "final page ${_SEARCH_PAGES_TOTAL} returned ${nerr} field errors; page DISCARDED (no later pages exist, so no tail withheld). Reduce MONITOR_GRAPHQL_SEARCH_PAGE_SIZE (now ${page_size})"
+            fi
+            break
+        fi
+        # Same discipline one level down: "no errors" is not "is a search
+        # result". An empty or non-envelope body with rc=0 would otherwise
+        # count as a healthy page, clear the degradation counter, and read
+        # as a recovered surface — a green light for a fetch that returned
+        # nothing at all.
+        if [[ "$(printf '%s' "$_stdout" | jq -r 'try (.data.search | type) catch "none"' 2>/dev/null)" != "object" ]]; then
+            _SEARCH_PAGES_FAILED=$(( _SEARCH_PAGES_FAILED + 1 ))
+            _SEARCH_PAGES_TRUNCATED=1
+            _graphql_search_partial_log "$surface" malformed_page \
+                "page ${_SEARCH_PAGES_TOTAL} carried no .data.search object despite a clean exit; walk TRUNCATED — every later page withheld this cycle"
+            break
+        fi
+        printf '%s' "$_stdout" | jq -c '.' 2>/dev/null >> "$out"
+        _SEARCH_PAGES_OK=$(( _SEARCH_PAGES_OK + 1 ))
+        hasnext=$(printf '%s' "$_stdout" | jq -r '.data.search.pageInfo.hasNextPage // false' 2>/dev/null)
+        cursor=$(printf '%s' "$_stdout" | jq -r '.data.search.pageInfo.endCursor // empty' 2>/dev/null)
+        [[ "$hasnext" == "true" && -n "$cursor" ]] || break
+    done
+    if (( _SEARCH_PAGES_TOTAL >= max_pages )); then
+        _SEARCH_PAGES_TRUNCATED=1
+        _graphql_search_partial_log "$surface" page_cap \
+            "walk stopped at the ${max_pages}-page cap (${page_size}/page); issues past #$(( max_pages * page_size )) in creation order were NOT fetched this cycle"
+    fi
+    (( _SEARCH_PAGES_OK > 0 ))
+}
+
+# Throttled (once per 10 min per surface+reason) WARN for a walk that
+# completed only partially. Distinct from `graphql_failure` so a
+# coverage gap is never mistaken for a transport hiccup: silent
+# truncation reads as "covered everything" when it did not.
+_graphql_search_partial_log() {
+    local surface="$1" reason="$2" detail="$3"
+    [[ -d "${STATE_DIR:-}" ]] || return 0
+    local marker="${STATE_DIR}/graphql-partial-last-log-${surface}-${reason}"
+    local now last=0
+    now=$(date +%s)
+    [[ -f "$marker" ]] && last=$(<"$marker")
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( now - last >= 600 )) || return 0
+    local iso; iso=$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
+    _ensure_service_log "${STATE_DIR}/watcher-alerts.log"
+    printf '[%s] WARN %s graphql_partial_walk reason=%s %s\n' \
+        "$iso" "$surface" "$reason" "$detail" \
+        >> "${STATE_DIR}/watcher-alerts.log" 2>/dev/null || true
+    printf '%s\n' "$now" > "$marker" 2>/dev/null || true
+}
+
 _snapshot_issue_comments() {
     local processed_content="$1"
     _graphql_backoff_active issue_comments && return 0
-    local _err _stdout
-    _err=$(mktemp)
-    if ! _stdout=$(_snapshot_graphql "$_err" api graphql \
-        -f query='
-          query($q: String!) {
-            search(type: ISSUE, query: $q, first: 100) {
+    local _pages
+    _pages=$(mktemp)
+    _snapshot_search_paged issue_comments '
+          query($q: String!, $first: Int!, $after: String) {
+            search(type: ISSUE, query: $q, first: $first, after: $after) {
+              pageInfo { hasNextPage endCursor }
               nodes {
                 ... on Issue {
                   number
@@ -712,18 +1190,45 @@ _snapshot_issue_comments() {
               }
             }
           }' \
-        -f q="repo:${REPO} is:issue is:open"); then
-        _watcher_handle_graphql_failure "$_err" issue_comments
-        rm -f "$_err"
+        "repo:${REPO} is:issue is:open sort:created-asc" "$_pages"
+    if (( _SEARCH_PAGES_OK == 0 )); then
+        # Every page failed — the surface produced nothing this cycle.
+        # `_watcher_handle_graphql_failure` already logged the cause;
+        # this is the out-of-band escalation `#595` requires.
+        rm -f "$_pages"
+        _graphql_note_failure issue_comments total
         return 0
     fi
-    rm -f "$_err"
+    if (( _SEARCH_PAGES_FAILED > 0 )); then
+        # PARTIAL DELIVERY IS NOT SUCCESS (skeptic req-001). Gate on
+        # FAILED, not on truncation: ANY page we could not consume is a
+        # set of issues we did not see this cycle, whether or not the
+        # walk also stopped early. Calling `_graphql_note_success` here
+        # — which the first version did, because some pages had landed —
+        # would clear the degradation counter and leave a throttled WARN
+        # as the ONLY trace of the withheld issues. That is precisely
+        # the log-only invisibility this issue exists to kill,
+        # reproduced one level down. A one-off stays quiet; a PERSISTENT
+        # one escalates out-of-band like any other failing fetch on the
+        # operator channel. `truncated` vs `partial` only changes the
+        # message, because the blast radius genuinely differs: a tail of
+        # unknown size versus one known page.
+        if (( _SEARCH_PAGES_TRUNCATED == 1 )); then
+            _graphql_note_failure issue_comments truncated
+        else
+            _graphql_note_failure issue_comments partial
+        fi
+    else
+        _graphql_note_success issue_comments
+    fi
     # Author filter is NOT applied here — `_filter_to_user_author`
     # downstream gates every emit through a single chokepoint
     # (issue #86). EYES/ROCKET and processed-comments dedup stay
     # local; only the author rule moved.
-    printf '%s' "$_stdout" \
-    | jq -r --arg login "${USER_LOGIN}" --arg processed "$processed_content" '
+    # jq consumes the page file as a STREAM of JSON documents (one per
+    # line), so the per-comment filter below is unchanged from the
+    # single-query shape — each page is just another document.
+    jq -r --arg login "${USER_LOGIN}" --arg processed "$processed_content" '
         ($processed | split("\n") | map(select(. != ""))) as $ids
         | .data.search.nodes[]?
         | .number as $n
@@ -737,7 +1242,8 @@ _snapshot_issue_comments() {
         | (.body // "" | gsub("[\n\r\t]+"; " ")) as $b
         | "issue=\($n) id=\(.databaseId) author=\(.author.login)\n  body: "
           + (if ($b | length) > 400 then ($b[0:400] + "…") else $b end)
-      ' 2>/dev/null
+      ' < "$_pages" 2>/dev/null
+    rm -f "$_pages"
 }
 
 # PR conversation comments + PR review-thread (inline-on-diff)

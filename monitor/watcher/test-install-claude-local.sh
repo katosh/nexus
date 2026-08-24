@@ -264,7 +264,7 @@ seed_local_pin "$LOCALPIN"
 seed_existing_binary "$LOCALPIN"
 out=$(run_installer NPM_STUB_MODE=success NPM_STUB_VERSION="$LOCALPIN" 2>&1)
 rc=$?
-calls=$(grep -c '^install' "$NPM_LOG" 2>/dev/null || echo 0)
+calls=$(grep -c '^install' "$NPM_LOG" 2>/dev/null) || calls=0
 if (( rc == 0 )) && (( calls == 0 )) && grep -q 'already at' <<<"$out"; then
     ok "local pin + matching binary → idempotent fast-path, no npm call"
 else
@@ -351,7 +351,7 @@ echo "=== transient EBUSY/.nfs retry ==="
 new_fixture
 out=$(run_installer NPM_STUB_MODE=ebusy-then-success NPM_STUB_VERSION="$PIN" 2>&1)
 rc=$?
-calls=$(grep -c '^install' "$NPM_LOG" 2>/dev/null || echo 0)
+calls=$(grep -c '^install' "$NPM_LOG" 2>/dev/null) || calls=0
 if (( rc == 0 )) && [[ "$(binary_version)" == "$PIN" ]] && (( calls == 2 )); then
     ok "EBUSY then success → retried once, exit 0, binary present"
 else
@@ -361,7 +361,7 @@ fi
 # (10) A NON-EBUSY failure is NOT retried (single npm call, fail fast).
 new_fixture
 run_installer NPM_STUB_MODE=fail-no-binary >/dev/null 2>&1
-calls=$(grep -c '^install' "$NPM_LOG" 2>/dev/null || echo 0)
+calls=$(grep -c '^install' "$NPM_LOG" 2>/dev/null) || calls=0
 if (( calls == 1 )); then
     ok "non-EBUSY failure → no retry (single npm call)"
 else

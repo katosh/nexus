@@ -13,7 +13,15 @@
 #                   install + watcher restart) AND Step 5b (the
 #                   watchdog-observed orchestrator self-restart) —
 #                   refused without gate evidence + the surfaces-clear
-#                   attestation. THE ONLY PATH THAT WRITES THE PIN.
+#                   attestation AND a per-surface evidence class
+#                   (--surface-evidence 2a=… 2b=… 2c-paste=… 2c-vi=…
+#                   2d=… 2e=…; an `empirical` class additionally requires
+#                   a stated --negative-control) AND changelog
+#                   completeness (--changelog-evidence, --changelog-ledger,
+#                   --changelog-dispositioned <release>=<N> for EVERY
+#                   release in the delta, with N checked against the
+#                   entry count derived from the fetched changelog).
+#                   THE ONLY PATH THAT WRITES THE PIN.
 #   compat-pr auto  rule 4: check for an existing open compat PR on the
 #                   nexus-code repo; comment findings on it (rc 0), or
 #                   report none-found (rc 10 — the evaluator then
@@ -39,8 +47,15 @@
 #
 #   0   success (verb-specific)
 #   2   usage / unknown verb
-#   3   refused: gate evidence missing, stale, or not GREEN; or the
-#       --surfaces-clear attestation absent
+#   3   refused: gate evidence missing, stale, or not GREEN; the
+#       --surfaces-clear attestation absent; the per-surface evidence
+#       is missing/ill-formed (unknown class or surface key, a COMPOSITE
+#       surface labelled as a whole instead of per sub-claim, `empirical`
+#       without a negative control, `gate` for a surface no scenario in
+#       the supplied gate log covers); or the changelog accounting is
+#       incomplete (evidence missing/stale/not the candidate's, a release
+#       in the delta with no disposition, N != M for a release, or an
+#       entry absent from the ledger)
 #   4   install failed (pin rolled back)
 #   5   binary verification failed (pin rolled back)
 #   6   watcher restart failed (pin + install stand; NO orchestrator kill)
@@ -165,6 +180,17 @@ source "$_self_dir/watcher/_cc_auto_update.sh"
 # `_ensure_service_log` (your-org/nexus-code#484).
 # shellcheck source=_log-mode.sh
 source "$_self_dir/_log-mode.sh"
+# `_clone_drift_probe` / `_clone_drift_field` — the deployment gate's
+# staleness measurement, SHARED with the watcher's clone-drift detector
+# rather than re-implemented (your-org/nexus-code#754). Side-effect-free
+# on source: a sourced-guard plus function definitions, nothing else.
+# shellcheck source=watcher/_clone_drift.sh
+source "$_self_dir/watcher/_clone_drift.sh"
+# `nexus_integration_branch` — the ONE resolver for the branch merged
+# fixes land on (your-org/nexus-code#763). See `_gate_integration_branch`
+# below for why this gate must not resolve it on its own.
+# shellcheck source=_integration_branch.sh
+source "$_self_dir/_integration_branch.sh"
 
 PACKAGE="${MONITOR_CC_UPDATE_PACKAGE:-@anthropic-ai/claude-code}"
 COMPAT_REPO="${CC_AUTO_COMPAT_REPO:-your-org/nexus-code}"
@@ -207,6 +233,73 @@ MINT_CMD="${CC_AUTO_MINT_CMD:-$NEXUS_ROOT/monitor/mint-token.sh}"
 PROJECTS_DIR="${CC_AUTO_PROJECTS_DIR:-$HOME/.claude/projects}"
 
 GATE_EVIDENCE_MAX_AGE="${CC_AUTO_GATE_EVIDENCE_MAX_AGE_SECONDS:-21600}"
+# The changelog must have been fetched from source in THIS evaluation —
+# same freshness contract as the gate log, for the same reason (the
+# GUIDE's "re-fetch from source, never summarise from memory" rule is
+# otherwise unobservable from here).
+CHANGELOG_EVIDENCE_MAX_AGE="${CC_AUTO_CHANGELOG_EVIDENCE_MAX_AGE_SECONDS:-$GATE_EVIDENCE_MAX_AGE}"
+# How many bytes of each changelog entry must appear verbatim in the
+# ledger for that entry to count as dispositioned. Long enough to be
+# distinctive (the shortest entry across the whole upstream changelog is
+# 14 chars; a prefix is used, so short entries match in full).
+CHANGELOG_PROBE_CHARS="${CC_AUTO_CHANGELOG_PROBE_CHARS:-60}"
+# Where this run READS the changelog from. Note the wording: reads from,
+# not "the authoritative source". See the provenance note below — that
+# distinction is the whole of it.
+CHANGELOG_REPO="${CC_AUTO_CHANGELOG_REPO:-anthropics/claude-code}"
+CHANGELOG_FETCH_CMD="${CC_AUTO_CHANGELOG_FETCH_CMD:-}"
+
+# ---- PROVENANCE IS NOT ESTABLISHED, AND THIS SCRIPT DOES NOT CLAIM IT --
+#
+# Read this before adding a check that "closes" the changelog source.
+#
+# The completeness rule below counts entries and demands a disposition
+# for each. A natural next thought is that the counts are therefore
+# upstream-authoritative. THEY ARE NOT, and three consecutive attempts to
+# make them so failed in three different ways, each one a door left open
+# beside the door just shut:
+#
+#   round 3 — trusted `--changelog-evidence`, a caller-supplied FILE.
+#             Truncating it (19 entries -> 5) was accepted at rc 0.
+#   round 4 — re-fetched via `gh`, so the file no longer decided M. But
+#             CC_AUTO_CHANGELOG_FETCH_CMD is read from the caller's ENV;
+#             pointing it at a truncated copy was accepted at rc 0.
+#   round 5 — enumerated the four source-affecting env vars and labelled
+#             the summary OVERRIDDEN when any was set. But GH_CMD is the
+#             bare name `gh`, resolved through PATH: a fake `gh` earlier
+#             in PATH was accepted at rc 0, with the summary printing
+#             "M from a live upstream fetch" and no warning at all.
+#
+# The pattern is not three bugs. It is one category error: this script
+# runs the fetch as a SUBPROCESS, and a caller who controls the
+# environment controls subprocess resolution — env, PATH, cwd, the
+# filesystem. You cannot enumerate the ways a caller reaches a
+# subprocess, and each enumeration produces a summary line asserting a
+# provenance the next seam quietly falsifies. A false assurance is worse
+# than none: it is what the following round quotes as evidence.
+#
+# So the claim is DROPPED rather than defended. This script prints what
+# it can actually prove — that M was counted, and every entry
+# dispositioned, against the changelog THIS RUN READ — and says nothing
+# about where those bytes came from. No `_cl_provenance`, no override
+# enumeration, no WARN that goes quiet on the door nobody thought of.
+#
+# WHY THAT IS ACCEPTABLE, stated so nobody re-litigates it silently. The
+# threat this check was built for is a SELF-DECEIVING evaluator: the
+# 2.1.224 round asserted "both releases read in full" and left nine
+# entries undispositioned, believing it had read them. Against that, a
+# ledger demanding every entry verbatim works regardless of provenance.
+# It is NOT built for a deliberately adversarial caller, and could not
+# be: that caller already owns the bump path outright — CC_AUTO_INSTALL_CMD
+# alone decides which bytes get installed, whatever the changelog says.
+# Hardening the changelog source while the install command stays wide
+# open would be theatre.
+#
+# If provenance ever must be earned, the honest way is to verify the
+# BYTES against something the caller does not control — a digest or
+# signature published independently of the fetch path — not to block one
+# more door. Upstream publishes no such digest for CHANGELOG.md today,
+# which is precisely why this says nothing instead.
 IDLE_WAIT="${CC_AUTO_IDLE_WAIT_SECONDS:-900}"
 IDLE_POLL="${CC_AUTO_IDLE_POLL_SECONDS:-15}"
 ARM_WAIT="${CC_AUTO_ARM_WAIT_SECONDS:-600}"
@@ -315,6 +408,240 @@ _restart_eligible() {
 
 # _check_gate_evidence <file> <candidate> — rc 0 iff the file exists, is
 # fresh, names a GREEN gate, and mentions the candidate.
+# ---- surface evidence: the labelling rule, enforced -----------------------
+#
+# THE DEFECT THIS CLOSES. A cc-update evaluation clears five collision
+# surfaces (GUIDE 2a-2e). Historically it then passed a bare
+# `--surfaces-clear` and wrote a report table labelling surfaces
+# `(empirical)`. In five of six rounds at least one of those labels was
+# false: the probe was REACHABILITY-ONLY — it could not distinguish the
+# hazardous behaviour working from the hazardous behaviour absent — and
+# the attestation laundered that into "I tested it".
+#
+# Two documented failure modes, both of which this check names:
+#   * NO-OP PREFIX — the 2.1.216 / 2.1.222 VI-mode probe prefixed its
+#     paste with `send-keys i BSpace` to force VI insert mode. The harness
+#     booted panes in DEFAULT (emacs) mode THEN (it seeds `vim` since
+#     #724), so the prefix typed `i` and deleted it. Proven by differential control: removing the line left
+#     the probe passing identically.
+#   * DEAD INSTRUMENTATION — the 2.1.218 turn-counter regex never matched
+#     anything, yet every assertion built on it reported PASS.
+#
+# THE RULE. A surface may be labelled `empirical` ONLY if a differential
+# or negative control showed the probe can go RED — break the assertion,
+# or strip the behaviour under test, and observe a failure. Anything else
+# is `reachability` (the hazardous input path cannot be reached here) or
+# `source-inspection` (read the code, reasoned about it). `gate` means a
+# cc-harness scenario covered it, and is the only class this script can
+# verify on its own — so it does, against the gate log.
+#
+# COMPOSITE SURFACES — the 2.1.224 recurrence (6th in 7 rounds). A single
+# GUIDE surface can cover more than one mechanism, and the classes above
+# are per-KEY, so a surface whose halves have DIFFERENT evidence could
+# still attest the stronger class for the whole of it. Surface 2c is
+# exactly that: the paste-buffer DELIVERY path (genuinely driven every
+# round, with a real control) and the VI-INSERT guard (never yet driven —
+# the harness boots panes with no `editorMode` key at all, so the
+# `i BSpace` prefix is a no-op there; proven by differential control,
+# removing the line left the probe passing identically). Labelling the
+# pair `empirical` let the undriven half ride on the driven half's
+# evidence.
+#
+# TWO CORRECTIONS THIS CHECK MUST NOT REPEAT, both found by skeptics
+# INSIDE the commits that added the check:
+#
+#  * The control offered for "VI mode is unreachable" was seeding
+#    `editorMode: "vi"` and observing no indicator. That control CANNOT
+#    FIRE: strings from the pinned 2.1.224 binary give the schema enum as
+#    ["normal","vim"], the mode test as == "vim", and NO comparison
+#    against "vi" anywhere; `.catch(void 0)` discards an out-of-enum
+#    value silently. So seeding "vi" leaves the pane in `normal` on every
+#    release, and no indicator could ever render. A probe that cannot
+#    fail — offered as evidence, inside the change that refuses exactly
+#    that. Third consecutive round for this class. If you seed, seed
+#    "vim", and assert the indicator RENDERS before concluding anything
+#    from its absence.
+#  * `2c-vi` is NOT permanently inert, and THIS FILE IS SHARED ACROSS
+#    OPERATORS. On one operator's host `editorMode: "vim"` is set in both
+#    ~/.claude.json and ~/.claude/settings.json and ~90% of live agent
+#    panes render `-- INSERT --`; on another it is absent from every
+#    settings file and 0 panes render it (both measured 2026-08-07). So
+#    no host's configuration may be baked in here. The label is
+#    established PER HOST, at evaluation time, by running the GUIDE's two
+#    re-check commands — `reachability` only where they both return zero.
+#
+# The fix: 2c is SPLIT into `2c-paste` and `2c-vi`, so each half carries
+# its own class and — when it claims `empirical` — its own negative
+# control. The aggregate key `2c` is REFUSED with a pointer to the two
+# halves. The audit row additionally records the derived parent label as
+# the WEAKEST of its sub-claims (_class_rank below), so `2c` reads
+# `reachability` in decisions.tsv the moment either half is argued rather
+# than driven. Splitting the key rather than accepting a parent class +
+# an enumeration of sub-claims is deliberate: an enumeration is only as
+# complete as the enumerator, and "the sub-claim I did not declare" is
+# the same silence-as-evidence failure the whole check exists to stop.
+SURFACE_EVIDENCE_SUMMARY=""
+SURFACE_EVIDENCE=(); NEGATIVE_CONTROLS=()
+_SURFACE_KEYS=(2a 2b 2c-paste 2c-vi 2d 2e)
+_SURFACE_CLASSES=(gate empirical reachability source-inspection)
+# GUIDE surfaces that are labelled through sub-claim keys instead. The
+# parent is never a valid --surface-evidence key; it is only a derived
+# label in the audit row.
+_SURFACE_COMPOSITES=(2c)
+
+# _surface_subclaims <parent> — the sub-claim keys a composite surface is
+# labelled through, space-separated; empty for a leaf surface.
+_surface_subclaims() {
+    case "$1" in
+        2c) printf '2c-paste 2c-vi' ;;
+        *)  printf '' ;;
+    esac
+}
+
+# _class_rank <class> — evidence strength, for "weakest of the
+# sub-claims". The ONLY load-bearing property of this order is that the
+# DRIVEN classes (a machine-checked gate scenario; a probe with a stated
+# negative control) outrank the ARGUED ones (a measured claim about
+# reachability; reading the source) — so a composite can never read as
+# driven when half of it was argued. The order within each pair is a
+# convention, not a claim.
+_class_rank() {
+    case "$1" in
+        gate)              printf 4 ;;
+        empirical)         printf 3 ;;
+        reachability)      printf 2 ;;
+        source-inspection) printf 1 ;;
+        *)                 printf 0 ;;
+    esac
+}
+
+# _surface_key_check <key> <flag-name> — rc 0 iff <key> is a labelable
+# surface. Refuses the composite PARENT with the halves named (the
+# ergonomic case: `2c=` is what a caller reaches for out of habit) and
+# any other unknown key outright (a typo used to be silently ignored,
+# and then surfaced as the far less obvious "no evidence for surface X").
+_surface_key_check() {
+    local key="$1" flag="$2" k sub
+    for k in "${_SURFACE_KEYS[@]}"; do [[ "$key" == "$k" ]] && return 0; done
+    sub=$(_surface_subclaims "$key")
+    if [[ -n "$sub" ]]; then
+        note "REFUSED: $flag $key=… — surface $key is COMPOSITE and cannot carry one class. Label each sub-claim separately: $sub. A probe that drives one half and does not reach the other must not attest for both, and the halves routinely differ: for 2c the paste path is drivable everywhere, while the VI half's class depends on THIS host's editorMode setting and must be re-established each round."
+    else
+        note "REFUSED: $flag $key=… names no known surface (expected: ${_SURFACE_KEYS[*]})"
+    fi
+    return 1
+}
+
+# Which gate scenario substantiates a `gate` claim for a surface. A
+# surface with no entry here CANNOT be claimed as `gate`: nothing in the
+# harness covers it. 2d's entry is deliberately the PreToolUse scenario
+# and NOT test-realmodel-overlimit — the over-limit scenario wires
+# Stop/StopFailure, a DIFFERENT hook event, and crediting it for a
+# PreToolUse changelog entry is exactly the 2.1.222 mistake.
+_surface_gate_scenarios() {
+    case "$1" in
+        2a) printf 'test-realmodel-idle-busy test-realmodel-autosuggest' ;;
+        2b) printf 'test-realmodel-blocked-question' ;;
+        2d) printf 'test-realmodel-pretooluse-hook' ;;
+        *)  printf '' ;;
+    esac
+}
+
+_check_surface_evidence() {
+    local gate_log="$1"
+    local -A class_of=() ; local -A negctl_of=()
+    local item key val
+
+    for item in ${SURFACE_EVIDENCE+"${SURFACE_EVIDENCE[@]}"}; do
+        key="${item%%=*}"; val="${item#*=}"
+        if [[ "$key" == "$item" || -z "$val" ]]; then
+            note "REFUSED: --surface-evidence must be <surface>=<class>, got '$item'"
+            return 1
+        fi
+        _surface_key_check "$key" --surface-evidence || return 1
+        class_of["$key"]="$val"
+    done
+    for item in ${NEGATIVE_CONTROLS+"${NEGATIVE_CONTROLS[@]}"}; do
+        key="${item%%=*}"; val="${item#*=}"
+        if [[ "$key" == "$item" || -z "$val" ]]; then
+            note "REFUSED: --negative-control must be <surface>=<what showed the probe can fail>, got '$item'"
+            return 1
+        fi
+        # A control attached to the composite parent (or to a typo) would
+        # silently satisfy nothing, and the caller would then be refused
+        # for an `empirical` half that "has" a control.
+        _surface_key_check "$key" --negative-control || return 1
+        negctl_of["$key"]="$val"
+    done
+
+    local surface class known scen ok
+    for surface in "${_SURFACE_KEYS[@]}"; do
+        class="${class_of[$surface]:-}"
+        if [[ -z "$class" ]]; then
+            note "REFUSED: no --surface-evidence for GUIDE surface $surface. Every surface needs an explicit evidence class: ${_SURFACE_CLASSES[*]}. A surface you cleared by reasoning is 'reachability' or 'source-inspection' — say so; do not label it 'empirical'."
+            return 1
+        fi
+        known=0
+        for val in "${_SURFACE_CLASSES[@]}"; do [[ "$class" == "$val" ]] && known=1; done
+        if (( known == 0 )); then
+            note "REFUSED: surface $surface has unknown evidence class '$class' (allowed: ${_SURFACE_CLASSES[*]})"
+            return 1
+        fi
+
+        case "$class" in
+            empirical)
+                # The teeth. An `empirical` claim without a stated
+                # differential/negative control is the exact label the
+                # 2.1.216 and 2.1.222 rounds got wrong.
+                if [[ -z "${negctl_of[$surface]:-}" ]]; then
+                    note "REFUSED: surface $surface claims 'empirical' but carries no --negative-control $surface=<how you showed the probe can go RED>. A probe that cannot fail is not evidence — break the assertion or strip the behaviour under test and observe the red, then state it here. Known failure modes: a no-op input prefix (the VI-insert probe in a default-mode pane) and dead instrumentation (a regex that never matched). If you cannot produce one, the honest class is 'reachability' or 'source-inspection'."
+                    return 1
+                fi
+                ;;
+            gate)
+                # Verifiable, so verified: a `gate` claim must name a
+                # scenario that actually ran in THIS gate log.
+                scen=$(_surface_gate_scenarios "$surface")
+                if [[ -z "$scen" ]]; then
+                    note "REFUSED: surface $surface cannot be cleared by 'gate' — no cc-harness scenario covers it. Use 'empirical' (with a negative control), 'reachability', or 'source-inspection'."
+                    return 1
+                fi
+                ok=0
+                for val in $scen; do
+                    grep -qF "$val" "$gate_log" 2>/dev/null && ok=1
+                done
+                if (( ok == 0 )); then
+                    note "REFUSED: surface $surface claims 'gate' but the gate evidence ($gate_log) shows none of: $scen. Do not credit coverage from a scenario that exercised a different surface."
+                    return 1
+                fi
+                ;;
+        esac
+    done
+
+    # Record the labels in the audit trail so a later reviewer can see
+    # exactly what was claimed, per surface, without re-reading the report.
+    local summary=""
+    for surface in "${_SURFACE_KEYS[@]}"; do
+        summary+="${summary:+,}$surface=${class_of[$surface]}"
+    done
+    # …and, for each composite surface, the derived parent label: the
+    # WEAKEST of its sub-claims. This is the line a later reviewer reads
+    # as "how well was 2c actually covered" — it cannot say `empirical`
+    # while either half was merely argued.
+    local parent sub low lowclass rank
+    for parent in "${_SURFACE_COMPOSITES[@]}"; do
+        low=99; lowclass=""
+        for sub in $(_surface_subclaims "$parent"); do
+            rank=$(_class_rank "${class_of[$sub]}")
+            if (( rank < low )); then low=$rank; lowclass="${class_of[$sub]}"; fi
+        done
+        summary+=",$parent=$lowclass(weakest-of-subclaims)"
+    done
+    SURFACE_EVIDENCE_SUMMARY="$summary"
+    note "surface evidence accepted: $summary"
+    return 0
+}
+
 _check_gate_evidence() {
     local file="$1" candidate="$2"
     [[ -f "$file" ]] || { note "REFUSED: gate evidence file missing: $file"; return 1; }
@@ -334,6 +661,294 @@ _check_gate_evidence() {
         note "REFUSED: gate evidence does not mention candidate $candidate — wrong gate run?"
         return 1
     fi
+    return 0
+}
+
+# ---- changelog completeness: every entry, every release, with counts -----
+#
+# THE DEFECT THIS CLOSES. The GUIDE has said "account for EVERY entry"
+# since 2.1.217 — whose one missed entry was the whole defect — and it
+# was advisory, so nothing checked it. The 2.1.224 round asserted "both
+# releases read in full" and then tabulated 41 of 50 entries: the nine it
+# omitted included the `bypassPermissions` vs org-disable-policy fix (the
+# flag EVERY nexus spawn rides), the workflow-sandbox dynamic-`import()`
+# escape, and `sandbox.filesystem.denyWrite` covering the working
+# directory (this nexus runs inside agent-sandbox). Three of those had
+# been pre-flagged BY NAME in the spawn brief. The skeptic then verified
+# each is inert — which is the point: "no impact" was the DEFAULT, not a
+# claim anyone made. Same shape as 2.1.217's unread footer entry.
+#
+# WHAT IS ENFORCED. Four things, in increasing order of teeth:
+#
+#  0. THE CHANGELOG IS FETCHED HERE, from upstream, by this script. The
+#     first cut of this check trusted `--changelog-evidence` — a
+#     caller-supplied file, validated only by its mtime and a grep for
+#     the candidate heading. A skeptic truncated 2.1.223 from 19 bullets
+#     to 5, declared `2.1.223=5`, and was ACCEPTED at rc 0 with
+#     "dispositioned 36 of 36". Freshness was no obstacle: a hand-edited
+#     copy has a fresh mtime by construction. So M was never the
+#     caller's to assert only in the sense that they had to edit a file
+#     first — which is no obstacle at all. Now `_cl_fetch_changelog`
+#     mints a token and re-fetches `CHANGELOG.md` itself (the same
+#     `mint-token.sh` the deployment gate's PR probe uses), and EVERY
+#     count and entry below is read from THAT copy. A fetch that fails
+#     REFUSES: the cardinal rule is that uncertainty never bumps.
+#  1. `--changelog-evidence` is still required, still fresh, and must
+#     still carry the candidate's section — but its role is now
+#     narrower and honest: it is what the evaluator ACTUALLY READ, and
+#     it is CROSS-CHECKED against the upstream fetch section by section.
+#     A stale or doctored read is named as such instead of surfacing
+#     later as a confusing ledger failure.
+#  2. The RELEASE SET is derived from the UPSTREAM copy: every `## <ver>`
+#     section with installed < ver <= candidate. A two-release jump needs
+#     both. Deriving beats enumerating patch numbers — upstream skips
+#     versions routinely (39 gaps in the 2.1.x series), so an arithmetic
+#     range would demand dispositions for releases that do not exist.
+#  3. M (entries in a release) is COUNTED from the upstream fetch; N is
+#     the caller's `--changelog-dispositioned <ver>=<N>`, and N != M
+#     refuses. And because a count alone can be bluffed by an evaluator who
+#     believes they read everything, each entry must additionally appear
+#     VERBATIM in `--changelog-ledger` — one line per entry, quote plus
+#     disposition. That file is what makes N honest: the ledger is the
+#     artifact the report's table is built from.
+#
+# What is NOT checkable from here: whether a disposition is CORRECT. The
+# ledger's verdict text is unread. This check enforces that every entry
+# was looked at and written down — the failure mode that has actually
+# recurred — not that the judgment on it was right.
+CHANGELOG_SUMMARY=""
+CHANGELOG_DISPOSITIONS=()
+
+# _ver_lt <a> <b> — rc 0 iff version a sorts strictly before b.
+_ver_lt() {
+    [[ "$1" == "$2" ]] && return 1
+    local first
+    first=$(printf '%s\n%s\n' "$1" "$2" | sort -V | sed -n 1p)
+    [[ "$first" == "$1" ]]
+}
+
+# _cl_entries <file> <version> — the entry TEXT (bullet stripped), one
+# per line, for that release's section.
+#
+# NESTED BULLETS COUNT. This was anchored at `^- `, which silently
+# skipped an INDENTED sub-bullet: not counted into M, never demanded in
+# the ledger, and the run accepted at rc 0 — a sub-entry describing a
+# behaviour change would have passed entirely unread. The heading parser
+# fails CLOSED (a heading shape this cannot read simply is not in the
+# derived release set, and a missing candidate section refuses outright);
+# the bullet parser failed OPEN, which is the more dangerous half and is
+# exactly the sort of "the failure mode is safe" claim that stops people
+# looking. Any bullet at any indent, `-` or `*`, is now an entry needing
+# its own disposition. Upstream is flat today (0 indented bullets across
+# all 357 sections, measured 2026-08-07), so this changes no count now —
+# it removes a prospective silent pass, and over-counting is the safe
+# direction: it can only demand MORE accounting, never less.
+_cl_entries() {
+    awk -v want="$2" '
+        /^## /                              { sec = ($2 == want) ? 1 : 0; next }
+        sec && /^[[:space:]]*[-*][[:space:]]/ {
+            line = $0
+            sub(/^[[:space:]]*[-*][[:space:]]+/, "", line)
+            print line
+        }' "$1"
+}
+
+# _cl_entry_count <file> <version> — how many such entries.
+_cl_entry_count() {
+    _cl_entries "$1" "$2" | grep -c '' || true
+}
+
+# _cl_fetch_changelog — print the upstream CHANGELOG.md on stdout; rc
+# non-zero on any failure (mint, network, gh, base64). The caller treats
+# a failure as a REFUSAL, never as "no entries" — a silent zero here
+# would hand a clean bill of health to an unread changelog.
+#
+# `--jq .content` returns base64 WRAPPED at 60 cols. The `tr -d` is
+# DEFENSIVE, not load-bearing here: measured on this host (GNU coreutils
+# 8.28) against the live 668,667-byte / 10,963-line wrapped body, `base64
+# -d` with and without it produce byte-identical 493,278-byte output,
+# rc 0 both ways. Kept for the BSD/macOS `base64`, which is stricter.
+#
+# The earlier comment here claimed the wrapping was what broke a hand-run
+# — it was not, and the misattribution is worth recording. What actually
+# broke it was `gh api … 2>&1 | base64 -d`: with `gh` unauthenticated,
+# `2>&1` folded "Welcome to GitHub CLI! To authenticate…" into the pipe
+# and base64 choked on the prose. Reproduced deliberately (`GH_CONFIG_DIR=
+# /nonexistent` → `base64: invalid input`). The lesson is about `2>&1` on
+# a binary pipe, not about line wrapping — so this function keeps stderr
+# out of stdout, which is the part that matters.
+_cl_fetch_changelog() {
+    if [[ -n "$CHANGELOG_FETCH_CMD" ]]; then
+        "$CHANGELOG_FETCH_CMD"
+        return $?
+    fi
+    local token
+    token=$("$MINT_CMD") || return 1
+    [[ -n "$token" ]] || return 1
+    GH_TOKEN="$token" "$GH_CMD" api \
+        "repos/$CHANGELOG_REPO/contents/CHANGELOG.md" --jq '.content' \
+        | tr -d '\n' | base64 -d
+}
+
+# _check_changelog_completeness <changelog> <ledger> <installed> <candidate>
+_check_changelog_completeness() {
+    local file="$1" ledger="$2" installed="$3" candidate="$4"
+    local item key val ver
+
+    if [[ -z "$file" ]]; then
+        note "REFUSED: --changelog-evidence <file> is required — the changelog you fetched from source in THIS evaluation. It is cross-checked, section by section, against the copy this run fetches for itself."
+        return 1
+    fi
+    [[ -s "$file" ]] || { note "REFUSED: changelog evidence missing or empty: $file"; return 1; }
+    if [[ -z "$ledger" ]] || [[ ! -s "$ledger" ]]; then
+        note "REFUSED: --changelog-ledger <file> is required and must be non-empty — ONE LINE PER ENTRY, each line carrying the entry quoted verbatim plus its disposition (a surface, or an explicit 'no nexus surface'). A count on its own is an assertion; the ledger is what makes it checkable."
+        return 1
+    fi
+
+    local now mtime age
+    now=$(date +%s); mtime=$(stat -c %Y "$file" 2>/dev/null || echo 0)
+    age=$(( now - mtime ))
+    if (( age > CHANGELOG_EVIDENCE_MAX_AGE )); then
+        note "REFUSED: changelog evidence is ${age}s old (> ${CHANGELOG_EVIDENCE_MAX_AGE}s) — re-fetch it from source in this session, do not reuse a prior round's copy"
+        return 1
+    fi
+
+    # ---- the authoritative copy: fetched HERE, not supplied -----------
+    # Everything below counts and quotes from $fetched. The caller's
+    # file is only ever compared against it.
+    local fetched
+    fetched=$(mktemp "${TMPDIR:-/tmp}/cc-changelog-fetched.XXXXXX" 2>/dev/null) \
+        || { note "REFUSED: could not create a temp file for the changelog fetch"; return 1; }
+    if ! _cl_fetch_changelog > "$fetched" 2>/dev/null || [[ ! -s "$fetched" ]]; then
+        rm -f "$fetched"
+        note "REFUSED: could not fetch $CHANGELOG_REPO CHANGELOG.md (mint/network/gh failure, or an empty body). This REFUSES rather than falling back to the supplied file: the supplied file is exactly what an unverified count would rest on. Retry, or fix the token; the next daily fire retries on its own."
+        return 1
+    fi
+    # Every exit from here on must remove it.
+    _cl_done() { rm -f "$fetched" 2>/dev/null || true; }
+
+    # No provenance note here, deliberately. The previous revision
+    # WARNed when any of four named env vars was set, which read as an
+    # all-clear when none was — and PATH, which is not among them and
+    # cannot be enumerated, was enough to spoof the whole thing. Silence
+    # about an unknown is more honest than a green light. See the
+    # provenance note at the top of this file.
+
+    if ! grep -q "^## $candidate\$" "$fetched"; then
+        _cl_done
+        note "REFUSED: the $CHANGELOG_REPO CHANGELOG.md this run fetched has no '## $candidate' section — the candidate is not a published release there, or the changelog format changed under us. Not something to work around: establish what the candidate actually is."
+        return 1
+    fi
+    if ! grep -q "^## $candidate\$" "$file"; then
+        _cl_done
+        note "REFUSED: your --changelog-evidence has no '## $candidate' section — you read something other than the candidate's changelog (stale fetch? wrong file?)"
+        return 1
+    fi
+
+    # The release set, derived from the UPSTREAM copy. Empty `installed`
+    # means the effective version could not be resolved; fall back to the
+    # candidate alone and say so LOUDLY rather than silently checking
+    # nothing.
+    local -a releases=()
+    if [[ -z "$installed" ]]; then
+        note "WARN changelog: effective installed version unresolved — cannot derive the release delta; requiring the candidate's release only"
+        releases=("$candidate")
+    else
+        while IFS= read -r ver; do
+            [[ -n "$ver" ]] || continue
+            _ver_lt "$installed" "$ver" || continue      # ver > installed
+            _ver_lt "$candidate" "$ver" && continue      # ver <= candidate
+            releases+=("$ver")
+        done < <(awk '/^## /{print $2}' "$fetched" | sort -V)
+    fi
+    if (( ${#releases[@]} == 0 )); then
+        _cl_done
+        note "REFUSED: no section of the fetched changelog falls in the delta ($installed, $candidate] — the effective version and the candidate do not describe a real bump"
+        return 1
+    fi
+
+    local -A disp_of=()
+    for item in ${CHANGELOG_DISPOSITIONS+"${CHANGELOG_DISPOSITIONS[@]}"}; do
+        key="${item%%=*}"; val="${item#*=}"
+        if [[ "$key" == "$item" || -z "$val" ]]; then
+            _cl_done
+            note "REFUSED: --changelog-dispositioned must be <release>=<count>, got '$item'"
+            return 1
+        fi
+        if [[ ! "$val" =~ ^[0-9]+$ ]]; then
+            _cl_done
+            note "REFUSED: --changelog-dispositioned $key=$val — the count must be a number"
+            return 1
+        fi
+        local in_set=0 r
+        for r in "${releases[@]}"; do [[ "$key" == "$r" ]] && in_set=1; done
+        if (( in_set == 0 )); then
+            _cl_done
+            note "REFUSED: --changelog-dispositioned $key=… names a release outside the delta. Releases requiring a disposition, derived from the fetched changelog: ${releases[*]}"
+            return 1
+        fi
+        disp_of["$key"]="$val"
+    done
+
+    # One line per entry; collapse whitespace on BOTH sides so the ledger
+    # may be a markdown table, a list, or plain lines.
+    local ledger_norm
+    ledger_norm=$(sed 's/[[:space:]][[:space:]]*/ /g' "$ledger")
+
+    local total_m=0 total_n=0 summary="" m n sup_m entry probe missing miss_shown
+    for ver in "${releases[@]}"; do
+        m=$(_cl_entry_count "$fetched" "$ver")
+
+        # The caller's copy must BE the upstream copy for this section.
+        # Without this, `--changelog-evidence` is decoration: a truncated
+        # hand-edit passes every other check in this function (measured —
+        # 2.1.223 cut from 19 bullets to 5 was accepted at rc 0).
+        if ! diff -q <(_cl_entries "$fetched" "$ver") <(_cl_entries "$file" "$ver") \
+                >/dev/null 2>&1; then
+            sup_m=$(_cl_entry_count "$file" "$ver")
+            _cl_done
+            note "REFUSED: your --changelog-evidence does not match the changelog this run fetched, for release $ver — you have $sup_m entries, the fetched copy has $m. What you read is not what the fetch returned: re-fetch and re-read. (This is the check that makes the counts below mean anything; do not route around it by adjusting N.)"
+            return 1
+        fi
+
+        n="${disp_of[$ver]:-}"
+        if [[ -z "$n" ]]; then
+            _cl_done
+            note "REFUSED: release $ver is in the delta ($installed → $candidate) but carries no --changelog-dispositioned $ver=<N>. A multi-release jump means EVERY release's changelog, not just the candidate's — the 2.1.224 round read one table and left nine entries across two releases unaccounted for. $ver has $m entries in the fetched changelog."
+            return 1
+        fi
+        if (( n != m )); then
+            _cl_done
+            note "REFUSED: release $ver — dispositioned $n of $m entries. Every entry needs an explicit disposition, including the ones that map to no surface ('no nexus surface' IS a disposition; silence is not). M is counted from the changelog this run fetched, not from your file. (Where those bytes came from is NOT established — see the provenance note at the top of this file.)"
+            return 1
+        fi
+
+        # The teeth on N: every entry, verbatim, in the ledger.
+        missing=0; miss_shown=""
+        while IFS= read -r entry; do
+            [[ -n "$entry" ]] || continue
+            probe=$(printf '%s' "$entry" | sed 's/[[:space:]][[:space:]]*/ /g' \
+                        | cut -c1-"$CHANGELOG_PROBE_CHARS")
+            grep -qF -- "$probe" <<<"$ledger_norm" && continue
+            missing=$(( missing + 1 ))
+            (( missing <= 3 )) && miss_shown+="${miss_shown:+ | }${probe}"
+        done < <(_cl_entries "$fetched" "$ver")
+        if (( missing > 0 )); then
+            _cl_done
+            note "REFUSED: release $ver claims $n of $m entries dispositioned, but $missing of those $m entries do not appear verbatim in the ledger ($ledger). First $(( missing < 3 ? missing : 3 )) of $missing: $miss_shown. The ledger must carry ONE LINE PER ENTRY with the entry text quoted verbatim (no wrapping, no paraphrase — a paraphrase is where the information goes)."
+            return 1
+        fi
+
+        total_m=$(( total_m + m )); total_n=$(( total_n + n ))
+        summary+="${summary:+,}$ver=$n/$m"
+    done
+    _cl_done
+
+    # What this line may say is bounded by what was actually established:
+    # the counts, and that they were taken from the changelog this run
+    # read. NOT where those bytes came from — see the provenance note.
+    CHANGELOG_SUMMARY="dispositioned $total_n of $total_m entries across ${#releases[@]} release(s): $summary (M counted from the changelog this run read; provenance NOT established)"
+    note "changelog completeness accepted: $CHANGELOG_SUMMARY"
     return 0
 }
 
@@ -376,30 +991,101 @@ _gate_live_agent_windows() {
     return 0
 }
 
+# _gate_integration_branch — the branch merged fixes actually land on.
+#
+# ONE claimant, and as of your-org/nexus-code#763 that is enforced BY
+# CONSTRUCTION rather than by this comment asking nicely. The resolution
+# chain lives in `monitor/_integration_branch.sh` and both consumers —
+# this gate and the watcher's clone-drift detector — call it. Hardcoding
+# `dev` here would re-instantiate #754's defect one branch over: a literal
+# that is right today and silently wrong for any fork whose flow differs,
+# which is precisely how `main` came to be baked in. Re-deriving the chain
+# here would be worse still — two records of one property drift apart, and
+# the gate and the detector would then disagree about the same clone.
+#
+# This wrapper survives only as the named seam the gate's evidence row
+# refers to (`integration_branch=<b>`); it adds no logic of its own.
+_gate_integration_branch() {
+    nexus_integration_branch
+}
+
 # _deployment_gate <candidate> — rc 0: proceed. rc 1: DEFER the apply
 # (nothing bumped; the caller records + exits 30). Every deferral is a
 # complete result — the verdict stands recorded and the next daily fire
 # retries once conditions clear.
 #
-# Also records clone staleness vs origin/main (nexus-code#511's actual
-# gap): `decisions.tsv` used to read `target-window-unresolved=…` as if
-# it were a code bug while the live clone was 114 commits behind the fix.
-# One `behind_main=N` field collapses that whole misdiagnosis class.
+# Also records clone staleness (nexus-code#511's actual gap):
+# `decisions.tsv` used to read `target-window-unresolved=…` as if it were
+# a code bug while the live clone was 114 commits behind the fix. One
+# `behind_integration=N` field collapses that whole misdiagnosis class.
 # Staleness is WARN-only, deliberately: a stale clone runs the stale
 # apply.sh regardless, so a defer here could never have protected the
 # incident tree — surfacing is what was missing.
+#
+# THE MEASUREMENT IS DELEGATED, NOT RE-IMPLEMENTED (nexus-code#754). This
+# gate used to hand-roll `fetch origin main` + `rev-list HEAD..origin/main`,
+# which was wrong three separate ways, all of the same shape — a check
+# answering a question nobody asked:
+#
+#   1. WRONG BRANCH. PRs on this repo merge to the INTEGRATION branch;
+#      `main` lags it by weeks. Measured on the live primary at HEAD
+#      f0c9510: 5 behind `main`, 23 behind `dev`. Among those 23 was the
+#      #747 merge installing `monitor/_pane-live.sh` — the #745 guard whose
+#      absence lets a watcher paste kill the tmux server and take the whole
+#      sandbox down with it. The gate said "5 behind, proceed" about a clone
+#      missing the guard that makes the restart it authorizes survivable.
+#   2. STALE REMOTE-TRACKING REF. The fetch was `|| true`, and `rev-list`
+#      against `origin/<b>` then answers CONFIDENTLY from whatever the last
+#      successful fetch left behind. Measured on a fixture: after a failed
+#      fetch it reported `behind=5` as fact when the true distance was 11.
+#      A wrong number, not an `unknown`.
+#   3. `unknown` WAS SILENT. `[[ $behind =~ ^[0-9]+$ ]]` guarded the WARN,
+#      so "I could not measure" emitted no warning and no notification at
+#      all — indistinguishable from "up to date". That is #740's thesis
+#      ("could not look" collapsing into "nothing was wrong") living inside
+#      #754's gate.
+#
+# `_clone_drift_probe` (#620) already solves all three: it resolves the tip
+# from a LIVE `ls-remote` rather than a tracking ref, and returns a
+# TRICHOTOMY — `up-to-date` / `behind` / `unknown` — in which `unknown` is a
+# distinct, loud outcome. Two mechanisms answering "is this clone stale" is
+# one too many; this is the collapse, and the watcher's is the survivor.
 _deployment_gate() {
     local candidate="$1"
 
     # 1. Clone staleness (warn + record, never defer).
-    local behind="unknown"
+    local branch; branch=$(_gate_integration_branch)
+    local drift="unknown" behind="unknown" reason=""
     if [[ -d "$NEXUS_ROOT/.git" ]] && command -v git >/dev/null 2>&1; then
-        timeout 10 git -C "$NEXUS_ROOT" fetch --quiet origin main >/dev/null 2>&1 || true
-        behind=$(git -C "$NEXUS_ROOT" rev-list --count HEAD..origin/main 2>/dev/null) || behind="unknown"
+        # Best-effort fetch so the margin is measurable without a network
+        # round-trip per commit. Correctness does NOT depend on it: the
+        # probe takes the tip from a live `ls-remote` either way, so a
+        # failed fetch degrades the MARGIN to `unknown`, never the VERDICT
+        # to a stale number.
+        timeout 10 git -C "$NEXUS_ROOT" fetch --quiet origin "$branch" >/dev/null 2>&1 || true
+        local line; line=$(_clone_drift_probe "$NEXUS_ROOT" "$branch")
+        drift=$(_clone_drift_field "$line" verdict)
+        case "$drift" in
+            up-to-date) behind=0 ;;
+            behind)     behind=$(_clone_drift_field "$line" commits) ;;
+            *)          drift="unknown"; behind="unknown"
+                        reason=$(_clone_drift_field "$line" reason) ;;
+        esac
+    else
+        reason="no_git_or_not_a_clone"
     fi
-    if [[ "$behind" =~ ^[0-9]+$ ]] && (( behind > 0 )); then
-        note "WARN deployment-gate: this clone is $behind commits behind origin/main — the apply.sh executing right now may predate merged fixes. Deploy: git -C $NEXUS_ROOT pull --ff-only origin main"
-        notify "cc-auto-update: clone is $behind commits behind origin/main — merged fixes are not deployed"
+    # Three outcomes, three messages. "behind by an unmeasured margin" is
+    # NOT the same finding as "could not tell whether it is behind" — the
+    # first is a proven staleness, the second an unproven one.
+    if [[ "$drift" == "behind" ]] && [[ "$behind" =~ ^[0-9]+$ ]] && (( behind > 0 )); then
+        note "WARN deployment-gate: this clone is $behind commits behind origin/$branch — the apply.sh executing right now may predate merged fixes. Deploy: git -C $NEXUS_ROOT pull --ff-only origin $branch"
+        notify "cc-auto-update: clone is $behind commits behind origin/$branch — merged fixes are not deployed"
+    elif [[ "$drift" == "behind" ]]; then
+        note "WARN deployment-gate: this clone DIFFERS from origin/$branch but the margin could not be measured — the apply.sh executing right now may predate merged fixes. Deploy: git -C $NEXUS_ROOT pull --ff-only origin $branch"
+        notify "cc-auto-update: clone differs from origin/$branch (margin unmeasured) — merged fixes may not be deployed"
+    elif [[ "$drift" != "up-to-date" ]]; then
+        note "WARN deployment-gate: COULD NOT DETERMINE whether this clone is behind origin/$branch (reason=${reason:-unspecified}). 'Could not look' is NOT 'up to date' — treat this apply as running on a possibly-stale tree."
+        notify "cc-auto-update: could not determine clone staleness vs origin/$branch (${reason:-unspecified}) — staleness is UNVERIFIED, not clean"
     fi
 
     # 2. Open PRs touching the watcher restart path. The restart being
@@ -410,7 +1096,7 @@ _deployment_gate() {
     local pr_lines
     if ! pr_lines=$("${CC_AUTO_GATE_PR_CMD:-_gate_default_pr_probe}" 2>/dev/null); then
         note "DEFER: deployment-gate could not query open PRs on $GATE_REPO — cannot establish the restart path is unclaimed; deferring the apply (retried at the next daily fire)"
-        record_outcome "$candidate" "safe-deferred" "restart-path-pr-query-failed behind_main=$behind"
+        record_outcome "$candidate" "safe-deferred" "restart-path-pr-query-failed behind_integration=$behind integration_branch=$branch drift=$drift"
         return 1
     fi
     local hits="" prn path gp
@@ -425,7 +1111,7 @@ _deployment_gate() {
     done <<<"$pr_lines"
     if [[ -n "$hits" ]]; then
         note "DEFER: open PR(s) touch the watcher restart path ($hits on $GATE_REPO) — the restart mechanics are under repair; deferring the apply. A recorded, unapplied safe-to-bump is a complete result."
-        record_outcome "$candidate" "safe-deferred" "deferred-pending-${hits// /,} behind_main=$behind"
+        record_outcome "$candidate" "safe-deferred" "deferred-pending-${hits// /,} behind_integration=$behind integration_branch=$branch drift=$drift"
         notify "cc-auto-update: $candidate is safe but the apply is DEFERRED — $hits touches the watcher restart path"
         return 1
     fi
@@ -436,12 +1122,12 @@ _deployment_gate() {
     local windows count
     windows=$(_gate_live_agent_windows)
     count=$(awk 'NF { n++ } END { print n+0 }' <<<"$windows")
-    note "deployment-gate: live agent windows=$count (max=$GATE_MAX_LIVE_WINDOWS) behind_main=$behind restart-path PRs: none"
+    note "deployment-gate: live agent windows=$count (max=$GATE_MAX_LIVE_WINDOWS) behind_integration=$behind integration_branch=$branch drift=$drift restart-path PRs: none"
     _cc_auto_log_decision "$AUTO_DIR" "$candidate" "deployment-gate" \
-        "live_windows=$count behind_main=$behind restart_path_prs=none"
+        "live_windows=$count behind_integration=$behind integration_branch=$branch drift=$drift restart_path_prs=none"
     if (( GATE_MAX_LIVE_WINDOWS > 0 )) && (( count > GATE_MAX_LIVE_WINDOWS )); then
         note "DEFER: $count live agent windows > max $GATE_MAX_LIVE_WINDOWS ($(tr '\n' ' ' <<<"$windows")) — deferring the apply to a quieter fire"
-        record_outcome "$candidate" "safe-deferred" "live-windows=$count>max=$GATE_MAX_LIVE_WINDOWS behind_main=$behind"
+        record_outcome "$candidate" "safe-deferred" "live-windows=$count>max=$GATE_MAX_LIVE_WINDOWS behind_integration=$behind integration_branch=$branch drift=$drift"
         notify "cc-auto-update: $candidate is safe but the apply is DEFERRED — $count agent windows in flight (max $GATE_MAX_LIVE_WINDOWS)"
         return 1
     fi
@@ -499,11 +1185,18 @@ _watcher_restart_invariant() {
 
 cmd_safe() {
     local candidate="" gate_evidence="" surfaces_clear=0
+    local changelog_evidence="" changelog_ledger=""
+    SURFACE_EVIDENCE=(); NEGATIVE_CONTROLS=(); CHANGELOG_DISPOSITIONS=()
     while (( $# > 0 )); do
         case "$1" in
-            --candidate)      candidate="$2"; shift 2 ;;
-            --gate-evidence)  gate_evidence="$2"; shift 2 ;;
-            --surfaces-clear) surfaces_clear=1; shift ;;
+            --candidate)         candidate="$2"; shift 2 ;;
+            --gate-evidence)     gate_evidence="$2"; shift 2 ;;
+            --surfaces-clear)    surfaces_clear=1; shift ;;
+            --surface-evidence)  SURFACE_EVIDENCE+=("$2"); shift 2 ;;
+            --negative-control)  NEGATIVE_CONTROLS+=("$2"); shift 2 ;;
+            --changelog-evidence)      changelog_evidence="$2"; shift 2 ;;
+            --changelog-ledger)        changelog_ledger="$2"; shift 2 ;;
+            --changelog-dispositioned) CHANGELOG_DISPOSITIONS+=("$2"); shift 2 ;;
             *) note "safe: unknown arg $1"; exit 2 ;;
         esac
     done
@@ -519,14 +1212,45 @@ cmd_safe() {
         record_outcome "$candidate" "safe-refused" "gate-evidence"
         exit 3
     fi
+    # --surfaces-clear used to be a BARE attestation: `apply.sh:506` set a
+    # flag, `:514` refused without it, and it verified nothing at all. Five
+    # of six evaluation rounds then laundered a reachability argument into
+    # "I tested it" through that flag. It now requires the evidence CLASS
+    # per surface, and cross-checks the checkable ones. See the function.
+    if ! _check_surface_evidence "$gate_evidence"; then
+        record_outcome "$candidate" "safe-refused" "surface-evidence"
+        exit 3
+    fi
+    # Append-only audit row (does NOT touch last-eval, which must keep
+    # naming the terminal decision): what was claimed, per surface.
+    _cc_auto_log_decision "$AUTO_DIR" "$candidate" "surface-evidence" \
+        "$SURFACE_EVIDENCE_SUMMARY"
 
-    # Idempotency: already on the candidate → success no-op.
+    # The effective version is BOTH the idempotency check below and the
+    # lower bound of the changelog delta, so resolve it once, here.
     local effective
     effective=$(cc_version_effective "$NEXUS_ROOT/package.json" "$PACKAGE" "$NEXUS_ROOT" 2>/dev/null || true)
+
+    # Idempotency: already on the candidate → success no-op. This sits
+    # BEFORE the changelog check on purpose: a re-run against a bump that
+    # already landed must stay a clean no-op, and the delta
+    # (candidate, candidate] is empty, which the check would (correctly,
+    # but unhelpfully) refuse.
     if [[ "$effective" == "$candidate" ]]; then
         note "safe: effective version is already $candidate — nothing to do"
         exit 0
     fi
+
+    # Changelog completeness: every entry of every release in the delta,
+    # each with an explicit disposition, counted against the fetched
+    # changelog rather than asserted. See the function.
+    if ! _check_changelog_completeness "$changelog_evidence" "$changelog_ledger" \
+            "$effective" "$candidate"; then
+        record_outcome "$candidate" "safe-refused" "changelog-completeness"
+        exit 3
+    fi
+    _cc_auto_log_decision "$AUTO_DIR" "$candidate" "changelog-completeness" \
+        "$CHANGELOG_SUMMARY"
 
     # Single-flight lock (mkdir is atomic; stale-lock recovery is manual
     # by design — a torn apply needs eyes, not a silent re-run).
@@ -628,7 +1352,7 @@ cmd_safe() {
     # lost) — never kill in that state.
     local pin_file="$STATE_DIR/orchestrator-session-id" sid="" jsonl=""
     sid=$(tr -d '[:space:]' < "$pin_file" 2>/dev/null || true)
-    if ! printf '%s' "$sid" | grep -qE "$_UUID_RE"; then
+    if ! grep -qE "$_UUID_RE" <<<"$sid"; then
         note "ABORT restart: orchestrator session pin absent/malformed ($pin_file) — a kill now would COLD-SPAWN (context lost). Bump itself is complete."
         record_outcome "$candidate" "safe-bumped-restart-aborted" "stale-pin"
         notify "cc-auto-update: bumped to $candidate but orchestrator restart aborted (stale session pin) — workspace is version-split"
@@ -940,7 +1664,7 @@ cmd_restart_orchestrator() {
     # only an agent can FIX). Clear any stale armed marker first: the
     # marker's fresh write by THIS watchdog is the arm signal.
     rm -f "$STATE_DIR/restart-watchdog-armed" "$STATE_DIR/restart-watchdog-failed" 2>/dev/null || true
-    if "$TMUX_CMD" list-windows -F '#W' 2>/dev/null | grep -Fxq -- "$WATCHDOG_WINDOW"; then
+    if grep -Fxq -- "$WATCHDOG_WINDOW" <<<"$("$TMUX_CMD" list-windows -F '#W' 2>/dev/null)"; then
         "$TMUX_CMD" kill-window -t "$WATCHDOG_WINDOW" 2>/dev/null || true
     fi
     local wd_template="${CC_AUTO_WATCHDOG_PROMPT_TEMPLATE:-$NEXUS_ROOT/monitor/cc-auto-update-watchdog-prompt.md}"

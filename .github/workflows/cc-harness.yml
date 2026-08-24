@@ -18,25 +18,161 @@ name: cc-harness
 
 on:
   pull_request:
+    # `edited` so that retargeting a PR's base re-runs this gate; the base
+    # change emits no other event (<your-org>/nexus-code#604). The job is gated
+    # on the base having actually changed, so title edits are free.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
     branches: [main, dev]
     paths:
       - 'monitor/cc-harness/**'
       - 'monitor/pane-state.sh'
       - 'monitor/watcher/test-integration/test-realmodel-*.sh'
+      # <your-org>/nexus-code#568 D6. The realmodel scenarios SOURCE these two
+      # modules, so a change to either changes what this workflow proves —
+      # yet neither was in the filter. `_idle_probe.sh` alone is 4,031 lines
+      # and owns the idle/busy classification the scenarios exist to check.
+      # The result: the ONLY real-binary evidence for the idle/over-limit
+      # stack was invisible to changes in that stack.
+      - 'monitor/watcher/_idle_probe.sh'
+      - 'monitor/watcher/_over_limit.sh'
+      # RETAINED, but D6's stated reason for them was WRONG (<your-org>/nexus-
+      # code#765). D6 added these two as "the substrate every scenario runs
+      # on". They are not the substrate of THIS workflow's scenarios: the eight
+      # `test-realmodel-*.sh` files source `../_test_helpers.sh` and
+      # `../../cc-harness/_lib.sh`, and reference `_harness.sh` and
+      # `stub-claude.sh` ONLY IN COMMENTS — which is why the derived closure
+      # (PF001) does not reach them.
+      #
+      # The fact D6 was reaching for is true of a DIFFERENT population:
+      # `_harness.sh` is sourced non-comment by five INTEGRATION scenarios
+      # (graceful-exit-relaunch, spawn-busy-idle-absent, wrapup-retain-close,
+      # same-name-recycle, slow-grind-respawn) and does build the `claude`
+      # stub. Those run under `tests-slow-integration.yml`, not here. A true
+      # fact was attached to the wrong workflow's filter.
+      #
+      # Kept anyway, deliberately: over-inclusion costs runner minutes and
+      # never hides evidence, and both files are already gated by
+      # `tests-slow-integration.yml`'s coarse `monitor/**`, so removing them
+      # would buy nothing. Documented rather than silently corrected, because
+      # the next reader would otherwise re-derive the same false dependency.
+      - 'monitor/watcher/test-integration/_harness.sh'
+      - 'monitor/watcher/test-integration/stub-claude.sh'
+      # <your-org>/nexus-code#765 — D6 again, one level up, and this time DERIVED
+      # rather than enumerated by hand. Everything below is in this workflow's
+      # transitive execution closure: `run-tests.sh` is the runner the workflow
+      # itself invokes (line ~190), `_test_helpers.sh` is sourced by every
+      # realmodel scenario, and `install-claude-local.sh` — which installs the
+      # binary that IS the subject under test — sources `_cc-version.sh`,
+      # `_node-bootstrap.sh` and `_trash.sh` and execs `link-nexus-tools.sh`.
+      #
+      # D6 fixed this list by hand and left the runner out; the hand fix could
+      # not have done otherwise, because nothing recomputed the closure. So the
+      # list is no longer trusted to stay right: monitor/lint-workflows.py rule
+      # PF001 derives the closure from this file's own `run:` steps and FAILS
+      # when the filter does not cover it. That is what makes an enumerated
+      # filter safe here — and enumeration is worth keeping over a coarse
+      # `monitor/**`, because this job boots the real binary twice and a
+      # `monitor/**` filter would run it on every unrelated monitor change.
+      #
+      # PF001 is a lower bound (it cannot resolve a path built from a runtime
+      # variable) and says so when it runs. It is not a guarantee of coverage;
+      # it is a guarantee that the resolvable edges are covered.
+      - 'monitor/watcher/run-tests.sh'
+      - 'monitor/watcher/_test_helpers.sh'
+      - 'monitor/install-claude-local.sh'
+      - 'monitor/_cc-version.sh'
+      - 'monitor/_node-bootstrap.sh'
+      - 'monitor/_trash.sh'
+      - 'monitor/link-nexus-tools.sh'
+      # Found ONLY by the derivation, by neither #765 nor #568 D6: the
+      # scenarios load `pane-state.sh`, which sources `_idle_probe.sh`, which
+      # sources `../_submit_evidence.sh` at _idle_probe.sh:1788. Three hops and
+      # an inline `$(dirname "${BASH_SOURCE[0]}")` — which is exactly why no
+      # one reading the workflow ever wrote it down.
+      - 'monitor/_submit_evidence.sh'
+      # <your-org>/nexus-code#792. Both kill-guard lints in this workflow now
+      # SOURCE `monitor/shell-files.sh` for their file population, so a change
+      # to the derivation changes what this workflow proves. Caught by PF001,
+      # not by me — which is the rule working exactly as its comment above
+      # says: the enumerated list is not trusted to stay right, and the
+      # derivation is what keeps it honest. Worth recording because it is the
+      # same defect shape this PR is about, one level up: a guard whose
+      # population silently fails to include the thing it guards.
+      - 'monitor/shell-files.sh'
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/cc-harness.yml'
   workflow_dispatch:
 
+# The event CLASS is in the key, exactly as in tests.yml (<your-org>/nexus-code
+# #628, gap found by #736). Without it, a title/body edit produces a run whose
+# single job SKIPS (the `if:` below), and `cancel-in-progress: true` lets that
+# free skip-run EVICT the in-flight real run for the same head — leaving this
+# head with cancelled+skipped, zero real-binary evidence, and a rollup that
+# reads clean because neither conclusion is a `failure`. It bites exactly the
+# PRs that touch the renderer surface, where this harness is the ONLY evidence.
+#
+# The `-meta` predicate must mirror the job `if:`'s negation EXACTLY. A base
+# RETARGET is also an `edited` event, but per #604 its job RUNS (the `if:` keys
+# on `changes.base.ref.from`), so it is expensive and belongs in `-code`; keying
+# `-meta` on `action == 'edited'` alone would file it beside title-edit
+# skip-runs and re-instantiate the hole inside its own remedy. Job `if:` skips
+# iff (pull_request && edited && !base.ref.from); this key is its negation.
+# monitor/lint-workflows.py asserts that property over every
+# workflow in this directory, so the next one cannot be missed the way this one
+# was.
 concurrency:
-  group: cc-harness-${{ github.ref }}
+  group: cc-harness-${{ github.ref }}-${{ (github.event_name == 'pull_request' && github.event.action == 'edited' && !github.event.changes.base.ref.from) && 'meta' || 'code' }}
   cancel-in-progress: true
 
 jobs:
   realmodel-harness:
-    name: real binary + mock backend
+    name: real binary + mock backend (tui ${{ matrix.tui }})
+    if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # TUI-mode matrix (<your-org>/nexus-code#568, charter item 4).
+    #
+    # fullscreen (alternate-screen) rendering is an OPT-IN mode, NOT what the
+    # repo ships: `"tui": "fullscreen"` was reverted out of worker-settings.json
+    # and orchestrator-settings.json in b37bb68 (<your-org>/nexus-code#570, see
+    # #573), and neither file carries a `tui` key today -- so real workers run
+    # the binary's OWN default. Both modes are exercised here because #568 found
+    # the renderer drift this harness exists to catch shows up under fullscreen,
+    # and an operator can still opt back into it, so the mode has to keep
+    # working even though it is not the shipped one.
+    #
+    # This is also the one place tmux 3.x gets covered. The tmux-version matrix
+    # in tests.yml probes `paste-buffer -p` (#556), NOT the renderer/capture
+    # interaction, and the #568 fullscreen evidence was all gathered on a tmux
+    # 2.6 host. ubuntu-latest ships ~3.x, so the `fullscreen` cell here is what
+    # establishes whether that mode holds on modern tmux rather than being
+    # assumed to generalise from 2.6 -- and #573 is where it did NOT.
+    strategy:
+      fail-fast: false
+      matrix:
+        tui: [default, fullscreen]
+    # The `fullscreen` cell was ADVISORY until <your-org>/nexus-code#573: it
+    # FAILED on tmux ~3.x because an idle fullscreen pane's transcript hash
+    # churned (a right-aligned composer nudge blinking into the padded gap above
+    # the input box), so a stale engagement mark never expired -- the
+    # pinned-window risk, and why the fullscreen DEFAULT was reverted out of
+    # #570. #573 fixes `pane-state.sh::_content_hash` to strip those nudges;
+    # with the fix ALL six realmodel scenarios pass under `CCH_TUI=fullscreen`
+    # on tmux 3.4 (verified against the real binary), so the cell is now
+    # BLOCKING for both TUI modes -- an advisory cell that has started passing
+    # is itself a "green row nobody re-examines". `default` stays covered too.
+    # If a future Claude Code release drifts the nudge shape past the strip's
+    # alignment key, THIS is the cell that should catch it.
+    env:
+      # This job runs the real-binary scenarios SEQUENTIALLY (concurrent boots
+      # hit RLIMIT_NPROC, exit 144), so it passes no `--jobs` — which means
+      # NEXUS_TEST_JOBS=1 and th_deadline scales by ceil(1/2) = 1 on a 2-vCPU
+      # runner. Deadlines here poll a real Claude Code session's pane, the
+      # slowest thing this repo waits on, so the inert scale bit hardest
+      # exactly where the margin is thinnest. Enforced by lint-workflows.py
+      # TD001 (<your-org>/nexus-code#751, generalising #749).
+      NEXUS_TEST_DEADLINE_SCALE: 2
     steps:
       - uses: actions/checkout@v6
 
@@ -64,7 +200,33 @@ jobs:
         # postmortem 2026-05-29). Fail the job before running anything if a
         # cmdline-pattern kill reappears in harness code. Mirrors the gate.sh
         # pre-flight; runs here so every PR is guarded, not just version bumps.
-        run: monitor/cc-harness/lint-no-mass-kill.sh
+        #
+        # --selftest first: it is the negative control on the FILE LIST, which
+        # is what was silently broken (<your-org>/nexus-code#792 — both kill
+        # guards were blind to every extensionless executable in the repo,
+        # `monitor/ng` included, and no test noticed because nothing asserted
+        # which files get read).
+        run: |
+          monitor/cc-harness/lint-no-mass-kill.sh --selftest
+          monitor/cc-harness/lint-no-mass-kill.sh
+
+      - name: safety lint — tmux kill-server/kill-session must be socket-scoped
+        # The other axis. tmux resolves its socket as
+        #   -L/-S  >  $TMUX  >  TMUX_TMPDIR  >  default
+        # and $TMUX is ALWAYS set (every agent runs in a pane), so a test that
+        # isolates itself with TMUX_TMPDIR alone is not isolated: its
+        # kill-server lands on the real server, ending the session bwrap holds
+        # open and tearing down the whole sandbox (<your-org>/nexus-code#644 —
+        # five tear-downs in 33 minutes on 2026-07-30).
+        #
+        # --selftest is the NEGATIVE CONTROL and runs first: it asserts the
+        # lint FAILS on planted violations (including the #644 line verbatim)
+        # for the expected rule id, and pins the count of socket-scoping
+        # pragmas so an exemption cannot be added silently. A guard never
+        # observed failing is not evidence.
+        run: |
+          monitor/cc-harness/lint-no-tmux-server-kill.sh --selftest
+          monitor/cc-harness/lint-no-tmux-server-kill.sh
 
       - name: install the project-local Claude Code binary
         # The real binary is the subject under test. npm ci is fine on a
@@ -84,6 +246,15 @@ jobs:
             exit 1
           fi
           echo "Discovered ${#tests[@]} scenario(s)."
+          # CCH_TUI is consumed by cch_setup, which writes it into the
+          # harness's ISOLATED CLAUDE_CONFIG_DIR. Empty => leave the binary's
+          # own default (no settings key written at all).
+          if [ '${{ matrix.tui }}' != default ]; then
+            export CCH_TUI='${{ matrix.tui }}'
+            echo "TUI mode under test: $CCH_TUI"
+          else
+            echo "TUI mode under test: binary default (CCH_TUI unset)"
+          fi
           RUN_CC_HARNESS=1 bash monitor/watcher/run-tests.sh "${tests[@]}"
 
       - name: collect pane captures on failure

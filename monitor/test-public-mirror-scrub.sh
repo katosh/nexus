@@ -50,6 +50,8 @@ cp "$TOOLKIT/scrub.pl" "$TOOLKIT/build.sh" "$TOOLKIT/leak-gate.sh" "$REPO/pm/"
 # the corruption regression (files after the mapping leak) is exercised.
 cat > "$REPO/pm/mapping.tsv" <<'MAP'
 map	secretorg/tool	your-org/tool	<your-org>/tool
+map	secretorg/secretpack	your-org/genpack	<your-org>/genpack
+map	secretpack	genpack	genpack
 map	secretorg	your-org	<your-org>
 map	secretuser	operator	<operator>
 map	brandx/public	zzkeepasset9zz	zzkeepasset9zz
@@ -57,6 +59,7 @@ map	brandx	operator	<operator>
 map	zzkeepasset9zz	brandx/public	brandx/public
 map	priv-store	shared	shared
 deny	secretorg
+deny	secretpack
 deny	secretuser
 deny	brandx
 deny	priv-store
@@ -79,6 +82,15 @@ printf 'clone brandx/public and ping @brandx for review\n' > "$REPO/assets.txt"
 # its dash-slug form (Claude Code slugifies /priv-store/... to -priv-store-...),
 # which matches neither the slashed nor underscored literal (your-org/nexus-code#493).
 printf 'session dir: -priv-store-user-x-nexus\n' > "$REPO/slug.txt"
+# Group-namespaced remote whose middle token also appears BARE (models the
+# your-org/hpc-skills remote: a group-owned repo `ORG/pack` where `pack` is
+# also a standalone name in prose/paths, with a qualified `ORG/pack` rule, a
+# bare `pack` rule, AND a generic `ORG/` collapse). The ordering hazard: the
+# bare or generic rule could fire on a qualified occurrence first and leave a
+# half-scrubbed `ORG/newpack` or `neworg/pack`. Longest-first ordering must send
+# every `ORG/pack` straight to the single coherent `neworg/newpack`. Mirrors
+# install-hpc-skills.sh:42's `REMOTE_URL=...github.com/secretorg/secretpack.git`.
+printf 'REMOTE_URL="${PACK_REMOTE:-https://github.com/secretorg/secretpack.git}"\n' > "$REPO/pack-install.txt"
 
 ( cd "$REPO"
   git init -q
@@ -151,7 +163,7 @@ printf 'internal ref brandx/private here\n' > "$REPO/leak2.txt"
 cp "$WORK/map.tsv" "$REPO/pm/mapping.tsv"
 ( cd "$REPO" && git add pm/mapping.tsv )
 dg_out=$( cd "$REPO" && bash pm/leak-gate.sh "$WORK/map.tsv" . 2>&1 ); dg_rc=$?
-if [[ $dg_rc -ne 0 ]] && printf '%s' "$dg_out" | grep -qi 'excluded'; then
+if [[ $dg_rc -ne 0 ]] && grep -qi 'excluded' <<<"$dg_out"; then
     ok "leak-gate FAILS when the excluded dictionary is present in the tree"
 else
     no "leak-gate did not flag a present excluded dictionary (rc=$dg_rc): $dg_out"
@@ -162,9 +174,41 @@ fi
 #    Simulate by making the exclude path a non-removable read-only dir entry is
 #    fragile; instead assert the guard code path exists and the happy path
 #    already reported "verified absent".
-printf '%s' "$build_out" | grep -q 'verified absent' \
+grep -q 'verified absent' <<<"$build_out" \
     && ok "build.sh reports excludes verified-absent (survivor assertion active)" \
     || no "build.sh did not run the survivor assertion: $build_out"
+
+# 7. group-namespaced remote (models the your-org/hpc-skills remote).
+#    a) The built fixture's REMOTE_URL is a SINGLE coherent generic URL — no
+#       half-scrub (neither `secretorg/genpack` nor `your-org/secretpack`), and
+#       no surviving denied token (secretorg / secretpack).
+pi="$REPO/pack-install.txt"
+if grep -q 'https://github.com/your-org/genpack.git' "$pi" \
+   && ! grep -Eq 'secretorg|secretpack|your-org/secretpack|secretorg/genpack' "$pi"; then
+    ok "group-namespaced remote scrubs to a single coherent generic URL"
+else
+    no "group-namespaced remote incoherent after build: $(cat "$pi")"
+fi
+#    b) Ordering across remote FORMS: qualified `ORG/pack` must beat both the
+#       bare `pack` rule and the generic `ORG/` collapse for every occurrence
+#       shape (https, ssh, no-.git, bare, bare-adjacent). Drive scrub.pl directly
+#       (build drops the mapping; the gate copy at $WORK/map.tsv is the dictionary).
+scrub_bare(){ printf '%s' "$1" | perl "$TOOLKIT/scrub.pl" "$WORK/map.tsv" bare; }
+ord_ok=1
+while IFS='|' read -r in want; do
+    got=$(scrub_bare "$in")
+    [[ "$got" == "$want" ]] || { ord_ok=0; no "ordering: '$in' -> '$got' (want '$want')"; }
+    # No half-scrub / deny-tripping residue in any case.
+    case "$got" in *secretorg*|*secretpack*) ord_ok=0; no "ordering: residue in '$got'";; esac
+done <<'CASES'
+https://github.com/secretorg/secretpack.git|https://github.com/your-org/genpack.git
+git@github.com:secretorg/secretpack.git|git@github.com:your-org/genpack.git
+https://github.com/secretorg/secretpack|https://github.com/your-org/genpack
+secretorg/secretpack|your-org/genpack
+~/.cache/secretpack|~/.cache/genpack
+clone secretorg/secretpack ; note the bare secretpack|clone your-org/genpack ; note the bare genpack
+CASES
+[[ $ord_ok -eq 1 ]] && ok "group-namespaced remote: every occurrence shape scrubs coherently (no half-scrub)"
 
 echo
 if [[ $fail -eq 0 ]]; then

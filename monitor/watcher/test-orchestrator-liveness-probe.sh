@@ -225,7 +225,13 @@ if [[ -f "$LP" ]]; then
     written=$(cat "$LP")
     now_ts=$(date +%s)
     delta=$(( now_ts - written ))
-    if [[ "$written" =~ ^[0-9]+$ ]] && (( delta >= 0 )) && (( delta <= 3 )); then
+    # Window widened 3 s → 120 s (the your-org/nexus-code#557 class review).
+    # The claim is "record_paste wrote a FRESH epoch", and what it guards
+    # against is a stale or bogus value — fixture-planted epochs in this
+    # suite are hours old, and a non-numeric write is caught by the regex.
+    # Nothing is lost by allowing 120 s, and a 3 s window is a wall-clock
+    # assertion on a starved runner's scheduling latency.
+    if [[ "$written" =~ ^[0-9]+$ ]] && (( delta >= 0 )) && (( delta <= 120 )); then
         pass "_orchestrator_record_paste writes a fresh epoch (delta=${delta}s)"
     else
         fail "record_paste wrote invalid/old epoch: written='$written' delta=${delta}s"

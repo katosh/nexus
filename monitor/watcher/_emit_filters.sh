@@ -256,9 +256,18 @@ _filter_emit_cooldown() {
 # current epoch + body sha. Pulled out of the per-line loop so the
 # cooldown logic is testable in isolation and so the loop body stays
 # small.
+#
+# ATOMIC per-id decide+stamp (your-org/nexus-code#562 skeptic finding):
+# with `comment_surface` and `compose_emit` both running this filter
+# from concurrent async subshells, the bare read-modify-write let both
+# read a pre-cooldown meta for the SAME comment, both pass, and the
+# comment double-paste. A per-id flock around the decide+stamp
+# serializes them so exactly one passes. Bounded (`-w 5`) and fail-open
+# (timeout or no flock(1) → the historical unlocked behaviour: worst
+# case one rare duplicate emit, never a stall).
 _emit_cooldown_flush() {
     local hist_dir="$1" now="$2" cooldown="$3" header="$4" body_line="$5"
-    local id="" sha meta_ts meta_sha drop=0 meta_path
+    local id=""
     if [[ "$header" =~ id=([^[:space:]]+) ]]; then
         id="${BASH_REMATCH[1]}"
     fi
@@ -267,8 +276,26 @@ _emit_cooldown_flush() {
         [[ -n "$body_line" ]] && printf '%s\n' "$body_line"
         return
     fi
+    local meta_path="$hist_dir/comment-${id//[^A-Za-z0-9._-]/_}.meta"
+    if command -v flock >/dev/null 2>&1; then
+        local _cf_fd
+        if { exec {_cf_fd}>"$meta_path.lock"; } 2>/dev/null; then
+            # Timeout falls through to an unlocked decide (fail-open).
+            flock -w 5 "$_cf_fd" 2>/dev/null || true
+            _emit_cooldown_flush_decide "$now" "$cooldown" "$header" "$body_line" "$meta_path"
+            exec {_cf_fd}>&-
+            return
+        fi
+    fi
+    _emit_cooldown_flush_decide "$now" "$cooldown" "$header" "$body_line" "$meta_path"
+}
+
+# The unguarded decide+stamp core of `_emit_cooldown_flush` — read the
+# meta, drop-or-print, stamp on pass. Callers own any locking.
+_emit_cooldown_flush_decide() {
+    local now="$1" cooldown="$2" header="$3" body_line="$4" meta_path="$5"
+    local sha meta_ts meta_sha drop=0
     sha=$(printf '%s' "$body_line" | sha256sum 2>/dev/null | awk '{print $1}')
-    meta_path="$hist_dir/comment-$id.meta"
     meta_ts=0
     meta_sha=""
     if [[ -f "$meta_path" ]]; then
@@ -283,8 +310,8 @@ _emit_cooldown_flush() {
         printf '%s\n' "$header"
         [[ -n "$body_line" ]] && printf '%s\n' "$body_line"
         if [[ -n "$sha" ]]; then
-            printf 'ts=%s\nbody_sha=%s\n' "$now" "$sha" > "$meta_path.tmp.$$" \
-                && mv "$meta_path.tmp.$$" "$meta_path" 2>/dev/null || true
+            printf 'ts=%s\nbody_sha=%s\n' "$now" "$sha" > "$meta_path.tmp.$BASHPID" \
+                && mv "$meta_path.tmp.$BASHPID" "$meta_path" 2>/dev/null || true
         fi
     fi
 }

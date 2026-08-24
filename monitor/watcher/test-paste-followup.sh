@@ -101,7 +101,15 @@ if [[ "$cmd" == "list-windows" ]]; then
     fmt=""; prev=""
     for a in "$@"; do [[ "$prev" == "-F" ]] && fmt="$a"; prev="$a"; done
     case "$fmt" in
-        *window_id*) for w in ${MOCK_TMUX_WINDOWS:-}; do printf '@3\t%s\n' "$w"; done ;;
+        *window_id*)
+            # Delimiter EXTRACTED from the requested format, never assumed.
+            # Hardcoding a TAB here silently diverged from the resolver when it
+            # moved off TAB (your-org/nexus-code#699: a C/POSIX locale makes
+            # tmux rewrite a TAB in `-F` output, so every present window read
+            # as absent). A stub that hardcodes what it claims to parse fails
+            # the same way the code under test did.
+            d="${fmt#*'#{window_id}'}"; d="${d%%'#{window_name}'*}"
+            for w in ${MOCK_TMUX_WINDOWS:-}; do printf '@3%s%s\n' "$d" "$w"; done ;;
         *)           printf '%s\n' "${MOCK_TMUX_WINDOWS:-}" ;;
     esac
     exit 0

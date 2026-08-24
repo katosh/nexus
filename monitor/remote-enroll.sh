@@ -282,13 +282,14 @@ cmd_enroll() {
     local keypair; keypair=$(_safe_pubkey "$pubkey") || exit 2
 
     # Build the authorized_keys line PER COMMAND POLICY (RFC §4.2).
+    # POSTURE-AWARE from= pin (your-org/nexus-code#902): under a loopback bind
+    # the peer is the local end of the carrier tunnel, so the list must permit
+    # loopback or sshd refuses the key before our wrapper can exempt it.
     local from_cidr; from_cidr=$(_remote_from_cidr)
+    local from_list; from_list=$(_remote_from_pin_list) \
+        || die "enroll: from_cidr has illegal characters: $from_cidr"
     local from_opt=""
-    if [[ -n "$from_cidr" ]]; then
-        # crude CIDR/host sanity (no spaces, no quotes) — defence in depth.
-        [[ "$from_cidr" =~ ^[0-9A-Fa-f:.*/_,-]+$ ]] || die "enroll: from_cidr has illegal characters: $from_cidr"
-        from_opt="from=\"$from_cidr\""
-    fi
+    [[ -n "$from_list" ]] && from_opt="from=\"$from_list\""
     local policy; policy=$(_remote_command_policy)
     local ak="$d/authorized_keys" line
     if [[ "$policy" == unfiltered ]]; then
@@ -320,7 +321,11 @@ cmd_enroll() {
 
     local mode_desc="channel-only (forced-command, request-only)"
     [[ "$policy" == unfiltered ]] && mode_desc="unfiltered (sandbox-confined SHELL — arbitrary commands)"
-    warn "enrolled principal '$principal' — policy: $mode_desc${from_cidr:+, from=$from_cidr}. Token consumed."
+    # Report the pin AS WRITTEN, not the configured cidr it was derived from
+    # (your-org/nexus-code#902). Saying `from=<cidr>` while the line carries the
+    # posture-aware list is a small lie in exactly the place an operator reads to
+    # confirm what a credential permits.
+    warn "enrolled principal '$principal' — policy: $mode_desc${from_list:+, from=$from_list}. Token consumed."
     warn "  Authorized: $ak"
     warn "  The client connects with its PRIVATE key (which never left its host)."
 }
@@ -375,13 +380,15 @@ cmd_enroll_invite() {
 
     local d; d=$(_ensure_principals_dir)
     # Optional from= pin (mirror cmd_enroll): the enroll line AND the resulting
-    # channel line are pinned to the same source range.
+    # channel line are pinned to the same source range. Both route through
+    # _remote_from_pin_list, so the posture-awareness (#902) cannot drift
+    # between them — an enroll line the client cannot reach is exactly as fatal
+    # as a channel line it cannot reach.
     local from_cidr; from_cidr=$(_remote_from_cidr)
+    local from_list; from_list=$(_remote_from_pin_list) \
+        || die "enroll-invite: from_cidr has illegal characters: $from_cidr"
     local from_opt=""
-    if [[ -n "$from_cidr" ]]; then
-        [[ "$from_cidr" =~ ^[0-9A-Fa-f:.*/_,-]+$ ]] || die "enroll-invite: from_cidr has illegal characters: $from_cidr"
-        from_opt="from=\"$from_cidr\""
-    fi
+    [[ -n "$from_list" ]] && from_opt="from=\"$from_list\""
 
     # Mint the token first — its hash tags the enroll line + is baked into the
     # enroll session's forced command (binding the enroll key to this token).

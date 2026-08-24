@@ -29,11 +29,9 @@ REAL_GIT=$(command -v git) || { echo "FATAL: real git not found"; exit 1; }
 
 PASS=0
 FAIL=0
-assert_eq() {
-    local label="$1" got="$2" want="$3"
-    if [[ "$got" == "$want" ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
-    else printf '  FAIL: %s — got %q want %q\n' "$label" "$got" "$want" >&2; FAIL=$(( FAIL + 1 )); fi
-}
+# assert_eq / assert_contains come from _test_helpers.sh (sourced above).
+# A byte-identical local copy used to shadow the helper here — dead code by
+# definition, and the kind that quietly diverges (your-org/nexus-code#568 D8).
 assert_contains() {
     local label="$1" haystack="$2" needle="$3"
     if [[ "$haystack" == *"$needle"* ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))

@@ -168,8 +168,8 @@ assert_eq "(b) unchanged canonical past floor → heartbeat emits" "$suppress" "
 # lives at the call site, by design next to the canonical gate that
 # adjudicates those bodies.
 if grep -q 'full_state_due != 1' "$_test_dir/main.sh" \
-   && grep -A1 'full_state_due != 1' "$_test_dir/main.sh" \
-        | grep -q '_compose_emit_should_suppress'; then
+   && grep -q '_compose_emit_should_suppress' \
+        <<<"$(grep -A1 'full_state_due != 1' "$_test_dir/main.sh")"; then
     printf '  PASS: %s\n' "(b) dedup call site skips full_state_due bodies"; PASS=$(( PASS + 1 ))
 else
     printf '  FAIL: main.sh dedup call is not full_state_due-guarded — the safety-floor heartbeat can be swallowed by the 24h dedup quiet window\n' >&2
@@ -321,6 +321,12 @@ else
     mkdir -p "$STATE_DIR/decisions" "$STATE_DIR/skeptic/pending"
     touch "$STATE_DIR/skeptic/pending/sweeper"
     rm -f "$STATE_DIR/pending-decisions-emit-state.tsv"
+    # Shadow tmux so the dead-window re-stat (watcher-emit-noise, Class 3)
+    # treats the decision windows as LIVE — the suppression exercised here
+    # is the skeptic-park guard, not the window-liveness filter (both
+    # `sweeper` and `other` must be present for these assertions to isolate
+    # the park behaviour). Matches this test's function-override style.
+    tmux() { case "${1:-}" in list-windows) printf 'sweeper\nother\n' ;; *) : ;; esac; }
     cat > "$STATE_DIR/decisions/sweeper.dc87da1b7e4d.json" <<'EOF'
 {"window":"sweeper","fingerprint":"dc87da1b7e4d","kind":"idle_prompt","prompt_excerpt":"Claude is waiting for your input"}
 EOF

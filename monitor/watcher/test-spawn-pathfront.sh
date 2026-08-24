@@ -62,6 +62,9 @@ printf '#!/bin/sh\necho DECOY:gh\n' > "$DECOY/gh"; chmod +x "$DECOY/gh"
 
 # Simulated rc that re-prepends the decoy dir on every shell invocation.
 printf 'export PATH="%s:$PATH"\n' "$DECOY" > "$FAKE_HOME/.zshenv"
+# ...and on every INTERACTIVE shell (the ~/.zshrc linuxbrew re-prepend that
+# #578's snapshot-generating login+interactive shell hit).
+printf 'export PATH="%s:$PATH"\n' "$DECOY" > "$FAKE_HOME/.zshrc"
 PRIOR_BASH_ENV="$SB/prior-bash-env.sh"
 printf 'export PATH="%s:$PATH"\n' "$DECOY" > "$PRIOR_BASH_ENV"
 
@@ -146,6 +149,164 @@ if command -v zsh >/dev/null 2>&1; then
 else
     printf '  SKIP: zsh not installed — zsh spawn-shell coverage skipped (CI installs zsh)\n'
 fi
+
+# --- zsh INTERACTIVE spawn shell (your-org/nexus-code#578) -----------------
+# The prior zsh cases exercise `zsh -c` (non-interactive; sources .zshenv only).
+# The #578 defect lived one layer deeper: an INTERACTIVE zsh sources .zshrc,
+# which re-sources ~/.zshrc (linuxbrew re-prepend) — and the .zshrc proxy did
+# NOT re-front, so the bot-default gh wrapper got buried in exactly the shell
+# Claude Code snapshots for its Bash tool. This case pins the re-front in the
+# interactive/login proxies via front-path.zsh.
+echo "=== zsh INTERACTIVE spawn shell (#578) ==="
+if command -v zsh >/dev/null 2>&1; then
+    # WITH the real proxies: interactive zsh sources ~/.zshrc (decoy prepend)
+    # then front-path.zsh re-fronts — the wrapper + nexus tools must win.
+    out=$(
+        export NEXUS_ROOT="$REPO_ROOT" NEXUS_LOCALS="$FAKE_LOCALS"
+        # shellcheck disable=SC1090,SC1091
+        . "$REPO_ROOT/monitor/locals-env.sh"    # sets ZDOTDIR=real shellenv
+        ZSH_COMPDUMP="$SB/.zcompdump" HOME="$FAKE_HOME" zsh -ic "$RESOLVE"
+    )
+    assert_resolution "zsh INTERACTIVE WITH re-front" "$out"
+
+    # WITHOUT the re-front: a broken shellenv whose .zshrc re-sources ~/.zshrc
+    # but omits front-path.zsh — the decoy MUST shadow (proves the fixture bites
+    # and that the re-front is load-bearing, not incidental).
+    BROKEN_ZDOTDIR="$SB/broken-shellenv"; mkdir -p "$BROKEN_ZDOTDIR"
+    # .zshenv fronts the nexus (like the real one) so the ONLY difference under
+    # test is the missing interactive re-front.
+    cp "$REPO_ROOT/monitor/shellenv/.zshenv" "$BROKEN_ZDOTDIR/.zshenv"
+    cp "$REPO_ROOT/monitor/shellenv/front-path.zsh" "$BROKEN_ZDOTDIR/front-path.zsh"
+    printf '[ -r "$HOME/.zshrc" ] && . "$HOME/.zshrc"\n' > "$BROKEN_ZDOTDIR/.zshrc"
+    out=$(
+        export NEXUS_ROOT="$REPO_ROOT" NEXUS_LOCALS="$FAKE_LOCALS"
+        # shellcheck disable=SC1090,SC1091
+        . "$REPO_ROOT/monitor/locals-env.sh"
+        export ZDOTDIR="$BROKEN_ZDOTDIR"        # override the real one
+        ZSH_COMPDUMP="$SB/.zcompdump" HOME="$FAKE_HOME" zsh -ic "$RESOLVE"
+    )
+    assert_decoy_wins "zsh INTERACTIVE WITHOUT re-front" "$out"
+else
+    printf '  SKIP: zsh not installed — interactive zsh coverage skipped (CI installs zsh)\n'
+fi
+
+# ===========================================================================
+# locals-env.sh must MOVE-TO-FRONT, not prepend-if-absent (#578 repair).
+#
+# WHY this is the load-bearing case. The Bash tool does NOT re-front per
+# command: it runs `zsh -c "source <snapshot> && <cmd>"`, and the snapshot's
+# final `export PATH=` line CLOBBERS whatever $ZDOTDIR/.zshenv just did. That
+# frozen PATH is verbatim the PATH the `claude` process inherited from the
+# spawn launcher — so the launcher's `. locals-env.sh` is the ONLY chance to
+# get the order right. The old presence guard ("already in PATH → skip")
+# tested presence and ignored POSITION, so when `tmux new-window` handed the
+# worker's login zsh an env that already carried the wrapper dirs and
+# ~/.zshrc then re-prepended linuxbrew on top, locals-env declined to repair
+# the burial and the bad order was frozen into every snapshot.
+# ===========================================================================
+echo
+echo "== locals-env.sh move-to-front =="
+
+# Position (1-based) of an exact dir within a PATH string; empty if absent.
+_pos() { printf '%s' "$2" | awk -F: -v d="$1" '{for(i=1;i<=NF;i++) if($i==d){print i; exit}}' | head -1; }
+# Count of exact occurrences of a dir in a PATH string.
+_count() { printf '%s' "$2" | awk -F: -v d="$1" '{c=0; for(i=1;i<=NF;i++) if($i==d) c++; print c}'; }
+
+# HERMETIC: strip BASH_ENV/ZDOTDIR. Both point at the sibling re-front hooks
+# (shellenv/bash_env.sh, shellenv/.zshenv), which ALREADY move-to-front
+# correctly — leaving them set would front the dirs no matter what
+# locals-env.sh did, and this block would pass against the very defect it
+# exists to catch. This isolates locals-env.sh as the only actor.
+_clean_env=(env -u NEXUS_LOCALS -u NEXUS_ROOT -u NEXUS_LOCALS_PATH_ONLY
+            -u BASH_ENV -u NEXUS_PREV_BASH_ENV -u NEXUS_BASH_ENV_CHAINED -u ZDOTDIR)
+_source_path() {   # $1=shell  $2=initial PATH
+    "${_clean_env[@]}" NEXUS_ROOT="$REPO_ROOT" NEXUS_LOCALS="$FAKE_LOCALS" PATH="$2" \
+        "$1" -c ". '$REPO_ROOT/monitor/locals-env.sh' >/dev/null 2>&1; printf '%s' \"\$PATH\""
+}
+
+GHW="$REPO_ROOT/monitor/ghwrap"
+NTW="$REPO_ROOT/monitor/notifywrap"
+PPW="$REPO_ROOT/monitor/pipwrap"
+LBIN="$FAKE_LOCALS/bin"
+# The exact shape of the live failure: every nexus dir present but BURIED
+# behind a competing entry, as ~/.zshrc's linuxbrew re-prepend leaves it.
+# /usr/bin:/bin keep the spawned shell's own rc (Lmod's modules.sh) quiet.
+BURIED="$DECOY:$GHW:$NTW:$PPW:$LBIN:/usr/bin:/bin"
+
+# TEETH: the fixture must genuinely start buried, or the test proves nothing.
+if [[ "$(_pos "$GHW" "$BURIED")" == "1" ]]; then
+    bad "fixture sanity" "BURIED PATH already has ghwrap at front — test has no teeth"
+else
+    ok "fixture sanity (ghwrap starts buried at position $(_pos "$GHW" "$BURIED"))"
+fi
+
+for sh_bin in /bin/bash "$(command -v zsh 2>/dev/null)"; do
+    [[ -x "$sh_bin" ]] || continue
+    sh_name=$(basename "$sh_bin")
+
+    got=$(_source_path "$sh_bin" "$BURIED")
+    # ghwrap leads, then notifywrap, pipwrap, locals/bin — the established
+    # invariant, now reached from a buried start rather than an absent one.
+    if [[ "$(_pos "$GHW" "$got")" == "1" && "$(_pos "$NTW" "$got")" == "2" \
+       && "$(_pos "$PPW" "$got")" == "3" && "$(_pos "$LBIN" "$got")" == "4" ]]; then
+        ok "$sh_name: buried nexus dirs moved to front in order"
+    else
+        bad "$sh_name: buried nexus dirs moved to front in order" "got: $got"
+    fi
+
+    # A buried dir must be MOVED, not copied — no duplicate left behind.
+    n=$(_count "$GHW" "$got")
+    [[ "$n" == "1" ]] && ok "$sh_name: no duplicate ghwrap entry" \
+                      || bad "$sh_name: no duplicate ghwrap entry" "found $n copies"
+
+    # Pre-existing duplicates collapse to the single front copy.
+    got=$(_source_path "$sh_bin" "$DECOY:$GHW:/usr/bin:$GHW:/bin")
+    n=$(_count "$GHW" "$got")
+    [[ "$(_pos "$GHW" "$got")" == "1" && "$n" == "1" ]] \
+        && ok "$sh_name: duplicate ghwrap copies collapse to one at front" \
+        || bad "$sh_name: duplicate ghwrap copies collapse to one at front" "got: $got"
+
+    # Empty PATH elements mean "cwd" — dropping them would silently change
+    # resolution semantics for whoever set them. bash only: zsh normalises
+    # PATH through its `path` array tie and discards empty elements itself,
+    # before any nexus code runs, so there is nothing for us to preserve.
+    if [[ "$sh_name" == "bash" ]]; then
+        got=$(_source_path "$sh_bin" ":$DECOY::$GHW:/usr/bin:")
+        n=$(printf '%s' "$got" | awk -F: '{c=0; for(i=1;i<=NF;i++) if($i=="") c++; print c}')
+        [[ "$n" == "3" ]] && ok "$sh_name: empty PATH elements preserved" \
+                          || bad "$sh_name: empty PATH elements preserved" "expected 3 empties, got $n in: $got"
+    fi
+
+    # Sourcing twice must be a no-op the second time.
+    once=$(_source_path "$sh_bin" "$BURIED")
+    twice=$("${_clean_env[@]}" NEXUS_ROOT="$REPO_ROOT" NEXUS_LOCALS="$FAKE_LOCALS" PATH="$BURIED" \
+            "$sh_bin" -c ". '$REPO_ROOT/monitor/locals-env.sh' >/dev/null 2>&1; . '$REPO_ROOT/monitor/locals-env.sh' >/dev/null 2>&1; printf '%s' \"\$PATH\"")
+    [[ "$once" == "$twice" ]] && ok "$sh_name: idempotent across re-source" \
+                              || bad "$sh_name: idempotent across re-source" "once=$once twice=$twice"
+
+    # The internal helper must not leak into the sourcing shell.
+    leak=$("${_clean_env[@]}" NEXUS_ROOT="$REPO_ROOT" NEXUS_LOCALS="$FAKE_LOCALS" PATH="$BURIED" \
+           "$sh_bin" -c ". '$REPO_ROOT/monitor/locals-env.sh' >/dev/null 2>&1; command -v _le_front_dir 2>/dev/null || echo NONE")
+    [[ "$leak" == "NONE" ]] && ok "$sh_name: _le_front_dir does not leak into the shell" \
+                            || bad "$sh_name: _le_front_dir does not leak into the shell" "found: $leak"
+
+    # PATH-ONLY mode is the operator's OWN interactive shell. Its documented
+    # contract is that homebrew shadowing nexus tools there is deliberately
+    # fine — so a buried locals/bin must be left exactly where it is, and no
+    # wrapper dir may be added.
+    got=$("${_clean_env[@]}" NEXUS_LOCALS_PATH_ONLY=1 \
+          NEXUS_ROOT="$REPO_ROOT" NEXUS_LOCALS="$FAKE_LOCALS" PATH="$DECOY:$LBIN:/usr/bin:/bin" \
+          "$sh_bin" -c ". '$REPO_ROOT/monitor/locals-env.sh' >/dev/null 2>&1; printf '%s' \"\$PATH\"")
+    # Assert RELATIVE order, not an absolute index: a global rc outside our
+    # control (/etc/zshenv in the sandbox prepends /app/bin) shifts indices.
+    # The contract is that locals/bin stays BEHIND the competing dir.
+    p_l=$(_pos "$LBIN" "$got"); p_d=$(_pos "$DECOY" "$got")
+    if [[ -n "$p_l" && -n "$p_d" && "$p_l" -gt "$p_d" && "$(_count "$GHW" "$got")" == "0" ]]; then
+        ok "$sh_name: PATH-ONLY mode leaves a buried locals/bin untouched"
+    else
+        bad "$sh_name: PATH-ONLY mode leaves a buried locals/bin untouched" "got: $got"
+    fi
+done
 
 echo
 if [[ $FAIL -eq 0 ]]; then

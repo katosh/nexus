@@ -46,7 +46,7 @@ fixture_group_reap() {
         rest="${stat##*) }"
         read -r _ _ g _ <<<"$rest"
         [[ "$g" == "$pgid" ]] || continue
-        if tr '\0' '\n' < "$d/cmdline" 2>/dev/null | grep -qF "$tree"; then
+        if grep -qF "$tree" <<<"$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null)"; then
             ok=1; break
         fi
     done

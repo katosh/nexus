@@ -246,6 +246,55 @@ trap on_term TERM INT
 log "supervisor up: sshd=$SSHD bind=$BIND port=$PORT principals_dir=$PRINCIPALS_DIR"
 log "  (read-only attach: $(_remote_allow_attach && echo enabled || echo disabled))"
 
+# ── PERMANENT-FAILURE HANDLING (your-org/nexus-code#894) ─────────────────
+# A retry loop is right for a transient failure and wrong for a permanent one.
+# This supervisor used to have only the transient policy, so an address another
+# operator owns was retried 1,753 times and never escalated. These two functions
+# are the classification the loop was missing.
+
+PROBE_HOST=$(_remote_probe_host "$BIND")
+
+# Stop, durably and loudly. Called only on a DEFINITE foreign holder.
+enter_bind_blocked() {
+    local reason="$1"
+    log "PERMANENT FAILURE — NOT retrying."
+    log "  $reason"
+    log "  $(_remote_attribute_listener "$PORT")"
+    if _remote_record_bind_blocked "$PROBE_HOST" "$PORT" "$reason"; then
+        log "  recorded: $(_remote_bind_blocked_marker)"
+    else
+        log "  WARNING: could not write the bind-blocked marker (stopping anyway)"
+    fi
+    log "  This cannot clear by waiting. Do NOT signal the holder — a uid with no pid"
+    log "  attribution is another operator's process, outside this user+pid namespace."
+    log "  Operator remedy: move OUR port —"
+    log "    monitor/remote-up.sh --down && monitor/remote-up.sh   # re-selects + re-records"
+    log "  then re-inform every pinned client of the new host:port. Incident:"
+    log "    monitor/ng service-incident $REMOTE_SERVICE_NAME"
+    if command -v sandbox-notify >/dev/null 2>&1; then
+        sandbox-notify "CRITICAL: $REMOTE_SERVICE_NAME STOPPED — $PROBE_HOST:$PORT is held by a FOREIGN sshd (permanent; not retrying)" \
+            || log "  (the terminal bell failed — the marker + this log are the durable surfaces)"
+    fi
+}
+
+# Honour a marker from a previous run: re-verify rather than trust it. Still
+# permanent ⇒ exit WITHOUT spawning sshd (one bind probe per recovery sweep,
+# not a process spawn per minute). Cleared ⇒ delete it and run normally, so the
+# service revives on its own the moment the foreign holder goes away.
+if _remote_bind_blocked; then
+    # Called DIRECTLY — a `$( )` capture would discard the reason globals.
+    if _remote_bind_failure_class "$PROBE_HOST" "$PORT" 5; then
+        if _remote_bind_blocked_should_log; then
+            log "still BIND-BLOCKED on $PROBE_HOST:$PORT — not launching sshd."
+            log "  $_REMOTE_BINDFAIL_REASON"
+            log "  (this notice is rate-limited; the marker is $(_remote_bind_blocked_marker))"
+        fi
+        exit 78          # EX_CONFIG: a condition an operator must resolve
+    fi
+    log "bind-blocked marker CLEARED — $PROBE_HOST:$PORT is usable again; resuming normal operation"
+    _remote_clear_bind_blocked
+fi
+
 delay="$RESTART_DELAY"
 while true; do
     # Re-check the gate each loop: a `remote-up.sh --down` (row removed)
@@ -313,6 +362,18 @@ while true; do
     wait "$SSHD_CHILD"; rc=$?
     SSHD_CHILD=''
     if (( rc == 0 )); then delay="$RESTART_DELAY"; fi   # clean exit → reset backoff
+    # CLASSIFY BEFORE RETRYING (your-org/nexus-code#894). Only a non-zero exit
+    # can be a bind failure; a clean exit is a stop, not a collision. `permanent`
+    # requires EADDRINUSE *and* a DEFINITE not-ours identity — an INDETERMINATE
+    # verdict stays in the retry policy, because a don't-know is not a verdict.
+    if (( rc != 0 )); then
+        # Called DIRECTLY — a `$( )` capture would discard the reason globals.
+        if _remote_bind_failure_class "$PROBE_HOST" "$PORT" 5; then
+            log "sshd exited rc=$rc"
+            enter_bind_blocked "$_REMOTE_BINDFAIL_REASON"
+            exit 78
+        fi
+    fi
     log "sshd exited rc=$rc — restarting in ${delay}s"
     sleep "$delay" & wait $! 2>/dev/null
     # capped exponential backoff so a persistently-failing sshd (port taken,

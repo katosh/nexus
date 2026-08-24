@@ -70,8 +70,8 @@ one of them.
   [Operating → Reports](https://katosh.github.io/nexus/operating/reports/).
 - **Distils orchestration patterns into reusable skills.** Files
   under `skills/nexus.*/SKILL.md` carry the safety floor every
-  worker inherits (bot identity, no `--no-verify`, no force-push,
-  report convention) and the orchestrator's window-cleanup
+  worker inherits (bot identity, no `--no-verify`, no force-push
+  to a shared branch, report convention) and the orchestrator's window-cleanup
   policy. Editing one file updates every subsequent worker. Deep
   dive:
   [Reference → Skills](https://katosh.github.io/nexus/reference/skills/).
@@ -244,14 +244,10 @@ behaviour changes), open an issue first to align on scope.
 
 ## Maintainer & lineage
 
-Built and maintained at the
-[<your-lab>](https://research.<your-institution>.example/<your-lab>/en.html) at the
-<your-institution> to coordinate research code work
-across many parallel projects. The lab's specific HPC deployment
-notes (the `<login-node>` → `<shared-node-tool>` → shared-HPC-node pattern, the
-`<hpc-mount>` filesystem layout, the `<hpc-skills>` add-on) live in
-the [<your-lab> addendum](https://katosh.github.io/nexus/admin/site-addendum/);
-nothing in the main guide depends on them.
+Built and maintained to coordinate research code work across many
+parallel projects. Deployment-specific notes — persistent-host
+patterns, shared-filesystem layout, and optional general HPC skill
+packs — are kept out of this guide so it stays deployment-neutral.
 
 The architecture is agent-agnostic; the reference orchestrator is
 [Claude Code](https://docs.claude.com/en/docs/claude-code/overview).

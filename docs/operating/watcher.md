@@ -59,7 +59,7 @@ The header and the `--- dashboard ---` footer are always present; everything bet
 | local diff | At least one of `reports/`, `tmux`, or any `work/<project>` HEAD changed. |
 | `--- eligible github comments ---` | One or more comments passed the eligibility filter. |
 | `--- standing bells ---` | A non-orchestrator window has bell=1 (silenced after emit so the next ring re-fires). |
-| `--- pending decisions ---` | One or more structured decision records await the operator (sourced from `monitor/.state/decisions/*.json`; ack by removing the cited file). |
+| `--- pending decisions ---` | One or more structured decision records await the operator, **and their panes are not already busy** (sourced from `monitor/.state/decisions/*.json`; ack with `ng decision-ack <window> <fp>` — removing the file does *not* stick, `#790`). |
 | `--- idle workers ---` | One or more workers transitioned across the idle threshold this cycle. |
 | `--- workspace snapshot ---` | Periodic full-state snapshot (every Nth emit), giving a cumulative view between the narrow transition emits. |
 | `--- dashboard ---` | Always present. Last-updated timestamp; if it's > 2h old the orchestrator is nudged to refresh via `ng dashboard put`. |

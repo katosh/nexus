@@ -102,7 +102,7 @@ note "new orchestrator pane pid $new_pid"
 # 4. verify
 n=$(tmux list-windows -F '#{window_name}' | grep -cx "$TARGET")
 (( n == 1 )) || fail "$n $TARGET windows — duplicate respawn (PR 214 class)"
-tmux list-windows -F '#{window_name}' | grep -qi standdown \
+grep -qi standdown <<<"$(tmux list-windows -F '#{window_name}')" \
     && fail "stand-down window present — duplicate respawn occurred"
 if [[ -n "${watcher_pid:-}" ]]; then
     kill -0 "$watcher_pid" 2>/dev/null \
@@ -142,8 +142,8 @@ VDEADLINE=$(( DEADLINE + GRACE_SECONDS ))
 last_size=$base_size
 diag() { printf '%s poll: %s\n' "$(date -Is)" "$*" >> "$LOG" 2>/dev/null || true; }
 while :; do
-    tail -c +$(( base_size + 1 )) "$jsonl" 2>/dev/null \
-        | grep -qF "\"version\":\"$candidate\"" && break
+    grep -qF "\"version\":\"$candidate\"" \
+        <<<"$(tail -c +$(( base_size + 1 )) "$jsonl" 2>/dev/null)" && break
     now=$(date +%s)
     cur_size=$(stat -c%s "$jsonl" 2>/dev/null || echo "$last_size")
     (( cur_size > last_size )) && last_size=$cur_size

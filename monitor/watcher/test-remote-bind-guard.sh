@@ -41,7 +41,7 @@ SUP="$MON_DIR/remote-sshd-supervised.sh"
 # mask the fail-closed assertion. Pin every knob to a throwaway fixture with an
 # EMPTY remote block so an unset/empty env var resolves to "" (not the live pin)
 # — env overrides still win per-case (env is checked before the file).
-WORK=$(mktemp -d -t nexus-bindguard-XXXXXX); trap 'rm -rf "$WORK"' EXIT
+WORK=$(mktemp -d -t nexus-bindguard-XXXXXX)
 HERMETIC_CFG="$WORK/nexus.yml"
 cat >"$HERMETIC_CFG" <<'YML'
 monitor:
@@ -50,6 +50,18 @@ monitor:
     from_cidr: ""
 YML
 export NEXUS_CONFIG="$HERMETIC_CFG"
+
+# …and pin the CREDENTIAL STORE too. `_remote_bind_guard` now reconciles the
+# configured from_cidr against the live authorized_keys (your-org/nexus-code#609
+# item 4), so an unpinned `principals_dir` made this suite read the OPERATOR'S REAL
+# ~/.claude/nexus-remote/authorized_keys — and every "routable + pin → PASS" case
+# started failing off production credential state. The suite already pins
+# NEXUS_CONFIG for exactly this reason; the credential store was the half nobody
+# had needed to isolate yet. Fixture dir must live under $HOME/.claude at 0700 or
+# _remote_principals_guard (correctly) refuses it.
+export MONITOR_REMOTE_PRINCIPALS_DIR="$HOME/.claude/principals-bindguard-$$"
+mkdir -p "$MONITOR_REMOTE_PRINCIPALS_DIR"; chmod 700 "$MONITOR_REMOTE_PRINCIPALS_DIR"
+trap 'rm -rf "$WORK" "$MONITOR_REMOTE_PRINCIPALS_DIR"' EXIT
 
 # Run _remote_bind_guard with a given (bind, cidr); echo PASS|REFUSE.
 guard() {

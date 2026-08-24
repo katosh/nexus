@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+# monitor/proc-kill-authorized — "may I kill this pid?", as an ALLOWLIST
+# with a default-DENY arm (your-org/nexus-code#851).
+#
+# THE INCIDENT. A worker stopping its own oversized test run built a kill
+# list by filtering `ps` output with a DENYLIST (`grep -v` on a few sibling
+# clone names) and killed everything else matching `run-tests`. It reaped
+# SIBLING agents' runs: two bash-5.2 legs died EXIT=143 mid-run, plus three
+# unattributable `run-tests.sh` pids.
+#
+# WHY NAME MATCHING CANNOT WORK, which is the crux. The siblings were
+# invoked cwd-relative (`bash monitor/watcher/run-tests.sh --jobs 4`), so
+# their `args` carried no clone path at all. A sibling's argv is
+# BYTE-IDENTICAL to your own. There is no string to filter on — the
+# information is not in `args`, and a deleted cwd (routine for
+# fixture-spawned processes) removes path attribution too. So every
+# name-based or path-based predicate has a permissive default arm by
+# construction, which is the class `bk_pane_kill_authorized` already fixed
+# for PANES and `bash-footgun-patterns.conf`'s `pkill-self` rows already
+# fixed for SELF-match. This is the third shape: a kill list that reaps
+# SIBLINGS.
+#
+# ---------------------------------------------------------------------------
+# WHY SESSION ID, AND NOT THE ANCESTRY WALK THE ISSUE PROPOSED
+# ---------------------------------------------------------------------------
+#
+# `#851` proposed walking `ppid` until it terminates at the caller's own
+# driver pid. That is the right INSTINCT (establish ownership structurally,
+# default-deny) and the wrong PRIMITIVE, and it fails on the very class it
+# was written for. Measured live on this host while designing it:
+#
+#     PID  PPID  PGID   SID  COMMAND
+#     363     1 21457 21457  bash /tmp/nexus-orphan-discovery-…/serve-supervised.sh
+#     554     1 15404 15404  bash /tmp/nexus-orphan-discovery-…/serve-supervised.sh
+#     555     1 34571 17312  bash /tmp/nexus-orphan-discovery-…/serve-supervised.sh
+#
+# `ppid` is 1 — already REPARENTED — while `sid` is intact. The proposed
+# walk terminates at 1, compares `1 != MY_DRIVER_PID`, and refuses. Safe
+# direction, but it can never authorise killing your OWN reparented
+# process, and fixture-spawned processes reparent routinely. A guard that
+# refuses the runaway you most need to stop is a brick, and a brick trains
+# its own bypass — the reasoning that produced `ng skeptic resolve` (#577).
+#
+# The session id survives reparenting, is ONE read rather than a walk (no
+# race window between hops, no bound to tune), and carries the property
+# that actually matters here:
+#
+#     A process can only ever LEAVE your session, never JOIN it.
+#
+# `setsid()` creates a NEW session; there is no call that moves a process
+# into an existing one it was not born into. So a sibling's process can
+# never acquire your sid, and this predicate cannot produce a false PERMIT
+# by reparenting, by argv collision, or by a deleted cwd. It can only
+# produce a false REFUSAL — the safe direction, and one you can always
+# resolve by naming the pid you actually own.
+#
+# WHAT THE FALSE REFUSALS ARE, stated so nobody is surprised by them:
+#   * Anything `setsid`-detached is a session leader of its OWN session, so
+#     it is never authorised. In this repo that is the watcher and every
+#     registered service (`monitor/README.md`: services run HEADLESS,
+#     `setsid`-detached). That is CORRECT — those are stopped with
+#     `monitor/svc.sh`, never with a hand-built kill list.
+#   * A process you spawned and then deliberately detached is likewise not
+#     authorised. Stop it by its recorded pid through whatever supervises
+#     it; do not widen this predicate to reach it.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS DOES NOT COVER — the guarantee, bounded
+# ---------------------------------------------------------------------------
+#
+# The guarantee is narrow and worth stating exactly, because a guard whose
+# hole is unstated is worse than one whose hole is documented:
+#
+#     It answers "IS THIS PID MINE?" — it does NOT answer "IS THIS THE PID
+#     I MEANT?", and it does not survive the gap between asking and killing.
+#
+# Two holes follow, neither closable inside this helper:
+#
+# 1. OWNERSHIP IS NOT INTENT. Everything in your session is authorised —
+#    your editor, a long-running job you forgot, the parent harness that
+#    spawned the runaway. This stops you reaping a SIBLING; it does not stop
+#    you reaping your OWN wrong process, which was not the #851 failure but
+#    is a real one. The selection step (which pids to consider) is still
+#    yours, and is still where a bad pattern does damage. `--filter` narrows
+#    a list; it does not audit how the list was built.
+#
+# 2. TOCTOU / PID REUSE. The verdict describes the pid at the instant it was
+#    read. `kill` happens later. If a pid exits between the check and the
+#    signal AND the kernel reuses it AND the reusing process lands in your
+#    session, the signal goes to a process this helper never examined. The
+#    window is milliseconds and all three conditions must coincide, so it is
+#    remote — but it is NOT zero, and it is the reason `absent` refuses
+#    rather than shrugging: a stale list is exactly how a reused pid gets
+#    signalled. When the cost of being wrong is high, do not check-then-kill
+#    at all: keep the pid you spawned (`$!`), or signal the process GROUP you
+#    created, and let the kernel do the attribution.
+#
+# Neither hole is a reason to widen the predicate. They are the reason the
+# predicate is not the whole answer.
+#
+# ---------------------------------------------------------------------------
+# CONTRACT
+# ---------------------------------------------------------------------------
+#
+#   proc-kill-authorized <pid> [<pid>…]   verdict per pid on stdout
+#   proc-kill-authorized --filter [<pid>…]  print ONLY authorised pids to
+#                                           stdout, one per line; refusals
+#                                           to stderr. Reads stdin when no
+#                                           pid arguments are given.
+#   proc-kill-authorized --quiet <pid>      no output; rc is the answer
+#
+# Exit: 0 — every pid examined is authorised (and, under --filter, at
+#           least the examined set was resolvable)
+#       1 — at least one pid was REFUSED (the default arm)
+#       2 — usage error
+#
+# `--filter` is the form that prevents the incident, and it is deliberate
+# that it exists: the failure was not "killed one wrong pid", it was "built
+# a LIST". A helper that only answers one pid at a time leaves the loop
+# hand-rolled, which is where the denylist lived. Use:
+#
+#     kill $(ps -eo pid=,args= | awk '/run-tests\.sh/ {print $1}' \
+#              | "$NEXUS_ROOT"/monitor/proc-kill-authorized --filter)
+#
+# and the sibling pids are dropped before `kill` ever sees them.
+#
+# The example deliberately does NOT use `pgrep -f`: that form matches your
+# own claude process (its argv holds your whole prompt), which is what the
+# `pkill-self` footgun rows already warn about. This helper COMPOSES with
+# that guard rather than replacing it — it would refuse your own pid as
+# `self`, but a pattern you should never have matched is still a mistake.
+#
+# ---------------------------------------------------------------------------
+# THE VERDICT VOCABULARY — an allowlist, everything else refuses
+# ---------------------------------------------------------------------------
+#
+#   authorized              the pid's session was POSITIVELY read and equals
+#                           the caller's own, and the pid is not ourselves,
+#                           not one of our ancestors, and not the session
+#                           leader.
+#
+# Every other outcome is a refusal with a named kind:
+#
+#   absent                  no such pid. Nothing to kill — and the pid may
+#                           since have been REUSED by an unrelated process,
+#                           which is the one way a stale kill list turns
+#                           lethal. Never treated as "already dead, fine".
+#   unreadable              the pid exists and its session could not be
+#                           read, or parsed to a number. "Could not look" is
+#                           not "looked and found mine" — the collapse that
+#                           #813/#825 are about.
+#   caller-session-unknown  we could not read OUR OWN session. Refuse
+#                           everything; a comparison with an unknown left
+#                           side is not a comparison.
+#   not-owned               session read, and it is not ours. The sibling
+#                           case, the reparented-sibling case, and the
+#                           setsid-detached-service case all land here.
+#   self                    the pid is this process or one of its ancestors.
+#                           Killing it kills the killer mid-list, leaving
+#                           the rest of the list unexamined.
+#   session-leader          the pid IS the session id. It is the top of your
+#                           own session (your shell / your pane); killing it
+#                           takes down the agent that asked.
+#   not-a-pid               the argument is not a positive integer, or is
+#                           <= 1. pid 1 is the namespace's init.
+#
+# ---------------------------------------------------------------------------
+# IMPLEMENTATION NOTE — /proc/<pid>/stat MUST NOT be parsed by field index
+# ---------------------------------------------------------------------------
+#
+# Field 2 is `comm` in parentheses, and comm may contain spaces AND
+# parentheses (it is the first 15 bytes of the executable name). Reproduced
+# on this host with a binary copied to the name `x) 1 2 3 (y`:
+#
+#     raw   : 36775 (x) 1 2 3 (y) S 36769 36334 36334 0 -1 …
+#     awk $6: (y)          <- garbage; a field-index parse
+#     ours  : 36334        <- parse after the LAST ") "; matches `ps -o sid=`
+#
+# A non-numeric session under a permissive design is a fail-open. Here it
+# is refused as `unreadable` — but the parse is simply correct, so it does
+# not arise. Nothing exotic is required to hit this: any script whose
+# FILENAME contains `") "` produces it.
+#
+# `/proc` is read directly rather than shelling out to `ps` because
+# `--filter` is called with tens of pids (25 concurrent `run-tests.sh`
+# processes at the time of the incident) and a fork per pid is both slow
+# and its own hazard under the worker RLIMIT_NPROC ceiling.
+
+set -uo pipefail
+
+_usage() {
+    cat >&2 <<'EOF'
+usage: proc-kill-authorized <pid> [<pid>…]
+       proc-kill-authorized --filter [<pid>…]   # stdin when no pids given
+       proc-kill-authorized --quiet <pid>
+
+Answers "may I kill this pid?" by SESSION OWNERSHIP, as an allowlist with a
+default-deny arm. Refuses anything it cannot positively attribute to the
+caller's own session. See your-org/nexus-code#851.
+EOF
+    exit 2
+}
+
+# _session_of <pid> -> echoes the numeric session id, rc 0
+#                      rc 3 = no such pid, rc 4 = present but unreadable
+#
+# Parses AFTER THE LAST ") " — never by field index. See the header.
+_session_of() {
+    local pid="$1" line rest
+    [[ -r "/proc/$pid/stat" ]] || {
+        # Distinguish "gone" from "there but closed to us". A pid whose
+        # directory exists but whose stat is unreadable is not the same
+        # claim as a pid that does not exist.
+        [[ -d "/proc/$pid" ]] && return 4
+        return 3
+    }
+    read -r line < "/proc/$pid/stat" 2>/dev/null || return 4
+    [[ -n "$line" ]] || return 4
+    [[ "$line" == *") "* ]] || return 4
+    rest=${line##*") "}
+    # rest = state ppid pgrp session …
+    set -- $rest
+    # $1 state  $2 ppid  $3 pgrp  $4 session
+    [[ $# -ge 4 ]] || return 4
+    [[ "$4" =~ ^[0-9]+$ ]] || return 4
+    printf '%s' "$4"
+    return 0
+}
+
+# _ppid_of <pid> -> echoes numeric ppid, rc 0; non-zero if unresolvable.
+_ppid_of() {
+    local pid="$1" line rest
+    [[ -r "/proc/$pid/stat" ]] || return 1
+    read -r line < "/proc/$pid/stat" 2>/dev/null || return 1
+    [[ "$line" == *") "* ]] || return 1
+    rest=${line##*") "}
+    set -- $rest
+    [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$2"
+    return 0
+}
+
+# Our own ancestor set, computed once. Bounded walk; a walk that ends early
+# only makes the predicate refuse MORE, never less, so the bound is safe.
+_ancestors=" $$ "
+_collect_ancestors() {
+    local cur="$$" i pp
+    for i in $(seq 1 64); do
+        pp=$(_ppid_of "$cur") || break
+        [[ -n "$pp" ]] || break
+        _ancestors="${_ancestors}${pp} "
+        [[ "$pp" -le 1 ]] && break
+        cur="$pp"
+    done
+}
+
+# The caller's own session. Read once, from ourselves — NOT taken as an
+# argument. A caller-supplied "my driver pid" is exactly the value that was
+# wrong in the incident, and a predicate whose left-hand side can be handed
+# in is a predicate that can be handed the wrong one.
+MY_SESSION=""
+_resolve_self() {
+    MY_SESSION=$(_session_of "$$") || MY_SESSION=""
+    _collect_ancestors
+}
+
+# _verdict <pid> -> echoes "<kind> <detail>"; rc 0 only for `authorized`.
+_verdict() {
+    local pid="$1" sid rc
+
+    if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
+        printf 'not-a-pid not-a-positive-integer'; return 1
+    fi
+    if (( pid <= 1 )); then
+        printf 'not-a-pid pid-%s-is-init-or-invalid' "$pid"; return 1
+    fi
+    if [[ -z "$MY_SESSION" ]]; then
+        printf 'caller-session-unknown own-session-unreadable'; return 1
+    fi
+
+    sid=$(_session_of "$pid"); rc=$?
+    case "$rc" in
+        3) printf 'absent no-such-pid-may-have-been-reused'; return 1 ;;
+        4) printf 'unreadable session-not-readable-or-not-numeric'; return 1 ;;
+        0) : ;;
+        *) printf 'unreadable probe-returned-%s' "$rc"; return 1 ;;
+    esac
+
+    if [[ "$sid" != "$MY_SESSION" ]]; then
+        printf 'not-owned session-%s-is-not-ours-%s' "$sid" "$MY_SESSION"; return 1
+    fi
+    if [[ "$_ancestors" == *" $pid "* ]]; then
+        printf 'self pid-is-this-process-or-an-ancestor'; return 1
+    fi
+    if [[ "$pid" == "$MY_SESSION" ]]; then
+        printf 'session-leader killing-it-takes-down-this-session'; return 1
+    fi
+    printf 'authorized session-%s' "$sid"
+    return 0
+}
+
+mode=verdict
+quiet=0
+declare -a pids=()
+while (( $# > 0 )); do
+    case "$1" in
+        --filter) mode=filter; shift ;;
+        --quiet)  quiet=1;     shift ;;
+        -h|--help) _usage ;;
+        --) shift; while (( $# > 0 )); do pids+=("$1"); shift; done ;;
+        # A NEGATIVE number is a pid-shaped argument, not a flag. Routing it
+        # to _usage (rc 2) would have hidden it from the default-deny arm:
+        # `not-a-pid` at rc 1 is the answer, and rc 2 is "I did not look".
+        -[0-9]*) pids+=("$1"); shift ;;
+        -*) _usage ;;
+        *)  pids+=("$1"); shift ;;
+    esac
+done
+
+_resolve_self
+
+# --filter with no pid arguments reads stdin. Accepts whitespace- or
+# newline-separated pids so it composes with `pgrep`, `ps … | awk`, etc.
+if [[ "$mode" == filter && ${#pids[@]} -eq 0 ]]; then
+    if [[ -t 0 ]]; then
+        echo "proc-kill-authorized: --filter with no pids and no stdin" >&2
+        exit 2
+    fi
+    while read -r _tok; do
+        for _t in $_tok; do pids+=("$_t"); done
+    done
+fi
+
+if (( ${#pids[@]} == 0 )); then _usage; fi
+
+rc_overall=0
+authorized_count=0
+for p in "${pids[@]}"; do
+    out=$(_verdict "$p"); vrc=$?
+    kind=${out%% *}
+    if (( vrc == 0 )); then
+        authorized_count=$(( authorized_count + 1 ))
+        if [[ "$mode" == filter ]]; then
+            printf '%s\n' "$p"
+        elif (( quiet == 0 )); then
+            printf 'pid=%s authorized=1 kind=%s detail=%s\n' "$p" "$kind" "${out#* }"
+        fi
+    else
+        rc_overall=1
+        if [[ "$mode" == filter ]]; then
+            printf 'proc-kill-authorized: REFUSED pid=%s kind=%s (%s)\n' \
+                "$p" "$kind" "${out#* }" >&2
+        elif (( quiet == 0 )); then
+            printf 'pid=%s authorized=0 kind=%s detail=%s\n' "$p" "$kind" "${out#* }"
+        fi
+    fi
+done
+
+# A filter that emits NOTHING must say so. An empty kill list piped into
+# `kill` is a silent no-op in some shells and an error in others, and
+# either way "it printed nothing" reads as "there was nothing to do" — the
+# workspace's dominant defect class, inside the guard against it.
+if [[ "$mode" == filter ]] && (( authorized_count == 0 )); then
+    printf 'proc-kill-authorized: NOTHING authorized out of %d pid(s) — emitting an empty list.\n' \
+        "${#pids[@]}" >&2
+    printf '  This is a REFUSAL, not "nothing to do". If you expected to own these,\n' >&2
+    printf '  check whether they are setsid-detached (services, the watcher: use svc.sh)\n' >&2
+    printf '  or belong to a sibling agent (your-org/nexus-code#851).\n' >&2
+fi
+
+exit "$rc_overall"

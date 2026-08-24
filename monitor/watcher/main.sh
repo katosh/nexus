@@ -270,6 +270,67 @@ source "$_script_dir/_fs_guard.sh"
 # shellcheck source=../_tmux-window.sh
 source "$_script_dir/../_tmux-window.sh"
 
+# The integration-branch resolver (your-org/nexus-code#763) — the ONE record
+# of "the branch merged fixes land on", consumed by the clone-drift detector
+# and by cc-auto-update's deployment gate.
+#
+# Sourced HERE, from main.sh, and not only from `_config.sh` where it is
+# actually used. `_version_watcher_source_set` derives the watcher's
+# version-tracked file set by parsing `source "$_script_dir/…"` lines out of
+# THIS FILE ALONE, so a module reached only through `_config.sh` is invisible
+# to it: editing the resolver would change what the watcher runs without
+# bumping the hash that triggers the self-restart. Leaf module, guarded
+# against double-sourcing, side-effect-free.
+# shellcheck source=../_integration_branch.sh
+source "$_script_dir/../_integration_branch.sh"
+
+# Bookkeeping guard primitives (your-org/nexus-code#790). The watcher
+# needs `bk_decision_row_actionable` — the pending-decisions pane gate's
+# ruling on whether a pane state still means "a human is needed".
+#
+# Sourced HERE for the same reason `_integration_branch.sh` above is: the
+# version source-set parser reads `source "$_script_dir/…"` lines out of
+# THIS FILE, so a module loaded anywhere else is invisible to the
+# self-restart hash. And sourced AT ALL because the gate's absence is
+# silent by construction: `_idle_probe.sh` fails OPEN when the predicate
+# is undefined (an unclassifiable pane must never silence a decision), so
+# a watcher that never loaded this file would emit exactly as it did
+# before the fix — a dead fix that looks like a live one, which is the
+# defect class #790 is about. `test-pending-decisions.sh` asserts the
+# predicate is reachable through this load path; that test is the loud
+# check this fail-open cannot be.
+# shellcheck source=../_bookkeeping.sh
+source "$_script_dir/../_bookkeeping.sh"
+
+# Dead-pane paste guard (#745). A `paste-buffer` into a pane tmux
+# reports as `#{pane_dead}` KILLS THE SERVER — 20/20 measured — taking
+# the watcher, every worker window and the sandbox with it. Sourced
+# EXPLICITLY here rather than relied on transitively: a missing
+# function is rc 127, which reads as "not dead" and silently restores
+# the hazard. Fail LOUD instead — a watcher that cannot load its own
+# paste guard must not paste.
+# shellcheck source=../_pane-live.sh
+[[ -r "$_script_dir/../_pane-live.sh" ]] && source "$_script_dir/../_pane-live.sh"
+if ! declare -F _tmux_pane_is_dead >/dev/null 2>&1; then
+    # FAIL-CLOSED FALLBACK (#745). Without the real predicate we cannot
+    # tell a live pane from a corpse, and a paste into a corpse kills the
+    # tmux SERVER — so every paste refuses, loudly, at the moment it is
+    # attempted.
+    #
+    # Deliberately NOT an `exit`/`return` at load time. The first cut
+    # refused to LOAD, and CI showed why that is wrong: several fixtures
+    # build partial trees from ENUMERATED copy lists, so the file is
+    # simply absent there, and four unrelated suites died on modules
+    # they never paste from. A missing paste guard must stop PASTES, not
+    # module loading. Quiet at load, loud at use: the noise belongs where
+    # the hazard is.
+    _tmux_pane_is_dead() {
+        printf '%s: _pane-live.sh unavailable — cannot prove %q is a live pane, refusing to paste (your-org/nexus-code#745: a paste into a dead pane kills the tmux server)\n' \
+            "${BASH_SOURCE[1]##*/}" "${1:-?}" >&2
+        return 0
+    }
+fi
+
 # shellcheck source=_respawn.sh
 source "$_script_dir/_respawn.sh"
 
@@ -399,8 +460,11 @@ done
 # absent and respawns the real orchestrator) unless a live
 # orchestrator shares the window.
 if _self_pane_info=$(_nexus_self_pane_window); then
-    _self_win_id="${_self_pane_info%%$'\t'*}"
-    _self_win_name="${_self_pane_info#*$'\t'}"
+    # Delimiter is '|', never a TAB — a non-UTF-8 locale rewrites a TAB in
+    # tmux output to `_`, collapsing both fields into one mangled string and
+    # making this guard fail OPEN (your-org/nexus-code#701 item A).
+    _self_win_id="${_self_pane_info%%|*}"
+    _self_win_name="${_self_pane_info#*|}"
     if [[ "$_self_win_name" == "$TARGET" ]]; then
         if ! _nexus_window_has_orchestrator "$_self_win_id"; then
             tmux rename-window -t "$_self_win_id" 'watcher-misplaced' 2>/dev/null || true
@@ -993,6 +1057,75 @@ _emit_delivery_ok() {
     rm -f "$EMIT_DELIVERY_FAIL_FILE" 2>/dev/null || true
 }
 
+# ---- one-shot marker consumption, deferred to delivery -------------------
+#
+# your-org/nexus-code#568 A2. One-shot markers (the launcher's install-failure
+# flags, the supervisor's watcher-revived marker, the reports-roll notice) used
+# to be `rm`'d at RENDER time — the moment their text was captured into a
+# variable, long before the paste that carries it is known to have landed. Two
+# routine paths then destroy the signal outright:
+#
+#   - COLD BOOT. The target window does not exist yet: `_schedule_task
+#     target_window` is registered AFTER the startup sweep, so the sweep's
+#     paste returns rc=2 with the markers already gone. The install-failure
+#     flag written by launcher.sh during that very boot is guaranteed
+#     consumed-and-never-delivered.
+#   - OVER-LIMIT. `_over_limit_orchestrator_paused` takes the held branch —
+#     the body is archived, never pasted — again with the markers gone. This
+#     is a ROUTINE condition, so it is the more frequent of the two.
+#
+# The discipline is the one `requests_commit_emitted` and the #483 stamp-on-
+# paste precedent already use: record consumption from the thing that observes
+# the outcome. Render collects candidates; a successful paste commits them; any
+# other outcome leaves them on disk to re-surface next cycle. It fails toward a
+# duplicate report, never a lost one.
+_ONESHOT_PENDING=()
+# Start a fresh render. Callers reset before composing so a body only ever
+# commits the markers IT carried (compose_emit runs in an async subshell and
+# would otherwise inherit an uncommitted list from the startup sweep).
+_oneshot_reset() {
+    _ONESHOT_PENDING=()
+}
+# Register a marker whose text has been rendered into the body being composed.
+_oneshot_defer() {
+    [[ -n "${1:-}" ]] && _ONESHOT_PENDING+=("$1")
+    return 0
+}
+# The paste landed — the signal has been delivered, consume the markers.
+_oneshot_commit() {
+    local f
+    for f in ${_ONESHOT_PENDING+"${_ONESHOT_PENDING[@]}"}; do
+        [[ -n "$f" ]] && rm -f "$f" 2>/dev/null || true
+    done
+    if (( ${#_ONESHOT_PENDING[@]} > 0 )); then
+        log "one-shot markers consumed after delivery (${#_ONESHOT_PENDING[@]})"
+    fi
+    _ONESHOT_PENDING=()
+}
+
+# _reports_roll_emit_section <notice_file>
+# One-shot: if a roll notice is pending, PRINT it. Consumption is the caller's
+# job — `_oneshot_defer` on a non-empty render, committed when the paste lands.
+# It cannot be done here: every call site captures this via `$(…)`, a subshell,
+# where a `_ONESHOT_PENDING+=` would be discarded on return. (That subshell
+# boundary is also why the old in-function `rm` looked harmless — the delete
+# was the one side effect that DID survive it.)
+#
+# DEFINED HERE, not next to its sibling roll code near the task catalog.
+# It is called from the STARTUP SWEEP, which is top-level script text — and
+# the sweep runs long before the bottom half of this file has been parsed into
+# function definitions. With the definition below the sweep the call resolved
+# to `command not found`, which `2>/dev/null || true` swallowed whole: the
+# startup sweep's roll breadcrumb was silently unreachable, never once
+# surfaced, with no error anywhere. (Found while implementing A2; the sweep is
+# the only forward reference of its kind in this file — verified by a
+# definition-order sweep over every top-level call.)
+_reports_roll_emit_section() {
+    local notice="${1:-}"
+    [[ -n "$notice" && -s "$notice" ]] || return 0
+    cat "$notice" 2>/dev/null || return 0
+}
+
 # Record a FAILED emit delivery. rc=2 (target window missing) is the
 # ORCHESTRATOR-respawn path, NOT a watcher delivery fault — it never counts
 # toward self-heal (restarting the watcher would not bring the window back,
@@ -1082,15 +1215,49 @@ _watcher_self_heal_restart() {
 # pane-state.sh grandchildren — is killed). Lets the SYNCHRONOUS startup
 # sweep degrade to a partial render + a loud WARN instead of blocking loop
 # entry unboundedly (the ~66 s startup stall on 2026-06-18).
+# POLL INTERVAL (your-org/nexus-code#568 B1). The reap loop used to `sleep 1`
+# before its FIRST re-check, and the first `kill -0` on a just-forked child
+# always succeeds — so every call paid a full second of floor regardless of how
+# fast the payload actually was. Measured at ~1008 ms of pure overhead per call.
+# That is not a rounding error in this codebase: `comment_surface` fires on a
+# 15 s cadence and exists (per #562) precisely to surface operator comments
+# FAST, `compose_emit` pays it 2-4 times, and the synchronous startup sweep
+# pays it at least four times before loop entry. The bound had become the
+# bottleneck it was written to prevent.
+#
+# Sub-second polling against a deadline preserves every part of the contract —
+# the whole-second budget, the rc, the partial output on timeout, and the
+# subtree kill — while collapsing the floor to one poll interval. 50 ms costs
+# at most 20 wakeups per budget-second on a path that already forks a subshell.
+MONITOR_RUN_BOUNDED_POLL_SECONDS="${MONITOR_RUN_BOUNDED_POLL_SECONDS:-0.05}"
+
 _run_bounded() {
     local budget="$1" outfile="$2"; shift 2
     [[ "$budget" =~ ^[0-9]+$ ]] || budget=20
     : > "$outfile" 2>/dev/null || true
     ( _close_inherited_locks; "$@" > "$outfile" 2>/dev/null ) &
-    local pid=$! waited=0
-    while kill -0 "$pid" 2>/dev/null && (( waited < budget )); do
-        sleep 1
-        waited=$(( waited + 1 ))
+    local pid=$!
+    # Deadline in whole seconds — identical semantics to the old
+    # `waited < budget` counter, just measured against the clock instead of
+    # accumulated one sleep at a time (so a slow poll cannot stretch the bound).
+    # `EPOCHSECONDS` (bash 5) keeps the poll FORK-FREE — at 20 wakeups per
+    # second a `date` fork per iteration would trade the sleep floor for a fork
+    # storm on a loaded node, which is the wrong bargain in this codebase.
+    local _now
+    if [[ -n "${EPOCHSECONDS:-}" ]]; then _now=$EPOCHSECONDS; else _now=$(date +%s); fi
+    local deadline=$(( _now + budget ))
+    local poll="${MONITOR_RUN_BOUNDED_POLL_SECONDS:-0.05}"
+    [[ "$poll" =~ ^[0-9]*\.?[0-9]+$ ]] || poll=0.05
+    # `sleep` accepting a fractional argument is a GNU/coreutils extension.
+    # Probe once, cheaply, and fall back to whole seconds where it is absent —
+    # a POSIX-only host degrades to the previous behaviour, never to a spin.
+    if ! sleep 0 2>/dev/null || ! sleep "$poll" 2>/dev/null; then
+        poll=1
+    fi
+    while kill -0 "$pid" 2>/dev/null; do
+        if [[ -n "${EPOCHSECONDS:-}" ]]; then _now=$EPOCHSECONDS; else _now=$(date +%s); fi
+        (( _now < deadline )) || break
+        sleep "$poll"
     done
     if kill -0 "$pid" 2>/dev/null; then
         pkill -P "$pid" 2>/dev/null || true
@@ -1597,8 +1764,30 @@ _compose_report_body() {
     # One-line workspace prelude. Always printed — gives the operator
     # a glance-level read on workspace state at the top of every emit
     # without scrolling. Issue #72 D4.
-    local prelude
-    prelude=$(render_idle_prelude 2>/dev/null || true)
+    #
+    # WALL-CLOCK BOUNDED (your-org/nexus-code#562): this render probes
+    # every worker pane and ran UNBOUNDED inside compose_emit — under
+    # load it was the main contributor to the 300s watchdog kills that
+    # delayed comment surfacing. With the shared pane cache it is
+    # near-free (reads the sweep's recordings), but bound it anyway so
+    # a cold/expired cache under extreme load degrades to a partial
+    # header instead of stalling the emit. Falls back to the direct
+    # call when the bounding helpers are unavailable (startup order,
+    # standalone test sourcing).
+    local prelude=""
+    if declare -F _run_bounded >/dev/null 2>&1 && [[ -n "${tmp_dir:-}" ]]; then
+        _ensure_watcher_tmp_dir
+        local _pr_to="${MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS:-20}"
+        [[ "$_pr_to" =~ ^[0-9]+$ ]] || _pr_to=20
+        local _pr_tmp="${tmp_dir}/compose-prelude.$BASHPID"
+        if ! _run_bounded "$_pr_to" "$_pr_tmp" render_idle_prelude; then
+            log "WARN compose_report: prelude render exceeded ${_pr_to}s; using partial (emit NOT blocked)"
+        fi
+        prelude=$(cat "$_pr_tmp" 2>/dev/null || true)
+        rm -f "$_pr_tmp" 2>/dev/null || true
+    else
+        prelude=$(render_idle_prelude 2>/dev/null || true)
+    fi
     if [[ -n "$prelude" ]]; then
         printf 'workspace: %s\n' "$prelude"
     fi
@@ -1807,10 +1996,66 @@ _compose_report_body() {
 #   2  target window missing
 #   3  paste / submit tmux API call failed
 #   4  paste submitted but signature not visible in pane
+#
+# Concurrency (your-org/nexus-code#562): with `comment_surface` and
+# `compose_emit` both running as async tasks, two pastes into the SAME
+# window could interleave their send-keys/paste-buffer sequences and
+# mangle both bodies. A per-target flock serializes them. Bounded
+# (flock -w, default 20s — several times a worst-case paste) and
+# fail-open: lock-acquisition timeout returns rc=3 (retryable via
+# paste_with_retry); a missing flock(1) or unopenable lock file falls
+# through to the unlocked paste (the pre-#562 behaviour). The fd is
+# process-scoped, so a watchdog-killed paster releases the lock with
+# its death — this path cannot wedge.
 paste_to_target() {
+    local target="$1"
+    local _pl_rc _pl_fd
+    if command -v flock >/dev/null 2>&1; then
+        local _pl_dir="${STATE_DIR:-/tmp}/paste-locks"
+        mkdir -p "$_pl_dir" 2>/dev/null || true
+        local _pl_file="$_pl_dir/${target//[^A-Za-z0-9._-]/_}.lock"
+        # Brace group, NOT a bare `exec ... 2>/dev/null`: redirections on
+        # an exec PERSIST in the shell, so the bare form would silence
+        # this process's stderr — the watcher log — forever after the
+        # first paste (caught by test-target-config).
+        if { exec {_pl_fd}>"$_pl_file"; } 2>/dev/null; then
+            local _pl_to="${MONITOR_PASTE_LOCK_TIMEOUT_SECONDS:-20}"
+            [[ "$_pl_to" =~ ^[0-9]+$ ]] || _pl_to=20
+            if ! flock -w "$_pl_to" "$_pl_fd" 2>/dev/null; then
+                exec {_pl_fd}>&-
+                log "paste_to_target: paste lock for '${target}' not acquired within ${_pl_to}s (concurrent paster stuck?); treating as retryable paste failure"
+                return 3
+            fi
+            _paste_to_target_unlocked "$@"; _pl_rc=$?
+            exec {_pl_fd}>&-
+            return $_pl_rc
+        fi
+    fi
+    _paste_to_target_unlocked "$@"
+}
+
+_paste_to_target_unlocked() {
     local target="$1" body_file="$2" stamp_mode="${3:-stamp}"
     command -v tmux >/dev/null 2>&1 || return 1
-    tmux list-windows -F '#{window_name}' 2>/dev/null | grep -qxF "$target" || return 2
+    grep -qxF "$target" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)" || return 2
+    # #745. The check above asks whether the NAME is listed, which a
+    # `remain-on-exit` corpse satisfies forever — and pasting into that
+    # corpse kills the tmux SERVER. This is the same name-vs-liveness
+    # confusion `#741` fixed in `_target_window_present`, living in a
+    # second, independent copy here; `#741` did not touch main.sh, so
+    # the probe was never what stood between the watcher and the
+    # corpse. rc 4 is distinct from "window missing" (2) and from a
+    # retryable tmux failure (3) and from "content did not land" (4).
+    # rc 5 is deliberately a NEW code and not one of the existing ones:
+    # 3 and 4 are both RETRIED by paste_with_retry, and retrying is
+    # precisely wrong here — the window is THERE and its agent is gone,
+    # so a second paste would just be a second attempt to kill the
+    # server. The answer is a respawn, which the `#741` probe reaches
+    # independently.
+    if _tmux_pane_is_dead "$target"; then
+        log "paste_to_target: target '$target' is a dead pane (remain-on-exit corpse) — REFUSING to paste; a paste into a dead pane kills the tmux server (your-org/nexus-code#745). The window needs a respawn, not a retry."
+        return 5
+    fi
     # Re-resolve name→@id for the tmux -t verbs (#323). The over-limit
     # worker-wake leg passes a WORKER name, which may contain a dot
     # (`cc-update-2.1.183`); `-t name` would dot-parse it as window.pane
@@ -1842,8 +2087,8 @@ paste_to_target() {
     sig=$(tail -1 "$body_file" 2>/dev/null \
           | sed -n 's/.*\(nexus-emit-sig [^ ]* [^ ]*\).*/\1/p' | head -c 100)
     if [[ -n "$sig" ]]; then
-        tmux capture-pane -t "$tgt" -p -S -200 2>/dev/null \
-            | grep -qF -e "$sig" || return 4
+        grep -qF -e "$sig" \
+            <<<"$(tmux capture-pane -t "$tgt" -p -S -200 2>/dev/null)" || return 4
     fi
     # Refresh the orchestrator-liveness pin (issue #150). A successful
     # round-trip here is the strongest "orch is reachable" signal the
@@ -1879,6 +2124,11 @@ paste_with_retry() {
     # rc=3 (tmux API glitch) and rc=4 (content didn't land) are both
     # retryable with a 0.5 s delay. rc=2 (target missing) is handled
     # by the agent-respawn path upstream; rc=1 (no tmux) is terminal.
+    # rc=5 (target is a dead pane, #745) is EXPLICITLY NOT retryable —
+    # the refusal is the point. A corpse does not become live in 0.5 s,
+    # and every retry is another chance to paste into it. The `#741`
+    # probe sees the same corpse on its own 2 s cadence and respawns;
+    # that is the recovery, not this.
     if (( rc == 3 || rc == 4 )); then
         sleep 0.5
         paste_to_target "$target" "$body_file" "$stamp_mode"; rc=$?
@@ -2297,7 +2547,11 @@ prune_archive() {
         # very-short cooldown configs operators might use during
         # debug). For the default 86400 (24h) this is exactly 1440 min.
         local mmin=$(( (horizon + 59) / 60 ))
-        find "$hist_dir" -maxdepth 1 -type f -name 'comment-*.meta' \
+        # `.meta.lock` (the #562 atomic decide+stamp lock) and orphaned
+        # `.meta.tmp.*` writes GC on the same horizon.
+        find "$hist_dir" -maxdepth 1 -type f \
+            \( -name 'comment-*.meta' -o -name 'comment-*.meta.lock' \
+               -o -name 'comment-*.meta.tmp.*' \) \
             -mmin "+${mmin}" -delete 2>/dev/null || true
     fi
     # Mirror the sweep for `_filter_reemit_backoff`'s per-mention stamp dir
@@ -2333,6 +2587,13 @@ prune_archive() {
 # WATCHER_WINDOW) are set above.
 # shellcheck source=_unstick.sh
 source "$_script_dir/_unstick.sh"
+
+# Shared pane-state recording cache (your-org/nexus-code#562). MUST be
+# sourced BEFORE _idle_probe.sh / _over_limit.sh so their probe
+# chokepoints find the cache helpers (they degrade to direct forks when
+# the helpers are absent, e.g. standalone test sourcing).
+# shellcheck source=_pane_cache.sh
+source "$_script_dir/_pane_cache.sh"
 
 # Idle-worker probe (tmux window_activity + pane-state.sh). See
 # _idle_probe.sh for the state machine and dedupe contract.
@@ -2387,6 +2648,17 @@ source "$_script_dir/_cc_auto_update.sh"
 # shellcheck source=_version_restart.sh
 source "$_script_dir/_version_restart.sh"
 
+# Primary-clone deployment-drift detection (your-org/nexus-code#614).
+# _version_restart.sh detects drift in a component's source set AFTER a
+# pull; it cannot see that the pull never happened. This peer check
+# compares the clone's HEAD against the live remote tip and surfaces a
+# `drift-clone` ask record through the SAME emit path. Detection only —
+# it never fetches, pulls or checks out. Functions only; no side
+# effects on source. MUST load after _version_restart.sh: it calls
+# `_version_write_drift_record`.
+# shellcheck source=_clone_drift.sh
+source "$_script_dir/_clone_drift.sh"
+
 # Continuous service-health watch (service-health-watch). Defines
 # `_service_health_check_tick` (the service_health task body) and
 # `_service_health_emit_section` (consumed by compose_emit). Functions
@@ -2435,7 +2707,12 @@ _over_limit_paste_via_watcher() {
 }
 _OVER_LIMIT_LOG_FN=_over_limit_log_to_watcher
 _OVER_LIMIT_PASTE_FN=_over_limit_paste_via_watcher
-export _OVER_LIMIT_LOG_FN _OVER_LIMIT_PASTE_FN
+# Suppression is a channel-muting condition, so it must report on the
+# channel-INDEPENDENT surface (your-org/nexus-code#592). `_watcher_alert` is
+# built for exactly this: alerts log + watcher log + sandbox-notify.
+_over_limit_alert_to_watcher() { _watcher_alert "$@"; }
+_OVER_LIMIT_ALERT_FN=_over_limit_alert_to_watcher
+export _OVER_LIMIT_LOG_FN _OVER_LIMIT_PASTE_FN _OVER_LIMIT_ALERT_FN
 
 # ---- main loop -----------------------------------------------------------
 
@@ -2467,7 +2744,14 @@ trap 'log "watcher exiting on SIGTERM during startup (scheduler handlers not yet
 # the EXIT trap still releases the pidfile/lock instead of lingering
 # as a PPID=1 orphan (issue #106).
 trap 'log "watcher exiting on SIGHUP (host terminal/window went away)"; exit 129' HUP
-current="${tmp_dir}/current"
+# NOTE: a global `current="${tmp_dir}/current"` used to be assigned here and
+# was never read — dead since the compose path moved to its own
+# `${tmp_dir}/compose-current.$$` (your-org/nexus-code#568 B2). Removing it is
+# not just tidiness: `current` is a LOCAL in two other modules
+# (`_idle_probe.sh:3967`, `_version_restart.sh:266`), and `_idle_probe.sh`
+# gates on exactly `[[ -n "$current" ]]`. A global of that name means any
+# helper that ever forgets its `local` silently inherits a path string and
+# takes the populated branch. The footgun outlived the variable's purpose.
 emit_body="${tmp_dir}/emit.md"
 
 # Self-heal the per-process scratch dir (nexus-code#236).
@@ -2759,6 +3043,7 @@ _progress_bump startup:local-done
 # the orchestrator's first paste. Spawn surfaces have a PATH fallback,
 # so a failed install doesn't brick spawning, but the orchestrator
 # should know it's running on the un-updateable system binary.
+_oneshot_reset
 install_failure_now=""
 install_failure_flags=$(find "$STATE_DIR" -maxdepth 1 -name 'local-claude-install-failed.*' -type f 2>/dev/null | sort)
 if [[ -n "$install_failure_flags" ]]; then
@@ -2774,10 +3059,14 @@ if [[ -n "$install_failure_flags" ]]; then
         printf 'Retry manually: `%s/monitor/install-claude-local.sh`\n' "$NEXUS_ROOT"
         printf 'Spawned workers + the orchestrator will switch to the local binary on their NEXT spawn (current sessions stay on the system binary).\n'
     )
+    # Registered, NOT deleted (#568 A2). On a cold boot the target window does
+    # not exist yet, so this very sweep's paste returns rc=2 — and the flag
+    # launcher.sh wrote during the same boot is exactly the one that would be
+    # consumed and never delivered. Consumption happens on a landed paste.
     while IFS= read -r flag; do
-        [[ -n "$flag" ]] && rm -f "$flag"
+        _oneshot_defer "$flag"
     done <<< "$install_failure_flags"
-    log "startup-sweep: local-claude install-failure flag(s) consumed and surfaced"
+    log "startup-sweep: local-claude install-failure flag(s) surfaced (consumed on delivery)"
 fi
 # cc update-detection: surface a pending (unsurfaced) candidate on the
 # first paste after a restart. The detection task's own first fire lands
@@ -2819,8 +3108,8 @@ if [[ -f "$WATCHER_REVIVED_MARKER" ]]; then
         printf 'for unattended GitHub comments / decisions and check the registered services.\n'
         printf 'If this recurs, inspect the cause: monitor/svc.sh logs watcher (and watcher-supervisor).\n'
     )
-    rm -f "$WATCHER_REVIVED_MARKER" 2>/dev/null || true
-    log "startup-sweep: watcher-revived self-failure report surfaced (downtime≈${_wr_down:-?}s)"
+    _oneshot_defer "$WATCHER_REVIVED_MARKER"
+    log "startup-sweep: watcher-revived self-failure report surfaced (consumed on delivery, downtime≈${_wr_down:-?}s)"
     unset _wr_reason _wr_down _wr_at _wr_by
 fi
 # Arm-watcher-supervisor reminder (mutual-liveness). A freshly-(re)started
@@ -2837,6 +3126,9 @@ supervisor_arm_now=$(_supervisor_arm_emit_section "$WATCHER_SUPERVISOR_HEARTBEAT
 # yet here — but read+consume any notice a crash left un-surfaced between its
 # write and the compose that would have shown it. One-shot, self-clearing.
 reports_roll_now=$(_reports_roll_emit_section "$REPORTS_ROLL_NOTICE_FILE" 2>/dev/null || true)
+# Consumed on delivery, not on read (#568 A2) — registered here, in the
+# caller, because the render above is a `$(…)` subshell.
+[[ -n "$reports_roll_now" ]] && _oneshot_defer "$REPORTS_ROLL_NOTICE_FILE"
 [[ -n "$reports_roll_now" ]] && log "startup-sweep: reports auto-roll breadcrumb surfaced"
 # Legacy-hosting migration notice (issue 182). The launcher's headless
 # spawns carry WATCHER_WINDOW=headless; anything else means this
@@ -2908,6 +3200,9 @@ if [[ -n "$gh_now" || -n "$bell_now" || -n "$idle_now" || -n "$pending_now" || -
         # failed startup paste leaves every request due for the
         # steady-state loop.
         requests_commit_emitted "$emit_body"
+        # Same stamp-on-delivery discipline for the one-shot markers this
+        # sweep rendered (#568 A2): the paste landed, so consume them now.
+        _oneshot_commit
         _respawn_loop_reset "$RESPAWN_HISTORY"
         rm -f "$RESPAWN_TRIPPED"
         # Successful paste = orchestrator reachable on both axes:
@@ -2969,12 +3264,15 @@ bump_heartbeat
 #   detect_unstick         @ 10s   async  medium    detect_and_unstick
 #   snapshot_local         @ 30s   async  medium    snapshot_local
 #   over_limit_scan        @ 60s   async  expensive _over_limit_scan_panes
-#   idle_section           @ 30s   async  expensive render_idle_section
+#   idle_section           @ 30s   async  expensive render_idle_section (authoritative
+#                                                   pane recorder — #562 shared cache)
 #   deliveries_poll        @ 15s   async  medium    snapshot_deliveries (webhook)
 #   github_poll            @ 600s  async  expensive snapshot_github + mentions (GraphQL)
 #   full_state_snap        @ 600s  async  expensive render_full_state_snapshot
 #   version_check          @ 60s   async  medium    _version_check_tick (issue 186)
 #   prune_archive          @ 600s  sync   cheap     prune_archive
+#   comment_surface        @ 15s   async  medium    sweep-independent eligible-comment
+#                                                   emit (#562); nudged on new events
 #   compose_emit           @ INT   async  medium    reads staging, emits
 #
 # Cadence-critical sync probes are bounded by their helper's natural
@@ -3042,7 +3340,15 @@ _v2_task_requests_poll() {
 # ---- async-task wrappers (helper output captured to
 #      `<name>.out` by _scheduler_fire_async; atomic via
 #      .tmp+rename) ----------------------------------------------
-_v2_task_idle_section()      { render_idle_section 2>/dev/null || true; }
+# idle_section is the AUTHORITATIVE pane recorder (#562): `record` mode
+# forks a fresh pane-state probe per window (idle/engagement detection
+# never reads a stale recording) and writes each result into the shared
+# cache, which every other assessment (over-limit scan, compose-time
+# prelude, full-state snapshot) then reuses for the rest of the loop.
+_v2_task_idle_section() {
+    _pane_cache_gc 2>/dev/null || true
+    MONITOR_PANE_CACHE_MODE=record render_idle_section 2>/dev/null || true
+}
 # Event-fetch split (issue #181). The two sources ride different
 # rate-limit buckets and live at different cadences:
 #
@@ -3485,6 +3791,23 @@ _v2_task_version_check() {
     return 0
 }
 
+# ---- clone_drift task (--async, 1h default cadence) ----------------
+# Deployment-drift detection (issue #614): is the code this clone
+# EXECUTES the code that was merged? version_check answers "did the
+# files change"; this answers "did the pull ever happen". One
+# `git ls-remote` (no ref writes, no working-tree touch) plus, only
+# when the remote tip is not already local, one `gh api compare`.
+# Detection only — the pull stays a human-timed orchestrator action,
+# because it swaps helper libraries under the running watcher and
+# in-flight workers. Verdict is persisted as a drift-clone ask record
+# and surfaced by the existing _version_emit_section path, so this task
+# needs no emit plumbing of its own. All state is on-disk; --async is
+# safe. Hourly: the condition it catches is measured in days.
+_v2_task_clone_drift() {
+    _clone_drift_tick
+    return 0
+}
+
 # ---- service_health task (--async, 120 s default cadence) ----
 # Continuous service-health watch (service-health-watch). Each fire runs
 # every registry service's column-4 healthcheck. A freshly-unhealthy
@@ -3565,16 +3888,10 @@ _v2_task_reports_roll() {
     return 0
 }
 
-# _reports_roll_emit_section <notice_file>
-# One-shot: if a roll notice is pending, print it and CONSUME it (delete),
-# so it surfaces exactly once and a subsequent quiet cycle re-adds nothing.
-# Same self-clearing shape as the watcher-revived one-shot.
-_reports_roll_emit_section() {
-    local notice="${1:-}"
-    [[ -n "$notice" && -s "$notice" ]] || return 0
-    cat "$notice" 2>/dev/null || return 0
-    rm -f "$notice" 2>/dev/null || true
-}
+# NOTE: `_reports_roll_emit_section` used to be defined here. It has moved
+# ABOVE the startup sweep — the sweep is top-level script text and called it
+# before this point in the file had been parsed, so the call silently resolved
+# to nothing. See its definition near `_oneshot_defer`.
 
 # ---- compose_emit task (--async, cadence = MONITOR_INTERVAL) -
 # Reads staged outputs from
@@ -3585,6 +3902,194 @@ _reports_roll_emit_section() {
 # RESPAWN_HISTORY counters), so running in an async subshell is
 # safe. EMIT_SIG_NONCE is set locally in the subshell — fresh per
 # fire.
+# Compute the eligible-comments view (gh_now) from the durable
+# deliveries queue + the staged GraphQL backstop + the re-emit
+# registry. Extracted from `_v2_task_compose_emit` (your-org/
+# nexus-code#562) so the lightweight `comment_surface` task can surface
+# operator comments WITHOUT waiting on the sweep-priced compose body —
+# and compose_emit keeps calling it as the slow-cadence backstop (the
+# per-comment cooldown stamp inside `_filter_emit_cooldown` makes the
+# two paths naturally exclusive: whatever one of them just emitted, the
+# other drops for MONITOR_EMIT_COOLDOWN_SECONDS).
+#
+# Semantics preserved verbatim from the pre-#562 inline block:
+#
+# Event-fetch split (issue #181). Concat both raw streams, then
+# run the shared filter+cross_repo+dedup pipeline so cross-source
+# duplicates (same comment surfacing through both webhook and
+# GraphQL backstop) collapse to a single emit block.
+#
+# Deliveries side reads the durable queue, NOT the scheduler
+# staging file (issue #186). The scheduler's atomic-replace write
+# of `_v2_task_deliveries_poll`'s stdout to `deliveries_poll.out`
+# is overwritten on every 15s tick, so a 60s read window misses
+# three of every four ticks. The queue is drained (locked
+# rename + read + rm) so events surface even when the fire that
+# produced them was followed by an empty fire.
+# Re-emit-until-acked for cross-repo bot-mention comments
+# (nexus-code#236). The deliveries queue is a DURABLE but emit-ONCE
+# buffer: a cross-repo `mention=` block drained here whose paste then
+# fails is gone with no retry (unlike in-$REPO comments, which
+# `snapshot_github`/github_poll.out re-emit until 👀-acked every
+# 600s). So: drain once, garbage-collect acked/aged registry entries,
+# register every fresh cross-repo block into the durable re-emit
+# registry, then compose gh_now from the fresh drain + the GraphQL
+# backstop + the registry's still-un-acked blocks. The shared
+# pipeline's `_dedup_emit_lines` collapses the drain/registry overlap,
+# `_filter_processed_comments` drops anything the bot has since 👀'd
+# (stops re-emit), and `_filter_emit_cooldown` throttles each comment
+# to the re-emit cadence (no per-poll storm).
+#
+# Registry scoping + the bounded body-processing stage: see the inline
+# comments below (verbatim from the original block).
+#
+# Prints gh_now on stdout (possibly empty); always returns 0. `log`
+# writes to stderr, so calling this via `$( … )` is safe.
+_compose_gh_now() {
+    local stage_dir="$V2_STAGE_DIR"
+    _ensure_watcher_tmp_dir
+    local _drained
+    _drained=$(_drain_deliveries_queue 2>/dev/null || true)
+    _reemit_gc 2>/dev/null || true
+    # Scope the durable registry by the bot's PARTICIPATION, not by author
+    # (your-org/nexus-code#359 round-2; operator: "other users' comments
+    # shouldn't be drained unless the bot participated... it could be user-
+    # relevant"). The deliveries log is global across every installed repo, so
+    # a raw drain carries cross-tenant blocks from other operators' nexuses.
+    #   * `_filter_cross_repo_surface` (mention_only) keeps ONLY cross-repo
+    #     blocks whose body @-mentions THIS bot -- the discussions the bot is
+    #     addressed in / participates in -- and drops the rest (genuine foreign
+    #     noise the bot is NOT involved in; those are the only blocks actually
+    #     DRAINED away). Adopted from #359's scoping, but as a PARTICIPATION
+    #     gate, not an author gate.
+    #   * `_reemit_register` then classifies the survivors by author:
+    #     operator-authored -> `direct=yes` (two-tier direct re-emit);
+    #     other-user-authored -> `direct=no` RETAINED CONTEXT (kept in the
+    #     registry, NEVER re-fed for direct emission). A user-relevant
+    #     cross-tenant comment the bot is involved in is preserved, not
+    #     discarded -- while the operator-author chokepoint in
+    #     `_gh_filter_dedup_pipeline` still guarantees no foreign block ever
+    #     direct-emits.
+    # The `/skip` opt-out filter is deliberately NOT applied: a cross-repo @bot
+    # mention is itself the eligibility gate (operator call, #359 thread).
+    # NOTE: `_filter_to_user_author` is intentionally NO LONGER in this
+    # pre-pass -- it would drop the very foreign-but-bot-involved blocks we now
+    # preserve as context; the DIRECT path keeps it as the chokepoint.
+    printf '%s\n' "$_drained" \
+        | _filter_cross_repo_surface \
+        | _reemit_register 2>/dev/null || true
+    # BOUNDED body-processing stage (compose_emit multibyte wedge). This
+    # filter pipeline is the step MOST exposed to operator-controlled
+    # comment content; LC_ALL=C inside each filter makes a byte-
+    # truncated (invalid-UTF-8) body byte-safe, and capping wall-clock here
+    # means no future pathological body (or filter regression) in THIS stage
+    # can hang and stall the caller. On a non-zero _run_bounded result:
+    # empty gh_now + loud log; the caller continues (skip the bad input,
+    # keep beating) rather than going stale.
+    local _ghf_to="${MONITOR_COMPOSE_FILTER_TIMEOUT_SECONDS:-30}"
+    [[ "$_ghf_to" =~ ^[0-9]+$ ]] || _ghf_to=30
+    local _ghf_in="${tmp_dir}/compose-ghfilter-in.$BASHPID"
+    local _ghf_out="${tmp_dir}/compose-ghfilter-out.$BASHPID"
+    {
+        printf '%s\n' "$_drained"
+        cat "$stage_dir/github_poll.out" 2>/dev/null || true
+        _reemit_pending 2>/dev/null || true
+    } > "$_ghf_in" 2>/dev/null || true
+    local _ghf_rc=0
+    _run_bounded "$_ghf_to" "$_ghf_out" _gh_filter_dedup_pipeline_file "$_ghf_in" || _ghf_rc=$?
+    if (( _ghf_rc == 0 )); then
+        cat "$_ghf_out" 2>/dev/null || true
+    else
+        # rc 124 = _run_bounded wall-clock kill (the hang case); any other
+        # non-zero is a pipeline-internal failure. Both degrade identically
+        # (skip this cycle's eligible-comments, keep beating) but log
+        # distinctly so a timeout isn't misattributed to a crash, or v.v.
+        if (( _ghf_rc == 124 )); then
+            log "WARN gh-now: gh-filter pipeline exceeded ${_ghf_to}s (wall-clock kill); eligible-comments treated as EMPTY this cycle (bad body/filter skipped, cycle NOT blocked)"
+        else
+            log "WARN gh-now: gh-filter pipeline failed (rc=${_ghf_rc}); eligible-comments treated as EMPTY this cycle (cycle NOT blocked)"
+        fi
+    fi
+    rm -f "$_ghf_in" "$_ghf_out" 2>/dev/null || true
+    return 0
+}
+
+# Lightweight, sweep-independent operator-comment surfacing
+# (your-org/nexus-code#562 — the symptom fix). Eligible-comment
+# surfacing needs the GITHUB POLL RESULT, not pane state; coupling it
+# to the sweep-priced compose_emit meant that precisely when the
+# workspace was busiest (many workers → slow sweep → 300s watchdog
+# kill) operator comments surfaced late (~8min observed). This task
+# computes the same shared gh_now view and pastes a MINIMAL emit —
+# header, `--- eligible github comments ---` section, sig trailer — with
+# no prelude sweep, no full-state render, no local diff. Its wall-clock
+# is bounded by the pipeline's own 30s cap + the paste, far inside any
+# watchdog budget, regardless of window count.
+#
+# Interplay with compose_emit (which keeps a backstop `_compose_gh_now`
+# call): `_filter_emit_cooldown` stamps each comment id AT FILTER-PASS
+# time, so whichever path surfaces a comment first makes the other drop
+# it for MONITOR_EMIT_COOLDOWN_SECONDS — no double-paste, and re-emit-
+# until-👀-acked cadence is preserved. The emit body shape keeps the
+# standard header/section/sig grammar so `_functional_check` (surfaced-
+# comment reaction audit), `_emit_dedup` canonicalization, and
+# paste_to_target's sig verification all keep working unchanged.
+_v2_task_comment_surface() {
+    local gh_now
+    gh_now=$(_compose_gh_now)
+    [[ -n "$gh_now" ]] || return 0
+    _ensure_watcher_tmp_dir
+    local sig_nonce
+    sig_nonce=$(head -c 4 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n' | head -c 6)
+    local emit_file="${tmp_dir}/comment-surface.$BASHPID"
+    {
+        printf '=== nexus state changed at %s (comments) ===\n' "$(date -Is)"
+        printf '*If unsure how to proceed: see CLAUDE.md.*\n'
+        printf -- '--- eligible github comments ---\n'
+        printf '%s\n' "$gh_now"
+        printf -- '--- nexus-emit-sig %s %s ---\n' "$(date -Is)" "$sig_nonce"
+    } > "$emit_file"
+    local archive_path
+    archive_path=$(archive_emit "$emit_file" "comments")
+    log "emit archive=$(basename "$archive_path") reason=comments (comment-surface fast path)"
+    # No `_compose_emit_should_suppress` consultation: that gate is
+    # bypassed for bodies carrying eligible comments by design, and
+    # every body here carries them. Per-comment rate limiting already
+    # happened inside the shared pipeline.
+    if _over_limit_orchestrator_paused; then
+        log "comment-surface paste suppressed: orchestrator over-limit (archive=$(basename "$archive_path"))"
+        _over_limit_record_held "$(basename "$archive_path")" "comments"
+    elif paste_with_retry "$TARGET" "$emit_file"; then
+        log "pasted to ${TARGET} (comment-surface)"
+        _emit_delivery_ok
+        _compose_emit_record_emit "$emit_file"
+        # A successful paste into the orchestrator target is the same
+        # channel-is-working evidence compose_emit's paste provides —
+        # reset the respawn-loop guards so comment-heavy stretches
+        # (where this path does most of the pasting) can't starve them.
+        _respawn_loop_reset "$RESPAWN_HISTORY"
+        rm -f "$RESPAWN_TRIPPED"
+        _respawn_consec_reset "$RESPAWN_CONSEC_COUNTER"
+        rm -f "$RESPAWN_SLOW_GRIND_TRIPPED"
+    else
+        local rc=$?
+        case $rc in
+            1) log "comment-surface: tmux not available; archive only" ;;
+            2) log "comment-surface: target window '${TARGET}' missing; archive only" ;;
+            4) log "comment-surface: paste submitted but signature not visible (VI mode?); archive only" ;;
+            *) log "comment-surface: paste failed (rc=$rc); archive only" ;;
+        esac
+        # Same loud delivery-failure accounting as compose_emit: a
+        # failing wake path must trip the self-heal, not rot silently.
+        # The comments themselves re-surface via the 600s github_poll
+        # re-emit (in-repo) / the durable re-emit registry (cross-repo)
+        # once their cooldown lapses.
+        _emit_delivery_fail "$rc"
+    fi
+    rm -f "$emit_file" 2>/dev/null || true
+    return 0
+}
+
 _v2_task_compose_emit() {
     local stage_dir="$V2_STAGE_DIR"
     local local_snapshot="$stage_dir/snapshot_local.out"
@@ -3634,100 +4139,13 @@ _v2_task_compose_emit() {
     fi
 
     local gh_now bell_now idle_now pending_now requests_now
-    # Event-fetch split (issue #181). Concat both raw streams, then
-    # run the shared filter+cross_repo+dedup pipeline so cross-source
-    # duplicates (same comment surfacing through both webhook and
-    # GraphQL backstop) collapse to a single emit block.
-    #
-    # Deliveries side reads the durable queue, NOT the scheduler
-    # staging file (issue #186). The scheduler's atomic-replace write
-    # of `_v2_task_deliveries_poll`'s stdout to `deliveries_poll.out`
-    # is overwritten on every 15s tick, so a 60s read window misses
-    # three of every four ticks. The queue is drained (locked
-    # rename + read + rm) so events surface even when the fire that
-    # produced them was followed by an empty fire.
-    # Re-emit-until-acked for cross-repo bot-mention comments
-    # (nexus-code#236). The deliveries queue is a DURABLE but emit-ONCE
-    # buffer: a cross-repo `mention=` block drained here whose paste then
-    # fails is gone with no retry (unlike in-$REPO comments, which
-    # `snapshot_github`/github_poll.out re-emit until 👀-acked every
-    # 600s). So: drain once, garbage-collect acked/aged registry entries,
-    # register every fresh cross-repo block into the durable re-emit
-    # registry, then compose gh_now from the fresh drain + the GraphQL
-    # backstop + the registry's still-un-acked blocks. The shared
-    # pipeline's `_dedup_emit_lines` collapses the drain/registry overlap,
-    # `_filter_processed_comments` drops anything the bot has since 👀'd
-    # (stops re-emit), and `_filter_emit_cooldown` throttles each comment
-    # to the re-emit cadence (no per-poll storm).
-    local _drained
-    _drained=$(_drain_deliveries_queue 2>/dev/null || true)
-    _reemit_gc 2>/dev/null || true
-    # Scope the durable registry by the bot's PARTICIPATION, not by author
-    # (your-org/nexus-code#359 round-2; operator: "other users' comments
-    # shouldn't be drained unless the bot participated... it could be user-
-    # relevant"). The deliveries log is global across every installed repo, so
-    # a raw drain carries cross-tenant blocks from other operators' nexuses.
-    #   * `_filter_cross_repo_surface` (mention_only) keeps ONLY cross-repo
-    #     blocks whose body @-mentions THIS bot -- the discussions the bot is
-    #     addressed in / participates in -- and drops the rest (genuine foreign
-    #     noise the bot is NOT involved in; those are the only blocks actually
-    #     DRAINED away). Adopted from #359's scoping, but as a PARTICIPATION
-    #     gate, not an author gate.
-    #   * `_reemit_register` then classifies the survivors by author:
-    #     operator-authored -> `direct=yes` (two-tier direct re-emit);
-    #     other-user-authored -> `direct=no` RETAINED CONTEXT (kept in the
-    #     registry, NEVER re-fed for direct emission). A user-relevant
-    #     cross-tenant comment the bot is involved in is preserved, not
-    #     discarded -- while the operator-author chokepoint in
-    #     `_gh_filter_dedup_pipeline` still guarantees no foreign block ever
-    #     direct-emits.
-    # The `/skip` opt-out filter is deliberately NOT applied: a cross-repo @bot
-    # mention is itself the eligibility gate (operator call, #359 thread).
-    # NOTE: `_filter_to_user_author` is intentionally NO LONGER in this
-    # pre-pass -- it would drop the very foreign-but-bot-involved blocks we now
-    # preserve as context; the DIRECT path keeps it as the chokepoint.
-    printf '%s\n' "$_drained" \
-        | _filter_cross_repo_surface \
-        | _reemit_register 2>/dev/null || true
-    # BOUNDED body-processing stage (compose_emit multibyte wedge). This
-    # filter pipeline is the compose_emit step MOST exposed to operator-
-    # controlled comment content; LC_ALL=C inside each filter makes a byte-
-    # truncated (invalid-UTF-8) body byte-safe, and capping wall-clock here
-    # means no future pathological body (or filter regression) in THIS stage
-    # can hang and stall the cycle-end heartbeat. (The upstream
-    # `_reemit_register` pre-pass and the downstream compose_report/paste
-    # remain unbounded — out of scope here; the supervisor-revive backstop
-    # still covers a hang there.) On a non-zero _run_bounded result: empty
-    # gh_now + loud log; the cycle continues and still bumps the heartbeat
-    # (skip the bad input, keep beating) rather than going stale and forcing
-    # a supervisor revive (~9min downtime in the 2026-06-24 incident).
-    _ensure_watcher_tmp_dir
-    local _ghf_to="${MONITOR_COMPOSE_FILTER_TIMEOUT_SECONDS:-30}"
-    [[ "$_ghf_to" =~ ^[0-9]+$ ]] || _ghf_to=30
-    local _ghf_in="${tmp_dir}/compose-ghfilter-in.$$"
-    local _ghf_out="${tmp_dir}/compose-ghfilter-out.$$"
-    {
-        printf '%s\n' "$_drained"
-        cat "$stage_dir/github_poll.out" 2>/dev/null || true
-        _reemit_pending 2>/dev/null || true
-    } > "$_ghf_in" 2>/dev/null || true
-    local _ghf_rc=0
-    _run_bounded "$_ghf_to" "$_ghf_out" _gh_filter_dedup_pipeline_file "$_ghf_in" || _ghf_rc=$?
-    if (( _ghf_rc == 0 )); then
-        gh_now=$(cat "$_ghf_out" 2>/dev/null || true)
-    else
-        gh_now=""
-        # rc 124 = _run_bounded wall-clock kill (the hang case); any other
-        # non-zero is a pipeline-internal failure. Both degrade identically
-        # (skip this cycle's eligible-comments, keep beating) but log
-        # distinctly so a timeout isn't misattributed to a crash, or v.v.
-        if (( _ghf_rc == 124 )); then
-            log "WARN compose_emit: gh-filter pipeline exceeded ${_ghf_to}s (wall-clock kill); eligible-comments treated as EMPTY this cycle (bad body/filter skipped, cycle NOT blocked, heartbeat preserved)"
-        else
-            log "WARN compose_emit: gh-filter pipeline failed (rc=${_ghf_rc}); eligible-comments treated as EMPTY this cycle (cycle NOT blocked, heartbeat preserved)"
-        fi
-    fi
-    rm -f "$_ghf_in" "$_ghf_out" 2>/dev/null || true
+    # Eligible-comments BACKSTOP (your-org/nexus-code#562). The primary,
+    # sweep-independent surfacing path is the `comment_surface` task;
+    # this call re-runs the same shared computation so comments still
+    # surface at the compose cadence if that task is disabled or broken.
+    # The per-comment cooldown stamp inside the shared pipeline keeps
+    # the two paths from double-pasting the same comment.
+    gh_now=$(_compose_gh_now)
     bell_now=$(cat "$stage_dir/bell_windows.out" 2>/dev/null || true)
     idle_now=$(cat "$stage_dir/idle_section.out" 2>/dev/null || true)
     pending_now=$(cat "$stage_dir/pending_decisions.out" 2>/dev/null || true)
@@ -3764,6 +4182,21 @@ _v2_task_compose_emit() {
                     log "WARN compose_emit: inline full-state render exceeded ${_ce_to}s; using partial (cycle NOT blocked)"
                 fi
                 full_state_lines=$(cat "$_ce_tmp" 2>/dev/null || true)
+            fi
+            # Stale-snapshot re-stat (watcher-emit-noise, Class 1). The
+            # staged full_state_snap.out is up to one async cadence
+            # (600s) old, so a window killed since it was rendered
+            # lingers as a live row. Drop rows for windows that no longer
+            # exist in the current tmux set so a heartbeat snapshot never
+            # presents a retired window as live. Cheap (one tmux call);
+            # queried once here and reused. Knob-guarded, default on.
+            if [[ -n "$full_state_lines" && "${MONITOR_FULL_STATE_RESTAT_WINDOWS:-true}" == "true" ]]; then
+                local _fs_live
+                _fs_live=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
+                if [[ -n "$_fs_live" ]]; then
+                    full_state_lines=$(printf '%s' "$full_state_lines" \
+                        | _full_state_restat_live_windows "$_fs_live")
+                fi
             fi
             if MONITOR_PRELUDE_DRY_RUN=1 _run_bounded "$_ce_to" "$_ce_tmp" render_idle_prelude; then
                 canonical_prelude=$(cat "$_ce_tmp" 2>/dev/null || true)
@@ -3859,6 +4292,11 @@ _v2_task_compose_emit() {
     # non-empty result is added to BOTH gate predicates below, so a
     # surfaced candidate always actually composes.
     local cc_update_now=""
+    # Fresh one-shot ledger for THIS body (#568 A2). This task runs in an
+    # async subshell, which would otherwise inherit an uncommitted list from
+    # the startup sweep or a previous fire and consume markers whose text is
+    # not in the body about to be pasted.
+    _oneshot_reset
     cc_update_now=$(_cc_update_emit_section "$STATE_DIR" 2>/dev/null || true)
 
     # Component-drift asks (issue #186): same surfacing model as the
@@ -3883,6 +4321,9 @@ _v2_task_compose_emit() {
     # workspace), never a standing/periodic one.
     local reports_roll_now=""
     reports_roll_now=$(_reports_roll_emit_section "$REPORTS_ROLL_NOTICE_FILE" 2>/dev/null || true)
+    # Registered here rather than inside the helper: the render is a `$(…)`
+    # subshell, so the ledger append must happen in this shell (#568 A2).
+    [[ -n "$reports_roll_now" ]] && _oneshot_defer "$REPORTS_ROLL_NOTICE_FILE"
 
     # Arm-watcher-supervisor reminder (mutual-liveness). A STANDING
     # condition reflecting the live supervisor-heartbeat freshness:
@@ -4023,12 +4464,33 @@ _v2_task_compose_emit() {
                     requests_commit_emitted "$emit_body"
                     : > "$stage_dir/requests_poll.out" 2>/dev/null || true
                 fi
+                # One-shot markers this body carried (#568 A2) — consumed here
+                # and nowhere else, so a suppressed or failed paste leaves them
+                # on disk to re-surface next cycle.
+                _oneshot_commit
                 _respawn_loop_reset "$RESPAWN_HISTORY"
                 rm -f "$RESPAWN_TRIPPED"
                 _respawn_consec_reset "$RESPAWN_CONSEC_COUNTER"
                 rm -f "$RESPAWN_SLOW_GRIND_TRIPPED"
-                if (( full_state_due == 1 )); then
+                # Full-state heartbeat due-clock reset (watcher-emit-noise,
+                # Class 2). Restart FULL_STATE_STAMP from ANY successful
+                # paste — a change/resurface poll already proved liveness
+                # and warmed the paste channel, so without this reset the
+                # periodic full-state fires again moments later (the
+                # 2026-07-21 00:36 poll → 00:38 poll-full-state
+                # double-wake). This moves only the DUE re-evaluation
+                # cadence; the genuine timeout heartbeat is governed by the
+                # canonical-cache mtime + effective floor (updated only on
+                # an actual full-state emit, below), so the liveness
+                # heartbeat still fires at the (stretched) floor and the
+                # startup dead-threshold clamp arithmetic — derived from
+                # the base floor + full_state_emit_interval, not this stamp
+                # — is unchanged. Knob-guarded, default on.
+                if (( full_state_due == 1 )) \
+                   || [[ "${MONITOR_FULL_STATE_RESET_STAMP_ON_EMIT:-true}" == "true" ]]; then
                     date +%s > "$FULL_STATE_STAMP" 2>/dev/null || true
+                fi
+                if (( full_state_due == 1 )); then
                     if [[ -n "$full_state_canonical" ]]; then
                         printf '%s' "$full_state_canonical" > "${FULL_STATE_CANONICAL_CACHE}.tmp" \
                             && mv "${FULL_STATE_CANONICAL_CACHE}.tmp" "$FULL_STATE_CANONICAL_CACHE" 2>/dev/null || true
@@ -4174,6 +4636,18 @@ if [[ "$MONITOR_VERSION_RESTART_ENABLED" == "true" ]] \
 else
     log "version-restart: disabled (monitor.version_restart.enabled=${MONITOR_VERSION_RESTART_ENABLED}, interval=${MONITOR_VERSION_CHECK_INTERVAL_SECONDS})"
 fi
+# Primary-clone deployment-drift detection (issue #614). Registered
+# independently of version_restart: they answer different questions
+# (files-changed vs pull-never-happened), so disabling the restart
+# machinery must not also blind the deployment check — that pairing is
+# what let 8 merged PRs sit un-deployed for five days.
+if [[ "$MONITOR_CLONE_DRIFT_ENABLED" == "true" ]] \
+   && (( MONITOR_CLONE_DRIFT_INTERVAL_SECONDS > 0 )); then
+    _schedule_task clone_drift         "$MONITOR_CLONE_DRIFT_INTERVAL_SECONDS" \
+                                                       _v2_task_clone_drift            --class expensive --async
+else
+    log "clone-drift: disabled (monitor.clone_drift.enabled=${MONITOR_CLONE_DRIFT_ENABLED}, interval=${MONITOR_CLONE_DRIFT_INTERVAL_SECONDS})"
+fi
 # Continuous service-health watch (service-health-watch). Registered only
 # when the master enable is on AND the interval is > 0; either off-switch
 # falls back to supervisor-only self-heal with no continuous detection or
@@ -4194,6 +4668,19 @@ fi
 # body never holds the scheduler's sync slot. target_window
 # force-fires this on rc=2.
 _schedule_task compose_emit            "$INTERVAL"  _v2_task_compose_emit           --class medium    --async
+# Sweep-independent operator-comment surfacing (your-org/nexus-code#562).
+# Cadence matches deliveries_poll (15s default) so a webhook-delivered
+# comment surfaces within ~one deliveries tick even when the sweep is
+# slow; the post-tick nudge additionally pulls it forward the moment the
+# queue/github staging advances. interval_seconds=0 disables the task —
+# compose_emit's backstop `_compose_gh_now` call then owns surfacing
+# (the pre-#562 behaviour).
+if (( MONITOR_COMMENT_SURFACE_INTERVAL_SECONDS > 0 )); then
+    _schedule_task comment_surface     "$MONITOR_COMMENT_SURFACE_INTERVAL_SECONDS" \
+                                                    _v2_task_comment_surface        --class medium    --async
+else
+    log "comment-surface: disabled (monitor.comment_surface.interval_seconds=0); compose_emit backstop owns comment surfacing"
+fi
 
 # Post-tick hook: compose_emit is async, so its body cannot use the
 # in-memory scheduler-override primitive (subshell mutations to the
@@ -4222,6 +4709,12 @@ _scheduler_post_tick_hook() {
 # steady-state poll.
 if (( ONCE == 1 )); then
     _schedule_disable compose_emit
+    # comment_surface would otherwise paste a comments-only emit on the
+    # pre-drain tick — --once promises a SINGLE emit equivalent to one
+    # steady-state poll, and compose_emit's backstop `_compose_gh_now`
+    # carries the comments in that emit. Guarded: the task is only
+    # registered when its interval knob is > 0.
+    [[ -n "${TASK_FN[comment_surface]:-}" ]] && _schedule_disable comment_surface
     _scheduler_tick; sched_rc=$?
     if (( sched_rc == 99 )); then
         log "scheduler shutdown (signal during once-tick)"
@@ -4265,6 +4758,20 @@ while true; do
     # death can never mature into a stale-heartbeat false DOWN.
     _progress_bump loop-tick
     _start_heartbeat_ticker
+    # Bell-batch release (your-org/nexus-code#560 round 2). The notify gate
+    # (monitor/notifywrap/sandbox-notify) captures cooldown-suppressed bells
+    # into per-class batches instead of dropping them; this is the RELEASE
+    # side — once per tick we flush any batch whose class window has elapsed as
+    # ONE digest bell. It is owned HERE (the supervised, self-healing watcher)
+    # rather than by the notifying process, because the one-shot cc-auto-update
+    # failure callers `exit` immediately after notifying — they cannot flush
+    # their own batch. Best-effort, cheap (a few small stat/reads), fail-quiet;
+    # a missed tick simply defers the digest to the next one (batches are
+    # durable files), so it can never wedge.
+    if [[ -x "${NEXUS_ROOT}/monitor/notifywrap/sandbox-notify" ]]; then
+        NEXUS_NOTIFY_FLUSH=1 NEXUS_NOTIFY_ANCESTRY_SCAN=0 \
+            "${NEXUS_ROOT}/monitor/notifywrap/sandbox-notify" >/dev/null 2>&1 || true
+    fi
     # Refresh the cross-host instance beacon once per loop iteration (the
     # scheduler caps its sleep at ~10s, so this fires well within the
     # staleness window), but SELF-FENCE first (D4): if the beacon on disk now

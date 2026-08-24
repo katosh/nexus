@@ -39,6 +39,39 @@
 # either test's "find my new launcher" diff picks up the other's
 # file, producing intermittent assertion failures on the launcher
 # body. See PR #166 CI flake; fix tracked in the same commit.
+# Directory this file lives in, resolved at SOURCE time. Needed to locate
+# monitor/guard-block.sh.in — the shim-guard template shared with
+# spawn-worker.sh. An assignment, not an action: the side-effect-free
+# contract above is about spawning/logging, not about knowing where you are.
+_respawn_dir=${_respawn_dir:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)}
+
+# Dead-pane paste guard (#745). Sourced EXPLICITLY rather than relied on
+# transitively from main.sh: this module is also sourced standalone by
+# test-respawn.sh and by entry.sh, and a missing function is rc 127 — which
+# reads as "not dead" and silently restores a hazard that kills the tmux
+# SERVER. Fail LOUD instead.
+# shellcheck source=../_pane-live.sh
+[[ -r "$_respawn_dir/../_pane-live.sh" ]] && source "$_respawn_dir/../_pane-live.sh"
+if ! declare -F _tmux_pane_is_dead >/dev/null 2>&1; then
+    # FAIL-CLOSED FALLBACK (#745). Without the real predicate we cannot
+    # tell a live pane from a corpse, and a paste into a corpse kills the
+    # tmux SERVER — so every paste refuses, loudly, at the moment it is
+    # attempted.
+    #
+    # Deliberately NOT an `exit`/`return` at load time. The first cut
+    # refused to LOAD, and CI showed why that is wrong: several fixtures
+    # build partial trees from ENUMERATED copy lists, so the file is
+    # simply absent there, and four unrelated suites died on modules
+    # they never paste from. A missing paste guard must stop PASTES, not
+    # module loading. Quiet at load, loud at use: the noise belongs where
+    # the hazard is.
+    _tmux_pane_is_dead() {
+        printf '%s: _pane-live.sh unavailable — cannot prove %q is a live pane, refusing to paste (your-org/nexus-code#745: a paste into a dead pane kills the tmux server)\n' \
+            "${BASH_SOURCE[1]##*/}" "${1:-?}" >&2
+        return 0
+    }
+fi
+
 _respawn_tmpdir() {
     printf '%s' "${RESPAWN_TMPDIR:-/tmp}"
 }
@@ -57,13 +90,57 @@ _respawn_tmpdir() {
 # callers degrade to their other signals. Child discovery uses
 # `pgrep -P <pid>` — PID-scoped, per the no-mass-kill rule
 # (monitor/cc-harness/lint-no-mass-kill.sh).
+# Capture-then-match, never `tr … | grep -q` (your-org/nexus-code#622).
+# When this file is sourced into a shell that has enabled the
+# pipe-failure option, `grep -q` exiting on a match before `tr` has
+# finished writing makes `tr` take SIGPIPE and inverts the pipeline's
+# verdict to a FALSE NEGATIVE at the moment it was true.
+#
+# FULL explanation — the 4 KB stdio boundary, why it is NOT the 64 KB
+# pipe capacity, and the position-dependent rate — lives on
+# `_nexus_pid_tree_has_env_marker` in `_lib.sh`, deliberately not
+# repeated here (see the inheritance note below).
+#
+# ---------------------------------------------------------------------
+# INHERITANCE, re-examined — the question `test-tmux-lookup-sigpipe.sh`
+# asks, answered here so the next person does not have to re-derive it.
+#
+# That guard greps THIS file for the pipe-failure option's NAME and
+# fails if it appears, to assert this helper still INHERITS the caller's
+# setting rather than establishing its own. It fired on the #622 fix
+# below — not because the fix set anything, but because the explanatory
+# comment MENTIONED the option by name. This file sets no shell options
+# at all; `grep -n '^[[:space:]]*set -' _respawn.sh` is empty, and it
+# was empty before the fix too.
+#
+# Q: does `_respawn.sh` still inherit the caller's setting?
+# A: YES, unchanged. It sets no options; sourcing it into `main.sh` /
+#    `svc.sh` leaves their own `set -uo …` options in force, exactly
+#    as before. The guard's premise still holds.
+#
+# Q: is inheriting still CORRECT now that the probes changed?
+# A: Yes, and it now matters LESS, which is the point of the change.
+#    The old `tr … | grep -q` form was correct ONLY with the option
+#    off — inheriting it is what made the probe return false negatives.
+#    The capture-then-match form has no pipeline, so it is correct
+#    under EITHER setting. This helper therefore no longer depends on
+#    which way it inherits, and a future caller that enables the option
+#    cannot silently invert these probes.
+#
+# The token is kept out of this file rather than widening the guard
+# (the `#671` precedent: remove the flagged dependency, do not relax
+# the check that flagged it). Single-sourcing the explanation in
+# `_lib.sh` is better practice anyway.
+# ---------------------------------------------------------------------
 _respawn_pid_tree_is_orchestrator() {
     local pid="$1" depth="${2:-3}"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    if [[ -r "/proc/$pid/environ" ]] \
-       && tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-          | grep -qxF 'NEXUS_IS_ORCHESTRATOR=1'; then
-        return 0
+    local _env_data
+    if [[ -r "/proc/$pid/environ" ]]; then
+        _env_data=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) || _env_data=""
+        if [[ -n "$_env_data" ]] && grep -qxF 'NEXUS_IS_ORCHESTRATOR=1' <<<"$_env_data"; then
+            return 0
+        fi
     fi
     (( depth <= 0 )) && return 1
     local child
@@ -97,12 +174,17 @@ _respawn_pid_tree_orchestrator_sid() {
     local pid="$1" depth="${2:-3}"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     local uuid_re='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-    if [[ -r "/proc/$pid/environ" ]] \
-       && tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-          | grep -qxF 'NEXUS_IS_ORCHESTRATOR=1'; then
+    # Capture the environ ONCE, then match against it — same #622
+    # reasoning as the two probes above. The `sed … | head -n 1` here
+    # is the same shape a second time: `head` exits after one line and
+    # SIGPIPEs its upstream, so with the caller's pipe-failure option
+    # enabled the status is 141 even when the value was extracted fine.
+    local _env_data=""
+    [[ -r "/proc/$pid/environ" ]] \
+        && { _env_data=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) || _env_data=""; }
+    if [[ -n "$_env_data" ]] && grep -qxF 'NEXUS_IS_ORCHESTRATOR=1' <<<"$_env_data"; then
         local sid
-        sid=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
-              | sed -n 's/^NEXUS_ORCH_SESSION_ID=//p' | head -n 1)
+        sid=$(sed -n 's/^NEXUS_ORCH_SESSION_ID=//p' <<<"$_env_data" | head -n 1)
         if [[ ! "$sid" =~ $uuid_re ]]; then
             sid=""
             local -a argv=()
@@ -210,15 +292,25 @@ _respawn_verify_target_absent() {
     fi
 
     # ---- enumerate orchestrator-marked panes (one pass) ----------------
-    local pane_pid win_id win_name sid
+    # DEAD PANES ARE SKIPPED (your-org/nexus-code#741). tmux keeps
+    # reporting `#{pane_pid}` for a `remain-on-exit` corpse, but that
+    # pid names a process that has EXITED — so every /proc answer about
+    # it is either nothing or, once the kernel recycles the number,
+    # about an unrelated process. Both readings are wrong here, and the
+    # second is the dangerous one: a recycled pid whose environ happens
+    # to carry the orchestrator marker would register a corpse as a
+    # LIVE orchestrator and veto every respawn from then on. A dead
+    # pane is evidence of absence, not an unreadable presence.
+    local pane_pid win_id win_name pane_dead sid
     local -a orch_pid=() orch_win=() orch_name=() orch_sid=()
-    while IFS='|' read -r pane_pid win_id win_name; do
+    while IFS='|' read -r pane_pid win_id win_name pane_dead; do
+        [[ "$pane_dead" == "1" ]] && continue
         [[ "$pane_pid" =~ ^[0-9]+$ ]] || continue
         if sid=$(_respawn_pid_tree_orchestrator_sid "$pane_pid"); then
             orch_pid+=("$pane_pid"); orch_win+=("$win_id")
             orch_name+=("$win_name"); orch_sid+=("$sid")
         fi
-    done < <(tmux list-panes -a -F '#{pane_pid}|#{window_id}|#{window_name}' 2>/dev/null)
+    done < <(tmux list-panes -a -F '#{pane_pid}|#{window_id}|#{window_name}|#{pane_dead}' 2>/dev/null)
 
     local pinned
     pinned=$(_respawn_read_pin_sid)
@@ -274,7 +366,7 @@ _respawn_verify_target_absent() {
         # the name — abort loudly and leave resolution to the operator
         # (the cockpit/watcher self-close guards make this state
         # self-healing for the known impostor classes).
-        if tmux list-windows -F '#{window_name}' 2>/dev/null | grep -qxF "$target"; then
+        if grep -qxF "$target" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"; then
             printf 'orchestrator-alive-elsewhere pane_pid=%s window_id=%s was_named=%s — slot %s still occupied by a non-orchestrator window; not healing%s' \
                 "${orch_pid[L]}" "${orch_win[L]}" "${orch_name[L]}" "$target" "$killed"
             return 1
@@ -327,7 +419,7 @@ _respawn_verify_target_absent() {
     fi
 
     # ---- impostor classification of a reappeared target window ----------
-    if tmux list-windows -F '#{window_name}' 2>/dev/null | grep -qxF "$target"; then
+    if grep -qxF "$target" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"; then
         # Re-probe once after a short settle: a freshly-spawned
         # orchestrator window briefly runs the /tmp launcher (no env
         # marker until it execs claude) and must not read as an
@@ -336,9 +428,20 @@ _respawn_verify_target_absent() {
         [[ "$reprobe" =~ ^[0-9]+$ ]] || reprobe=1
         (( reprobe > 0 )) && sleep "$reprobe"
 
-        local classified=0 occupant=''
-        while IFS='|' read -r pane_pid win_id win_name; do
+        local classified=0 occupant='' live_panes=0 dead_panes=0
+        while IFS='|' read -r pane_pid win_id win_name pane_dead; do
             [[ "$win_name" == "$target" ]] || continue
+            # A `remain-on-exit` corpse is not an occupant. Counting it
+            # as one is your-org/nexus-code#741 one layer below the
+            # probe: the pane's process is gone, so `/proc` cannot
+            # classify it, and "unclassified" routed straight to the
+            # refuse arm below — an eternal veto on the respawn of an
+            # orchestrator that had already died.
+            if [[ "$pane_dead" == "1" ]]; then
+                dead_panes=$(( dead_panes + 1 ))
+                continue
+            fi
+            live_panes=$(( live_panes + 1 ))
             [[ "$pane_pid" =~ ^[0-9]+$ ]] || continue
             if _respawn_pid_tree_is_orchestrator "$pane_pid"; then
                 printf 'window-reappeared-live pane_pid=%s window_id=%s (late marker)' \
@@ -352,7 +455,26 @@ _respawn_verify_target_absent() {
                 classified=1
                 occupant=$(tr '\0' ' ' < "/proc/$pane_pid/cmdline" 2>/dev/null | head -c 120)
             fi
-        done < <(tmux list-panes -a -F '#{pane_pid}|#{window_id}|#{window_name}' 2>/dev/null)
+        done < <(tmux list-panes -a -F '#{pane_pid}|#{window_id}|#{window_name}|#{pane_dead}' 2>/dev/null)
+
+        # The slot holds nothing but corpses. Proceeding is what the
+        # caller's kill-then-spawn is FOR: the kill clears the dead
+        # window, the spawn restores the orchestrator.
+        #
+        # Both halves of this condition are POSITIVE observations, and
+        # that is the safety argument. `dead_panes > 0` requires rows
+        # tmux actually returned; a query that failed yields no rows at
+        # all, lands on `live_panes == 0 && dead_panes == 0`, and falls
+        # through to the refuse arm below. So this branch cannot be
+        # reached by failing to look — only by looking and finding a
+        # corpse. Same asymmetry the probe is built on: a wrong
+        # "proceed" duplicates an orchestrator, a wrong "abort" delays
+        # one, and only the first leaves wreckage.
+        if (( live_panes == 0 && dead_panes > 0 )); then
+            printf 'verified-absent (remain-on-exit corpse: %d dead pane(s) under %s, no live process)' \
+                "$dead_panes" "$target"
+            return 0
+        fi
 
         if (( classified )); then
             # Killable: a positively non-orchestrator occupant (e.g. a
@@ -380,6 +502,20 @@ _respawn_resolve_settings_flag() {
     local nexus_root="$1"
     local p="$nexus_root/monitor/orchestrator-settings.json"
     [[ -f "$p" ]] || return 0
+    # Operator-local overlay (your-org/nexus-code#614): prefer the
+    # merged `<tracked> * <tracked>.local` result when an untracked
+    # `orchestrator-settings.local.json` exists, so the operator's model
+    # pin and TUI mode survive a pull instead of being silently
+    # discarded when a conflict is resolved in upstream's favour. On
+    # resolver failure fall back to the tracked file — this is the
+    # RESPAWN path, and an orchestrator that comes back with default
+    # settings is strictly better than one that does not come back at
+    # all. The failure is not silent: the resolver has already written
+    # its reason to stderr, which lands in the watcher log.
+    local eff
+    if [[ -x "$nexus_root/monitor/resolve-settings.sh" ]]; then
+        eff=$("$nexus_root/monitor/resolve-settings.sh" "$p" 2>/dev/null) && [[ -n "$eff" ]] && p="$eff"
+    fi
     printf -- '--settings %s' "$p"
 }
 
@@ -532,15 +668,44 @@ _respawn_compose_launcher() {
     local sid_export=''
     [[ -n "$session_id" ]] \
         && printf -v sid_export 'export NEXUS_ORCH_SESSION_ID="%s"\n' "$session_id"
+    # Shim precondition, from the SINGLE SOURCE shared with spawn-worker.sh
+    # (monitor/guard-block.sh.in). Read as DATA, never sourced — this file is
+    # itself sourced by the watcher, and adding a sourced dependency here is
+    # the skew hazard CLAUDE.md documents. Two hand-maintained copies of a
+    # guard is how the next divergence lands, and a guard silently diverged
+    # from its twin is a cousin of the class this closes.
+    local _rs_tpl="$_respawn_dir/../guard-block.sh.in"
+    local _respawn_guard_block
+    if [ -r "$_rs_tpl" ]; then
+        _respawn_guard_block=$(sed -e 's/@@WHO@@/_respawn/g' -e 's/@@ACTION@@/RESPAWN/g' -- "$_rs_tpl")
+    else
+        # Fail LOUD, never to an empty block: an absent template would emit a
+        # launcher with NO guard at all, which is the exact defect (#589).
+        _respawn_guard_block=$(printf '%s\n' \
+            'echo "_respawn: REFUSING TO RESPAWN — shim guard template missing (guard-block.sh.in); an empty guard block is a guard that does not run (your-org/nexus-code#589)." >&2' \
+            'exit 78')
+    fi
     cat > "$launcher" <<LAUNCHER
 #!/bin/bash
 rm -f "$launcher"
 export NEXUS_ROOT="$nexus_root"
+# The tree the WATCHER itself ships in. The shared guard block searches it as
+# a second root so a re-rooted NEXUS_ROOT cannot relocate the guard away from
+# the code that requires it (#577 + #589).
+export NEXUS_SPAWN_CODE_ROOT="$(cd "$_respawn_dir/../.." 2>/dev/null && pwd)"
 export NEXUS_IS_ORCHESTRATOR=1
 export NEXUS_ORCHESTRATOR_WINDOW="$target_window"
 # Join the nexus-wide toolchain (PATH += locals/bin, UV_* -> locals/) so the
 # orchestrator invokes nexus tools by name; guarded silent no-op if absent.
 [ -f "\$NEXUS_ROOT/monitor/locals-env.sh" ] && . "\$NEXUS_ROOT/monitor/locals-env.sh" || true
+# The shim precondition, emitted from the SINGLE source monitor/guard-block.sh.in
+# (your-org/nexus-code#589). The orchestrator runs the same Bash-tool shells a
+# worker does, so every monitor/*wrap shim must be reachable there. No
+# NEXUS_ASSERT_NPROC_EXPECT is set here: unlike a worker, the orchestrator
+# carries no soft nproc ceiling (it restarts services that must be able to raise
+# soft back to hard), so the helper only OBSERVES propagation rather than
+# requiring a specific ceiling.
+${_respawn_guard_block}
 ${sid_export}exec "$CLAUDE_BIN" --dangerously-skip-permissions $continue_flag $settings_flag
 LAUNCHER
     chmod +x "$launcher"
@@ -592,7 +757,7 @@ _respawn_spawn_window() {
             *) printf 'respawn pre-kill verify: %s\n' "$_verify_reason" >&2 ;;
         esac
     fi
-    if tmux list-windows -F '#{window_name}' 2>/dev/null | grep -qxF "$target"; then
+    if grep -qxF "$target" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"; then
         tmux kill-window -t "$target" 2>/dev/null || true
     fi
     tmux new-window -d -n "$target" -c "$nexus_root" "$launcher" 2>/dev/null || return 3
@@ -712,6 +877,17 @@ _respawn_wait_for_submit_evidence() {
 _respawn_paste_prompt_file() {
     local target="$1" prompt_file="$2"
     local buf rc
+    # #745: never paste into a dead pane — it kills the tmux server
+    # (20/20 measured). This site pastes the recovery prompt into a
+    # window `_respawn_spawn_window` has just created, so the pane is
+    # normally live; the guard covers the case where the spawned
+    # launcher died between `new-window` and here, which is exactly the
+    # crash-loop this module exists to survive.
+    if _tmux_pane_is_dead "$target"; then
+        printf '_respawn: target %q is a dead pane — refusing to paste the recovery prompt (your-org/nexus-code#745: a paste into a dead pane kills the tmux server)\n' \
+            "$target" >&2
+        return 1
+    fi
     buf="nexus-respawn-$$-$(date +%s%N)"
     rc=0
     if ! tmux send-keys -t "$target" i BSpace 2>/dev/null; then

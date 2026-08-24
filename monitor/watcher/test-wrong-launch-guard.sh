@@ -50,6 +50,12 @@ ROOT="$WORK/nexus"
 mkdir -p "$ROOT/monitor/watcher" "$ROOT/config" "$ROOT/monitor/.state" "$WORK/bin"
 cp "$_test_dir"/*.sh "$ROOT/monitor/watcher/"
 cp "$_src_root/monitor/_cc-version.sh" "$ROOT/monitor/" 2>/dev/null || true
+# `_config.sh` REFUSES to start without the integration-branch resolver
+# (your-org/nexus-code#763) — deliberately, since a fallback there would be a
+# second claimant on a repo-wide property. Copied unconditionally, NOT with
+# `|| true`: if it goes missing this fixture must fail loudly rather than
+# exercise the guards under test against a watcher that died before them.
+cp "$_src_root/monitor/_integration_branch.sh" "$ROOT/monitor/"
 # FAST config shim: every key echoes its default (the guards run after
 # _config.sh; a slow shim would add ~15 s per case).
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "${2:-}"\n' > "$ROOT/config/load.sh"
@@ -128,9 +134,18 @@ case "\$1" in
       while (( \$# > 0 )); do
           case "\$1" in -p) shift ;; -t) shift 2 ;; *) fmt="\$1"; shift ;; esac
       done
+      # _nexus_self_pane_window asks for '#{window_id}' and '#{window_name}'
+      # SEPARATELY (your-org/nexus-code#701 item A — a single multi-field
+      # format is what a non-UTF-8 locale mangles into one field), so serve
+      # each on its own. Both derive from the one pair below rather than a
+      # hardcoded parallel copy: a stub that hardcodes what it claims to
+      # serve is the same defect class as the code under test.
+      _ow='@3|orchwin'
       case "\$fmt" in
-          '#{pane_pid}') cat "$WORK/guard-pane-pid" 2>/dev/null ;;
-          *)             printf '@3\torchwin\n' ;;
+          '#{pane_pid}')    cat "$WORK/guard-pane-pid" 2>/dev/null ;;
+          '#{window_id}')   printf '%s\n' "\${_ow%%|*}" ;;
+          '#{window_name}') printf '%s\n' "\${_ow#*|}" ;;
+          *)                printf '%s\n' "\$_ow" ;;
       esac
       ;;
   list-panes) : ;;   # no orchestrator process in the window

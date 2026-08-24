@@ -256,8 +256,8 @@ if [[ "${BV_LIVE_TEST:-0}" == "1" ]]; then
             && ok "live: shared standalone uv + interpreter under nexus locals" \
             || bad "live shared toolchain" "uv or interpreter missing (cpython dirs=$ucount)"
         rm -rf "$lhome"; mkdir -p "$lhome"
-        if HOME="$lhome" "$lnex/locals/venvs/projA/bin/python" -c 'print("A")' 2>/dev/null | grep -qx A \
-           && HOME="$lhome" "$lnex/locals/venvs/projB/bin/python" -c 'print("B")' 2>/dev/null | grep -qx B; then
+        if grep -qx A <<<"$(HOME="$lhome" "$lnex/locals/venvs/projA/bin/python" -c 'print("A")' 2>/dev/null)" \
+           && grep -qx B <<<"$(HOME="$lhome" "$lnex/locals/venvs/projB/bin/python" -c 'print("B")' 2>/dev/null)"; then
             ok "live: both project pythons survive a wiped \$HOME"
         else
             bad "live fresh-tmpfs" "a venv python failed after \$HOME wipe"

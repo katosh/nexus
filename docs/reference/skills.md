@@ -43,12 +43,13 @@ A skill's audience is the second column in the table below.
 | [`nexus.worker-defaults`](#nexusworker-defaults) | injected | The always-applies safety floor for every spawned worker |
 | [`nexus.bot`](#nexusbot) | worker + orchestrator | Bot identity for all GitHub writes; the `ng` / `mint-token.sh` channels |
 | [`nexus.report`](#nexusreport) | worker + orchestrator | Report schema, filename convention, the Infrastructure Issues feedback loop |
-| [`nexus.lit`](#nexuslit) | worker | Literature research for scientific work: `ng lit` content-relevance discovery (S2 + ASTA) deduped against the reference library, library growth, and citing references in scientific reports |
+| [`nexus.lit`](#nexuslit) | worker | Literature research for scientific work: `ng lit` content-relevance discovery (S2 + ASTA + OpenAlex) deduped against the reference library, library growth, and citing references in scientific reports |
 | [`nexus.infra-review`](#nexusinfra-review) | orchestrator | Periodic meta-review of `## Infrastructure Issues` across the report corpus |
 | [`nexus.self-fix`](#nexusself-fix) | orchestrator + maintainers | Editing the nexus itself — watcher, monitor scripts, skills, CLAUDE.md |
 | [`nexus.dashboard`](#nexusdashboard) | orchestrator | Overview-issue identity block (`ng nexus-identity`) + formalized dashboard schema (`ng dashboard scaffold`/`validate`) |
 | [`nexus.skeptic`](#nexusskeptic) | orchestrator + skeptic | Independent adversarial validation of a worker's result; three spawn modes (`require`/`auto`/`deny`), wrap-up enforcement, worker↔skeptic channel + nudge, bounded recursion |
 | [`nexus.service-recovery`](#nexusservice-recovery) | orchestrator | Response protocol for a watcher `--- service health ---` emit: restore first, dispatch a reversible root-cause fix, open an incident via `ng service-incident`, close the loop |
+| [`nexus.watcher`](#nexuswatcher) | orchestrator | Operating & diagnosing the watcher: liveness by loop-proof heartbeat (not `watcher.log` mtime), the supervisor's silent self-heal, recovery recipes by failure signature (wedge / stale-lock / decapitation-duplicate), phantom-window auto-resurrection, eligible-comment eyes-ack + stale-eyes re-emit, CC-banner vs gated cc-update |
 | [`nexus.jupyter`](#nexusjupyter) | orchestrator | JupyterLab-as-a-service: one-command activation (`monitor/jupyter-up.sh`), work-root session with all project kernels, supervised auto-revival via `services.registry` |
 | [`nexus.private-package-install`](#nexusprivate-package-install) | worker | Installing private GitHub packages (R `remotes::install_github`, `uv`/`pip` `git+`) via the user's `gh auth token`, not the bot's installation token |
 | [`nexus.cron-state-tsv`](#nexuscron-state-tsv) | orchestrator | Durable session-state for `CronCreate`-driven recurring agents: TSV state file + recovery-marker so a respawned orchestrator keeps the fire count |
@@ -119,7 +120,9 @@ its `## Worker floor` section is prepended verbatim by
 
 **What it covers:** the executable rules every worker must follow
 regardless of task: bot identity for GitHub writes, no
-`--no-verify`, no force-push, `sandbox-notify` for blockers, the
+`--no-verify`, no force-push to a shared branch (rebasing your own
+PR branch onto the current base and force-pushing it is expected —
+the merge gate requires it), `sandbox-notify` for blockers, the
 `ng fetch-asset` recipe for `user-attachments` URLs, the
 report + `ng wrap-up` hand-off.
 
@@ -342,6 +345,41 @@ fix verifies. The availability-and-trust contract for everything in
 **Why restore-before-diagnose:** a registered service is something an
 operator or project agent depends on being up; the root-cause
 investigation is important but secondary to getting the surface back.
+
+## `nexus.watcher`
+
+→ [`skills/nexus.watcher/SKILL.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.watcher/SKILL.md)
+
+**Audience:** orchestrator-only. A worker never operates the watcher; to
+*change* watcher code, use `nexus.self-fix` (and the separate-clone
+rule). This skill is about *operating* the running loop.
+
+**Trigger:** judging whether the watcher is alive; a supervisor
+`Monitor` exited or a "watcher DOWN" signal arrived; a fresh
+`watcher/main.sh` pid or `startup-sweep` emit appears; an eligible
+GitHub comment keeps re-emitting; a phantom `claude` window spawns and
+vanishes; or you're about to conflate the CC TUI update banner with the
+gated cc-update emit.
+
+**What it covers:** (1) liveness = the **loop-proof heartbeat**, never
+`watcher.log` mtime (a fresh log can hide a wedged loop); (2) the
+supervisor **self-heals silently** — a new pid / `startup-sweep` is
+usually normal, and you only get an exit-notification when a revive
+*fails*; (3) diagnose by process **GROUP** not pid (`ppid==1` is a false
+top-level test — orphaned subshells reparent to init); (4) recovery
+recipes keyed to failure signature — `compose_emit` wedge, decapitation
+**duplicate** (two racing watchers, `flock` fd inherited by every fork),
+and **stale-lock** blocking auto-revival (silent no-op, same dead pid);
+(5) phantom-window auto-resurrection after 3 missed pastes; (6) the
+eligible-comment **eyes-ack** (`ng react … eyes`, bot 👀 only) and the
+**stale-eyes re-emit** papercut; (7) the CC update **banner** ≠ the
+gated cc-update **emit**.
+
+**Why a dedicated skill:** watcher liveness is counter-intuitive (the
+obvious signal — the log — lies), and the recovery paths differ by
+signature in ways that a wrong guess makes worse (reviving a decapitation
+duplicate manufactures a third watcher). Too detailed for `CLAUDE.md`,
+fired by a sharp set of conditions.
 
 ## `nexus.jupyter`
 

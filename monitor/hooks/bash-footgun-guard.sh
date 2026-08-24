@@ -112,6 +112,15 @@ if [ -f "$_pattern_file" ]; then
         [ -z "${tag// /}" ] && continue
         case "$tag" in '#'*) continue ;; esac
         [ -n "$cmd_re" ] || continue
+        # `\p` -> a literal `|` in the regex field (your-org/nexus-code#835).
+        # The field separator IS `|`, so a regex could not previously refer to
+        # a pipe at all — which left every "still in the same command" exclusion
+        # class blind to the one separator that matters most. `git push origin
+        # main | grep -f pats` then matched a force-push rule on grep's `-f`,
+        # and (first-match-wins) the worker LOST the cwd-pinning reminder it
+        # should have had. Substitution happens after field splitting, so the
+        # separator semantics are untouched.
+        cmd_re=${cmd_re//\\p/|}
         if [[ "$_cmd" =~ $cmd_re ]]; then
             already_seen "$tag" && exit 0
             deliver "${severity:-warn}" "$tag" "$message"
@@ -124,15 +133,25 @@ fi
 # separator forbids. Matched here instead. Same dedup + delivery.
 
 # python … | tail/tee block-buffers and reads as a hang.
-if printf '%s' "$_cmd" | grep -Eq 'python[0-9.]*\b[^|]*\|[[:space:]]*(tail|tee)\b'; then
+if grep -Eq 'python[0-9.]*\b[^|]*\|[[:space:]]*(tail|tee)\b' <<<"$_cmd"; then
     already_seen "pipe-buffer" || deliver warn "pipe-buffer" \
         "Pipelines block-buffer: python … | tail/tee emits nothing until the process exits and reads as a hang. Add python -u (or flush=True), or drop the pipe."
 fi
 
 # ml/module piped: the env-changing eval is discarded in the subshell.
-if printf '%s' "$_cmd" | grep -Eq '\b(ml|module)[[:space:]][^|]*\|'; then
+if grep -Eq '\b(ml|module)[[:space:]][^|]*\|' <<<"$_cmd"; then
     already_seen "ml-pipe" || deliver warn "ml-pipe" \
         "ml/module is a shell function; piping it forks a subshell and the env-changing eval is silently discarded (the module never loads). Run ml … on its own line, unpiped."
+fi
+
+# `ps … | grep <pattern>` — the third self-matching process-table shape
+# (see the procmatch-wait / pkill-self block in the conf). Its trigger is
+# a literal pipe, so it cannot be expressed in the |-delimited conf.
+# The grep's OWN argv contains the pattern, so the pipeline reports at
+# least one phantom match and can never answer "nothing is running".
+if grep -Eq '\bps[[:space:]][^|]*\|[[:space:]]*(command[[:space:]]+)?grep\b' <<<"$_cmd"; then
+    already_seen "procmatch-self" || deliver warn "procmatch-self" \
+        "\`ps … | grep <pattern>\` always matches ITSELF: the grep's own argv contains the pattern, so you get a phantom hit and the pipeline can never report \"nothing running\". Under a worker it is worse — claude's argv carries your whole prompt, so any pattern mentioned there matches too. Use \`pgrep -x <exact-name>\` (name, not -f), or bracket the pattern (\`[p]attern\`), or best: record the pid at launch and test that pid."
 fi
 
 exit 0

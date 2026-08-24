@@ -136,7 +136,7 @@ logfile()       { printf '%s' "$1/monitor/.state/restart-watchdog.log"; }
 
 if ! /usr/bin/python3 -c 'import yaml' 2>/dev/null; then
     echo "skipped: /usr/bin/python3 lacks pyyaml (config/load.sh cannot resolve keys)"
-    exit 0
+    exit 77   # SKIP, not PASS (your-org/nexus-code#568 A6)
 fi
 
 BASE='{"version":"2.1.202"}

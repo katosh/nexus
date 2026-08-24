@@ -66,3 +66,23 @@ __pycache__/
 # mkdocs build output.
 /site/
 
+
+# zsh completion dump written by interactive-zsh probes/snapshots under
+# monitor/shellenv as ZDOTDIR (assert-gh-wrapped.sh redirects it, but Claude
+# Code snapshot generation can still land one here). Never a source artifact.
+monitor/shellenv/.zcompdump*
+
+# run-tests.sh per-job sidecars. When its `$out_file` base resolves empty the
+# sidecars land at the REPO ROOT as `.assertions` / `.caseskipped` / `.err` /
+# `.failed` / `.nocount` / `.out` / `.zerocount` instead of under the run dir.
+# They are pure scratch, and a `git add -A` in a tree where the suite has run
+# will commit them (your-org/nexus-code#835 — it did, into this repo's PR).
+.assertions
+.caseskipped
+.err
+.failed
+.nocount
+.out
+.zerocount
+.timedout
+.accounted

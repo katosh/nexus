@@ -1,6 +1,14 @@
 # RFC — inbound agent channels: a watcher-mediated request inbox, signal-source standardization, confined remote access, and the bidirectional client↔orchestrator protocol over SSH
 
-**Status:** 🟡 PROPOSAL — review-first, **nothing implemented**. This is the
+**Status:** 🟢 **PARTS A, B and D ARE SHIPPED**; the remainder is still a
+proposal. Shipped surface: `monitor/remote-up.sh`, `monitor/request-channel.sh`,
+`ng request` / `ng remote`, `spawn-worker.sh --reply-to`, and the four-file
+`skills/nexus.remote-access/`. This banner used to read "nothing implemented",
+contradicted by an `> **IMPLEMENTED**` callout inside this very file — so the
+repo's largest document opened by telling a self-fix worker that a subsystem it
+was about to touch did not exist (<your-org>/nexus-code#568 C4). Treat unmarked
+sections below as design intent; check for an `IMPLEMENTED` callout before
+concluding something is unbuilt. This is the
 "thorough review, then clean design" the operator asked for: a self-contained
 context document a future developer can read to understand *why* the inbound
 channels are shaped the way they are, and to extend them without drift.
@@ -1022,11 +1030,34 @@ nexus-remote-ssh<TAB>$NEXUS_ROOT<TAB>monitor/remote-sshd-supervised.sh<TAB>monit
   (a command=-less line would grant a shell) — the belt-and-suspenders the
   global `ForceCommand` was meant to provide, relocated to a startup gate.
 - **healthcheck** `remote-ssh-health.sh` — cheap: registered ⇒ assert the
-  forced-command wrapper is executable AND a real sshd answers on the configured
-  bind/port — an **identity-aware** probe that reads the `SSH-2.0-` banner (not
-  just a socket), so a foreign listener squatting the port is *not* false-healthy
-  (the jupyter-health lesson); not-registered ⇒ exit 0 (correctly-not-running =
-  "healthy", so it never false-alarms).
+  forced-command wrapper is executable, a listener answers on the configured
+  bind/port with an `SSH-2.0-` banner, **and that listener presents OUR host
+  key**; not-registered ⇒ exit 0 (correctly-not-running = "healthy", so it never
+  false-alarms).
+
+  The host-key comparison is the identity check, and it was added late
+  (<your-org>/nexus-code#609). This paragraph previously claimed the *banner* made
+  the probe "identity-aware, so a foreign listener squatting the port is not
+  false-healthy" — which was false, and load-bearing: it is why nobody suspected
+  the green during the 2026-07-29 outage. A banner is **protocol** evidence; any
+  responder emitting those eight bytes satisfied it, including a 20-line socket
+  server with no SSH implementation at all. Because the sandbox shares the host
+  network namespace, the `bind:port` is host-global (`127.0.0.1` included), so
+  two operator nexuses on one machine collide by construction and the loser read
+  healthy off the winner. The check now reads the host key over a real key
+  exchange and VERIFIES THE SERVER'S SIGNATURE over it, using a real `ssh` client
+  with `$principals_dir/ssh_host_ed25519_key.pub` as the sole pinned
+  `known_hosts` entry and `PreferredAuthentications=none` (so the probe can
+  never open a session; reaching the auth refusal is what proves the kex
+  completed). A key READ is explicitly not sufficient: `ssh-keyscan` records the
+  key a server CLAIMS and aborts before the signature check, and our public host
+  key is handed to clients out-of-band by design — so it is replayable by
+  anyone. `ssh-keyscan` is retained only to NAME the key a foreign endpoint
+  presented, never to decide the verdict. THIS is
+  the jupyter-health lesson (an *authenticated* probe); the banner alone was only
+  the equivalent of "something answered the port". A verified-foreign endpoint is
+  always UNHEALTHY; only an **undeterminable** one (no `ssh-keyscan` on the host)
+  is overridable, via `monitor.remote.health_require_identity: false`.
 - **policy `emit-only`** (the 6th field) — a wedged/compromised `sshd` is **not**
   blindly restarted; after the grace window the watcher escalates to the
   orchestrator via `--- service health ---` (§4.3). A network listener is exactly
@@ -1575,6 +1606,33 @@ This branch is a clean specialization: same request file, same reply rename, sam
 `await` detection; only `publish=false` swaps the reply's *reference* fields from
 `github_issue` to the advisory `{progress,results}_path` and unlocks the `fetch`
 verb — whose reachable surface stays pinned to `replies/<id>/{progress,results}.md`.
+
+> **IMPLEMENTED — the worker wrap-up integration.** The "materializes the report
+> into the reply dir … on wrap-up" step above is no longer a convention the
+> orchestrator has to remember to instruct: it is the `--reply-to` mode of the
+> universal hand-off verb.
+>
+> - `monitor/spawn-worker.sh --reply-to <request-id> [--issue <n>]` — an
+>   ORCHESTRATOR-set dispatch flag (never inferred from the client's prose, which
+>   is untrusted input). It validates the id against the inbox at spawn time and
+>   injects the `## Reply-to wrap-up override` section of
+>   `skills/nexus.worker-defaults/SKILL.md` after the worker floor, replacing the
+>   floor's `ng wrap-up <issue> <report>` instruction. Without the flag the
+>   composed prompt is byte-identical to the pre-flag behaviour.
+> - `monitor/ng wrap-up --reply-to <id> <report> [--issue <n>] [--answer-file <p>]`
+>   — the same verb, the same `report-check` pre-flight, the same skeptic gate,
+>   the same action log and window retain; steps 1–3 (upload / issue comment /
+>   trigger rocket) are skipped unless `--issue` is given, and a new step 2c
+>   delivers the answer through `request-channel.sh reply` (so the claim-first
+>   transition, the `body_bytes` boundary, and the byte-exact `results.md`
+>   materialization all stay single-source).
+>
+> The answer body is `--answer-file` when given, else the report's full
+> `## Summary` section, plus a footer naming the report (and the asset + comment
+> URLs when both surfaces ran). A failed delivery FAILS the wrap-up — the
+> requester is blocked on it, so a silent success would be the worst outcome.
+> Tests: `monitor/watcher/test-spawn-worker-reply-to.sh`,
+> `monitor/watcher/test-ng-wrap-up-reply-to.sh`.
 
 ### D.7 End-to-end worked example
 

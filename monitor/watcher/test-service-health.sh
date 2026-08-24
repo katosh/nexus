@@ -173,7 +173,7 @@ assert_contains "grace emit says grace window" "$emit" "grace window"
 assert_contains "grace emit reports policy"    "$emit" "policy: auto-restart"
 assert_contains "grace emit is no-action"      "$emit" "No action needed yet"
 # A grace emit must NOT claim a restart is happening.
-if printf '%s' "$emit" | grep -q "auto-restart in progress"; then
+if grep -q "auto-restart in progress" <<<"$emit"; then
     assert_eq "grace emit does not claim restart-in-progress" "leaked" "clean"
 else
     assert_eq "grace emit does not claim restart-in-progress" "clean" "clean"
@@ -193,7 +193,7 @@ assert_eq      "status=recovered after self-heal" "$status" "recovered"
 recovered_via=$(_sh_field "$SHDIR/myservice.state" recovered_via)
 assert_contains "recovered_via marks within-grace self-heal" "$recovered_via" "self-healed within grace"
 events=$(cat "$SHDIR/myservice.events")
-if printf '%s' "$events" | grep -q "restart-issued"; then
+if grep -q "restart-issued" <<<"$events"; then
     assert_eq "no restart-issued event for a self-heal" "leaked" "clean"
 else
     assert_eq "no restart-issued event for a self-heal" "clean" "clean"
@@ -442,11 +442,32 @@ while :; do sleep 0.2; done
 EOF
 chmod +x "$WD/launch.sh"
 SUP_PID=""
+# your-org/nexus-code#568 D7. Two defects, both here:
+#   1. The wait loop `break`s on timeout and then RETURNS SUCCESS, so all five
+#      call sites proceeded believing "a live supervisor exists" when it may
+#      not. A fixture that is silently wrong asserts nothing — the same
+#      failure the `start_build` helper at :783 already guards against by
+#      refusing to proceed. Do the same here.
+#   2. The 15 s deadline was UNSCALED, in the exact subsystem `th_deadline`
+#      was written for (#558): under `--jobs N` on a busy host the fixture
+#      legitimately needs longer, and an unscaled deadline turns load into a
+#      test failure. Only four files in the suite used the helper; this one
+#      sources it already.
 start_supervisor() { bash "$WD/launch.sh" >/dev/null 2>&1 & SUP_PID=$!; echo "$SUP_PID" > "$PIDFILE"
-    local d=$(( SECONDS + 15 ))
+    local d=$(( SECONDS + $(th_deadline 15) )) up=0
     until [[ "$(tr '\0' ' ' < "/proc/$SUP_PID/cmdline" 2>/dev/null)" == *launch.sh* ]]; do
         (( SECONDS >= d )) && break; sleep 0.05
-    done; }
+    done
+    [[ "$(tr '\0' ' ' < "/proc/$SUP_PID/cmdline" 2>/dev/null)" == *launch.sh* ]] && up=1
+    if (( up == 0 )); then
+        # Refuse to proceed on a fixture that does not satisfy the contract
+        # under test — exactly what start_build does at :790. A `return 1` here
+        # would be swallowed (this suite runs `set -uo pipefail`, not `-e`), so
+        # the five call sites would carry on believing a supervisor is live.
+        echo "supervisor fixture broken: pid $SUP_PID never exec'd launch.sh within $(th_deadline 15)s" >&2
+        exit 1
+    fi
+    return 0; }
 stop_supervisor() { [[ -n "$SUP_PID" ]] && { kill "$SUP_PID" 2>/dev/null; wait "$SUP_PID" 2>/dev/null; }; SUP_PID=""; }
 # A PID that is provably not a live supervisor: spawned, exited, reaped. Even
 # in the pathological case where the kernel recycles it, the cmdline guard in
@@ -770,6 +791,10 @@ JREG_LAUNCH="$WORK/fake-monitor/labsh-supervised.sh"   # string only; never exec
 # runner's output pipe open.
 BUILD_BIN="$JWD/uv"                       # /proc/<pid>/exe basename → uv
 cp "$(command -v bash)" "$BUILD_BIN"
+# fixture-port-lint: allow-never-bound  JPORT is written into a fixture env
+# file and passed as an argv token to a FAKE build process (a copied bash
+# spinning in a loop). No process in this suite binds it, so it cannot be
+# seized (your-org/nexus-code#800).
 JPORT=$(( 49152 + (RANDOM % 16000) ))     # ephemeral; never a labsh port
 printf 'PORT=%s\n' "$JPORT" > "$JDIR/labsh-service.env"
 BUILD_PID=""
@@ -780,7 +805,7 @@ start_build() {   # simulate labsh's backgrounded cold uvx build (no URL yet)
         tool uvx --from jupyterlab jupyter-lab --port "$JPORT" --no-browser ) >/dev/null 2>&1 &
     BUILD_PID=$!
     echo "$BUILD_PID" > "$JDIR/labsh.bg.pid"
-    local d=$(( SECONDS + 15 ))
+    local d=$(( SECONDS + $(th_deadline 15) ))
     until [[ "$(tr '\0' ' ' < "/proc/$BUILD_PID/cmdline" 2>/dev/null)" == *jupyter-lab* ]]; do
         (( SECONDS >= d )) && break; sleep 0.05
     done
@@ -805,7 +830,7 @@ start_impostor() {
     ( cd "$WORK" && exec "$IMPOSTOR_BIN" -c 'while :; do sleep 0.2; done' \
         tool uvx --from jupyterlab jupyter-lab --port "$JPORT" --no-browser ) >/dev/null 2>&1 &
     IMPOSTOR_PID=$!
-    local d=$(( SECONDS + 15 ))
+    local d=$(( SECONDS + $(th_deadline 15) ))
     until [[ "$(tr '\0' ' ' < "/proc/$IMPOSTOR_PID/cmdline" 2>/dev/null)" == *jupyter-lab* ]]; do
         (( SECONDS >= d )) && break; sleep 0.05
     done

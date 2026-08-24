@@ -193,7 +193,7 @@ _cc_auto_last_eval_skip() {
 # kill the dead window before spawning).
 _cc_auto_window_alive() {
     local window="${1:?window required}"
-    tmux list-windows -F '#W' 2>/dev/null | grep -Fxq -- "$window" || return 1
+    grep -Fxq -- "$window" <<<"$(tmux list-windows -F '#W' 2>/dev/null)" || return 1
     local dead
     dead=$(tmux display-message -p -t "$window" '#{pane_dead}' 2>/dev/null || echo "")
     [[ "$dead" != "1" ]]
@@ -452,9 +452,8 @@ _cc_auto_reconcile_pending_restart() {
     #    foreground pre-flight (exit 21).
     local sid
     sid=$(tr -d '[:space:]' < "$state_dir/orchestrator-session-id" 2>/dev/null || true)
-    printf '%s' "$sid" | grep -qE \
-        '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' \
-        || return 0
+    grep -qE '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' \
+        <<<"$sid" || return 0
     local slug jsonl
     slug=$(printf '%s' "$nexus_root" | sed 's|[^a-zA-Z0-9]|-|g')
     jsonl="$projects_dir/$slug/$sid.jsonl"
@@ -659,9 +658,56 @@ _cc_auto_update_tick() {
 
     # Clean up a dead remain-on-exit evaluator window from a prior life
     # so spawn-worker's collision check (exit 7) doesn't refuse.
-    if tmux list-windows -F '#W' 2>/dev/null | grep -Fxq -- "$CC_AUTO_WINDOW"; then
+    if grep -Fxq -- "$CC_AUTO_WINDOW" <<<"$(tmux list-windows -F '#W' 2>/dev/null)"; then
         tmux kill-window -t "$CC_AUTO_WINDOW" 2>/dev/null || true
     fi
+
+    # Resolve the tracking issue, or REFUSE to fire (your-org/nexus-code#866).
+    #
+    # This used to interpolate the configured value straight into the prompt,
+    # where the template pairs it with SURFACE_REPO. A bare number therefore
+    # resolved against whatever repo the template happened to name — so a
+    # reference written for one repo was consumed against another, and every
+    # write landed, succeeded, and was never seen. Nothing errored, because
+    # nothing checked that the number and the repo came from the same place.
+    #
+    # A qualified reference carries its own repo, so the two cannot drift.
+    # An unqualified one is REFUSED here rather than guessed: the evaluator
+    # does not fire, the reason is logged, and the decision is recorded. That
+    # is a deliberately worse outcome than firing — a skipped evaluation is
+    # visible on the next fire, whereas a misrouted one is invisible forever.
+    # Unset is the common case and has nothing to resolve, so the resolver is
+    # only consulted when a value EXISTS. That also keeps "no standing issue"
+    # working on a root where the resolver is somehow absent, while a value
+    # that cannot be checked still refuses (below) — absence of the checker is
+    # not evidence the reference is fine.
+    local _ref_out _ref_rc=3 _track_repo="" _track_issue=""
+    local _track_raw="${MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE:-}"
+    _track_raw="${_track_raw#"${_track_raw%%[![:space:]]*}"}"
+    if [[ -n "$_track_raw" ]]; then
+        if [[ -r "$nexus_root/monitor/issue-ref.sh" ]]; then
+            _ref_out=$(bash "$nexus_root/monitor/issue-ref.sh" "$_track_raw" \
+                --field monitor.cc_auto_update.tracking_issue 2>&1)
+            _ref_rc=$?
+        else
+            _ref_out="issue-ref: REFUSING — resolver missing at $nexus_root/monitor/issue-ref.sh; cannot verify the tracking reference"
+            _ref_rc=4
+        fi
+    fi
+    case "$_ref_rc" in
+        0)  _track_repo=$(printf '%s\n' "$_ref_out" | sed -n 's/^REPO=//p')
+            _track_issue=$(printf '%s\n' "$_ref_out" | sed -n 's/^ISSUE=//p') ;;
+        3)  : ;;   # unset — legitimate: no standing issue, evaluator opens one if it must
+        *)  declare -F log >/dev/null 2>&1 && log \
+                "ERROR cc-auto-update: monitor.cc_auto_update.tracking_issue is not a qualified owner/repo#N reference; REFUSING to fire rather than posting to a guessed repo"
+            printf '%s\n' "$_ref_out" | while IFS= read -r _l; do
+                declare -F log >/dev/null 2>&1 && log "cc-auto-update:   $_l"
+            done
+            _cc_auto_stamp "$stamp" "$now"
+            _cc_auto_log_decision "$auto_dir" "$candidate" "refused-unqualified-tracking-issue" \
+                "value=${MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE:-} (want owner/repo#N)"
+            return 0 ;;
+    esac
 
     # Render the evaluator prompt.
     local template="${CC_AUTO_PROMPT_TEMPLATE:-$nexus_root/monitor/cc-auto-update-prompt.md}"
@@ -673,7 +719,8 @@ _cc_auto_update_tick() {
             "STATE_DIR=$state_dir" \
             "DATE=$today" \
             "SURFACE_REPO=${CC_AUTO_SURFACE_REPO:-your-org/nexus-code}" \
-            "TRACKING_ISSUE=${MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE:-}" \
+            "TRACKING_ISSUE=${_track_issue}" \
+            "TRACKING_REPO=${_track_repo}" \
             "GUIDE=${MONITOR_CC_UPDATE_SKILL_PATH:-skills/nexus.cc-update/GUIDE.md}"; then
         declare -F log >/dev/null 2>&1 \
             && log "ERROR cc-auto-update: prompt template missing/unreadable at $template; cannot spawn evaluator"

@@ -104,6 +104,9 @@
 #   11  no / invalid principal (misconfigured authorized_keys command=)
 #   12  refused: unknown verb / disallowed flag / malformed command
 #   13  refused: attach not enabled, or tmux/ng not found
+#   14  refused: peer source address outside monitor.remote.from_cidr (or the
+#       peer address could not be determined while a pin is configured —
+#       fail-closed). RUNTIME enforcement of the pin; see gate 3 below.
 
 set -uo pipefail
 
@@ -364,6 +367,28 @@ if ! _remote_valid_principal "$PRINCIPAL"; then
     refuse 11 "missing/invalid principal in authorized_keys command= (got: '${PRINCIPAL}')"
 fi
 ORIGIN="remote-$PRINCIPAL"
+
+# ── gate 3: SOURCE ADDRESS (your-org/nexus-code#609 item 4) ────────────
+# monitor.remote.from_cidr declares who may reach this channel. Until now that
+# declaration was applied ONLY as a `from=` option written into authorized_keys
+# at ENROLL time — so a pin configured after a key was enrolled applied to
+# nothing, nothing reconciled the two, and `build_sshd_args` carried no
+# address-scoped restriction either (`AllowUsers=$USER` scopes by USER, not by
+# source). Live proof: this deployment's from_cidr was a /32 while the sole
+# credential read `command="…",restrict <key>` with no `from=` at all — and
+# `_remote_bind_guard` read SATISFIED, licensing a routable LAN bind on the
+# strength of a value enforced nowhere.
+#
+# This check reads the config on EVERY connection, so it cannot drift from it.
+# It is POST-auth (sshd has already accepted the key by the time a forced
+# command runs), which makes it strictly weaker than `from=`: an off-CIDR key
+# holder still completes authentication before being refused here. It is
+# therefore the floor, not a replacement — `_remote_source_restriction_guard`
+# reports the missing `from=` loudly so the re-enroll that restores the pre-auth
+# refusal actually gets done.
+if ! _remote_source_guard; then
+    refuse 14 "source address rejected: $_REMOTE_SRC_REASON"
+fi
 
 # ── tokenize $SSH_ORIGINAL_COMMAND SAFELY (no eval, no glob, no subst) ──
 CMD="${SSH_ORIGINAL_COMMAND:-}"

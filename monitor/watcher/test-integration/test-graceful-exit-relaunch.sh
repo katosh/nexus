@@ -81,8 +81,8 @@ pane_state_is() {
 
 window_exists() {
     local win="$1"
-    "$HARNESS_TMUX" list-windows -t "$HARNESS_SESSION" \
-        -F '#{window_index}' 2>/dev/null | grep -qxF "$win"
+    grep -qxF "$win" <<<"$("$HARNESS_TMUX" list-windows -t "$HARNESS_SESSION" \
+        -F '#{window_index}' 2>/dev/null)"
 }
 
 # ---------------------------------------------------------------------------
@@ -94,10 +94,7 @@ winA=$(harness_spawn_worker graceful-exit-A \
     "STUB_CLAUDE_BUSY_SECONDS=3" \
     "STUB_CLAUDE_HOLD_SECONDS=20" \
     "STUB_CLAUDE_EXIT_AFTER_BUSY=1")
-[[ "$winA" =~ ^[0-9]+$ ]] || {
-    echo "  FAIL: spawn returned non-numeric window index: $winA" >&2
-    th_summary_and_exit
-}
+[[ "$winA" =~ ^[0-9]+$ ]] || th_abort "spawn returned non-numeric window index: $winA"
 echo "  spawned phase-A worker at window=$winA"
 
 # Mirror spawn-worker.sh:318. The harness's `harness_spawn_worker`
@@ -203,10 +200,7 @@ harness_tmux set-window-option -t "${HARNESS_SESSION}:graceful-exit-B" \
 winB=$("$HARNESS_TMUX" list-windows -t "$HARNESS_SESSION" \
     -F '#{window_name} #{window_index}' \
     | awk '$1=="graceful-exit-B" {print $2; exit}')
-[[ "$winB" =~ ^[0-9]+$ ]] || {
-    echo "  FAIL: phase B spawn returned non-numeric window index: $winB" >&2
-    th_summary_and_exit
-}
+[[ "$winB" =~ ^[0-9]+$ ]] || th_abort "phase B spawn returned non-numeric window index: $winB"
 echo "  spawned phase-B worker at window=$winB"
 
 # First claude run, busy spinner rendering. Budget covers the wrapper's
@@ -233,7 +227,7 @@ wait_for "phase B: window still listed after recycle" 2 -- \
 # window must not rewrite or append a second retain row, or the
 # matcher would mistake the recycle for a new lifecycle.
 retain_row_after=$(grep '"window":"graceful-exit-B"' "$ACTION_LOG" 2>/dev/null | tail -1)
-retain_row_count=$(grep -c '"window":"graceful-exit-B"' "$ACTION_LOG" 2>/dev/null || echo 0)
+retain_row_count=$(grep -c '"window":"graceful-exit-B"' "$ACTION_LOG" 2>/dev/null) || retain_row_count=0
 assert_eq "phase B: action-log retain row unchanged across recycle" \
     "$retain_row_after" "$retain_row_before"
 assert_eq "phase B: action-log retain-row count stays at 1" \

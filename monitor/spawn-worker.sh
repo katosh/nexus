@@ -140,6 +140,15 @@
 #      not-writable message). A worker that cannot write its workdir or
 #      file its mandatory report is dead on arrival, so this fails fast
 #      rather than warning. See monitor/write-probe.sh.
+#   16 --reply-to: the request id is malformed, does not resolve to a
+#      request in the inbox, or is already terminal (done/failed) so a
+#      reply could never land. Fails at DISPATCH rather than letting the
+#      worker discover at wrap-up that its answer has nowhere to go.
+#   17 --issue passed without --reply-to (the flag only shapes the
+#      channel-mode wrap-up instruction; the default floor already
+#      carries the issue form).
+#   18 ## Reply-to wrap-up override section empty or missing in
+#      $FLOOR_FILE (only checked in --reply-to mode).
 #
 # This helper does NOT remove $PROMPT_FILE — the orchestrator owns it.
 
@@ -176,6 +185,22 @@ usage: monitor/spawn-worker.sh -n <window-name> -c <workdir> -p <prompt-file>
                  fully backward-compatible.
   --topic        one-line context summary for the provenance record (and
                  the overview registry). Defaults to the window name.
+  --reply-to <request-id>
+                 this worker ANSWERS a request-channel request; its
+                 wrap-up delivers over the channel instead of opening a
+                 GitHub issue thread. The "## Reply-to wrap-up override"
+                 section of skills/nexus.worker-defaults/SKILL.md is
+                 injected after the floor (with <REQUEST_ID> substituted),
+                 replacing the floor's \`ng wrap-up <issue> <report>\`
+                 instruction with \`ng wrap-up --reply-to <id> <report>\`.
+                 The id is validated against the inbox AT DISPATCH.
+                 This is the ORCHESTRATOR's choice of delivery surface —
+                 never inferred from a (remote, untrusted) client's prose.
+  --issue <n>    with --reply-to ONLY: a GitHub write-up is ALSO wanted,
+                 so the injected wrap-up carries \`--issue <n>\` and the
+                 worker does both (channel reply + upload/link comment).
+                 Without --reply-to this is an error (exit 17) — the
+                 default floor already names the issue form.
   --model        pin THIS worker's claude to <model-id> (e.g.
                  claude-fable-5). Opt-in, default-off: when omitted the
                  worker inherits the ambient default model and the
@@ -253,7 +278,11 @@ SKEPTIC_ROLE=0
 SKEPTIC_TARGET=
 SKEPTIC_ORIG=
 MODEL=
+REPLY_TO=
+ISSUE_NUM=
 filtered_args=()
+expect_reply_to_val=0
+expect_issue_val=0
 expect_resume_val=0
 expect_model_val=0
 expect_kind_val=0
@@ -303,6 +332,16 @@ for arg in "$@"; do
         expect_model_val=0
         continue
     fi
+    if [ "$expect_reply_to_val" -eq 1 ]; then
+        REPLY_TO="$arg"
+        expect_reply_to_val=0
+        continue
+    fi
+    if [ "$expect_issue_val" -eq 1 ]; then
+        ISSUE_NUM="$arg"
+        expect_issue_val=0
+        continue
+    fi
     case "$arg" in
         --print-prompt) PRINT_ONLY=1 ;;
         --resume)       expect_resume_val=1 ;;
@@ -326,6 +365,10 @@ for arg in "$@"; do
         --skeptic-orig=*)  SKEPTIC_ORIG="${arg#--skeptic-orig=}" ;;
         --model)        expect_model_val=1 ;;
         --model=*)      MODEL="${arg#--model=}" ;;
+        --reply-to)     expect_reply_to_val=1 ;;
+        --reply-to=*)   REPLY_TO="${arg#--reply-to=}" ;;
+        --issue)        expect_issue_val=1 ;;
+        --issue=*)      ISSUE_NUM="${arg#--issue=}" ;;
         *) filtered_args+=("$arg") ;;
     esac
 done
@@ -360,6 +403,38 @@ fi
 if [ "$expect_skeptic_orig_val" -eq 1 ]; then
     echo "spawn-worker: --skeptic-orig requires a window-name value" >&2
     usage
+fi
+if [ "$expect_reply_to_val" -eq 1 ]; then
+    echo "spawn-worker: --reply-to requires a request-id value" >&2
+    usage
+fi
+if [ "$expect_issue_val" -eq 1 ]; then
+    echo "spawn-worker: --issue requires an issue-number value" >&2
+    usage
+fi
+# --issue only shapes the CHANNEL-mode wrap-up instruction. Alone it would
+# silently do nothing (the default floor already names the issue form), so
+# refuse it rather than let the orchestrator think it took effect.
+if [ -n "$ISSUE_NUM" ] && [ -z "$REPLY_TO" ]; then
+    echo "spawn-worker: --issue <n> is only valid together with --reply-to <request-id>" >&2
+    echo "  (without --reply-to the injected floor already carries 'ng wrap-up <issue> <report>')" >&2
+    exit 17
+fi
+if [ -n "$ISSUE_NUM" ]; then
+    case "$ISSUE_NUM" in
+        ''|*[!0-9]*) echo "spawn-worker: --issue must be a positive integer, got: $ISSUE_NUM" >&2; exit 17 ;;
+    esac
+fi
+# Request-id charset mirrors request-channel.sh's _validate_id: a filename
+# stem of [A-Za-z0-9_-] only. Rejecting anything else here makes `..`, `/`
+# and absolute paths un-representable BEFORE the id is interpolated into
+# the prompt or handed to the channel.
+if [ -n "$REPLY_TO" ]; then
+    case "$REPLY_TO" in
+        *[!A-Za-z0-9_-]*|'')
+            echo "spawn-worker: --reply-to must be a request id matching [A-Za-z0-9_-]+, got: $REPLY_TO" >&2
+            exit 16 ;;
+    esac
 fi
 case "$SPAWN_KIND" in
     task|interactive) ;;
@@ -412,14 +487,217 @@ if [ -z "$RESUME_TARGET" ]; then
     [ -n "$WORKDIR" ]     || { echo "spawn-worker: -c <workdir> required"     >&2; usage; }
     [ -n "$PROMPT_FILE" ] || { echo "spawn-worker: -p <prompt-file> required" >&2; usage; }
 
-    [ -d "$WORKDIR" ]      || { echo "spawn-worker: workdir not a directory: $WORKDIR" >&2; exit 6; }
+    # Existence check AND canonicalisation in ONE step (your-org/nexus-code#642).
+    # The old form was `[ -d "$WORKDIR" ]`, which resolved a RELATIVE -c against
+    # THIS process's cwd — and then $WORKDIR was written verbatim into the
+    # generated /tmp/spawn-launcher-*.sh, which runs with a DIFFERENT cwd. So a
+    # relative -c could pass the guard here and still die on `cd` in the
+    # launcher, in a window nobody was looking at, while the parent had already
+    # printed `spawned:` and exited 0. Validated in one frame of reference, used
+    # in another. `cd && pwd -P` cannot disagree with itself: whatever it
+    # accepts, it also converts to the absolute path the launcher receives.
+    #
+    # `CDPATH=` is load-bearing, not decoration — it is the same defect one
+    # level down. A CDPATH set in the operator's environment makes `cd
+    # <relative>` resolve against a search path that `[ -d ]` never consulted,
+    # so check and use would once again be answering about different
+    # directories. `_sw_realpath` (defined below, after NEXUS_ROOT resolution)
+    # takes the same precaution; this site cannot call it yet, hence the
+    # open-coded form.
+    #
+    # `pwd -P` (physical) rather than `pwd` (logical) matches how an inherited
+    # NEXUS_ROOT is resolved via `_sw_realpath`, so the root-cwd equality test
+    # further down compares two paths normalised the same way.
+    _sw_workdir_arg="$WORKDIR"
+    WORKDIR=$(CDPATH= cd "$_sw_workdir_arg" 2>/dev/null && pwd -P) \
+        || { echo "spawn-worker: workdir not a directory: $_sw_workdir_arg" >&2; exit 6; }
     [ -r "$PROMPT_FILE" ]  || { echo "spawn-worker: prompt-file not readable: $PROMPT_FILE" >&2; exit 4; }
 else
     [ -z "$PROMPT_FILE" ] || { echo "spawn-worker: -p is not valid with --resume (the session keeps its own conversation; paste follow-ups into the pane)" >&2; usage; }
 fi
 
-NEXUS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# ---------------------------------------------------------------------------
+# Resolve NEXUS_ROOT — the PRIMARY clone, not merely this script's own tree.
+# ---------------------------------------------------------------------------
+# your-org/nexus-code#577. This used to be an unconditional
+# `NEXUS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"`, which silently FORKED the
+# whole nexus state whenever the launcher was invoked from a secondary clone —
+# and invoking it from a secondary clone is a PRESCRIBED workflow (CLAUDE.md
+# requires watcher-touching work to run in its own clone under `work/`).
+#
+# Confirmed forensics for the #577 incident. The orchestrator ran
+# `work/nexus-code-570fix/monitor/spawn-worker.sh` for a skeptic. Every piece of
+# state then resolved inside that clone:
+#   * `work/nexus-code-570fix/monitor/.state/action-log.jsonl` holds the ONLY
+#     record of the spawn + skeptic-spawn events — the primary log has none, so
+#     nothing in the primary could see the skeptic existed;
+#   * the require-gate marker was seeded at
+#     `work/nexus-code-570fix/monitor/.state/skeptic/pending/nexuscode-570fix`;
+#   * the skeptic inherited NEXUS_ROOT=<clone>, so `ng report-init` wrote its
+#     verdict to `work/nexus-code-570fix/reports/` — the symptom the operator
+#     first noticed, and invisible to the corpus;
+#   * meanwhile the LIVE marker blocking retirement sat in the PRIMARY state dir
+#     (written by the worker's own wrap-up, which ran under the primary root),
+#     where no verdict could ever clear it.
+# Result: `retire-preflight` reported `safe=0 … required skeptic has not
+# returned a verdict` for a window whose verdict existed, forever — leaving only
+# a hand-`rm` of the very marker that exists to prevent hand-clearing.
+#
+# Resolution order, and why:
+#   1. An inherited, VALID $NEXUS_ROOT wins. This mirrors the convention every
+#      other nexus helper already follows (`monitor/locals-env.sh`:
+#      `${NEXUS_ROOT:-<script-relative>}`, and `ng`'s _resolve_state_dir), and
+#      it alone fixes the incident: the orchestrator's env carried
+#      NEXUS_ROOT=<primary> and this script overrode it. Honouring the caller
+#      also keeps test harnesses (which export NEXUS_ROOT into a tmpdir) exact.
+#   2. Otherwise the script-relative root — UNLESS that root is structurally a
+#      SECONDARY CLONE: it sits at `<A>/work/…` for some ancestor A that is
+#      itself a plausible nexus root. Then re-root to A, loudly. The nesting
+#      relation IS the definition of a secondary clone here, it needs no
+#      configuration, and it cannot fire for a legitimately separate install or
+#      fork (which is not nested under another nexus's `work/`). Deliberately
+#      NOT config `nexus.root`: with NEXUS_ROOT unset, config/load.sh resolves
+#      relative to its own script dir, so from a clone with no config/nexus.yml
+#      it returns the example template's `/path/to/nexus` placeholder — measured,
+#      and an oracle that answers with a placeholder exactly when the env is
+#      missing is no oracle at all.
+# WHAT RE-ROOTING ACTUALLY MOVES — read this before relying on it.
+# The WORKDIR is untouched: the worker still WORKS in the clone. But it is NOT
+# true that "only state lands in the primary", and that distinction is
+# load-bearing enough to spell out (the first version of this comment claimed
+# it, and a reviewer demonstrated otherwise). Everything this script resolves
+# through $NEXUS_ROOT now comes from the PRIMARY's checkout, while the body of
+# spawn-worker.sh executing it is the CLONE's:
+#   * FLOOR_FILE — the worker floor injected into every prompt   (policy)
+#   * worker-settings.json — the MODEL PIN and hook wiring       (config)
+#   * `.`-sourced helpers: _claude-bin.sh, _tmux-window.sh, _fm_lib.sh (code)
+#   * claude-loop.sh (exec'd), ng, request-channel.sh, skeptic-channel.sh,
+#     write-probe.sh, config/load.sh, and the #589 assert helper      (code)
+#   * action log, spawn-prompts, heartbeat, pending-tool, requests and the
+#     skeptic markers                                          (state — the point)
+# Two consequences follow, both currently LATENT rather than live:
+#   1. Sourced-helper version skew. The clone's spawn-worker.sh body calls the
+#      primary's _fm_lib.sh / _tmux-window.sh / _claude-bin.sh. A branch that
+#      changes one of those signatures breaks a clone-invoked spawn quietly —
+#      the same "functions in memory call functions on disk with mismatched
+#      arity" class CLAUDE.md documents for the watcher. This branch changes
+#      none of the three.
+#   2. Testability. A worker in a clone can no longer exercise a MODIFIED
+#      floor, worker-settings.json or claude-loop.sh by spawning from its own
+#      tree — it reads those from the tree it was isolated from. Use
+#      NEXUS_ALLOW_SECONDARY_ROOT=1 when that is what you are testing.
+# The trade is still worth it: a forked action log and a require-marker no
+# verdict can clear are worse failures than either consequence above.
+# NEXUS_ALLOW_SECONDARY_ROOT=1 forces the old script-relative behaviour.
+NEXUS_ROOT_SCRIPT="$(cd "$(dirname "$0")/.." && pwd)"
+# Capture the INHERITED value before anything overwrites it. `env -u NEXUS_ROOT`
+# (what the test suites use) correctly leaves this empty.
+NEXUS_ROOT_INHERITED="${NEXUS_ROOT:-}"
+
+_sw_root_is_nexus() {   # is $1 a plausible nexus root?
+    [ -n "${1:-}" ] && [ -d "$1" ] && [ -x "$1/monitor/spawn-worker.sh" ] && [ -d "$1/config" ]
+}
+_sw_realpath() { (CDPATH= cd "${1:-/nonexistent}" 2>/dev/null && pwd -P); }
+
+NEXUS_ROOT="$NEXUS_ROOT_SCRIPT"
+NEXUS_ROOT_REROOTED=0
+_sw_script_rp=$(_sw_realpath "$NEXUS_ROOT_SCRIPT")
+
+if [ "${NEXUS_ALLOW_SECONDARY_ROOT:-}" = 1 ]; then
+    : # explicit opt-out: keep the script-relative root, fork the state knowingly
+elif _sw_root_is_nexus "$NEXUS_ROOT_INHERITED" \
+     && [ "$(_sw_realpath "$NEXUS_ROOT_INHERITED")" != "$_sw_script_rp" ]; then
+    NEXUS_ROOT=$(_sw_realpath "$NEXUS_ROOT_INHERITED")
+    NEXUS_ROOT_REROOTED=1
+    echo "spawn-worker: note: launcher lives in $NEXUS_ROOT_SCRIPT but NEXUS_ROOT=$NEXUS_ROOT was inherited — spawning against the inherited (primary) root so state does not fork (your-org/nexus-code#577)." >&2
+else
+    # No usable inherited root. Decide STRUCTURALLY whether this script's own
+    # tree is a SECONDARY CLONE: walk up from it looking for an ancestor A such
+    # that the tree sits at `A/work/…` AND A is itself a plausible nexus root.
+    # That relation IS the definition of a secondary clone in this workspace
+    # (CLAUDE.md: `git clone … work/<project>-<task>/`), it needs no
+    # configuration, and it cannot fire for a genuinely separate install or fork
+    # (which is not nested under another nexus's `work/`).
+    #
+    # NOT config `nexus.root`, deliberately: with NEXUS_ROOT unset,
+    # `config/load.sh` resolves its own candidate list relative to the SCRIPT
+    # dir, so from inside a clone that has no `config/nexus.yml` of its own it
+    # falls through to the repo-tracked `config/nexus.example.yml` and returns
+    # the literal placeholder `/path/to/nexus`. Measured, not assumed — an
+    # oracle that answers with a placeholder exactly when the inherited env is
+    # missing is no oracle at all.
+    _sw_cand="$_sw_script_rp"
+    while :; do
+        case "$_sw_cand" in
+            */work/*) : ;;
+            *) break ;;
+        esac
+        _sw_cand="${_sw_cand%/work/*}"        # strip to the innermost `/work/`
+        [ -n "$_sw_cand" ] || break
+        if _sw_root_is_nexus "$_sw_cand" && [ "$_sw_cand" != "$_sw_script_rp" ]; then
+            NEXUS_ROOT="$_sw_cand"
+            NEXUS_ROOT_REROOTED=1
+            echo "spawn-worker: note: this launcher is a SECONDARY CLONE under $NEXUS_ROOT/work — spawning against the primary root so the action log, skeptic markers and reports do not fork (your-org/nexus-code#577). Set NEXUS_ALLOW_SECONDARY_ROOT=1 to override." >&2
+            break
+        fi
+    done
+fi
+
+# The tree THIS script ships in — captured from NEXUS_ROOT_SCRIPT, i.e. before
+# the resolution above can re-root NEXUS_ROOT onto the primary. The shim
+# precondition guard below is searched HERE as well as under NEXUS_ROOT, so
+# re-rooting can never relocate a guard away from the code that requires it
+# (your-org/nexus-code#577 + #589). It must never be derived from NEXUS_ROOT:
+# that is the variable re-rooting moves.
+NEXUS_SPAWN_CODE_ROOT="$NEXUS_ROOT_SCRIPT"
 FLOOR_FILE="$NEXUS_ROOT/skills/nexus.worker-defaults/SKILL.md"
+
+# --- fail-CLOSED shim precondition, emitted into every launcher ------------
+#
+# Read from monitor/guard-block.sh.in — the SINGLE SOURCE shared with
+# monitor/watcher/_respawn.sh. `cat`, never sourced: it is a template, and
+# reading it as data avoids the sourced-helper skew hazard CLAUDE.md documents
+# for the watcher. Rationale, the two-name/two-root search and the refusal
+# contract all live in that file's header.
+#
+# Fail LOUD if the template is missing: this is a guard whose whole subject is
+# guards that vanish quietly, so it must not itself degrade to an empty block.
+GUARD_BLOCK_TEMPLATE="$NEXUS_SPAWN_CODE_ROOT/monitor/guard-block.sh.in"
+if [ ! -r "$GUARD_BLOCK_TEMPLATE" ]; then
+    echo "spawn-worker: REFUSING TO SPAWN — shim guard template missing: $GUARD_BLOCK_TEMPLATE" >&2
+    echo "spawn-worker: an empty guard block is a guard that does not run (your-org/nexus-code#589)." >&2
+    exit 78
+fi
+SHIM_GUARD_BLOCK=$(sed -e 's/@@WHO@@/spawn-worker/g' -e 's/@@ACTION@@/SPAWN/g' \
+                       -- "$GUARD_BLOCK_TEMPLATE")
+
+# --reply-to: resolve the id against the request inbox AT DISPATCH. A typo'd
+# or already-terminal id means the worker's answer has nowhere to land — and
+# it would only discover that at wrap-up, an hour of work later. Fail here.
+# The inbox is keyed off THIS script's NEXUS_ROOT (the same root exported to
+# the worker), so the check and the eventual `ng wrap-up --reply-to` agree on
+# which state dir they mean. A fork without request-channel.sh degrades to a
+# skip rather than a hard block.
+REPLY_TO_STATE=
+if [ -n "$REPLY_TO" ]; then
+    _reqchan="$NEXUS_ROOT/monitor/request-channel.sh"
+    if [ -x "$_reqchan" ]; then
+        _reqfile=$(NEXUS_ROOT="$NEXUS_ROOT" "$_reqchan" reqfile "$REPLY_TO" 2>/dev/null) || _reqfile=
+        if [ -z "$_reqfile" ]; then
+            echo "spawn-worker: --reply-to $REPLY_TO does not resolve to any request in the inbox" >&2
+            echo "  inbox: $NEXUS_ROOT/monitor/.state/requests  (list it with: monitor/ng request list)" >&2
+            exit 16
+        fi
+        # <stem>.<state>.md → the state word.
+        REPLY_TO_STATE=$(basename -- "$_reqfile"); REPLY_TO_STATE="${REPLY_TO_STATE%.md}"
+        REPLY_TO_STATE="${REPLY_TO_STATE##*.}"
+        case "$REPLY_TO_STATE" in
+            done|failed|replied)
+                echo "spawn-worker: --reply-to $REPLY_TO is already terminal (state=$REPLY_TO_STATE) — a reply can never land on it" >&2
+                exit 16 ;;
+        esac
+    fi
+fi
 
 # Resolve $CLAUDE_BIN: env override → project-local install → PATH →
 # fail loud. The resolved path is baked into the launcher heredoc
@@ -489,8 +767,28 @@ fi
 # startup dialog.
 SETTINGS_FILE="$NEXUS_ROOT/monitor/worker-settings.json"
 [ -f "$SETTINGS_FILE" ] || { echo "spawn-worker: worker-settings.json missing: $SETTINGS_FILE" >&2; exit 10; }
+# Operator-local overlay (your-org/nexus-code#614). If
+# `worker-settings.local.json` (UNTRACKED) sits next to the tracked
+# file, its keys win and the merged result is what claude receives.
+# This is what keeps an operator's `model` pin out of a tracked file:
+# before it, resolving a pull conflict the obvious way (take upstream)
+# silently downgraded every worker off the operator's chosen model with
+# no error anywhere. The resolver is a pure pass-through when no
+# overlay exists. It FAILS LOUD rather than falling back to the tracked
+# defaults — a spawn that silently drops the overlay is the very bug.
+if [ -x "$NEXUS_ROOT/monitor/resolve-settings.sh" ]; then
+    _resolved=$("$NEXUS_ROOT/monitor/resolve-settings.sh" "$SETTINGS_FILE") || {
+        echo "spawn-worker: settings overlay resolution failed (see above); refusing to spawn with operator settings silently dropped" >&2
+        exit 10
+    }
+    SETTINGS_FILE="$_resolved"
+fi
+# ONE variable, not two (your-org/nexus-code#568 D4). A second, byte-identical
+# `HOOKS_PATH_ARG` used to sit here, and its sole consumer was the
+# less-exercised loop-wrapper path — so the two could drift apart with only the
+# rarely-taken branch changing behaviour, which is the worst way for a
+# duplicate to be found.
 HOOKS_FLAG="--settings $SETTINGS_FILE"
-HOOKS_PATH_ARG="--settings $SETTINGS_FILE"
 
 # Seed the watcher's lifecycle anchors BEFORE the launcher has a chance
 # to settle the renderer. This closes two regressions from issue #72:
@@ -546,6 +844,14 @@ _seed_lifecycle_anchors() {
         for kv in "$@"; do
             extra_flags+=( --extra "$kv" )
         done
+        # Record a re-rooted spawn (your-org/nexus-code#577): the launcher lived
+        # in a secondary clone and its state was redirected to the primary. This
+        # lands in the PRIMARY action log — which is the point — so the event
+        # trail shows both that the spawn happened and that it nearly didn't land
+        # here at all.
+        if [ "${NEXUS_ROOT_REROOTED:-0}" = 1 ]; then
+            extra_flags+=( --extra "rerooted-from=$NEXUS_ROOT_SCRIPT" )
+        fi
         "$ng" log-action monitor \
             --event spawn \
             --extra "window=$window" \
@@ -587,6 +893,12 @@ _write_provenance_record() {
     local skeptic_mode="${8:-auto}" skeptic_depth="${9:-0}"
     local skeptic_role="${10:-0}" skeptic_target="${11:-}"
     local skeptic_orig="${12:-}"
+    # reply_to: the request-channel id this worker owes an answer to
+    # (empty on a normal spawn). Observability only — `ng wrap-up` takes
+    # its delivery surface from the EXPLICIT --reply-to flag, never from
+    # here, so a worker that omits the flag fails loudly instead of
+    # silently routing somewhere the orchestrator can't predict.
+    local reply_to="${13:-}"
     local windows_dir="$nexus_root/monitor/.state/windows"
     mkdir -p "$windows_dir" 2>/dev/null || return 0
     local out="$windows_dir/${window//[^a-zA-Z0-9_-]/_}.json"
@@ -614,13 +926,14 @@ _write_provenance_record() {
             --argjson skeptic_role "$skeptic_role_json" \
             --arg skeptic_target "$skeptic_target" \
             --arg skeptic_orig "$skeptic_orig" \
+            --arg reply_to "$reply_to" \
             '{window: $window, session_id: $session_id, kind: $kind,
               spawned_by: $spawned_by, workdir: $workdir,
               prompt_file: $prompt_file, topic: $topic,
               spawned_at: $spawned_at, last_activity_ref: $last_activity_ref,
               skeptic_mode: $skeptic_mode, skeptic_depth: $skeptic_depth,
               skeptic_role: $skeptic_role, skeptic_target: $skeptic_target,
-              skeptic_orig: $skeptic_orig}' \
+              skeptic_orig: $skeptic_orig, reply_to: $reply_to}' \
             > "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$out" 2>/dev/null \
         || { rm -f "$tmp" 2>/dev/null; return 0; }
@@ -638,14 +951,15 @@ _write_provenance_record() {
         _e_ref=$(printf '%s' "$hb_ref"              | sed 's/\\/\\\\/g; s/"/\\"/g')
         _e_sm=$(printf '%s' "$skeptic_mode"         | sed 's/\\/\\\\/g; s/"/\\"/g')
         _e_st=$(printf '%s' "$skeptic_target"       | sed 's/\\/\\\\/g; s/"/\\"/g')
-        local _e_so
+        local _e_so _e_rt
         _e_so=$(printf '%s' "$skeptic_orig"         | sed 's/\\/\\\\/g; s/"/\\"/g')
+        _e_rt=$(printf '%s' "$reply_to"             | sed 's/\\/\\\\/g; s/"/\\"/g')
         local _e_depth="${skeptic_depth:-0}"
         [[ "$_e_depth" =~ ^[0-9]+$ ]] || _e_depth=0
-        printf '{"window":"%s","session_id":"%s","kind":"%s","spawned_by":"orchestrator","workdir":"%s","prompt_file":"%s","topic":"%s","spawned_at":"%s","last_activity_ref":"%s","skeptic_mode":"%s","skeptic_depth":%s,"skeptic_role":%s,"skeptic_target":"%s","skeptic_orig":"%s"}\n' \
+        printf '{"window":"%s","session_id":"%s","kind":"%s","spawned_by":"orchestrator","workdir":"%s","prompt_file":"%s","topic":"%s","spawned_at":"%s","last_activity_ref":"%s","skeptic_mode":"%s","skeptic_depth":%s,"skeptic_role":%s,"skeptic_target":"%s","skeptic_orig":"%s","reply_to":"%s"}\n' \
             "$_e_window" "$_e_sid" "$_e_kind" "$_e_wd" "$_e_pf" \
             "$_e_topic" "$_e_at" "$_e_ref" \
-            "$_e_sm" "$_e_depth" "$skeptic_role_json" "$_e_st" "$_e_so" \
+            "$_e_sm" "$_e_depth" "$skeptic_role_json" "$_e_st" "$_e_so" "$_e_rt" \
             > "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$out" 2>/dev/null \
         || { rm -f "$tmp" 2>/dev/null; return 0; }
@@ -701,7 +1015,7 @@ _resume_pinned_orch_sid() {
     local pin="$NEXUS_ROOT/monitor/.state/orchestrator-session-id" sid=""
     [ -f "$pin" ] || return 0
     sid=$(tr -d '[:space:]' < "$pin" 2>/dev/null || true)
-    if printf '%s' "$sid" | grep -qE "$_UUID_RE"; then
+    if grep -qE "$_UUID_RE" <<<"$sid"; then
         printf '%s' "$sid"
     fi
     return 0
@@ -785,7 +1099,7 @@ _resume_session_id() {
         fm_window=$(_fm_get "$r" window)
         [ "$fm_window" = "$window" ] || continue
         sid=$(_fm_get "$r" session-id)
-        if printf '%s' "$sid" | grep -qE "$_UUID_RE"; then
+        if grep -qE "$_UUID_RE" <<<"$sid"; then
             if _resume_sid_allowed "$sid" "$window"; then
                 printf '%s' "$sid"; return 0
             fi
@@ -795,7 +1109,7 @@ _resume_session_id() {
     done < <(ls -t "$NEXUS_ROOT/reports/"*.md 2>/dev/null)
     # 2. window-close event (captured freshest-jsonl at close time).
     sid=$(_resume_event_field window-close "$window" '."session-id"')
-    if printf '%s' "$sid" | grep -qE "$_UUID_RE"; then
+    if grep -qE "$_UUID_RE" <<<"$sid"; then
         if _resume_sid_allowed "$sid" "$window"; then
             printf '%s' "$sid"; return 0
         fi
@@ -809,7 +1123,7 @@ _resume_session_id() {
     local hb="$NEXUS_ROOT/monitor/.state/heartbeat/$window.json"
     if [ -f "$hb" ]; then
         sid=$(sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' "$hb" | head -1)
-        if printf '%s' "$sid" | grep -qE "$_UUID_RE"; then
+        if grep -qE "$_UUID_RE" <<<"$sid"; then
             if _resume_sid_allowed "$sid" "$window"; then
                 printf '%s' "$sid"; return 0
             fi
@@ -820,7 +1134,7 @@ _resume_session_id() {
     #    resume-mode respawns always record it; fresh spawns stamp a
     #    generated `--session-id` since your-nexus#206.
     sid=$(_resume_event_field spawn "$window" '."session-id"')
-    if printf '%s' "$sid" | grep -qE "$_UUID_RE"; then
+    if grep -qE "$_UUID_RE" <<<"$sid"; then
         if _resume_sid_allowed "$sid" "$window"; then
             printf '%s' "$sid"; return 0
         fi
@@ -863,7 +1177,7 @@ if [ -n "$RESUME_TARGET" ]; then
 
     SESSION_ID=
     SOURCE_WINDOW=
-    if printf '%s' "$RESUME_TARGET" | grep -qE "$_UUID_RE"; then
+    if grep -qE "$_UUID_RE" <<<"$RESUME_TARGET"; then
         # Explicit session-id override. The window name can't be
         # derived from a bare UUID, so -n is mandatory.
         SESSION_ID="$RESUME_TARGET"
@@ -904,7 +1218,33 @@ MSG
             exit 12
         fi
     fi
-    WORKDIR=$(cd "$WORKDIR" && pwd)
+    # Same canonicalise-so-the-launcher-gets-an-absolute-path purpose as the
+    # fresh-spawn guard above (your-org/nexus-code#642), with two deliberate
+    # differences. (1) The `||` arm is NEW: a bare `WORKDIR=$(cd … && pwd)`
+    # sets WORKDIR to the EMPTY STRING when the cd fails (the assignment
+    # swallows the status), so a workdir deleted between the `-d` test above
+    # and this line would spawn against "" rather than refusing — the silent
+    # branch of the same class. (2) It stays `pwd`, NOT `pwd -P`: RESUME_SLUG
+    # below is derived from this exact string and must match the
+    # ~/.claude/projects/<slug> directory Claude Code created from the path the
+    # session originally ran in. Resolving symlinks here would silently
+    # relocate the transcript lookup and break --resume on any symlinked
+    # checkout.
+    # The original argument is saved BEFORE the assignment, and the `||` arm
+    # reports THAT — not `$WORKDIR`. A failed command substitution assigns the
+    # EMPTY STRING to the variable and only then runs the `||` arm, so reading
+    # `$WORKDIR` there prints `workdir not a directory: ` with nothing after the
+    # colon: a refusal that does not say what it refused.
+    #
+    # This was a fresh instance of the very class this change closes — the PR's
+    # subject is that a bad workdir must be reported legibly, and the fresh-spawn
+    # arm above already saved `_sw_workdir_arg` for exactly this reason while
+    # this one did not. Caught by the skeptic, not by me, and not by the suite:
+    # the only control covered the fresh-spawn arm, so the guard added here had
+    # no coverage at all (your-org/nexus-code#648 review, F1/F2).
+    _sw_resume_workdir_arg="$WORKDIR"
+    WORKDIR=$(CDPATH= cd "$_sw_resume_workdir_arg" && pwd) \
+        || { echo "spawn-worker: workdir not a directory: $_sw_resume_workdir_arg" >&2; exit 6; }
 
     if [ -z "$SESSION_ID" ]; then
         if ! SESSION_ID=$(_resume_session_id "$SOURCE_WINDOW" "$WORKDIR"); then
@@ -988,7 +1328,7 @@ MSG
     # --replace, because pasting a follow-up into the live worker is
     # almost always the right move (see nexus.window-cleanup
     # "Continue-vs-spawn").
-    if tmux list-windows -F '#W' 2>/dev/null | grep -Fxq -- "$WINDOW_NAME"; then
+    if grep -Fxq -- "$WINDOW_NAME" <<<"$(tmux list-windows -F '#W' 2>/dev/null)"; then
         # Re-resolve name→@id and target by id: a dotted name (#323)
         # would otherwise dot-parse in display-message/kill-window -t.
         EXIST_WID=$(resolve_window_id "$WINDOW_NAME" || true)
@@ -1026,6 +1366,7 @@ MSG
     cat > "$LAUNCHER_TMP" <<LAUNCHER
 #!/bin/bash
 export NEXUS_ROOT="$NEXUS_ROOT"
+export NEXUS_SPAWN_CODE_ROOT="$NEXUS_SPAWN_CODE_ROOT"
 export NEXUS_WORKER_WINDOW="$WINDOW_NAME"
 # Join the nexus-wide toolchain (PATH += locals/bin, UV_* -> locals/) so
 # \`uv\`/\`python\`/nexus tools resolve by name and nothing writes to \$HOME.
@@ -1033,7 +1374,24 @@ export NEXUS_WORKER_WINDOW="$WINDOW_NAME"
 [ -f "\$NEXUS_ROOT/monitor/locals-env.sh" ] && . "\$NEXUS_ROOT/monitor/locals-env.sh" || true
 # Soft nproc ceiling: a fork storm degrades this worker, not the node
 # (fork-storm class, your-org/nexus-code#487 — rationale in spawn-worker.sh).
+# It is applied BEFORE the precondition check below, deliberately: that check
+# OBSERVES the ceiling in this process, a child and a grandchild rather than
+# trusting that this line worked — note its failure is swallowed by \`|| true\`
+# (your-org/nexus-code#589).
 $NPROC_ULIMIT_LINE
+# Fail-CLOSED PATH-front-shim + nproc precondition (your-org/nexus-code#578,
+# generalised in #589). Confirm EVERY shim under monitor/*wrap (gh, pip, pip3,
+# sandbox-notify, ...) is reachable in the shell this worker's Bash tool will
+# actually run — the launcher's OWN PATH is not enough (the tool shell sources a
+# snapshot that can bury the shim dirs) — and that the nproc ceiling above
+# reaches a child and a grandchild. The ceiling is DECLARED to the guard here so
+# the guard can OBSERVE whether it actually applied. The block itself is emitted
+# from the single source monitor/guard-block.sh.in, whose header carries the
+# two-name/two-root search and the refusal contract: a MISSING guard is a
+# REFUSAL (78), not a warning, and a guard that ran but could not adjudicate
+# exits 79 and is recorded as NOT CHECKED rather than folded into a pass.
+export NEXUS_ASSERT_NPROC_EXPECT="$WORKER_NPROC_LIMIT"
+$SHIM_GUARD_BLOCK
 # Pin worker cwd (issue #95) — claude --resume must also run from the
 # session's project dir or Claude Code won't find the transcript.
 cd "$WORKDIR" || exit 1
@@ -1104,6 +1462,21 @@ fi
 # write-probe.sh is itself sandbox-aware (it owns the in/out-of-sandbox
 # remedy split). Absence of the script degrades to a silent skip so an
 # older fork without it still spawns.
+#
+# KNOWN MEMBER OF THE SILENT-NO-OP CLASS, DELIBERATELY UNFIXED (#589).
+# This is the same shape the shim precondition above used to have —
+# `if [ -x <helper> ]` with no else, so an absent helper is indistinguishable
+# from a passing check — and it is on the SPAWN path, where refusing WOULD be
+# safe. It is left alone here only because closing it needs its own test and
+# negative control; shipping it unverified alongside a change about guards
+# that silently do not run would be the same defect wearing a fix's clothes.
+#
+# It is pinned as still-present by the manifest in
+# monitor/watcher/test-guard-closure-boundary.sh, so fixing it reddens that
+# suite and forces the manifest to be updated with it. Note the boundary
+# sentence there is drawn on guard KIND (shim-precondition), NOT on execution
+# path — precisely because a path-drawn bound would claim this site is closed
+# when it is not.
 WRITE_PROBE="$NEXUS_ROOT/monitor/write-probe.sh"
 if [ -x "$WRITE_PROBE" ]; then
     if ! "$WRITE_PROBE" --quiet "$WORKDIR_REAL" "$NEXUS_ROOT/reports"; then
@@ -1129,6 +1502,119 @@ if [ -n "$PRIOR_REPORT" ]; then
     fi
 fi
 
+# ---- clone freshness (your-org/nexus-code#814) ----------------------------
+# Emit, into the prompt, how old THIS clone's knowledge of its remote is.
+#
+# WHY. A worker pinned into a stale clone draws a repo-wide NEGATIVE from an
+# object store that is missing the very commits that would refute it, and every
+# check it runs agrees with the wrong answer. Measured 2026-08-08 in
+# `work/kompot_revisions-272refine`: `origin/main` at `d501f4f` (2026-07-27)
+# against a real `main` of `a3ee52d` (2026-08-08), with six commits that
+# redesigned the work simply ABSENT from the object store. The worker asked
+# "is there a newer design anywhere in the repo?", ran `git branch -a` and
+# `git log --all --not HEAD`, got clean answers, and was wrong by nine days —
+# it published a figure with inverted labels. `git branch -a` / `git log --all`
+# enumerate the LOCAL store; they cannot see what was never fetched.
+#
+# ⚠️  NOT `FETCH_HEAD` mtime, and this is load-bearing. #814 proposed that
+# probe and then DISPROVED its own suggestion: a FAILED fetch truncates
+# `.git/FETCH_HEAD` to zero bytes AND updates its mtime, so it reads FRESHER
+# than the tree is in exactly the case that matters most — a clone that cannot
+# fetch at all. Re-measured here on git 2.17.1 before writing this:
+#
+#     baseline (successful fetch) : FETCH_HEAD size=197  mtime=03:30:35
+#     after an auth-FAILED fetch  : FETCH_HEAD size=0    mtime=03:30:37
+#     origin/main                 : unchanged, still the pre-failure commit
+#
+# The mtime moved forward two seconds while the clone learned nothing. Do not
+# reintroduce it.
+#
+# What IS emitted is a remote-tracking ref's commit date: no network call, and
+# unfalsifiable by a failed fetch (a fetch that fails does not move the ref).
+#
+# WHICH ref, and why not a hardcoded `origin/main` as #814 suggested: a clone
+# whose default branch is not `main` has no `origin/main`, so that form emits
+# NOTHING — a silent absence in the freshness signal, which is the same defect
+# class one level up. Resolve in order of relevance and NAME the winner, and
+# when none resolves say so loudly rather than emitting a blank.
+_clone_freshness_block() {
+    local dir="$1"
+    git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || {
+        printf -- '- Clone freshness: NOT A GIT REPOSITORY (%s) — no remote-tracking state to report.\n' "$dir"
+        return 0
+    }
+    local head_line branch
+    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
+    # NB: `git branch --show-current` does not exist on git 2.17.1 and dies
+    # silently mid-chain; `rev-parse --abbrev-ref HEAD` is the portable form.
+    head_line=$(git -C "$dir" log -1 --format='%h %ci (%cr)' HEAD 2>/dev/null) || head_line=""
+    # ORDER IS LOAD-BEARING (your-org/nexus-code#814 skeptic F2). `@{upstream}`
+    # used to be FIRST, which handed every worker past its first push its OWN
+    # push as the primary freshness line — `git push` writes
+    # refs/remotes/origin/<branch> LOCALLY without fetching anything, so the
+    # line reads "0 seconds ago" while the clone has learned nothing. Measured
+    # on a clone blind to three upstream commits, after a `push -u`:
+    #
+    #     origin/operator/mytask c3849fb … (0 seconds ago)  [resolved via @{upstream}]
+    #     clone origin/main = bb595ec     real main = f8d7c07  (all 3 commits ABSENT)
+    #
+    # The remote's DEFAULT branch is the ref a "is there something newer in
+    # this repo?" question is actually about, and it is the one a worker's own
+    # push cannot touch. `@{upstream}` survives only as a last resort, labelled.
+    local ref="" chosen=""
+    for cand in 'origin/HEAD' 'origin/main' 'origin/master' 'origin/dev' '@{upstream}'; do
+        if git -C "$dir" rev-parse --verify --quiet "$cand" >/dev/null 2>&1; then
+            ref=$(git -C "$dir" rev-parse --abbrev-ref "$cand" 2>/dev/null) || ref="$cand"
+            chosen="$cand"
+            break
+        fi
+    done
+    printf -- '- Clone freshness (your-org/nexus-code#814) — how old this clone'"'"'s knowledge\n'
+    printf -- '  of its remote is, measured with NO network call:\n'
+    printf -- '    HEAD           : %s%s\n' "${head_line:-<unreadable>}" \
+        "${branch:+  [branch $branch]}"
+    if [ -n "$ref" ]; then
+        local ref_line
+        ref_line=$(git -C "$dir" log -1 --format='%h %ci (%cr)' "$ref" 2>/dev/null) || ref_line=""
+        printf -- '    %-15s: %s  [resolved via %s]\n' "$ref" "${ref_line:-<unreadable>}" "$chosen"
+        if [ "$chosen" = '@{upstream}' ]; then
+            printf -- '      ^ NOTE: no default-branch ref resolved, so this is YOUR OWN branch'"'"'s\n'
+            printf -- '        tracking ref — `git push` advances it locally without fetching\n'
+            printf -- '        anything, so a recent date here may be your own push and NOT\n'
+            printf -- '        evidence that this clone knows the remote. Fetch before any\n'
+            printf -- '        negative claim.\n'
+        fi
+    else
+        printf -- '    remote-tracking: NONE RESOLVED (no @{upstream}, origin/HEAD, origin/main,\n'
+        printf -- '                     origin/master or origin/dev) — this clone'"'"'s knowledge of\n'
+        printf -- '                     the remote is UNKNOWN, not fresh. Fetch before any negative\n'
+        printf -- '                     claim about the repository.\n'
+    fi
+    # NO "newest remote-tracking ref anywhere in this clone" line. The first
+    # version emitted one, calling it "the BOUND on your knowledge". It is not:
+    # `git push` writes refs/remotes/origin/<branch> locally, so the bound
+    # advances to NOW on the worker's own push while the clone learns nothing —
+    # the exact same shape as the FETCH_HEAD mtime probe this block rejects (a
+    # LOCAL operation advancing a REMOTE-knowledge indicator), and falsified in
+    # the OPTIMISTIC direction.
+    #
+    # It was added to suppress a false alarm: a clone made minutes ago on `dev`
+    # reports `origin/main` as weeks old because `main` genuinely has not moved.
+    # That trade runs the wrong way. A false alarm costs one `git fetch`; a
+    # false reassurance costs your-org/nexus-code#814 — a published figure with
+    # inverted labels. Every other guard in this batch takes the conservative
+    # side of exactly this trade, and so does this one now: an unmoved default
+    # branch reads old, and that is the correct bias.
+    printf -- '  A NEGATIVE CLAIM ABOUT THIS REPOSITORY IS ONLY AS OLD AS THAT DATE.\n'
+    printf -- '  `git branch -a` and `git log --all` read the LOCAL object store: commits\n'
+    printf -- '  pushed since are ABSENT, and every check you run will agree with the wrong\n'
+    printf -- '  answer. `git fetch` first, or scope the claim to a sha and a date.\n'
+    printf -- '  Do NOT reach for `.git/FETCH_HEAD` mtime as a freshness check — a FAILED\n'
+    printf -- '  fetch truncates it to zero bytes and updates its mtime, so it reads fresher\n'
+    printf -- '  than the tree is in precisely the case that matters (measured: size 197 -> 0,\n'
+    printf -- '  mtime +2s, `origin/main` unmoved).\n'
+}
+
 # Extract "## Worker floor" section body up to the next "## " H2 (or EOF).
 # H2 boundaries are load-bearing for this extraction; see the orchestrator
 # prose in skills/nexus.worker-defaults/SKILL.md.
@@ -1141,6 +1627,41 @@ floor_body=$(awk '
 if [ -z "$(printf '%s' "$floor_body" | tr -d '[:space:]')" ]; then
     echo "spawn-worker: '## Worker floor' section empty/missing in $FLOOR_FILE" >&2
     exit 3
+fi
+
+# Reply-to override body. Extracted the SAME awk way as the floor, from a
+# SEPARATE H2 so the floor extraction above is untouched (its `/^## /` stop
+# already terminates on any following H2 — this section adds no new
+# boundary). Read ONLY in --reply-to mode; a normal spawn never touches it,
+# which is what makes the default composed prompt byte-identical.
+# `<REQUEST_ID>` is substituted with the id validated above (charset
+# [A-Za-z0-9_-], so it is inert as sed replacement text).
+reply_to_body=
+if [ -n "$REPLY_TO" ]; then
+    reply_to_body=$(awk '
+      /^## Reply-to wrap-up override[[:space:]]*$/ { in_sec=1; next }
+      in_sec && /^## /                             { exit }
+      in_sec                                       { print }
+    ' "$FLOOR_FILE")
+    if [ -z "$(printf '%s' "$reply_to_body" | tr -d '[:space:]')" ]; then
+        echo "spawn-worker: '## Reply-to wrap-up override' section empty/missing in $FLOOR_FILE" >&2
+        exit 18
+    fi
+    reply_to_body=$(printf '%s\n' "$reply_to_body" | sed "s|<REQUEST_ID>|$REPLY_TO|g")
+    # --issue <n>: the worker wraps up to BOTH surfaces. Append the concrete
+    # command rather than leaving the generic "add --issue <n>" prose, so the
+    # worker has one copy-pasteable line.
+    if [ -n "$ISSUE_NUM" ]; then
+        reply_to_body="$reply_to_body
+
+**This spawn wants BOTH surfaces.** Your issue is \`#$ISSUE_NUM\`, so the
+exact hand-off command is:
+
+    monitor/ng wrap-up --reply-to $REPLY_TO --issue $ISSUE_NUM <report-path>
+
+That posts the normal upload + link comment on the issue AND delivers the
+channel reply."
+    fi
 fi
 
 # Sanitize window name for filenames. Tempfiles honour TMPDIR (same
@@ -1190,7 +1711,7 @@ if [ "$USE_LOOP_WRAPPER" -eq 0 ]; then
     elif command -v uuidgen >/dev/null 2>&1; then
         WORKER_SESSION_ID=$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]') || WORKER_SESSION_ID=""
     fi
-    printf '%s' "$WORKER_SESSION_ID" | grep -qE "$_UUID_RE" || WORKER_SESSION_ID=""
+    grep -qE "$_UUID_RE" <<<"$WORKER_SESSION_ID" || WORKER_SESSION_ID=""
 fi
 SESSION_ID_FLAG=""
 if [ -n "$WORKER_SESSION_ID" ]; then
@@ -1206,6 +1727,7 @@ fi
     printf -- '- Workdir: %s\n' "$WORKDIR"
     printf -- '- Primary nexus root: %s\n' "$NEXUS_ROOT"
     printf -- '- Reports dir: %s/reports\n' "$NEXUS_ROOT"
+    _clone_freshness_block "$WORKDIR"
     # Skeptic disclosure (skills/nexus.skeptic). An ORDINARY worker is told
     # NOTHING about a possible subsequent skeptic here — it does its work
     # unaware, and learns of the skeptic decision/gate only at wrap-up
@@ -1237,6 +1759,14 @@ fi
         printf '\n\n---\n\n'
     fi
     printf '%s\n\n---\n\n' "$floor_body"
+    # Conditional fourth block: the reply-to wrap-up override. Placed AFTER
+    # the floor (so it visibly supersedes the floor's issue-form wrap-up
+    # bullet by recency and by its own explicit wording) and BEFORE the task
+    # prompt (so per-spawn task instructions still have the last word).
+    # Empty on every non---reply-to spawn ⇒ zero bytes emitted.
+    if [ -n "$reply_to_body" ]; then
+        printf '%s\n\n---\n\n' "$reply_to_body"
+    fi
     cat -- "$PROMPT_FILE"
 } > "$PROMPT_TMP"
 
@@ -1253,7 +1783,7 @@ fi
 tmux info >/dev/null 2>&1 || { rm -f "$PROMPT_TMP"; echo "spawn-worker: no tmux server running — cannot spawn worker window" >&2; exit 8; }
 
 # Window-name collision check.
-if tmux list-windows -F '#W' 2>/dev/null | grep -Fxq -- "$WINDOW_NAME"; then
+if grep -Fxq -- "$WINDOW_NAME" <<<"$(tmux list-windows -F '#W' 2>/dev/null)"; then
     rm -f "$PROMPT_TMP"
     echo "spawn-worker: tmux window '$WINDOW_NAME' already exists" >&2
     exit 7
@@ -1327,6 +1857,7 @@ if [ "$USE_LOOP_WRAPPER" -eq 1 ]; then
 cat > "$LAUNCHER_TMP" <<LAUNCHER
 #!/bin/bash
 export NEXUS_ROOT="$NEXUS_ROOT"
+export NEXUS_SPAWN_CODE_ROOT="$NEXUS_SPAWN_CODE_ROOT"
 export NEXUS_WORKER_WINDOW="$WINDOW_NAME"
 # Join the nexus-wide toolchain (PATH += locals/bin, UV_* -> locals/) so
 # \`uv\`/\`python\`/nexus tools resolve by name and nothing writes to \$HOME.
@@ -1334,7 +1865,24 @@ export NEXUS_WORKER_WINDOW="$WINDOW_NAME"
 [ -f "\$NEXUS_ROOT/monitor/locals-env.sh" ] && . "\$NEXUS_ROOT/monitor/locals-env.sh" || true
 # Soft nproc ceiling: a fork storm degrades this worker, not the node
 # (fork-storm class, your-org/nexus-code#487 — rationale in spawn-worker.sh).
+# It is applied BEFORE the precondition check below, deliberately: that check
+# OBSERVES the ceiling in this process, a child and a grandchild rather than
+# trusting that this line worked — note its failure is swallowed by \`|| true\`
+# (your-org/nexus-code#589).
 $NPROC_ULIMIT_LINE
+# Fail-CLOSED PATH-front-shim + nproc precondition (your-org/nexus-code#578,
+# generalised in #589). Confirm EVERY shim under monitor/*wrap (gh, pip, pip3,
+# sandbox-notify, ...) is reachable in the shell this worker's Bash tool will
+# actually run — the launcher's OWN PATH is not enough (the tool shell sources a
+# snapshot that can bury the shim dirs) — and that the nproc ceiling above
+# reaches a child and a grandchild. The ceiling is DECLARED to the guard here so
+# the guard can OBSERVE whether it actually applied. The block itself is emitted
+# from the single source monitor/guard-block.sh.in, whose header carries the
+# two-name/two-root search and the refusal contract: a MISSING guard is a
+# REFUSAL (78), not a warning, and a guard that ran but could not adjudicate
+# exits 79 and is recorded as NOT CHECKED rather than folded into a pass.
+export NEXUS_ASSERT_NPROC_EXPECT="$WORKER_NPROC_LIMIT"
+$SHIM_GUARD_BLOCK
 # Pin worker cwd to the worktree (issue #95). tmux's -c "$WORKDIR"
 # on new-window sets the pane's start dir, but a redundant cd here
 # survives launcher reuse and any pre-claude wrappers that might
@@ -1351,12 +1899,13 @@ trap 'rm -f $PROMPT_TMP $LAUNCHER_TMP' EXIT
 exec "\$NEXUS_ROOT/monitor/claude-loop.sh" \\
     --window "$WINDOW_NAME" \\
     --prompt-file "$PROMPT_TMP" \\
-    $HOOKS_PATH_ARG${MODEL_ARG:+ $MODEL_ARG}
+    $HOOKS_FLAG${MODEL_ARG:+ $MODEL_ARG}
 LAUNCHER
 else
 cat > "$LAUNCHER_TMP" <<LAUNCHER
 #!/bin/bash
 export NEXUS_ROOT="$NEXUS_ROOT"
+export NEXUS_SPAWN_CODE_ROOT="$NEXUS_SPAWN_CODE_ROOT"
 export NEXUS_WORKER_WINDOW="$WINDOW_NAME"
 # Join the nexus-wide toolchain (PATH += locals/bin, UV_* -> locals/) so
 # \`uv\`/\`python\`/nexus tools resolve by name and nothing writes to \$HOME.
@@ -1364,7 +1913,24 @@ export NEXUS_WORKER_WINDOW="$WINDOW_NAME"
 [ -f "\$NEXUS_ROOT/monitor/locals-env.sh" ] && . "\$NEXUS_ROOT/monitor/locals-env.sh" || true
 # Soft nproc ceiling: a fork storm degrades this worker, not the node
 # (fork-storm class, your-org/nexus-code#487 — rationale in spawn-worker.sh).
+# It is applied BEFORE the precondition check below, deliberately: that check
+# OBSERVES the ceiling in this process, a child and a grandchild rather than
+# trusting that this line worked — note its failure is swallowed by \`|| true\`
+# (your-org/nexus-code#589).
 $NPROC_ULIMIT_LINE
+# Fail-CLOSED PATH-front-shim + nproc precondition (your-org/nexus-code#578,
+# generalised in #589). Confirm EVERY shim under monitor/*wrap (gh, pip, pip3,
+# sandbox-notify, ...) is reachable in the shell this worker's Bash tool will
+# actually run — the launcher's OWN PATH is not enough (the tool shell sources a
+# snapshot that can bury the shim dirs) — and that the nproc ceiling above
+# reaches a child and a grandchild. The ceiling is DECLARED to the guard here so
+# the guard can OBSERVE whether it actually applied. The block itself is emitted
+# from the single source monitor/guard-block.sh.in, whose header carries the
+# two-name/two-root search and the refusal contract: a MISSING guard is a
+# REFUSAL (78), not a warning, and a guard that ran but could not adjudicate
+# exits 79 and is recorded as NOT CHECKED rather than folded into a pass.
+export NEXUS_ASSERT_NPROC_EXPECT="$WORKER_NPROC_LIMIT"
+$SHIM_GUARD_BLOCK
 # Pin worker cwd to the worktree (issue #95). See the loop-wrapped
 # branch above for the full rationale.
 cd "$WORKDIR" || exit 1
@@ -1418,14 +1984,20 @@ tmux send-keys -t "$WID" "$LAUNCHER_TMP" Enter
 # resume mode that shares it). The session-id extra (when the
 # generated `--session-id` is in play) is what the --resume resolver's
 # spawn-event source reads back (your-nexus#206).
+# reply-to rides the spawn event only when set, so a normal spawn's
+# action-log row is byte-identical to the pre-flag shape.
+_anchor_extra_replyto=()
+[ -n "$REPLY_TO" ] && _anchor_extra_replyto=("reply-to=$REPLY_TO")
 if [ -n "$WORKER_SESSION_ID" ]; then
     _seed_lifecycle_anchors "$NEXUS_ROOT" "$WINDOW_NAME" "$WORKDIR" \
         "session-id=$WORKER_SESSION_ID" "kind=$SPAWN_KIND" \
-        "skeptic-mode=$SKEPTIC_MODE" "skeptic-depth=$SKEPTIC_DEPTH"
+        "skeptic-mode=$SKEPTIC_MODE" "skeptic-depth=$SKEPTIC_DEPTH" \
+        ${_anchor_extra_replyto[@]+"${_anchor_extra_replyto[@]}"}
 else
     _seed_lifecycle_anchors "$NEXUS_ROOT" "$WINDOW_NAME" "$WORKDIR" \
         "kind=$SPAWN_KIND" \
-        "skeptic-mode=$SKEPTIC_MODE" "skeptic-depth=$SKEPTIC_DEPTH"
+        "skeptic-mode=$SKEPTIC_MODE" "skeptic-depth=$SKEPTIC_DEPTH" \
+        ${_anchor_extra_replyto[@]+"${_anchor_extra_replyto[@]}"}
 fi
 
 # Write the durable provenance record. The ABSENCE of this file is what
@@ -1438,7 +2010,7 @@ _write_provenance_record \
     "$NEXUS_ROOT" "$WINDOW_NAME" "${WORKER_SESSION_ID:-}" \
     "$SPAWN_KIND" "$WORKDIR" "$PROMPT_FILE" "$SPAWN_TOPIC" \
     "$SKEPTIC_MODE" "$SKEPTIC_DEPTH" "$SKEPTIC_ROLE" "$SKEPTIC_TARGET" \
-    "$SKEPTIC_ORIG"
+    "$SKEPTIC_ORIG" "$REPLY_TO"
 
 # Skeptic-spawn linkage (skills/nexus.skeptic). When this spawn IS a
 # skeptic reviewing another worker (--skeptic-role --skeptic-target

@@ -1,0 +1,31 @@
+# strip-heredocs-failsafe.manifest — the files `th_strip_heredocs` CANNOT strip.
+#
+# WHAT THIS RECORDS. `th_strip_heredocs` (your-org/nexus-code#806) gives corpus
+# lints a source view with heredoc bodies blanked. When it finds a heredoc still
+# OPEN at end of file it concludes it has mis-parsed, discards its own output,
+# emits the file UNSTRIPPED, and says so on stderr. That fail-safe is the reason
+# a stripper bug over-reports instead of going silently blind.
+#
+# A file listed here is one the fail-safe currently catches. Its consumers fall
+# back to raw-source scanning for that file — today's pre-#806 behaviour, loudly.
+#
+# WHY IT IS PINNED AS DATA. The fail-safe makes a stripper regression HARMLESS,
+# not INVISIBLE — and those are different. `#822` found that breaking the
+# arithmetic left-shift guard (`$(( budget << streak ))` read as a heredoc
+# delimiter) reddened NOTHING, because the fail-safe silently absorbed it: the
+# population simply moved 1 → 2 and no assertion looked. This file is what makes
+# that movement visible. It is the assertion that would have caught it.
+#
+# EXACT SET, not a ceiling. A file appearing here that is not listed means a
+# parse newly fails; a listed file that no longer appears means one was fixed
+# and the line must go. Both directions red, for the same reason the sibling
+# manifests do: a list that only grows stops describing the tree.
+#
+# DO NOT regenerate this to make a red go away. A new entry means
+# `th_strip_heredocs` cannot parse something it used to, and the question is
+# which guard stopped working.
+#
+# Checked by monitor/watcher/test-strip-heredocs.sh
+#
+# <path>::<why this file cannot be parsed>
+monitor/watcher/test-assert-shims-wrapped.sh::a multi-line single-quoted awk program containing `<<LAUNCHER` inside a regex; per-line quote state cannot span the quoted string, so the scanner reads it as a heredoc opener whose terminator never arrives

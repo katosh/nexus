@@ -148,7 +148,14 @@ run_bootstrap() {
 }
 
 install_invocations() {
-    [[ -f "$INSTALL_LOG" ]] && grep -c 'invoked' "$INSTALL_LOG" || echo 0
+    # `grep -c` prints `0` on no match AND exits 1, so `&& grep -c … || echo 0`
+    # emitted "0\n0" whenever the log EXISTED with no `invoked` line — exactly
+    # the state the `== "0"` assertions below expect, which would have failed
+    # them spuriously. `if/else` separates "no log" from "log, no match", and
+    # `|| true` neutralises the no-match exit without printing again (#725).
+    if [[ -f "$INSTALL_LOG" ]]; then grep -c 'invoked' "$INSTALL_LOG" || true
+    else echo 0
+    fi
 }
 
 echo "=== fresh operator: no claude anywhere ==="

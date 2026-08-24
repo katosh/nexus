@@ -1,0 +1,143 @@
+# monitor/guard-block.sh.in — the SHIM-PRECONDITION guard, emitted verbatim
+# into every agent launcher. THIS FILE IS THE SINGLE SOURCE (#589).
+#
+# It is a TEMPLATE, not a script: it is `cat`-read (never sourced) by
+# monitor/spawn-worker.sh and monitor/watcher/_respawn.sh, which substitute
+# @@WHO@@ / @@ACTION@@ and interpolate the result into their launcher
+# heredocs. Reading it as data rather than sourcing it deliberately avoids the
+# sourced-helper skew hazard CLAUDE.md documents for the watcher.
+#
+# WHY ONE SOURCE. This block previously existed as two hand-maintained copies,
+# one per launcher. Two copies of a guard is how the next divergence gets
+# introduced, and a guard that has silently diverged from its twin is a close
+# cousin of the class this whole change closes: both ends look enforced, only
+# one is. monitor/watcher/test-guard-closure-boundary.sh asserts both callers
+# read THIS file and that no inline copy has reappeared.
+#
+# WHAT IT REPLACES. `if [ -x "$NEXUS_ROOT/monitor/assert-gh-wrapped.sh" ];
+# then <run it>; fi`, commented "Absent helper (older checkout) → skipped".
+# That is a guard that does not execute, which is indistinguishable from a
+# guard that passed. It was live: re-rooting (#577) points NEXUS_ROOT at the
+# operator's primary, whose checkout may carry no assert helper at all — over
+# the #487 pip fork-storm that took a node down twice in two days.
+#
+# Two NAMES are searched because #589 renames the guard as it generalises it
+# from `gh` to every shim; two ROOTS because of the re-rooting above —
+# NEXUS_SPAWN_CODE_ROOT is the tree the emitting script itself ships in, so a
+# guard follows the code that requires it. Finding NEITHER is a REFUSAL.
+_nx_guard=""
+for _nx_root in "$NEXUS_ROOT" "$NEXUS_SPAWN_CODE_ROOT"; do
+    [ -n "$_nx_root" ] || continue
+    for _nx_name in assert-shims-wrapped.sh assert-gh-wrapped.sh; do
+        if [ -x "$_nx_root/monitor/$_nx_name" ]; then
+            _nx_guard="$_nx_root/monitor/$_nx_name"
+            break 2
+        fi
+    done
+done
+
+# Durable sink for every announce-and-proceed outcome below. An announcement
+# that goes nowhere durable is unobservable after the fact — the observability
+# half of the same defect.
+#
+# MODE MATTERS HERE (your-org/nexus-code#484). A bare `>>` creates the file
+# under the ambient umask; on this stack that is 007, so 0660 —
+# group-writable, in a drwxrws--- tree. A group-writable log is one whose
+# contents cannot be trusted as evidence: any group member can append,
+# truncate or rewrite it and nothing records that they did. This file's ONLY
+# purpose is to establish after the fact that an agent started unverified, so
+# creating it group-writable would defeat the entire point of F2. Caught by
+# the round-4 skeptic; it was not on my radar.
+#
+# The helper is used when reachable. The inline fallback is NOT a weaker
+# path — `umask 0027` yields the identical 0640 — it exists only so the
+# launcher does not gain a hard dependency it would then have to refuse over,
+# which for a LOGGING helper would be worse than the problem.
+_nx_note() {
+    echo "@@WHO@@: $1" >&2
+    [ -n "${NEXUS_ROOT:-}" ] || {
+        echo "@@WHO@@: NEXUS_ROOT unset — the above is NOT durably recorded." >&2
+        return 0
+    }
+    _nx_log="$NEXUS_ROOT/monitor/.state/guard-unverified.log"
+    # mkdir, not `[ -d ] &&`. The gate used to be `[ -d <state> ]` with no
+    # else, so a checkout without .state — a fresh clone, i.e. EXACTLY the
+    # old-checkout case this guard exists for — silently got no row. That is
+    # the canonical silent-no-op shape, written inside the fix for silent
+    # no-ops. Same skeptic, same request.
+    mkdir -p "$NEXUS_ROOT/monitor/.state" 2>/dev/null || true
+    if [ -r "$NEXUS_ROOT/monitor/_log-mode.sh" ]; then
+        # shellcheck disable=SC1090
+        . "$NEXUS_ROOT/monitor/_log-mode.sh" 2>/dev/null && _ensure_service_log "$_nx_log"
+    elif [ ! -e "$_nx_log" ]; then
+        ( umask 0027; : >> "$_nx_log" ) 2>/dev/null || true
+    fi
+    if ! printf '%s\t%s\t%s\t%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown-ts)" \
+            "@@WHO@@" \
+            "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" \
+            "$1" >> "$_nx_log" 2>/dev/null; then
+        # Failing to record is itself a distinguishable outcome, never a
+        # silent one — the whole contract of this change, applied to its own
+        # bookkeeping.
+        echo "@@WHO@@: could NOT record the above to $_nx_log — this run leaves no durable evidence." >&2
+    fi
+}
+
+if [ -n "$_nx_guard" ]; then
+    "$_nx_guard"; _nx_rc=$?
+    if [ "$_nx_rc" = 79 ]; then
+        # The THIRD outcome: the guard ran and could not adjudicate. Neither a
+        # pass nor a failure, and never silently folded into either.
+        _nx_note "shim precondition NOT CHECKED — the guard's own precondition is absent (exit 79, see above). This is not a pass."
+        if [ -n "${NEXUS_REQUIRE_SHIM_CHECK:-}" ]; then
+            echo "@@WHO@@: REFUSING TO @@ACTION@@ — NEXUS_REQUIRE_SHIM_CHECK is set and the check could not run." >&2
+            exit 78
+        fi
+    elif [ "$_nx_rc" != 0 ]; then
+        echo "@@WHO@@: aborting — shim precondition failed (see above)" >&2
+        exit 78
+    fi
+elif [ -n "${NEXUS_ALLOW_MISSING_SHIM_GUARD:-}" ]; then
+    _nx_note "WARNING — shim precondition guard MISSING, proceeding UNVERIFIED by explicit override (NEXUS_ALLOW_MISSING_SHIM_GUARD=${NEXUS_ALLOW_MISSING_SHIM_GUARD}). The #487 pip fork-storm shim and the bot-default gh wrapper are UNCHECKED."
+else
+    echo "@@WHO@@: REFUSING TO @@ACTION@@ — no shim precondition guard found." >&2
+    echo "@@WHO@@: looked for assert-shims-wrapped.sh, assert-gh-wrapped.sh under \$NEXUS_ROOT=$NEXUS_ROOT and \$NEXUS_SPAWN_CODE_ROOT=${NEXUS_SPAWN_CODE_ROOT:-<unset>}" >&2
+    echo "@@WHO@@: a MISSING guard is not a passing guard (your-org/nexus-code#589). Bring the checkout that owns \$NEXUS_ROOT up to date, or set NEXUS_ALLOW_MISSING_SHIM_GUARD=<reason> to proceed unverified." >&2
+    exit 78
+fi
+
+# --- in-turn guard preconditions -------------------------------------------
+# The block above covers the SHIM-PRECONDITION guard. The two ENFORCEMENT
+# hooks are a different kind and a different constraint: gh-write-guard.sh
+# (GitHub IDENTITY — the #497 failure, five operator-authored writes in one
+# day) and bash-footgun-guard.sh (which can `exit 2` to BLOCK a tool call).
+# Each opens `command -v jq >/dev/null 2>&1 || exit 0`, and the footgun guard
+# gates its entire conf-driven ruleset on `[ -f <patterns> ]` with no else.
+#
+# Those exits are CORRECT and are deliberately left alone: a PreToolUse hook
+# that refuses because a dependency is missing wedges every tool call, which
+# is worse than the guard it protects. What was wrong is that NOTHING ANYWHERE
+# NOTICED the environment had disabled them — jq is an undeclared hard
+# dependency, and 13 sites under monitor/ change behaviour without it.
+#
+# So the precondition is asserted ONCE, here, where a human reads it. Loud,
+# durably recorded, and NOT refusing: a host without jq must still be able to
+# start an agent to fix itself. NEXUS_REQUIRE_SHIM_CHECK=1 escalates it.
+_nx_missing=""
+command -v jq >/dev/null 2>&1 || _nx_missing="jq"
+_nx_pat_found=0
+for _nx_pat in "$NEXUS_ROOT/monitor/bash-footgun-patterns.conf" "$NEXUS_SPAWN_CODE_ROOT/monitor/bash-footgun-patterns.conf"; do
+    case "$_nx_pat" in /*/monitor/*) ;; *) continue ;; esac
+    if [ -f "$_nx_pat" ]; then _nx_pat_found=1; break; fi
+done
+if [ "$_nx_pat_found" != 1 ]; then
+    _nx_missing="${_nx_missing:+$_nx_missing, }bash-footgun-patterns.conf"
+fi
+if [ -n "$_nx_missing" ]; then
+    _nx_note "IN-TURN GUARDS NOT ENFORCED — missing: $_nx_missing. gh-write-guard.sh (GitHub identity, #497) and bash-footgun-guard.sh (blocks tool calls) silently no-op without these. Their exit-0 is by design; this notice is the only thing that makes it visible. Not a pass."
+    if [ -n "${NEXUS_REQUIRE_SHIM_CHECK:-}" ]; then
+        echo "@@WHO@@: REFUSING TO @@ACTION@@ — NEXUS_REQUIRE_SHIM_CHECK is set and the in-turn guards cannot run." >&2
+        exit 78
+    fi
+fi

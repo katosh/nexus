@@ -26,6 +26,50 @@
 
 set -uo pipefail
 
+# ---- HERMETIC ENV (your-org/nexus-code#655) -----------------------------
+#
+# The FOURTH suite on this variable, and the first one found by a MACHINE
+# rather than by a human running the band twice: the `NEXUS_ROOT`-exported CI
+# cell added in the same change caught it on its first run. `#706`'s sweep over
+# fixture-nexus suites did not include it.
+#
+# This file builds a FAKE_NEXUS and runs the real spawn-worker.sh against it.
+# spawn-worker.sh honours an INHERITED NEXUS_ROOT over its own script-relative
+# root (`spawn-worker.sh:594-596`, your-org/nexus-code#577), so with the
+# variable exported the run under test is against somebody else's tree and
+# Test 1's launcher body is never produced. Same class as the two spawn-worker
+# suites, same one-line fix.
+#
+# COVERAGE BOUNDARY. This paragraph used to say the CI-specific trigger was NOT
+# established, and it instructed the next reader not to bother looking. It IS
+# established now (#655 round 12 skeptic, corroborated round 13):
+#
+#   `_claude-bin.sh` resolves CLAUDE_BIN env -> $NEXUS_ROOT/node_modules/.bin/claude
+#   -> `command -v claude` -> exit 1. Under the re-root $NEXUS_ROOT is the
+#   INHERITED root, which has no node_modules/ (gitignored, .gitignore:38, so
+#   absent from any checkout), and a GitHub runner has no `claude` on PATH
+#   either. Both fallbacks miss, the spawn fails, and Test 1's launcher body is
+#   never produced. 2x2 with a control: claude absent + NEXUS_ROOT exported ->
+#   `5 passed, 3 failed`, rc=1; the other three cells 8/0 green.
+#
+# The earlier "did not reproduce locally" was a FAILURE TO REPRODUCE, not a
+# refutation: BASH_ENV=monitor/shellenv/bash_env.sh re-prepends $NEXUS_LOCALS/bin
+# into every CHILD bash, so `claude` was verified absent in the outer shell and
+# restored in the shell that actually ran the spawn. Any experiment that removes
+# a binary from PATH here must clear BASH_ENV too, or it tests nothing.
+#
+# What is NOT diagnostic is the ASSERTION COUNT. "Three assertions failed" was
+# offered as corroboration that the mechanism is claude-absence; it is not. Any
+# cause that makes the spawn exit non-zero reddens the same three assertions.
+# Round 13 produced `5 passed, 3 failed` with `claude` fully resolvable, by
+# pointing NEXUS_ROOT at a tree that merely lacked skills/nexus.worker-defaults/
+# SKILL.md (`spawn-worker: floor file missing:`). The mechanism above stands on
+# the direct CLAUDE_BIN-resolution evidence, not on the count.
+#
+# The SENSITIVITY — which is what the scrub below removes, and what
+# monitor/nexus-root-sensitivity.sh measures directly — was never in doubt.
+unset NEXUS_ROOT
+
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SCRIPT_REAL="$_test_dir/../spawn-worker.sh"
 LAUNCHER_REAL="$_test_dir/launcher.sh"
@@ -84,6 +128,12 @@ mkdir -p "$FAKE_NEXUS/monitor" \
          "$FAKE_NEXUS/reports" \
          "$FAKE_NEXUS/node_modules/.bin"
 cp "$SCRIPT_REAL" "$FAKE_NEXUS/monitor/spawn-worker.sh"
+# The shim-guard TEMPLATE (your-org/nexus-code#589). spawn-worker.sh emits its
+# launcher guard from monitor/guard-block.sh.in and REFUSES (exit 78) rather
+# than emitting an empty block — an empty block is a guard that does not run.
+# A hard dependency of any fake tree that RUNS spawn-worker.sh.
+cp "$_test_dir/../guard-block.sh.in" "$FAKE_NEXUS/monitor/guard-block.sh.in"
+
 cp "$_test_dir/../_claude-bin.sh"  "$FAKE_NEXUS/monitor/_claude-bin.sh"
 cp "$_test_dir/../_tmux-window.sh" "$FAKE_NEXUS/monitor/_tmux-window.sh"
 cp "$_test_dir/../_fm_lib.sh"      "$FAKE_NEXUS/monitor/_fm_lib.sh"
@@ -130,10 +180,26 @@ chmod +x "$FAKE_NEXUS/monitor/ng"
 # tempfile persists under $TMPDIR for inspection.
 run_spawn() {  # run_spawn <window-name> [env VAR=val ...]
     local win="$1"; shift
-    env "$@" PATH="$STUB_BIN:$PATH" "$SCRIPT" -n "$win" -c "$WORKDIR" -p "$PROMPT_FILE" >/dev/null 2>&1
+    # KEEP the spawn's own output (#655). It used to go to /dev/null, so when
+    # the launcher body came back empty the three assertions below said only
+    # "missing <string>" — true, useless, and identical whether spawn-worker
+    # refused, aborted, or wrote somewhere else. That is what made this suite's
+    # CI-only failure un-diagnosable from the log. Echoed only when the body is
+    # empty, so a green run stays quiet.
+    env "$@" PATH="$STUB_BIN:$PATH" "$SCRIPT" -n "$win" -c "$WORKDIR" -p "$PROMPT_FILE" \
+        > "$WORK/spawn-$win.out" 2> "$WORK/spawn-$win.err"
+    printf '%s' "$?" > "$WORK/spawn-$win.rc"
 }
 launcher_body() {  # launcher_body <window-name>
-    cat "$SPAWN_TMP/spawn-launcher-$1".*.sh 2>/dev/null
+    local body
+    body=$(cat "$SPAWN_TMP/spawn-launcher-$1".*.sh 2>/dev/null)
+    if [[ -z "$body" ]]; then
+        printf '  (no launcher body for %s — spawn rc=%s; its output follows)\n' \
+            "$1" "$(cat "$WORK/spawn-$1.rc" 2>/dev/null)" >&2
+        tail -n 15 "$WORK/spawn-$1.out" "$WORK/spawn-$1.err" 2>/dev/null \
+            | sed 's/^/    /' >&2
+    fi
+    printf '%s' "$body"
 }
 
 # ---- Test 1: generated launcher carries the soft nproc ceiling -----------

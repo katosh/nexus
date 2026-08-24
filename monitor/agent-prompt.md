@@ -191,7 +191,13 @@ there — beats waiting for GitHub's confusing "Resource not accessible
 by integration" error.
 
 Raw `gh` escape hatch — use this when `ng` doesn't cover the case.
-**The bot is now the DEFAULT even for a bare `gh`**: a PATH-front
+**Mint explicitly and verify:** `GH_TOKEN=$("$NEXUS_ROOT"/monitor/mint-token.sh)
+gh <write> …`, then `"$NEXUS_ROOT"/monitor/assert-bot-author.sh <url>`.
+The bot is also the default for a bare `gh`, but that path is a
+BACKSTOP, not the mechanism — it has been observed broken on a live
+clone (five operator-authored writes in one day, `#497`), and the
+failure is silent because GitHub mutes the operator's own notification.
+The wrapper, for reference: a PATH-front
 `gh` wrapper (`monitor/ghwrap/gh`, prepended to the front of `PATH`
 for every agent shell) auto-injects the bot token on WRITE verbs
 (`pr`/`issue` create·comment·edit·…, `release upload`, `api` with a
@@ -259,12 +265,16 @@ the full rules.
 4. Render the dashboard into the overview issue body, between the
    `<!-- NEXUS_DASHBOARD_START -->` / `<!-- NEXUS_DASHBOARD_END -->`
    markers. Sections:
-   - **Decisions Needed** (with links to per-decision issues)
-   - **Active Agents** (table: window | project | task | started | last activity)
-   - **Blocked / Waiting**
-   - **Recently Completed** (last ~3 days)
-   - **Project Status** (per `work/*` repo)
-   - **Next Actions** (ranked)
+   - **`## Identity`** — what this nexus IS (host, repos, watcher paths); generate with `monitor/ng nexus-identity`
+   - **`## Infra`** — watcher/services/cockpit health
+   - **`## Services`** — registered services and their state
+   - **`## In-flight`** — active windows (window | project | task | started | last activity)
+   - **`## Awaiting operator`** — decisions blocked on the operator, with links to per-decision issues
+   - **`## Recent landings`** — merged PRs / completed work (last ~3 days)
+
+   These six headings are the SCHEMA — `ng dashboard validate` matches them
+   with `grep -Fx` and exits 1 on any that is missing. Scaffold with
+   `monitor/ng dashboard scaffold`, then validate before you put.
 
    Use `monitor/ng dashboard put --body-file <path>` — it re-reads the
    live body, splices your new middle in between the markers, and
@@ -277,7 +287,13 @@ the full rules.
    presence. If the heartbeat is missing or stale, spawn the watcher
    via:
 
-       monitor/watcher/launcher.sh --target <your-tmux-window>
+       monitor/svc.sh restart watcher      # or: monitor/watcher/launcher.sh --replace
+
+   Do NOT pass `--target <window>`: it defaults to config
+   `monitor.target_window`, and hard-coding it is the `#459`
+   anti-pattern that `launcher.sh:97-118` documents as a bug and
+   `CLAUDE.md` explicitly forbids. It now exits 2 rather than failing
+   silently, so the cost is a wasted cold-boot turn.
 
    The launcher spawns the watcher HEADLESS — `setsid`-detached,
    no tmux window, with `monitor/watcher/main.sh`'s output appended
@@ -462,12 +478,12 @@ Full criteria in `skills/nexus.window-cleanup/SKILL.md`
 
 ### Processing local-state changes
 
-- New `reports/*.md` → update Active Agents / Recently Completed in
+- New `reports/*.md` → update In-flight / Recent landings in
   the overview issue body. If the report indicates a new decision
   needed, create a per-thread issue (`nexus:decision`). If it has
   an `## Infrastructure Issues` section, file each entry per
   `## Capturing improvement ideas` below.
-- tmux window added/removed → update Active Agents.
+- tmux window added/removed → update In-flight.
 - git HEAD or clean↔dirty change → update Project Status.
 
 For trivial deltas (single dirty/clean flip, no other change), end the

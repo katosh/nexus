@@ -29,7 +29,7 @@ one.
 
 - **`{reports-dir}`** — the **absolute** reports path injected
   into every worker's prompt as part of the `## Worker
-  environment` header (e.g. `$NEXUS_ROOT/reports`).
+  environment` header (e.g. `/shared/your-lab-m/user/<operator>/nexus/reports`).
   Do **not** use a relative `reports/` from your workdir — when
   the workdir is a secondary clone (worktree / fresh clone), a
   relative path lands in that clone's tree and the orchestrator
@@ -37,7 +37,7 @@ one.
   (`monitor/spawn-worker.sh`) inject the absolute path so the
   destination is unambiguous.
 - **`{project}`** — name of the `work/` subdirectory being worked on
-  (e.g. `kompot`, `<hpc-skills>`, `labsh`). Use `nexus` for
+  (e.g. `kompot`, `hpc-skills`, `labsh`). Use `nexus` for
   workspace-level tasks that span projects.
 - **`{YYYY-MM-DD}`** — ISO date.
 - **`{HHMMSS}`** — 24h time. UTC or local — be consistent across the
@@ -50,6 +50,15 @@ number in the slug, e.g.
 `diff-dynamics_2026-05-02_184500_issue53-m8-drift-pressure.md`. This
 lets future workers retrieve the chain via
 `ls reports/*issue53* 2>/dev/null`.
+
+To search report **content** (not just filenames) — "has this come up
+before?" — use `monitor/ng report-grep <pattern>`, NOT a bare
+`grep -r … reports/`. The operator's `grep` wraps `ugrep --ignore-files`
+and `reports/.gitignore` is a bare `*`, so a recursive grep returns a
+SILENT zero over the whole corpus (`<your-org>/nexus-code#618`);
+`report-grep` fails loud (exit 3 + diagnostic) instead of handing back a
+false "no". Filename globs like `ls reports/*issue53*` are explicit
+arguments and are never suppressed.
 
 Example: `reports/kompot_2026-04-14_153200_fig2-revision.md`.
 
@@ -278,5 +287,7 @@ its verdict and the evidence backing it.
 - `nexus.tmux-spawn` — when spawning a follow-up worker, briefing it
   with prior-report context (`ls reports/{project}_*`) is part of
   the spawn pattern.
-- nexus root `CLAUDE.md` — the canonical "Agent Reports (CRITICAL)"
-  section the workspace relies on.
+- nexus root `CLAUDE.md` — the canonical "Reports — write one before
+  you finish, idle, or run out of context" section the workspace relies
+  on. (The old citation named an "Agent Reports (CRITICAL)" heading that
+  no longer exists — <your-org>/nexus-code#568 C8.)
