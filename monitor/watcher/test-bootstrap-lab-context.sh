@@ -98,6 +98,7 @@ run_bootstrap() {
         USER="testuser" \
         CLAUDE_BIN="$STUB_CLAUDE" \
         _NEXUS_HPC_MOUNT="$hpc_mount" \
+        _NEXUS_HPC_HOST_PREFIXES="login|gpu|compute" \
         _NEXUS_HOSTNAME="$hostname" \
         bash "$NEXUS/monitor/bootstrap-install.sh" 2>"$WORK/boot.err"
     LAST_RC=$?
