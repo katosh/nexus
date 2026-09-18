@@ -155,7 +155,7 @@ assert_contains  "stderr names usage shape"          "$err" "usage: ng process <
 echo '=== ng process --bogus 42 → exit 1, unknown flag ==='
 run_ng out err rc "$sd" process --bogus 42
 assert_eq        "exit 1"                            "$rc" "1"
-assert_contains  "stderr names unknown flag"         "$err" "unknown flag: --bogus"
+assert_contains  "stderr names unknown flag"         "$err" "unknown flag: '--bogus'"
 
 # ---- Test 2: cmd_process — happy path, zero reactions → eligible ------
 

@@ -78,6 +78,24 @@ HARNESS_SESSION=0
 SCENARIO_INTERVAL_S=1
 SCENARIO_THRESHOLD_S=2
 WORKER_NAME=wrapup-worker
+# EMIT-VISIBILITY BUDGET. Every assertion below reads the ARCHIVED emit
+# bodies, and that body's `--- idle workers ---` section is NOT recomputed at
+# `monitor.interval_seconds`. It is served from `.state/scheduler-staging/
+# idle_section.out` (`main.sh:4396`), which only the `idle_section` scheduled
+# task refreshes — registered at a HARD-CODED 30 s
+# (`_schedule_task idle_section 30 …`, `main.sh:4841`; no config key, no env
+# override, so a fixture cannot lower it). `list_idle_transitions` is called
+# once per that task run, so an idle-pool RECLASSIFICATION reaches an archive
+# only on the next 30 s tick, no matter how fast the poll loop turns.
+#
+# The budgets here used to be `SCENARIO_INTERVAL_S * 6` (6 s) and `* 4` (4 s),
+# i.e. sized against the 1 s poll cadence — arithmetic against the wrong
+# producer. They passed only when the 30 s tick happened to land just after
+# the injection, which is exactly the 2-3-4-failure spread this suite has
+# shown every reporter (your-org/nexus-code#1102). This is not slack for a
+# loaded box; it is one full producer period plus a compose cycle, and it must
+# not be tuned back down to look faster.
+EMIT_VISIBILITY_BUDGET_S=45
 RETAIN_REASON="wrap-up-$(date -u +%Y-%m-%d)"
 
 echo "=== harness ==="
@@ -190,7 +208,7 @@ echo
 echo "=== spawn worker ==="
 win=$(harness_spawn_worker "$WORKER_NAME" \
     "STUB_CLAUDE_BUSY_SECONDS=3" \
-    "STUB_CLAUDE_HOLD_SECONDS=60")
+    "STUB_CLAUDE_HOLD_SECONDS=300")
 [[ "$win" =~ ^[0-9]+$ ]] || th_abort "spawn returned non-numeric window index: $win"
 echo "  worker at window=$win"
 
@@ -324,7 +342,7 @@ wait_for "pane-state reports idle after spinner clears" 8 -- pane_state_is idle
 echo
 echo "=== phase 3: idle-pool surfaces no-wrap-up ==="
 wait_for "watcher emits no-wrap-up row for $WORKER_NAME" \
-    $(( SCENARIO_THRESHOLD_S + 8 )) -- \
+    "$EMIT_VISIBILITY_BUDGET_S" -- \
     emits_contain "$WORKER_NAME idle"
 
 # ---------------------------------------------------------------------------
@@ -335,7 +353,7 @@ echo
 echo "=== phase 4: inject wrap-up → 'wrapped' emit ==="
 inject_wrap_up
 wait_for "watcher emits wrapped row for $WORKER_NAME" \
-    $(( SCENARIO_INTERVAL_S * 6 )) -- \
+    "$EMIT_VISIBILITY_BUDGET_S" -- \
     emits_contain "$WORKER_NAME wrapped up"
 
 # ---------------------------------------------------------------------------
@@ -349,10 +367,10 @@ echo
 echo "=== phase 5: inject window-retain → retained footer ==="
 inject_retain
 wait_for "watcher emits retained footer with $WORKER_NAME ($RETAIN_REASON)" \
-    $(( SCENARIO_INTERVAL_S * 6 )) -- \
+    "$EMIT_VISIBILITY_BUDGET_S" -- \
     emits_contain "$WORKER_NAME ($RETAIN_REASON)"
 wait_for "retained footer header rendered" \
-    $(( SCENARIO_INTERVAL_S * 4 )) -- \
+    "$EMIT_VISIBILITY_BUDGET_S" -- \
     emits_contain "retained windows suppressed"
 
 # ---------------------------------------------------------------------------
@@ -377,7 +395,7 @@ engagement_row_pruned() {
         "$elog" >/dev/null 2>&1
 }
 wait_for "engagement-log row for $WORKER_NAME pruned after disappearance" \
-    $(( SCENARIO_INTERVAL_S * 4 )) -- engagement_row_pruned
+    "$EMIT_VISIBILITY_BUDGET_S" -- engagement_row_pruned
 
 # ---------------------------------------------------------------------------
 # Diagnostic dump on failure. Cheap when the test passes; precious on

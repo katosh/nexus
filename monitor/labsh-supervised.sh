@@ -135,29 +135,80 @@ START_GRACE="${LABSH_SVC_START_GRACE:-900}"
 
 log() { echo "[$(date -Is)] labsh-svc: $*"; }
 
-# ── labsh self-heal (incident your-org/other-nexus#103) ────────────────────
-# labsh's runtime lives at ~/.local/lib/labsh/bin/labsh, reached via a thin
-# shim at ~/.local/bin/labsh. Per the sandbox bwrap mounts, ~/.local/bin is
-# bind-mounted (persistent) but ~/.local/lib rides the ephemeral --tmpfs HOME
-# overlay: a HOME-overlay reset wipes the lib target (binary + uv venv) and
-# leaves the persistent shim dangling. The running server survives in memory
-# until a node crunch kills it; every restart then fails rc=127 (missing
-# binary), so the watchdog cannot recover and flaps to the auto-restart
-# ceiling with no way out. These helpers detect the dangling/rc=127 condition
-# and reinstall the pinned release from the in-repo labsh source ONCE per start
-# cycle, so the watcher's auto-restart heals it with no human. Non-degrading:
-# reinstalls the SAME pinned version via `make install-lib`; never vendors or
-# bumps labsh. Reversible: `git revert` this commit removes only the self-heal.
+# ── labsh self-heal (incident your-org/other-nexus#103, extended) ──────────
+# labsh's runtime (binary + helper venv) and its shim can both disappear from
+# under the running supervisor. The #103 fix targeted the FIRST of two disjoint
+# wipe surfaces; this extension covers the second.
+#
+#   * dangling-shim wipe (#103):
+#     shim ~/.local/bin/labsh persists (bind-mounted from outside the sandbox)
+#     while lib target ~/.local/lib/labsh/bin/labsh rides the ephemeral
+#     --tmpfs HOME overlay and gets wiped on every sandbox restart.
+#     `labsh_dangling` catches this; `reinstall_labsh` used to write into
+#     ~/.local/lib via `make install-lib`.
+#   * shim-missing wipe (this fix):
+#     if the outside operator's ~/.local/bin/labsh is itself gone (never
+#     installed there, removed by a ~/.local cleanup between sandbox runs, or
+#     ~/.local shadowed at bwrap-mount time), `command -v labsh` returns
+#     empty at supervisor startup. There is no shim to dangle-detect, and
+#     the pre-#103 hard FATAL then killed the supervisor before any self-heal
+#     could run. Additionally, ~/.local/bin AND ~/.local/lib are both
+#     read-only from inside this sandbox (bwrap --ro-bind on ~/.local/bin, no
+#     writable overlay on ~/.local/lib), so `make install-lib` cannot repair
+#     either surface from in-sandbox — the #103 heal target itself is unreachable.
+#
+# `reinstall_labsh` therefore installs into $NEXUS_LOCALS/{bin,lib}/labsh
+# instead of ~/.local — the nexus-managed tool tree that is
+# WRITABLE from inside the sandbox, PERSISTENT across restarts (lives on
+# /shared, not $HOME), and already on PATH via monitor/locals-env.sh (which
+# this wrapper sources up top). Ephemeral-HOME wipes cannot touch it, so a
+# healed labsh survives the next sandbox restart without re-healing.
+#
+# We also force-front $NEXUS_LOCALS/bin in PATH so a stale dangling shim
+# lingering in ~/.local/bin (from a previous outside-sandbox install) cannot
+# shadow the fresh nexus copy — the sandbox typically has ~/.local/bin ahead
+# of $NEXUS_LOCALS/bin in PATH, and locals-env.sh's idempotent prepend is a
+# no-op when locals/bin already appears anywhere in PATH.
+#
+# Same #103 contract: non-degrading (reinstalls the SAME pinned source; never
+# vendors or bumps labsh), reversible (git revert of this commit removes only
+# the self-heal), loop-guarded (at most one reinstall attempt per start cycle).
 
 # NEXUS_ROOT = the parent of monitor/ (this wrapper is $NEXUS_ROOT/monitor/…).
 # locals-env.sh resolves but does not export it, so derive it from SCRIPT_DIR.
 NEXUS_ROOT=$(cd "$SCRIPT_DIR/.." 2>/dev/null && pwd)
+NEXUS_LOCALS_DIR="${NEXUS_LOCALS:-$NEXUS_ROOT/locals}"
 
-# First labsh source tree (a operator/labsh checkout whose Makefile has an
-# install-lib target) among the operator's known locations. repos/labsh is
-# where this operator's manual clone + the incident recovery lived; work/labsh
-# is where monitor/install-labsh.sh clones, so it is the portable default for
-# operators without a repos/labsh. Prints the path; empty (rc 1) if none found.
+# Force-front NEXUS_LOCALS/bin so a stale ~/.local/bin/labsh shim (bind-mounted
+# read-only from outside the sandbox and pointing at a wiped ~/.local/lib
+# target) cannot shadow the fresh nexus install. locals-env.sh's own prepend
+# is idempotent — it no-ops when NEXUS_LOCALS/bin is already anywhere in PATH,
+# even if buried behind ~/.local/bin. This re-assertion is scoped to the
+# supervisor process; it does not leak into the operator's shells. Called
+# again by reinstall_labsh() after a fresh install so a first-time-created
+# NEXUS_LOCALS/bin (absent at supervisor startup) still front-loads.
+front_locals_bin() {
+    [[ -d "$NEXUS_LOCALS_DIR/bin" ]] || return 0
+    case ":$PATH:" in
+        ":$NEXUS_LOCALS_DIR/bin:"*) : ;;   # already at front
+        *)
+            local pruned=":${PATH}:"
+            pruned="${pruned//:$NEXUS_LOCALS_DIR\/bin:/:}"
+            pruned="${pruned#:}"
+            pruned="${pruned%:}"
+            export PATH="$NEXUS_LOCALS_DIR/bin:$pruned"
+            ;;
+    esac
+    hash -r 2>/dev/null || true
+}
+front_locals_bin
+
+# First labsh source tree (a katosh/labsh checkout whose Makefile has the
+# install-lib target we replay inline) among the operator's known locations.
+# repos/labsh is where this operator's manual clone + the incident recovery
+# lived; work/labsh is where monitor/install-labsh.sh clones, so it is the
+# portable default for operators without a repos/labsh. Prints the path;
+# empty (rc 1) if none found.
 labsh_src_dir() {
     local d
     for d in "$NEXUS_ROOT/repos/labsh" \
@@ -171,15 +222,19 @@ labsh_src_dir() {
     return 1
 }
 
-# Resolve the lib target the `labsh` shim execs to (the ~/.local/lib/labsh/bin
-# path). Empty when labsh is not a thin exec-shim (e.g. a brew-installed real
-# binary) — in that case we never second-guess its presence.
+# Resolve the lib target the `labsh` shim execs to (an ~/.local/lib/labsh/bin
+# or $NEXUS_LOCALS/lib/labsh/bin path). Empty when labsh is not a thin
+# exec-shim (e.g. a brew-installed real binary) — in that case we never
+# second-guess its presence.
 labsh_lib_target() {
     local shim
     shim=$(command -v labsh 2>/dev/null) || return 1
     [[ -r "$shim" ]] || return 1
     sed -nE 's/^[[:space:]]*exec[[:space:]]+"?([^"[:space:]]+)"?.*/\1/p' "$shim" | head -1
 }
+
+# True iff labsh is entirely absent from PATH (no shim, no binary).
+labsh_missing() { ! command -v labsh >/dev/null 2>&1; }
 
 # True iff labsh is a DANGLING shim: the shim resolves on PATH but the lib
 # target it execs is gone (the #103 wipe). A non-shim labsh (no parseable
@@ -190,9 +245,18 @@ labsh_dangling() {
     [[ -n "$tgt" && ! -x "$tgt" ]]
 }
 
-# Reinstall the pinned labsh from source via `make install-lib`. Guarded to at
-# most one attempt per start cycle (REINSTALL_ATTEMPTED, reset in start_server)
-# so a persistently-failing reinstall can never spin. Returns 0 on success.
+# True iff labsh needs a self-heal reinstall this cycle — either entirely
+# missing or a dangling shim. Distinct from labsh_dangling so start_server can
+# still log the two conditions separately.
+labsh_needs_install() { labsh_missing || labsh_dangling; }
+
+# Reinstall the pinned labsh from source into $NEXUS_LOCALS/{bin,lib}/labsh.
+# Replays the Makefile's install-lib + install-bin targets inline so the
+# destination is nexus-controlled (writable from inside the sandbox, on PATH,
+# persistent across HOME overlay resets) rather than the ~/.local prefix the
+# Makefile bakes in via PREFIX. Guarded to at most one attempt per start
+# cycle (REINSTALL_ATTEMPTED, reset in start_server) so a persistently-failing
+# reinstall can never spin. Returns 0 on success.
 REINSTALL_ATTEMPTED=0
 reinstall_labsh() {
     if (( REINSTALL_ATTEMPTED )); then
@@ -200,24 +264,51 @@ reinstall_labsh() {
         return 1
     fi
     REINSTALL_ATTEMPTED=1
-    local src out rc _l
+    local src out rc _l lib bin
     src=$(labsh_src_dir) || {
         log "ERROR: cannot self-heal labsh — no labsh source tree found (looked under $NEXUS_ROOT/repos/labsh, work/labsh)"
         return 1
     }
-    log "self-heal: reinstalling labsh from $src (make install-lib)"
-    out=$(make -C "$src" install-lib 2>&1); rc=$?
-    while IFS= read -r _l; do [[ -n "$_l" ]] && log "  install-lib: $_l"; done <<<"$out"
-    if (( rc == 0 )); then
-        log "self-heal: labsh reinstall OK ($(command -v labsh 2>/dev/null))"
+    lib="$NEXUS_LOCALS_DIR/lib/labsh"
+    bin="$NEXUS_LOCALS_DIR/bin"
+    log "self-heal: reinstalling labsh from $src into $NEXUS_LOCALS_DIR (bin+lib)"
+    out=$(
+        set -e
+        install -d "$lib/bin" "$bin"
+        install -m 755 "$src/bin/labsh"           "$lib/bin/labsh"
+        install -m 755 "$src/bin/_labsh_kernel.py" "$lib/bin/_labsh_kernel.py"
+        install -m 644 "$src/VERSION"             "$lib/VERSION"
+        # Shim mirrors the Makefile's install-bin: exec into the lib target so
+        # SCRIPT_DIR resolves to $lib/bin, independent of how the shim was found.
+        printf '#!/bin/sh\nexec "%s/bin/labsh" "$@"\n' "$lib" > "$bin/labsh"
+        chmod 755 "$bin/labsh"
+    ) 2>&1
+    rc=$?
+    while IFS= read -r _l; do [[ -n "$_l" ]] && log "  install: $_l"; done <<<"$out"
+    # Ensure the freshly-created $NEXUS_LOCALS/bin fronts PATH — supervisor
+    # startup may have skipped that when the dir did not yet exist.
+    front_locals_bin
+    if (( rc == 0 )) && command -v labsh >/dev/null 2>&1; then
+        log "self-heal: labsh reinstall OK ($(command -v labsh))"
         return 0
     fi
-    log "ERROR: self-heal labsh reinstall FAILED rc=$rc (make -C $src install-lib)"
+    log "ERROR: self-heal labsh reinstall FAILED rc=$rc"
     return 1
 }
 
+# If labsh isn't on PATH at supervisor startup, try the self-heal ONCE before
+# FATAL'ing. Covers the shim-missing wipe (see block comment above) — the
+# pre-#103 hard FATAL here killed the supervisor before the pre-start
+# dangle-check in start_server got a chance to run, so a missing shim was
+# unrecoverable without a human. Post-heal, re-check PATH so a self-heal that
+# claimed success but did not actually produce a callable labsh still fails
+# loud instead of silently proceeding to a broken start_server.
+if labsh_missing; then
+    log "labsh not on PATH — self-healing before supervisor start (extends your-org/other-nexus#103)"
+    reinstall_labsh || true
+fi
 command -v labsh >/dev/null 2>&1 || {
-    log "FATAL: labsh not on PATH — install via 'brew install operator/tools/labsh' or monitor/install-labsh.sh"
+    log "FATAL: labsh not on PATH — self-heal did not produce a callable binary; install via 'brew install katosh/tools/labsh' or monitor/install-labsh.sh"
     exit 1
 }
 
@@ -279,7 +370,8 @@ reap_port_orphan() {
     while IFS= read -r line; do
         pid=$(grep -oE 'pid=[0-9]+' <<<"$line" | head -1 | cut -d= -f2)
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
-        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+        # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+        cmd=$( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null )
         case "$cmd" in
             *jupyter*)
                 log "reaping orphan jupyter (pid $pid) squatting port $port before start"
@@ -496,10 +588,15 @@ _start_cycle() {
     reap_port_orphan "$port"
     reap_stale_builds "$port"       # kill unfinished builds holding the uv lock (#33)
     read_opts
-    # Self-heal a wiped labsh binary BEFORE starting (incident #103): if the
-    # persistent shim dangles because the ephemeral-HOME lib target is gone,
-    # reinstall the pinned release so the start below can actually succeed.
-    if labsh_dangling; then
+    # Self-heal a wiped labsh binary BEFORE starting (incident #103, extended):
+    # cover both the persistent-shim-with-missing-lib-target dangle case (#103)
+    # AND the entirely-missing case (shim itself gone after a HOME overlay
+    # reset that leaves no ~/.local/bin/labsh in place). Either way, reinstall
+    # into $NEXUS_LOCALS so the start below can actually succeed.
+    if labsh_missing; then
+        log "labsh not on PATH — self-healing before start (see your-org/other-nexus#103, extended)"
+        reinstall_labsh || true
+    elif labsh_dangling; then
         log "labsh shim dangles (lib target missing) — self-healing before start (see your-org/other-nexus#103)"
         reinstall_labsh || true
     fi

@@ -1,0 +1,74 @@
+# gate-coverage.tsv — what the cc-harness gate COVERS, declared.
+#
+# Read by monitor/cc-harness/gate-coverage.sh; consumed by
+# monitor/cc-harness/gate.sh to print its coverage boundary beside the
+# GREEN/RED verdict (your-org/nexus-code#1261).
+#
+# Columns are TAB-separated:
+#   1 kind          gated | exempt | surface
+#   2 scenario      basename under monitor/watcher/test-integration/
+#   3 pane_states   comma-separated pane-state states this scenario
+#                   ASSERTS, or `-`. Every member must be in
+#                   `monitor/pane-state.sh --states` (checked) and must
+#                   appear as a token in the scenario file (checked, and
+#                   deliberately a PERMISSIVE falsifier — it catches an
+#                   invented claim, it does not verify a true one).
+#   4 delivery      comma-separated delivery transports this scenario
+#                   DRIVES, or `-`. Members must be declared by a
+#                   monitor/harness/*.sh adapter (checked).
+#   5 note          free text. REQUIRED and non-empty for kind=exempt, AND
+#                   for kind=exempt it must additionally carry an OWNER: a
+#                   tracker ref (`#NNNN` / `owner/repo#NNNN`) or an
+#                   `until:YYYY-MM-DD` expiry (your-org/nexus-code#1486).
+#                   An exemption nobody had to justify is an omission with a
+#                   row in front of it — and A REASON IS NOT AN OWNER: this
+#                   file's own `apispoof` row satisfied "has a reason" with a
+#                   sentence CONCEDING that no rationale was on record. Prose
+#                   gives an exemption somewhere to be inherited; a ref or a
+#                   date gives it somewhere to be re-argued. Same predicate as
+#                   the `none` rows in guard-positive-controls.manifest
+#                   (#1482), deliberately one rule rather than two that drift.
+#
+# THE RATCHET: every test-realmodel-*.sh on disk must appear here as
+# `gated` or `exempt`, or the gate REFUSES (exit 2). gate.sh has always
+# warned that "adding the file without adding this line would have
+# reproduced #724 one level down"; this file is what makes that a red
+# rather than a comment.
+#
+# COLUMN 3/4 VALUES SELECT, they do not merely label: a token written here
+# is matched against the derived vocabularies, and an unrecognised one is a
+# refusal, not a note (CLAUDE.md, "a field that SELECTS is not a label").
+#
+# kind	scenario	pane_states	delivery	note
+gated	test-realmodel-idle-busy.sh	idle,busy,absent	-	the base walk: boots idle -> busy during stream -> idle -> absent after kill	monitor/pane-state.sh
+gated	test-realmodel-blocked-question.sh	idle,blocked	-	AskUserQuestion chip-bar overlay classifies blocked	monitor/pane-state.sh
+gated	test-realmodel-autosuggest.sh	idle,autosuggest-only,absent	-	real autosuggest bytes; ghost-vs-typed discrimination and the dead-pid arm	monitor/pane-state.sh
+gated	test-realmodel-overlimit.sh	idle,over-limit	-	rate_limit StopFailure payload shape + notice-text detection (2026-07-14 incident)	monitor/pane-state.sh
+gated	test-realmodel-pretooluse-hook.sh	-	-	hook-contract scenario: PreToolUse payload fields; asserts no pane-state and drives no delivery transport	-
+gated	test-realmodel-vimode.sh	idle,user-typing	-	production editorMode=vim (your-org/nexus-code#724)	monitor/pane-state.sh
+gated	test-realmodel-trust-dialog.sh	idle,blocked	-	structural select-dialog arm; workspace-trust modal must not classify empty (your-org/nexus-code#896)	monitor/pane-state.sh
+gated	test-realmodel-trust-sandboxed-env.sh	idle,blocked	-	canary: CLAUDE_CODE_SANDBOXED=1 keeps an unseeded workdir off the workspace-trust dialog; control arm proves the gate is live (your-org/nexus-code#1334)	monitor/spawn-worker.sh
+exempt	test-realmodel-longjob-wake.sh	-	-	EXISTS AND IS NOT GATED, BY MEASUREMENT. OWNER: your-org/nexus-code#1535. The longjob-watch dispatcher is a plugin monitor, and the host arms plugin monitors only when the GrowthBook rollout flag tengu_amber_sentinel (default FALSE at 2.1.272) is served; under the mock backend the binary is a "third-party provider", GrowthBook is off, the disk cache is not consulted and the flag is the default — measured 2026-09-15: four harness boots with --plugin-dir, trust seeded, telemetry re-enabled and the cache seeded, footer 0 monitor and no ledger every time. So this scenario boots, sees no ledger and SKIPS with that reason; the arming, delivery, mid-turn and three-events-no-re-arm claims are measured by the hermetic REAL-AUTH probes recorded on #1535, and the cc-update GUIDE (2g) carries the by-hand recipe. Re-evaluate the moment the harness can boot first-party auth or a local flag override exists (the shipped build stubs readConfigOverrides/getEnvironmentOverrides to nothing).
+exempt	test-realmodel-apispoof.sh	-	-	EXISTS AND IS NOT GATED. 529-spoof StopFailure -> interrupted -> resume chain. OWNER: your-org/nexus-code#1486 — enrolment was never EVALUATED (the #1261 fix made the omission visible rather than deciding it), so the open question is whether this scenario should be gated, not why it is exempt. Tracked there rather than inherited here; it drives _idle_probe.sh, which no gated scenario reaches.
+exempt	test-realmodel-long-exchange.sh	-	-	EXISTS AND IS NOT GATED. Multi-turn exchange with injected render distortion through the real _idle_probe.sh engagement bookkeeping. OWNER: your-org/nexus-code#1486 — same unevaluated enrolment as apispoof. It is the closest existing scenario to a delivery-path exercise (it send-keys prompts), which is why the delivery gap below is 0/2 rather than partially covered; #1486 asks whether tmux-paste deserves to be a gate scenario given that it is the transport whose failure archived 75 emits in #1477.
+#
+# SURFACE rows (your-org/nexus-code#1344) — the production-surface axis:
+#   1 kind          surface
+#   2 path          repo-relative production file the gate speaks for
+#   3 status        gated     — at least one gated scenario DRIVES it (column 6)
+#                   known-gap — declared so the gap is VISIBLE; no scenario drives it
+#   4 -             (unused; keeps columns aligned)
+#   5 reason        why it is a gap, or what gates it
+# and column 6 of a gated scenario row: comma-separated surfaces it DRIVES
+# (falsified permissively: the basename must appear in the scenario file).
+# Declared, not derived, because a surface has no vocabulary to derive from;
+# the population is the rows below and nothing else, so an env override
+# cannot make a gap disappear.
+surface	monitor/spawn-worker.sh	gated	-	test-realmodel-trust-sandboxed-env.sh drives the CLAUDE_CODE_SANDBOXED=1 canary every launcher this file generates now relies on to stay off the workspace-trust dialog (your-org/nexus-code#1334); the launcher COMPOSITION and the detect-and-recover loop are driven by test-spawn-worker-trust-verify.sh (unit), not through the real binary -- so this row speaks for the flag's semantics, not for the script
+surface	monitor/pane-state.sh	gated	-	every classification scenario asserts pane-state's verdict on real harness bytes (idle/busy/absent, blocked, autosuggest, over-limit, user-typing, trust dialog)
+surface	monitor/longjob-watch.sh	known-gap	-	the dispatcher cannot be armed under the mock backend (GrowthBook off → tengu_amber_sentinel default false, see the exempt test-realmodel-longjob-wake.sh row), so no gated scenario drives it through the real binary; its emit policy, probes, caps and the launch-path arming are driven by test-longjob-watch.sh, test-longjob-plugin-arming.sh and test-pane-state-longjob-discount.sh (unit), and the real-binary wake is measured by hermetic real-auth probes (your-org/nexus-code#1535)
+surface	monitor/paste-followup.sh	known-gap	-	the delivery path: no gated scenario pastes into a real pane; test-realmodel-long-exchange.sh send-keys prompts but is EXEMPT, so this stays 0/2 on the delivery axis too
+surface	monitor/hooks/bash-footgun-guard.sh	known-gap	-	test-realmodel-pretooluse-hook.sh asserts the PreToolUse payload FIELDS the hook reads, not the hook's own verdicts; the guard is driven by test-bash-footgun-guard.sh (unit), never through the real binary
+surface	monitor/send.sh	known-gap	-	no gated scenario drives a delivery transport through the real binary (the delivery axis above reads 0/2 for the same reason)
+surface	monitor/watcher/_idle_probe.sh	known-gap	-	exercised only by EXEMPT scenarios (apispoof, long-exchange); a gated classification scenario stops at pane-state
+surface	monitor/watcher/_unstick.sh	known-gap	-	test-realmodel-trust-dialog.sh mentions it but asserts the pane-state classification of the modal, not an unstick action through the real binary

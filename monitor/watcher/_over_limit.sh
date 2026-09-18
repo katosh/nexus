@@ -227,6 +227,47 @@ _over_limit_observation_drop() {
     if [[ -s "$tmp" ]]; then mv "$tmp" "$path"; else rm -f "$path" "$tmp"; fi
 }
 
+# WHICH LIMIT was hit, per key (your-org/nexus-code#1488). A SIDECAR, for the
+# same reason the observation epoch is one: the state row is EIGHT fields and
+# must stay eight. `unknown` is never stored — an absent row and a stored
+# "unknown" would be two spellings of one fact.
+_over_limit_flavour_path() {
+    printf '%s/over-limit-limit.tsv' "${STATE_DIR:-.}"
+}
+_over_limit_flavour_get() {
+    local key="$1" path
+    path=$(_over_limit_flavour_path)
+    [[ -f "$path" ]] || return 0
+    awk -F'\t' -v k="$key" '$1 == k && $2 != "" { print $2; exit }' "$path"
+}
+_over_limit_flavour_set() {
+    local key="$1" flavour="$2" path tmp
+    [[ -n "$key" && -n "$flavour" && "$flavour" != unknown ]] || return 0
+    path=$(_over_limit_flavour_path)
+    mkdir -p "$(dirname "$path")" 2>/dev/null || true
+    tmp=$(mktemp "${path}.XXXXXX") || return 0
+    [[ -f "$path" ]] && awk -F'\t' -v k="$key" '$1 != k' "$path" > "$tmp"
+    printf '%s\t%s\n' "$key" "$flavour" >> "$tmp"
+    mv "$tmp" "$path"
+}
+_over_limit_flavour_drop() {
+    local key="$1" path tmp
+    [[ -n "$key" ]] || return 0
+    path=$(_over_limit_flavour_path)
+    [[ -f "$path" ]] || return 0
+    tmp=$(mktemp "${path}.XXXXXX") || return 0
+    awk -F'\t' -v k="$key" '$1 != k' "$path" > "$tmp"
+    if [[ -s "$tmp" ]]; then mv "$tmp" "$path"; else rm -f "$path" "$tmp"; fi
+}
+# How a limit is NAMED in prose. `unknown` becomes "usage", never a model name
+# nobody measured: the whole defect was asserting a tier the evidence did not
+# support.
+_over_limit_flavour_label() {
+    local f="${1:-}"
+    if [[ -z "$f" || "$f" == unknown ]]; then printf 'usage'
+    else printf '%s' "${f//_/ }"; fi
+}
+
 # Off-time log (operator ask, your-nexus#275): a human-readable,
 # consolidated record of what the watcher HELD while the orchestrator was
 # over-limit. main.sh appends one line per suppressed emit; the resume
@@ -269,9 +310,17 @@ _over_limit_alert_stamp_path() {
 # that mutes operator communication must announce itself out-of-band. So once
 # a hold outlives MONITOR_OVER_LIMIT_SUPPRESSION_ALERT_SECONDS, escalate
 # through the injected alert channel (main.sh wires `_watcher_alert`: alerts
-# log + watcher log + sandbox-notify), and keep re-announcing at that interval
-# for as long as it continues. Rate-limited via a stamp file so the ~50s emit
-# cadence cannot turn this into a notification storm.
+# log + watcher log + sandbox-notify), then remind on the SLOWER
+# MONITOR_OVER_LIMIT_SUPPRESSION_REMINDER_SECONDS cadence for as long as it
+# continues. Rate-limited via a stamp file so the ~50s emit cadence cannot
+# turn this into a notification storm.
+#
+# This sentence used to say "keep re-announcing at that interval", the
+# pre-19c1e12 single-interval model, while the function immediately below
+# had already been rewritten to one announcement plus slower reminders —
+# the two cadences are the whole point of the split (a 5h hold fired 20
+# critical-class bells when they were one). Corrected by
+# your-org/nexus-code#976; same class as `#582` finding C.
 _over_limit_record_held() {
     local archive="$1" reason="$2" path ts
     path=$(_over_limit_held_log_path)
@@ -331,6 +380,94 @@ _over_limit_maybe_alert_suppression() {
     fi
     "$_OVER_LIMIT_ALERT_FN" \
         "over-limit hold ${kind}: the orchestrator's emit channel has been suppressed for $(( (now - first_seen) / 60 )) min (${held_n} emits held). The pane is still rendering the over-limit notice — last observed ${since_obs} — so this is a live hold, not a stale stamp; the reset it states is '${token}'. Held emits are archived and summarised on resume: $(_over_limit_held_log_path)."
+}
+
+# ---- liveness sidecar: DEFENCE IN DEPTH against a stale over-limit read ----
+#
+# OWNERSHIP NOTE, so nobody mistakes this for the fix. The classification bug
+# is `pane-state.sh` 1b: it short-circuits to `over-limit` on the hook-written
+# stamp before inspecting the pane at all, and that stamp's only clear is the
+# Stop hook on the next SUCCESSFUL turn — which for a worker mid-turn was
+# measured 20+ minutes away (your-org/nexus-code#1141). That is fixed there,
+# where every consumer reads it. THIS is the belt: pane-state is not the only
+# thing that can hand the watcher a wrong answer, and the wake loop's cost for
+# believing one is measured — 63 held emits in an hour, five windows
+# re-stamped and re-briefed, one resume brief pasted 62 s after the last.
+#
+# The asymmetry this closes: the WAKE path already knows that a pane servicing
+# turns is not suspended — its resumption arm lists busy / working-background /
+# working-self-paced / idle-orphan-async and says so. The DETECTOR never
+# applied the same knowledge, so a pane the wake loop had just retired as alive
+# was re-stamped by the very next scan on the same stale signal.
+#
+# `<key>\t<epoch>\t<reason>` — when this pane was last ACTIONED as resumed.
+# It is the mirror of the observation sidecar above: that one records evidence
+# of SUSPENSION and keeps the emit gate shut; this one records that a
+# contradiction was already resolved, and keeps a row from being re-created on
+# the same evidence that produced the resolution. Same substrate discipline — a separate file, so it
+# is invisible to an older watcher reading the eight-column row format.
+_over_limit_liveness_path() {
+    printf '%s/over-limit-liveness.tsv' "${STATE_DIR:-.}"
+}
+
+# `<epoch> <reason>` on stdout, or empty when never noted / file absent.
+_over_limit_liveness_get() {
+    local key="$1" path
+    path=$(_over_limit_liveness_path)
+    [[ -f "$path" ]] || return 0
+    awk -F'\t' -v k="$key" '$1 == k && $2 ~ /^[0-9]+$/ { print $2, $3; exit }' "$path"
+}
+
+_over_limit_liveness_set() {
+    local key_raw="$1" epoch="$2" reason="$3" key path tmp
+    [[ -n "$key_raw" && "$epoch" =~ ^[0-9]+$ ]] || return 0
+    key=$(_over_limit_sanitize_key "$key_raw")
+    path=$(_over_limit_liveness_path)
+    mkdir -p "$(dirname "$path")" 2>/dev/null || true
+    tmp=$(mktemp "${path}.XXXXXX") || return 0
+    [[ -f "$path" ]] && awk -F'\t' -v k="$key" '$1 != k' "$path" > "$tmp"
+    printf '%s\t%s\t%s\n' "$key" "$epoch" "${reason:-alive}" >> "$tmp"
+    mv "$tmp" "$path"
+}
+
+# Is this key inside the post-resume suppression window? Echoes a
+# human-readable reason on stdout when it is.
+#
+# WHY THIS ARM AND NOT A BROADER ONE — the narrowing matters more than the
+# mechanism, and the repo's own suite is what forced it. The first version of
+# this gate also armed on ANY pane observed alive by the scan. That reads as
+# strictly safer and is not: the scan probes every pane every 60 s and panes
+# are alive nearly all the time, so a note would be sitting there at the moment
+# of essentially EVERY genuine suspension, and every hold would start a full
+# grace period late. That is not a narrow cost paid in an edge case — it is the
+# normal path, and it weakens the hold exactly as much as the spam it was
+# meant to stop. `test-over-limit.sh` caught it by failing on a legitimate
+# fresh orchestrator hold.
+#
+# So the arm is only ever set where the watcher has ALREADY ACTED on a
+# contradiction: it pasted a resume brief and retired the row. The turn that
+# brief starts is what clears the underlying stamp, and until that turn ends
+# the same stale signal is still there to be re-read. That is the "one banner
+# instance, one resume" rule — fresh evidence has to mean a NEW suspension, not
+# the scrollback that produced the last one.
+#
+# The residual, stated rather than hidden: a stale read arriving with NO prior
+# resume still stamps once, and the wake loop then pastes one brief before this
+# arm engages. The bound is therefore ONE spurious brief per episode, not zero
+# and not a loop. Closing that last one would need the broad arm, and the
+# paragraph above is why it costs more than it buys.
+_over_limit_liveness_suppressed() {
+    local key="$1" now="$2" note epoch reason window
+    note=$(_over_limit_liveness_get "$key")
+    [[ -n "$note" ]] || return 1
+    read -r epoch reason <<<"$note"
+    [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+    [[ "$reason" == "resumed" ]] || return 1
+    window="${MONITOR_OVER_LIMIT_RESUME_SUPPRESSION_SECONDS:-300}"
+    [[ "$window" =~ ^[0-9]+$ ]] || window=300
+    (( window > 0 )) || return 1
+    (( now - epoch <= window )) || return 1
+    printf '%s %ss ago' "$reason" "$(( now - epoch ))"
 }
 
 _over_limit_sanitize_key() {
@@ -535,7 +672,33 @@ _over_limit_record() {
     # that is when the banner we are re-deriving from was actually observed.
     local anchor_now="$now"
     local existing _
-    if existing=$(_over_limit_load "$key"); then
+    existing=$(_over_limit_load "$key") || existing=""
+    # LIVENESS PRECEDENCE, and note the scope: this gates CREATION of a row,
+    # never the refresh of one that already exists.
+    #
+    # That boundary is the whole reason this cannot weaken the hold. A refresh
+    # is what keeps the observation sidecar fresh through a genuine multi-hour
+    # suspension; blocking it would let the emit gate open mid-hold on
+    # staleness, which is the failure the hold exists to prevent. Re-CREATION
+    # is a different event — it happens only after the row was dropped, i.e.
+    # after this module already concluded the pane had resumed — and it is the
+    # one the measured loop consisted of.
+    #
+    # Suppressing the record deliberately also suppresses the observation
+    # write below, so the emit gate opens rather than staying shut on evidence
+    # we have positive reason to disbelieve. That is this module's stated
+    # polarity: absent evidence of suspension opens the gate, because emitting
+    # into a live pane is cheap and withholding is not.
+    if [[ -z "$existing" ]]; then
+        local _live_reason
+        if _live_reason=$(_over_limit_liveness_suppressed "$key" "$now") \
+            && [[ -n "$_live_reason" ]]; then
+            "$_OVER_LIMIT_LOG_FN" \
+                "over-limit: '${window}' (key=${key}) reads over-limit but was already ${_live_reason}; NOT stamping — one banner instance gets one resume, and the turn that brief started has not ended yet"
+            return 0
+        fi
+    fi
+    if [[ -n "$existing" ]]; then
         local e_token e_reset e_first e_next e_attempts
         IFS=$'\t' read -r _ _ _ e_token e_reset e_first e_next e_attempts <<<"$existing"
         [[ "$e_first" =~ ^[0-9]+$ ]] && first_seen="$e_first"
@@ -649,6 +812,7 @@ _over_limit_drop() {
     # Keep the sidecar in step so it cannot accumulate entries for keys that
     # no longer exist, and so a re-stamped key starts from a fresh observation.
     _over_limit_observation_drop "$key"
+    _over_limit_flavour_drop "$key"
 }
 
 # Probe one pane via pane-state.sh; emit `state reset_at` on stdout
@@ -664,7 +828,7 @@ _over_limit_drop() {
 # hours; the scan cadence is 60s). Fail-open on every cache condition.
 _over_limit_probe_pane() {
     local window_arg="$1" expected_name="${2:-}"
-    local line state reset_at
+    local line state reset_at flavour
     if declare -F _pane_cache_read >/dev/null 2>&1; then
         line=$(_pane_cache_read "$window_arg" "$expected_name") || line=""
     else
@@ -691,8 +855,12 @@ _over_limit_probe_pane() {
     fi
     state=$(printf '%s' "$line" | sed -n 's/.*state=\([a-z-]*\).*/\1/p')
     reset_at=$(printf '%s' "$line" | sed -n 's/.*reset_at=\([^ ]*\).*/\1/p')
+    # WHICH limit, carried alongside (your-org/nexus-code#1488). Absent on a
+    # pane-state that predates the field, which resolves to `unknown` and
+    # renders as "usage" — never as a model tier nobody measured.
+    flavour=$(printf '%s' "$line" | sed -n 's/.*[ ]limit=\([^ ]*\).*/\1/p')
     [[ -n "$state" ]] || return 0
-    printf '%s %s' "$state" "${reset_at:-unknown}"
+    printf '%s %s %s' "$state" "${reset_at:-unknown}" "${flavour:-unknown}"
 }
 
 # Scan the orchestrator pane + every worker pane. Stamp any returning
@@ -702,7 +870,7 @@ _over_limit_probe_pane() {
 # `orchestrator` / `monitor` + registry services) stays in one place.
 _over_limit_scan_panes() {
     local target="${1:?target window required}"
-    local probe state reset_at
+    local probe state reset_at flavour
     # Orchestrator pane: name-targeted lookup. tmux's send-keys et al.
     # accept the window NAME, so pane-state.sh — which expects an
     # index or `session:window` — needs the index resolved first.
@@ -716,10 +884,11 @@ _over_limit_scan_panes() {
     if [[ -n "$orch_index" ]]; then
         probe=$(_over_limit_probe_pane "$orch_index" "$target")
         if [[ -n "$probe" ]]; then
-            read -r state reset_at <<<"$probe"
+            read -r state reset_at flavour <<<"$probe"
             if [[ "$state" == "over-limit" ]]; then
                 _over_limit_record "_orchestrator" "$target" \
                     "orchestrator" "$reset_at"
+                _over_limit_flavour_set "_orchestrator" "${flavour:-}"
             else
                 _over_limit_reconcile_alive "_orchestrator" "$state"
             fi
@@ -735,9 +904,10 @@ _over_limit_scan_panes() {
             local probe_target="${window_index:-$name}"
             probe=$(_over_limit_probe_pane "$probe_target" "$name")
             [[ -n "$probe" ]] || continue
-            read -r state reset_at <<<"$probe"
+            read -r state reset_at flavour <<<"$probe"
             if [[ "$state" == "over-limit" ]]; then
                 _over_limit_record "$name" "$name" "worker" "$reset_at"
+                _over_limit_flavour_set "$(_over_limit_sanitize_key "$name")" "${flavour:-}"
             else
                 _over_limit_reconcile_alive "$name" "$state"
             fi
@@ -909,15 +1079,33 @@ _over_limit_compose_resume_brief() {
 # Build the worker-side wake brief. Workers carry their own
 # conversation context; a terse "resume" suffices.
 _over_limit_compose_worker_brief() {
-    local token="$1" pretty
+    local token="$1" flavour="${2:-}" pretty label
     # Same first-underscore-only split as the orchestrator brief.
     if [[ "$token" == *_* ]]; then
         pretty="${token%%_*} (${token#*_})"
     else
         pretty="$token"
     fi
+    label=$(_over_limit_flavour_label "$flavour")
     {
-        printf 'Watcher resume: weekly Opus limit reset (%s). You can continue the work you had in flight before suspension.\n' "$pretty"
+        # AN UNKNOWN RESET IS A PROBE, NOT A RESET (your-org/nexus-code#1488).
+        # This line used to read "weekly Opus limit reset (unknown)" — it
+        # asserted a reset in the same sentence that admitted the time was
+        # unknown, and it named a model tier nobody had measured. Both halves
+        # were wrong for the worker it was pasted into: the limit was FABLE and
+        # the reset time was never established, so the worker was refused again
+        # on arrival (2 pastes, 3 rejections).
+        #
+        # The wake paste is legitimately a PROBE — the fail-open design says so
+        # in _over_limit_bump_or_failopen: "if the limit genuinely reset the
+        # pasted brief lands; if it is truly still limited, the turn fails".
+        # The wording now says what the mechanism does, so a recipient who is
+        # STILL limited is not told they are not.
+        if [[ -z "$token" || "$token" == unknown ]]; then
+            printf 'Watcher probe: your %s limit MAY have reset — the watcher could not establish a reset time from your pane, so this is a PROBE, not a statement that you are back. If you can act, continue the work you had in flight. If you are still limited, ignore this; the refusal re-stamps the hold with the current reset time.\n' "$label"
+        else
+            printf 'Watcher resume: your %s limit was reported to reset at %s. If you can act, continue the work you had in flight before suspension. If you are still refused, ignore this — the refusal re-stamps the hold.\n' "$label" "$pretty"
+        fi
     }
 }
 
@@ -950,7 +1138,7 @@ _over_limit_failopen() {
         _over_limit_compose_resume_brief \
             "$token" "$duration" "$(_over_limit_worker_summary)" "$first_seen" > "$body"
     else
-        _over_limit_compose_worker_brief "$token" > "$body"
+        _over_limit_compose_worker_brief "$token" "$(_over_limit_flavour_get "$key")" > "$body"
         _machine_input_stamp "$window" "over-limit-wake"
     fi
     "$_OVER_LIMIT_PASTE_FN" "$window" "$body" || true
@@ -1058,7 +1246,7 @@ _over_limit_evaluate_row() {
         return 0
     fi
 
-    local probe state reset_at
+    local probe state reset_at flavour
     probe=$(_over_limit_probe_pane "$probe_target")
     if [[ -z "$probe" ]]; then
         "$_OVER_LIMIT_LOG_FN" \
@@ -1068,7 +1256,7 @@ _over_limit_evaluate_row() {
             "$reset_epoch" "$first_seen" "$attempts" "$now"
         return 0
     fi
-    read -r state reset_at <<<"$probe"
+    read -r state reset_at flavour <<<"$probe"
 
     case "$state" in
         over-limit)
@@ -1124,6 +1312,13 @@ _over_limit_evaluate_row() {
             if "$_OVER_LIMIT_PASTE_FN" "$window" "$body"; then
                 "$_OVER_LIMIT_LOG_FN" \
                     "over-limit: '${window}' resumed (suspended ${duration}s); resume brief pasted"
+                # ONE BANNER INSTANCE, ONE RESUME. Armed here and NOT in
+                # _over_limit_failopen: the fail-open paste happens while the
+                # pane still reads over-limit, so no liveness was observed and
+                # nothing has earned a suppression — re-stamping immediately is
+                # correct there, and is how the gate re-closes after a paste
+                # into a pane that never actually came back.
+                _over_limit_liveness_set "$key" "$now" "resumed"
                 _over_limit_drop "$key"
             else
                 "$_OVER_LIMIT_LOG_FN" \

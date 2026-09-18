@@ -232,8 +232,11 @@ _watcher_pid_is_live_watcher() {
     if [[ -r "/proc/$pid/cmdline" ]]; then
         # cmdline is NUL-delimited; read each argument as an element.
         local arg
-        while IFS= read -r -d '' arg; do argv+=("$arg"); done \
-            < "/proc/$pid/cmdline" 2>/dev/null
+        # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+        # The `-r` test above narrows the window; it does not close it, because
+        # the pid can exit between the test and the read.
+        { while IFS= read -r -d '' arg; do argv+=("$arg"); done \
+            < "/proc/$pid/cmdline"; } 2>/dev/null
     elif command -v ps >/dev/null 2>&1; then
         # ps space-joins argv (we lose exact tokenisation, but ps is
         # only the non-Linux fallback). Word-split on whitespace.
@@ -1483,8 +1486,26 @@ _nexus_fs_evidence() {
     printf 'project_dir=%s\n' "${project:-unset}"
 
     # Filer capacity — proves this is not an ENOSPC / storage outage.
-    local dfline
-    if dfline=$(df -Ph "$path" 2>/dev/null | tail -1); then
+    #
+    # Capture `df`'s OWN status, never the pipeline's. `if dfout=$(df … |
+    # tail -1)` reads `tail`'s status, and `tail` essentially always
+    # succeeds — so on a failing `df` the success arm ran with an EMPTY
+    # dfline and printed `fs_source=` / `fs_avail=` (blank), which a reader
+    # cannot tell from a filer that answered. This file is deliberately
+    # side-effect-free and sets no shell options of its own (see the header),
+    # so the status must be CAPTURED rather than the option changed. See
+    # your-org/nexus-code#1056, and #928 for the class.
+    #
+    # The option is named here only by description, never by its literal
+    # token: `early-exit-readers.sh`'s axis predicate greps whole files for
+    # that string with no comment stripping, so a COMMENT saying this file
+    # does not set it enrols the file onto the axis. Measured — see the
+    # follow-up issue filed with #1056.
+    local dfout dfline=''
+    if dfout=$(df -Ph "$path" 2>/dev/null); then
+        dfline=$(printf '%s\n' "$dfout" | tail -1)
+    fi
+    if [[ -n "$dfline" ]]; then
         printf 'fs_source=%s\n' "$(printf '%s' "$dfline" | awk '{print $1}')"
         printf 'fs_avail=%s\n'  "$(printf '%s' "$dfline" | awk '{print $4" avail of "$2" ("$5" used)"}')"
     else
@@ -2891,7 +2912,8 @@ _nexus_pid_tree_has_env_marker() {
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     local _env_data
     if [[ -r "/proc/$pid/environ" ]]; then
-        _env_data=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) || _env_data=""
+        # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+        _env_data=$( { tr '\0' '\n' < "/proc/$pid/environ"; } 2>/dev/null ) || _env_data=""
         if [[ -n "$_env_data" ]] && grep -qxF "$marker" <<<"$_env_data"; then
             return 0
         fi
@@ -2941,8 +2963,9 @@ _nexus_pid_is_cockpit() {
     [[ -r "/proc/$pid/cmdline" ]] || return 1
     local -a argv=()
     local arg
-    while IFS= read -r -d '' arg; do argv+=("$arg"); done \
-        < "/proc/$pid/cmdline" 2>/dev/null
+    # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+    { while IFS= read -r -d '' arg; do argv+=("$arg"); done \
+        < "/proc/$pid/cmdline"; } 2>/dev/null
     (( ${#argv[@]} >= 1 && ${#argv[@]} <= 2 )) || return 1
     case "${argv[${#argv[@]}-1]}" in
         */svc.sh|svc.sh) return 0 ;;
@@ -2998,7 +3021,8 @@ _nexus_find_live_cockpit_pane() {
 # Does this pid's argv name a Claude Code process?
 _nexus_pid_is_claude() {
     local p="$1" cmd
-    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || return 1
+    # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+    cmd=$( { tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null ) || return 1
     [[ -n "$cmd" && "$cmd" == *claude* ]]
 }
 
@@ -3007,8 +3031,49 @@ _nexus_pid_is_claude() {
 # `_respawn_compose_launcher` writes /tmp/nexus-respawn-launch-XXXXXX.sh and
 # tmux runs it as the pane command; it ends in `exec claude`, so the pane
 # process BECOMES claude. Between `tmux new-window` and that exec the pane is
-# alive and hosts no claude — a ~1.7 s window on this host, dominated by
-# `assert-shims-wrapped.sh` (~2.2 s). Calling that DEAD is a false negative,
+# alive and hosts no claude. Calling that DEAD is a false negative,
+#
+# HOW WIDE THAT WINDOW IS — AND WHY NO NUMBER BELONGS IN THIS COMMENT.
+# It used to read "a ~1.7 s window on this host, dominated by
+# `assert-shims-wrapped.sh` (~2.2 s)" — a whole smaller than the part said
+# to dominate it, which is the tell that neither figure was re-measured
+# together. The real width is not a property of this host at all: it depends
+# on whether the launcher runs with a CONTROLLING TTY, and a tmux pane always
+# does. Measured 2026-09-10 on clusterk87, guard invoked inside a real tmux
+# pane, 1 rep per cell (`monitor/assert-shims-wrapped.sh`, wall clock):
+#
+#   dev b87192b9   respawn shape  42149 ms   worker shape  44092 ms
+#   PR#1498 head    respawn shape   3135 ms   worker shape   3064 ms
+#
+# Pre-#1497, GNU `timeout` puts the probe shell in a BACKGROUND PROCESS GROUP
+# and it then cannot make progress against the controlling terminal. THE FORM
+# IS SHELL-DEPENDENT and the difference decides whether the bound works at all
+# (measured 2026-09-10 under a pty on this host, from /proc/<pid>/status):
+#
+#   zsh 5.4.2  -lic : SPINS. stat=R, pcpu=100, CPU time tracking wall time 1:1
+#                     for the whole bound. SigBlk 0x380000 blocks TSTP/TTIN/
+#                     TTOU, so `tcsetpgrp` errors instead of stopping and zsh
+#                     retries. No handlers installed, so `timeout`'s SIGTERM
+#                     does kill it: 40 s, empty surface, one core pinned.
+#   bash 4.4   -lic : STOPS, and NEVER RETURNS. SigIgn 0x280004 IGNORES SIGTTOU,
+#                     so the stop is SIGTTIN (default disposition). SigCgt has
+#                     bit 14: it CATCHES SIGTERM, which cannot be delivered to a
+#                     stopped process — measured, ShdPnd 0x4000 pending after a
+#                     SIGTERM that did not move it, and SIGCONT only let it
+#                     re-stop. Without `-k` there is NO bound: one such pair was
+#                     observed at 4909 s against a 10 s bound (491x).
+#
+# So SIGKILL — i.e. `timeout -k` — is the only thing that ends the bash case,
+# and `setsid` cures both by removing the controlling terminal. Do not write
+# this up as "SIGTTOU": that was the first account and bash's own SigIgn
+# refutes it. Either way the guard resolves NOTHING — 5 `did not resolve at
+# all (empty)` warnings per run, against 0 post-fix.
+#
+# THE RECOGNITION BELOW IS A NAME MATCH WITH NO TIME BOUND, which is why a
+# 42 s window is survivable here and why this correction changes no
+# behaviour: nothing keys a deadline off the figure that was wrong. Do not
+# reintroduce one. If you need a number, re-measure it — and say which tree
+# and whether there was a tty, because without both it is not a measurement.
 # and the trigger is CORRELATED rather than random: the operator reaches for
 # `./watcher` precisely when the orchestrator has just died, which is precisely
 # when the watcher is respawning it. Recognising the launcher closes the window
@@ -3016,7 +3081,8 @@ _nexus_pid_is_claude() {
 # launcher is running" and "claude is running".
 _nexus_pid_is_spawning_agent() {
     local p="$1" cmd
-    cmd=$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null) || return 1
+    # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+    cmd=$( { tr '\0' ' ' < "/proc/$p/cmdline"; } 2>/dev/null ) || return 1
     [[ -n "$cmd" && "$cmd" == *nexus-respawn-launch-* ]]
 }
 

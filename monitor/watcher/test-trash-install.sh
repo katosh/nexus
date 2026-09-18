@@ -171,6 +171,27 @@ else
 fi
 
 # ====================================================================
+# --- default root resolves like STATE (your-org/nexus-code#1451) ------------
+# NEXUS_TRASH_DIR -> NEXUS_STATE_DIR/.trash -> NEXUS_ROOT/monitor/.state/.trash
+# -> BASH_SOURCE. It used to skip straight from the override to BASH_SOURCE,
+# so a suite pinning NEXUS_ROOT for the linker still had the linker trash into
+# the CHECKOUT (the band's first LEAK-AT-SOURCE catch). One variable per case.
+echo "--- default trash root resolves NEXUS_TRASH_DIR > NEXUS_STATE_DIR > NEXUS_ROOT > BASH_SOURCE (#1451)"
+G="$WORK/G"; mkdir -p "$G/state" "$G/root/monitor/.state"; echo g > "$G/file"
+check() { if [ "$2" = 0 ]; then ok "$1"; else bad "$1" "resolved to: ${r:-<empty>} / dest: ${dest:-<empty>}"; fi; }
+r=$(env -u NEXUS_TRASH_DIR NEXUS_STATE_DIR="$G/state" NEXUS_ROOT="$G/root" bash -c '. "$1"; _trash_default_root' _ "$TRASH_SRC")
+check "NEXUS_STATE_DIR set -> \$NEXUS_STATE_DIR/.trash (root ignored)" "$([ "$r" = "$G/state/.trash" ] && echo 0 || echo 1)"
+r=$(env -u NEXUS_TRASH_DIR -u NEXUS_STATE_DIR NEXUS_ROOT="$G/root" bash -c '. "$1"; _trash_default_root' _ "$TRASH_SRC")
+check "NEXUS_STATE_DIR unset -> \$NEXUS_ROOT/monitor/.state/.trash" "$([ "$r" = "$G/root/monitor/.state/.trash" ] && echo 0 || echo 1)"
+r=$(env NEXUS_TRASH_DIR="$G/explicit" NEXUS_STATE_DIR="$G/state" NEXUS_ROOT="$G/root" bash -c '. "$1"; _trash_default_root' _ "$TRASH_SRC")
+check "an explicit NEXUS_TRASH_DIR still wins over both" "$([ "$r" = "$G/explicit" ] && echo 0 || echo 1)"
+r=$(env -u NEXUS_TRASH_DIR -u NEXUS_STATE_DIR -u NEXUS_ROOT bash -c '. "$1"; _trash_default_root' _ "$TRASH_SRC")
+check "with neither set -> the BASH_SOURCE root (the pre-#1451 default, kept as the LAST arm)" "$([ "$r" = "$(cd "$(dirname "$TRASH_SRC")/.." && pwd)/monitor/.state/.trash" ] && echo 0 || echo 1)"
+# …and the resolved root is where `trash` actually MOVES the target.
+dest=$(env -u NEXUS_TRASH_DIR NEXUS_STATE_DIR="$G/state" NEXUS_ROOT="$G/root" bash "$TRASH_SRC" trash "$G/file")
+check "trash with NEXUS_STATE_DIR pinned lands under the pin" "$([ -n "$dest" ] && [ "${dest#"$G/state/.trash/"}" != "$dest" ] && [ -f "$dest" ] && echo 0 || echo 1)"
+check "…and NOT under NEXUS_ROOT/monitor/.state" "$([ -z "$(ls -A "$G/root/monitor/.state" 2>/dev/null)" ] && echo 0 || echo 1)"
+
 echo
 echo "=== PART B: install-claude-local.sh wiring ==="
 # ====================================================================

@@ -28,8 +28,8 @@
 # Comment ids and issue ids share GitHub's monotonic int sequence per
 # table but not across tables; we keep one shared cursor because the
 # only purpose is "have we seen something newer than X" — false
-# negatives (we re-evaluate an item) are caught by the
-# `processed-comments.txt` dedup that follows. False positives
+# negatives (we re-evaluate an item) are caught by the reaction filter
+# that follows (a handled item carries the bot's 👀/🚀). False positives
 # (skipping an item we should have surfaced) are bounded by GitHub's
 # id monotonicity, which holds within each table; cross-table mismatch
 # can't manufacture an id higher than something the table actually
@@ -51,14 +51,20 @@
 #   2. Body contains `@USER_LOGIN` with word boundaries.
 #   3. databaseId > cursor (cheap optimization — caps walk size after
 #      a long stretch of no signal).
-#   4. Not in `processed-comments.txt` under the `mention:<id>` (or
-#      `mention:issue:<n>` for body matches) prefix. Distinct prefix
-#      from the `comment:` / `issue:` keys used by `snapshot_github`
-#      and the deliveries path so the same id surfaced via two sources
-#      doesn't collide on a confusing key.
-#   5. No ROCKET reaction; no EYES reaction by anyone other than
+#   4. No ROCKET reaction; no EYES reaction by anyone other than
 #      USER_LOGIN. Identical to `snapshot_github`'s filter — keeps the
 #      surface uniform for downstream `ng process`.
+#
+# There is deliberately NO processed-comments.txt condition here
+# (your-org/nexus-code#1509). One used to be documented — "not under the
+# `mention:<id>` / `mention:issue:<n>` prefix" — and NOTHING EVER WROTE
+# THAT PREFIX: `ng`'s `_mark_processed` accepts only `comment|issue|rocket`
+# and no other writer exists (0 of 1253 live rows at `4f73e0e7`, positive
+# control `_emit_filters.sh:491` for `comment:`). A documented guard that
+# cannot fire is worse than none, because it gets relied on in reasoning
+# (#1509's own filer did). The live reaction filter above is the whole
+# dedup; a handled mention is suppressed by the bot's 👀 (eyes-ack), not by
+# a cache key.
 #
 # Author filter: NOT enforced here. `_filter_to_user_author` downstream
 # is the single chokepoint (issue #86). In practice this path emits
@@ -104,10 +110,6 @@ snapshot_mentions() {
         echo "snapshot_mentions: USER_LOGIN unset; skipping cycle" >&2
         return 0
     }
-
-    local processed_file="${STATE_DIR}/processed-comments.txt"
-    local processed_content=""
-    [[ -f "$processed_file" ]] && processed_content=$(<"$processed_file")
 
     # Bot-installed repos cache. Newline-separated `owner/repo`. Empty
     # string is fine — every repo will be eligible (modulo the $REPO
@@ -196,7 +198,7 @@ snapshot_mentions() {
     # operator (here the handle and the self login coincide).
     local extracted
     extracted=$(_mention_walk "$raw" "$USER_LOGIN" "$USER_LOGIN" \
-                              "skip" "mention" "$cursor" "$bot_repos" "$processed_content")
+                              "skip" "$cursor" "$bot_repos")
     [[ -n "$extracted" ]] || return 0
 
     _mention_emit_loop "cross_repo" "$cursor" "$cursor_file" <<<"$extracted"
@@ -260,7 +262,7 @@ _bot_installed_repos_cache() {
 # their repo scope (skip-installed vs keep-installed), and their emit
 # vocabulary (`cross_repo=` vs `mention=`). EVERYTHING else — the
 # word-boundary mention regex, the ROCKET/non-self-EYES suppression, the
-# cursor short-circuit, the processed-comments dedup, the body+comment
+# cursor short-circuit, the body+comment
 # emit shape, the 400-char body preview, and the cursor advance — is
 # identical and lives here ONCE. A fix to the regex / reaction rule /
 # dedup logic now lands in a single place instead of two (the redundancy
@@ -268,8 +270,13 @@ _bot_installed_repos_cache() {
 
 # Walk a GraphQL `search` response and emit one compact-JSON candidate
 # per eligible mention. Reads $1 (raw JSON) on a here-string; writes the
-# candidate objects to stdout. All four divergent axes are arguments so
-# the body is shared verbatim between both callers.
+# candidate objects to stdout. All divergent axes are arguments so the
+# body is shared verbatim between both callers.
+#
+# Dedup is the reaction filter and the cursor, nothing else. A
+# processed-comments.txt lookup under a per-caller prefix
+# (`mention:` / `botmention:`) used to sit in this walk and was inert —
+# no writer for either prefix ever existed (your-org/nexus-code#1509).
 #
 # Args:
 #   $1 raw         raw GraphQL JSON ({ data: { search: { nodes: [...] } } })
@@ -277,23 +284,18 @@ _bot_installed_repos_cache() {
 #   $3 self_login  the login whose EYES reaction does NOT block — always
 #                  the OPERATOR (USER_LOGIN); their own 👀 isn't a veto
 #   $4 scope       "skip" → drop installed repos; "keep" → only installed
-#   $5 prefix      processed-comments dedup namespace ("mention"|"botmention")
-#   $6 cursor      integer databaseId floor (items <= it were seen already)
-#   $7 bot_repos   newline-separated installed `owner/repo` cache
-#   $8 processed   processed-comments.txt content
+#   $5 cursor      integer databaseId floor (items <= it were seen already)
+#   $6 bot_repos   newline-separated installed `owner/repo` cache
 _mention_walk() {
-    local raw="$1" handle="$2" self_login="$3" scope="$4" prefix="$5"
-    local cursor="$6" bot_repos="$7" processed="$8"
+    local raw="$1" handle="$2" self_login="$3" scope="$4"
+    local cursor="$5" bot_repos="$6"
     jq -c --arg handle "$handle" \
           --arg repo "$REPO" \
           --arg bot_repos "$bot_repos" \
           --arg self "$self_login" \
           --arg scope "$scope" \
-          --arg pfx "$prefix" \
-          --arg processed "$processed" \
           --argjson cursor "$cursor" '
         ($bot_repos | split("\n") | map(select(. != ""))) as $bots
-        | ($processed | split("\n") | map(select(. != ""))) as $proc
         | def mention_re: "(^|[^[:alnum:]_])@" + $handle + "([^[:alnum:]_-]|$)";
           def has_mention(s): ((s // "") | test(mention_re; "i"));
           def has_blocking_reaction(rs):
@@ -318,7 +320,6 @@ _mention_walk() {
             (
               if has_mention($node.body)
                  and (($node.databaseId // 0) > $cursor)
-                 and (($proc | index($pfx + ":issue:" + ($node.number|tostring))) | not)
                  and (has_blocking_reaction($node.reactions.nodes) | not)
               then
                 { src: "body", repo: $r, kind: $kind,
@@ -332,7 +333,6 @@ _mention_walk() {
               | . as $c
               | select(($c.databaseId // 0) > $cursor)
               | select(has_mention($c.body))
-              | select(($proc | index($pfx + ":" + ($c.databaseId | tostring))) | not)
               | select(has_blocking_reaction($c.reactions.nodes) | not)
               | { src: "comment", repo: $r, kind: $kind,
                   n: ($node.number | tostring), id: ($c.databaseId | tostring),
@@ -453,11 +453,11 @@ _mention_emit_loop() {
 #
 # Cursor file: monitor/.state/last-bot-mention-cursor.txt (independent of
 # the user-mention cursor). Same monotonic-databaseId semantics as
-# snapshot_mentions. Dedup prefix: `botmention:<id>` (comment) /
-# `botmention:issue:<n>` (body) — distinct from the `mention:` /
-# `comment:` / `issue:` keys used by the other sources so the same id
-# surfaced via two sources doesn't collide on a confusing key; the
-# cross-source `_dedup_emit_lines` still collapses the duplicate `id=`.
+# snapshot_mentions. No processed-comments.txt dedup: the documented
+# `botmention:<id>` / `botmention:issue:<n>` prefix had no writer, like the
+# user path's `mention:` prefix (your-org/nexus-code#1509) — the reaction
+# filter in `_mention_walk` is the dedup, and the cross-source
+# `_dedup_emit_lines` still collapses a duplicate `id=`.
 #
 # Line shape (folds into the deliveries `mention=` vocabulary):
 #   mention=<owner>/<repo> kind=<issue|pr> n=<n> id=<id> author=<login> [src=body]
@@ -481,10 +481,6 @@ snapshot_bot_mentions() {
         cursor=$(<"$cursor_file")
         [[ "$cursor" =~ ^[0-9]+$ ]] || cursor=0
     fi
-
-    local processed_file="${STATE_DIR}/processed-comments.txt"
-    local processed_content=""
-    [[ -f "$processed_file" ]] && processed_content=$(<"$processed_file")
 
     # Installed-repos cache. We KEEP only repos in this list (the inverse
     # of snapshot_mentions, which skips them) — the bot can only act where
@@ -570,7 +566,7 @@ snapshot_bot_mentions() {
     # @bot-mention shouldn't veto it.
     local extracted
     extracted=$(_mention_walk "$raw" "$bot_slug" "${USER_LOGIN:-}" \
-                              "keep" "botmention" "$cursor" "$bot_repos" "$processed_content")
+                              "keep" "$cursor" "$bot_repos")
     [[ -n "$extracted" ]] || return 0
 
     _mention_emit_loop "mention" "$cursor" "$cursor_file" <<<"$extracted"

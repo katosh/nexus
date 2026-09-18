@@ -115,6 +115,20 @@ else
             _gw_cand_rp=$(_gw_rp "$_gw_cand" 2>/dev/null || true)
             [ "$_gw_cand_rp" = "$_gw_self_rp" ] && continue
         fi
+        # #1033: this degraded arm reproduces the pre-#755 IDENTITY resolution,
+        # so it also reproduces its blindness to a SECOND WRAPPER COPY (a
+        # different inode at a different path passes every gate above). Without
+        # this, the fallback for "gh-capable.sh is missing" is a fork bomb.
+        case "$_gw_cand" in */ghwrap/gh) continue ;; esac
+        IFS= read -r -N 2 _gw_magic < "$_gw_cand" 2>/dev/null || _gw_magic=""
+        if [ "$_gw_magic" = '#!' ]; then
+            _gw_isw=0; _gw_scan=0
+            while [ "$_gw_scan" -lt 40 ] && IFS= read -r _gw_line; do
+                case "$_gw_line" in *monitor/ghwrap/gh*) _gw_isw=1; break ;; esac
+                _gw_scan=$((_gw_scan + 1))
+            done < "$_gw_cand"
+            [ "$_gw_isw" = 1 ] && continue
+        fi
         _gw_real="$_gw_cand"
         break
     done

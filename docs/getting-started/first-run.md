@@ -57,7 +57,7 @@ The dashboard rendered into the overview issue body sits between two markers:
 <!-- NEXUS_DASHBOARD_END -->
 ```
 
-The six required sections (`ng dashboard validate` exits 1 if any is missing): **`## Identity`**, **`## Infra`**, **`## Services`**, **`## In-flight`**, **`## Awaiting operator`**, **`## Recent landings`**. `monitor/ng dashboard scaffold` writes them for you. On a brand-new nexus the body looks sparse; that's expected.
+The six required sections (`ng dashboard validate` exits 1 if any is missing **or duplicated**): **`## Identity`**, **`## Infra`**, **`## Services`**, **`## In-flight`**, **`## Awaiting operator`**, **`## Recent landings`**. `monitor/ng dashboard scaffold` writes them for you. On a brand-new nexus the body looks sparse; that's expected.
 
 ## Your first comment
 

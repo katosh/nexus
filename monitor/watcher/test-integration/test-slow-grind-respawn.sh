@@ -169,6 +169,24 @@ for f in "$HARNESS_REPO_ROOT"/monitor/_*.sh; do
     cp "$f" "$HARNESS_DIR/monitor/$(basename "$f")"
 done
 cp "$HARNESS_REPO_ROOT/monitor/reports-roll.sh" "$HARNESS_DIR/monitor/reports-roll.sh" 2>/dev/null || true
+# ...and the shim-precondition TEMPLATE, which is DATA, not a shell module, so
+# neither glob above reaches it. `_respawn_compose_launcher` resolves it as
+# `$_respawn_dir/../guard-block.sh.in` — relative to the WATCHER TREE IT RAN
+# FROM, which here is the fake nexus, not the real repo. Absent, it bakes a
+# `REFUSING TO RESPAWN … exit 78` block into the launcher
+# (your-org/nexus-code#589), so `tmux new-window` succeeds and the pane's
+# command dies on the next line.
+#
+# HONEST SCOPE: this is a real fixture gap and it is NOT what fixed anything.
+# It was inert at baseline because the async respawn never reached the
+# launcher-writing step (the 30 s `--help` stall came first) — which is why
+# your-org/nexus-code#1102 correctly ruled it out as that issue's cause. The
+# prediction that it would become LIVE once the stall was fixed was tested and
+# is FALSIFIED: with the stall fixed, planting this `cp` moved the suite from
+# 8/0, 7/1, 7/1 to 7/1, 8/0, 7/1 — no measurable effect on the pass rate. It is
+# carried because the fixture should exercise the REAL guard rather than a
+# refusal stub, not because it changes a result.
+cp "$HARNESS_REPO_ROOT/monitor/guard-block.sh.in" "$HARNESS_DIR/monitor/guard-block.sh.in"
 
 # ---------------------------------------------------------------------------
 # Engage the failure injection BEFORE launching the watcher so the

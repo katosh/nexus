@@ -43,6 +43,7 @@ set -uo pipefail
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 NG_REAL="$_test_dir/ng"
 BK_REAL="$_test_dir/_bookkeeping.sh"
+NR_REAL_1077="$_test_dir/_nexus-root.sh"
 
 REAL_GREP=$(command -v grep 2>/dev/null || true)
 [[ -x "$REAL_GREP" ]] || REAL_GREP=/bin/grep
@@ -62,7 +63,8 @@ assert_ne() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if "$REAL_GREP" -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && "$REAL_GREP" -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else printf '  FAIL: %s\n           expected substring: %s\n           in: %s\n' "$label" "$needle" "$hay" >&2; FAIL=$(( FAIL + 1 )); fi
 }
 assert_not_contains() {
@@ -84,6 +86,8 @@ build_install() {
     mkdir -p "$fn/monitor" "$fn/config" "$fn/reports"
     cp "$NG_REAL" "$fn/monitor/ng"
     (( with_bk == 1 )) && cp "$BK_REAL" "$fn/monitor/_bookkeeping.sh"
+    # your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+    cp "$NR_REAL_1077" "$fn/monitor/_nexus-root.sh"
     cat > "$fn/config/load.sh" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in

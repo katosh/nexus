@@ -169,13 +169,62 @@ export UV_LINK_MODE="${UV_LINK_MODE:-hardlink}"
 # operator's interactive shells (PATH-ONLY mode, returned above) never
 # see it. Prepended BEFORE notifywrap/ghwrap so those keep the very-front
 # slots (established invariant: ghwrap leads).
+# Board-lethal tmux-kill guard — PATH-FRONT `tmux` shim (monitor/tmuxwrap),
+# same mechanism as ghwrap (your-org/nexus-code#892; remedy for the session
+# surface named in #889). Ending the tmux server ends the session bwrap holds
+# open under --die-with-parent, so it tears down the ENTIRE SANDBOX — watcher,
+# every worker, every service (2026-08-09; and five times in 33 minutes on
+# 2026-07-30, #644). The corpus lint cannot see a command an agent TYPES, or one
+# nested in a script it writes at runtime; a real executable covers every child.
+#
+# NOTE THE INVERTED POLARITY versus ghwrap, and do not "fix" it: this shim's
+# default arm is PASS-THROUGH. monitor/ issues 46 kill-window calls and ~200
+# tmux window operations, so a shim that refused when confused would wedge the
+# control surface — the very outage it prevents. It refuses ONLY on
+# positively-identified lethality against the BOARD socket, and it is inert on
+# the hot path (`list-windows`/`display-message` exec straight through after a
+# pure argv walk — no subprocess, no server query).
+#
+# Full mode only — the operator's interactive shells (PATH-ONLY mode, returned
+# above) never see it. Prepended BEFORE pipwrap/notifywrap/ghwrap so those keep
+# the very-front slots (established invariant: ghwrap leads).
 # Fronted in reverse of the desired final order, so the LAST call wins the
-# very-front slot. Final order: ghwrap : notifywrap : pipwrap : locals/bin : …
+# very-front slot. Final order:
+#   ghwrap : notifywrap : pipwrap : tmuxwrap : locals/bin : …
 # (established invariant: ghwrap leads). Same order as front-path.zsh and
 # bash_env.sh, both of which already move-to-front correctly.
-[ -d "$_le_root/monitor/pipwrap" ]    && _le_front_dir "$_le_root/monitor/pipwrap"
-[ -d "$_le_root/monitor/notifywrap" ] && _le_front_dir "$_le_root/monitor/notifywrap"
-[ -d "$_le_root/monitor/ghwrap" ]     && _le_front_dir "$_le_root/monitor/ghwrap"
+# your-org/nexus-code#1188 - PER-WRAPPER fixture opt-out. Semantics, the
+# no-blanket rule and the reason a typo is silent here: see the block comment
+# in monitor/shellenv/bash_env.sh. Honoured HERE as well as there because this
+# file is sourced by ng, by every launcher and by the wrappers themselves, so a
+# marker honoured only in bash_env.sh is re-armed by the first descendant that
+# sources this one (measured: patching bash_env.sh alone still returned
+# monitor/tmuxwrap/tmux from the grandchild).
+#
+# COVERAGE BOUNDARY, STATED SO NOBODY ASSUMES OTHERWISE: this marker does NOT
+# cover the `$_le_locals/bin` front earlier in this file. That is the
+# `claude`-stub surface of #746, guarded on the test side by
+# th_require_stub_claude, and putting it under the same marker has a strictly
+# larger blast radius (it is the whole nexus toolchain, not one wrapper). It is
+# deliberately out of scope and wants its own decision.
+_le_front_off() {
+    case " ${NEXUS_PATH_FRONT_OFF:-} " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+[ -d "$_le_root/monitor/tmuxwrap" ]   && ! _le_front_off tmuxwrap && _le_front_dir "$_le_root/monitor/tmuxwrap"
+[ -d "$_le_root/monitor/pipwrap" ]    && ! _le_front_off pipwrap && _le_front_dir "$_le_root/monitor/pipwrap"
+[ -d "$_le_root/monitor/notifywrap" ] && ! _le_front_off notifywrap && _le_front_dir "$_le_root/monitor/notifywrap"
+[ -d "$_le_root/monitor/ghwrap" ]     && ! _le_front_off ghwrap && _le_front_dir "$_le_root/monitor/ghwrap"
+
+# The BOARD's tmux socket, recorded from the launcher's own $TMUX so the shim
+# above can still identify it inside an `env -u TMUX` child — the one shape that
+# defeats every other route to the answer. Full mode only, so the operator's own
+# shells are unaffected. Harmless when unset (the shim falls back to $TMUX, then
+# to the compiled default socket for this uid).
+if [ -n "${TMUX:-}" ] && [ -z "${NEXUS_TMUX_SOCKET:-}" ]; then
+    NEXUS_TMUX_SOCKET="${TMUX%%,*}"
+    export NEXUS_TMUX_SOCKET
+fi
 
 # Fail-CLOSED bot identity. The PATH-front wrapper above is a SHADOW, not a
 # boundary. Any shell rc that re-prepends its own bin dir (linuxbrew, /app/bin)

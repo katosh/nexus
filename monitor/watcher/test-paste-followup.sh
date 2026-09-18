@@ -52,7 +52,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s\n' "$label" >&2
@@ -94,10 +95,11 @@ cat > "$STUB_DIR/tmux" <<'STUB'
 #!/usr/bin/env bash
 cmd="${1:-}"
 if [[ "$cmd" == "list-windows" ]]; then
-    # Two callers (#323): the existence check queries `-F
-    # '#{window_name}'`; resolve_window_id queries `-F
-    # '#{window_id}\t#{window_name}'`. Emit @id<TAB>name for the
-    # latter so name→@id resolution succeeds.
+    # Three callers: a bare existence check queries `-F
+    # '#{window_name}'`; resolve_window_id queries
+    # `#{window_id}<delim>#{window_name}` (#323); resolve_window_key /
+    # resolve_window_index query `#{window_index}<delim>#{window_name}`
+    # (#905). Answer each in its own shape so both resolvers succeed.
     fmt=""; prev=""
     for a in "$@"; do [[ "$prev" == "-F" ]] && fmt="$a"; prev="$a"; done
     case "$fmt" in
@@ -110,6 +112,22 @@ if [[ "$cmd" == "list-windows" ]]; then
             # the same way the code under test did.
             d="${fmt#*'#{window_id}'}"; d="${d%%'#{window_name}'*}"
             for w in ${MOCK_TMUX_WINDOWS:-}; do printf '@3%s%s\n' "$d" "$w"; done ;;
+        *window_index*)
+            # THE INDEX SHAPE (your-org/nexus-code#905). `resolve_window_key`
+            # and `resolve_window_index` ask for
+            # `#{window_index}<delim>#{window_name}`, which contains no
+            # `window_id` — so it used to fall through to the default arm and
+            # come back as a BARE name carrying no delimiter. The resolver then
+            # correctly refused the unsplittable row ("Window presence is
+            # UNKNOWN, not absent") and the paste never happened. Answer it the
+            # way real tmux does: index, delimiter, name — one row per window,
+            # indices distinct. Delimiter EXTRACTED from the format, for the
+            # same reason as the window_id arm above.
+            d="${fmt#*'#{window_index}'}"; d="${d%%'#{window_name}'*}"
+            i=0
+            for w in ${MOCK_TMUX_WINDOWS:-}; do
+                printf '%s%s%s\n' "$i" "$d" "$w"; i=$(( i + 1 ))
+            done ;;
         *)           printf '%s\n' "${MOCK_TMUX_WINDOWS:-}" ;;
     esac
     exit 0
@@ -156,8 +174,72 @@ helper_env() {
         "NEXUS_STATE_DIR=$RUN_STATE" \
         "NEXUS_CC_HOME=$CC_HOME" \
         "PASTE_CONFIRM_TIMEOUT_SECONDS=2" \
-        "PASTE_CONFIRM_POLL_SECONDS=0.05"
+        "PASTE_CONFIRM_POLL_SECONDS=0.05" \
+        "BASH_ENV="
 }
+
+# ── THE FIXTURE'S PATH ISOLATION, MADE REAL (your-org/nexus-code#1120, #1188)
+#
+# `export PATH="$STUB_DIR:$PATH"` above is NOT sufficient in this workspace, and
+# the reason is that it is undone in the CHILD. Agent processes carry
+# `BASH_ENV=$NEXUS_ROOT/monitor/shellenv/bash_env.sh`, which bash sources at the
+# start of EVERY non-interactive shell and which force-fronts the nexus
+# toolchain — including `monitor/tmuxwrap` — ahead of whatever PATH it inherited.
+# `run_helper` drives the code under test as `env … bash "$SCRIPT"`, a new
+# non-interactive bash, so inside it a bare `tmux` is the WRAPPER and the
+# recorder stub is second in line.
+#
+# The wrapper is a pass-through, so the helper's own calls still reach the stub —
+# but on its way there tmuxwrap issues exactly one `show -s command-alias` of its
+# own (its `_tw_resolve_alias`, monitor/tmuxwrap/tmux:572, a read of a SERVER
+# OPTION rather than a write to any board), and the stub duly recorded it. That
+# put ONE line in $ACTIONS on a path where the helper does nothing, so
+# `missing window: no tmux writes` read `got 1 want 0`.
+#
+# Measured at 50c36ef, tree byte-identical, PATH-injection the ONLY variable:
+#   bash                   test-paste-followup.sh  -> 43 passed / 1 failed
+#   env -u BASH_ENV   bash test-paste-followup.sh  -> 44 passed / 0 failed
+#   env -u NEXUS_ROOT bash test-paste-followup.sh  -> 44 passed / 0 failed
+# (front-path is guarded on $NEXUS_ROOT, so either unset disarms it.)
+#
+# So #1120's two candidate explanations — "the guard stopped short-circuiting"
+# or "the fixture's window really is present" — are BOTH wrong: the helper's
+# short-circuit is intact and MOCK_TMUX_WINDOWS never lists `no-such-window`.
+# The cause was never in the tree, which is exactly why #1120 reproduced at two
+# refs with the blob unchanged. #1188 carries the CLASS (29 at-risk suites) and
+# this fix does NOT close it: the dangerous direction there is a suite whose
+# stub is bypassed reporting GREEN about the wrapper instead of its subject, and
+# that is invisible. This is one member, fixed at the member.
+#
+# The remedy is #1105's shape — belt, and an ALARM. `helper_env` now pins an
+# EMPTY `BASH_ENV` for the child (belt: no force-front, so the stub the fixture
+# installed is the tmux the helper reaches), and the control below asserts that
+# from inside the same `bash` shape `run_helper` uses (alarm: a future mechanism
+# that displaces the stub again must be RED here, naming the isolation, instead
+# of surfacing as an unrelated off-by-one in a recorder count). The belt fixes
+# today's force-front; the alarm is the half that generalises.
+# THE PROBE MUST RUN THE REAL BELT, NOT A COPY OF IT (skeptic F4). This line used
+# to hardcode `env "BASH_ENV=" bash …`, which tested a DUPLICATE of the pin rather
+# than the pin — so removing the belt from helper_env left the alarm GREEN and the
+# regression resurfaced as exactly the "unrelated off-by-one in a recorder count"
+# three lines above promise it would replace. Measured, belt-only mutant against
+# the hardcoded form: 44 passed / 1 failed with `ISOLATION CONTROL` PASSING.
+# The author's own mutant could not see this because it rewrote BOTH strings at
+# once — and reported the sentinel appearing TWICE as proof the mutation applied,
+# without asking why a belt-only change would touch two sites.
+# Calling helper_env means the probe exercises whatever run_helper actually gives
+# the child, so a belt regression reds the alarm AND a novel force-front still does.
+# RUN_STATE is a helper_env input and run_helper reassigns it per call; give the
+# probe its own so `set -u` has something bound.
+RUN_STATE=$(mktemp -d "$WORK/state.isoprobe.XXXXXX")
+_pf_child_tmux=$(env $(helper_env) bash -c 'command -v tmux' 2>/dev/null)
+if [[ "$_pf_child_tmux" == "$STUB_DIR/tmux" ]]; then
+    printf '  PASS: %s\n' "ISOLATION CONTROL — a child \`bash\` reaches the FIXTURE stub, not a PATH-fronted wrapper (#1120)"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: %s\n' "ISOLATION CONTROL — the code under test would reach ${_pf_child_tmux:-<nothing>}, not this fixture's stub (#1120/#1188); every \$ACTIONS assertion below would be about that binary's calls too" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
 
 run_helper() {
     # Fresh per-run state dir so stamp assertions are exact.
@@ -295,6 +377,105 @@ assert_contains "paste failure: loud stderr" "$HELPER_OUT" 'paste-buffer failed'
 assert_contains "paste failure: stamp retained" \
     "$(cat "$RUN_STATE/machine-input.tsv" 2>/dev/null)" $'demo-rerun-lead\t'
 unset MOCK_TMUX_FAIL
+
+echo '=== your-org/nexus-code#1200: refuse to paste into a pane sitting on an overlay ==='
+# THE PROPERTY: a message-delivery paste must not land in a pane with a
+# permission overlay up, because the trailing Enter is consumed by the overlay
+# and SELECTS ITS HIGHLIGHTED DEFAULT instead of delivering the message. The
+# recorded incident: an instruction reading "OPTION 3 — HOLD. Do not commit the
+# assets" selected `Commit all 325 MB`, pushed 384 files, and the send reported
+# `delivered` — correctly by its own contract, which answers DID THE TEXT
+# ARRIVE and never DID THE TEXT GET READ.
+#
+# The pane-state answer is injected through NEXUS_PASTE_PANE_STATE_BIN rather
+# than by driving a real overlay: the property under test is what the paste
+# path DOES with a `blocked` verdict, not how pane-state derives one (which
+# test-pane-state.sh owns against real ANSI fixtures).
+_ovl_stub="$STUB_DIR/ps-blocked"
+cat > "$_ovl_stub" <<'PSSTUB'
+#!/usr/bin/env bash
+printf 'state=blocked active=1 window=9 name=%s overlay=permission content_hash=1\n' "$1"
+PSSTUB
+chmod +x "$_ovl_stub"
+_ovl_ok="$STUB_DIR/ps-idle"
+cat > "$_ovl_ok" <<'PSSTUB'
+#!/usr/bin/env bash
+printf 'state=idle active=0 window=9 name=%s input=blank content_hash=1\n' "$1"
+PSSTUB
+chmod +x "$_ovl_ok"
+
+export MOCK_TMUX_WINDOWS='demo-rerun-lead'
+: > "$ACTIONS"
+NEXUS_PASTE_PANE_STATE_BIN="$_ovl_stub" \
+    run_helper demo-rerun-lead --message 'OPTION 3 - HOLD. Do not commit the assets.'
+assert_eq       "#1200 blocked pane: refuses (non-zero exit)" "$(( HELPER_RC != 0 ))" "1"
+assert_contains "#1200 blocked pane: names the overlay kind"  "$HELPER_OUT" "overlay=permission"
+assert_contains "#1200 blocked pane: says why, not just no"   "$HELPER_OUT" "SELECT ITS HIGHLIGHTED DEFAULT"
+# THE ARM THAT MATTERS. A refusal that still pasted would be worse than no
+# guard: it would carry the incident AND a message saying it did not.
+assert_not_contains "#1200 blocked pane: NOTHING was pasted" \
+    "$(cat "$RUN_STATE/machine-input.tsv" 2>/dev/null)" $'demo-rerun-lead\t'
+
+# POSITIVE CONTROL — the same call with an IDLE verdict must still deliver.
+# Without it every assertion above is satisfied by a guard that refuses always.
+: > "$ACTIONS"
+NEXUS_PASTE_PANE_STATE_BIN="$_ovl_ok" \
+    run_helper demo-rerun-lead --message 'ordinary follow-up'
+assert_eq "#1200 CONTROL: an idle pane still accepts the paste" "$HELPER_RC" "0"
+
+# EVERY DOUBT PASTES — deliberately the opposite of the dead-pane guard above.
+# This guard prevents a WRONG DELIVERY; refusing on doubt would break every
+# delivery wherever pane-state is unavailable, including hermetic fixtures.
+: > "$ACTIONS"
+NEXUS_PASTE_PANE_STATE_BIN="$STUB_DIR/does-not-exist" \
+    run_helper demo-rerun-lead --message 'unreadable pane state'
+assert_eq "#1200 CONTROL: an unavailable pane-state does NOT block delivery" "$HELPER_RC" "0"
+
+# The override is deliberate, and it is the issue's own ask 2: answering an
+# overlay is a DIFFERENT ACT from sending a message, and must be spelled.
+: > "$ACTIONS"
+NEXUS_PASTE_PANE_STATE_BIN="$_ovl_stub" \
+    run_helper demo-rerun-lead --message 'I have looked' --allow-blocked
+assert_eq "#1200 --allow-blocked: the deliberate override delivers" "$HELPER_RC" "0"
+# …AND IS ACTUALLY RECORDED. The first cut documented an audit trail and wrote
+# nothing — a claim the code did not implement, in the guard whose whole subject
+# is machinery that reports success for a question adjacent to the one that
+# matters. Asserted on the artefact, not on the prose.
+# ASSERTED ON THE ACTION LOG, NOT ON STDERR. The first cut of this arm checked
+# $HELPER_OUT — which also carries the stderr courtesy print — so a mutant that
+# dropped the RECORD and kept the print left it green. Measured: 56/0 with the
+# record deleted. That is the proxy-vs-property defect this very guard exists to
+# close, occurring inside it: the property is "a durable record exists", and
+# stderr is not durable. The record is what an auditor reads.
+assert_contains "#1200 --allow-blocked: the override is AUDITED in the ACTION LOG" \
+    "$(cat "$RUN_STATE"/action-log.jsonl 2>/dev/null)" "allow-blocked OVERRIDE"
+assert_contains "#1200 --allow-blocked: the logged record names the overlay it overrode" \
+    "$(cat "$RUN_STATE"/action-log.jsonl 2>/dev/null)" "overlay=permission"
+
+# FIELD-EXACT extraction. A greedy `.*state=` binds to the LAST match, so a
+# line whose real state is `idle` but which also carries `refined_state=blocked`
+# would refuse; and the mirror case (`state=blocked … x_state=idle`) would let
+# the paste THROUGH, which is the defect this guard exists to stop.
+_ovl_greedy="$STUB_DIR/ps-greedy"
+cat > "$_ovl_greedy" <<'PSSTUB'
+#!/usr/bin/env bash
+printf 'state=idle active=0 window=9 name=%s refined_state=blocked overlay=permission\n' "$1"
+PSSTUB
+chmod +x "$_ovl_greedy"
+: > "$ACTIONS"
+NEXUS_PASTE_PANE_STATE_BIN="$_ovl_greedy" \
+    run_helper demo-rerun-lead --message 'idle pane, decoy field'
+assert_eq "#1200 a trailing *_state=blocked field does NOT trigger the guard" "$HELPER_RC" "0"
+_ovl_greedy2="$STUB_DIR/ps-greedy2"
+cat > "$_ovl_greedy2" <<'PSSTUB'
+#!/usr/bin/env bash
+printf 'state=blocked active=1 window=9 name=%s overlay=permission prior_state=idle\n' "$1"
+PSSTUB
+chmod +x "$_ovl_greedy2"
+: > "$ACTIONS"
+NEXUS_PASTE_PANE_STATE_BIN="$_ovl_greedy2" \
+    run_helper demo-rerun-lead --message 'blocked pane, decoy field'
+assert_eq "#1200 …and a trailing *_state=idle does NOT suppress it" "$(( HELPER_RC != 0 ))" "1"
 
 echo
 echo "=== summary: $PASS passed, $FAIL failed ==="

@@ -228,6 +228,12 @@ Common failure modes:
 
 - `private key not found` → `bot_pem_path` is wrong, or perms are
   loose. `ls -l <PEM_FILE>` must show `-rw-------`.
+- `REFUSING to sign … verdict=exposed` (exit 4) → the key is
+  world-accessible **and** every ancestor directory is world-traversable,
+  so another local user can reach it (<your-org>/nexus-code#1501).
+  `chmod 600` it, then **rotate** — a chmod does not un-expose a key that
+  was readable. `./monitor/mint-token.sh --check-key` prints the verdict
+  without minting.
 - `Bad credentials` on the deliveries probe → `bot_app_id` mismatched
   the pem you downloaded; re-check the App page.
 - Deliveries probe returns `[]` → expected on a fresh install. Step 11
@@ -263,8 +269,12 @@ monitor/watcher/launcher.sh
 
 The target — the tmux window the watcher pastes reports into — comes from
 config `monitor.target_window` (workspace convention: `orchestrator`). Set it
-there, not with a `--target` flag: hard-coding it is the `#459` anti-pattern
-that `launcher.sh:97-118` documents as a bug, and it now exits 2. The watcher runs
+there rather than hard-coding a `--target` flag in a runbook: `#459` was an
+`--target "$TARGET_WINDOW"` line whose variable was unset, so an EMPTY string
+won over the configured default and the watcher launched with no coordinator
+window to paste into. `launcher.sh`'s `_require_arg` guard now refuses an empty
+`--target`/`--window` at **exit 2**. A non-empty `--target <name>` is still
+accepted and still overrides config. The watcher runs
 **headless** — `setsid`-detached, with **no tmux window of its own**;
 its output goes to `monitor/.state/watcher.log` and its liveness is
 anchored by the pidfile `monitor/.state/watcher.pid` + heartbeat. The
@@ -337,9 +347,10 @@ gh search repos topic:nexus-fork org:<ORG> --json fullName,description
 - **Deliveries log keeps returning `[]` after step 11** — App is not
   subscribed to the event you triggered. Re-check step 4 against the
   App settings page's *Subscribe to events* block.
-- **Watcher logs `snapshot_deliveries: 404 — App has no webhook URL`**
-  — the App's *Webhook → Active* toggle is off, or the URL field is
-  blank. Re-check step 2.
+- **Watcher logs `snapshot_deliveries: /app/hook/deliveries returned
+  404 — App has no webhook URL configured`** (once per day) — the
+  App's *Webhook → Active* toggle is off, or the URL field is blank.
+  Re-check step 2.
 - **`gh pr edit` from the bot fails with an org-membership error** —
   the *Organization → Members: read* permission is missing; see the
   troubleshooting block in `BOT_SETUP.md`.

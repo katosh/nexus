@@ -12,13 +12,27 @@
 #                                processed-comments cache
 #   _filter_emit_cooldown      — last-hop per-comment rate limiter
 #   _emit_cooldown_flush       — per-block helper for the cooldown loop
+#   _filter_alert_cooldown     — per-SURFACE edge damper for
+#                                `watcher_alert=` blocks (#966); the
+#                                only hop that can express an alert —
+#                                every other one takes its DEFAULT ARM
+#                                on a non-comment header, which is a
+#                                permissive-default failure and NOT an
+#                                id-keying one (see "WHY NOTHING DAMPED
+#                                AN ALERT" below)
+#   _alert_cooldown_flush      — per-block helper for the alert damper
 #   _dedup_emit_lines          — cross-source id= dedup
 #
 # Side-effect-free: only function definitions, no top-level state.
 # Caller globals (set by main.sh before the functions are CALLED —
 # nothing is read at source time):
-#   STATE_DIR                      monitor/.state
-#   MONITOR_EMIT_COOLDOWN_SECONDS  cooldown knob (0 disables)
+#   STATE_DIR                            monitor/.state
+#   MONITOR_EMIT_COOLDOWN_SECONDS        per-comment cooldown (0 disables)
+#   `MONITOR_ALERT_EMIT_COOLDOWN_SECONDS` (default 900) — per-surface alert
+#                                        damper; 0 disables. Spelled on ONE
+#                                        line on purpose: `test-knob-default-
+#                                        agrees.sh` reads this literal and
+#                                        holds it to the config-resolved value.
 # Manual emit-suppression. Reads `$STATE_DIR/emit-suppression.lines`
 # once into an awk hash and drops any emit block (header + body) whose
 # `id=<N>` token matches a `comment:<N>` entry in the file. Operator
@@ -395,13 +409,160 @@ _filter_reemit_backoff() {
     fi
 }
 
+# Reaction TARGET of a cross-repo mention block (your-org/nexus-code#1500).
+#
+# A mention block's `id=` is NOT always a comment database id, and the two
+# consumers that key on it — the backoff stamp below and `_reemit.sh`'s
+# two-tier reaction classifier — were both written as though it always
+# were. Measured cost: a `mention=<repo> kind=issue_new n=1499 id=1499`
+# block carries an ISSUE NUMBER in `id=`, so `_reemit_reaction_state` asked
+# `repos/<repo>/issues/comments/1499/reactions`, got a PERMANENT 404, and
+# returned "unknown" — which by contract neither evicts nor reclassifies.
+# The entry could therefore never leave the FAST (5 min) tier: not by 👀,
+# not by 🚀. The reactions existed; the classifier consulted an endpoint
+# that cannot see them.
+#
+# The three id vocabularies actually in circulation:
+#   * comment mentions (`issue_comment` deliveries; `src=comment` walks)
+#     → `id` is a COMMENT database id, GLOBALLY unique. Reactions at
+#     `repos/{r}/issues/comments/{id}/reactions`.
+#   * BODY mentions — `src=body` from the mention walk, and `kind=issue_new`
+#     / a PR OPEN from the deliveries path → the reaction lives on the
+#     ISSUE/PR ITSELF, at `repos/{r}/issues/{n}/reactions`, keyed on `n=`
+#     and NOT on `id=`. (`repos/{r}/issues/{n}` serves PRs too — a PR is an
+#     issue.) For `src=body` the `id` is the issue's databaseId, which that
+#     endpoint does not accept either; for `kind=issue_new` id==n only by
+#     coincidence, which is precisely why the bug read as "the right id".
+#   * `kind=pr_review` WITH `path=` → a PR REVIEW COMMENT, reactions at
+#     `repos/{r}/pulls/comments/{id}/reactions`. WITHOUT `path=` it is a
+#     TOP-LEVEL PR review, which has NO reactions endpoint at all.
+#
+# One derivation, two consumers, so the mapping cannot drift between them.
+#
+# Prints exactly one `<type>:<value>` and ALWAYS returns 0. "Unresolvable"
+# is the explicit value `none:<n|0>` rather than a bare non-zero: a caller
+# that ignores rc still receives a value it has to handle, and `none:` is a
+# fail-CLOSED token for which no endpoint is ever guessed.
+#
+# ARM ORDER (your-org/nexus-code#1121). The permissive `comment:` arm is
+# LAST, and every earlier arm accepts only inputs no later arm wants:
+#   - `pr_review` is never a body mention (the mention walk emits only
+#     `issue`/`pr`; deliveries emits `pr_review` only for the two review
+#     events), so arm 1 shadows nothing beneath it.
+#   - a `src=body` / `issue_new` id is by definition not a comment id, so
+#     arm 2 shadows nothing beneath it.
+# Any NEW specific shape goes ABOVE the `comment:` arm, never below it.
+_mention_target_key() {
+    local header="$1"
+    local kind="" n="" id="" src="" haspath=0
+    [[ "$header" =~ (^|[[:space:]])kind=([^[:space:]]+) ]] && kind="${BASH_REMATCH[2]}"
+    [[ "$header" =~ (^|[[:space:]])n=([0-9]+) ]]           && n="${BASH_REMATCH[2]}"
+    [[ "$header" =~ (^|[[:space:]])id=([0-9]+) ]]          && id="${BASH_REMATCH[2]}"
+    [[ "$header" =~ (^|[[:space:]])src=([^[:space:]]+) ]]  && src="${BASH_REMATCH[2]}"
+    [[ "$header" =~ (^|[[:space:]])path=[^[:space:]] ]]    && haspath=1
+
+    # 1. PR review shapes. `path=` present ⇒ a review COMMENT (its own
+    #    endpoint under /pulls/); absent ⇒ a top-level review, which GitHub
+    #    gives no reactions endpoint — say so rather than inventing one.
+    if [[ "$kind" == "pr_review" ]]; then
+        if (( haspath )) && [[ -n "$id" ]]; then
+            printf 'review_comment:%s\n' "$id"
+            return 0
+        fi
+        printf 'none:%s\n' "${n:-0}"
+        return 0
+    fi
+    # 2. Body-level mentions — reaction on the issue/PR itself, keyed on n.
+    #    `kind=issue_new` is kept alongside `src=body` on purpose: it is the
+    #    BACK-COMPAT arm for entries already persisted in
+    #    `unacked-mentions.lines` before `_deliveries.sh` started stamping
+    #    `src=body`. Without it the live #1499 entry could not be classified
+    #    after this fix landed without hand-editing watcher state.
+    if [[ "$src" == "body" || "$kind" == "issue_new" ]]; then
+        if [[ -n "$n" ]]; then
+            printf 'issue:%s\n' "$n"
+            return 0
+        fi
+        printf 'none:0\n'
+        return 0
+    fi
+    # 3. Default: a comment database id. LAST arm by design (see ARM ORDER).
+    if [[ -n "$id" ]]; then
+        printf 'comment:%s\n' "$id"
+        return 0
+    fi
+    printf 'none:%s\n' "${n:-0}"
+    return 0
+}
+
+# Backoff-stamp filename stem for a mention block's reaction target
+# (your-org/nexus-code#1500).
+#
+# A COMMENT / REVIEW-COMMENT id is a GLOBAL GitHub database id and needs no
+# repo scope — and keeping that spelling byte-identical (`comment-<id>`)
+# means every stamp already on disk stays valid across this change, with no
+# migration step.
+#
+# An ISSUE NUMBER is repo-LOCAL. `your-org/nexus-code#1499` and any other
+# repo's #1499 would otherwise share one `comment-1499.ts` stamp and
+# silently suppress each other's re-emit for a whole backoff window — the
+# same collision `_deliveries.sh` already guards with its repo-scoped
+# `issue:<repo>:<n>` processed-comments key. So body-level and unresolvable
+# targets ARE repo-scoped.
+#
+# The stem is also the operator-facing artefact: `comment-1499.ts` for what
+# was actually issue #1499 is what made #1500 cost twenty minutes to
+# localize. `issue-your-org_nexus-code-1499.ts` says what it is.
+#
+# THIS MERGES TWO REGISTRY ENTRIES ONTO ONE STAMP, AND THAT IS INTENDED —
+# named here because an UNNAMED emit-suppression is exactly what #1500 was
+# (your-org/nexus-code#1500, skeptic finding F3).
+#
+# One issue can sit in the registry TWICE, because the two sources spell its
+# `id=` differently and `_reemit_register` dedupes on `id=`:
+#
+#   mention=<r> kind=issue_new n=1499 id=1499        src=body   (deliveries: the NUMBER)
+#   mention=<r> kind=issue     n=1499 id=3388812345  src=body   (mention walk: the databaseId)
+#
+# Pre-change they stamped `comment-1499.ts` and `comment-3388812345.ts` —
+# two independent backoff windows. Both now key on `issue:1499` and share
+# `issue-<repo>-1499.ts`, so whichever flushes first suppresses the other
+# for one MONITOR_REEMIT_BACKOFF_SECONDS window.
+#
+# WHY THAT IS THE RIGHT SEMANTICS, not merely a tolerable side effect: the
+# stamp bounds the emit cadence of a REACTABLE OBJECT, and these two entries
+# have the SAME one. A single 👀/🚀 on that issue acks both — the classifier
+# returns one verdict for both, and a 🚀 evicts both in the same `_reemit_gc`
+# pass. Two entries about one issue backing off independently would emit the
+# same issue at twice the intended rate, which is the defect this filter
+# exists to prevent.
+#
+# WHAT IT COSTS: a DELAY, never a loss. The registry gate (`_reemit_pending`)
+# is separate and untouched, so the suppressed entry re-emits after the
+# window. Bounded honestly: reachable by construction, NOT observed live —
+# the primary's registry held exactly one entry for #1499.
+_reemit_stamp_stem() {
+    local repo="$1" key="$2"
+    local type="${key%%:*}" val="${key#*:}"
+    case "$type" in
+        comment|review_comment)
+            printf '%s-%s\n' "$type" "$val"
+            ;;
+        *)
+            local r="${repo//\//_}"
+            r="${r//[^A-Za-z0-9._-]/_}"
+            printf '%s-%s-%s\n' "$type" "${r:-unknown}" "$val"
+            ;;
+    esac
+}
+
 # Helper for `_filter_reemit_backoff`. Gates a single (header, body_line)
-# block. Non-mention shapes and id-less blocks pass through untouched. A
-# `mention=`/`cross_repo=` block with an `id=<N>` is dropped when its
-# dedicated `reemit-backoff/comment-<id>.ts` stamp is younger than the
-# backoff window; otherwise it prints and (re)stamps `now`. The stamp tracks
-# actually-emitted state (written only when the block proceeds), so the
-# window measures last-emit to now — not last-considered.
+# block. Non-mention shapes and identity-less blocks pass through untouched.
+# A `mention=`/`cross_repo=` block is dropped when the stamp for its
+# reaction target (`reemit-backoff/<stem>.ts`, see `_reemit_stamp_stem`) is
+# younger than the backoff window; otherwise it prints and (re)stamps `now`.
+# The stamp tracks actually-emitted state (written only when the block
+# proceeds), so the window measures last-emit to now — not last-considered.
 _reemit_backoff_flush() {
     local hist_dir="$1" now="$2" backoff="$3" header="$4" body_line="$5"
     if [[ ! "$header" =~ ^(mention|cross_repo)= ]]; then
@@ -409,16 +570,20 @@ _reemit_backoff_flush() {
         [[ -n "$body_line" ]] && printf '%s\n' "$body_line"
         return
     fi
-    local id=""
-    if [[ "$header" =~ id=([^[:space:]]+) ]]; then
-        id="${BASH_REMATCH[1]}"
-    fi
-    if [[ -z "$id" ]]; then
+    local repo=""
+    [[ "$header" =~ ^(mention|cross_repo)=([^[:space:]]+) ]] && repo="${BASH_REMATCH[2]}"
+    local key
+    key=$(_mention_target_key "$header")
+    if [[ "$key" == "none:0" ]]; then
+        # Neither `n=` nor `id=` — no identity to key a stamp on. Pass
+        # through, exactly as the id-less case always did.
         printf '%s\n' "$header"
         [[ -n "$body_line" ]] && printf '%s\n' "$body_line"
         return
     fi
-    local stamp_path="$hist_dir/comment-$id.ts" last=0
+    local stem
+    stem=$(_reemit_stamp_stem "$repo" "$key")
+    local stamp_path="$hist_dir/$stem.ts" last=0
     if [[ -f "$stamp_path" ]]; then
         last=$(awk 'NR==1{print; exit}' "$stamp_path" 2>/dev/null)
         [[ "$last" =~ ^[0-9]+$ ]] || last=0
@@ -430,6 +595,187 @@ _reemit_backoff_flush() {
     [[ -n "$body_line" ]] && printf '%s\n' "$body_line"
     printf '%s\n' "$now" > "$stamp_path.tmp.$$" \
         && mv "$stamp_path.tmp.$$" "$stamp_path" 2>/dev/null || true
+}
+
+# Per-surface EDGE damper for `watcher_alert=` blocks
+# (your-org/nexus-code#966).
+#
+# WHY THIS IS NOT A GENERATOR FIX. Every alert generator in `_github.sh`
+# is ALREADY edge-triggered and demonstrably works:
+# `_graphql_note_failure` prints only when `announced==0` or the remind
+# cadence has lapsed, `_graphql_backoff_announce` keys a sentinel file on
+# (surface, armed), `_watcher_handle_graphql_failure` keys one on
+# (surface, reset), and `_graphql_note_success` deletes the state file as
+# it emits. The 2026-08-17 GraphQL 503 measured this exactly: `announced=`
+# never moved off its 10:45:41 value, yet 62 pastes went out in the next
+# ten minutes, ALL carrying the same frozen `held_s=2403`. One generator
+# edge, 62 deliveries.
+#
+# The defect is delivery, not generation. `_compose_gh_now` `cat`s
+# `<stage>/github_poll.out` WITHOUT consuming it (main.sh ~L3995) and
+# `github_poll` refreshes that file only every 600 s, so every
+# `comment_surface` fire (15 s base, 5 s under the nudge override) re-reads
+# the same bytes. That replay is BY DESIGN and correct for comments, which
+# the pipeline damps.
+#
+# WHY NOTHING DAMPED AN ALERT — stated as the predicate that is actually
+# true, because the convenient one ("all eight hops key on `id=<N>`") is
+# NOT, and a near-true universal is the shape that survives review and then
+# misleads the next reader. Every hop dispatches on the recognised emit-
+# header shapes `^(issue|pr|pr_review|issue_new|mention|cross_repo)=`.
+# `watcher_alert=` matches none of them, so each hop takes its DEFAULT ARM
+# and forwards the block untouched. That is the whole mechanism, and it is
+# a permissive-default-arm failure, not an id-keying one.
+#
+# The id-keying is true only of the five DAMPING hops (`_dedup_emit_lines`,
+# `_filter_suppression`, `_filter_processed_comments`,
+# `_filter_reemit_backoff`, `_filter_emit_cooldown`). The other three key on
+# something else entirely — `_filter_to_user_author` on `author=`,
+# `_filter_skip_marker` on body content, `_filter_cross_repo_surface` on the
+# mention shapes — and would have passed an alert even if it HAD carried an
+# `id=`. So "no hop could express an alert" holds; "all eight key on id="
+# does not, and fixing the latter would not have been enough.
+#
+# `_v2_task_comment_surface` then pastes unconditionally (its dedup gate is
+# deliberately bypassed for comment-bearing bodies). The storm ended only
+# when the 600 s tick happened to replace the staged bytes with an empty
+# file — an external event, not a damper.
+#
+# WHAT THIS ADDS. The identity the pipeline was missing, keyed on the
+# surface (the alert's actual state-machine subject) rather than on a
+# comment id it will never have. Per surface we remember the last EMITTED
+# (kind, content-hash, timestamp) and pass a block when any of:
+#
+#   * the KIND changed        — a real state edge (`ingest-degraded` ->
+#                               `ingest-recovered`). Always passes, never
+#                               waits out a cooldown. This is what keeps a
+#                               recovery from being swallowed by the hold
+#                               its own degraded alert took out, which
+#                               would leave the operator unable to tell
+#                               "recovered" from "watcher died".
+#   * the CONTENT changed     — a re-nag at a new `held_s`, or a new
+#                               escalation tier. The generator only
+#                               produces these on its own cadence, so
+#                               passing them is passing an edge.
+#   * the cooldown lapsed     — backstop only, so a future generator that
+#                               forgets its own announce-once still cannot
+#                               storm indefinitely.
+#
+# So the emit stream carries one delivery per generator edge, which is the
+# symmetry `_graphql_note_success` already had and the escalated side had
+# lost somewhere between the generator and the paste.
+#
+# The default MUST exceed the 600 s `github_poll` staging window, or a
+# single staged generation still lands twice; 900 s is that bound plus
+# margin. `0` disables (passthrough, zero on-disk footprint) — the
+# convention the sibling filters use, and the negative control the test
+# suite uses to reproduce `#966` on demand.
+#
+# Non-alert lines pass through untouched: this filter has no opinion about
+# comments, and must never acquire one — damping the operator channel is a
+# strictly worse failure than the storm it replaces.
+_filter_alert_cooldown() {
+    local cooldown="${MONITOR_ALERT_EMIT_COOLDOWN_SECONDS:-900}"
+    if ! [[ "$cooldown" =~ ^[0-9]+$ ]]; then
+        cooldown=900
+    fi
+    if (( cooldown == 0 )); then
+        cat
+        return
+    fi
+    local hist_dir="${STATE_DIR}/alert-history"
+    mkdir -p "$hist_dir" 2>/dev/null || true
+    local now
+    now=$(date +%s)
+    local header="" body_line=""
+    local line
+    while IFS= read -r line; do
+        if [[ "$line" == watcher_alert=* ]]; then
+            if [[ -n "$header" ]]; then
+                _alert_cooldown_flush "$hist_dir" "$now" "$cooldown" "$header" "$body_line"
+                header=""; body_line=""
+            fi
+            header="$line"
+            body_line=""
+        elif [[ -n "$header" && -z "$body_line" && "$line" =~ ^[[:space:]]+body: ]]; then
+            body_line="$line"
+        else
+            if [[ -n "$header" ]]; then
+                _alert_cooldown_flush "$hist_dir" "$now" "$cooldown" "$header" "$body_line"
+                header=""; body_line=""
+            fi
+            printf '%s\n' "$line"
+        fi
+    done
+    if [[ -n "$header" ]]; then
+        _alert_cooldown_flush "$hist_dir" "$now" "$cooldown" "$header" "$body_line"
+    fi
+}
+
+# Helper for `_filter_alert_cooldown` — gate one (header, body_line) alert
+# block. Mirrors `_emit_cooldown_flush`'s per-key flock for the same reason
+# it exists there (your-org/nexus-code#562 skeptic finding): `comment_surface`
+# and `compose_emit` run this pipeline from CONCURRENT async subshells, so an
+# unguarded read-modify-write lets both read a pre-cooldown stamp for the same
+# surface, both pass, and the alert double-paste — reintroducing a small
+# version of the very storm this filter exists to stop. Bounded (`-w 5`) and
+# fail-open, matching the sibling.
+_alert_cooldown_flush() {
+    local hist_dir="$1" now="$2" cooldown="$3" header="$4" body_line="$5"
+    local kind="" surface=""
+    [[ "$header" =~ ^watcher_alert=([^[:space:]]+) ]] && kind="${BASH_REMATCH[1]}"
+    [[ "$header" =~ surface=([^[:space:]]+) ]] && surface="${BASH_REMATCH[1]}"
+    # An alert with no parseable kind is an unknown shape; forward it rather
+    # than damp it. Silence is the failure mode this whole file is about.
+    if [[ -z "$kind" ]]; then
+        printf '%s\n' "$header"
+        [[ -n "$body_line" ]] && printf '%s\n' "$body_line"
+        return
+    fi
+    # Key on the SURFACE so kind-vs-kind is a detectable edge. A surfaceless
+    # alert keys on its own kind (it is its own state machine).
+    local key="${surface:-$kind}"
+    local stamp_path="$hist_dir/alert-${key//[^A-Za-z0-9._-]/_}.meta"
+    if command -v flock >/dev/null 2>&1; then
+        local _af_fd
+        if { exec {_af_fd}>"$stamp_path.lock"; } 2>/dev/null; then
+            flock -w 5 "$_af_fd" 2>/dev/null || true
+            _alert_cooldown_decide "$now" "$cooldown" "$header" "$body_line" "$stamp_path" "$kind"
+            exec {_af_fd}>&-
+            return
+        fi
+    fi
+    _alert_cooldown_decide "$now" "$cooldown" "$header" "$body_line" "$stamp_path" "$kind"
+}
+
+# The unguarded decide+stamp core of `_alert_cooldown_flush`. Callers own
+# any locking. Stamps only on PASS, so the window measures last-emitted
+# rather than last-considered — same contract as the comment cooldown.
+_alert_cooldown_decide() {
+    local now="$1" cooldown="$2" header="$3" body_line="$4" stamp_path="$5" kind="$6"
+    local sha prev_ts=0 prev_sha="" prev_kind="" drop=0
+    sha=$(printf '%s\n%s' "$header" "$body_line" | sha256sum 2>/dev/null | awk '{print $1}')
+    if [[ -f "$stamp_path" ]]; then
+        prev_ts=$(awk -F= '/^ts=/{print $2; exit}' "$stamp_path" 2>/dev/null)
+        prev_sha=$(awk -F= '/^sha=/{sub(/^sha=/, ""); print; exit}' "$stamp_path" 2>/dev/null)
+        prev_kind=$(awk -F= '/^kind=/{sub(/^kind=/, ""); print; exit}' "$stamp_path" 2>/dev/null)
+        [[ "$prev_ts" =~ ^[0-9]+$ ]] || prev_ts=0
+    fi
+    # Drop ONLY the exact case the storm is made of: same surface, same
+    # kind, byte-identical content, still inside the window.
+    if [[ "$kind" == "$prev_kind" && -n "$sha" && "$sha" == "$prev_sha" ]] \
+       && (( now - prev_ts < cooldown )); then
+        drop=1
+    fi
+    if (( drop == 0 )); then
+        printf '%s\n' "$header"
+        [[ -n "$body_line" ]] && printf '%s\n' "$body_line"
+        if [[ -n "$sha" ]]; then
+            printf 'ts=%s\nkind=%s\nsha=%s\n' "$now" "$kind" "$sha" \
+                > "$stamp_path.tmp.$BASHPID" \
+                && mv "$stamp_path.tmp.$BASHPID" "$stamp_path" 2>/dev/null || true
+        fi
+    fi
 }
 
 # Dedup adjacent emit blocks by extracting the `id=<X>` token. Each

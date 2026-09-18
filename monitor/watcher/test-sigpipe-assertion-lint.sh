@@ -36,12 +36,49 @@
 # reader can close one. It is also shorter. There is no case in this repo where
 # the pipe form was needed.
 #
-# COVERAGE BOUNDARY. This lint covers ANY producer piped into `grep` with a
-# `q` flag — `<anything> | grep -<…q…>` — under monitor/, whether the pipe sits
-# on one line or is split across a `\`-continuation. It is PRODUCER-AGNOSTIC by
-# design: the hazard is the READER, not the writer. `grep -q` exits on first
-# match without draining, and `pipefail` promotes the writer's EPIPE to the
-# pipeline's status no matter what wrote the bytes (your-org/nexus-code#622).
+# COVERAGE BOUNDARY, WRITTEN FROM THE PREDICATE RATHER THAN FROM THE INTENT.
+# This lint covers any producer piped into an early-exiting `grep` reader under
+# monitor/. It is PRODUCER-AGNOSTIC by design: the hazard is the READER, not
+# the writer. `grep -q` exits on first match without draining, and `pipefail`
+# promotes the writer's EPIPE to the pipeline's status no matter what wrote the
+# bytes (your-org/nexus-code#622).
+#
+# The READER side is NOT agnostic, and this sentence used to pretend it was.
+# It promised "ANY producer piped into `grep` with a `q` flag" while the regex
+# matched only a BARE `grep` immediately after the pipe carrying a SHORT `q`
+# flag. Six spellings squarely inside that promise evaded it, every one of them
+# measured to carry the hazard — match on line 1 of a 200 001-byte payload
+# under `set -uo pipefail`, status consumed, `rc=141` on a string that DOES
+# match, for all six (your-org/nexus-code#1029). A declared gap is a boundary;
+# an undeclared one is a false promise, and the promise is what the next author
+# reads before deciding whether their construct is covered.
+#
+# So the covered set is now ENUMERATED, and every member of it is planted as a
+# control in case 3 — the enumeration is asserted by execution, not by prose:
+#
+#   READER SPELLINGS COVERED
+#     grep -q, -qF, -Fq, -qE …      short flags, `q` anywhere in the cluster
+#     grep --quiet, grep --silent   long options
+#     command|builtin|exec|env|nice|stdbuf grep -q      command-word prefixes
+#     /bin/grep -q, ./tools/grep -q                     any path-qualified grep
+#     LC_ALL=C grep -q              any run of VAR=val assignment prefixes
+#     "$REAL_GREP" -q, $grepbin -q  a VARIABLE command word whose name mentions
+#                                   grep, quoted or not (#1372)
+#     …and any combination (`| LC_ALL=C command /bin/grep --quiet`)
+#   PIPE SPELLINGS COVERED
+#     cmd | grep -q                 same line
+#     cmd \ ⏎ | grep -q             producer on the PREVIOUS line (#630)
+#     cmd | ⏎ grep -q               READER on the NEXT line (trailing pipe)
+#     cmd |& grep -q                bash's `2>&1 |`
+#
+# The trailing-pipe form is the mirror image of the `\`-continuation `#630`
+# closed, and it was left open for exactly as long because a same-line matcher
+# structurally cannot express it. It is the only member needing more than a
+# regex: the scan keeps the previous line and pairs a line ending in exactly
+# ONE trailing pipe with a following line that OPENS with a covered reader.
+# `||` at end of line is excluded — a `||`-joined pair of herestring greps
+# split across lines is the prescribed SAFE form, not a pipe into grep, and
+# case 3 plants it as a negative control alongside its same-line twin.
 #
 # This boundary was redrawn three times, each time because a PROXY stood in for
 # the real property — and each proxy let a live instance survive:
@@ -94,11 +131,14 @@
 # _NOT_SHELL_NOT_DOC (other languages + recorded fixtures) is hand-maintained,
 # and case 2b(d) asserts it is both load-bearing and SOUND (nothing it drops
 # carries a shell shebang) — the one place a blind spot can still be created.
-# Two shapes are deliberately NOT flagged because they carry no pipe into grep:
-# the safe replacement `grep -q … <<<"…"`, and a `||`-joined herestring
+# THREE shapes are deliberately NOT flagged because they carry no pipe into
+# grep: the safe replacement `grep -q … <<<"…"`; a `||`-joined herestring
 # (`… <<<"…" || grep -qF … <<<"…"`) whose `||` a naive `\| *grep` misreads as a
-# pipe. Case 3 asserts both stay green, and plants both a `\`-continuation and
-# an extensionless shebang script to prove the two non-regex proxies are gone.
+# pipe; and that same `||`-joined pair SPLIT ACROSS LINES, which the
+# trailing-pipe pass must not mistake for a pipe continuation. Case 3 asserts
+# all three stay green, plants every reader spelling the boundary above
+# enumerates, and plants both a `\`-continuation and an extensionless shebang
+# script to prove the two non-regex proxies are gone.
 #
 # WHO OWNS WHAT. Two files touch this defect; say plainly what each is FOR,
 # because "two guards over one idiom" is otherwise indistinguishable from a
@@ -139,15 +179,90 @@
 # (shell embedded in YAML scalars) and must NOT be smuggled into the same
 # regex — they need their own extractor and their own controls.
 #
-# WHAT IS STILL NOT COVERED, AND WHY. Only a DIFFERENT early-exit reader:
+# WHAT IS STILL NOT COVERED, AND WHY. First, a DIFFERENT early-exit reader:
 # `cmd | head`, `cmd | grep -m1`. They exit before draining exactly as
 # `grep -q` does and carry the identical hazard, but they are a wider class the
 # repo has not swept — documented-unlinted, not converted. This is a READER
 # boundary (which matcher), not a producer boundary: do not let a future edit
-# narrow it back onto the writer. As of #622 every `<producer> | grep -q` under
-# monitor/ — production and test, single-line and `\`-continuation — is
-# converted, and (case 2b) no non-shell doc under monitor/ PRESCRIBES the piped
-# form. The `| grep -q` text that remains under monitor/ is INTENTIONAL
+# narrow it back onto the writer.
+#
+# Second — and named here because the previous wording implied otherwise — a
+# reader the SOURCE TEXT does not spell as `grep`:
+#
+#     $notgrep -q                      the command word is a variable whose NAME
+#                                      does not mention grep ("$GREP" -q and
+#                                      $grepbin -q ARE covered since #1372)
+#     eval "… | grep -q …"             the pipeline is built at runtime
+#     alias g='grep -q'                the reader is renamed
+#     xargs grep -q, find -exec grep -q      the reader is an argument
+#     egrep|fgrep|zgrep|rg|ug -q       a grep VARIANT, not `grep`
+#
+# The variant row is a DECLARED boundary rather than a hidden hole: measured at
+# `3458180`, `git grep -nE '\|[[:space:]]*(e|f|z)grep[[:space:]]+-[A-Za-z]*q'
+# -- monitor` returns zero, so nothing under monitor/ uses one today. Widening
+# to them is cheap and defensible the moment one appears; asserting coverage of
+# them while the regex says `grep` is what this block exists to prevent.
+#
+# A seventh spelling will always exist. That is precisely why the ENUMERATION
+# in COVERAGE BOUNDARY — planted, executed, one control per member — is the
+# contract, and the regex is only its current implementation.
+#
+# THE CONVERSION CLAIM, RE-DATED. `#622` said "every `<producer> | grep -q`
+# under monitor/ is converted", and that was true of the spellings its regex
+# could see. Widening the matcher for `#1029` immediately surfaced TWO live
+# sites that had been sitting inside the boundary SENTENCE and outside the
+# PREDICATE the whole time — neither is a plant:
+#
+#     monitor/remote-forced-command.sh:410              | LC_ALL=C grep -q
+#     monitor/watcher/test-tmux-window-resolver.sh:784  | LC_ALL=C command grep -q
+#
+# BOTH ARE DEFENCE IN DEPTH, NOT LIVE FAIL-OPENS. This block first claimed the
+# `remote-forced-command.sh` site "fails OPEN on a security check". That was
+# overstated, and the correction is kept rather than quietly deleted: an
+# overstated severity that becomes a lineage's canonical example is worse than
+# no example, because it is the sentence everyone then cites.
+#
+#   * `remote-forced-command.sh:410` is the non-printable-byte refusal on the
+#     remote channel's forced command. `set -uo pipefail` IS in scope (line
+#     111) and the pipeline's status IS the `if` condition, so an inverted
+#     verdict would take the ELSE branch and admit the byte. It cannot fire
+#     THERE: three lines above, `case "$CMD" in *$'\n'*) refuse 12 …` rejects
+#     any embedded newline and `refuse` exits, so `$CMD` is SINGLE-LINE by
+#     construction — and grep must read a COMPLETE LINE before it can match, so
+#     a single-line producer never gives it the chance to exit early.
+#   * `test-tmux-window-resolver.sh:784` decodes ONE source line, so its payload
+#     is a few hundred bytes — orders of magnitude below the pipe buffer the
+#     hazard needs. Same conclusion, different reason.
+#
+# MEASURED on the exact source shape, `set -uo pipefail`, non-printable byte at
+# position 1, TEN trials per size — this is a race, so one sample is not a
+# measurement and a single point either side of the onset looks like a step it
+# is not:
+#
+#     single-line   1 KB · 70 KB · 200 KB · 2 MB      REFUSED 10/10 (all sizes)
+#     multi-line    8 KB · 32 KB · 60 KB              REFUSED 10/10
+#     multi-line   65 KB                              ADMITTED  2/10
+#     multi-line   70 KB                              ADMITTED  6/10
+#     multi-line  100 KB · 200 KB                     ADMITTED 10/10  (rc=141)
+#
+# So the hazard is real, it requires MULTI-LINE input, and its onset is the
+# 64 KiB pipe buffer — a probabilistic transition band, not a threshold. That
+# REFINES this issue's own framing: `printf` does keep writing past the match,
+# but whether that write BLOCKS long enough to see EPIPE is governed by the
+# buffer, so a small multi-line payload is in fact safe here. The durable
+# discriminator remains match POSITION — a match on the LAST line can never
+# fire, at any size.
+#
+# The conversion is still right, and that is why these sites are converted
+# rather than annotated: what protects line 410 is a newline refusal three
+# lines away, belonging to a different concern. Move it, weaken it, or copy the
+# idiom to a site with no such guard, and the hazard is live with nothing
+# saying so. Reverting either conversion, one at a time, reddens case 2 by name
+# (measured: rc 1, exactly one `FAIL: sigpipe idiom` each).
+#
+# So as of #1029 every `<producer> | <covered reader>` under monitor/ —
+# production and test, all four pipe spellings — is converted, and (case 2b)
+# no non-shell doc under monitor/ PRESCRIBES the piped form. The `| grep -q` text that remains under monitor/ is INTENTIONAL
 # fixture material: the equivalence-proof file (blanket-exempt); in THIS
 # file, planted idioms explicitly marked with the `grepq-fixture` sentinel; and
 # in docs, antipattern quotations marked `grepq-antipattern`. Both markers are
@@ -170,6 +285,136 @@ REPO_ROOT=$(cd "$_test_dir/../.." && pwd)
 PASS=0; FAIL=0
 ok()  { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
 bad() { printf '  FAIL: %s — %s\n' "$1" "$2" >&2; FAIL=$(( FAIL + 1 )); }
+# SOURCED SHELL WITH NEITHER AN EXTENSION NOR A SHEBANG. A startup dotfile is
+# executable shell that `.`-sources into every agent shell, but it carries no
+# `.sh` name and — being sourced, not executed — no shebang either, so BOTH of
+# _shell_files' arms miss it. monitor/shellenv/{.zshenv,.zshrc,.zprofile,.zlogin}
+# are exactly that, and they are load-bearing: they are what puts the `gh`
+# wrapper at the front of PATH (your-org/nexus-code#578). `*.sh.in` is the same
+# argument for templates — the generated file is shell, so the template is too.
+# Named explicitly rather than pattern-guessed, and asserted non-empty below: a
+# list that silently stops matching is a blind spot wearing a coverage badge.
+_SOURCED_SHELL=( -name '.zshenv' -o -name '.zshrc' -o -name '.zprofile' \
+                 -o -name '.zlogin' -o -name '.bashrc' -o -name '.profile' \
+                 -o -name '*.sh.in' )
+# PRUNE THE RUNTIME STATE DIRECTORY, in every walk below
+# (your-org/nexus-code#1487, sibling sweep). `monitor/.state/` is gitignored
+# runtime state, never source, and it GROWS for as long as a nexus runs.
+# Measured 2026-09-08, `find monitor -type f | wc -l` under bash:
+#
+#     primary clone   26,863 files — of which 26,048 (97%) are monitor/.state
+#     fresh clone        810 files — of which 3
+#
+# This probe opens every non-`.sh` file to read its shebang, so on the primary
+# it was opening ~26,000 runtime files and TIMED OUT at rc 124 — the same
+# "refused only where operators are" shape as #1487's own subject, arrived at
+# from a different cause (that one walks `.` and meets `work/`; this one walks
+# `monitor` and meets `.state`).
+#
+# THE CLASS WAS ALREADY KNOWN HERE AND FIXED ONE INSTANCE AT A TIME: the
+# `! -name '.zcompdump*'` below excludes zsh's gitignored completion cache
+# because admitting it made `guards-for-diff --run` REFUSE at rc 2. `.state` is
+# that same fact at 26,048 files instead of one, so it is pruned as a
+# DIRECTORY rather than named as another special case.
+_PRUNE_STATE=( -path 'monitor/.state' -prune -o )
+_shell_files() {   # emits monitor/… paths relative to CWD
+    { find monitor "${_PRUNE_STATE[@]}" -type f \( -name '*.sh' -o -name '*.zsh' -o -name '*.bash' \
+          -o "${_SOURCED_SHELL[@]}" \) -print;
+      find monitor "${_PRUNE_STATE[@]}" -type f ! -name '*.sh' ! -name '*.zsh' ! -name '*.bash' \
+           ! -name '.zcompdump*' -print0 \
+        | while IFS= read -r -d '' _f; do
+            # `.zcompdump*` is EXCLUDED before the shebang probe: it is zsh's
+            # completion cache, written into monitor/shellenv/ (ZDOTDIR) by any
+            # zsh that starts while a suite runs, and gitignored. Admitted, it
+            # joined the DECLARED population as a transient — a `guards-for-diff
+            # --run` concurrent with a full band was REFUSED (rc 2) because the
+            # path existed at enumeration and was gone at the existence check
+            # (your-org/nexus-code#1378, W2-20). A cache is not a file this lint
+            # reads for shell content; naming it as read was the defect.
+            # The mechanism obeys its own rule: the shebang test is the prescribed
+            # herestring form, NOT `head … | grep -q`. That pipeline was the FOURTH
+            # proxy in this lineage (pipefail-file → producer-name → file-glob → the
+            # enforcement mechanism re-instantiating the banned class), hidden by a
+            # blanket self-exemption. your-org/nexus-code#622 skeptic, round 2.
+            # your-org/nexus-code#1347. The herestring stays -- see above, it is
+            # the prescribed form and this fix is compatible with that rule --
+            # but its SUBJECT is no longer a command substitution. `$( … )`
+            # cannot carry a NUL, so a binary under monitor/ made bash warn
+            # `ignored null byte in input` and yielded a mangled value; and
+            # `head -1` on a binary with no early newline reads the WHOLE file.
+            # `IFS= read -r -n 200` has no substitution, cannot be truncated by
+            # a NUL, and is BOUNDED -- which is exactly what the shared
+            # predicate already does at monitor/shell-files.sh:177. Measured on
+            # a planted binary whose first line holds a NUL: the old form warns,
+            # this one does not, and both yield the same 12-char value.
+            IFS= read -r -n 200 _first < "$_f" 2>/dev/null || _first=''
+            grep -qE '^#!.*(bash|zsh|/sh$|/sh |env (ba|z)?sh)' \
+              <<<"$_first" && printf '%s\n' "$_f";
+          done;
+    } | sort -u
+}
+# _doc_files is the COMPLEMENT, not another extension list. Enumerating docs by
+# `*.md -o *.example -o …` would have been the SIXTH proxy — the identical
+# mistake at one remove, and it demonstrably had a hole: it missed the sourced
+# zsh dotfiles above, `*.conf`, and `*.sh.in`. So the partition is made TOTAL
+# instead: every file under monitor/ is a shell file, a doc, or explicitly
+# declared NEITHER. Only the "neither" set is a list, it is small, it is
+# justified per entry, and case 2b(d) asserts the partition covers everything.
+#
+# NEITHER = other languages (a `| grep -q` inside them does not run under the
+# caller's shell pipe-failure option, so it is not this hazard) and recorded
+# fixtures (terminal captures are RECORDINGS, not prescriptions — flagging them
+# would train people to ignore the guard).
+_NOT_SHELL_NOT_DOC='\.(py|pl|jq|awk|json|tsv|ansi|gitignore)$|/ci-bash-version$'
+_doc_files() {   # every file _shell_files does NOT claim and that is not declared NEITHER
+    local _sh; _sh=$(_shell_files)
+    find monitor "${_PRUNE_STATE[@]}" -type f -print | sort -u | while IFS= read -r _f; do
+        grep -qxF "$_f" <<<"$_sh" && continue
+        [[ "$_f" =~ $_NOT_SHELL_NOT_DOC ]] && continue
+        printf '%s\n' "$_f"
+    done
+}
+
+# --- the `--population` protocol (your-org/nexus-code#803, #1193) ---------
+#
+# THIS LINT WAS BYTE-IDENTICAL AND GREEN THROUGHOUT AND STILL MISSED A REAL
+# VIOLATION — and nothing malfunctioned. `#1171` added a violating file
+# straight past it because the lint declared no population and was therefore
+# INVISIBLE to `ng guards-for-diff`: absent from SELECTED and from CONSIDERED
+# AND EXCLUDED alike, for a diff whose defining feature was a violation of
+# this very lint, while ten other guards were selected and all ten passed at
+# rc 0. The author got a clean answer from the tool this repo prescribes for
+# exactly that gap. A green guard describes the population it has SEEN, never
+# the world; declaring the population is what makes those the same question
+# for a diff the index can route here.
+#
+# THE POPULATION IS THIS GUARD'S OWN ENUMERATORS — never a copy, never a
+# hand-typed list of what they return today. A copy is a second
+# implementation, and a second implementation drifts, at which point the
+# index reports with total confidence that this lint does not read a file it
+# does read.
+#
+# BOTH halves, because the lint scans both: `_shell_files` is the code axis
+# and `_doc_files` is its TOTAL complement (case 2b), the two together being
+# every file under monitor/ except the explicitly-declared NEITHER set.
+# Declaring only the shell half would re-open the #1029 boundary this suite
+# already closed, and would leave the doc axis exactly as unroutable as the
+# whole lint was before this block.
+#
+# Both enumerators emit paths relative to CWD, hence the `cd`.
+#
+# PLACED HERE — above section 1, not merely above the first scan — because
+# `gp_handle` EXITS when it handles the flag, so anything printed before it
+# lands in the probe's STDOUT and is read as a population row. Measured: with
+# this block after the enumerators' original position, the probe emitted four
+# lines of section-1 output ahead of 615 real rows, and `gp_render` would
+# have refused all four as paths that do not exist. A probe must answer
+# without doing the suite's work, and 'without' includes its banners.
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    ( cd "$REPO_ROOT" && { _shell_files; _doc_files; } )
+}
+gp_handle "$@"
 
 # ===========================================================================
 # 1. THE PREMISE IS REAL — proven by execution, not asserted in prose.
@@ -226,13 +471,87 @@ fi
 #    asserted below to be load-bearing, the self tier additionally asserted
 #    NARROW (an unmarked pipe-into-grep-q in this file is still flagged).
 echo "--- 2. the idiom is absent from monitor/ ---"
-# PRODUCER-AGNOSTIC: `<preceding char that is NOT a pipe>| … grep -<…q…>`. The
-# leading `(^|[^|])` matches a real single pipe while refusing `||` (a herestring
-# OR, not a pipe into grep); it needs no producer token on the line, so a
-# `\`-continuation `… \` ⏎ `| grep -q` is caught on its `| grep` line. `q` is
-# required (early-exit), so `grep -c` and a `-q`-less `grep` are correctly out,
-# and so is the safe `grep -q … <<<"…"` (no pipe). See COVERAGE BOUNDARY.
-LINT_RE='(^|[^|])\|[[:space:]]*grep[[:space:]]+-[A-Za-z]*q'
+# PRODUCER-AGNOSTIC on the writer side; ENUMERATED on the reader side. The full
+# covered set, and what is deliberately outside it, is in COVERAGE BOUNDARY —
+# and case 3 plants one control per member, so that enumeration is executed
+# rather than asserted.
+#
+# _GREPQ_READER is the READER ALONE, factored out because it is needed in two
+# places: after a same-line pipe, and at the start of a line whose predecessor
+# ends in a trailing pipe. Sharing one fragment is not tidiness — an earlier
+# round of this file validated a COPY of the matcher in its own controls, which
+# is one of the two reasons `echo "$var" | grep -q` survived #616. Two
+# transcriptions of one idea drift; one fragment used twice cannot.
+#
+#   (VAR=val|command|builtin|exec|env|nice|stdbuf) …   command-word prefixes,
+#                                                       any number, any order
+#   ([^…]*/)?                                          path qualification
+#   grep                                               the reader, spelled `grep`
+#   (-[A-Za-z]*q|--quiet|--silent)                     a quiet flag, either
+#                                                       spelling; `q` may sit
+#                                                       anywhere in a cluster
+#                                                       (`-Fq` and `-qF` both)
+#
+# `q` is REQUIRED (early-exit), so `grep -c` and a `-q`-less `grep` are
+# correctly out — both drain their input and carry no hazard — and so is the
+# safe `grep -q … <<<"…"`, which has no pipe at all.
+# The command word is either a literal (path-qualified or bare) `grep`, or — since
+# your-org/nexus-code#1372 — a VARIABLE whose name contains `grep` in any case,
+# quoted or not (`"$REAL_GREP" -q`, `$grepbin -q`): stub-claude-fixtures.sh:109
+# piped a `"$REAL_GREP"` writer into a `"$REAL_GREP" -qE` reader and recorded a
+# well-formed WRONG value at rc 0, and this lint's boundary had declared that
+# spelling out of scope. A variable whose name does not mention grep stays out —
+# the lint keys on the source text, and a name that hides the reader is the
+# renamed-reader row below, not this one.
+_GREPQ_READER='(([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*|command|builtin|exec|env|nice|stdbuf)[[:space:]]+)*(([^[:space:]|<>&;()"'"'"'`]*/)?grep|"?\$\{?[A-Za-z_]*[Gg][Rr][Ee][Pp][A-Za-z0-9_]*\}?"?)[[:space:]]+(-[A-Za-z]*q|--quiet|--silent)'
+# SAME-LINE pipe: `<preceding char that is NOT a pipe>|` and an optional `&`
+# (bash's `|&` is `2>&1 |`, and `[[:space:]]*` alone cannot cross the `&`). The
+# leading `(^|[^|])` matches a real single pipe while refusing `||` (a
+# herestring OR, not a pipe into grep); it needs no producer token on the line,
+# so a `\`-continuation `… \` ⏎ `| grep -q` is caught on its `| grep` line.
+LINT_RE='(^|[^|])\|&?[[:space:]]*'"$_GREPQ_READER"
+# TRAILING-PIPE split: the mirror image, where the pipe ends line N and the
+# reader opens line N+1. No single-line matcher can express it, so the scan
+# keeps the previous line (see _split_hits). Two halves, both required:
+#   _PIPE_EOL_RE   line N ends in exactly ONE pipe (`|` or `|&`), never `||`
+#   LINT_RE_SPLIT  line N+1 OPENS with a covered reader
+#
+# Written with `[|]`, never `\|`. These are handed to awk as DYNAMIC regexes,
+# where `\|` is degraded to a plain `|` with a warning — which turns
+# `(^|[^|])\|&?[[:space:]]*$` into an alternation whose last branch matches the
+# EMPTY STRING at the end of every line, i.e. a predicate that is true
+# everywhere. Measured while writing this, on this tree at `3458180`: **274**
+# false hits with the backslash spelling, **0** with `[|]`. A guard whose
+# precondition is universally true reports its second half as if it were the
+# conjunction — the same silent-widening shape this file exists to catch.
+_PIPE_EOL_RE='(^|[^|])[|]&?[[:space:]]*$'
+# …AND NOT A MARKDOWN TABLE ROW (your-org/nexus-code#1029 follow-up).
+# `|` is markdown's column separator, so EVERY row of a table ends in one. The
+# doc scan reads markdown, and a table immediately above a shell snippet made
+# this pass flag the snippet — including, measured, the lint's OWN PRESCRIBED
+# REPLACEMENT:
+#
+#     | flag | meaning |
+#     | --- | --- |
+#     | -q | quiet |
+#     grep -q needle <<<"$var"        <- the safe form, FLAGGED
+#
+# That is `#1059` ("procmatch-self fires on the bracketed pattern its own
+# message prescribes") reappearing in a different lint hours after its fix
+# merged as `#1090`. The cost is not the noise: an author who follows the advice
+# and is flagged anyway learns the tag is noise, and skips the NEXT firing,
+# which is real. A guard that punishes its own remedy is worse than silent.
+#
+# A table row is recognised by its LEADING `|` (optionally inside a shell
+# comment, since these tables also appear in `#`-prefixed prose). That covers
+# the leading-pipe style used throughout this repo and the `| --- | --- |`
+# delimiter row. NOT covered, and declared rather than implied: the pipe-less
+# GitHub style whose rows happen to end in `|` (`-q | quiet |`), and a genuine
+# shell continuation that both starts and ends with a pipe — contrived, and
+# case 3 plants the safe form rather than pretending neither exists.
+_MD_TABLE_ROW_RE='^[[:space:]]*(#[[:space:]]*)?[|]'
+LINT_RE_SPLIT='^[[:space:]]*'"$_GREPQ_READER"
+
 # Two exemption TIERS, because the two files that contain the idiom are not
 # alike. test-tmux-lookup-sigpipe.sh is a PURE fixture file (the tmux
 # equivalence proof) with no enforcement logic — blanket-exempt by path. THIS
@@ -277,39 +596,46 @@ _apply_exemptions() {
 # claim was false because the scan reused the lint's own `.sh` proxy. So the
 # scan now enumerates every `*.sh|.zsh|.bash` file AND every extensionless file
 # whose first line is a sh/bash/zsh shebang.
-# SOURCED SHELL WITH NEITHER AN EXTENSION NOR A SHEBANG. A startup dotfile is
-# executable shell that `.`-sources into every agent shell, but it carries no
-# `.sh` name and — being sourced, not executed — no shebang either, so BOTH of
-# _shell_files' arms miss it. monitor/shellenv/{.zshenv,.zshrc,.zprofile,.zlogin}
-# are exactly that, and they are load-bearing: they are what puts the `gh`
-# wrapper at the front of PATH (your-org/nexus-code#578). `*.sh.in` is the same
-# argument for templates — the generated file is shell, so the template is too.
-# Named explicitly rather than pattern-guessed, and asserted non-empty below: a
-# list that silently stops matching is a blind spot wearing a coverage badge.
-_SOURCED_SHELL=( -name '.zshenv' -o -name '.zshrc' -o -name '.zprofile' \
-                 -o -name '.zlogin' -o -name '.bashrc' -o -name '.profile' \
-                 -o -name '*.sh.in' )
-_shell_files() {   # emits monitor/… paths relative to CWD
-    { find monitor -type f \( -name '*.sh' -o -name '*.zsh' -o -name '*.bash' \
-          -o "${_SOURCED_SHELL[@]}" \);
-      find monitor -type f ! -name '*.sh' ! -name '*.zsh' ! -name '*.bash' -print0 \
-        | while IFS= read -r -d '' _f; do
-            # The mechanism obeys its own rule: the shebang test is the prescribed
-            # herestring form, NOT `head … | grep -q`. That pipeline was the FOURTH
-            # proxy in this lineage (pipefail-file → producer-name → file-glob → the
-            # enforcement mechanism re-instantiating the banned class), hidden by a
-            # blanket self-exemption. your-org/nexus-code#622 skeptic, round 2.
-            grep -qE '^#!.*(bash|zsh|/sh$|/sh |env (ba|z)?sh)' \
-              <<<"$(head -1 "$_f" 2>/dev/null)" && printf '%s\n' "$_f";
-          done;
-    } | sort -u
+# `_SOURCED_SHELL` and `_shell_files` are defined near the TOP of this file,
+# not here, so the `--population` probe can call them before the suite does
+# any work (your-org/nexus-code#1193). Only their position changed.
+# The TRAILING-PIPE pass. `awk` and not a second `grep`, because the predicate
+# spans two lines and no single-line matcher can express it — which is exactly
+# why this member of the covered set outlived the other five. Reported at the
+# READER's line, matching the same-line pass's convention of naming where the
+# early-exiting reader is, so both passes point at the thing to rewrite.
+#
+# `prevpipe` is reset at FNR==1 so a trailing pipe on the last line of one file
+# cannot pair with the first line of the next.
+_split_hits() {   # $@ = files
+    # Two guards on the PREVIOUS line, both about telling a pipe from something
+    # that merely ends in the same character:
+    #   * a markdown table row is not a pipe continuation (see _MD_TABLE_ROW_RE);
+    #   * a whole-line COMMENT does not continue a pipeline into CODE. Prose
+    #     cannot pipe into the next statement. Comment-to-comment still pairs,
+    #     which is what keeps a doc that PRESCRIBES the split form in scope
+    #     (case 2b's whole subject), and code-to-code is untouched.
+    awk -v rdr="$LINT_RE_SPLIT" -v pend="$_PIPE_EOL_RE" -v mdrow="$_MD_TABLE_ROW_RE" '
+        FNR == 1 { prevpipe = 0; prevcmt = 0 }
+        {
+            cmt = ($0 ~ /^[[:space:]]*#/)
+            if (prevpipe && prevcmt == cmt && $0 ~ rdr)
+                printf "%s:%d:%s\n", FILENAME, FNR, $0
+            prevpipe = ($0 ~ pend) && ($0 !~ mdrow)
+            prevcmt  = cmt
+        }
+    ' "$@" 2>/dev/null
 }
+# BOTH passes, one comment filter, one dedup. A line can match both (a same-line
+# `| grep -q` whose predecessor also ends in a pipe); `sort -u` makes that one
+# finding rather than two, and every consumer below counts findings.
 _scan_root() {   # $1 = tree whose monitor/ subtree to scan; grep the shell files
     ( cd "$1" 2>/dev/null || exit 0
       local -a _files; mapfile -t _files < <(_shell_files)
       (( ${#_files[@]} )) || exit 0
-      grep -EHn "$LINT_RE" "${_files[@]}" 2>/dev/null \
-        | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#'
+      { grep -EHn "$LINT_RE" "${_files[@]}" 2>/dev/null
+        _split_hits "${_files[@]}"; } \
+        | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' | sort -u
     )
 }
 _lint_scan() { _scan_root "$REPO_ROOT"; }
@@ -413,34 +739,22 @@ fi
 # ===========================================================================
 echo "--- 2b. prescriptive shell in NON-shell files (docs, examples, registries) ---"
 DOC_SENTINEL='grepq-antipattern'
-# _doc_files is the COMPLEMENT, not another extension list. Enumerating docs by
-# `*.md -o *.example -o …` would have been the SIXTH proxy — the identical
-# mistake at one remove, and it demonstrably had a hole: it missed the sourced
-# zsh dotfiles above, `*.conf`, and `*.sh.in`. So the partition is made TOTAL
-# instead: every file under monitor/ is a shell file, a doc, or explicitly
-# declared NEITHER. Only the "neither" set is a list, it is small, it is
-# justified per entry, and case 2b(d) asserts the partition covers everything.
-#
-# NEITHER = other languages (a `| grep -q` inside them does not run under the
-# caller's shell pipe-failure option, so it is not this hazard) and recorded
-# fixtures (terminal captures are RECORDINGS, not prescriptions — flagging them
-# would train people to ignore the guard).
-_NOT_SHELL_NOT_DOC='\.(py|pl|jq|awk|json|tsv|ansi|gitignore)$|/ci-bash-version$'
-_doc_files() {   # every file _shell_files does NOT claim and that is not declared NEITHER
-    local _sh; _sh=$(_shell_files)
-    find monitor -type f | sort -u | while IFS= read -r _f; do
-        grep -qxF "$_f" <<<"$_sh" && continue
-        [[ "$_f" =~ $_NOT_SHELL_NOT_DOC ]] && continue
-        printf '%s\n' "$_f"
-    done
-}
+# `_NOT_SHELL_NOT_DOC` and `_doc_files` are defined near the TOP of this file
+# for the same reason as `_shell_files` — see the note there. Only their
+# position changed; the partition argument is unchanged and travelled with
+# them.
 # NOTE: no comment-line filter here. In a doc, the snippet IS the payload —
 # filtering comments would re-hide the exact site this case exists to catch.
 _doc_scan() {
     ( cd "${1:-$REPO_ROOT}" 2>/dev/null || exit 0
       local -a _files; mapfile -t _files < <(_doc_files)
       (( ${#_files[@]} )) || exit 0
-      grep -EHn "$LINT_RE" "${_files[@]}" 2>/dev/null )
+      # Same two passes as the code scan. A doc that PRESCRIBES the split form
+      # is as much a template for the defect as one prescribing the same-line
+      # form; letting the two scans cover different spelling sets would put the
+      # doc axis back where COVERAGE BOUNDARY was before #1029.
+      { grep -EHn "$LINT_RE" "${_files[@]}" 2>/dev/null
+        _split_hits "${_files[@]}"; } | sort -u )
 }
 _doc_apply() { grep -vF "$DOC_SENTINEL" || true; }
 mapfile -t _dochits < <( _doc_scan | _doc_apply )
@@ -513,8 +827,14 @@ _excluded=(); _excluded_but_shell=()
 for _f in "${_all_files[@]}"; do
     [[ "$_f" =~ $_NOT_SHELL_NOT_DOC ]] || continue
     _excluded+=("$_f")
+    # Same NUL-safe probe as the population sweep above (your-org/nexus-code#1347):
+    # `$(head -1 …)` on a binary with no early newline reads the whole file and
+    # warns per NUL; `IFS= read -r -n 200` has no substitution. This was the
+    # second copy of the probe and it was left on the old form when the first
+    # was fixed — noted on the W2-20 handover, fixed on the merge.
+    IFS= read -r -n 200 _first < "$REPO_ROOT/$_f" 2>/dev/null || _first=''
     grep -qE '^#!.*(bash|zsh|/sh$|/sh |env (ba|z)?sh)' \
-        <<<"$(head -1 "$REPO_ROOT/$_f" 2>/dev/null)" && _excluded_but_shell+=("$_f")
+        <<<"$_first" && _excluded_but_shell+=("$_f")
 done
 if (( ${#_excluded[@]} > 0 )); then
     ok "exclusion list load-bearing: _NOT_SHELL_NOT_DOC excludes ${#_excluded[@]} file(s) (other languages + recorded fixtures) of ${#_all_files[@]} under monitor/; shell=${#_shf2[@]} doc=${#_docall[@]}"
@@ -559,6 +879,106 @@ else
 Either it was renamed — update this witness — or _doc_files' extension list no longer
 reaches it, and this whole axis is green over nothing."
 fi
+
+# ===========================================================================
+# 2b(e). THE PASS MUST NOT FIRE ON THE REMEDY IT PRESCRIBES.
+#
+#     `|` is markdown's column separator, so every row of a table ends in one,
+#     and the trailing-pipe pass read a table row as a pipe continuation. The
+#     line it then flagged was the lint's OWN PRESCRIBED REPLACEMENT — measured,
+#     not hypothesised: `monitor/flags.md:6:grep -q needle <<<"$var"`.
+#
+#     That is your-org/nexus-code#1059 — "procmatch-self fires on the bracketed
+#     pattern its own message prescribes" — recurring in a different lint hours
+#     after its fix merged as `#1090`. The cost is not noise. An author who
+#     follows the advice and is flagged anyway learns the tag is noise and
+#     skips the NEXT firing, which is real.
+#
+#     So: the exact planted doc is a NEGATIVE control, and a doc that genuinely
+#     prescribes the split form is a POSITIVE one — because "stop flagging the
+#     table" is satisfiable by disabling the pass, and only the pair rules that
+#     out.
+# ===========================================================================
+echo "--- 2b(e). markdown tables are not pipe continuations ---"
+MTMP=$(mktemp -d) || { echo "mktemp failed" >&2; exit 1; }
+mkdir -p "$MTMP/monitor/watcher"
+: > "$MTMP/monitor/watcher/keep.sh"   # so _shell_files is non-empty
+cat > "$MTMP/monitor/flags.md" <<'MDSAFE'
+# grep flags
+
+| flag | meaning |
+| --- | --- |
+| -q | quiet |
+grep -q needle <<<"$var"
+MDSAFE
+mapfile -t _md_safe < <( _doc_scan "$MTMP" | _doc_apply )
+if (( ${#_md_safe[@]} == 0 )); then
+    ok "a markdown table above the PRESCRIBED herestring form is not flagged (#1059's class, not reintroduced)"
+else
+    bad "markdown table/false positive" "the lint flagged its own prescribed replacement: ${_md_safe[*]}
+A table row ends in \`|\` because that is markdown's column separator, not because
+it pipes into the next line. Flagging the remedy teaches authors the tag is noise."
+fi
+# POSITIVE control on the same axis: a doc that really does PRESCRIBE the split
+# form must still be caught, or the fix above is indistinguishable from
+# switching the pass off.
+# WRITTEN WITH printf, NOT A HEREDOC, and that is not a style choice. A heredoc
+# body lives in THIS file, so a fixture that WRITES the split form puts a real
+# trailing-pipe idiom two lines apart in the lint's own source — and case 2
+# caught exactly that while this control was being added
+# (`test-sigpipe-assertion-lint.sh:788: grep -q '<marker>'`). Quoting each line
+# as a printf argument keeps the fixture bytes identical while leaving no pipe
+# at end-of-line here. `test-helper-honesty.sh` records the same manoeuvre for
+# the same reason.
+printf '%s\n' \
+    'Recommended healthcheck body assertion:' \
+    '' \
+    '    curl -fsS "$url" |' \
+    "        grep -q '<marker>'" \
+    > "$MTMP/monitor/flags.md"
+mapfile -t _md_bad < <( _doc_scan "$MTMP" | _doc_apply )
+if (( ${#_md_bad[@]} == 1 )) && [[ "${_md_bad[0]}" == *"flags.md:4:"* ]]; then
+    ok "…and a doc that genuinely PRESCRIBES the trailing-pipe form is still caught on its reader line"
+else
+    bad "markdown table/over-correction" "expected exactly the line-4 hit, got ${#_md_bad[@]}: ${_md_bad[*]:-<none>}
+The table exclusion has switched the trailing-pipe pass off for docs instead of
+narrowing it — which satisfies the negative control above and covers nothing."
+fi
+rm -rf "$MTMP"
+
+# 2b(f). PROSE DOES NOT PIPE INTO CODE. The second half of the same narrowing:
+# a whole-line comment ending in `|` is a sentence that happens to end in a
+# pipe character, and the CODE line after it is not its continuation. Asserted
+# with its own positive twin, so this too cannot be satisfied by switching the
+# pass off.
+echo "--- 2b(f). a comment ending in a pipe does not continue into code ---"
+PTMP=$(mktemp -d) || { echo "mktemp failed" >&2; exit 1; }
+mkdir -p "$PTMP/monitor/watcher"
+cat > "$PTMP/monitor/watcher/prose.sh" <<'PROSE'
+#!/usr/bin/env bash
+set -uo pipefail
+# the separator we use is |
+grep -q needle <<<"$var"
+PROSE
+mapfile -t _prose < <( _scan_root "$PTMP" || true )
+if (( ${#_prose[@]} == 0 )); then
+    ok "a prose comment ending in \`|\` does not make the next CODE line a pipe continuation"
+else
+    bad "prose/false positive" "flagged a herestring under a comment: ${_prose[*]}"
+fi
+cat > "$PTMP/monitor/watcher/prose.sh" <<'PROSE2'
+#!/usr/bin/env bash
+set -uo pipefail
+some_producer |
+    grep -q needle && echo hit  # grepq-fixture
+PROSE2
+mapfile -t _prose2 < <( _scan_root "$PTMP" || true )
+if (( ${#_prose2[@]} == 1 )) && [[ "${_prose2[0]}" == *"prose.sh:4:"* ]]; then
+    ok "…and a REAL trailing-pipe continuation in the same file is still caught"
+else
+    bad "prose/over-correction" "expected exactly the line-4 hit, got ${#_prose2[@]}: ${_prose2[*]:-<none>}"
+fi
+rm -rf "$PTMP"
 
 echo "--- 2c. the comment filter drops prose but NOT a real line ---"
 CTMP=$(mktemp -d) || { echo "mktemp failed" >&2; exit 1; }
@@ -664,6 +1084,81 @@ same-line regex — this is how monitor/watcher/main.sh:2009 survived #625/#630.
 fi
 rm -f "$TMP/monitor/watcher/planted-cont.sh"
 
+# READER-SPELLING controls (your-org/nexus-code#1029). COVERAGE BOUNDARY above
+# ENUMERATES the reader and pipe spellings this lint claims. An enumeration
+# asserted only in prose is precisely the false promise #1029 is about — the
+# old boundary sentence promised "ANY producer piped into `grep` with a `q`
+# flag" while SIX spellings inside it evaded the regex, and case 3 planted not
+# one of them. So every member of the enumeration is planted here.
+#
+# Each was first measured to carry the REAL hazard, not merely to match a
+# regex: match on line 1 of a 200 001-byte payload, `set -uo pipefail`, status
+# consumed. All returned `rc=141` — pipeline FAILURE on a string that DOES
+# match. Before the widening exactly ONE of them (`| grep -q`) was reported;
+# the other six were silent. If a future edit narrows the matcher, the member
+# it drops reddens here by name instead of quietly leaving the boundary a lie.
+#
+# `<label>|<expected line>|<body>` — `read` puts the remainder, pipes and all,
+# in the last field, so the body may contain `|`. `%b` expands `\n`, which is
+# how the two-line trailing-pipe plant is written.
+READER_SPELLINGS=(
+    "short-flag|3|if printf '%s' \"\$b\" | grep -q needle; then :; fi"                            # grepq-fixture
+    "short-cluster-qF|3|if printf '%s' \"\$b\" | grep -qF needle; then :; fi"                     # grepq-fixture
+    "short-cluster-Fq|3|if printf '%s' \"\$b\" | grep -Fq needle; then :; fi"                     # grepq-fixture
+    "long-quiet|3|if printf '%s' \"\$b\" | grep --quiet needle; then :; fi"                       # grepq-fixture
+    "long-silent|3|if printf '%s' \"\$b\" | grep --silent needle; then :; fi"                     # grepq-fixture
+    "command-prefix|3|if printf '%s' \"\$b\" | command grep -q needle; then :; fi"                # grepq-fixture
+    "env-prefix|3|if printf '%s' \"\$b\" | env grep -q needle; then :; fi"                        # grepq-fixture
+    "path-qualified|3|if printf '%s' \"\$b\" | /bin/grep -q needle; then :; fi"                   # grepq-fixture
+    "var-prefix|3|if printf '%s' \"\$b\" | LC_ALL=C grep -q needle; then :; fi"                   # grepq-fixture
+    "combined|3|if printf '%s' \"\$b\" | LC_ALL=C command /bin/grep --quiet needle; then :; fi"   # grepq-fixture
+    "amp-pipe|3|if printf '%s' \"\$b\" |& grep -q needle; then :; fi"                             # grepq-fixture
+    "trailing-pipe|4|printf '%s' \"\$b\" |\n    grep -q needle && echo hit"                       # grepq-fixture
+    "var-quoted|3|if printf '%s' \"\$b\" | \"\$REAL_GREP\" -qE needle; then :; fi"                 # grepq-fixture (#1372)
+    "var-bare|3|if printf '%s' \"\$b\" | \$grepbin -q needle; then :; fi"                           # grepq-fixture (#1372)
+)
+for _spec in "${READER_SPELLINGS[@]}"; do
+    IFS='|' read -r _lbl _wantline _body <<<"$_spec"
+    _f="$TMP/monitor/watcher/spelling-$_lbl.sh"
+    { printf '#!/usr/bin/env bash\nset -uo pipefail\n'; printf '%b\n' "$_body"; } > "$_f"
+    mapfile -t _sp < <( _scan_root "$TMP" || true )
+    if (( ${#_sp[@]} == 1 )) && [[ "${_sp[0]}" == *"spelling-$_lbl.sh:$_wantline:"* ]]; then
+        ok "reader spelling \`$_lbl\` caught at the expected file and line — enumerated in COVERAGE BOUNDARY, asserted here"
+    else
+        bad "reader spelling/$_lbl" "expected exactly 1 hit in spelling-$_lbl.sh line $_wantline, got ${#_sp[@]}:
+${_sp[*]:-<none>}
+COVERAGE BOUNDARY claims this spelling. It carries the hazard (measured rc=141),
+so a miss here is the boundary promising coverage the predicate does not deliver
+— your-org/nexus-code#1029 exactly, reintroduced."
+    fi
+    rm -f "$_f"
+done
+
+# TRAILING-PIPE negative control, and it is the one that earns its keep. The
+# split pass pairs a line ending in a pipe with the next line's reader. A
+# `||`-joined pair of HERESTRING greps split across lines has the same
+# silhouette — line N ends in `|`-ish, line N+1 opens with `grep -q` — and is
+# the prescribed SAFE form. `_PIPE_EOL_RE` requires exactly ONE trailing pipe,
+# which is what tells them apart. Planted so a future edit that relaxes it to
+# `\|+` reddens here rather than flagging the fix this file prescribes.
+cat > "$TMP/monitor/watcher/split-safe.sh" <<'SPLITSAFE'
+#!/usr/bin/env bash
+set -uo pipefail
+grep -qF -- "$a" <<<"$x" ||
+    grep -qF -- "$b" <<<"$y"
+printf '%s' "$c" |
+    wc -l
+SPLITSAFE
+mapfile -t _splitsafe < <( _scan_root "$TMP" || true )
+if (( ${#_splitsafe[@]} == 0 )); then
+    ok "the \`||\`-joined herestring pair SPLIT ACROSS LINES is not flagged, and neither is a trailing pipe into a NON-grep reader"
+else
+    bad "split control/false positive" "the trailing-pipe pass flagged a safe form: ${_splitsafe[*]}
+A line ending in \`||\` is a boolean continuation, not a pipe; a trailing pipe into
+\`wc\` is not an early-exiting reader. Flagging either trains people to ignore the guard."
+fi
+rm -f "$TMP/monitor/watcher/split-safe.sh"
+
 # EXTENSIONLESS control — planted AT path monitor/ng, the exact file that was
 # invisible (your-org/nexus-code#622 skeptic asked for the negative control to
 # run against the file that hid, not a generic stand-in). It is extensionless
@@ -706,6 +1201,47 @@ if (( ${#after[@]} == 0 )); then
     ok "the prescribed replacement (and a \`||\`-joined herestring pair) does not trip the lint"
 else
     bad "control/fix" "the herestring/\`||\` form is flagged: ${after[*]}"
+fi
+
+# ===========================================================================
+# your-org/nexus-code#1347 — the first-line probe over an UNFILTERED corpus.
+# TWO-SIDED, because this is a POPULATION predicate and the dominant defect
+# here is a silently SMALLER population, not a louder one.
+# ===========================================================================
+_n47=$(mktemp -d) || _n47=''
+if [[ -n "$_n47" ]]; then
+    # A binary whose FIRST LINE carries a NUL. `$( … )` cannot hold a NUL, so
+    # the pre-#1347 form warned `ignored null byte in input` and yielded a
+    # mangled value; `IFS= read -r -n 200` does neither. The `.pyc` that sits
+    # under monitor/ on a working tree does NOT trigger it (its first line is
+    # `3\r\r\n`), which is exactly why this control is PLANTED rather than
+    # left to whatever binary happens to be present.
+    printf '\x7fELF\x02\x01\x00\x00\x00\x00\x00\x00binary\n' > "$_n47/bin.dat"
+    _w47=$( { IFS= read -r -n 200 _l47 < "$_n47/bin.dat" 2>/dev/null || _l47=''; } 2>&1 )
+    if [[ -z "$_w47" ]]; then
+        ok "#1347: a planted binary first-line read emits NO warning"
+    else
+        bad "#1347: a planted binary first-line read emits NO warning" "got: $_w47"
+    fi
+
+    # The OTHER direction, and the one that matters more: a real shell file
+    # with an unusual first line must STILL classify as shell. An over-tight
+    # read is a population that shrinks in silence.
+    _miss47=0
+    for _sheb47 in '#!/usr/bin/env  zsh' '#!/bin/sh' '#!/usr/bin/env bash' '#!/bin/bash -eu'; do
+        printf '%s\nexit 0\n' "$_sheb47" > "$_n47/odd.sh"
+        IFS= read -r -n 200 _l47 < "$_n47/odd.sh" 2>/dev/null || _l47=''
+        grep -qE '^#!.*(bash|zsh|/sh$|/sh |env (ba|z)?sh)' <<<"$_l47" \
+            || { _miss47=1; _bad47="$_sheb47"; }
+    done
+    if (( _miss47 == 0 )); then
+        ok "#1347: four unusual-but-real shebangs still classify as shell"
+    else
+        bad "#1347: four unusual-but-real shebangs still classify as shell" "missed: ${_bad47:-?}"
+    fi
+    rm -rf "$_n47"
+else
+    bad "#1347 controls" "mktemp failed — the controls did NOT run"
 fi
 
 # ===========================================================================

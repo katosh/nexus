@@ -446,11 +446,26 @@ _nfiles=$(find "$_dir/test-integration" -name 'test-realmodel-*.sh' -type f | wc
 # bumped; `neither` is still 0. Recorded because this census going red TWICE
 # for one PR is the manifest working as designed — it forced a human to look
 # at each new announcement instead of letting the band drift.
-assert_eq "manifest: 9 realmodel files are enumerated"   "$_nfiles"          "9"
-assert_eq "manifest: 46 realmodel FAIL announcements"    "$(echo "$_c" | cut -d' ' -f1)" "46"
-assert_eq "manifest: 11 are disposed by \`exit\`, NOT by a counter" \
-    "$(echo "$_c" | cut -d' ' -f2)" "11"
-assert_eq "manifest: 35 are disposed by a counter bump"  "$(echo "$_c" | cut -d' ' -f3)" "35"
+#
+# 9 -> 10 files, 46 -> 51 announcements, 11 -> 15 by-exit, 35 -> 36 by-count:
+# your-org/nexus-code#1334 added `test-realmodel-trust-sandboxed-env.sh`, the
+# canary for the undocumented `CLAUDE_CODE_SANDBOXED` trust-gate bypass the
+# worker launchers now set. Re-derived: four preconditions disposed by
+# `exit 1` (worker-settings.json unreadable; `jq` absent; either window never
+# appearing) and one expected-count guard disposed by `_th_fail`. `neither`
+# is still 0.
+#
+# 10 -> 11 files, 51 -> 52 announcements, 15 by-exit unchanged, 36 -> 37
+# by-count: your-org/nexus-code#1535 added `test-realmodel-longjob-wake.sh`
+# (the longjob dispatcher against the real binary). Re-derived on the
+# bundle-2609 tree by this suite's own census (this block, run on the merged
+# tree: `11`, `52 15 37 0`): one new announcement, disposed by a counter
+# bump. `neither` is still 0.
+assert_eq "manifest: 11 realmodel files are enumerated"  "$_nfiles"          "11"
+assert_eq "manifest: 52 realmodel FAIL announcements"    "$(echo "$_c" | cut -d' ' -f1)" "52"
+assert_eq "manifest: 15 are disposed by \`exit\`, NOT by a counter" \
+    "$(echo "$_c" | cut -d' ' -f2)" "15"
+assert_eq "manifest: 37 are disposed by a counter bump"  "$(echo "$_c" | cut -d' ' -f3)" "37"
 # The load-bearing one: the carve-out's CONCLUSION.
 assert_eq "manifest: ZERO realmodel aborts neither exit nor count" \
     "$(echo "$_c" | cut -d' ' -f4)" "0"

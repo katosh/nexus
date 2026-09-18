@@ -54,7 +54,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s\n           expected: %s\n           in: %s\n' \
@@ -86,7 +87,24 @@ build_tree() {  # build_tree — fresh fake nexus with a WORKING helper
     mkdir -p "$FAKE/monitor/.state" "$FAKE/config" "$FAKE/reports"
     cp "$NG_REAL" "$FAKE/monitor/ng"
     cp "$MON/_bookkeeping.sh" "$FAKE/monitor/_bookkeeping.sh"
+    # your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+    cp "$MON/_nexus-root.sh" "$FAKE/monitor/_nexus-root.sh"
     cp "$MON/_tmux-window.sh" "$FAKE/monitor/_tmux-window.sh"
+    # your-org/nexus-code#977 — `retire-window` is gate-then-prune, and since
+    # #977 the gate runs on the ABSENT path too (checks 1b/1c are obligation
+    # checks, not liveness checks). So `retire-preflight.sh` is a hard
+    # dependency of every non-`--dry-run` invocation, not of the
+    # present-window arm only, and `ng` now refuses BY NAME rather than
+    # leaking `rc 127` when it is missing.
+    #
+    # This fixture omitted it, and that was invisible until #977: the absent
+    # path never consulted the gate, so a fake tree with NO GATE AT ALL retired
+    # windows and reported success. The subject of this suite is the
+    # `_tmux-window.sh` dependency, so supplying the OTHER dependency is what
+    # keeps its assertions about the one it means to test.
+    cp "$MON/retire-preflight.sh" "$FAKE/monitor/retire-preflight.sh"
+    cp "$MON/_obligations.sh"     "$FAKE/monitor/_obligations.sh"
+    chmod +x "$FAKE/monitor/retire-preflight.sh"
     chmod +x "$FAKE/monitor/ng"
     cat > "$FAKE/config/load.sh" <<'STUB'
 #!/usr/bin/env bash

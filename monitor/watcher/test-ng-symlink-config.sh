@@ -51,7 +51,8 @@ assert_not_contains() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — expected to find %q\n' "$label" "$needle" >&2
         printf '         output:\n%s\n' "$hay" | sed 's/^/           /' >&2
@@ -72,6 +73,8 @@ cp "$NG_REAL" "$TREE/monitor/ng"
 # it (your-org/nexus-code#601/#605: degrading to the silent-coercion
 # behaviour it replaces is worse than refusing). Copy it alongside.
 cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$TREE/monitor/_bookkeeping.sh"
+# your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+cp "$(dirname "$NG_REAL")/_nexus-root.sh" "$TREE/monitor/_nexus-root.sh"
 
 # Stubbed config/load.sh: drops a marker EVERY time it is invoked (proving
 # it was found via the resolved _script_dir) and echoes a distinct sentinel

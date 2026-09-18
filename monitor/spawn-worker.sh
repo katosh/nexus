@@ -149,6 +149,34 @@
 #      carries the issue form).
 #   18 ## Reply-to wrap-up override section empty or missing in
 #      $FLOOR_FILE (only checked in --reply-to mode).
+#   19 $NEXUS_STATE_DIR is set but names a directory this script cannot
+#      create or write. Refused rather than falling back to
+#      $NEXUS_ROOT/monitor/.state: a caller that pinned the state dir has
+#      already concluded it is isolated, and the silent fall-through is
+#      exactly what leaked a fixture's skeptic marker into the operator's
+#      live state (your-org/nexus-code#973).
+##   20 --skeptic-role where the SPAWNING agent is one of the REVIEWED
+#      windows — `--skeptic-target`, or `--skeptic-orig` when it differs
+#      (a depth-2 spawn obligates a verdict on the chain root too, so the
+#      root is a reviewed party in the ledger's own terms). A worker may
+#      not spawn its own skeptic, because the reviewed party would be
+#      writing its own reviewer's mandate (your-org/nexus-code#1098). File `ng request file --kind spawn-skeptic` instead, or
+#      override loudly with NEXUS_SKEPTIC_SELF_SPAWN=1 plus
+#      NEXUS_SKEPTIC_SELF_SPAWN_REASON='<why>' (both required; audited to
+#      $STATE_DIR/skeptic-self-spawn.log).
+#   22 --dry-run without --resume (your-org/nexus-code#1471): the flag is
+#      consumed only by the resume branch; outside it the script used to
+#      fall through to a REAL spawn. Refused before anything is composed.
+#      --print-prompt is the no-side-effect seam for a fresh spawn.
+#   23 an unrecognised `--`-prefixed option (your-org/nexus-code#1471): the
+#      parser's default arm used to pass it through, so a typo became an
+#      ordinary spawn with the intended behaviour absent.
+#   21 post-spawn trust verification (your-org/nexus-code#1334): the worker
+#      sat on the workspace-trust dialog and recovery is exhausted
+#      (NEXUS_SPAWN_TRUST_MAX_RECOVER, default 2) or REFUSED (a transcript
+#      exists or moved, so something ran and the pane must not be killed).
+#      The window is left in place with the dialog readable. Clear of the
+#      `timeout` injection set (124/125/126/127/137/143).
 #
 # This helper does NOT remove $PROMPT_FILE — the orchestrator owns it.
 
@@ -228,7 +256,11 @@ usage: monitor/spawn-worker.sh -n <window-name> -c <workdir> -p <prompt-file>
                  \`skeptic-spawn\` linkage event and seeds the comms
                  channel for the reviewed task.
   --skeptic-target <window>  with --skeptic-role: the worker window this
-                 skeptic is validating.
+                 skeptic is validating. REFUSED (exit 20) when the spawning
+                 agent IS that window OR is --skeptic-orig (the chain root,
+                 which a depth-2 spawn also obligates a verdict on) — a worker
+                 may not spawn its own skeptic; file \`ng request file --origin <w> --kind spawn-skeptic\`
+                 instead (#1098).
   --skeptic-orig <window>  with --skeptic-role: the ORIGINAL worker window
                  at the root of the skeptic chain. A second-or-later skeptic
                  reviews not just its immediate target (the prior skeptic)
@@ -369,9 +401,34 @@ for arg in "$@"; do
         --reply-to=*)   REPLY_TO="${arg#--reply-to=}" ;;
         --issue)        expect_issue_val=1 ;;
         --issue=*)      ISSUE_NUM="${arg#--issue=}" ;;
+        --)             filtered_args+=("$arg") ;;
+        --*)
+            # AN UNRECOGNISED LONG OPTION IS REFUSED, NOT PASSED THROUGH
+            # (your-org/nexus-code#1471). This arm used to be the permissive
+            # default below, so `--dryrun`, `--skpetic-role` and every other
+            # typo became an ordinary spawn with the intended behaviour absent —
+            # the allowlist-with-default-deny doctrine inverted, in the one
+            # script whose side effect is a live agent. Bare positionals and
+            # short options still flow to getopts below; only `--`-prefixed
+            # words nobody declared are refused.
+            echo "spawn-worker: unknown option '$arg' — refusing rather than spawning with it ignored (your-org/nexus-code#1471). See --help." >&2
+            exit 23
+            ;;
         *) filtered_args+=("$arg") ;;
     esac
 done
+# --dry-run OUTSIDE --resume IS AN ERROR, NOT A NO-OP (your-org/nexus-code#1471).
+# The flag's only consumer is the resume branch; without --resume it was set,
+# never read, and the script fell through to a REAL spawn — the one flag whose
+# universal meaning is "take no action" performed the action. A caller who
+# read the header ("--dry-run  with --resume: …") can still reasonably expect
+# the universal meaning; the honest answer is to refuse, loudly, before
+# anything is composed. Exit 22 is its own code so a caller can tell it from
+# a usage error.
+if [ "$RESUME_DRYRUN" -eq 1 ] && [ -z "$RESUME_TARGET" ] && [ "$expect_resume_val" -eq 0 ]; then
+    echo "spawn-worker: --dry-run is only meaningful with --resume (it prints the resolved resume plan); without --resume it used to be silently IGNORED and a REAL worker was spawned (your-org/nexus-code#1471). Refusing. To compose a prompt without spawning, use --print-prompt." >&2
+    exit 22
+fi
 if [ "$expect_resume_val" -eq 1 ]; then
     echo "spawn-worker: --resume requires a value (<window-name | session-id>)" >&2
     usage
@@ -478,6 +535,21 @@ while getopts "n:c:p:r:h" opt; do
         h|*) usage ;;
     esac
 done
+
+# your-org/nexus-code#1153 (second, cheap improvement at the SOURCE): a window
+# NAMED like a skeptic but spawned without --skeptic-role writes no linkage
+# record, so its target's idle probe reads "skeptic-pending marker but NO live
+# skeptic" and walks a live pairing toward retirement. Four spawns in one day
+# used a bare -n/-c/-p. A WARNING, never a refusal — the suffix is a
+# convention, not a contract, and a false refusal would block a legitimate
+# spawn; the linkage record is what matters and this names the flag that
+# writes it.
+if [ "$SKEPTIC_ROLE" -eq 0 ]; then
+    case "$WINDOW_NAME" in
+        *-sk|*-sk[0-9]|*-sk[0-9][0-9]|*sk|*sk[0-9]|*sk[0-9][0-9]|*-skeptic|*skeptic|*skeptic[0-9])
+            echo "spawn-worker: WARNING: window '$WINDOW_NAME' is named like a skeptic but is spawned WITHOUT --skeptic-role — no skeptic linkage record will be written, so its target will read as having NO live skeptic (your-org/nexus-code#1153; check with ng skeptic-evidence <reviewed-window>). If this window reviews another worker, add --skeptic-role --skeptic-target <reviewed-window>." >&2 ;;
+    esac
+fi
 
 # Fresh-spawn mode requires -n/-c/-p; resume mode resolves window and
 # workdir itself and refuses -p (the resumed session already has its
@@ -652,6 +724,56 @@ fi
 NEXUS_SPAWN_CODE_ROOT="$NEXUS_ROOT_SCRIPT"
 FLOOR_FILE="$NEXUS_ROOT/skills/nexus.worker-defaults/SKILL.md"
 
+# ---- STATE_DIR — honour $NEXUS_STATE_DIR (your-org/nexus-code#973) ---------
+#
+# Every other component that writes under `monitor/.state/` resolves it
+# through $NEXUS_STATE_DIR first — `ng` (_resolve_state_dir, documented there
+# as "env override — direct path; TEST ESCAPE HATCH"), request-channel.sh,
+# skeptic-channel.sh, retire-preflight.sh, worker-heartbeat.sh, and 30 more.
+# This script honoured it NOWHERE: at e256d4a it contained ZERO references to
+# the variable, and pinned all ten of its state paths to
+# `$NEXUS_ROOT/monitor/.state` directly. So the repo's own isolation knob —
+# the one `setup_fake_nexus` EXPORTS specifically so that "the wrong thing has
+# to be impossible, not discouraged" (#833) — bought a fixture nothing here.
+#
+# The consequence is not hypothetical, and the action log records it in a
+# shape that names the mechanism. The #545 case in test-spawn-worker.sh pins
+# NEXUS_STATE_DIR at the fixture for its spawn. On 2026-08-04 12:17, with an
+# ambient NEXUS_ROOT still inherited (pre-#706 scrub), that spawn split in
+# two: the action-log row went through `ng`, which HONOURS the pin, and
+# landed in the fixture — the operator's primary log has no `ackme` spawn row
+# to this day — while the skeptic-pending marker, written directly off
+# NEXUS_ROOT, landed in the operator's LIVE `skeptic/pending/ackme-worker`,
+# where it sat as an orphaned retire-block for 19 days. One spawn, two state
+# roots, because two writers disagreed about which variable is authoritative.
+#
+# A pending marker is a HARD retire gate (retire-preflight.sh check 1b), so
+# the failure is not cosmetic: a fixture name that a future window happens to
+# reuse boots already blocked, with no task and no verdict able to clear it.
+#
+# In production NEXUS_STATE_DIR is UNSET — no non-test caller in the repo sets
+# it — so the fallback below is byte-identical to the previous behaviour and
+# this change is inert outside fixtures. That is the point: it removes an
+# entire leak axis without moving any real state.
+#
+# FAIL CLOSED. A pin we cannot honour is worse than no pin, because the caller
+# has already concluded it is isolated. If NEXUS_STATE_DIR names something we
+# cannot create or write, refuse the spawn rather than silently falling
+# through to the live root — which is precisely the fall-through that wrote
+# `ackme-worker`.
+if [ -n "${NEXUS_STATE_DIR:-}" ]; then
+    STATE_DIR="$NEXUS_STATE_DIR"
+    if ! mkdir -p "$STATE_DIR" 2>/dev/null || [ ! -w "$STATE_DIR" ]; then
+        echo "spawn-worker: NEXUS_STATE_DIR=$STATE_DIR is not creatable/writable — REFUSING to spawn rather than falling back to $NEXUS_ROOT/monitor/.state (your-org/nexus-code#973). A caller that pinned the state dir has already concluded it is isolated; honouring that pin or failing is the only safe pair." >&2
+        exit 19
+    fi
+else
+    STATE_DIR="$NEXUS_ROOT/monitor/.state"
+fi
+# HANDED DOWN (your-org/nexus-code#1335): the two `ng log-action` calls below
+# read NEXUS_STATE_DIR; the resolved STATE_DIR must reach them.
+export NEXUS_STATE_DIR="$STATE_DIR"
+
 # --- fail-CLOSED shim precondition, emitted into every launcher ------------
 #
 # Read from monitor/guard-block.sh.in — the SINGLE SOURCE shared with
@@ -671,6 +793,45 @@ fi
 SHIM_GUARD_BLOCK=$(sed -e 's/@@WHO@@/spawn-worker/g' -e 's/@@ACTION@@/SPAWN/g' \
                        -- "$GUARD_BLOCK_TEMPLATE")
 
+# THE SPAWNER'S OWN SNAPSHOT, carried into the launcher (your-org/nexus-code
+# #1477, D2). The guard's frozen-snapshot leg cannot read the CHILD's snapshot
+# (it does not exist until claude starts) and the launcher has no `claude`
+# ancestor (it is tmux's child), so inside the launcher the guard's ancestry
+# walk always misses and it used to fall through to "newest file in the CC
+# home by mtime" — a proxy that on 2026-09-06 selected a snapshot written by a
+# `claude` launched OUTSIDE the nexus and refused every spawn for 18 h.
+#
+# THIS process normally runs inside the spawning agent's Bash tool, whose
+# frame is `zsh -c source <cc-home>/shell-snapshots/snapshot-<id>.sh …`, so
+# the walk succeeds HERE. What it finds is the spawning agent's own tool-shell
+# recording: a nexus-launched shell on the same rc chain as the child — the
+# subject the guard's header always said it examined. The guard ranks it after
+# its own ancestry and before the mtime proxies, and REPORTS which route it
+# used, so a reader can tell a measurement from an inference. Found nothing
+# (headless caller such as the watcher's cc-auto-update spawn): the export is
+# omitted and the guard says so via its "selected via:" line.
+_spawner_snapshot() {
+    local pid=$$ hop=0 line ppid cand
+    while (( hop < 8 )); do
+        # One pid, header suppressed: `ps` prints exactly one line, so no
+        # `| head -1` — an early-exit reader whose status this `||` would
+        # consume (the #622 shape the early-exit-readers manifest tracks).
+        line=$(ps -o ppid=,args= -p "$pid" 2>/dev/null) || return 1
+        [[ -n "$line" ]] || return 1
+        line=${line#"${line%%[![:space:]]*}"}     # ps right-pads ppid: strip leading blanks
+        ppid=${line%% *}
+        [[ "$ppid" =~ ^[0-9]+$ ]] || return 1
+        cand=$(printf '%s' "$line" | tr ' ' '\n' | grep -E '/shell-snapshots/snapshot-[^/]*\.sh$' | tail -1)
+        if [[ -n "$cand" && -r "$cand" ]]; then printf '%s' "$cand"; return 0; fi
+        pid=$ppid; hop=$(( hop + 1 ))
+    done
+    return 1
+}
+SPAWNER_SNAPSHOT_EXPORT='# (no spawner snapshot: this spawn-worker run had no claude tool-shell ancestor — the guard falls back to the mtime proxy and says so; #1477)'
+if _sw_snap=$(_spawner_snapshot); then
+    printf -v SPAWNER_SNAPSHOT_EXPORT 'export NEXUS_SPAWNER_SNAPSHOT=%q' "$_sw_snap"
+fi
+
 # --reply-to: resolve the id against the request inbox AT DISPATCH. A typo'd
 # or already-terminal id means the worker's answer has nowhere to land — and
 # it would only discover that at wrap-up, an hour of work later. Fail here.
@@ -685,7 +846,7 @@ if [ -n "$REPLY_TO" ]; then
         _reqfile=$(NEXUS_ROOT="$NEXUS_ROOT" "$_reqchan" reqfile "$REPLY_TO" 2>/dev/null) || _reqfile=
         if [ -z "$_reqfile" ]; then
             echo "spawn-worker: --reply-to $REPLY_TO does not resolve to any request in the inbox" >&2
-            echo "  inbox: $NEXUS_ROOT/monitor/.state/requests  (list it with: monitor/ng request list)" >&2
+            echo "  inbox: $STATE_DIR/requests  (list it with: monitor/ng request list)" >&2
             exit 16
         fi
         # <stem>.<state>.md → the state word.
@@ -705,6 +866,88 @@ fi
 # the worker shell's PATH.
 # shellcheck disable=SC1091
 . "$NEXUS_ROOT/monitor/_claude-bin.sh"
+
+# Session MESSAGING name = this worker's tmux window name (#1047), so an
+# orchestrator can address a live worker by the window it can already see
+# instead of guessing the derived basename($PWD)-<hex> form. Gated on a
+# capability probe: an unsupported --name is FATAL (rc 1, "unknown option"),
+# so an unconditional flag would kill every spawn on an older Claude Code pin.
+# _spawn_name_arg echoes the flag (%q-quoted — a tmux window name is
+# operator-supplied text) or nothing, and is called at each launcher-compose
+# site rather than once here: on the --resume path $WINDOW_NAME is not final
+# until it falls back to $RESUME_TARGET further down, so computing it here
+# would bake an EMPTY name into exactly the resume launcher. The probe itself
+# caches, so repeated calls cost nothing.
+#
+# SCOPE: addresses a LIVE agent; NOT a task key — windows get reused and
+# renamed, and the session name does NOT follow a later `tmux rename-window`.
+# _spawn_plugin_arg <window> → `--plugin-dir <dir>` or nothing
+# (your-org/nexus-code#1535). Arms the longjob-watch dispatcher — the ONE
+# host-armed plugin monitor per session that wakes a worker when a long job
+# ends or fails. FAIL-OPEN by construction: every reason not to arm (kill
+# switch, missing/invalid manifest, a binary without --plugin-dir, a validator
+# that times out) prints NOTHING here and one line on stderr, and is recorded
+# in monitor/.state/longjob/arming.log — the spawn itself is never blocked,
+# because a launch path that can refuse to launch is a board that cannot
+# revive itself. Same two-root helper search as _spawn_name_arg below.
+_spawn_plugin_arg() {
+    local w="${1:-}" out='' r
+    if ! declare -F longjob_plugin_flag >/dev/null 2>&1; then
+        for r in "$NEXUS_ROOT" "$NEXUS_SPAWN_CODE_ROOT"; do
+            if [[ -r "$r/monitor/_longjob-plugin.sh" ]]; then
+                # shellcheck disable=SC1090
+                . "$r/monitor/_longjob-plugin.sh" >/dev/null 2>&1 || true
+            fi
+            declare -F longjob_plugin_flag >/dev/null 2>&1 && break
+        done
+    fi
+    if ! declare -F longjob_plugin_flag >/dev/null 2>&1; then
+        echo "spawn-worker: note: no monitor/_longjob-plugin.sh in either root (older primary?) — NOT passing --plugin-dir; this worker will have no longjob-watch dispatcher and cannot be woken by a long job (your-org/nexus-code#1535)." >&2
+        return 0
+    fi
+    # STATE_DIR is resolved (and exported as NEXUS_STATE_DIR) above; passed
+    # explicitly so the helper's own fallback chain is never what decides
+    # where a spawn's arming row lands.
+    out=$(longjob_plugin_flag "$w" "$STATE_DIR") || return 0
+    printf '%s' "$out"
+}
+
+_spawn_name_arg() {
+    local n="${1:-}" out=''
+    [[ -n "$n" ]] || return 0
+    # The probe may be ABSENT, not merely negative. spawn-worker sources
+    # _claude-bin.sh from $NEXUS_ROOT — the PRIMARY root (#577 state routing) —
+    # so a clone running its own newer spawn-worker.sh against an older
+    # primary gets the primary's helper, which has no such function. Measured
+    # on a live spawn: "claude_supports_name_flag: command not found", and
+    # without this guard `set -u`/rc handling turns a naming nicety into noise
+    # on every spawn. Degrade to the derived name, loudly and once.
+    if ! declare -F claude_supports_name_flag >/dev/null 2>&1 \
+       && [[ -r "$NEXUS_SPAWN_CODE_ROOT/monitor/_claude-bin.sh" ]]; then
+        # Two-root search, the same shape the shim guard block already uses:
+        # $NEXUS_ROOT is the PRIMARY (state), $NEXUS_SPAWN_CODE_ROOT is the tree
+        # this script actually ships in. Falling back to our own tree is what
+        # makes a clone's spawn-worker.sh work against an older primary,
+        # instead of silently dropping the flag it was updated to pass.
+        # shellcheck disable=SC1091
+        . "$NEXUS_SPAWN_CODE_ROOT/monitor/_claude-bin.sh" >/dev/null 2>&1 || true
+    fi
+    if ! declare -F claude_supports_name_flag >/dev/null 2>&1; then
+        if [[ -z "${_SPAWN_NAME_PROBE_WARNED:-}" ]]; then
+            _SPAWN_NAME_PROBE_WARNED=1
+            echo "spawn-worker: note: ${NEXUS_ROOT}/monitor/_claude-bin.sh has no claude_supports_name_flag (older primary?) — NOT passing --name; this worker self-names from its cwd basename and will not be addressable as '$n' (your-org/nexus-code#1047)." >&2
+        fi
+        return 0
+    fi
+    claude_supports_name_flag || return 0
+    # No trailing space: call sites add the separator with ${NAME_ARG:+ ...}
+    # so an EMPTY name leaves the surrounding tokens byte-identical to the
+    # pre-#1047 launcher. A stray double space here is not cosmetic — it broke
+    # test-spawn-worker's `--dangerously-skip-permissions --model "<id>"`
+    # adjacency assertion, which is the guard on --model quoting.
+    printf -v out -- '--name %q' "$n"
+    printf '%s' "$out"
+}
 
 # --- worker RLIMIT_NPROC ceiling (fork-storm class, your-org/nexus-code#487)
 # Two node-downs in two days (2026-07-08 Lmod command_not_found_handle,
@@ -749,6 +992,270 @@ fi
 # shellcheck disable=SC1091
 . "$NEXUS_ROOT/monitor/_fm_lib.sh"
 
+# your-org/nexus-code#1245 / #1196 — the three-valued "is this directory the
+# root of its OWN history?" predicate. `git -C <dir>` WALKS UP: on a directory
+# under work/ that is not itself a repository, the nearest enclosing repository
+# is the nexus, so every `git -C "$dir" …` answers about the NEXUS at rc 0 with
+# nothing on stderr. The freshness banner then prints the nexus's branch and
+# HEAD as the clone's own. rr_has_own_history is the READ-side question
+# (a linked worktree's HEAD *is* its own, so the 131 worktrees under work/
+# keep reporting honestly); rr_is_own_root is the WRITE-side one and is the
+# wrong predicate here.
+#
+# ITS ABSENCE IS `undetermined`, NOT `is a repo`. A bare `.` here dies under
+# `set -e` with no diagnostic — fail-closed in the sense that nothing wrong is
+# printed, but it refuses the whole spawn over a BANNER, and it does so
+# silently. The three-valued contract is the right answer applied to the tool's
+# own absence: without the predicate we cannot honestly say whether the workdir
+# is its own repository, so the block says exactly that and the spawn proceeds.
+# What must never happen is falling back to the walk-up, which is the defect.
+_SW_RR_OK=1
+if [ -r "$NEXUS_ROOT/monitor/repo-root.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$NEXUS_ROOT/monitor/repo-root.sh" || _SW_RR_OK=0
+else
+    _SW_RR_OK=0
+fi
+if [ "$_SW_RR_OK" -eq 1 ] && ! declare -F rr_has_own_history >/dev/null 2>&1; then
+    _SW_RR_OK=0
+fi
+
+# THE FALLBACK, and why it is not "a second resolver" (#1077 forbids those).
+# Degrading to UNDETERMINED whenever repo-root.sh is missing was too blunt: this
+# script is VENDORED into fake-nexus fixtures that copy an explicit helper list,
+# so the degraded arm fired for every such caller and the freshness block went
+# silent — measured, `test-spawn-worker.sh` 145/0 -> 136/9.
+#
+# This runs ONLY when the canonical predicate is absent, so the two can never
+# disagree at runtime; it is a degraded MODE, not a competing answer. It is
+# deliberately narrower than rr_has_own_history and it is correct about the one
+# thing that matters here: it NEVER WALKS UP. `--show-toplevel` returns the
+# ENCLOSING repository's root for a non-repo directory, so comparing it against
+# the directory itself is a sound not-my-repo test.
+#
+# `env -u GIT_DIR -u GIT_WORK_TREE` closes the one hole that would otherwise
+# make it say YES for a directory that is not a repository at all (repo-root.sh
+# HOLE 3): with those inherited — and GIT EXPORTS THEM FOR EVERY HOOK IT RUNS —
+# a plain directory reports `--show-toplevel` equal to itself. Measured here.
+#
+# Still NOT covered, stated rather than papered over: a BARE repository, where
+# `--show-toplevel` disagrees with itself across git versions (#1257). A bare
+# repo is not a plausible `-c` workdir, and the arm answers NO there, which is
+# the conservative direction.
+_sw_has_own_history_fallback() {
+    local d="$1" top real
+    top=$(env -u GIT_DIR -u GIT_WORK_TREE git -C "$d" rev-parse --show-toplevel 2>/dev/null) || return 1
+    [ -n "$top" ] || return 1
+    real=$(CDPATH= cd "$d" 2>/dev/null && pwd -P) || return 1
+    [ "$top" = "$real" ]
+}
+if [ "$_SW_RR_OK" -ne 1 ]; then
+    echo "spawn-worker: note: monitor/repo-root.sh unavailable under $NEXUS_ROOT — the clone-freshness block falls back to a narrower self-rooted check that still never walks up (your-org/nexus-code#1245)" >&2
+fi
+
+# your-org/nexus-code#941 — the window-key encoder lives in ONE place
+# (monitor/_bookkeeping.sh). spawn-worker is the WRITER for `windows/<key>.json`,
+# the spawn-prompt cache and the skeptic markers; a writer and a reader
+# disagreeing about the key ORPHANS state exactly as a collision MERGES it, so
+# there is no fallback to the lossy form. Absence refuses the spawn rather than
+# writing under a key the readers will never look at.
+#
+# `$NEXUS_ROOT` here, not the script's own dir: this file already resolves its
+# helpers from the PRIMARY root (see the header note above about a branch's
+# helpers), and the key must match what the primary's readers compute.
+if ! declare -F wk_encode >/dev/null 2>&1; then
+    if [ -r "$NEXUS_ROOT/monitor/_bookkeeping.sh" ]; then
+        # shellcheck source=monitor/_bookkeeping.sh
+        . "$NEXUS_ROOT/monitor/_bookkeeping.sh"
+    else
+        echo "spawn-worker: cannot load the window-key encoder from $NEXUS_ROOT/monitor/_bookkeeping.sh — refusing" >&2
+        exit 2
+    fi
+fi
+
+# ---- A WORKER MAY NOT SPAWN ITS OWN SKEPTIC (your-org/nexus-code#1098) ----
+#
+# `skills/nexus.skeptic/SKILL.md` says at :147 and :181 that the ORCHESTRATOR
+# composes the skeptic brief and spawns. Nothing enforced it. Measured on this
+# nexus on 2026-08-27: worker `harness` filed a skeptic request at 23:43:53 and
+# spawned its OWN reviewer at 23:44:35 — 39 s before the orchestrator acted on
+# that same request. Two agents reviewed one target, and one of them read a
+# mandate written by the party under review.
+#
+# The obligation ledger resolved the duplicate correctly on its own
+# (`void-superseded` vs `live`), so this is NOT a bookkeeping defect. It is a
+# control that existed only in prose, which is why a CAREFUL worker walked
+# straight through it: the brief that worker wrote was good — it named the PR,
+# the branch and the base sha, and told its skeptic to clone out rather than
+# work in the primary. The hazard a self-written brief carries is not a wrong
+# answer, it is an UNEXAMINED REGION, and an omission is invisible from inside
+# the brief that omits it.
+#
+# TWO KEYS, EITHER OF WHICH REFUSES. They answer the same question through
+# different evidence, and each covers the other's blind spot:
+#
+#   1. SESSION IDENTITY — `$CLAUDE_SESSION_ID` (the spawning agent's own
+#      session, exported by the harness) against `.session_id` in the TARGET's
+#      provenance record. A UUID on both sides, so a match is identity and not
+#      a coincidence of names. This is the key `#1098` names.
+#   2. WINDOW IDENTITY — `$NEXUS_WORKER_WINDOW` (exported to every worker by
+#      this very script, line ~1594) against `--skeptic-target`. Both are tmux
+#      window names in ONE namespace — the same nexus's session — so a match
+#      means "I am the window under review", not "two unrelated things share a
+#      string". It covers the target whose record predates provenance, carries
+#      an empty `session_id`, or cannot be read because `jq` is absent and the
+#      record is pretty-printed.
+#
+# WHICH KEY ACTUALLY FIRES IN PRODUCTION — MEASURED, and it is not the one the
+# issue proposes. `$CLAUDE_SESSION_ID` is NOT reliably present in the
+# environment a worker's shell tool hands to this launcher: measured in one
+# session on 2026-08-28, populated at 00:0x and ABSENT half an hour later, with
+# nothing in monitor/shellenv unsetting it. So key 1 is real but intermittent,
+# and the live end-to-end refusal was carried by key 2:
+#
+#     $ ./monitor/spawn-worker.sh -n delivery-selftest … \
+#           --skeptic-role --skeptic-target delivery --print-prompt
+#     rc=20
+#     evidence: $NEXUS_WORKER_WINDOW is 'delivery', which IS --skeptic-target
+#
+# Had this been built to `#1098`'s proposal alone — the session id, which is the
+# better key and the one the issue names — the guard would have been INERT in
+# exactly the configuration just tested, while a source-text reading of it
+# looked complete. That is `your-org/nexus-code#1085`'s shape (a field spelled
+# only in the branch never taken) reappearing inside a fix for the same class.
+# Both keys stay: key 1 because it is the one that cannot be confused by names
+# and does fire when the harness exports it, key 2 because it is the one that
+# fires here.
+#
+# POSITIVE IDENTIFICATION ONLY — this does NOT default-deny. A spawn whose
+# identity cannot be established proceeds. That polarity is deliberate and is
+# the opposite of this repo's usual fail-closed default, so it is stated rather
+# than left to be inferred: the orchestrator is the overwhelmingly common
+# caller, it has no relationship to the target at all, and a guard that refused
+# whenever it could not read a descriptor would take the whole fleet down the
+# first time `jq` went missing. The failure being prevented is a specific
+# ACCIDENT — an agent reaching for the launcher instead of `ng skeptic
+# request` — and an accident is caught by positive identification. Neither key
+# resists a determined agent that overwrites its own environment; nothing here
+# is a security boundary, and it does not need to be.
+#
+# THE LEGITIMATE PATH ALREADY EXISTS AND ALREADY WORKED: a worker wanting
+# review files `ng request file --kind spawn-skeptic`, which the orchestrator adjudicates. It
+# worked twice in the hour this defect was measured. The refusal points there.
+if [ "$SKEPTIC_ROLE" -eq 1 ] && [ -n "$SKEPTIC_TARGET" ]; then
+    # Read one JSON string field without jq and without a pipe. A pipe here
+    # would be an early-exit reader (`| head -1`) under this script's
+    # `pipefail`, which is monitor/watcher/early-exit-readers.sh's population;
+    # the loop runs in THIS shell, so `return` leaves the function directly.
+    # The record is jq PRETTY-printed, so the key sits on its own line with a
+    # space after the colon — both spellings are handled.
+    _ss_json_string() {   # <file> <key> -> value on stdout, empty when absent
+        local _f="$1" _k="$2" _line _v
+        [ -r "$_f" ] || return 0
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            case "$_line" in
+                *"\"$_k\""*) ;;
+                *) continue ;;
+            esac
+            _v="${_line#*\"$_k\"}"
+            _v="${_v#*:}"
+            _v="${_v# }"
+            case "$_v" in
+                '"'*) ;;
+                *) continue ;;
+            esac
+            _v="${_v#\"}"
+            _v="${_v%%\"*}"
+            printf '%s' "$_v"
+            return 0
+        done < "$_f"
+        return 0
+    }
+
+    # BOTH REVIEWED WINDOWS ARE CHECKED, NOT JUST `--skeptic-target`
+    # (skeptic F1 on the PR that introduced this guard — CONFIRMED, reproduced).
+    #
+    # The first version compared only against `$SKEPTIC_TARGET`, and a depth-2
+    # spawn names TWO reviewed parties. `--skeptic-orig` is not decorative: when
+    # it differs from the target, :2445 opens a SECOND `skeptic-verdict`
+    # obligation with the ORIG as creditor, :2495 inits a comms channel to the
+    # orig, and :2522 writes a pending marker under the ORIG's key. So the orig
+    # is a reviewed party in the ledger's own terms. Measured on the fixture:
+    #
+    #   I  --skeptic-target rootworker,          I am rootworker  -> 20 REFUSED
+    #   J  --skeptic-target rootworker-sk
+    #        --skeptic-orig rootworker,          I am rootworker  ->  0 ALLOWED
+    #   K  as J, identified by the session key                    ->  0 ALLOWED
+    #
+    # J and K are `#1098` exactly, one level removed: a root worker spawning a
+    # depth-2 skeptic FORMALLY OBLIGATED to review its own work, with a brief it
+    # wrote. **A guard complete in the branch it was written against and absent
+    # on the neighbouring one** — which is the same shape as the
+    # `$CLAUDE_SESSION_ID` correction two paragraphs down, and the same shape as
+    # `#1085`. Writing the general form of the lesson here rather than only the
+    # instance, because the instance is not what recurs.
+    #
+    # `[ "$SKEPTIC_ORIG" != "$SKEPTIC_TARGET" ]` mirrors the three call sites
+    # above: orig DEFAULTS to target (line ~474), so without that clause the
+    # orig arm would fire on every first-pass spawn and duplicate the target
+    # arm's diagnostic with a misleading noun.
+    _ss_self_session="${CLAUDE_SESSION_ID:-}"
+    _ss_self_window="${NEXUS_WORKER_WINDOW:-}"
+    _ss_target_record="$STATE_DIR/windows/$(wk_encode "$SKEPTIC_TARGET").json"
+    _ss_target_session=$(_ss_json_string "$_ss_target_record" session_id)
+    _ss_orig_session=""
+    if [ -n "$SKEPTIC_ORIG" ] && [ "$SKEPTIC_ORIG" != "$SKEPTIC_TARGET" ]; then
+        _ss_orig_record="$STATE_DIR/windows/$(wk_encode "$SKEPTIC_ORIG").json"
+        _ss_orig_session=$(_ss_json_string "$_ss_orig_record" session_id)
+    fi
+
+    _ss_evidence=""
+    if [ -n "$_ss_self_session" ] && [ -n "$_ss_target_session" ] \
+       && [ "$_ss_self_session" = "$_ss_target_session" ]; then
+        _ss_evidence="session id $_ss_self_session is the session recorded for --skeptic-target '$SKEPTIC_TARGET' in $_ss_target_record"
+    elif [ -n "$_ss_self_session" ] && [ -n "$_ss_orig_session" ] \
+         && [ "$_ss_self_session" = "$_ss_orig_session" ]; then
+        _ss_evidence="session id $_ss_self_session is the session recorded for --skeptic-orig '$SKEPTIC_ORIG' in $_ss_orig_record — the CHAIN ROOT, which this spawn also obligates a verdict on"
+    elif [ -n "$_ss_self_window" ] && [ "$_ss_self_window" = "$SKEPTIC_TARGET" ]; then
+        _ss_evidence="\$NEXUS_WORKER_WINDOW is '$_ss_self_window', which IS --skeptic-target"
+    elif [ -n "$_ss_self_window" ] && [ -n "$SKEPTIC_ORIG" ] \
+         && [ "$SKEPTIC_ORIG" != "$SKEPTIC_TARGET" ] \
+         && [ "$_ss_self_window" = "$SKEPTIC_ORIG" ]; then
+        _ss_evidence="\$NEXUS_WORKER_WINDOW is '$_ss_self_window', which IS --skeptic-orig — the CHAIN ROOT, which this spawn also obligates a verdict on"
+    fi
+
+    if [ -n "$_ss_evidence" ]; then
+        # AUDITED OVERRIDE, deliberately shaped like GH_IMPERSONATE rather than
+        # invented: a hard refusal with no escape is how a legitimate future
+        # case gets worked around by editing this script, which is strictly
+        # worse than one that leaves a record. A reason is REQUIRED — the flag
+        # alone is not an override — and the call is logged.
+        if [ "${NEXUS_SKEPTIC_SELF_SPAWN:-}" = "1" ] \
+           && [ -n "${NEXUS_SKEPTIC_SELF_SPAWN_REASON:-}" ]; then
+            mkdir -p "$STATE_DIR" 2>/dev/null || true
+            printf '%s\t%s\t%s\t%s\n' \
+                "$(date -Is 2>/dev/null || date)" "$SKEPTIC_TARGET" \
+                "${WINDOW_NAME:-<unnamed>}" "$NEXUS_SKEPTIC_SELF_SPAWN_REASON" \
+                >> "$STATE_DIR/skeptic-self-spawn.log" 2>/dev/null || true
+            echo "spawn-worker: SELF-SPAWNED SKEPTIC, audited — the spawning agent IS the reviewed party ($_ss_evidence)." >&2
+            echo "spawn-worker:   reason: $NEXUS_SKEPTIC_SELF_SPAWN_REASON" >&2
+            echo "spawn-worker:   recorded in $STATE_DIR/skeptic-self-spawn.log (your-org/nexus-code#1098)." >&2
+        else
+            echo "spawn-worker: REFUSING — a worker may not spawn its own skeptic (your-org/nexus-code#1098)." >&2
+            echo "spawn-worker:   evidence: $_ss_evidence" >&2
+            echo "spawn-worker:   The reviewed party would be writing its own reviewer's mandate. skills/nexus.skeptic" >&2
+            echo "spawn-worker:   assigns brief-composition to the ORCHESTRATOR, which has the spawn context you do not." >&2
+            echo "spawn-worker:   Do this instead:  monitor/ng request file --origin ${NEXUS_WORKER_WINDOW:-<your-window>} --kind spawn-skeptic --slug review-$SKEPTIC_TARGET --message '<what to review and why>'" >&2
+            echo "spawn-worker:   (your-org/nexus-code#1124: the remedy used to name \`ng skeptic request\`, a verb that does not exist)" >&2
+            echo "spawn-worker:   Intentional self-spawn (rare): set NEXUS_SKEPTIC_SELF_SPAWN=1 and" >&2
+            echo "spawn-worker:   NEXUS_SKEPTIC_SELF_SPAWN_REASON='<why>'; both are required and the call is audited." >&2
+            exit 20
+        fi
+    fi
+    unset -f _ss_json_string
+fi
+
+
 # Validate the window name up front (both spawn and resume paths set
 # WINDOW_NAME before any tmux op). Dots stay legal — that's the point
 # of #323 — but control chars and parse-hostile punctuation are
@@ -790,6 +1297,433 @@ fi
 # duplicate to be found.
 HOOKS_FLAG="--settings $SETTINGS_FILE"
 
+# Pre-seed Claude Code's workspace-trust entry for the worker's workdir
+# (cc 2.1.232: "nested git repositories [no longer inherit] trust from a
+# parent directory"). work/<project> checkouts are separate git repos nested
+# inside the nexus repo, so without this an interactive spawn stops on the
+# trust dialog and never reaches a REPL. (This used to add "and pane-state
+# reads that frame as `state=empty active=0`, NOT `blocked`, so the watcher
+# never sees a pane to unstick" — FALSE since #896 added the
+# `workspace-trust` overlay arm; the frame now measures
+# `state=blocked active=0 overlay=workspace-trust`. Corrected, not deleted:
+# your-org/nexus-code#1015 finding 4.) Neither --dangerously-skip-permissions nor
+# skipDangerousModePermissionPrompt suppresses it; seeding .claude.json is
+# the only mechanism. Idempotent: a no-op (no write at all) once trusted.
+# Blocking on failure is deliberate — spawning anyway yields exactly the
+# silent hang this prevents. See monitor/ensure-workdir-trusted.sh.
+#
+# Defined here but CALLED at each `tmux new-window` site, because that is the
+# first point where $WORKDIR is final on BOTH paths: fresh-spawn canonicalises
+# it early, but --resume only resolves it (from the window's traces) much
+# later. Seeding at this line would have silently no-op'd on an empty WORKDIR
+# for every resume — the rarely-taken-branch drift of #568 D4.
+_seed_workspace_trust() {
+    [ -x "$NEXUS_ROOT/monitor/ensure-workdir-trusted.sh" ] || return 0
+    [ -n "${WORKDIR:-}" ] || {
+        echo "spawn-worker: internal: workspace-trust seed reached with an empty WORKDIR" >&2
+        exit 10
+    }
+    "$NEXUS_ROOT/monitor/ensure-workdir-trusted.sh" "$WORKDIR" || {
+        echo "spawn-worker: could not pre-seed workspace trust for $WORKDIR (see above); refusing to spawn a worker that would hang on the trust dialog" >&2
+        exit 10
+    }
+}
+
+# ---- post-spawn workspace-trust verification (your-org/nexus-code#1334) -----
+#
+# The seed above is NECESSARY and was measured INSUFFICIENT: one of five
+# clones seeded by the same code path in one session still booted into the
+# trust dialog, with the seed reporting success and the key present on disk
+# afterwards. Nothing at the write site can close that, because the other
+# writer of .claude.json is the harness. So after the launcher is sent, this
+# block CONFIRMS the worker did not land on the dialog, and if it did, it
+# recovers — bounded, loud, and without depending on the cause.
+#
+# WHAT THE CAUSE IS AND IS NOT (measured on the real 2.1.261 binary in the
+# cc-harness, 2026-09-05). The "claude rewrites .claude.json wholesale from
+# stale in-memory state" hypothesis is NOT supported: with a claude at the
+# dialog (config loaded), keys seeded externally for other dirs SURVIVED the
+# binary's dialog-accept write, its graceful-exit write and a fresh-startup
+# write, and the file's inode changed on every write (temp+rename, never
+# truncate-in-place). The residual that cannot be excluded that way is a
+# narrow read-modify-write interleave — claude reads, we seed, claude writes —
+# against which claude takes no lock. The recovery below is correct under
+# either, which is why it is a loop and not a lock.
+#
+# THE REMEDY IS A RESPAWN, NOT A KEYSTROKE. On >=2.1.248 the dialog's DEFAULT
+# highlight is `❯ No, exit` (measured: the cursor row read `No, exit` first),
+# so a bare Enter EXITS the worker, and any keystroke driver would have to
+# navigate the harness's own UI — cc-version-sensitive by construction.
+# Killing the window and re-creating it under the same name loses nothing:
+# lifecycle anchors and the provenance record are keyed by NAME, and a fresh
+# `--session-id` can be REUSED after a kill at the dialog (measured: zero
+# transcript files exist while the dialog is up; a respawn with the same id
+# boots to idle). Reuse of an id that HAS a transcript kills the new pane,
+# which is why "no transcript" is a hard precondition below and not a hope.
+#
+# THE KILL IS AN EXEMPTION FROM `bk_pane_kill_authorized`, STATED HERE SO
+# NOBODY COPIES OR DELETES IT BLIND. `blocked` is in `_BK_ACTIVE_STATES`
+# (monitor/_bookkeeping.sh) and NOT on the kill allowlist, so the guard this
+# repo prescribes for every kill decision answers NO for a pane on this
+# dialog — correctly, for the rule it enforces (2026-06-15: live workers
+# retired from a hand-enumerated state list). This block does NOT weaken
+# that guard: no allowlist gains `blocked`, no state token is added. It is
+# exempt on a NARROWER, CHECKABLE claim than "blocked panes are dead":
+#   (1) the kill fires ONLY on `state=blocked` AND `overlay=workspace-trust`
+#       — the one dialog that precedes session start — never on `blocked`
+#       alone, never on any other overlay;
+#   (2) "no work is lost" is ASSERTED immediately before the kill, not
+#       argued: fresh spawn -> zero transcript files for this session id;
+#       --resume -> the resumed transcript is byte-for-byte the size and
+#       mtime it had before the launcher was sent; loop-wrapper (no id) ->
+#       no transcript ANYWHERE under projects/*/ newer than a stamp taken
+#       before the launcher was sent (coarse, so it can only over-refuse).
+#       Every probe is `find -H`: the projects dir is a symlink on this
+#       host and a bare start point is a confident zero. A transcript that exists or
+#       moved means something RAN, which means the detection is wrong, and
+#       that is exactly when this must not kill: it REFUSES and exits 21.
+# A future change that lets this kill fire on any other state or overlay
+# must go back to `bk_pane_kill_authorized`, not extend this exemption.
+#
+# NORMAL-PATH COST. Polling stops at the first POSITIVE classification
+# (anything that is not `empty`/`unknown`/boot-grace `absent`), i.e. the
+# time to first paint, ~1-3 s. `empty` means "don't know yet" (#603), so the
+# wait tolerates it up to NEXUS_SPAWN_TRUST_VERIFY_SECONDS (default 20) and
+# then prints UNVERIFIED and exits 0 — a slow box must never manufacture a
+# spawn failure. A `blocked` pane on any OTHER overlay is noted and left
+# alone; it is not this block's to recover. The state names in the positive
+# arm are a STOP-WAITING list, not a kill list: an unenumerated token falls
+# to "keep polling", the safe direction, and the only destructive arm is the
+# exact pair in (1).
+#
+# BOUNDED AND LOUD. At most NEXUS_SPAWN_TRUST_MAX_RECOVER recoveries (default
+# 2); then exit 21 with a diagnostic and the window LEFT IN PLACE so the
+# dialog can be read. Every detection reads the key from disk BEFORE acting
+# and prints + action-logs `trust-key-at-detection=true|false|ABSENT` — the
+# discriminating measurement #1334 prescribes (seed, launch, read BEFORE
+# anyone answers), taken automatically on every field occurrence. `ABSENT`
+# at detection is a lost seed; `true` at every detection means a re-seed
+# cannot help (the seeder's fast path is a no-op) and the suspect moves to a
+# key-path mismatch or a second gate — the final diagnostic then lists the
+# .projects keys that share this workdir's basename.
+#
+# THE PRIMARY FIX SITS IN THE LAUNCHER TEMPLATES BELOW, AND THIS BLOCK IS
+# THE FALLBACK. Every launcher sets `CLAUDE_CODE_SANDBOXED=1` on the claude
+# invocation. The binary (2.1.261) reads it at the head of its trust gate and
+# returns "trusted" BEFORE the config key is consulted, so the dialog cannot
+# appear whatever happened to the seed. It is a claim about the environment,
+# and here it is TRUE: workers run under a kernel-enforced sandbox, so setting
+# it INFORMS the tool rather than defeating a check (the operator's point,
+# and the reason it is set at all).
+#
+# Measured before adoption, one variable, real worker configuration
+# (`--dangerously-skip-permissions` + worker-settings.json), 2026-09-05:
+#   * trust gate: key ABSENT + env -> idle, no dialog (key ABSENT -> dialog
+#     without it). The only behaviour the flag changed anywhere.
+#   * project-permission-rule gating (the flag's second site in the binary):
+#     print-mode with a project `permissions.allow` rule and NO bypass, key
+#     ABSENT: rules IGNORED ("this workspace has not been trusted") with the
+#     env unset AND set — the "Ignoring … allow entry" path keys on the config
+#     key itself, not on the flag. Potency of the probe: key PRESENT -> the
+#     rule is honoured and the tool runs. With bypass on, the tool runs in
+#     every arm, env or not.
+#   * directory-move note (the third site): `/cd` into an untrusted dir that
+#     declares rules paints the SAME move dialog with and without the flag,
+#     and the post-move pane is byte-identical after accepting.
+#   * normal boot (key present, bypass, worker settings): boot frames
+#     byte-identical with and without the flag.
+# So in this configuration the marginal effect is the trust gate and nothing
+# else observable. The flag is INHERITED by the worker's children, so a nested
+# `claude -p` the worker itself runs inherits it — bounded by the same sandbox
+# and by the worker already holding every permission.
+#
+# IT IS UNDOCUMENTED AND cc-VERSION-SENSITIVE (an env read at 3 sites in a
+# binary re-pinned weekly), which is why (a) this recovery loop stays as the
+# fallback — it depends on neither the cause nor the flag — and (b) a CANARY
+# pins the flag's semantics against the real binary:
+# monitor/watcher/test-integration/test-realmodel-trust-sandboxed-env.sh
+# (key ABSENT + env -> idle; key ABSENT alone -> the dialog). An upstream
+# change is then a red on the next cc bump, not an intermittent field
+# mystery. Belongs on skills/nexus.cc-update/GUIDE.md's collision list.
+_SW_TRUST_KEEP_L=""; _SW_TRUST_KEEP_P=""; _SW_TRUST_MODE=""; _SW_TRUST_STAMP=""
+_SW_TRUST_XSCRIPT=""; _SW_TRUST_XSCRIPT_SIG=""
+
+_sw_trust_cfg_file() { printf '%s/.claude.json' "${CLAUDE_CONFIG_DIR:-$HOME}"; }
+# Transcripts live under <config-dir>/projects; the config dir is
+# $CLAUDE_CONFIG_DIR when set (production and the cc-harness), else ~/.claude.
+_sw_trust_projects_dir() { printf '%s/projects' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"; }
+_sw_trust_abs_workdir() { ( CDPATH= cd "$WORKDIR" 2>/dev/null && pwd -P ); }
+# The key claude reads: .projects[<physical workdir>].hasTrustDialogAccepted.
+_sw_trust_key_on_disk() {
+    local cfg abs
+    cfg=$(_sw_trust_cfg_file); abs=$(_sw_trust_abs_workdir) || abs="$WORKDIR"
+    [ -f "$cfg" ] || { printf 'ABSENT'; return 0; }
+    jq -r --arg d "$abs" '.projects[$d].hasTrustDialogAccepted // "ABSENT"' "$cfg" 2>/dev/null \
+        || printf 'UNREADABLE'
+}
+_sw_trust_transcript_sig() { stat -c '%s:%Y' "$1" 2>/dev/null || printf 'nostat'; }
+
+# Called immediately BEFORE the launcher is sent (both sites). Keeps copies of
+# the launcher (and prompt) — the launcher deletes the originals as its first
+# act, so a respawn needs its own — records the mode, and takes the baseline
+# the no-work-lost precondition is measured against.
+_sw_trust_keep_launcher() {
+    _SW_TRUST_MODE="$1"
+    _SW_TRUST_KEEP_L=""; _SW_TRUST_KEEP_P=""; _SW_TRUST_XSCRIPT=""; _SW_TRUST_XSCRIPT_SIG=""
+    if [ -f "$LAUNCHER_TMP" ] && cp -p "$LAUNCHER_TMP" "$LAUNCHER_TMP.keep" 2>/dev/null; then
+        _SW_TRUST_KEEP_L="$LAUNCHER_TMP.keep"
+    fi
+    if [ -n "${PROMPT_TMP:-}" ] && [ -f "$PROMPT_TMP" ] \
+        && cp -p "$PROMPT_TMP" "$PROMPT_TMP.keep" 2>/dev/null; then
+        _SW_TRUST_KEEP_P="$PROMPT_TMP.keep"
+    fi
+    _SW_TRUST_STAMP="$LAUNCHER_TMP.stamp"
+    : > "$_SW_TRUST_STAMP" 2>/dev/null || _SW_TRUST_STAMP=""
+    if [ "$_SW_TRUST_MODE" = resume ] && [ -n "${SESSION_ID:-}" ]; then
+        # `-H`: the projects dir is a SYMLINK on at least one host
+        # (sandbox-config/projects -> ~/.claude/projects) and GNU find does
+        # not descend a symlinked STARTING POINT without -H/-L — a bare start
+        # returned 0 for a 2.6 MB transcript that exists (sp1334sk, #1334).
+        # `-print -quit`, not `| head -1`: no early-exit reader (#682).
+        _SW_TRUST_XSCRIPT=$(find -H "$(_sw_trust_projects_dir)" -maxdepth 2 -name "$SESSION_ID.jsonl" -print -quit 2>/dev/null) || _SW_TRUST_XSCRIPT=""
+        [ -n "$_SW_TRUST_XSCRIPT" ] && _SW_TRUST_XSCRIPT_SIG=$(_sw_trust_transcript_sig "$_SW_TRUST_XSCRIPT")
+    fi
+    return 0
+}
+_sw_trust_drop_keep() {
+    [ -n "$_SW_TRUST_KEEP_L" ] && rm -f "$_SW_TRUST_KEEP_L"
+    [ -n "$_SW_TRUST_KEEP_P" ] && rm -f "$_SW_TRUST_KEEP_P"
+    [ -n "$_SW_TRUST_STAMP" ]  && rm -f "$_SW_TRUST_STAMP"
+    _SW_TRUST_KEEP_L=""; _SW_TRUST_KEEP_P=""; _SW_TRUST_STAMP=""
+    return 0
+}
+
+# THE NO-WORK-LOST PRECONDITION. rc 0 = provably nothing ran in this pane;
+# rc 1 = a transcript exists or moved (or the question could not be asked),
+# with the reason on stdout. Fail-CLOSED: "could not look" is rc 1.
+_sw_trust_no_work_ran() {
+    local pdir n sig
+    pdir=$(_sw_trust_projects_dir)
+    if [ ! -d "$pdir" ]; then
+        # No projects dir at all: no transcript can exist anywhere under it.
+        printf 'no-projects-dir'; return 0
+    fi
+    case "$_SW_TRUST_MODE" in
+        resume)
+            if [ -z "$_SW_TRUST_XSCRIPT" ]; then
+                printf 'resume-transcript-not-located-before-send'; return 1
+            fi
+            sig=$(_sw_trust_transcript_sig "$_SW_TRUST_XSCRIPT")
+            if [ "$sig" != "$_SW_TRUST_XSCRIPT_SIG" ]; then
+                printf 'resume-transcript-changed(%s->%s)' "$_SW_TRUST_XSCRIPT_SIG" "$sig"; return 1
+            fi
+            printf 'resume-transcript-unchanged'; return 0 ;;
+        *)
+            # `find -H`, NOT a bare start: see _sw_trust_keep_launcher. The bare
+            # form was a CONFIDENT ZERO on the host that has the symlink, which
+            # made this precondition pass for a transcript that existed — the
+            # exact class it exists to police, inside the check itself.
+            if [ -n "${WORKER_SESSION_ID:-}" ]; then
+                n=$(find -H "$pdir" -maxdepth 2 -name "$WORKER_SESSION_ID.jsonl" 2>/dev/null | wc -l) || n=""
+                case "$n" in ''|*[!0-9]*) printf 'transcript-probe-failed'; return 1 ;; esac
+                if [ "$n" -ne 0 ]; then printf 'transcript-exists(%s)' "$n"; return 1; fi
+                printf 'zero-transcripts-for-session-id'; return 0
+            fi
+            # Loop wrapper: no id claude will honour. COARSE ON PURPOSE: refuse on
+            # ANY transcript under projects/*/ newer than the stamp taken before
+            # the launcher was sent. A previous cut keyed on the workdir's
+            # project slug, re-implementing the binary's undocumented path
+            # encoding — and a wrong slug failed OPEN (no dir -> return 0 ->
+            # kill). This is a KILL precondition, so it must err toward
+            # REFUSING: on a busy board another worker's transcript will often
+            # be newer than the stamp and this arm will refuse a recovery that
+            # would have been fine. That costs one spawn; the other direction
+            # costs a worker's session. (sp1334sk on #1334.)
+            [ -n "$_SW_TRUST_STAMP" ] && [ -f "$_SW_TRUST_STAMP" ] || { printf 'no-stamp'; return 1; }
+            n=$(find -H "$pdir" -mindepth 2 -maxdepth 2 -name '*.jsonl' -newer "$_SW_TRUST_STAMP" 2>/dev/null | wc -l) || n=""
+            case "$n" in ''|*[!0-9]*) printf 'transcript-probe-failed'; return 1 ;; esac
+            if [ "$n" -ne 0 ]; then printf 'transcript-newer-than-spawn-anywhere(%s)' "$n"; return 1; fi
+            printf 'no-transcript-newer-than-spawn'; return 0 ;;
+    esac
+}
+
+_sw_trust_log() {  # <event> <k=v>...
+    local ev="$1"; shift
+    [ -x "$NEXUS_ROOT/monitor/ng" ] || return 0
+    local -a extra=(); local kv
+    for kv in "$@"; do extra+=( --extra "$kv" ); done
+    "$NEXUS_ROOT/monitor/ng" log-action monitor --event "$ev" \
+        --extra "window=$WINDOW_NAME" --extra "workdir=$WORKDIR" \
+        "${extra[@]}" >/dev/null 2>&1 || true
+}
+
+# One pane-state reading for a window @id. pane-state.sh keys on
+# index / session:window / NAME, not @id, so resolve the index form first
+# (unambiguous unless a window is NAMED as that digit; pane-state then
+# refuses with rc 2, which reads here as "could not look" — keep polling).
+# rc 3 = the window key could not be resolved (distinct from pane-state's own
+# rc, and carried in the RETURN CODE because this runs inside a command
+# substitution — a variable set here dies with the subshell).
+_sw_trust_pane_state() {
+    local wid="$1" key
+    key=$(tmux display-message -p -t "$wid" '#{session_name}:#{window_index}' 2>/dev/null) || key=""
+    [ -n "$key" ] || return 3
+    "$NEXUS_ROOT/monitor/pane-state.sh" "$key" 2>/dev/null
+}
+
+# Kill + re-seed + re-create under the same name. rc 0 with WID updated; rc 1
+# (reason on stderr) when the precondition or any step refuses.
+_sw_trust_respawn() {
+    local old_wid="$1" why key
+    if ! why=$(_sw_trust_no_work_ran); then
+        printf 'spawn-worker: REFUSING to recover %s: the no-work-lost precondition failed (%s).\n' "$WINDOW_NAME" "$why" >&2
+        printf '  A transcript exists or changed, so something RAN in that pane and the trust-overlay\n' >&2
+        printf '  detection is not to be trusted. The window is left in place; inspect it.\n' >&2
+        return 1
+    fi
+    if [ -z "$_SW_TRUST_KEEP_L" ] || [ ! -f "$_SW_TRUST_KEEP_L" ]; then
+        printf 'spawn-worker: cannot recover %s: no kept launcher copy (%s).\n' "$WINDOW_NAME" "${_SW_TRUST_KEEP_L:-unset}" >&2
+        return 1
+    fi
+    # See the exemption paragraph above before touching this line: it fires
+    # only on state=blocked + overlay=workspace-trust, after the precondition
+    # just asserted (`$why`) that nothing ran in the pane.
+    tmux kill-window -t "$old_wid" 2>/dev/null || true
+    cp -p "$_SW_TRUST_KEEP_L" "$LAUNCHER_TMP" || return 1
+    chmod +x "$LAUNCHER_TMP" 2>/dev/null || true
+    if [ -n "$_SW_TRUST_KEEP_P" ]; then cp -p "$_SW_TRUST_KEEP_P" "$PROMPT_TMP" || return 1; fi
+    # Re-seed (the same call every window-creation site makes; exits 10 if the
+    # seeder itself fails) and READ IT BACK — a seed that reports success is
+    # what failed in the field, so the readback is the check, not the rc.
+    _seed_workspace_trust
+    key=$(_sw_trust_key_on_disk)
+    [ "$key" = true ] || { printf 'spawn-worker: re-seed for %s did not stick: key reads %s immediately after the seed.\n' "$WORKDIR" "$key" >&2; return 1; }
+    WID=$(tmux new-window -P -F '#{window_id}' -d -n "$WINDOW_NAME" -c "$WORKDIR") || WID=""
+    if [ -z "$WID" ]; then
+        printf 'spawn-worker: recovery: tmux new-window failed / returned no window id for %s\n' "$WINDOW_NAME" >&2
+        return 1
+    fi
+    tmux set-window-option -t "$WID" remain-on-exit on 2>/dev/null || true
+    tmux set-window-option -t "$WID" automatic-rename off 2>/dev/null || true
+    tmux set-window-option -t "$WID" allow-rename off 2>/dev/null || true
+    # Re-take the baseline: the new pane's stamp is now.
+    if [ -n "$_SW_TRUST_STAMP" ]; then : > "$_SW_TRUST_STAMP" 2>/dev/null || true; fi
+    tmux send-keys -t "$WID" "$LAUNCHER_TMP" Enter
+    return 0
+}
+
+# Entry point, called after `tmux send-keys` at BOTH window-creation sites.
+# Exits 21 on bounded failure; returns 0 otherwise (verified, unverified, or
+# not ours to recover — each said on stderr).
+_sw_trust_verify() {
+    local wid="$1"
+    local budget="${NEXUS_SPAWN_TRUST_VERIFY_SECONDS-20}" max_recover="${NEXUS_SPAWN_TRUST_MAX_RECOVER-2}"
+    case "$budget" in ''|*[!0-9]*)
+        printf 'spawn-worker: NEXUS_SPAWN_TRUST_VERIFY_SECONDS=%q is not a non-negative integer; using 20\n' "$budget" >&2
+        budget=20 ;; esac
+    case "$max_recover" in ''|*[!0-9]*)
+        printf 'spawn-worker: NEXUS_SPAWN_TRUST_MAX_RECOVER=%q is not a non-negative integer; using 2\n' "$max_recover" >&2
+        max_recover=2 ;; esac
+    if [ "$budget" -eq 0 ]; then _sw_trust_drop_keep; return 0; fi
+    if [ ! -x "$NEXUS_ROOT/monitor/pane-state.sh" ]; then
+        printf 'spawn-worker: NOTE — %s/monitor/pane-state.sh is not executable; post-spawn trust verification SKIPPED (worker %s is UNVERIFIED).\n' "$NEXUS_ROOT" "$WINDOW_NAME" >&2
+        _sw_trust_drop_keep; return 0
+    fi
+    local recoveries=0 detections=0 history="" line state overlay evidence tok key deadline psrc nokey
+    while :; do
+        deadline=$(( $(date +%s) + budget ))
+        nokey=0
+        while :; do
+            psrc=0; line=$(_sw_trust_pane_state "$wid") || psrc=$?
+            [ "$psrc" -eq 0 ] || line=""
+            if [ "$psrc" -eq 3 ]; then
+                # The window's session:index could not be resolved — a tmux that
+                # cannot answer about a window it just created. Tolerate a short
+                # hiccup, then say UNVERIFIED rather than wait out the budget on
+                # a question nothing can answer.
+                nokey=$((nokey + 1))
+                if [ "$nokey" -ge 3 ]; then
+                    printf 'spawn-worker: NOTE — worker %s UNVERIFIED: tmux could not resolve window %s to a pane-state key (%d consecutive failures). Not a failure; the trust dialog was not observed.\n' \
+                        "$WINDOW_NAME" "$wid" "$nokey" >&2
+                    _sw_trust_log spawn-trust-unverified "reason=window-key-unresolvable"
+                    _sw_trust_drop_keep; return 0
+                fi
+            else
+                nokey=0
+            fi
+            state=""; overlay=""; evidence=""
+            for tok in $line; do
+                case "$tok" in
+                    state=*)    state=${tok#state=} ;;
+                    overlay=*)  overlay=${tok#overlay=} ;;
+                    evidence=*) evidence=${tok#evidence=} ;;
+                esac
+            done
+            case "$state" in
+                blocked)
+                    if [ "$overlay" = workspace-trust ]; then break; fi
+                    printf 'spawn-worker: NOTE — worker %s is blocked on overlay=%s; not the trust dialog, so nothing here recovers it (pane-state: %s)\n' \
+                        "$WINDOW_NAME" "${overlay:-?}" "$line" >&2
+                    _sw_trust_drop_keep; return 0 ;;
+                idle|busy|user-typing|autosuggest-only|working-background|working-self-paced|over-limit|idle-orphan-async)
+                    printf 'spawn-worker: post-spawn check: worker %s reached state=%s (trust dialog not shown%s)\n' \
+                        "$WINDOW_NAME" "$state" "$([ "$recoveries" -gt 0 ] && printf ' after %d recover(y|ies)' "$recoveries")" >&2
+                    _sw_trust_drop_keep; return 0 ;;
+                absent)
+                    case "$evidence" in
+                        boot-grace|'') : ;;   # too young to have booted — keep polling
+                        *)  printf 'spawn-worker: NOTE — worker %s pane reads absent (evidence=%s) during post-spawn check; not the trust dialog, nothing here recovers it (pane-state: %s)\n' \
+                                "$WINDOW_NAME" "$evidence" "$line" >&2
+                            _sw_trust_drop_keep; return 0 ;;
+                    esac ;;
+                *) : ;;   # empty | unknown | anything unenumerated: keep polling
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+                printf 'spawn-worker: NOTE — worker %s UNVERIFIED: no positive pane state within %ss (last pane-state: %s). Not a failure; the trust dialog was not observed.\n' \
+                    "$WINDOW_NAME" "$budget" "${line:-<none>}" >&2
+                _sw_trust_log spawn-trust-unverified "budget=$budget" "last=${line:-none}"
+                _sw_trust_drop_keep; return 0
+            fi
+            sleep 0.5
+        done
+        # ---- detected: the pane sits on the workspace-trust dialog ----------
+        detections=$((detections + 1))
+        key=$(_sw_trust_key_on_disk)
+        history="${history:+$history,}$key"
+        printf 'spawn-worker: worker %s landed on the WORKSPACE-TRUST dialog (detection %d; trust-key-at-detection=%s; recoveries so far=%d) — your-org/nexus-code#1334\n' \
+            "$WINDOW_NAME" "$detections" "$key" "$recoveries" >&2
+        _sw_trust_log spawn-trust-overlay "detection=$detections" "trust-key-at-detection=$key" \
+            "recoveries=$recoveries" "mode=${_SW_TRUST_MODE:-?}" "session-id=${WORKER_SESSION_ID:-${SESSION_ID:-}}"
+        if [ "$recoveries" -ge "$max_recover" ]; then
+            printf 'spawn-worker: FAILED — worker %s is still on the workspace-trust dialog after %d recover(y|ies) (max %d). The window is left in place.\n' \
+                "$WINDOW_NAME" "$recoveries" "$max_recover" >&2
+            printf '  trust-key-at-detection history: %s\n' "$history" >&2
+            case "$history" in
+                *ABSENT*|*false*)
+                    printf '  The key was MISSING at a detection: the seed was LOST between seed and boot (a competing writer of %s).\n' "$(_sw_trust_cfg_file)" >&2 ;;
+                *)
+                    printf '  The key read TRUE at EVERY detection, so a re-seed cannot help (the seeder is a no-op on a present key).\n' >&2
+                    printf '  Suspect a KEY-PATH MISMATCH (claude keys on its own canonical form of the cwd) or a second gate.\n' >&2
+                    printf '  .projects keys sharing this workdir basename (%s):\n' "$(basename "$WORKDIR")" >&2
+                    jq -r '.projects | keys[]' "$(_sw_trust_cfg_file)" 2>/dev/null | grep -F -- "/$(basename "$WORKDIR")" | sed 's/^/    /' >&2 || true ;;
+            esac
+            _sw_trust_log spawn-trust-failed "detections=$detections" "recoveries=$recoveries" "history=$history"
+            _sw_trust_drop_keep
+            exit 21
+        fi
+        recoveries=$((recoveries + 1))
+        if ! _sw_trust_respawn "$wid"; then
+            _sw_trust_log spawn-trust-failed "detections=$detections" "recoveries=$recoveries" "history=$history" "reason=respawn-refused"
+            _sw_trust_drop_keep
+            exit 21
+        fi
+        _sw_trust_log spawn-trust-recover "recovery=$recoveries" "new-window-id=$WID"
+        printf 'spawn-worker: recovered worker %s: re-seeded trust (read back true) and re-created the window (recovery %d of %d)\n' \
+            "$WINDOW_NAME" "$recoveries" "$max_recover" >&2
+        wid="$WID"
+    done
+}
+
 # Seed the watcher's lifecycle anchors BEFORE the launcher has a chance
 # to settle the renderer. This closes two regressions from issue #72:
 #
@@ -818,7 +1752,10 @@ _seed_lifecycle_anchors() {
     local nexus_root="$1" window="$2" workdir="$3"
     shift 3
     local ng="$nexus_root/monitor/ng"
-    local state_dir="$nexus_root/monitor/.state"
+    # CODE comes from $nexus_root; STATE comes from $STATE_DIR. Keeping the
+    # two derived from one variable is what let a pinned NEXUS_STATE_DIR be
+    # honoured by `ng` and ignored here in the same spawn (#973).
+    local state_dir="${STATE_DIR:-$nexus_root/monitor/.state}"
     local elog="$state_dir/engagement-log.tsv"
     local now
     now=$(date +%s)
@@ -899,23 +1836,52 @@ _write_provenance_record() {
     # here, so a worker that omits the flag fails loudly instead of
     # silently routing somewhere the orchestrator can't predict.
     local reply_to="${13:-}"
-    local windows_dir="$nexus_root/monitor/.state/windows"
+    # STATE, not code — see the $STATE_DIR block near the NEXUS_ROOT
+    # resolution (#973). The `:-` fallback is load-bearing: two suites
+    # eval-EXTRACT this function and call it without sourcing the script, so
+    # the global does not exist in their shell and a bare $STATE_DIR would
+    # trip `set -u`.
+    local windows_dir="${STATE_DIR:-$nexus_root/monitor/.state}/windows"
     mkdir -p "$windows_dir" 2>/dev/null || return 0
-    local out="$windows_dir/${window//[^a-zA-Z0-9_-]/_}.json"
+    local out="$windows_dir/$(wk_encode "$window").json"
     local tmp; tmp=$(mktemp "${out}.XXXXXX" 2>/dev/null) || return 0
     local spawned_at; spawned_at=$(date -Is 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)
-    local hb_ref="$nexus_root/monitor/.state/heartbeat/$window.json"
+    # Same STATE_DIR rule as windows_dir above. This one is a POINTER rather
+    # than a write, which is exactly why the first pass missed it — and why it
+    # still had to move: the heartbeat it names is written at
+    # $STATE_DIR/heartbeat (see _stamp_heartbeat), so leaving this keyed off
+    # $nexus_root made the provenance record's `last_activity_ref` name a path
+    # where no heartbeat exists whenever the state dir is pinned. A dangling
+    # pointer is a quieter failure than a misplaced file, not a smaller one.
+    local hb_ref="${STATE_DIR:-$nexus_root/monitor/.state}/heartbeat/$window.json"
     # Topic defaults to window name when not supplied.
     local effective_topic="${topic:-$window}"
     # skeptic_role is a JSON boolean; normalize the 0/1 flag.
     local skeptic_role_json=false
     [ "$skeptic_role" = "1" ] && skeptic_role_json=true
+    # `harness` — skills/nexus.agent-delivery §6. THE registration point for a
+    # mixed-harness nexus: it is what lets `ng send` pick an adapter without
+    # reading any harness's private registry (reading ~/.claude to decide WHICH
+    # harness is running is circular). This launcher spawns Claude Code, so it
+    # records that; a launcher for another harness records its own, and an
+    # absent field degrades to `generic-tmux`, which assumes nothing about the
+    # software in the pane.
+    #
+    # ONE binding, consumed by BOTH writers below. It is a variable rather than
+    # two literals because two literals is exactly how this broke: the field
+    # was spelled only in the `printf` arm — the one taken when `jq` is
+    # ABSENT, i.e. never on this host — so every record the launcher actually
+    # wrote omitted it, while a source-text grep for the literal found it and
+    # reported the producer conformant (your-org/nexus-code#1085). A single
+    # binding cannot diverge per branch.
+    local harness="claude-code"
     if command -v jq >/dev/null 2>&1; then
         jq -n \
             --arg window "$window" \
             --arg session_id "$session_id" \
             --arg kind "$kind" \
             --arg spawned_by "orchestrator" \
+            --arg harness "$harness" \
             --arg workdir "$workdir" \
             --arg prompt_file "$prompt_file" \
             --arg topic "$effective_topic" \
@@ -928,7 +1894,7 @@ _write_provenance_record() {
             --arg skeptic_orig "$skeptic_orig" \
             --arg reply_to "$reply_to" \
             '{window: $window, session_id: $session_id, kind: $kind,
-              spawned_by: $spawned_by, workdir: $workdir,
+              spawned_by: $spawned_by, harness: $harness, workdir: $workdir,
               prompt_file: $prompt_file, topic: $topic,
               spawned_at: $spawned_at, last_activity_ref: $last_activity_ref,
               skeptic_mode: $skeptic_mode, skeptic_depth: $skeptic_depth,
@@ -956,14 +1922,49 @@ _write_provenance_record() {
         _e_rt=$(printf '%s' "$reply_to"             | sed 's/\\/\\\\/g; s/"/\\"/g')
         local _e_depth="${skeptic_depth:-0}"
         [[ "$_e_depth" =~ ^[0-9]+$ ]] || _e_depth=0
-        printf '{"window":"%s","session_id":"%s","kind":"%s","spawned_by":"orchestrator","workdir":"%s","prompt_file":"%s","topic":"%s","spawned_at":"%s","last_activity_ref":"%s","skeptic_mode":"%s","skeptic_depth":%s,"skeptic_role":%s,"skeptic_target":"%s","skeptic_orig":"%s","reply_to":"%s"}\n' \
-            "$_e_window" "$_e_sid" "$_e_kind" "$_e_wd" "$_e_pf" \
+        local _e_harness
+        _e_harness=$(printf '%s' "$harness"         | sed 's/\\/\\\\/g; s/"/\\"/g')
+        printf '{"window":"%s","session_id":"%s","kind":"%s","spawned_by":"orchestrator","harness":"%s","workdir":"%s","prompt_file":"%s","topic":"%s","spawned_at":"%s","last_activity_ref":"%s","skeptic_mode":"%s","skeptic_depth":%s,"skeptic_role":%s,"skeptic_target":"%s","skeptic_orig":"%s","reply_to":"%s"}\n' \
+            "$_e_window" "$_e_sid" "$_e_kind" "$_e_harness" "$_e_wd" "$_e_pf" \
             "$_e_topic" "$_e_at" "$_e_ref" \
             "$_e_sm" "$_e_depth" "$skeptic_role_json" "$_e_st" "$_e_so" "$_e_rt" \
             > "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$out" 2>/dev/null \
         || { rm -f "$tmp" 2>/dev/null; return 0; }
     fi
+}
+
+# Add the `harness` key to an EXISTING descriptor that lacks it, touching
+# nothing else. The resume path needs this and a fresh spawn does not:
+# `_write_provenance_record` is reached only on the fresh path (the resume
+# branch exits at its own `exit 0`), so a window that is only ever RESUMED —
+# the watcher's crash-recovery path, `--replace`, the orchestrator respawn —
+# keeps whatever descriptor it was born with forever. Before
+# your-org/nexus-code#1085 that is a descriptor with no `harness`, and
+# `ng send` degrades it to `generic-tmux` for the rest of its life. Short-lived
+# workers heal on their next fresh spawn; the long-lived windows do not, and the
+# orchestrator is precisely the window a worker is told to message.
+#
+# TWO INVARIANTS, both deliberate:
+#   * NEVER CREATE a descriptor here. Its ABSENCE is what marks a window as
+#     operator-manual; manufacturing one would silently reclassify a hand-made
+#     window as orchestrator-spawned.
+#   * NEVER OVERWRITE an existing `harness`. A foreign launcher's value is its
+#     business, and this one has no standing to correct it.
+# Best-effort throughout, like the writer it complements: no failure here may
+# abort a resume.
+_ensure_harness_field() {
+    local nexus_root="$1" window="$2" harness="${3:-claude-code}"
+    local windows_dir="${STATE_DIR:-$nexus_root/monitor/.state}/windows"
+    local out="$windows_dir/$(wk_encode "$window").json"
+    [ -f "$out" ] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    jq -e 'has("harness")' "$out" >/dev/null 2>&1 && return 0
+    local tmp; tmp=$(mktemp "${out}.XXXXXX" 2>/dev/null) || return 0
+    jq --arg harness "$harness" '. + {harness: $harness}' "$out" > "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$out" 2>/dev/null \
+        || { rm -f "$tmp" 2>/dev/null; return 0; }
+    return 0
 }
 
 # ---- resume mode (--resume <window-name | session-id>) -----------------
@@ -1012,7 +2013,7 @@ _resume_coordinator_window() {
 # when the pin is absent or malformed — the gate below then allows
 # everything, i.e. pre-#206 behaviour.
 _resume_pinned_orch_sid() {
-    local pin="$NEXUS_ROOT/monitor/.state/orchestrator-session-id" sid=""
+    local pin="$STATE_DIR/orchestrator-session-id" sid=""
     [ -f "$pin" ] || return 0
     sid=$(tr -d '[:space:]' < "$pin" 2>/dev/null || true)
     if grep -qE "$_UUID_RE" <<<"$sid"; then
@@ -1041,7 +2042,7 @@ _resume_sid_allowed() {
 # to the plain-text sources (reports, spawn-prompt cache).
 _resume_event_field() {
     local event="$1" window="$2" field="$3"
-    local log="$NEXUS_ROOT/monitor/.state/action-log.jsonl"
+    local log="$STATE_DIR/action-log.jsonl"
     [ -f "$log" ] || return 0
     command -v jq >/dev/null 2>&1 || return 0
     grep "\"event\":\"$event\"" "$log" 2>/dev/null \
@@ -1071,7 +2072,9 @@ _resume_workdir() {
     wd=$(_resume_event_field spawn "$window" '.workdir')
     if [ -n "$wd" ] && [ -d "$wd" ]; then printf '%s' "$wd"; return 0; fi
     # 4. Spawn-prompt cache's "- Workdir:" line.
-    local cache="$NEXUS_ROOT/monitor/.state/spawn-prompts/${window//[^a-zA-Z0-9_-]/_}.txt"
+    # DIRECTORY from #973's $STATE_DIR, NAME from #941's wk_encode — the two
+    # PRs change orthogonal halves of this one path and both halves are needed.
+    local cache="$STATE_DIR/spawn-prompts/$(wk_encode "$window").txt"
     if [ -f "$cache" ]; then
         wd=$(sed -n 's/^- Workdir: //p' "$cache" | head -1)
         if [ -n "$wd" ] && [ -d "$wd" ]; then printf '%s' "$wd"; return 0; fi
@@ -1120,7 +2123,7 @@ _resume_session_id() {
     #    authoritative live-session record for a window that never
     #    filed a report and never closed cleanly (the #206 incident
     #    class: container restart mid-task).
-    local hb="$NEXUS_ROOT/monitor/.state/heartbeat/$window.json"
+    local hb="$STATE_DIR/heartbeat/$window.json"
     if [ -f "$hb" ]; then
         sid=$(sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' "$hb" | head -1)
         if grep -qE "$_UUID_RE" <<<"$sid"; then
@@ -1293,11 +2296,11 @@ MSG
     # is deliberately NOT auto-nudged: that worker was waiting on a
     # human, and "continue" could steamroll the pending question.
     HB_STATE=""
-    HB_FILE="$NEXUS_ROOT/monitor/.state/heartbeat/$SOURCE_WINDOW.json"
+    HB_FILE="$STATE_DIR/heartbeat/$SOURCE_WINDOW.json"
     if [ -f "$HB_FILE" ]; then
         HB_STATE=$(sed -n 's/.*"state":"\([^"]*\)".*/\1/p' "$HB_FILE" | head -1)
     fi
-    PENDING_FILE="$NEXUS_ROOT/monitor/.state/pending-tool/$SOURCE_WINDOW.json"
+    PENDING_FILE="$STATE_DIR/pending-tool/$SOURCE_WINDOW.json"
     DO_NUDGE=0
     NUDGE_REASON="heartbeat-${HB_STATE:-absent}"
     case "$RESUME_NUDGE" in
@@ -1346,7 +2349,7 @@ MSG
         fi
     fi
 
-    SAFE_NAME="${WINDOW_NAME//[^a-zA-Z0-9_-]/_}"
+    SAFE_NAME=$(wk_encode "$WINDOW_NAME")
     LAUNCHER_TMP="${TMPDIR:-/tmp}/spawn-launcher-${SAFE_NAME}.$$.sh"
 
     # Resume launcher: identical env wiring to the fresh-spawn shape
@@ -1363,11 +2366,16 @@ MSG
     if [ "$DO_NUDGE" -eq 1 ]; then
         NUDGE_ARG=" \"$NUDGE_TEXT\""
     fi
+    NAME_ARG=$(_spawn_name_arg "$WINDOW_NAME")
+    PLUGIN_ARG=$(_spawn_plugin_arg "$WINDOW_NAME")
     cat > "$LAUNCHER_TMP" <<LAUNCHER
 #!/bin/bash
 export NEXUS_ROOT="$NEXUS_ROOT"
 export NEXUS_SPAWN_CODE_ROOT="$NEXUS_SPAWN_CODE_ROOT"
 export NEXUS_WORKER_WINDOW="$WINDOW_NAME"
+# The spawning agent's own tool-shell snapshot, for the guard's frozen-snapshot
+# leg (your-org/nexus-code#1477 — see _spawner_snapshot in spawn-worker.sh).
+$SPAWNER_SNAPSHOT_EXPORT
 # Join the nexus-wide toolchain (PATH += locals/bin, UV_* -> locals/) so
 # \`uv\`/\`python\`/nexus tools resolve by name and nothing writes to \$HOME.
 # Guarded: a missing env file is a silent no-op, never a launcher failure.
@@ -1396,11 +2404,17 @@ $SHIM_GUARD_BLOCK
 # session's project dir or Claude Code won't find the transcript.
 cd "$WORKDIR" || exit 1
 rm -f $LAUNCHER_TMP
+# CLAUDE_CODE_SANDBOXED=1: see the fresh launcher (#1334).
+CLAUDE_CODE_SANDBOXED=1 \\
 CLAUDE_CODE_RESUME_THRESHOLD_MINUTES=999999999 \\
 CLAUDE_CODE_RESUME_TOKEN_THRESHOLD=999999999999 \\
-    "$CLAUDE_BIN" --dangerously-skip-permissions $HOOKS_FLAG --resume "$SESSION_ID"$NUDGE_ARG
+    "$CLAUDE_BIN" --dangerously-skip-permissions${NAME_ARG:+ $NAME_ARG}${PLUGIN_ARG:+ $PLUGIN_ARG} $HOOKS_FLAG --resume "$SESSION_ID"$NUDGE_ARG
 LAUNCHER
     chmod +x "$LAUNCHER_TMP"
+
+    # WORKDIR is final on the resume path only from here (it is resolved from
+    # the window's traces well after the fresh-spawn canonicalisation).
+    _seed_workspace_trust
 
     # Capture the new window's @id at creation and target every
     # subsequent op by id (#323). No server restart can interleave
@@ -1413,10 +2427,52 @@ LAUNCHER
     tmux set-window-option -t "$WID" remain-on-exit on 2>/dev/null || true
     tmux set-window-option -t "$WID" automatic-rename off 2>/dev/null || true
     tmux set-window-option -t "$WID" allow-rename off 2>/dev/null || true
+    # your-org/nexus-code#1051 — NO DEAD-PANE GUARD HERE, AND THE REASON IS THE
+    # PRIMITIVE, NOT THE ADJACENCY.
+    #
+    # `#745` is a **`paste-buffer`** defect. `send-keys` was its measured-SAFE
+    # CONTROL, and monitor/_pane-live.sh records both: `paste-buffer` into a dead
+    # pane killed the server 20/20, `send-keys` into the same dead pane survived
+    # 10/10 — "`send-keys` into the same dead pane is harmless". paste-followup.sh
+    # says the same thing from the other side, offering `tmux send-keys` as the way
+    # to "poke a corpse". This file contains no executable `paste-buffer` at all.
+    #
+    # So the server-death hazard is NOT reachable from this line, whatever the pane's
+    # state. An earlier revision of this comment asserted that `#745` was a
+    # `send-keys` defect and instructed a successor to add `_tmux_pane_is_dead` if
+    # the send were ever separated from its window creation. That premise was FALSE,
+    # and the instruction would have made someone pay a real cost — see below — for a
+    # hazard that does not exist on this path.
+    #
+    # The adjacency (`$WID` is assigned by the nearest `tmux new-window` above, in
+    # this execution, no branch and no reassignment) is real and worth knowing, but it
+    # is not what makes this safe. If a future edit separates the send from the
+    # creation, the send is STILL safe; what you would lose is only the guarantee that
+    # the window exists at all, whose failure mode is a `send-keys` that does nothing.
+    #
+    # AND THE GUARD WOULD COST MORE THAN IT BUYS. `_tmux_pane_is_dead` is
+    # deliberately fail-CLOSED: it returns "dead" — REFUSE — whenever it cannot tell,
+    # and one of those arms is `tmux list-panes` failing, which its own comment
+    # attributes to "a fork failure under the worker RLIMIT_NPROC ceiling, or a busy
+    # socket". This nexus runs workers under exactly that ceiling. On the PASTE path
+    # that trade is right, because there the primitive really is lethal. Here it would
+    # convert a transient tmux hiccup into a FAILED SPAWN to prevent nothing.
+    #
+    # NO DISTANCE IS QUOTED ON PURPOSE. "N lines up" is a line number wearing a
+    # disguise: an earlier draft said 7, and adding the comment itself moved it to 29.
+    _sw_trust_keep_launcher resume
     tmux send-keys -t "$WID" "$LAUNCHER_TMP" Enter
 
     _seed_lifecycle_anchors "$NEXUS_ROOT" "$WINDOW_NAME" "$WORKDIR" \
         "mode=resume" "session-id=$SESSION_ID"
+
+    # Heal a pre-#1085 descriptor in place. See _ensure_harness_field: this is
+    # the ONLY path on which a long-lived window's descriptor is ever revisited.
+    _ensure_harness_field "$NEXUS_ROOT" "$WINDOW_NAME"
+
+    # Post-spawn trust verification (your-org/nexus-code#1334) — same block as
+    # the fresh path; a resumed worker meets the same dialog.
+    _sw_trust_verify "$WID"
 
     echo "resumed: window=$WINDOW_NAME session=$SESSION_ID workdir=$WORKDIR settings=$SETTINGS_FILE nudge=$([ "$DO_NUDGE" -eq 1 ] && echo on || echo off) ($NUDGE_REASON)" >&2
     exit 0
@@ -1538,11 +2594,48 @@ fi
 # class one level up. Resolve in order of relevance and NAME the winner, and
 # when none resolves say so loudly rather than emitting a blank.
 _clone_freshness_block() {
-    local dir="$1"
-    git -C "$dir" rev-parse --git-dir >/dev/null 2>&1 || {
+    local dir="$1" _rr=0
+    if [ "${_SW_RR_OK:-0}" -ne 1 ]; then
+        # Degraded mode: narrower predicate, same never-walk-up property. Two
+        # valued, so there is no UNDETERMINED arm to reach here.
+        if _sw_has_own_history_fallback "$dir"; then
+            _rr=0
+        else
+            printf -- '- Clone freshness: NOT A GIT REPOSITORY (%s) — no remote-tracking state to report.\n' "$dir"
+            return 0
+        fi
+    else
+    # your-org/nexus-code#1245. NOT `git -C "$dir" rev-parse --git-dir`: that
+    # walks UP and answers about the nearest ENCLOSING repository, so for a
+    # non-repo workdir under work/ it returns rc 0 and every line below reports
+    # the NEXUS's branch and HEAD as this clone's. Measured on `dev` @ 989b888:
+    # a plain directory under work/ printed `dev` / `989b888` as its own
+    # freshness. This block's entire purpose is to make a worker's negative
+    # claims datable; dating them against a different repository is the defect
+    # it exists to prevent, one level up.
+    rr_has_own_history "$dir" || _rr=$?
+    fi
+    if [ "$_rr" -eq 1 ]; then
+        # BYTE-IDENTICAL to the pre-#1245 wording, deliberately. What #1245
+        # changes is WHICH directories reach this arm (a non-repo under a repo
+        # now does, instead of silently inheriting the enclosing branch/HEAD) —
+        # not what it says. `test-spawn-worker-reply-to.sh` composes this exact
+        # line into an independent byte-for-byte reference, and richer wording
+        # bought a diagnostic nobody asked for at the cost of that contract.
         printf -- '- Clone freshness: NOT A GIT REPOSITORY (%s) — no remote-tracking state to report.\n' "$dir"
         return 0
-    }
+    fi
+    if [ "$_rr" -ne 0 ]; then
+        # rc 3 — UNDETERMINED. Deliberately NOT phrased as "not a git
+        # repository": that is a confident negative, and the whole point of
+        # this block is that a negative claim be trustworthy (#1245).
+        printf -- '- Clone freshness: COULD NOT DETERMINE whether %s is a repository of its\n' "$dir"
+        printf -- '  own (kind=%s, reason=%s). This is NEITHER "fresh" NOR "not a repo" —\n' \
+            "${RR_KIND:-unknown}" "${RR_REASON:-unknown}"
+        printf -- '  treat this clone'"'"'s remote knowledge as UNKNOWN and fetch before any\n'
+        printf -- '  negative claim about the repository.\n'
+        return 0
+    fi
     local head_line branch
     branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
     # NB: `git branch --show-current` does not exist on git 2.17.1 and dies
@@ -1615,6 +2708,177 @@ _clone_freshness_block() {
     printf -- '  mtime +2s, `origin/main` unmoved).\n'
 }
 
+# ── your-org/nexus-code#1260 — reconcile the PROSE against the TREE ────────
+#
+# A spawn prompt's prose names a clone and a ref ("Clone `work/X`, fresh at
+# `dev` @ `<sha>`"). That claim is hand-authored by the orchestrator and is the
+# line a worker reads as ground truth. Nothing compared it against the tree
+# that was actually delivered. Measured three times in one day on this board:
+# a clone delivered on `main` 4 days stale, one on a feature branch 3 behind,
+# and one on `dev` 42 commits behind — each announced as fresh at a `dev` sha.
+#
+# The failure direction is the bad one. Every measurement a worker then makes
+# SUCCEEDS and agrees with itself, on a tree nobody named. Two of the three
+# briefs named this very issue by number and instructed the agent to verify its
+# own ref, which is why a note is not enough: the agent cannot verify what it
+# was told before it starts, and by then it has already been told.
+#
+# WARN, NEVER REFUSE (the issue is explicit). A prompt may legitimately name a
+# ref the worker is expected to fetch and check out itself. The obligation is
+# that the worker be TOLD, not left to notice.
+#
+# WHY IT ANCHORS ON CANDIDATE LINES rather than scanning the whole body: a
+# brief quotes shas about other repositories all the time. Anchoring on the
+# workdir's own name, or on the recurring "this is your clone" phrasings, is
+# what keeps a warning channel from becoming noise. A missed claim costs the
+# status quo; a false one costs a line the worker must adjudicate.
+_prompt_tree_reconcile() {
+    local dir="$1" pf="$2"
+    [ "${_SW_RR_OK:-0}" -eq 1 ] || return 0
+    [ -n "$pf" ] && [ -r "$pf" ] || return 0
+
+    local _rr=0
+    rr_has_own_history "$dir" || _rr=$?
+    # No own history, or undetermined: the freshness block above has already
+    # said so. "That sha is not present" would be a confident negative about a
+    # tree we cannot read — the #1245 arm owns this case.
+    [ "$_rr" -eq 0 ] || return 0
+
+    local head_sha branch base
+    head_sha=$(git -C "$dir" rev-parse HEAD 2>/dev/null) || return 0
+    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null) || branch=""
+    base=$(basename -- "$dir")
+
+    # `$base` is a REGEX here, not a literal — a metacharacter in the basename
+    # silently loses the anchor. Escape it (your-org/nexus-code#1260 skeptic).
+    local base_re; base_re=$(printf '%s' "$base" | sed 's/[][^$.*+?(){}|\\/]/\\&/g')
+    local lines
+    lines=$(grep -aEi -e "$base_re" -e 'fresh at|freshly cloned|checked out on|already on|now on|on branch|your clone|clone is|is checked out|^[[:space:]]*Clone:' \
+                -- "$pf" 2>/dev/null | sed -n '1,60p') || lines=''
+    [ -n "$lines" ] || return 0
+
+    # SINGLE-quoted patterns throughout: a backtick inside a double-quoted
+    # shell word is command substitution, and these patterns are dense with
+    # backticks by construction (your-org/nexus-code#1157).
+    local claimed_shas claimed_branches out='' sha br
+    # BOTH spellings. Measured over the 1,874 real prompts in
+    # monitor/.state/spawn-prompts: `` at `sha` `` occurs 293 times and
+    # `` @ `sha` `` only 174 — the ORIGINAL pattern matched the LESS common
+    # form. The suite missed this because its fixtures were written from the
+    # phrasings the code already supported rather than drawn from the corpus.
+    claimed_shas=$(printf '%s\n' "$lines" \
+        | grep -oE '(@|[[:space:]]at)[[:space:]]*`?[0-9a-f]{7,40}`?' 2>/dev/null \
+        | grep -oE '[0-9a-f]{7,40}' | sort -u) || claimed_shas=''
+    # TWO CLASSES, because they carry different evidence.
+    #
+    # EXPLICIT forms ("checked out on", "fresh at", "already on", "now on",
+    # "on branch") SAY the token is a branch. They are ungated.
+    #
+    # The BARE `, on `X`` form does not. Measured over the 1,874 real prompts in
+    # monitor/.state/spawn-prompts/, it appears 60 times and is used for a
+    # branch (`, on `dev``), a REPO (`, on `your-org/nexus-code``, 8 prompts)
+    # and a FILE (`, on `test-erofs-escalation.sh``). Adding it ungated would
+    # manufacture confident warnings about claims the prompt never made.
+    #
+    # `%` is in the class so a branch named `100%-coverage` is captured whole
+    # rather than truncated to `100` and reported as a mismatch it invented.
+    # BACKTICKED explicit claims are UNGATED; UNBACKTICKED ones are gated
+    # exactly like the bare `, on X` form. The gating rationale below applies
+    # verbatim to this arm and it did not have it, which made the arm extract
+    # ENGLISH from prose. Measured over all 1,875 real prompts, the ungated arm
+    # produced a claim in 123 of them and its commonest tokens included `the`
+    # (15), `disk` (9), `branch` (6), `a` (5) and `is` (4) — beside real
+    # branches like `operator/autolink-removal` (22) and `dev` (15). A warning
+    # that fires on prose is a confident FALSE POSITIVE in a diagnostic, and a
+    # diagnostic that cries wolf on the common path is worse than none: once a
+    # reader has seen ``names branch `the``, they stop reading the real ones.
+    #
+    # A backtick is the AUTHOR'S OWN MARK that a token is an identifier, so it
+    # is evidence and it is honoured. Absent that mark, require the token to
+    # resolve as a ref. Measured, that pair drops 18 prose tokens and readmits
+    # zero, while recovering the ONE real branch a plain backtick requirement
+    # would have lost (`operator/post-recovery-fixes`, written unbackticked in
+    # one prompt and backticked elsewhere).
+    claimed_branches=$(printf '%s\n' "$lines" \
+        | grep -oEi '(checked out on|fresh at|already on|now on|on branch)[[:space:]]+`[A-Za-z0-9._/%-]+`' 2>/dev/null \
+        | sed -E 's/.*`([A-Za-z0-9._/%-]+)`$/\1/' | sort -u) || claimed_branches=''
+    local loose_branches
+    loose_branches=$(printf '%s\n' "$lines" \
+        | grep -oEi '(checked out on|fresh at|already on|now on|on branch)[[:space:]]+[A-Za-z0-9._/%-]+' 2>/dev/null \
+        | sed -E 's/.*[[:space:]]([A-Za-z0-9._/%-]+)$/\1/' | sort -u) || loose_branches=''
+    local weak_branches
+    weak_branches=$(printf '%s\n' "$lines" \
+        | grep -oEi ',[[:space:]]*on[[:space:]]+`?[A-Za-z0-9._/%-]+`?' 2>/dev/null \
+        | sed -E 's/.*[[:space:]]`?([A-Za-z0-9._/%-]+)`?$/\1/' | tr -d '`' | sort -u) || weak_branches=''
+
+    for sha in $claimed_shas; do
+        if ! git -C "$dir" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+            out="${out}    - the prompt names @ ${sha}, which is NOT PRESENT in this clone.\n"
+        elif ! git -C "$dir" merge-base --is-ancestor "$sha" "$head_sha" 2>/dev/null; then
+            out="${out}    - the prompt names @ ${sha}, which is present but is NOT AN ANCESTOR of HEAD.\n"
+        fi
+    done
+
+    # A token that resolves to no ref here is not evidence — but that is only a
+    # reason for SILENCE on the ambiguous form. Applying it to the explicit
+    # forms too would silence the ORIGINATING INCIDENT: a clone delivered on
+    # `main` whose prompt names a `dev` that was never fetched has no local
+    # `dev` ref, and that is exactly the case #1260 exists for.
+    _sw_ref_exists() {
+        git -C "$1" rev-parse --verify --quiet "refs/heads/$2" >/dev/null 2>&1 && return 0
+        git -C "$1" rev-parse --verify --quiet "refs/remotes/origin/$2" >/dev/null 2>&1
+    }
+    _sw_branch_mismatch() {   # <token> <gated:0|1>
+        local br="$1" gated="$2"
+        [ -n "$branch" ] || return 1
+        [ "$br" != "$branch" ] || return 1
+        # A hex token here is a sha that landed in the branch bucket; the sha
+        # loop already adjudicated it.
+        [[ "$br" =~ ^[0-9a-f]{7,40}$ ]] && return 1
+        [ "$gated" -eq 1 ] && { _sw_ref_exists "$dir" "$br" || return 1; }
+        return 0
+    }
+    for br in $claimed_branches; do
+        if _sw_branch_mismatch "$br" 0; then
+            out="${out}    - the prompt names branch \`${br}\`; this clone is on \`${branch}\`.\n"
+        fi
+    done
+    for br in $loose_branches; do
+        case $'\n'"$claimed_branches"$'\n' in *$'\n'"$br"$'\n'*) continue ;; esac
+        if _sw_branch_mismatch "$br" 1; then
+            out="${out}    - the prompt names branch \`${br}\`; this clone is on \`${branch}\`.\n"
+        fi
+    done
+    for br in $weak_branches; do
+        case $'\n'"$loose_branches"$'\n' in *$'\n'"$br"$'\n'*) continue ;; esac
+        # NOT `printf … | grep -q … && continue`. Under `pipefail`, `grep -q`
+        # exits on the FIRST match, `printf` takes SIGPIPE and the pipeline
+        # reports rc 141 — a false failure on exactly the inputs that match.
+        # I fixed this idiom once already in this same function and then
+        # reintroduced it here while fixing something else, which is the
+        # argument for the lint existing rather than for remembering the rule.
+        # `case` over a newline-delimited list needs no pipe.
+        case $'\n'"$claimed_branches"$'\n' in *$'\n'"$br"$'\n'*) continue ;; esac
+        if _sw_branch_mismatch "$br" 1; then
+            out="${out}    - the prompt names branch \`${br}\`; this clone is on \`${branch}\`.\n"
+        fi
+    done
+
+    [ -n "$out" ] || return 0
+    printf -- '\n'
+    printf -- '  ⚠️  PROMPT/TREE MISMATCH (your-org/nexus-code#1260) — the prompt'"'"'s prose\n'
+    printf -- '      disagrees with the tree you were actually given:\n'
+    # `printf "%b"`, never `printf -- "$out"`: a `%` in a branch name would be
+    # read as a CONVERSION and silently eat the text (measured: "branch
+    # %s-feature" printed as "branch -feature"). The data is never the format.
+    printf '%b' "$out"
+    printf -- '      MEASURED: HEAD is %s on branch %s.\n' \
+        "$(git -C "$dir" rev-parse --short HEAD 2>/dev/null)" "${branch:-<detached>}"
+    printf -- '      The BANNER above is measured; the prompt'"'"'s ref claim is asserted.\n'
+    printf -- '      Trust the banner. Fetch and check out explicitly if the prompt'"'"'s ref\n'
+    printf -- '      is the one you are meant to work against, and say which you used.\n'
+}
+
 # Extract "## Worker floor" section body up to the next "## " H2 (or EOF).
 # H2 boundaries are load-bearing for this extraction; see the orchestrator
 # prose in skills/nexus.worker-defaults/SKILL.md.
@@ -1669,7 +2933,7 @@ fi
 # production runs with TMPDIR unset land in /tmp as before, while test
 # harnesses point TMPDIR at a per-test dir so concurrent suite runs
 # can't glob-inspect (or delete) each other's launcher files.
-SAFE_NAME="${WINDOW_NAME//[^a-zA-Z0-9_-]/_}"
+SAFE_NAME=$(wk_encode "$WINDOW_NAME")
 PROMPT_TMP="${TMPDIR:-/tmp}/spawn-prompt-${SAFE_NAME}.$$.txt"
 LAUNCHER_TMP="${TMPDIR:-/tmp}/spawn-launcher-${SAFE_NAME}.$$.sh"
 
@@ -1728,6 +2992,7 @@ fi
     printf -- '- Primary nexus root: %s\n' "$NEXUS_ROOT"
     printf -- '- Reports dir: %s/reports\n' "$NEXUS_ROOT"
     _clone_freshness_block "$WORKDIR"
+    _prompt_tree_reconcile "$WORKDIR" "$PROMPT_FILE"
     # Skeptic disclosure (skills/nexus.skeptic). An ORDINARY worker is told
     # NOTHING about a possible subsequent skeptic here — it does its work
     # unaware, and learns of the skeptic decision/gate only at wrap-up
@@ -1789,8 +3054,66 @@ if grep -Fxq -- "$WINDOW_NAME" <<<"$(tmux list-windows -F '#W' 2>/dev/null)"; th
     exit 7
 fi
 
+# ── your-org/nexus-code#1081 — THE ADDRESS SPACE IS WIDER THAN tmux ──────
+#
+# The delivery contract pins identity to the tmux WINDOW NAME
+# (skills/nexus.agent-delivery/SKILL.md §1) and takes on responsibility for that
+# address being unambiguous. The refusal above discharges it against the LIVE
+# tmux window list — a population strictly SMALLER than the one the property
+# must hold over. The preferred transport resolves a name against the harness's
+# peer set, which has included RETIRED nexus window names surfaced as the
+# operator's sessions on other machines. Measured on 2026-08-27: 13 addressable
+# peers against 8 live windows, one of them `fig4e-skeptic` — a retired nexus
+# name that `-n fig4e-skeptic` would have re-issued, making the name denote two
+# entries at once.
+#
+# WHY THIS WARNS AND DOES NOT REFUSE. Name reuse after retirement is a
+# SUPPORTED workflow, not an accident: `#73` D2 built structural support for it
+# (the spawn event's ts becomes the lifecycle birth so a stale wrap-up from the
+# prior life is rejected), and test-integration/test-same-name-recycle.sh exists
+# to hold it. Refusing every name this nexus has ever used would break a
+# designed behaviour to close a narrower hazard — the fix costing more than the
+# defect. So the LIVE collision stays a hard refusal and a RECYCLE is surfaced.
+#
+# WHY THE SCRIPT CANNOT CLOSE THIS ITSELF. The harness's peer list is available
+# to an AGENT, never to a shell script — there is no command this file could
+# run to enumerate it. So the residual check is an ORCHESTRATOR obligation and
+# is written down as one in the contract, next to the identity rule it
+# qualifies. An undocumented boundary is a false promise; a documented one is a
+# boundary.
+# KEYED ON THE ACTION LOG FIRST, and that is a correction rather than a
+# refinement (your-org/nexus-code#1081 skeptic). The first version read ONLY
+# `windows/<key>.json` — and `"file:windows/{s}.json"` is a member of
+# `BK_RETIRE_SURFACES`, so `ng retire-window`, the verb the skill tells the
+# orchestrator to PREFER, DELETES the evidence this check reads. Coverage would
+# have shrunk precisely as operators adopted the preferred verb: a name retired
+# properly becomes indistinguishable from a name never used, which is the
+# silent-zero shape wearing a bookkeeping costume.
+#
+# `monitor/.state/action-log.jsonl` is NOT in BK_RETIRE_SURFACES and is
+# append-only, so a spawn recorded there survives retirement. Verified: the
+# retired name `fig4e-skeptic` has 6 action-log entries and would be caught.
+# The `windows/` record is kept as a second, cheaper witness — either is enough.
+#
+# ONE grep, no pipe: `grep -aF … | grep -q …` is the SIGPIPE idiom this file was
+# already caught reintroducing once tonight.
+_sw_name_seen_before() {
+    local name="$1" n
+    if [ -r "$STATE_DIR/action-log.jsonl" ]; then
+        n=$(grep -acF "\"window\":\"${name}\"" "$STATE_DIR/action-log.jsonl" 2>/dev/null)
+        [ "${n:-0}" -gt 0 ] && return 0
+    fi
+    [ -e "$STATE_DIR/windows/$(wk_encode "$name").json" ]
+}
+_sw_prior_record="$STATE_DIR/windows/$(wk_encode "$WINDOW_NAME").json"
+if _sw_name_seen_before "$WINDOW_NAME"; then
+    echo "spawn-worker: NOTE — the window name '$WINDOW_NAME' has been used in this nexus before (action log, and/or $_sw_prior_record)." >&2
+    echo "spawn-worker:        tmux freed the name, so this spawn is legitimate; but the delivery transport's address space is WIDER than the live window list and may still hold the earlier bearer (your-org/nexus-code#1081)." >&2
+    echo "spawn-worker:        Before relying on '$WINDOW_NAME' as a delivery address, enumerate peers with ListAgents and confirm exactly ONE row bears it. READ-ONLY: never message a peer that is one of the operator's other sessions." >&2
+fi
+
 # Spawn-prompt cache. Copy the fully-composed prompt to
-# $NEXUS_ROOT/monitor/.state/spawn-prompts/<window>.txt so the
+# $STATE_DIR/spawn-prompts/<window>.txt so the
 # orchestrator's tier-3/4 subject-issue discovery (see
 # `monitor/agent-prompt.md` "Pending decisions" → "Three-tier
 # taxonomy") has a fallback when the worker hasn't written a
@@ -1801,7 +3124,7 @@ fi
 # Best-effort: write failures degrade silently. The cache is a
 # convenience, not load-bearing — the tier-3/4 discovery still
 # works (just less informatively) when this file is absent.
-SPAWN_PROMPT_CACHE_DIR="$NEXUS_ROOT/monitor/.state/spawn-prompts"
+SPAWN_PROMPT_CACHE_DIR="$STATE_DIR/spawn-prompts"
 mkdir -p "$SPAWN_PROMPT_CACHE_DIR" 2>/dev/null \
     && cp -- "$PROMPT_TMP" "$SPAWN_PROMPT_CACHE_DIR/$SAFE_NAME.txt" 2>/dev/null \
     || true
@@ -1853,12 +3176,20 @@ MODEL_ARG=""
 if [ -n "$MODEL" ]; then
     MODEL_ARG="--model \"$MODEL\""
 fi
+# longjob-watch dispatcher arming (your-org/nexus-code#1535): `--plugin-dir
+# <dir>` or EMPTY, decided once here for both launcher shapes. Empty leaves
+# the launchers byte-identical to the pre-#1535 form; the reason is on
+# stderr and in monitor/.state/longjob/arming.log.
+PLUGIN_ARG=$(_spawn_plugin_arg "$WINDOW_NAME")
 if [ "$USE_LOOP_WRAPPER" -eq 1 ]; then
 cat > "$LAUNCHER_TMP" <<LAUNCHER
 #!/bin/bash
 export NEXUS_ROOT="$NEXUS_ROOT"
 export NEXUS_SPAWN_CODE_ROOT="$NEXUS_SPAWN_CODE_ROOT"
 export NEXUS_WORKER_WINDOW="$WINDOW_NAME"
+# The spawning agent's own tool-shell snapshot, for the guard's frozen-snapshot
+# leg (your-org/nexus-code#1477 — see _spawner_snapshot in spawn-worker.sh).
+$SPAWNER_SNAPSHOT_EXPORT
 # Join the nexus-wide toolchain (PATH += locals/bin, UV_* -> locals/) so
 # \`uv\`/\`python\`/nexus tools resolve by name and nothing writes to \$HOME.
 # Guarded: a missing env file is a silent no-op, never a launcher failure.
@@ -1896,17 +3227,25 @@ cd "$WORKDIR" || exit 1
 # wrapper still releases /tmp. The --settings file is repo-tracked,
 # not a tempfile — nothing to clean up there.
 trap 'rm -f $PROMPT_TMP $LAUNCHER_TMP' EXIT
+# CLAUDE_CODE_SANDBOXED=1: exported (not prefixed) so claude-loop.sh's own
+# \`claude --continue\` re-invocations carry it too. See the fresh direct
+# launcher and spawn-worker.sh's "PRIMARY FIX" paragraph (#1334).
+export CLAUDE_CODE_SANDBOXED=1
 exec "\$NEXUS_ROOT/monitor/claude-loop.sh" \\
     --window "$WINDOW_NAME" \\
     --prompt-file "$PROMPT_TMP" \\
-    $HOOKS_FLAG${MODEL_ARG:+ $MODEL_ARG}
+    $HOOKS_FLAG${MODEL_ARG:+ $MODEL_ARG}${PLUGIN_ARG:+ $PLUGIN_ARG}
 LAUNCHER
 else
+NAME_ARG=$(_spawn_name_arg "$WINDOW_NAME")
 cat > "$LAUNCHER_TMP" <<LAUNCHER
 #!/bin/bash
 export NEXUS_ROOT="$NEXUS_ROOT"
 export NEXUS_SPAWN_CODE_ROOT="$NEXUS_SPAWN_CODE_ROOT"
 export NEXUS_WORKER_WINDOW="$WINDOW_NAME"
+# The spawning agent's own tool-shell snapshot, for the guard's frozen-snapshot
+# leg (your-org/nexus-code#1477 — see _spawner_snapshot in spawn-worker.sh).
+$SPAWNER_SNAPSHOT_EXPORT
 # Join the nexus-wide toolchain (PATH += locals/bin, UV_* -> locals/) so
 # \`uv\`/\`python\`/nexus tools resolve by name and nothing writes to \$HOME.
 # Guarded: a missing env file is a silent no-op, never a launcher failure.
@@ -1937,7 +3276,12 @@ cd "$WORKDIR" || exit 1
 prompt=\$(<$PROMPT_TMP)
 rm -f $PROMPT_TMP $LAUNCHER_TMP
 # --settings file is repo-tracked; no tempfile cleanup needed.
-"$CLAUDE_BIN" --dangerously-skip-permissions${MODEL_ARG:+ $MODEL_ARG} $HOOKS_FLAG${SESSION_ID_FLAG:+ $SESSION_ID_FLAG} "\$prompt"
+# CLAUDE_CODE_SANDBOXED=1: tells Claude Code it runs inside a sandbox (it
+# does — kernel-enforced), which makes its workspace-trust gate return
+# "trusted" before the config key is consulted. Rationale, measurement and
+# the canary that guards the undocumented flag: spawn-worker.sh, "PRIMARY
+# FIX" paragraph above the post-spawn verification block (#1334).
+CLAUDE_CODE_SANDBOXED=1 "$CLAUDE_BIN" --dangerously-skip-permissions${MODEL_ARG:+ $MODEL_ARG}${NAME_ARG:+ $NAME_ARG}${PLUGIN_ARG:+ $PLUGIN_ARG} $HOOKS_FLAG${SESSION_ID_FLAG:+ $SESSION_ID_FLAG} "\$prompt"
 LAUNCHER
 fi
 chmod +x "$LAUNCHER_TMP"
@@ -1949,6 +3293,7 @@ chmod +x "$LAUNCHER_TMP"
 # The id is valid for this whole spawn (no restart can interleave); the
 # NAME remains the durable cross-turn key (re-resolved via
 # resolve_window_id at each later targeting op — see #323).
+_seed_workspace_trust
 WID=$(tmux new-window -P -F '#{window_id}' -d -n "$WINDOW_NAME" -c "$WORKDIR") || true
 if [ -z "$WID" ]; then
     rm -f "$PROMPT_TMP" "$LAUNCHER_TMP"
@@ -1977,6 +3322,40 @@ tmux set-window-option -t "$WID" remain-on-exit on 2>/dev/null || true
 # and pollutes the snapshot diff.
 tmux set-window-option -t "$WID" automatic-rename off 2>/dev/null || true
 tmux set-window-option -t "$WID" allow-rename off 2>/dev/null || true
+# your-org/nexus-code#1051 — NO DEAD-PANE GUARD HERE, AND THE REASON IS THE
+# PRIMITIVE, NOT THE ADJACENCY.
+#
+# `#745` is a **`paste-buffer`** defect. `send-keys` was its measured-SAFE
+# CONTROL, and monitor/_pane-live.sh records both: `paste-buffer` into a dead
+# pane killed the server 20/20, `send-keys` into the same dead pane survived
+# 10/10 — "`send-keys` into the same dead pane is harmless". paste-followup.sh
+# says the same thing from the other side, offering `tmux send-keys` as the way
+# to "poke a corpse". This file contains no executable `paste-buffer` at all.
+#
+# So the server-death hazard is NOT reachable from this line, whatever the pane's
+# state. An earlier revision of this comment asserted that `#745` was a
+# `send-keys` defect and instructed a successor to add `_tmux_pane_is_dead` if
+# the send were ever separated from its window creation. That premise was FALSE,
+# and the instruction would have made someone pay a real cost — see below — for a
+# hazard that does not exist on this path.
+#
+# The adjacency (`$WID` is assigned by the nearest `tmux new-window` above, in
+# this execution, no branch and no reassignment) is real and worth knowing, but it
+# is not what makes this safe. If a future edit separates the send from the
+# creation, the send is STILL safe; what you would lose is only the guarantee that
+# the window exists at all, whose failure mode is a `send-keys` that does nothing.
+#
+# AND THE GUARD WOULD COST MORE THAN IT BUYS. `_tmux_pane_is_dead` is
+# deliberately fail-CLOSED: it returns "dead" — REFUSE — whenever it cannot tell,
+# and one of those arms is `tmux list-panes` failing, which its own comment
+# attributes to "a fork failure under the worker RLIMIT_NPROC ceiling, or a busy
+# socket". This nexus runs workers under exactly that ceiling. On the PASTE path
+# that trade is right, because there the primitive really is lethal. Here it would
+# convert a transient tmux hiccup into a FAILED SPAWN to prevent nothing.
+#
+# NO DISTANCE IS QUOTED ON PURPOSE. "N lines up" is a line number wearing a
+# disguise: an earlier draft said 7, and adding the comment itself moved it to 29.
+_sw_trust_keep_launcher fresh
 tmux send-keys -t "$WID" "$LAUNCHER_TMP" Enter
 
 # Seed the watcher's lifecycle anchors BEFORE the launcher has a chance
@@ -2032,6 +3411,40 @@ if [ "$SKEPTIC_ROLE" -eq 1 ] && [ -n "$SKEPTIC_TARGET" ]; then
             --extra "depth=$SKEPTIC_DEPTH" \
             >/dev/null 2>&1 || true
     fi
+    # OBLIGATION EDGE (your-org/nexus-code#845). The `skeptic-spawn` event
+    # above records that a pairing HAPPENED; it is an append-only log line
+    # and nothing queries it as current state. The edge below records that
+    # the pairing is OUTSTANDING — this window OWES $SKEPTIC_TARGET a
+    # verdict — and `retire-preflight` check 1d reads it before any kill.
+    #
+    # This is the moment the dependency becomes true, and it is the ONLY
+    # moment at which it is known without anyone having to remember it. The
+    # alternative on the board was for the orchestrator to hold the pairing
+    # in its head, which is what it was already doing when it retired
+    # `sk911` mid-obligation and left `papercuts` pushing a fix to a
+    # reviewer that no longer existed.
+    #
+    # The ORIGINAL worker gets an edge too when the chain is recursive: a
+    # second-or-later skeptic reviews the WHOLE chain (skills/nexus.skeptic
+    # Change 2), so the original is equally owed and equally strandable.
+    # obl_open refuses a self-edge, so the orig == target case is a no-op
+    # rather than a duplicate.
+    if [ -x "$NEXUS_ROOT/monitor/obligations.sh" ]; then
+        "$NEXUS_ROOT/monitor/obligations.sh" open \
+            --debtor "$WINDOW_NAME" --creditor "$SKEPTIC_TARGET" \
+            --kind skeptic-verdict --round "$SKEPTIC_DEPTH" \
+            --by "spawn-worker.sh --skeptic-role" \
+            --detail "skeptic spawned to review $SKEPTIC_TARGET at depth $SKEPTIC_DEPTH" \
+            >/dev/null 2>&1 || true
+        if [ -n "$SKEPTIC_ORIG" ] && [ "$SKEPTIC_ORIG" != "$SKEPTIC_TARGET" ]; then
+            "$NEXUS_ROOT/monitor/obligations.sh" open \
+                --debtor "$WINDOW_NAME" --creditor "$SKEPTIC_ORIG" \
+                --kind skeptic-verdict --round "$SKEPTIC_DEPTH" \
+                --by "spawn-worker.sh --skeptic-role (chain root)" \
+                --detail "recursive skeptic at depth $SKEPTIC_DEPTH reviews the whole chain rooted at $SKEPTIC_ORIG" \
+                >/dev/null 2>&1 || true
+        fi
+    fi
     # Auto-ack the pending spawn-skeptic request (your-org/nexus-code#545).
     # `ng wrap-up` files a `kind=spawn-skeptic` request into the request
     # inbox to PUSH the orchestrator to spawn this skeptic; spawning it IS
@@ -2047,7 +3460,7 @@ if [ "$SKEPTIC_ROLE" -eq 1 ] && [ -n "$SKEPTIC_TARGET" ]; then
     # SPAWN; this just stops the request re-emitting. Best-effort — a miss
     # degrades to the request re-emitting until the orchestrator acks by
     # hand, never to a broken spawn.
-    _sk_req_dir="$NEXUS_ROOT/monitor/.state/requests"
+    _sk_req_dir="$STATE_DIR/requests"
     _sk_chan="$NEXUS_ROOT/monitor/request-channel.sh"
     if [ -d "$_sk_req_dir" ] && [ -x "$_sk_chan" ]; then
         _sk_target_safe=$(printf '%s' "$SKEPTIC_TARGET" | tr -c 'a-zA-Z0-9_-' '_')
@@ -2064,7 +3477,51 @@ if [ "$SKEPTIC_ROLE" -eq 1 ] && [ -n "$SKEPTIC_TARGET" ]; then
             _sk_origin=$(sed -n 's/^origin:[[:space:]]*//p' "$_sk_rf" 2>/dev/null | head -1) || _sk_origin=""
             [ "$_sk_origin" = "$_sk_target_safe" ] || continue
             _sk_id=$(basename "$_sk_rf"); _sk_id=${_sk_id%.md}; _sk_id=${_sk_id%.*}
-            "$_sk_chan" ack "$_sk_id" >/dev/null 2>&1 || true
+            # A REFUSED ACK MUST BE VISIBLE (your-org/nexus-code#1358). This was
+            # `>/dev/null 2>&1 || true`, which reported success, refusal and
+            # error IDENTICALLY — the silent-failure class in the one place that
+            # decides whether a filed request stays open. Still best-effort: no
+            # ack outcome fails the spawn, because the marker is the gate and it
+            # is already in place. What changes is that the outcome is SAID.
+            #
+            # rc 6 is `cmd_ack`'s reply-required refusal. It does not fire for a
+            # spawn-skeptic request today — `ng` files those without `--reply`,
+            # deliberately, so the ordinary spawn->done path is unchanged — and
+            # the arm exists because a refusal that nothing prints is
+            # indistinguishable from an ack that happened. If a request kind
+            # reaching here ever does demand a reply, this says so and names the
+            # verb that satisfies it rather than leaving the request open with
+            # no explanation.
+            # `_sk_ack_rc=0; … || _sk_ack_rc=$?` AND NOT `out=$(…); rc=$?`.
+            # This script is `set -euo pipefail` (line ~170, no `set +e`
+            # anywhere) and this block is the body of a top-level `if`,
+            # which does NOT suppress errexit. A BARE assignment whose
+            # command substitution exits non-zero therefore TERMINATES THE
+            # SCRIPT: `_sk_ack_rc=$?` never runs and the `case` below is
+            # unreachable for every rc it was written to report. Measured
+            # on the bare form with the real binaries: a `reply: required`
+            # ack (rc 6) and a concurrent-rename ack (rc 1) both exited the
+            # launcher with EMPTY stderr, skipping `skeptic-channel init`
+            # below, the `skeptic/pending` marker at ~:2979 and
+            # `ng skeptic-arm` — while the tmux window created at ~:2742
+            # already exists. So the skeptic runs on with no comms channel
+            # and NO marker for `retire-preflight.sh` check 1b to read,
+            # which is the live-worker-retirement class. The `|| true` form
+            # this replaced could not do that: the change meant to end a
+            # silent failure had converted a survivable silence into a
+            # SILENT ABORT — silent precisely because the printing is what
+            # became unreachable.
+            _sk_ack_rc=0; _sk_ack_out=$("$_sk_chan" ack "$_sk_id" 2>&1) || _sk_ack_rc=$?
+            case "$_sk_ack_rc" in
+                0) : ;;
+                6) printf 'spawn-worker: spawn-skeptic request %s demands a REPLY and was not auto-acked.\n' "$_sk_id" >&2
+                   printf '  It stays open until it is answered. `reply` both records the decision and\n' >&2
+                   printf '  closes the loop:\n' >&2
+                   printf '      ng request reply %s --status spawned --worker %s --file <rationale>\n' "$_sk_id" "$WINDOW_NAME" >&2 ;;
+                *) printf 'spawn-worker: could not ack spawn-skeptic request %s (rc %s) — the spawn is\n' "$_sk_id" "$_sk_ack_rc" >&2
+                   printf '  unaffected; the request will keep re-emitting until it is answered.\n' >&2
+                   printf '%s\n' "$_sk_ack_out" | sed 's/^/  /' >&2 ;;
+            esac
         done
     fi
     if [ -x "$NEXUS_ROOT/monitor/skeptic-channel.sh" ]; then
@@ -2095,15 +3552,169 @@ if [ "$SKEPTIC_ROLE" -eq 1 ] && [ -n "$SKEPTIC_TARGET" ]; then
     # really spawned, never on a merely-recommended pass the orchestrator
     # declined. The reviewed worker's marker is therefore never cleared "early"
     # here; it is cleared only at verdict time and reborn only at a real spawn.
-    SKEPTIC_PENDING_DIR="$NEXUS_ROOT/monitor/.state/skeptic/pending"
+    SKEPTIC_PENDING_DIR="$STATE_DIR/skeptic/pending"
     mkdir -p "$SKEPTIC_PENDING_DIR" 2>/dev/null || true
-    _sk_safe() { printf '%s' "${1//[^a-zA-Z0-9_-]/_}"; }
+    _sk_safe() { wk_encode "${1-}"; }
     printf '%s' "$SKEPTIC_DEPTH" \
         > "$SKEPTIC_PENDING_DIR/$(_sk_safe "$SKEPTIC_TARGET")" 2>/dev/null || true
     if [ -n "$SKEPTIC_ORIG" ] && [ "$SKEPTIC_ORIG" != "$SKEPTIC_TARGET" ]; then
         printf '%s' "$SKEPTIC_DEPTH" \
             > "$SKEPTIC_PENDING_DIR/$(_sk_safe "$SKEPTIC_ORIG")" 2>/dev/null || true
     fi
+    # ── AND RECORD WHAT THE ARM IS ABOUT (your-org/nexus-code#1207) ─────────
+    #
+    # The block above establishes the ARMED STATE. Until this, it recorded no
+    # SUBJECT — the marker holds a depth integer and nothing else — so nothing
+    # downstream could say which artefact this reviewer was pinned to, and
+    # `_skeptic_record_discharge` could attribute no verdict against it.
+    #
+    # Read the comment above this one for why that is not an edge case: for a
+    # first-pass skeptic the marker write is an idempotent re-stamp, but for a
+    # SECOND-or-later pass this is *the only thing that restores the block*. So
+    # every re-validation round — the rounds that exist because something was
+    # already found wrong — armed without a subject. Measured: `annz36` logged
+    # `subject-armed-sha:"-"` at verdict time, and `ncpanestate` carries ONE
+    # `armed` row against four rounds, so all six of its delivered verdicts read
+    # `asserted-not-armed`.
+    #
+    # `PRIOR_REPORT_RESOLVED` is the right subject and is why this is a repair
+    # rather than a workaround: it is the report this skeptic is being POINTED
+    # AT (resolved against NEXUS_ROOT at line ~1919), so arming against it names,
+    # per round, exactly what the reviewer was told to read.
+    #
+    # `ng skeptic-arm` owns the row format and the idempotence rule — it appends
+    # nothing when this artefact is already outstanding, because a second arm for
+    # one artefact IS `ambiguous-N-arms-outstanding`, and a fix for one pole of
+    # `#1156` that manufactures another is not a fix.
+    #
+    # BEST-EFFORT, LOUD: a state dir that cannot be written must not fail a
+    # spawn — the marker is the gate and it is already in place. But it says so
+    # on stderr rather than swallowing it, because "armed with no subject" is
+    # exactly the silent state this issue is about. rc 3 (already outstanding) is
+    # the normal first-pass outcome and is not reported as a problem.
+    # No `--issue`: this script has no issue number in scope (there is no such
+    # variable), so the row records `-` rather than a value invented here. That
+    # costs nothing the supersession relation needs — it is keyed on the issue of
+    # the DISCHARGE rows, not of the arm.
+    #
+    # ── THE SHAPE MIRRORS THE MARKER BLOCK ABOVE, DELIBERATELY ────────────
+    #
+    # An earlier version looped over `"$SKEPTIC_TARGET" "$SKEPTIC_ORIG"` with a
+    # dedup guard meant to skip the SECOND iteration when ORIG == TARGET. It
+    # skipped BOTH: on iteration 1 the window IS the target, so when
+    # ORIG == TARGET the guard's first test is also true and `continue` fired for
+    # the target as well. Nothing was armed.
+    #
+    # ORIG == TARGET is the DEFAULT, not an edge case — the block at the top of
+    # this file sets `SKEPTIC_ORIG="$SKEPTIC_TARGET"` whenever `--skeptic-orig` is
+    # omitted, and the first-pass spawn command deliberately omits it. Measured
+    # over `action-log.jsonl`: 818 spawns with ORIG == TARGET against 9 without
+    # (excluding a test fixture), and 83 against 1 since the ledger feature
+    # landed. So the fix was inoperative for essentially every spawn it existed
+    # for — including `annz36`, the witness this whole change was derived from.
+    #
+    # And it failed SILENTLY: `-r` WAS supplied, so the no-report warning below
+    # could not fire and stderr stayed empty. A fix for silent record loss that
+    # itself loses records silently is the defect class re-instantiated inside its
+    # own remedy.
+    #
+    # The marker block three lines up had the correct shape all along —
+    # unconditional for TARGET, guarded for ORIG. Mirroring it removes the chance
+    # to get the dedup wrong, because there is no dedup: there are two call sites
+    # with the same guard the markers use.
+    _sk_record_arm() {
+        [ -n "${1-}" ] || return 0
+        # `|| _sk_arm_rc=$?`, NEVER a bare `_sk_arm_rc=$?` on the next line.
+        # `set -euo pipefail` is on (top of this file), so a command
+        # SUBSTITUTION that exits non-zero terminates the shell AT THE
+        # ASSIGNMENT — the next line never runs and the `case` below is
+        # UNREACHABLE for every rc it was written to handle.
+        #
+        # That is not a corner case, it is THE COMMON PATH: `ng skeptic-arm`
+        # exits 3 for ALREADY CURRENT, which its own docs call "Not a failure",
+        # and which is exactly what the target window has already produced by
+        # arming its own report at `require` wrap-up before the orchestrator
+        # spawns the reviewer with the `-r` that #1251 made mandatory.
+        # Measured at 0b82ffb2: the tmux window IS created and the launcher IS
+        # sent — the worker is LIVE — and spawn-worker then exits 3 having never
+        # printed its `spawned:` line. A success reported as a failure, after
+        # the irreversible half already happened.
+        _sk_arm_rc=0
+        _sk_arm_out=$("$NEXUS_ROOT/monitor/ng" skeptic-arm "$1" \
+            --report "$PRIOR_REPORT_RESOLVED" --state-dir "$STATE_DIR" 2>&1) \
+            || _sk_arm_rc=$?
+        case "$_sk_arm_rc" in
+            0|3) : ;;
+            *) printf 'spawn-worker: WARNING — could not record the skeptic ARM for %s (ng skeptic-arm rc=%s).\n' \
+                   "$1" "$_sk_arm_rc" >&2
+               printf '%s\n' "$_sk_arm_out" | sed 's/^/  /' >&2
+               printf '  The marker IS in place, so the gate is shut; the ledger just cannot\n' >&2
+               printf '  attribute a verdict to an artefact. See your-org/nexus-code#1207.\n' >&2 ;;
+        esac
+    }
+    if [ -n "$PRIOR_REPORT_RESOLVED" ] && [ -x "$NEXUS_ROOT/monitor/ng" ]; then
+        _sk_record_arm "$SKEPTIC_TARGET"
+        if [ -n "$SKEPTIC_ORIG" ] && [ "$SKEPTIC_ORIG" != "$SKEPTIC_TARGET" ]; then
+            _sk_record_arm "$SKEPTIC_ORIG"
+        fi
+    elif [ -z "$PRIOR_REPORT_RESOLVED" ]; then
+        # ── ASK THE LEDGER BEFORE CLAIMING WHAT IT HOLDS (your-org/nexus-code#1302)
+        #
+        # The predicate available in this arm is "did THIS invocation receive
+        # -r?". The claim the warning used to make is "the arm records NO
+        # SUBJECT" — a property of the LEDGER, which this arm never consulted.
+        # On the protocol's NORMAL path the two disagree: a worker that wrapped
+        # up with `--skeptic-decision require` has ALREADY armed its own key
+        # with its own report's sha (`_skeptic_record_arm`, from the wrap-up
+        # skeptic step in `monitor/ng`) before the orchestrator ever spawns. So
+        # the unconditional warning fired on the COMMON case — and because its
+        # text was identical either way, an orchestrator had no way to
+        # recognise the genuine case it exists for. Habituation then hides it.
+        #
+        # `ng skeptic-obligations` is the ledger's own THREE-VALUED answer, and
+        # the third value is the point: a diagnostic that cannot tell "no
+        # subject" from "could not look" will eventually assert the first while
+        # meaning the second.
+        #   rc 1  outstanding > 0  -> a subject IS on record; say so, alarm nothing
+        #   rc 0  outstanding = 0  -> no subject: the original warning, now TRUE
+        #   rc 3  REFUSED          -> ledger present but unreadable/unparseable
+        # Any other rc (2 usage, 127 no `ng`, ...) is also "could not look" and
+        # falls to the same arm — default-DENY on the CLAIM, never on the spawn.
+        #
+        # `|| _sk_ob_rc=$?` is not style, it is the same `set -e` trap fixed
+        # above: a bare `out=$(cmd)` at non-zero rc terminates the script before
+        # the next line can read `$?`.
+        _sk_ob_out=""
+        _sk_ob_rc=0
+        if [ -x "$NEXUS_ROOT/monitor/ng" ]; then
+            _sk_ob_out=$("$NEXUS_ROOT/monitor/ng" skeptic-obligations "$SKEPTIC_TARGET" \
+                --state-dir "$STATE_DIR" 2>/dev/null) || _sk_ob_rc=$?
+        else
+            _sk_ob_rc=127
+        fi
+        case "$_sk_ob_rc" in
+            1)  printf 'spawn-worker: no prior report (-r) given for this --skeptic-role spawn, but the\n' >&2
+                printf '  ledger ALREADY HOLDS an outstanding arm for %s, so a verdict CAN be\n' "$SKEPTIC_TARGET" >&2
+                printf '  attributed. Nothing to repair here. Confirm the arm names the artefact this\n' >&2
+                printf '  reviewer will actually read; if it does not, respawn with -r.\n' >&2
+                printf '%s\n' "$_sk_ob_out" | sed 's/^/    /' >&2 ;;
+            0)  printf 'spawn-worker: NOTE — no prior report (-r) given for this --skeptic-role spawn and\n' >&2
+                printf '  the ledger holds NO outstanding arm, so the ARM for %s records NO SUBJECT\n' "$SKEPTIC_TARGET" >&2
+                printf '  and a verdict against it cannot be attributed (it will still be RECORDED:\n' >&2
+                printf '  evidence class `verdict-without-arm`).\n' >&2
+                printf '  Pass -r <report-the-skeptic-should-read>. See your-org/nexus-code#1207.\n' >&2 ;;
+            *)  printf 'spawn-worker: NOTE — no prior report (-r) given for this --skeptic-role spawn, and\n' >&2
+                printf '  the ledger for %s COULD NOT BE READ (ng skeptic-obligations rc=%s). Whether a\n' "$SKEPTIC_TARGET" "$_sk_ob_rc" >&2
+                printf '  subject is on record is UNKNOWN — this is NOT a claim that none is.\n' >&2
+                printf '  Pass -r <report-the-skeptic-should-read>. See your-org/nexus-code#1302.\n' >&2 ;;
+        esac
+    fi
 fi
+
+# Post-spawn trust verification (your-org/nexus-code#1334): after the anchors,
+# provenance and skeptic bookkeeping above (all keyed by NAME, so a recovery
+# that re-creates the window under the same name leaves them valid), and
+# before the `spawned:` line, so a bounded failure never prints a success.
+_sw_trust_verify "$WID"
 
 echo "spawned: window=$WINDOW_NAME workdir=$WORKDIR prompt=$PROMPT_FILE kind=$SPAWN_KIND floor=injected${PRIOR_REPORT_RESOLVED:+ prior-report=$PRIOR_REPORT_RESOLVED} settings=$SETTINGS_FILE${WORKER_SESSION_ID:+ session-id=$WORKER_SESSION_ID}$([ "$USE_LOOP_WRAPPER" -eq 1 ] && echo ' loop=on')" >&2

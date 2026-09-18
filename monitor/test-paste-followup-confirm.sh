@@ -51,7 +51,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — missing %q\n  in: <<%s>>\n' "$label" "$needle" "$hay" >&2
@@ -117,6 +118,15 @@ case "${1:-}" in
           # Delimiter EXTRACTED from the requested format (your-org/nexus-code#699).
           d="${fmt#*'#{window_id}'}"; d="${d%%'#{window_name}'*}"
           printf '@1%s%s\n' "$d" "$STUB_WINDOW"
+      elif [[ "$fmt" == *window_index* ]]; then
+          # The INDEX shape (your-org/nexus-code#905): resolve_window_key /
+          # resolve_window_index ask for `#{window_index}<delim>#{window_name}`,
+          # which carries no `window_id`. Without this branch it fell to the
+          # bare-name else below and came back unsplittable, which the resolver
+          # rightly refused ("Window presence is UNKNOWN, not absent"), so the
+          # paste never happened. Delimiter EXTRACTED, never assumed, as above.
+          d="${fmt#*'#{window_index}'}"; d="${d%%'#{window_name}'*}"
+          printf '0%s%s\n' "$d" "$STUB_WINDOW"
       else printf '%s\n' "$STUB_WINDOW"; fi
       exit 0 ;;
   send-keys)

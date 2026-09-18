@@ -1,5 +1,5 @@
 ---
-description: "Operating and diagnosing the nexus watcher: judging liveness by the loop-proof heartbeat (NOT watcher.log mtime), the supervisor's silent self-heal, recovery recipes by failure signature (wedge / stale-lock / decapitation-duplicate), phantom-window auto-resurrection, the eligible-comment eyes-ack + stale-eyes re-emit, and CC-banner vs gated cc-update. Orchestrator-facing; pairs with nexus.self-fix for code fixes and nexus.service-recovery for service-health emits."
+description: "Operating and diagnosing the nexus watcher: judging liveness by the UP/BUSY/WEDGED/DOWN verdict over the heartbeat/progress/cycle triple (NOT watcher.log mtime, and NOT the heartbeat alone), the supervisor's silent self-heal, recovery recipes by failure signature (wedge / stale-lock / decapitation-duplicate), phantom-window auto-resurrection, the eligible-comment eyes-ack + stale-eyes re-emit, and CC-banner vs gated cc-update. Orchestrator-facing; pairs with nexus.self-fix for code fixes and nexus.service-recovery for service-health emits."
 ---
 
 # nexus.watcher — operating & diagnosing the watcher
@@ -23,20 +23,43 @@ the running loop). For a `--- service health ---` emit, use
 The watcher runs headless (no tmux window); its log is
 `monitor/.state/watcher.log`.
 
-## 1. Judge liveness by the heartbeat, never `watcher.log` mtime
+## 1. Judge liveness by the verdict, never `watcher.log` mtime
 
-Since the "heartbeat IS the proof-of-working-loop" change, the
-authoritative liveness signal is the **loop-proof heartbeat** the main
-loop writes each tick — what `watcher-supervise-tick.sh` and
-`revive-watcher.sh` check. **`watcher.log` mtime ≠ loop liveness:** the
-log can keep getting touched while the loop is wedged (e.g. a
-`compose_emit` hang), giving a FALSE "healthy" read. Do not
-`stat watcher.log` to judge health — run `monitor/svc.sh status` (reads
-the watcher row) or trust the supervisor's verdict.
+**`watcher.log` mtime ≠ loop liveness:** the log can keep getting
+touched while the loop is wedged (e.g. a `compose_emit` hang), giving a
+FALSE "healthy" read. Do not `stat watcher.log` to judge health — run
+`monitor/svc.sh status` (reads the watcher row) or trust the
+supervisor's verdict.
 
-An even stronger signal than either heartbeat or log mtime: **is the
-loop forking fresh children** (`tac`/`jq`/`gh`)? A wedged loop stops
-spawning.
+**And the heartbeat alone is no longer the whole answer either.** Since
+`#491` the three questions are three files, because a heartbeat bumped
+per compose cycle was a WORKLOAD signal: cycle duration scales with
+worker count while every threshold is a constant, so at ≥12 workers a
+healthy watcher was GUARANTEED to read DOWN, and every remedy keyed on
+that verdict killed it mid-loop (the 2026-07-09 restart storm).
+
+| File | Question | Writer |
+|---|---|---|
+| `watcher-heartbeat` | is the PROCESS alive and scheduled? | a background `setsid` ticker at `monitor.watcher.heartbeat_tick_seconds` (default 20 s) — workload-independent by construction |
+| `watcher-progress` | is the LOOP moving? | the scheduler loop, every iteration + at stage boundaries |
+| `watcher-cycle` | did a full COMPOSE CYCLE complete? | `_cycle_bump` at each correct cycle end, carrying the measured period |
+
+`_watcher_liveness_verdict` (`_lib.sh`) folds them into the operator
+trichotomy: **`UP` / `BUSY` / `WEDGED` / `DOWN`**, exit
+`0` / `1` / `4` / `2`. **`BUSY` is HEALTHY under load — never restart
+it.** Only **`svc.sh status`** and **`watcher-supervise-tick.sh`**
+call it, so those are the two places you read a verdict WORD.
+`revive-watcher.sh` and `ng watcher-status` call `_watcher_alive`
+directly and give you the raw bucket instead (`0` fresh, `1` stale,
+`2` very stale or dead pid, `3` no heartbeat, `4` wedged) — the same
+vocabulary one layer down, and `ng watcher-status` prints no `state=`
+line at all. (`_lib.sh`'s own header names four callers; measured at
+`a3177ef6`, two of them read the bucket, not the verdict.)
+
+An even stronger signal than any file: **is the loop forking fresh
+children** (`tac`/`jq`/`gh`)? A wedged loop stops spawning — and this
+is the fork-freshness signal the heartbeat ticker deliberately runs
+OUTSIDE the watcher's process group so as not to pollute.
 
 ## 2. The supervisor self-heals SILENTLY — don't over-react
 
@@ -173,12 +196,56 @@ emits `--- claude code update available ---` (logged as
 `cc-update FIRED: … candidate=X installed=Y`; state in
 `monitor/.state/cc-update-available`). The check runs on a cadence, so
 the registry can be ahead of the gate for a while — present the banner
-as at most an early heads-up, never as the gate firing. On a SAFE verdict
+as at most an early heads-up, never as the gate firing.
+
+**And on a stock config that emit never comes.**
+`monitor.cc_update.emit_enabled` defaults to `false`
+(`_cc_update.sh` returns early), because the autonomous
+`cc_auto_update` routine closes the gated loop on its own and the
+manual nag is redundant. DETECTION still runs and keeps
+`monitor/.state/cc-update-available` current — so read that file, not
+the absence of an emit, when you want to know whether a candidate
+exists. Set the knob to `true` only if you deliberately want the
+manual evaluation gate back. On a SAFE verdict
 the routine bumps the pin and restarts the watcher (and tries the
 orchestrator) silently; an `APPLY_EXIT=20 safe-bumped-restart-deferred`
 is a benign version-split that self-heals on the next natural respawn —
 don't force-kill your own window to chase it. Evaluation procedure:
 `nexus.cc-update`.
+
+## 8. `WARN … exceeded …s` in `watcher.log` — key on the CONTEXT, never on `rc 124`
+
+`#1066` (merge `50a959d`; first post-fix line `2026-08-26T21:33:30-07:00`)
+routed **seven** bounded-call failure paths through `_bounded_failure_log`,
+which emits either `and was killed (rc 124)` or
+`FAILED with rc N — NOT a timeout`. Seven is the number of
+`_bounded_failure_log` CALL SITES, not of `_run_bounded` sites — there are
+more of the latter, and the ones outside this set (`snapshot_local`'s scans,
+`gh-now: gh-filter`) carry their own correctly-gated wording.
+**It cannot correct what was already written.** Earlier lines NAMED A CAUSE the
+code never tested — a bounded call that failed for any reason was reported as
+a timeout — and that is what sent `#1063` down two wrong diagnoses.
+
+The untrustworthy corpus is exactly the three helper contexts:
+
+```zsh
+command grep -E 'WARN (compose_report|compose_emit|startup-sweep):.*exceeded' LOG \
+  | command grep -v 'rc 124'
+```
+
+**Do NOT filter on `rc 124` alone.** Other sites emit `exceeded` and are
+correctly gated — on a MEASURED 124 (`snapshot_local`'s reports/git scans) or
+on a direct age comparison (`scheduler: async task … watchdog budget`) — and
+none of them prints the token. On the 2026-08-28 archive a bare token filter
+flags **1,172 correctly-gated lines** against the **9,407** that really are
+unverifiable: an 11% false-positive rate, pointing the next investigator at
+code that was already right.
+
+The corpus survives only in a ROTATED ARCHIVE: `watcher.log` rotates at
+`monitor.state_log_max_bytes` to `watcher.log.<epoch>`, and archives older than
+`monitor.diff_retention_days` are deleted on the NEXT rotation. The live
+`watcher.log` has carried zero pre-fix lines since `2026-08-28T11:29:46-0700`,
+so a search of the live log is a true zero for the wrong reason.
 
 ## See also
 

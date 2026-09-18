@@ -76,7 +76,7 @@ ok()  { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
 bad() { printf '  FAIL: %s — %s\n' "$1" "$2" >&2; FAIL=$(( FAIL + 1 )); }
 assert_eq() { [[ "$2" == "$3" ]] && ok "$1" || bad "$1" "got [$2] want [$3]"; }
 assert_ne() { [[ "$2" != "$3" ]] && ok "$1" || bad "$1" "got [$2], wanted anything else"; }
-assert_contains() { grep -qF -- "$3" <<<"$2" && ok "$1" || bad "$1" "missing [$3] in <<$2>>"; }
+assert_contains() { [[ -n "$3" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2; [[ -n "$3" ]] && grep -qF -- "$3" <<<"$2" && ok "$1" || bad "$1" "missing [$3] in <<$2>>"; }
 
 [[ -f "$UPLOAD" ]] || { echo "missing $UPLOAD" >&2; exit 1; }
 command -v setsid >/dev/null || { echo "SKIP: setsid unavailable" >&2; exit 0; }

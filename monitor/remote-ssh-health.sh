@@ -97,13 +97,41 @@ _probe_banner() {
     # because a redirection error on `exec` exits a non-interactive shell;
     # the `C:` marker distinguishes connect-failure from an empty read.
     local out banner
-    out=$(
-        { exec 3<>"/dev/tcp/$PROBE_HOST/$PORT"; } 2>/dev/null || exit 9
-        printf 'C:'
+    # your-org/nexus-code#1028 — the `read -t` bounds the READ; it never bounded
+    # the CONNECT, and a blackholing address blocks in `exec` for the kernel's
+    # SYN budget (~127s here) before the read timeout is ever reached. Wrapping
+    # the WHOLE subshell adds NO second connect — the one-connect-per-attempt
+    # property this function exists to preserve (MaxStartups=3 pressure, #431)
+    # is untouched.
+    local _ct _ov
+    _ct=$(_remote_connect_timeout)
+    [[ "$_ct" =~ ^[0-9]+$ ]] && (( _ct > 0 )) || _ct=3
+    _ov=$(( _ct + TIMEOUT ))
+    # BRACES ARE LOAD-BEARING inside the probe below (your-org/nexus-code#1028
+    # skeptic F1). Bash applies redirections LEFT TO RIGHT, so a bare
+    # `exec 3<>… 2>/dev/null` attempts the connect BEFORE stderr is redirected
+    # and leaks the shell own diagnostic. Measured: 91 bytes
+    # ("bash: connect: Connection refused") against 0 for the grouped form.
+    #
+    # NOT COSMETIC. `_service_health.sh:313` selects the operator-facing verdict
+    # by keyword over stderr with `head -n1`, and `refused` is in that list — so
+    # the leak WINS over the real diagnostic and a port held by a FOREIGN
+    # SQUATTER is reported as our daemon being down. That is the distinction
+    # `#609`/`#637` exist to preserve, re-broken by a new route at unchanged rc.
+    #
+    # This comment is OUTSIDE the `bash -c '…'` on purpose: it is single-quoted,
+    # so an apostrophe in there terminates the script (caught by `bash -n`).
+    out=$(timeout "$_ov" bash -c '
+        # BRACES ARE LOAD-BEARING — see the note above this bash -c.
+        { exec 3<>"/dev/tcp/$0/$1"; } 2>/dev/null || exit 9
+        printf "C:"
         b=""
-        IFS= read -t "$TIMEOUT" -r b <&3 2>/dev/null || true
-        printf '%s' "$b"
-    )
+        IFS= read -t "$2" -r b <&3 2>/dev/null || true
+        printf "%s" "$b"
+    ' "$PROBE_HOST" "$PORT" "$TIMEOUT")
+    # A timeout leaves `out` without the `C:` marker, so it takes the SAME
+    # branch as a refused connect: fall through to the `nc` probe (`-w 2`,
+    # already bounded). A blind probe must never read as a live banner.
     if [[ "$out" != C:* ]]; then
         _nc_banner; return $?           # /dev/tcp unusable or connect refused → try nc
     fi
@@ -171,8 +199,25 @@ identity_gate() {
             return 1 ;;
         *)  # INDETERMINATE — the ONLY overridable verdict, because it is the
             # only one that means "unknown" rather than "verified not ours".
+            # ATTRIBUTE THE SOCKET HERE TOO (your-org/your-nexus#331). This was
+            # printed on the rc-1 arm only, so the ONE verdict that means "I do
+            # not know" withheld the most useful evidence an operator could have
+            # for resolving it. During the 2026-08-24 false alarm the emit did
+            # carry the line — from the rc-1 arm — and it CONTRADICTED the
+            # verdict printed two lines above it:
+            #
+            #   socket owner uid:71780 held by "sshd",pid=19516,fd=3 (inside this namespace)
+            #
+            # It is EVIDENCE, NOT A VERDICT, and deliberately does not vote.
+            # In-namespace + our uid rules out ANOTHER OPERATOR (a foreign
+            # socket renders as uid:65534 with no pid attribution), but it does
+            # NOT establish that the listener is the confined endpoint we mean —
+            # a stale sshd of OUR OWN, serving a different host key, attributes
+            # identically and is genuinely not-ours. `ss` may also be absent
+            # entirely. So it sharpens the report and never moves the gate.
             if _remote_health_require_identity; then
                 echo "remote-ssh-health: UNHEALTHY — cannot verify endpoint identity: $_REMOTE_ID_REASON" >&2
+                echo "remote-ssh-health:   $(_remote_attribute_listener "$PORT")" >&2
                 echo "remote-ssh-health:   an unverifiable endpoint is reported DOWN by default. Install openssh-client," >&2
                 echo "remote-ssh-health:   or set monitor.remote.health_require_identity: false to accept protocol-only" >&2
                 echo "remote-ssh-health:   evidence (which CANNOT distinguish our daemon from another operator's)." >&2

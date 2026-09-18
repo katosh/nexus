@@ -10,8 +10,8 @@
 # DUAL-TREE by design. `monitor/_public-guard.sh` is bootstrap state that ships
 # ONLY in the public mirror (it is not produced by the scrub toolkit and does
 # not exist in the source repo). So:
-#   - source tree (no guard file present): the test SKIPS and exits 0, keeping
-#     the source CI green (there is no shipped guard to exercise here).
+#   - source tree (no guard file present): the test declines with exit 77, which
+#     the runner tallies SKIP (there is no shipped guard to exercise here).
 #   - public mirror (guard file present): the test exercises the REAL shipped
 #     guard — refusal when the unlock is unset/empty/non-1, allow when it is 1.
 # This is the mirror-side assertion nexus-code#520 asks for, authored on the
@@ -23,7 +23,8 @@
 # per case), so it passes on a bare $NEXUS_ROOT too (reference_sandbox_env_masks_ci).
 #
 # Run: bash monitor/watcher/test-public-guard-refusal.sh
-# Expected: ALL TESTS PASSED on stdout (or SKIPPED on a source tree), exit 0.
+# Expected: ALL TESTS PASSED on stdout, exit 0 — or, on a source tree, a SKIP
+#           reason on stdout and exit 77 (SKIP, never a zero-check PASS).
 
 set -uo pipefail
 export LC_ALL=C
@@ -33,13 +34,21 @@ _root=$(cd "$_test_dir/../.." && pwd)
 GUARD="$_root/monitor/_public-guard.sh"
 
 # Source-tree skip: the guard ships only in the public mirror.
+#
+# EXIT 77, NOT 0 (your-org/nexus-code#1145, adopting #568 A6). This arm asserts
+# NOTHING — there is no shipped guard on a source tree to exercise. It used to
+# print `ALL TESTS PASSED (0 checks — skipped on source tree)` and `exit 0`,
+# which is honest to a human reading stdout and invisible to the runner: it
+# reads rc, records PASS, and the ledger says `assertions=0` with nothing
+# flagging it. A suite that CANNOT RUN in this environment is a SKIP, and the
+# distinction is the whole point — a skip states its coverage boundary, a pass
+# claims a property it never tested. The banner is deleted rather than reworded
+# because `ALL TESTS PASSED` is the exact string humans and scrapers grep for.
 if [[ ! -r "$GUARD" ]]; then
     echo "SKIP: monitor/_public-guard.sh absent — guard ships only in the public"
     echo "      mirror (bootstrap state, not produced by the scrub toolkit). The"
     echo "      refusal assertion runs against the real shipped guard on the mirror."
-    echo
-    echo "ALL TESTS PASSED (0 checks — skipped on source tree)"
-    exit 0
+    exit 77
 fi
 
 pass=0; fail=0

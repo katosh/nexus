@@ -27,8 +27,10 @@ about each worker window:
 
 1. **What is the pane doing right now?** Answered by
    `monitor/pane-state.sh`, which captures the bottom of the tmux
-   pane with ANSI escapes preserved and decides one of eleven
-   pane states from the chevron row, spinner row, the over-limit
+   pane with ANSI escapes preserved and decides one of the pane
+   states `monitor/pane-state.sh --states` enumerates (twelve at
+   the time of writing — **ask the tool, do not count this page**)
+   from the chevron row, spinner row, the over-limit
    notice row, and (refining the `idle` verdict) the worker's
    async-work signals.
 2. **Is the worker really idle, and if so, in what way?** Answered
@@ -98,7 +100,7 @@ stateDiagram-v2
     engaged --> engaged_close_reminder : operator away reminder period (24 h)
     engaged --> paste_unconfirmed : stamped paste, no submit (180 s)
 
-    active_busy --> over_limit : weekly Opus limit hit
+    active_busy --> over_limit : usage limit hit (tier read from the pane)
     over_limit --> active_busy : reset reached
     active_busy --> pane_absent : claude process gone / blocked
 
@@ -197,8 +199,31 @@ Output by `monitor/pane-state.sh <window-index>` as a single
 key=value line:
 
 ```
-state=<state> active=<0|1> window=<idx> name=<windowname> [reset_at=<token>] [orphan_kinds=<csv>] [content_hash=<crc>]
+state=<state> active=<0|1> window=<idx> name=<windowname> [input=<typed|ghost|blank|?>] \
+  [queued=1] [throttled=1] [reset_at=<token>] [limit=<flavour>] \
+  [evidence=<token>] [reason=<token> site=<label> [capture=failed]] \
+  [overlay=<rate-limit|permission|bypass-permissions|askuq|workspace-trust|dialog>] \
+  [orphan_kinds=<csv>] [bg_shells=<n> bg_reliable=<0|1> bg_cpu=<jiffies> \
+   bg_oldest_start=<epoch> bg_infra=<n> bg_stale=<n> bg_cmd=<comm:cmd-tail> \
+   bg_cpu_bp=<basis-points|-> bg_wedged=<0|1>] [content_hash=<crc>]
 ```
+
+`monitor/pane-state.sh`'s own file header carries the emit format at
+lines 5–13 and glosses the conditional fields below it — but that
+format block is itself incomplete at `a3177ef6`: it omits `throttled=1`
+(emitted at `:4456`, `:4544`, `:4590`; discussed in the header prose at
+`:81`), `overlay=<kind>` (emitted at `:4316` alongside `state=blocked`;
+glossed at `:84`) and `content_hash=` (`:3453`, "appended to every
+emit"; glossed at `:107`). The fence above is a superset of all three.
+The ground truth is the emitted line itself, and `--states` for the
+vocabulary. `input=` tells an operator DRAFT from Claude Code's
+autosuggest ghost and is the only sound way to do so — see
+[`skills/nexus.window-cleanup`](skills.md) "Reading a pane before you
+kill or paste into it". `queued=1` and `throttled=1` are
+sub-conditions of `busy`, not states: `queued=1` means input is
+already waiting behind a running turn (never paste again), and
+`throttled=1` means the pane is mid-turn under `/low-priority` with
+the retry banner up and no tokens moving (`#1340`).
 
 `reset_at` appears only when `state=over-limit`; it carries the
 extracted reset-time token (spaces collapsed to `_`, parens
@@ -240,8 +265,8 @@ busy spinner → autosuggest dim-cursor → empty input → fallback.
 | `blocked` | Permission overlay (`Do you want to proceed?` + `❯ <digit>.`) or rate-limit menu (`What do you want to do?` + `Stop and wait for limit`) is present. | Claude is waiting on the operator (or the auto-unstick library). |
 | `absent` | The window RESOLVES, and `_emit_absent_or_unknown` — the **one** emitter permitted to produce this state (`#788`) — could NAME positive evidence of death: tmux's own `#{pane_dead}`, a `ps` that provably works and cannot see `pane_pid`, or a proven-functional process view finding no `claude` and nothing else alive under a pane older than the boot grace. Every `state=absent` row carries `evidence=<token>` saying which. The production shape is a window held open by `remain-on-exit on` whose claude has exited. | The inner Claude REPL is truly gone. (The `busy`-fallback short-circuit in `pane-state.sh` still upgrades to `busy` if a token-counter spinner is visible despite no chevron — see Fragility 1.) |
 | `unknown` | The classifier **could not answer**, and says why: `reason=<live-claude \| live-descendant \| proc-view-blind \| boot-grace \| no-pane-pid>` plus `site=<label>` naming which arm deferred, plus `capture=failed` when `tmux capture-pane` itself failed. Since `#788` this is the default for every path that cannot name positive evidence of death — the inversion of the old shape, where `absent` was what you got by *not* deciding. | Do nothing yet; re-poll. `unknown` is **off** `bk_pane_kill_authorized`'s allowlist and `retire-preflight.sh` already treats it as a deferral. Every refusal is bounded: `boot-grace` self-clears with the pane's own age, and the others name a condition an operator can act on. |
-| `over-limit` | The canonical "You've hit your limit · resets `<time>`" notice and a companion `resets <time>` line both appear within the bottom ~15 rows of the pane. | Claude has hit its weekly Opus limit and is functionally suspended until the reset. The emit line carries a `reset_at=<token>` field so the orchestrator can schedule a resume rather than treat the worker as routinely idle. The bottom-anchor scan rejects transcript scrollback mentions of the same phrase. |
-| `working-background` | An `idle` verdict **refined** (issue `#183`) when the worker has an in-flight async tool handle: heartbeat `monitor_handles > 0` / `background_bash_count > 0`, or the pane-footer fallback (`N monitor[s] still running`, `N background bash …`). | The worker looks idle at the prompt but a `Monitor`/background-bash handle is still running inside claude's own process; the harness will wake it on completion. Not idle — leave it alone. |
+| `over-limit` | The canonical "You've hit your limit · resets `<time>`" notice and a companion `resets <time>` line both appear within the bottom ~15 rows of the pane. | Claude has hit a usage limit and is functionally suspended until the reset. The emit line carries `reset_at=<token>` (so the orchestrator can schedule a resume rather than treat the worker as routinely idle) and `limit=<flavour>` — the tier the PANE named, e.g. `weekly_Opus` / `weekly_Fable`, or `unknown` when the banner named none. **Do not assume Opus** (`#1488`): a Fable worker read as an Opus suspension and was resumed against the wrong reset. The bottom-anchor scan rejects transcript scrollback mentions of the same phrase. |
+| `working-background` | An `idle` verdict **refined** (issue `#183`) when the worker has an in-flight async tool handle: a live background shell in claude's PROCESS TREE, or the pane footer's `· N monitor ·` / `· N shell ·` token (the footer is the ONLY source for Monitor handles — the heartbeat has never carried a count of them, issue `#1374`). | The worker looks idle at the prompt but a `Monitor`/background-bash handle is still running inside claude's own process; the harness will wake it on completion. Not idle — leave it alone. |
 | `working-self-paced` | An `idle` verdict refined when heartbeat `scheduled_wakeup_at` is in the future. | The worker scheduled a `/loop` `ScheduleWakeup` and the harness will resume it then. Not idle — leave it alone. |
 | `idle-orphan-async` | An `idle` verdict refined when heartbeat `external_waits` is non-empty AND neither `working-background` nor `working-self-paced` applies. The emit carries `orphan_kinds=<kind:id,…>`. | The worker declared (or the `PostToolUse` auto-detect spotted) async external work — a Slurm job, CI run, background poller — but installed **no** resume mechanism: a contract violation. `external_waits` has no renderer fallback, so a worker silent about its async work can't be caught here. Surface to the operator; the fix is a wake mechanism or `declare-no-wait.sh`. |
 
@@ -313,7 +338,7 @@ engagement-anchored age has crossed
 `monitor.idle_threshold_seconds` (default 60 s) AND its pane state
 is in the idle/ambiguous/dead set — with one exception:
 `over-limit` short-circuits the age gate so a worker hitting the
-weekly Opus limit surfaces immediately. Active workers
+usage limit surfaces immediately. Active workers
 (`busy` / `user-typing`) never produce a classification row.
 
 | Class | Trigger | Watcher line | Inviolability |
@@ -322,14 +347,14 @@ weekly Opus limit surfaces immediately. Active workers
 | `wrapped-but-stub` | `wrap-up` entry exists but `ng report-check` fails. Detail column carries the `;`-joined missing-fields summary. | `<window> wrapped-but-stub (<missing-fields>)` | Inviolable — never suppressed. A broken report must surface. |
 | `no-wrap-up` | Really idle but no matching `wrap-up` event. | `<window> idle <age> WITHOUT wrap-up — consider follow-up paste` | Suppressible by `window-retain`. |
 | `idle-too-long` | Age ≥ `monitor.idle_close_hours` (default 24 h). Overrides whatever the wrap-up flow would have produced; preserves the stub detail when applicable. | `<window> idle-too-long <age> (exceeds close threshold; consider close)` | Inviolable. |
-| `pane-absent` | Pane state is `absent` or `blocked` for a worker window. Short-circuits the wrap-up classification entirely — whether a report exists is moot until the worker is relaunched. (`empty` is no longer mapped here — see the pane-states table above.) | `<window> pane-absent (claude process gone or unresponsive; relaunch or close)` | Inviolable. |
-| `over-limit` | Pane state is `over-limit`. Short-circuits the spawn-grace and age gates — a worker hitting the weekly limit was likely busy a moment ago, so its engagement-anchored age sits at zero; surfacing the suspension immediately is the whole point. Detail column carries the extracted `reset_at` token (or `unknown`). The watcher's wake-loop (`_over_limit.sh`, sourced by `main.sh`) owns the scheduled resume — the orchestrator role is passive (read the row to know which workers are suspended; intervene manually only if the wake-loop hits its max-attempts cap). | `<window> OVER-LIMIT (resets <reset_at>; weekly Opus limit hit — schedule resume)` | Inviolable. |
+| `pane-absent` | Pane state is `absent` or `blocked` for a worker window. Short-circuits the wrap-up classification entirely — whether a report exists is moot until the worker is relaunched. (`empty` is no longer mapped here — see the pane-states table above.) | **ONE class, TWO advisories** (`#808`): `absent` renders `<window> pane-absent (claude process gone or unresponsive; relaunch or close)`, while `blocked` renders `<window> pane-absent (overlay awaiting the operator (blocked) — ANSWER it in the pane; do NOT relaunch or close)`. A `blocked` pane is ALIVE and rendering a modal it wants a human to answer; relaunching it destroys a live agent's context. | Inviolable. |
+| `over-limit` | Pane state is `over-limit`. Short-circuits the spawn-grace and age gates — a worker hitting the weekly limit was likely busy a moment ago, so its engagement-anchored age sits at zero; surfacing the suspension immediately is the whole point. Detail column carries the extracted `reset_at` token (or `unknown`). The watcher's wake-loop (`_over_limit.sh`, sourced by `main.sh`) owns the scheduled resume — the orchestrator role is passive (read the row to know which workers are suspended; intervene manually only if the wake-loop hits its max-attempts cap, at which point it FAILS OPEN — pastes the wake brief and drops the row). | `<window> OVER-LIMIT (resets <reset_at>; <flavour> limit hit — schedule resume)`, where `<flavour>` is the pane's own wording (an absent/`unknown` flavour renders as `usage`). When no reset time was extractable the line instead reads `<window> OVER-LIMIT (<flavour> limit hit; RESET TIME UNKNOWN — do not schedule a resume against a time nobody read; surface it)` (`#1488`). | Inviolable. |
 | `retained` | Base class was `wrapped` or `no-wrap-up`, AND the orchestrator has logged a recent `window-retain` event for the window, AND there has been no engagement since `retain.ts`, AND the retain is within TTL. Collated into a footer rather than emitted per-row. | `(N retained windows suppressed: <w1> (<reason1>), <w2> (<reason2>), …)` | — (this class *is* the suppression). |
 | `operator-engaged` | An *unstamped* `UserPromptSubmit` (no covering machine-input stamp) corroborated by pane-content change — the operator is typing in the pane. Idle nags, follow-up pastes, `idle_prompt` decisions, and retire-eligibility are suppressed while the mark is valid; it **self-expires** once the pane goes static past `monitor.operator_engaged_change_ttl_seconds` (default 600 s). Ended explicitly by `ng engaged-done`, a newer spawn, or window close; a wrap-up does *not* end it. Full lifecycle: [`agent-state-machine.md`](https://github.com/<your-org>/nexus-code/blob/main/monitor/docs/agent-state-machine.md). | `<window> operator-engaged (src=<submit\|submit-after-wrap>; idle <age> — operator driving; idle/retire handling suppressed while engaged)` | Inviolable in the other direction — never closed, never pasted into, while engaged. |
 | `parked-awaiting-skeptic` | Worker has a **live** `skeptic-pending` marker (`monitor/.state/skeptic/pending/<window>`, mtime refreshed by its `skeptic-channel.sh await` loop within `monitor.skeptic.await_hang_seconds`, default 600 s) — it is blocked in `await`, legitimately waiting for the reviewing skeptic's next request, not idle. Set by `ng wrap-up` on a `require` / auto-`require` decision (and re-asserted by the recursion logic); cleared only when a skeptic returns a verdict. A *stale* marker (the `await` died, or the worker never entered the loop) lapses the exemption so a genuine hang resurfaces (the hang-vs-wait boundary). Precedence: below `interrupted` (a crashed await is recoverable, not parked), above `operator-engaged`. Full protocol: [`skills/nexus.skeptic`](skills.md). | `<window> parked-awaiting-skeptic (idle <age>; skeptic reviewing — exempt from idle/close until verdict; see skills/nexus.skeptic)` | Exempt from `idle-too-long` / `no-wrap-up` while live; surfaced once as its own informational row. The retire gate (`retire-preflight.sh` check 1b) independently blocks a close while the marker is live. |
 | `engaged-close-reminder` | The engaged operator has been *away* (no submit for `monitor.operator_engaged_grace_seconds`, default 1800 s) long enough to cross the reminder period (`monitor.operator_engaged_close_reminder_seconds`, default 86400 s = 24 h). At most one per period. | `<window> operator-engaged but operator away <age> (src=<seed>) — consider closing this window; …` | Emitted **uniformly** by `_idle_probe.sh` regardless of window kind — the classifier reads no provenance record, only the `operator-engaged` mark and its away-age. The kind-dependent fork lives one layer up, in the **orchestrator close policy** ([`skills/nexus.window-cleanup`](skills.md) / `retire-preflight.sh`): for a `task`/operator-manual window, relay to the operator and never auto-close; for an `interactive` window (provenance `kind=interactive`, read by the policy layer) this same row is the **auto-retire trigger** the orchestrator consumes — see the lifecycle graph above and [`skills/nexus.window-cleanup`](skills.md) "Interactive-window auto-retire lifecycle". Consistent with this page's detection-vs-policy split: the watcher detects away-ness; the policy decides what to do with it. |
 | `paste-unconfirmed` | Pairing validation: a `paste-followup` injection older than `monitor.paste_confirm_grace_seconds` (default 180 s) fired **no** `UserPromptSubmit` on a hook-live window — the nudge *may* have failed to submit, or the paste landed via the retry-Enter path, which is consumed but never stamped (#568 A9). | `<window> paste-unconfirmed (paste <age>s ago; no UserPromptSubmit fired — …; re-paste via monitor/paste-followup.sh)` | Inviolable. **VERIFY CONSUMPTION FIRST, then re-paste only if needed.** This class has FALSE POSITIVES (<your-org>/nexus-code#568 A9): `machine-submit/<window>` is stamped only by the watcher's `UserPromptSubmit` path, so a paste delivered via `paste-followup.sh`'s RETRY-ENTER path is fully consumed and still leaves the stamp unchanged — and because the worker then goes idle, the row never self-heals. Acting on it blindly re-delivers an already-executed instruction (duplicate comments/commits). Read the pane or transcript for evidence the pasted content was acted on; re-paste via `monitor/paste-followup.sh` only if it demonstrably was not. |
-| `idle-orphan-async` | The worker declared async external work (Slurm job, background poller, …) but installed no resume mechanism — a contract violation. Detail carries the `kind:id,…` summary. | `<window> idle-orphan-async (…)` | Inviolable — install a wake mechanism or `declare-no-wait.sh`. |
+| `idle-orphan-async` | The worker declared async external work (Slurm job, background poller, …) but installed no resume mechanism — a contract violation. Detail carries the `kind:id,…` summary. **The class says the worker has no way to WAKE; it does NOT say the job is over** — conflating the two is what makes the clearing remedy dangerous. Since <your-org>/nexus-code#1071 the watcher owns a wake loop for this class (`monitor/watcher/_orphan_async.sh`, the same treatment `over-limit` gets): it resolves every wait per-kind, refuses to wake while ANY resolves `running`, refuses to deliver into a pane reading `queued=1` or one that has left the class, and pastes a resume-first brief that reports unresolvable waits AS unresolvable. The orchestrator role is now passive, as with `over-limit`. | `<window> idle-orphan-async (…)` | Inviolable — install a wake mechanism. **`declare-no-wait.sh` is the EXCEPTION, not the co-equal option**: clearing a wait on a job that is genuinely running destroys the only record that work is outstanding, so use it only after independently confirming the job is dead (for Slurm, an empty `squeue` checked BY ID). |
 | `interrupted` | A **fresh** turn-failure marker (`monitor/.state/turn-failure/<window>.json`, written by the `StopFailure` hook, freshness-gated by `MONITOR_TURN_FAILURE_STALENESS_SECONDS`, default 1800 s) — the worker's last turn died to an API/model error (StopFailure fired, not a clean Stop). The pane is byte-identical to a forgot-to-wrap worker (alive, empty input box), so only the marker tells them apart. Detail carries `<category>:<recovery>` (e.g. `transient:paste`, `config:respawn`, `conversation:respawn`, `auth:operator`). | `<window> interrupted <age> — turn crashed (<category>); …` (recovery hint varies by category: paste a resume nudge for `transient`, RESPAWN via `claude --continue` for `config`/`conversation`, escalate to operator for `auth`). | Inviolable w.r.t. `window-retain`. Precedence: **above** `parked-awaiting-skeptic`, `operator-engaged`, `no-wrap-up`, and retain (a crashed turn is actionable, not parked or muted); **below** `idle-too-long` (an abandoned crash past the close threshold is a close candidate — the inline override demotes it). |
 
 Transitions are deduped against the previous cycle's
@@ -502,9 +527,9 @@ Per worker window, per watcher poll:
                               │
         ┌─────────────────────┼────────────────┬───────────┐
         ▼                     ▼                ▼           ▼
-     busy /             idle /          absent /        (unknown:
-   user-typing       autosuggest /      empty /         skip)
-        │              empty box        blocked
+     busy /             idle /          absent /        (empty /
+   user-typing       autosuggest /      blocked         unknown:
+        │              empty box                        skip)
         │                  │                │
         │                  │                │
    STAMP engagement-       │                ▼

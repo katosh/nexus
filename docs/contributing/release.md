@@ -15,7 +15,12 @@ upgrade path.
 
 What this means in practice:
 
-- **No tags.** `git tag --list` is empty.
+- **No release tags.** The only tags in the repo are
+  `pre-dev-promotion-<date>` rollback anchors (two on `origin` as of
+  2026-09-09: `pre-dev-promotion-2026-08-28`,
+  `pre-dev-promotion-2026-09-04`); none of them is a version. A tag set is
+  a property of the remote at a MOMENT, not of a tree at a ref — re-derive
+  it rather than quoting this: `git ls-remote --tags origin`.
 - **No release notes.** The
   [`CHANGELOG.md`](https://github.com/<your-org>/nexus-code/blob/main/CHANGELOG.md)
   at the repo root is the closest substitute; it groups recent

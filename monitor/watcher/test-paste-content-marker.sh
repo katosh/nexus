@@ -53,6 +53,10 @@ pass() { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
 fail() { printf '  FAIL: %s\n' "$1" >&2; FAIL=$(( FAIL + 1 )); }
 ck()   { if [[ "$2" == "$3" ]]; then pass "$1 (got '$2')"; else fail "$1 — got '$2' want '$3'"; fi; }
 ck_has() {
+    if [[ -z "${3:-}" ]]; then
+        fail "$(printf '%s — EMPTY needle: `grep -qF ""` matches anything, so this assertion could only have passed VACUOUSLY (your-org/nexus-code#1110). Fix the CALLER: its expected value came back empty; check the rc of whatever produced it.' "$1")"
+        return
+    fi
     if grep -qF -- "$3" <<<"$2"; then pass "$1"
     else fail "$(printf '%s — %q not found in %q' "$1" "$3" "$2")"; fi
 }
@@ -110,6 +114,17 @@ if [[ "$cmd" == "list-windows" ]]; then
         *window_id*)
             d="${fmt#*'#{window_id}'}"; d="${d%%'#{window_name}'*}"
             for w in ${MOCK_TMUX_WINDOWS:-}; do printf '@3%s%s\n' "$d" "$w"; done ;;
+        *window_index*)
+            # The INDEX shape (your-org/nexus-code#905): resolve_window_key /
+            # resolve_window_index ask for `#{window_index}<delim>#{window_name}`,
+            # which carries no `window_id`. Without this arm it fell to the
+            # default below and came back a BARE, unsplittable name. Delimiter
+            # EXTRACTED from the requested format, never assumed.
+            d="${fmt#*'#{window_index}'}"; d="${d%%'#{window_name}'*}"
+            i=0
+            for w in ${MOCK_TMUX_WINDOWS:-}; do
+                printf '%s%s%s\n' "$i" "$d" "$w"; i=$(( i + 1 ))
+            done ;;
         *)           printf '%s\n' "${MOCK_TMUX_WINDOWS:-}" ;;
     esac
     exit 0

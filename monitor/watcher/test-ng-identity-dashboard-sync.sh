@@ -57,6 +57,8 @@ chmod +x "$FAKE_NEXUS/config/load.sh"
 STUB_DIR="$WORK/bin"
 CAPTURE="$WORK/gh-calls.txt"
 BODY_CAPTURE="$WORK/gh-body.txt"
+# The forge's STORE — what a GET returns after a PATCH updated it (#1118).
+STORE="$WORK/gh-store.txt"
 
 make_gh_stub "$STUB_DIR/gh" "$CAPTURE" --with-body-capture "$BODY_CAPTURE" <<'CASES'
     */issues\?labels=nexus:overview*|*/issues?labels=nexus:overview*)
@@ -64,7 +66,27 @@ make_gh_stub "$STUB_DIR/gh" "$CAPTURE" --with-body-capture "$BODY_CAPTURE" <<'CA
         ;;
     */issues/[0-9]*)
         if [[ "$method" == "PATCH" ]]; then
-            printf '%s' '{"html_url":"https://mock.example/issues/1"}'
+            # your-org/nexus-code#1118 — the PATCH response must carry the
+            # body, because `_patch_issue_body` now VERIFIES the write by
+            # reading it back rather than trusting the 200. Echo faithfully:
+            # the captured request is the `{"body": "..."}` envelope, so
+            # `.body` unwraps it. `-c` keeps it one line; the helper uses
+            # `jq -j` on its side so no newline is invented on either.
+            if [[ -n "${MOCK_BODY_CAPTURE_PATH:-}" && -s "${MOCK_BODY_CAPTURE_PATH:-}" ]]; then
+                if [[ -n "${MOCK_STORE_PATH:-}" ]]; then
+                    jq -j '.body' < "$MOCK_BODY_CAPTURE_PATH" > "$MOCK_STORE_PATH" 2>/dev/null || true
+                fi
+                jq -c --arg u "https://mock.example/issues/1" \
+                   '{html_url:$u, body:.body}' < "$MOCK_BODY_CAPTURE_PATH"
+            else
+                printf '%s' '{"html_url":"https://mock.example/issues/1"}'
+            fi
+            return 0 2>/dev/null || exit 0
+        fi
+        # GET: the STORE if a PATCH has updated it, else the fixture — so an
+        # independent read-back (your-org/nexus-code#1118 guard 3) is meaningful.
+        if [[ -n "${MOCK_STORE_PATH:-}" && -s "${MOCK_STORE_PATH:-}" ]]; then
+            jq -Rs --arg u "https://mock.example/issues/1" '{html_url:$u, body:.}' < "$MOCK_STORE_PATH"
             return 0 2>/dev/null || exit 0
         fi
         printf '%s' '{"body":"prefix\n<!-- NEXUS_DASHBOARD_START -->\nold middle\n<!-- NEXUS_DASHBOARD_END -->\nsuffix\n"}'
@@ -91,11 +113,13 @@ run_ng() {
     local _out_var="$1" _err_var="$2" _rc_var="$3"; shift 3
     local _stdout _stderr _rc _out_tmp _err_tmp
     _out_tmp=$(mktemp); _err_tmp=$(mktemp)
-    : > "$CAPTURE"; : > "$BODY_CAPTURE"
+    : > "$CAPTURE"; : > "$BODY_CAPTURE"; : > "$STORE"
     ( cd "$NEUTRAL_CWD" && run_hermetic \
         NEXUS_ROOT="$FAKE_NEXUS" \
         NEXUS_STATE_DIR="$WORK/state" \
         PATH="$STUB_DIR:$PATH" \
+        MOCK_BODY_CAPTURE_PATH="$BODY_CAPTURE" \
+        MOCK_STORE_PATH="$STORE" \
         -- "$NG_BIN" "$@" </dev/null ) >"$_out_tmp" 2>"$_err_tmp"
     _rc=$?
     _stdout=$(<"$_out_tmp"); _stderr=$(<"$_err_tmp")

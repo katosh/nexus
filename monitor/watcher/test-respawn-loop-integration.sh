@@ -149,13 +149,18 @@ echo "(CLAUDE_BIN resolves to the fixture stub — verified, #746)"
 
 SESSION="nexus-respawn-test-$$"
 # Use a dedicated tmux server to fully isolate from the live nexus
-# tmux AND from concurrent runs of this test. `-L <name>` sockets
-# always live under /tmp/tmux-$UID/ regardless of cwd, so the name
-# itself must be unique per run: a fixed name ("tmux-sock") meant two
+# tmux AND from concurrent runs of this test. `-L <name>` sockets live under
+# $TMUX_TMPDIR/tmux-$UID/ — which `nx_tmux_fixture_init` below points into this
+# fixture's own dir, so they no longer sit beside the board's `default` socket.
+# The name must still be unique per run: a fixed name ("tmux-sock") meant two
 # gates running on the same box shared ONE server, and the first
 # test's `kill-server` cleanup killed the other's in-flight session
 # ("can't find session nexus-respawn-test-NNN" / "no server running").
 SOCK_NAME="nexus-respawn-integ-$$"
+# your-org/nexus-code#991: measure the socket path BEFORE tmux is asked to
+# bind it. A too-long TMUX_TMPDIR is an ENVIRONMENT fault, not a defect in
+# the code under test, and without this it presents as one.
+th_require_tmux_socket "$SOCK_NAME"
 TMUX_BIN_WRAPPER="$F/.bin/tmux"
 mkdir -p "$F/.bin"
 # Hermetic fixture config. Without it tmux builds every pane from the
@@ -165,11 +170,38 @@ mkdir -p "$F/.bin"
 # next `send-keys`, and `set -e` turned that into a bare "lost server" with
 # no diagnosis (your-org/nexus-code#555). See th_tmux_fixture_conf.
 th_tmux_fixture_conf "$F/tmux.conf"
-cat > "$TMUX_BIN_WRAPPER" <<TMUXWRAP
-#!/usr/bin/env bash
-exec $(command -v tmux) -L "$SOCK_NAME" -f "$F/tmux.conf" "\$@"
-TMUXWRAP
-chmod +x "$TMUX_BIN_WRAPPER"
+# THE FIFTH SITE (your-org/nexus-code#1117, #1115 skeptic round 2).
+# `$(command -v tmux)` expands AT WRITE TIME to monitor/tmuxwrap/tmux under an
+# agent, so this shim NAMED the wrapper, tmuxwrap's gate-3 skipped it, and a
+# bare `tmux` in a fresh bash reached the real tmux with NO -L — i.e. the
+# operator's board, since $TMUX outranks $TMUX_TMPDIR (#644). This file drives
+# main.sh through a fresh bash, and `_paste_to_target_unlocked` is the exact
+# function that pasted into the live orchestrator pane on 2026-08-27.
+#
+# It predates all of that and was missed TWICE: by an enumerating predicate that
+# saw only the assignment spelling, and by a lint whose entry gate required a
+# LITERAL `/tmux` target — this site holds the path in $TMUX_BIN_WRAPPER. Both
+# misses are recorded in _tmux_shim_scan.awk, which keys on the planted BODY.
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_tmux-fixture.sh"
+_rli_realbin=$(nx_real_tmux_bin) || {
+    echo "ENV-FAIL: no real tmux BINARY on PATH (only wrappers) — refusing to run unisolated" >&2
+    exit 1
+}
+# BRACES (your-org/nexus-code#1115 skeptic r3, H3). The belt above stops
+# tmuxwrap's gate-3 skipping this shim; without braces the shim still carried
+# `TMUX_TMPDIR="/tmp"` and this fixture's server sat directly beside the board's
+# own `default` socket. Belt without braces is one displaced pin away from the
+# thing this file is most exposed to — it drives `main.sh --target orchestrator`
+# through a fresh bash. Also unsets $TMUX, which outranks $TMUX_TMPDIR (#644)
+# and which the EXIT-trap teardown below is explicitly wary of.
+nx_tmux_fixture_init "$F" || {
+    echo "ENV-FAIL: could not set up a private TMUX_TMPDIR under $F" >&2
+    exit 1
+}
+nx_write_tmux_shim "$(dirname "$TMUX_BIN_WRAPPER")" "$_rli_realbin" "$SOCK_NAME" -f "$F/tmux.conf" || {
+    echo "ENV-FAIL: could not write the private-tmux shim" >&2
+    exit 1
+}
 
 # The fixture server dying is an ENVIRONMENT failure, not a product failure —
 # say so, loudly and by name, instead of letting `set -e` abort on a client's

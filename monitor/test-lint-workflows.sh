@@ -60,7 +60,7 @@ else
 fi
 # The selftest must actually have exercised EVERY rule; a selftest that
 # silently stopped covering one of them would still exit 0.
-for rule in MC001 MC002 SR001 TD001 PF001; do
+for rule in MC001 MC002 SR001 TD001 PF001 AU001 AU002; do
   if grep -q "$rule" "$TMP/selftest.out"; then
     ok "--selftest exercises $rule"
   else
@@ -163,11 +163,83 @@ mutate "unscaled-slow-band" "tests-slow-integration.yml" \
   '/NEXUS_TEST_DEADLINE_SCALE/d' TD001 'run-tests\.sh'
 
 # M6 — the same strip in tests.yml, where the exposure is subtler: the matrix
-#      still passes `--jobs`, but the `jobs: 2` cell is ceil(2/2) = 1. A rule
+#      still passes `--jobs`, but a `jobs: 2` cell is ceil(2/2) = 1. A rule
 #      that accepted "some --jobs was passed" would survive this mutant, which
 #      is exactly why it is here and not merely a duplicate of M5.
+#
+#      THE MUTANT NOW PLANTS ITS OWN COLLAPSING CELL, and that is the whole
+#      point of this note (your-org/nexus-code#1300). It used to rely on the
+#      real matrix CONTAINING a `jobs: 2` cell, so it was not testing TD001 —
+#      it was testing a property of production config that TD001 happens to
+#      read. When the `bash@2` cell was dropped for cost, the remaining cells
+#      are all `jobs: 4`, ceil(4/2) = 2, the band is scaled by the fallback,
+#      TD001 correctly stays quiet, and this mutant SURVIVED: measured,
+#      `lint exited 0, wanted 1 — MUTANT SURVIVED`, 22 passed / 1 failed
+#      against a 23/0 baseline. The rule was not blind; the mutant had stopped
+#      constructing the condition it claims to probe.
+#
+#      So the sed now does BOTH halves itself: demote a `jobs: 4` matrix cell
+#      to `jobs: 2` AND strip the scale. That makes the mutant independent of
+#      how many cells production carries and what their parallelism is — which
+#      is what a mutation test should have been all along. A guard that only
+#      fires while an unrelated config value happens to hold is a guard whose
+#      green means less than it appears to.
 mutate "unscaled-unit-matrix" "tests.yml" \
-  '/NEXUS_TEST_DEADLINE_SCALE/d' TD001 'jobs \${{ matrix.jobs }}'
+  's/^            jobs: 4$/            jobs: 2/; /NEXUS_TEST_DEADLINE_SCALE/d' \
+  TD001 'jobs \${{ matrix.jobs }}'
+
+# M7/M8/M9 — TD001 must judge the pin's VALUE, not merely its PRESENCE
+#            (your-org/nexus-code#1300 R3). The rule used to `continue` the
+#            moment the variable was MENTIONED in any scope, so the ONE edit
+#            that actually degrades CI walked through it: a scale of `1` is a
+#            VALID override th_deadline honours, reverting every polled
+#            deadline to its bare literal — the #749 state, reached from
+#            inside #749's own remedy, by one character, and STRICTLY WORSE
+#            than deleting the pin (which falls back to ceil(jobs/nproc)).
+#
+#            Three mutants, not one, because the value can be set in three
+#            different SCOPES and a text scan gets the precedence backwards:
+#            GitHub takes the LAST enclosing scope, a first-match scan takes
+#            the first, and the disagreement silently favours whichever value
+#            makes the check pass. M9 is the sharpest — a step-scoped `1`
+#            sitting UNDER a job-scoped `2`.
+mutate "inert-scale-job-env" "tests.yml" \
+  's/^      NEXUS_TEST_DEADLINE_SCALE: 2$/      NEXUS_TEST_DEADLINE_SCALE: 1/' \
+  TD001 'jobs \${{ matrix.jobs }}'
+
+# M8 — the INLINE form, which is not exotic: the SLOW band sets the scale as a
+#      command prefix (`SLOW_TESTS=1 NEXUS_TEST_DEADLINE_SCALE=2 … run-tests.sh`),
+#      so a resolver walking only the YAML env scopes reports that band UNPINNED
+#      and is confidently wrong about the one band #749 was filed against.
+mutate "inert-scale-inline" "tests-slow-integration.yml" \
+  's/NEXUS_TEST_DEADLINE_SCALE=2/NEXUS_TEST_DEADLINE_SCALE=1/' \
+  TD001 'run-tests\.sh'
+
+# M9 — a STEP-scoped `1` beneath the job-scoped `2`. GitHub resolves the
+#      innermost scope, so the effective value is 1 while the job env still
+#      reads 2. This is the mutant that a first-textual-match check reports
+#      as OK.
+mutate "inert-scale-step-env" "tests.yml" \
+  '/^          NEXUS_TEST_JOBS: \${{ matrix.jobs }}$/a\          NEXUS_TEST_DEADLINE_SCALE: 1' \
+  TD001 'jobs \${{ matrix.jobs }}'
+
+# M10 — your-org/nexus-code#1505 ITSELF, restored: strip the source narrowing
+#       back out of tests.yml, leaving every `apt-get update` bare. Six sites
+#       shipped exactly like this. The sentinel is the invocation: AU has
+#       nothing to say about a file that never updates apt.
+mutate "bare-apt-update-tests" "tests.yml" \
+  '/sudo rm -f \/etc\/apt\/sources\.list\.d\/google-chrome\*/d' AU001 'apt-get update'
+
+# M11 — the same strip in the SLOW band, so a rule that happened to read only
+#       the flagship file cannot pass on M10 alone.
+mutate "bare-apt-update-slow" "tests-slow-integration.yml" \
+  '/sudo rm -f \/etc\/apt\/sources\.list\.d\/google-chrome\*/d' AU001 'apt-get update'
+
+# M12 — the tempting one-liner, planted in the harness workflow: mask the
+#       update with `|| true` while the narrowing stays. Reddens AU002, NOT
+#       AU001 — the rules are distinct, and the wrong fix is wrong on its own.
+mutate "masked-apt-update-cc-harness" "cc-harness.yml" \
+  's/sudo apt-get update \&\& break/sudo apt-get update || true \&\& break/' AU002 'apt-get update'
 
 # --- layer 3b: PF mutants, which need a REPO and not a flat dir ------------
 #

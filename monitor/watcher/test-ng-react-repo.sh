@@ -32,7 +32,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s\n' "$label" >&2
@@ -63,6 +64,8 @@ cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
 # it (your-org/nexus-code#601/#605: degrading to the silent-coercion
 # behaviour it replaces is worse than refusing). Copy it alongside.
 cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
+# your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+cp "$(dirname "$NG_REAL")/_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 NG="$FAKE_NEXUS/monitor/ng"
 
 # State dir under the fake nexus so processed-comments cache writes

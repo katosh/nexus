@@ -47,10 +47,16 @@ BK="$_repo_root/monitor/_bookkeeping.sh"
 FIX_DIR="$_test_dir/fixtures"
 NBSP=$' '
 
+# Shared harness, for the durable LEDGER and `th_summary_and_exit`
+# (your-org/nexus-code#1232 / #1214 D2). This suite was `ledger=no count=none`,
+# which is why eight assertions could vanish in silence.
+# shellcheck disable=SC1091
+. "$_test_dir/_test_helpers.sh"
+
 PASS=0
 FAIL=0
-pass() { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
-fail() { printf '  FAIL: %s\n' "$1" >&2; FAIL=$(( FAIL + 1 )); }
+pass() { printf '  PASS: %s\n' "$1"; _th_pass; }
+fail() { printf '  FAIL: %s\n' "$1" >&2; _th_fail; }
 ck()   { if [[ "$2" == "$3" ]]; then pass "$1 ($2)"; else fail "$1 — got '$2' want '$3'"; fi; }
 
 [[ -x "$HELPER" ]] || { echo "helper not executable: $HELPER" >&2; exit 1; }
@@ -107,12 +113,35 @@ done
 
 # ---------------------------------------------------------------------------
 echo "=== case 3: autosuggest ghosts unchanged ==="
-for f in "$FIX_DIR"/autosuggest-*.ansi; do
-    [[ -r "$f" ]] || continue
-    out=$(run "$f")
-    ck "$(basename "$f") stays autosuggest-only" "$(field "$out" state)" autosuggest-only
-    ck "$(basename "$f") stays input=ghost"      "$(field "$out" input)" ghost
-done
+# THE POPULATION COMES FROM THE MANIFEST, NOT FROM A FILENAME GLOB
+# (your-org/nexus-code#1232). This read `for f in "$FIX_DIR"/autosuggest-*.ansi`,
+# which is BOTH halves of the defect this branch has been chasing:
+#
+#   * the expectation was derived from the FILENAME PREFIX — the scheme `#1176`
+#     removes, and whose promise ("a fixture's name is now free to DESCRIBE the
+#     capture") this made false in a file `#1176` never touched;
+#   * and the failure was SILENT. Renaming the four fixtures WITH their manifest
+#     rows took this suite from 31 passed to 23 passed, 0 failed, ALL TESTS
+#     PASSED, rc 0. EIGHT ASSERTIONS VANISHED and the suite still announced a
+#     clean sweep. That is strictly worse than a loud red: nothing to
+#     investigate, and the count is the only witness.
+#
+# Both halves are closed here. The manifest names the fixtures and carries the
+# expectation, and the EXPECTED-count guard at the foot makes a vanished loop
+# body RED — because selecting the right population is not enough if iterating
+# zero times still passes.
+_wi_auto=0
+while IFS=$'\t' read -r _mf _mw _me _ma _mr; do
+    [[ "$_mw" == "autosuggest-only" && "$_me" == "-" && "$_ma" == "-" ]] || continue
+    [[ -r "$FIX_DIR/$_mf" ]] || continue
+    _wi_auto=$(( _wi_auto + 1 ))
+    out=$(run "$FIX_DIR/$_mf")
+    ck "$_mf stays autosuggest-only" "$(field "$out" state)" autosuggest-only
+    ck "$_mf stays input=ghost"      "$(field "$out" input)" ghost
+done < <(grep -vE '^[[:space:]]*(#|$)' "$_test_dir/pane-state-fixtures.manifest")
+if (( _wi_auto == 0 )); then
+    fail "no manifest fixture expects autosuggest-only — case 3 asserted NOTHING"
+fi
 
 # ---------------------------------------------------------------------------
 echo "=== case 4: the pre-existing empty-box renderings still classify ==="
@@ -246,6 +275,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-printf '\n=== summary: %d passed, %d failed ===\n' "$PASS" "$FAIL"
-if (( FAIL == 0 )); then echo "ALL TESTS PASSED"; exit 0; fi
-exit 1
+# EXPECTED-COUNT GUARD (your-org/nexus-code#807, applied here by #1232). The
+# fixed cases contribute 23; case 3 contributes 2 per manifest-selected
+# autosuggest fixture. DERIVED, so adding or removing a fixture moves the
+# expectation with it — and a loop that iterates zero times can no longer pass.
+EXPECTED=$(( 23 + 2 * _wi_auto ))
+if (( PASS + FAIL != EXPECTED )); then
+    printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. An assertion did not execute.\n' \
+        "$(( PASS + FAIL ))" "$EXPECTED" >&2
+    _th_fail
+fi
+
+th_summary_and_exit

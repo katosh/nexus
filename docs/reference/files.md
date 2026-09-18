@@ -1,9 +1,17 @@
 # Files
 
-Every file and runtime artifact in a nexus-code checkout, grouped by
-role. "Tracked?" means the file is committed to the code repo; state
-artifacts under `monitor/.state/` and per-project trees under `work/`
-are runtime-only and gitignored.
+The load-bearing files and runtime artifacts in a nexus-code
+checkout, grouped by role. "Tracked?" means the file is committed to
+the code repo; state artifacts under `monitor/.state/` and
+per-project trees under `work/` are runtime-only and gitignored.
+
+**This is a curated inventory, not an exhaustive one.** `monitor/`
+alone holds 153 tracked files at depth 1 at `a3177ef6`, of which this
+page names 73; the tables below cover the entry points, the shared
+libraries other code sources, and the artifacts an operator has to
+reason about. `git ls-files -- ':(glob)monitor/*'` is the ground
+truth, and the `:(glob)` prefix is not optional — git's pathspec `*`
+crosses `/`, so the bare form answers about the whole subtree.
 
 For the architectural framing see [Architecture](architecture.md).
 For per-key config documentation see [Config](config.md).
@@ -69,17 +77,21 @@ notifications (`notify.sh`).
 | `monitor/upload-asset.sh` | Commits a local file into the asset repo's `main` branch under `assets/...`; prints a SHA-pinned URL. `ng upload` is a thin shim over this | yes |
 | `monitor/notify.sh` | Tiered Pushover / ntfy / SMTP fan-out for events GitHub can't surface | yes |
 | `monitor/spawn-worker.sh` | Worker launcher — creates the tmux window, prepends the worker floor, execs `claude --dangerously-skip-permissions` | yes |
-| `monitor/pane-state.sh` | Robust pane-state classifier. **Eleven** states: `state=<idle\|busy\|user-typing\|autosuggest-only\|empty\|blocked\|absent\|over-limit\|working-background\|working-self-paced\|idle-orphan-async> active=<0\|1>`. `working-background` and `working-self-paced` mean the worker is ACTIVE — a caller matching a shorter list retires a live worker. The helper to call instead of eyeballing `tmux capture-pane` | yes |
+| `monitor/pane-state.sh` | Robust pane-state classifier. **`monitor/pane-state.sh --states` is the vocabulary** — do not hand-maintain a copy of it here; at `a3177ef6` it prints twelve tokens: `idle`, `busy`, `user-typing`, `autosuggest-only`, `empty`, `blocked`, `absent`, `over-limit`, `working-background`, `working-self-paced`, `idle-orphan-async`, `unknown`. `working-background` and `working-self-paced` mean the worker is ACTIVE, and `unknown` means *could not look at all* — a caller matching a shorter list retires a live worker. The helper to call instead of eyeballing `tmux capture-pane` | yes |
+| `monitor/_tmux_socket.sh` | The tmux SOCKET-PATH ceiling in one place: `tmux_socket_path/len/verdict` compose `${TMUX_TMPDIR:-/tmp}/tmux-<uid>/<name>` and compare against `TMUX_SUN_PATH_MAX=107` — `sun_path` is 108 bytes and **107** is the most a NUL-terminating caller can bind, so a guard written to the widely-quoted "108" is off by one and passes the boundary path that fails. 108 IS bindable by the kernel with a full-struct `addrlen`; the limit is the calling convention, not the kernel (#991) | yes |
+| `monitor/tmux-socket-fits.sh` | CLI over the above: `--socket NAME [--tmpdir DIR]` -> exit 0 fits / **3 REFUSED** with the measured length, the composed path and the remedy; `--suggest` prints a `TMUX_TMPDIR` that cannot blow the ceiling. Separates "the address could not be formed" from "the code under test is broken", which used to present as the same FAIL | yes |
+| `monitor/mutation-gate.sh` | Safe single-mutant harness (#1032). Refuses any line that is not a complete logical line (`--list` shows the eligible ones), PROVES the edit applied, runs every mutant under `timeout` + `ulimit -f` + a free-space floor, and classifies `killed-by-assertion` / `survived` / `killed-unattributable` rather than reporting a bare KILL. `--run-bounded <script>` exercises the bound alone | yes |
 | `monitor/svc.sh` | Service cockpit (read-only dashboard) + unified service CLI: `status`, `up`, `start/stop/restart <name>`, `logs <name>` | yes |
 | `monitor/bootstrap-recover.sh` | Idempotent whole-stack recovery — relaunches an unhealthy watcher via `launcher.sh` and every unhealthy, unsupervised registry service (headless). `svc.sh up` delegates here | yes |
 | `monitor/services.registry.example` | Annotated template for the operator-local `services.registry` (one TAB-separated service per line: name, workdir, launch, healthcheck, optional logfile) | yes |
 | `monitor/services.registry` | The operator's actual service registry | no |
 | `monitor/claude-loop.sh` | The orchestrator loop wrapper — execs `claude` with the resolved `$CLAUDE_BIN`, `--dangerously-skip-permissions`, `--settings`, and `--continue`, suppressing the resume dialog via `CLAUDE_CODE_RESUME_*` env vars | yes |
-| `monitor/spawn-fresh-orchestrator.sh` | Cold-spawn an orchestrator window (no resume), used when the session pin is stale/absent. (Lives under `watcher/`; see that table) | yes |
+| `monitor/watcher/spawn-fresh-orchestrator.sh` | Cold-spawn an orchestrator window (no resume), used when the session pin is stale/absent. (Lives under `watcher/`; listed again in that table) | yes |
 | `monitor/retire-preflight.sh` | The MANDATORY synchronous pre-kill gate — reads *live* pane state and returns `safe=<0\|1>` before any worker `tmux kill-window`; blocks while a `skeptic-pending` marker is live (`test-retire-preflight.sh` covers it) | yes |
 | `monitor/skeptic-channel.sh` | The worker↔skeptic comms channel + `await` park used by `nexus.skeptic` (await-hang marker under `.state/skeptic/pending/`) | yes |
 | `monitor/worker-heartbeat.sh` | Worker liveness writer invoked from `worker-settings.json` hooks; parses the hook payload (`.tool_name`, `.session_id`, `.notification_type`) into `heartbeat/<window>.json` | yes |
 | `monitor/declare-wait.sh` / `monitor/declare-no-wait.sh` | Worker self-declarations of an external-wait (e.g. a long Slurm job) vs. no-wait, written keyed on `$NEXUS_WORKER_WINDOW` so the idle classifier refines `idle-orphan-async` | yes |
+| `monitor/async-run.sh` | Status-preserving background launcher (<your-org>/nexus-code#1071). `setsid`-detaches a command, retains its exit status in a per-token state dir, and registers a RESOLVABLE `asyncrun:<token>` wait. `--status <token>` answers `running` / `terminal rc=N` / `died` (killed before it could report) — the three-way a bare `nohup … &` fuses into "absent". Use instead of `nohup … &`. | yes |
 | `monitor/_pane-live.sh` | `_tmux_pane_is_dead` — refuse to `paste-buffer` into a dead pane; a paste into one kills the tmux SERVER (`#745`) | yes |
 | `monitor/paste-followup.sh` | Deliver a follow-up message into a running worker/orchestrator window (VI-mode-hardened load-buffer/paste-buffer pattern) | yes |
 | `monitor/user-pat.sh` | Resolves the user's `gh auth token` PAT for surfaces the bot's installation token can't reach (`ng fetch-asset`, private-package installs) | yes |
@@ -93,8 +105,23 @@ notifications (`notify.sh`).
 | `monitor/watcher-supervise-tick.sh` / `monitor/revive-watcher.sh` / `monitor/boot-recover.sh` / `monitor/boot-recover.session-start-hook.json` | Watcher supervision tick, manual watcher revival, and boot-time stack recovery (SessionStart hook) | yes |
 | `monitor/calibrate-pressure-thresholds.sh` | One-shot calibration of context-pressure thresholds | yes |
 | `monitor/git-https-setup` | Helper to wire git HTTPS credential flow for the bot | yes |
+| `monitor/repo-root.sh` | Shared three-valued predicate: is a directory the ROOT of its own git repository? (`git -C <non-repo>` walks UP and answers about the enclosing repo at rc 0 — <your-org>/nexus-code#1196, #1080) | yes |
+| `monitor/boot-recover-hook-check.sh` | Reports whether the cold-boot `SessionStart` hook is actually ARMED — i.e. actually runs `boot-recover.sh`, not merely that some hook is executable. A hook whose command does not exist is silent on every channel anyone looks at (stdout, stderr, rc identical to no hooks; it IS recorded in the session transcript, `stream-json` and `--debug-file`, none on by default — measured, `#1174`), so a check outside the session is the practical signal | yes |
 | `monitor/async-launch-patterns.conf` | Regex patterns `hooks/async-launch-detect.sh` matches to spot background spawns | yes |
 | `monitor/test-interactive-sessions.sh` / `monitor/test-retire-preflight.sh` | Top-level `monitor/` unit tests (interactive-session detection; retire-preflight gate) | yes |
+| `monitor/proc-kill-authorized` | "May I kill this pid?" as an ALLOWLIST with a default-DENY arm (`#851`) — session ownership, never name matching. `--filter` passes only authorised pids, names every refusal on stderr, exits 1 when it dropped any | yes |
+| `monitor/proc-exists-authorized` | The waiting-side sibling (`#1073`): "is the job I am waiting on still running?", keyed on session ownership and pid identity rather than argv, and it OWNS the loop so the polarity cannot be inverted. Five exit codes; `3` means REFUSED — neither present nor absent | yes |
+| `monitor/_bookkeeping.sh` | The bookkeeping-contract guard primitives, including `bk_pane_kill_authorized` — the pane-state kill allowlist with a default-deny arm | yes |
+| `monitor/_tmux-window.sh` | One window-key vocabulary (`@id`-resolved, index / `session:window` / NAME) shared by `pane-state.sh` and `paste-followup.sh`; refuses an ambiguous key rather than guessing (`#323`, `#905`) | yes |
+| `monitor/shell-files.sh` | `shf_is_shell` — one DERIVED definition of "which files here are shell files", for guards whose population must not be a filename glob (`#792`) | yes |
+| `monitor/guards-for-diff.sh` | "Which registered guards read the files I just changed?" (`#803`) — `--run` executes exactly those. Backs `ng guards-for-diff` | yes |
+| `monitor/send.sh` | `ng send` — the harness-neutral agent-delivery contract (per-agent transport + receipt, one common ledger); see `skills/nexus.agent-delivery` | yes |
+| `monitor/request-channel.sh` | The watcher-mediated request inbox and request/reply protocol (agent-channel RFC parts B + D); the inbox lives under `.state/requests/` and rides the watcher's existing emit | yes |
+| `monitor/lit.sh` | Backs `ng lit` — content-relevance literature discovery across S2, ASTA and OpenAlex, deduped against the reference library (see [Literature](literature.md)) | yes |
+| `monitor/locals-env.sh` | SOURCE-only: joins the nexus-wide project-local toolchain (`locals/bin` on `PATH`, uv state pinned out of `$HOME`). Sourced by every spawn launcher; also the `BASH_ENV` this nexus exports | yes |
+| `monitor/remote-up.sh` / `monitor/remote-*.sh` / `monitor/_remote_lib.sh` | The off-by-default confined remote agent channel — enable/status/down helper, forced command, enrollment, sshd supervision, health (see `skills/nexus.remote-access`) | yes |
+| `monitor/obligations.sh` / `monitor/_obligations.sh` | The obligation ledger backing `ng obligation pairs` / `ng obligation settle` — who is waiting on whom, discharged on the record | yes |
+| `monitor/reports-roll.sh` | Time-partitions the flat `reports/` dir into MONTHLY archive subdirs behind a ≥1-month buffer, so recency-oriented `-maxdepth 1` consumers keep working (`#444`) | yes |
 
 ### `monitor/hooks/`
 
@@ -159,6 +186,7 @@ inventory.
 | `monitor/watcher/_functional_check.sh` | Post-emit functional check — reaction scan over the eligible-comments section | yes |
 | `monitor/watcher/_orchestrator_liveness.sh` | Orchestrator liveness machine (heartbeat / paste-received / jsonl-mtime fallback) | yes |
 | `monitor/watcher/_over_limit.sh` | Rate-limit / over-limit detection + re-wake scheduling | yes |
+| `monitor/watcher/_orphan_async.sh` | `idle-orphan-async` wake loop (<your-org>/nexus-code#1071): resolves each declared wait per-kind (`sacct` for Slurm, `async-run.sh --status` for `asyncrun`, `unresolvable` for a `syn-` token), and wakes the stalled worker ONLY when nothing is still running, nothing is queued in its pane, and it still reads the class. Never clears a wait. | yes |
 | `monitor/watcher/_service_health.sh` | Registered-service healthcheck runner → the `--- service health ---` emit (`nexus.service-recovery`) | yes |
 | `monitor/watcher/_scheduler.sh` | Cadence scheduler for the watcher's periodic surfaces | yes |
 | `monitor/watcher/_target_absent.sh` | Detect-and-recover when the target (orchestrator) window is absent | yes |
@@ -168,12 +196,28 @@ inventory.
 | `monitor/watcher/spawn-fresh-orchestrator.sh` | Cold-spawn an orchestrator with no resume (safe degradation when the pin is stale/absent) | yes |
 | `monitor/watcher/run-tests.sh` | Runs the whole `monitor/watcher/test-*.sh` suite | yes |
 | `monitor/watcher/fixtures/` | Stub gh / tmux / mint-token binaries + `.ansi` pane fixtures used by the test scripts | yes |
-| `monitor/watcher/test-*.sh` | Mock-tmux / mock-gh unit tests (~125 files, one per behavioural surface; run all via `run-tests.sh` or any with `bash <file>`) | yes |
+| `monitor/watcher/test-*.sh` | Mock-tmux / mock-gh unit tests, one per behavioural surface; run all via `run-tests.sh` or any one with `bash <file>` | yes |
 
-The suite is large — roughly **125** `test-*.sh` files under
-`monitor/watcher/` (plus a couple at the `monitor/` top level), one per
-behavioural surface. The table below is a **curated sample** of the
-load-bearing ones, not the full list; run the whole suite with
+The suite is large, and **this page deliberately carries no test-file
+count** — a count is a property of a tree and of a moment, and a
+number here rots silently. Derive it, with its ref:
+
+```bash
+git ls-tree -r --name-only <ref> | grep -cE '(^|/)test-[^/]*\.sh$'
+```
+
+Measured at `a3177ef6`: **469** files named `test-*.sh` tree-wide, of
+which **452** are in the fast band CI discovers (`monitor/` and
+`monitor/watcher/`, depth 1 each) — **431** under `monitor/watcher/`
+and **21** at the `monitor/` top level — plus **16** under
+`monitor/watcher/test-integration/` and **1** under
+`monitor/cc-harness/`. Note the anchor: a bare
+`grep -c 'test-.*\.sh$'` matches on the whole PATH and so counts
+`test-integration/_harness.sh` and `test-integration/stub-claude.sh`,
+which are not tests; it answers **471**.
+
+The table below is a **curated sample** of the load-bearing ones, not
+the full list; run the whole suite with
 `monitor/watcher/run-tests.sh`.
 
 | Test file | Covers |
@@ -189,6 +233,9 @@ load-bearing ones, not the full list; run the whole suite with
 | `test-snapshot-deliveries.sh` | `_deliveries.sh` end-to-end (curl mock) |
 | `test-snapshot-mentions.sh` | `_mentions.sh` cross-repo mention search |
 | `test-idle-probe.sh` | `_idle_probe.sh` six-class transitions + dedup |
+| `test-tmux-socket-ceiling.sh` | The 107/108 boundary against a real AF_UNIX bind AND real tmux, tmux's socket composition, the three outcomes of `th_require_tmux_socket`, `run-tests.sh`'s pre-flight refusal, and a ratchet that every helper-sourcing real-tmux suite carries the precondition |
+| `test-mutation-gate-bounds.sh` | `monitor/mutation-gate.sh`'s two properties: the predicate (including the `&&`/`\|`/heredoc shapes that promote a line with no backslash anywhere, which `bash -n` calls valid) and the bound (the real `yes yes` contained at 64 KB, rc 153, inherited by a grandchild; the pipe hole closed by the wall clock) |
+| `test-public-mirror-build-entry-guard.sh` | `public-mirror/build.sh`'s entry conditions: a flagless invocation is a dry run (exit 6) and a dirty tree is refused (exit 7), each paired with a WHOLE-TREE CHECKSUM proving nothing was touched; `--yes` / `--allow-dirty` / `NEXUS_MIRROR_BUILD_OK=1` still build |
 | `test-pane-state.sh` | `monitor/pane-state.sh` classifier across fixtures |
 | `test-entry.sh` | `entry.sh` self-checks, pin reconciliation (`--continue`), `svc.sh up` delegation, cockpit hand-off |
 | `test-hosting-migration.sh` | `_hosting_migration.sh` legacy-hosting detection + one-shot migration notice |
@@ -203,7 +250,7 @@ watcher launch.
 
 | Path | Purpose | Retention |
 |---|---|---|
-| `watcher-heartbeat` | pid + ISO ts + target; mtime-bumped every cycle | overwritten each poll |
+| `watcher-heartbeat` | pid + ISO ts + target; **liveness only** — beaten by a constant-cadence background ticker (`monitor.watcher.heartbeat_tick_seconds`, default 20 s), not by the poll loop | overwritten each tick |
 | `watcher.pid` | Self-published watcher PID — the headless-hosting liveness anchor (`launcher.sh` and `svc.sh` validate the owner's identity, not just `kill -0`) | watcher lifetime |
 | `watcher.lock` | PID-based lock; prevents two watchers on the same state dir | watcher lifetime |
 | `watcher-target` | Current target window (written at startup) | watcher lifetime |
@@ -321,9 +368,9 @@ monitor/                   watcher + bot + helpers + agent prompt
   hooks/                   Claude Code hook handlers (session-pin, decision-emit, …)
   docs/                    agent-state-machine.md  orchestrator-guide.md
   cc-harness/              gate.sh + mock-backend.py — cc-update gate
-  watcher/                 entry, main, launcher, bootstrap, _*.sh helpers, ~125 test-*.sh
+  watcher/                 entry, main, launcher, bootstrap, _*.sh helpers, the test-*.sh suite
   infra-resolved.md
-skills/                    one dir per nexus.* skill (14)
+skills/                    one dir per nexus.* skill (see reference/skills.md)
 watcher  nexus            symlinks → monitor/watcher/entry.sh
 package.json  package-lock.json     project-local Claude Code npm pin
 CLAUDE.md  README.md  LICENSE  CHANGELOG.md

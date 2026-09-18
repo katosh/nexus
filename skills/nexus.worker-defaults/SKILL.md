@@ -63,7 +63,10 @@ is recomputed when something asks GitHub for the PR's mergeability, and
 not otherwise. Measured: two refs sat stale for **26 and 36 hours**
 across many base advances, while one refreshed to the base's current tip
 **within two minutes of a single `GET /pulls/{n}`** and an untouched
-control did not move. Two consequences, and the second is the sharp one:
+control did not move. (A model, not a mechanism: a `GET` has since been
+measured refreshing `mergeable` while the ref's base stayed put, n=2 —
+see `monitor/_merge_ref_base.sh` and `#923` before leaning on "one GET
+refreshes it".) Two consequences, and the second is the sharp one:
 "it has been a while, it must have refreshed" is false; and **querying
 the PR refreshes it, so the act of checking changes what you are
 checking.** Never read a green, then query the PR, then treat that green
@@ -108,6 +111,17 @@ REFUSED / `3` no such remote branch, mirroring `guards-for-diff.sh`'s
 `#803` shape where "could not check" and "nothing found" are separate
 codes and neither is a pass.
 
+**And its `1` is a claim to reconcile, not a verdict to obey**
+(`#835`, `#898`). The check matches commits by patch-id, so a rebase
+whose replay needed conflict resolution, a content-changing `--amend`,
+and a rebase that flattens a merge all report UNSAFE — byte-identical
+to a real loss — while destroying nothing. The `force-push` conf rows
+now say so at the push, name the per-file patch-id reconciliation
+that separates the two, and mark the one PERMANENT `2` (a multi-URL
+remote, `#930`) with its per-URL next step. The posture is not
+weakened: a false UNSAFE costs one reconciliation, a false SAFE costs
+a sibling their commit.
+
 **And it must compare the ref the push MOVES, not `HEAD`** — the third
 correction, and a false SAFE rather than a refusal. A push updates
 `refs/heads/<dst>` on the remote from `<src>` locally, and neither is
@@ -146,10 +160,13 @@ already computes, stop deriving and ask the tool.**
 
 ## How injection works
 
-`monitor/spawn-worker.sh` resolves `NEXUS_ROOT` from its own
-`dirname` (so it works in forks and fresh clones), reads this
-file, extracts the `## Worker floor` section body via awk
-(`/^## Worker floor$/` to the next `## ` H2 or EOF; per-spawn
+`monitor/spawn-worker.sh` resolves `NEXUS_ROOT` — an inherited,
+valid `$NEXUS_ROOT` wins, else its own `dirname`, except that a
+script-relative root sitting under another nexus's `work/` is
+re-rooted to that primary (`#577`), so state never forks into a
+secondary clone — reads this file, extracts the `## Worker floor`
+section body via awk
+(`/^## Worker floor[[:space:]]*$/` to the next `## ` H2 or EOF; per-spawn
 Claude Code settings come from the dedicated
 `monitor/worker-settings.json` file — see `## Worker settings`
 below), and composes the worker's prompt as three blocks
@@ -252,7 +269,63 @@ a hook or your task prompt points you there.
 
   Neither is a fetch time. The only thing that makes a negative claim
   current is an actual successful `git fetch`.
+- **Three hazards that used to live in every brief now have TOOLS.**
+  Reach for the tool; the refusal it prints IS the explanation, with
+  the measured number in it.
+  - **A tmux socket path holds 107 bytes** — `sun_path` is 108
+    INCLUDING the NUL. tmux composes
+    `${TMUX_TMPDIR:-/tmp}/tmux-<uid>/<socket-name>`, and a session
+    scratchpad `TMUX_TMPDIR` (~124 bytes here) is over the limit
+    before the suffix. Every real-tmux suite then fails `File name
+    too long` and reports it as a defect in the code under test —
+    and it reproduces on EVERY tree, so "clean `dev` fails too"
+    answers YES and means the opposite of what it is read to mean.
+    Five wrong attributions and one retracted finding (`#991`).
+    `monitor/watcher/run-tests.sh` now REFUSES such a run (exit 2)
+    rather than dispatching doomed suites. Check a path yourself
+    with `monitor/tmux-socket-fits.sh --socket <name>` (exit 3 =
+    too long, naming the measured length); `--suggest` prints a
+    dir that fits. Keep it short: `/tmp/<brief>`, never the
+    scratchpad — **for the SOCKET DIRECTORY ONLY.** `/tmp/c71780` and
+    any short `TMUX_TMPDIR` you pick hold tmux sockets and nothing
+    else; everything else you write goes under the session scratchpad
+    (`$TMPDIR`) or inside your clone. Measured 2026-09-03: workers who
+    read "put scratch in `/tmp/c71780`" literally left **16.5 GiB** of
+    per-window payload in a directory whose short name exists for the
+    108-byte `sun_path` limit, and `monitor/tmpfs-guard.sh --check`
+    now goes UNHEALTHY above `monitor.tmpfs.max_c71780_payload_mib`
+    (<your-org>/nexus-code#1422).
+  - **Never hand-roll a mutation gate** — `monitor/mutation-gate.sh
+    --suite <f> --list`, then `--line N`. Commenting a line that
+    does not END a logical line does not delete it, it PROMOTES the
+    next line to a standalone command; one such mutant executed
+    `yes yes` and filled the sandbox-wide 378 GB `/tmp` to 8 KB
+    free (`#1032`). The tool refuses such a line AND, independently,
+    bounds every mutant with `timeout` + `ulimit -f` + a free-space
+    floor — the second is what saves you, because the first is a
+    predicate that can be wrong.
+  - **`monitor/public-mirror/build.sh` destroys the checkout it is
+    invoked from.** DRY RUN by default (exit 6); `--yes` is the
+    opt-in, and a dirty tree is refused (exit 7) unless
+    `--allow-dirty` (`#1001`). Throwaway clones only.
+- **`ng send` returning `UNKNOWN` is not a licence to re-send** (a fallback fires only on rc 4);
+  resolve it after the fact with `ng send <window> --check --last` (or `--list`, then `--check --nonce <hex>`).
 - **`sandbox-notify "<msg>"`** on blocker / ready / done.
+- **You can reach the orchestrator mid-task — `SendMessage`.** Use it
+  for a blocker, a scope question, or a finding that should not wait
+  for your report; `sandbox-notify` has been observed missed, and
+  nothing else reaches the orchestrator before you wrap up. Address it
+  by the name **`ListAgents` prints** — read that name, do not
+  construct it: it is normally your tmux window name, but an older
+  Claude Code pin degrades to a workdir-derived one. **Never follow a
+  `success:false` did-you-mean hint blind**: it proposes
+  near-neighbour names, and with siblings like `overlay` beside
+  `overlay-sk` a blind retry delivers your message to the wrong agent
+  — re-read `ListAgents` instead. **Upward only.** A raw `SendMessage`
+  to another WORKER writes no `machine-input.tsv` stamp, so the
+  watcher cannot see the re-task: that worker never supersedes its
+  last wrap-up and can be reported `wrapped` for work it never did.
+  The orchestrator is exempt because nothing retires it on idle-age.
 - **Never invoke `pip` in ANY form — `uv pip` only.** That means
   bare `pip`, `pip3`, AND `python -m pip`, every verb (`install`,
   `download`, …). The sandbox's wrapped pip fork-storms without
@@ -264,11 +337,114 @@ a hook or your task prompt points you there.
   `sc-dandelion`, not `dandelion`. Same rule generalized: bound
   any command whose process tree can grow without a named bound
   (`ulimit -u`, hard `timeout`, capped `--jobs`) before you run it.
-- **Own your async work.** If you `sbatch` / `srun --no-block` /
+- **Own your async work, and launch it with something that KEEPS
+  THE EXIT STATUS.** If you `sbatch` / `srun --no-block` /
   `nohup &` a job, you OWN the wake — don't end your turn with a
   job in flight and no resume mechanism armed. A hook spells out
   the three acceptable mechanisms the moment you launch one; act
-  on it then.
+  on it then. For a local background job use
+  `monitor/async-run.sh --desc "<what>" -- <cmd> …` and read it
+  back with `--status <token>`: a bare `nohup … &` destroys the
+  exit status (the child survives, reparented to init — the
+  parent shell that would reap it does not), so "finished
+  cleanly" and "SIGKILLed" both read as simply absent, and a
+  producer killed mid-write leaves a TRUNCATED, plausible
+  intermediate that passes every emptiness check. **A job at 0% CPU
+  for hours is BLOCKED, not long-running** — read its `wchan`, `fd/0`
+  and `cmdline` in `/proc` before waiting on it; a command-less
+  `> file` typed into a zsh tool call is one way there
+  (<your-org>/nexus-code`#1393`: 7 h 30 m, a child `cat` with no
+  arguments). If you idle
+  anyway the watcher resolves your waits and pastes the verdict
+  — that is a BACKSTOP, not your resume mechanism.
+  **A retained exit status is not an armed wake**
+  (<your-org>/nexus-code`#1523`). `async-run.sh` keeps the rc for you
+  to READ; it never RE-INVOKES you, so it is not a parking mechanism.
+  Exactly two things re-invoke this agent when a wait ends: the Bash
+  tool's `run_in_background` option (the harness re-invokes you when
+  the job exits, which is what makes a typed rc actionable) and a
+  `Monitor` until-loop (for a condition rather than a job). A parked
+  agent must be able to name what will RE-INVOKE it; if the answer is
+  a status file, it is not parked — it is asleep. Measured: a skeptic
+  `await` launched through `async-run.sh` expired cleanly (rc 4,
+  retained) and the agent sat idle 809 s until the watcher backstop
+  pasted. Wherever the skeptic contract says to run `await`
+  BACKGROUNDED, it means `run_in_background`, never `async-run.sh`.
+- **A job that will outlive the 30-minute `Monitor` cap gets a
+  longjob WATCH, and you end your turn** (<your-org>/nexus-code`#1535`).
+  Every nexus session carries ONE host-armed plugin monitor (the
+  longjob-watch dispatcher) that wakes you with a task notification on
+  ANY terminal state of a watched subject. Three shapes, cheapest first:
+  an `sbatch` / `srun --no-block` is auto-watched by the launch hook
+  (nothing to do); a long LOCAL command is
+  `monitor/ng longjob run --desc "<what>" -- <cmd …>` (launched via
+  `async-run.sh`, rc retained, watch armed, one line); anything else is
+  `monitor/ng longjob add slurm:<id>|asyncrun:<token>|pid:<pid>|file:<path>|cmd:'<probe>'`.
+  **READ `add`'s LAST LINE.** `dispatcher: ARMED` means end your turn.
+  `NOT ARMED` (rc 3) means nothing in this session will wake you: run
+  `monitor/longjob-watch.sh await <id> --timeout <s>` in a Bash call with
+  `run_in_background: true` instead, then `ng longjob status` says why.
+  A watch that cannot tell emits `UNKNOWN … PARKED` after 5 blind polls
+  rather than sleeping you forever; every delivered line costs a wake
+  PLUS whatever work you then do, so default watches print only their
+  terminal state. This closes `#1523`'s shape: `async-run.sh` retains
+  an rc and re-invokes nobody, and `asyncrun:<token>` is the wake it
+  lacked. `skills/nexus.longjob/SKILL.md` for the rest.
+- **Never `| head` an existence query over a large tree, never
+  recurse into `reports/`, and route anything that might run long
+  through `async-run.sh`** (<your-org>/nexus-code`#1446`). `grep -r … |
+  head -5` reads as "stop after 5 hits" and behaves as "scan
+  everything" when the hits run out: `head` exits, the producer only
+  learns via SIGPIPE on its NEXT write, and with no further matches it
+  walks the whole tree in silence — so the hang is specific to the
+  answer "no", which is the one you were hunting. Three workers wedged
+  49m, 1h54m and 2h48m in one session, each pane reading
+  `working-background`. `-m1` bounds per FILE, not overall. Bound the
+  WALK: `find DIR -maxdepth N -type f -print0 | xargs -0 grep -l PAT`.
+  `reports/` is gitignored, so a recursive `grep` there returns a
+  confident zero (`#618`): use `monitor/ng report-grep PAT`, which exits
+  3 rather than vouch for a zero it cannot see. And a child at ~0% CPU
+  for an hour is BLOCKED on the filesystem, not computing —
+  `pane-state` now says so (`bg_wedged=1`).
+- **`/tmp/c71780` holds SOCKETS ONLY** (<your-org>/nexus-code`#1422`).
+  Its short name exists for the 107-byte `sun_path` limit and nothing
+  else; it held 16.5 GiB of per-worker scratch because briefs handed it
+  out as general scratch. Scratch goes under the session scratchpad
+  (`$TMPDIR` / the directory your brief names) or inside your clone —
+  never under `/tmp/c71780`, which the tmpfs reaper deliberately never
+  touches because live sockets are exactly what it must not delete.
+- **An orphan left by your OWN backgrounded Bash call is stopped
+  with `TaskStop`, not with a signal — and the guard that refuses
+  it is right.** Backgrounding makes that shell its own SESSION
+  LEADER, so it sits OUTSIDE your session and
+  `proc-kill-authorized` refuses it `not-owned`. That refusal is
+  CORRECT and it is also AMBIGUOUS: *"another agent's"* and
+  *"yours, but it left your session"* read identically, and nothing
+  downstream disagrees. One orphan ran **twelve hours** because its
+  own launcher hit that refusal at ten minutes old and took the
+  sibling reading; a second was measured at **28 hours**, still
+  looping on a sentinel that could never appear
+  (<your-org>/nexus-code`#1235`). The refusal now prints
+  `NOT-A-SIBLING` whenever it can establish the parent is yours —
+  when you see it, the answer is the harness-native **`TaskStop
+  <task-id>`**: the harness launched the task, so the harness can
+  stop it. `svc.sh` stops `setsid`-detached services; nothing
+  stops a default-deny refusal by hand-rolling a signal past it.
+- **Label a parameter you CHOSE as chosen, never as upstream
+  convention** (<your-org>/nexus-code`#970`). If you pick a value the
+  tool does not default for you — a bin width, a threshold, a seed, a
+  filter cutoff — say so plainly in BOTH the script comment and the
+  report: *"we chose N because Y"*. Do not write *"the default per
+  common usage"* or similar unless you have verified it against the
+  tool's own source or docs AND can cite where. Measured: a 40 kb bin
+  width annotated as *"the default per common ATAClone usage"* — where
+  the argument is REQUIRED and the package ships no default and no
+  vignette call supplying one — survived an OOM, a memory patch and
+  three failed runs unexamined, because every review of the run treated
+  the bin width as settled. That is what the mislabelling buys: a value
+  presented as convention is re-derived by nobody downstream, human or
+  agent, so the one number nobody chose deliberately is also the one
+  number nobody checks.
 - **Before you finish, idle, or run low on context: file a
   report and wrap up.** `monitor/ng report-init <slug>` writes a
   five-section skeleton at the canonical reports path (captures
@@ -283,8 +459,15 @@ a hook or your task prompt points you there.
   you through anything else that applies at that moment (skeptic
   validation if your spawn required it, finalisation reminders).
   Do task-specific finalisation — build, tests, branch push, PR
-  — BEFORE wrap-up. End your turn on exit 0; on non-zero, retry
-  only the failed step(s) named on stderr.
+  — BEFORE wrap-up. End your turn on exit 0; on **1**, retry only
+  the failed step(s) named on stderr. **Exit 3 is not a failure and
+  retrying cannot clear it**: every step did what it was asked and
+  your correction still reached nobody — the report changed, the
+  link comment is composed from `## Summary` alone, and yours is
+  byte-identical to the one already posted. Re-running reproduces
+  it exactly. Do what stderr says instead: edit `## Summary` in
+  place so the correction is IN the composed body and re-run, or
+  pass `--comment-body-file`, or say it on the thread yourself.
 
 Deeper skills, consulted only when the above is insufficient:
 `skills/nexus.bot/SKILL.md` (verb table, cross-repo `GH_TOKEN`,
@@ -330,6 +513,7 @@ session** (per-window dedup) so it informs without nagging.
 | `hooks/bash-footgun-guard.sh` (Bash, data-driven by `bash-footgun-patterns.conf`) | a Bash command matches a footgun pattern: `pkill/pgrep -f`, `kill $(jobs -p)`, `git push`, `git push --force`/`-f`, `scancel --name/--partition`, foreground `sleep`, `python…\| tail`, `ml…\| tail` | the specific self-kill / wrong-remote / force-push-boundary / sibling-job / buffering reminder as `additionalContext` |
 | `hooks/gh-write-guard.sh` (Bash) | a `gh` write is attempted | bot-identity guidance (`ng` verbs, `GH_TOKEN` mint for cross-repo); already warns on a bypass that would post as the operator |
 | `hooks/async-launch-detect.sh` (Bash) | `sbatch` / `srun --no-block` / `nohup &` is launched | the async-ownership rule + the three resume mechanisms; records the wait for the watcher's `idle-orphan-async` |
+| `hooks/bash-footgun-guard.sh` row `async-status` (Bash) | a bare `nohup … &` in command position | hands over `monitor/async-run.sh`, which retains the rc and registers a RESOLVABLE `asyncrun:<token>` wait (<your-org>/nexus-code#1071) |
 
 **Proposed, NOT wired.** The following is a design note, not a
 guard that exists. It sat inside the table above, under a heading

@@ -80,7 +80,18 @@ assert_file_exists "authorized_keys written" "$ak"
 akline=$(cat "$ak")
 assert_contains "line carries forced command" "$akline" "remote-forced-command.sh alice"
 assert_contains "line carries restrict"        "$akline" "restrict"
-assert_contains "line carries the client key"   "$akline" "$(awk '{print $2}' "$WORK/client.pub")"
+# The needle below comes from a PROBE, and an EMPTY needle makes
+# `assert_contains` pass VACUOUSLY — it is `grep -qF -- "$needle"`, and
+# `grep -qF ""` matches every line of any non-empty haystack
+# (your-org/nexus-code `#1024`). This is reachable, not theoretical: the
+# `command -v ssh-keygen` skip-guard above proves ssh-keygen EXISTS, not that it
+# SUCCEEDED, and its rc is not checked at the keygen site — so a build without
+# ed25519, a FIPS policy, or an unwritable $WORK leaves no `client.pub`, `awk`
+# prints nothing, and the assertion certifies a key it never saw.
+_client_key=$(awk '{print $2}' "$WORK/client.pub" 2>/dev/null)
+assert_eq "client pubkey field is non-empty (else the next assert is vacuous)" \
+    "$([ -n "$_client_key" ] && echo yes || echo no)" "yes"
+assert_contains "line carries the client key"   "$akline" "$_client_key"
 assert_eq "token consumed (no pending records)" "$(ls "$PDIR/enroll/"*.token 2>/dev/null | wc -l | tr -d ' ')" "0"
 
 echo "== 4. replay of consumed token fails closed (rc3) =="

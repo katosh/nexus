@@ -357,6 +357,16 @@ seed_surfaces() {
     printf '%s\t0\t0\t1\tmachine\t0\n' "$w" > "$ST/operator-engaged.tsv"
     printf '%s\tover\n'           "$w" >  "$ST/over-limit-state.tsv"
     printf '%s\t1\tpaste-followup\n' "$w" > "$ST/machine-input.tsv"
+    # your-org/nexus-code#1101 (skeptic F2): the orphan-async loop's own two
+    # surfaces. `retire-window` DELETES heartbeat/{w}.json, which is where that
+    # loop reads its authoritative wait list from, and it did NOT prune the
+    # loop's row — so retiring through the canonical verb left a row whose wait
+    # list could only fall back to a truncated display string, gating #1101's
+    # terminating conjunction closed in exactly the configuration operators are
+    # steered toward.
+    mkdir -p "$ST/orphan-async-woken"
+    printf '%s\tasyncrun:ar-1,asyncrun:ar-2\t1\t2\t0\n' "$w" > "$ST/orphan-async-state.tsv"
+    echo 1785370294 > "$ST/orphan-async-woken/$s"
     # An unrelated window, to prove the prune is scoped.
     printf 'other-window\twrapped\n' >> "$ST/idle-state.tsv"
 }
@@ -384,8 +394,7 @@ assert_not_contains "#602 idle-state.tsv no longer holds the retired row" \
 assert_contains "#602 CONTROL: an unrelated window's row SURVIVES the prune" \
     "$(cat "$ST/idle-state.tsv")" "other-window"
 
-# `ng retire-window` end-to-end, on a window absent from tmux (the
-# preflight has nothing live to protect, so it is correctly skipped).
+# `ng retire-window` end-to-end, on a window absent from tmux.
 #
 # `--assume-absent` keeps this hermetic rather than dependent on whether the
 # environment happens to have a live tmux server. CI installs tmux but starts
@@ -394,16 +403,222 @@ assert_contains "#602 CONTROL: an unrelated window's row SURVIVES the prune" \
 # design — it must never prune the state of a window it did not OBSERVE. The
 # flag asserts what is true in this fixture (kompot-panelL exists nowhere) and
 # does not weaken the assertions below: with a live server the resolver
-# returns rc 1 and the flag is never consulted. The teardown property being
-# tested here is the prune-and-verify, not the tmux lookup.
+# returns rc 1 and the flag is never consulted.
+#
+# ── your-org/nexus-code#977: THIS BLOCK USED TO CERTIFY THE DEFECT ─────────
+#
+# `seed_surfaces` seeds `skeptic/pending/<key>` — a LIVE required-skeptic
+# obligation — because it is a manifest surface and the prune must reach it.
+# The case below then asserted `retire-window … exits 0 on a clean teardown`,
+# under a comment reading "the preflight has nothing live to protect, so it
+# is correctly skipped".
+#
+# That comment is the defect stated as a justification. It is true of the
+# LIVENESS checks and false of the OBLIGATION checks: a marker on disk is
+# exactly as binding whether or not a pane still exists, and check 1b exists
+# to refuse precisely this. So the verb destroyed an unserved required
+# verdict AND the whole worker<->skeptic channel directory, silently, and a
+# green test said the teardown was clean.
+#
+# Worth stating plainly rather than quietly editing: the failure survived
+# because a passing assertion described it. The three assertions below are
+# now split into the two questions that were conflated —
+#   (1) does an UNRELEASED obligation refuse the teardown?   [#977]
+#   (2) once RELEASED, is the prune still complete?          [#602]
+# — and (2) keeps every property #602 was asserting.
 rm -rf "$ST"; seed_surfaces kompot-panelL
 rw_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
     bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelL --reason test --assume-absent 2>&1); rw_rc=$?
+assert_rc "#977 retire-window REFUSES an absent window that still owes a verdict" "$rw_rc" 1
+assert_contains "#977 …and the refusal comes from the preflight, not a new copy of the check" \
+    "$rw_out" "preflight refused"
+assert_contains "#977 …naming the gate that fired" \
+    "$rw_out" "required skeptic marker is LIVE"
+assert_contains "#977 …and the pane state it was evaluated under" \
+    "$rw_out" "pane=absent"
+# THE PROPERTY. A refusal that still pruned would satisfy every string
+# assertion above and be the bug.
+assert_file_exists "#977 the obligation SURVIVES the refused teardown" \
+    "$ST/skeptic/pending/kompot-panelL"
+assert_contains "#977 …and so does every other surface (nothing was pruned)" \
+    "$(cat "$ST/idle-state.tsv" 2>/dev/null)" "kompot-panelL"
+
+# The RELEASE. A gate with no release is a brick and a brick trains the `rm`
+# bypass — which destroys the obligation outside any gate, i.e. #977 made
+# worse. Driven through the REAL `ng skeptic resolve` rather than an `rm`
+# here, because the release working on a window that is GONE FROM TMUX is the
+# load-bearing half of the refusal being the right direction.
+#
+# `NEXUS_WORKER_WINDOW` is unset explicitly: `resolve` is orchestrator-only
+# and refuses from a worker context, and this suite may itself run inside a
+# spawned worker (run_hermetic does not clear that variable).
+rel_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
+    env -u NEXUS_WORKER_WINDOW bash "$REPO_ROOT/monitor/ng" skeptic resolve kompot-panelL \
+        --reason "verdict landed in the secondary clone state dir; see the linked report" 2>&1); rel_rc=$?
+assert_rc "#977 the sanctioned release works on a window absent from tmux" "$rel_rc" 0
+assert_contains "#977 …and leaves a rationale record" "$rel_out" "rationale appended"
+
+rw_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
+    bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelL --reason test --assume-absent 2>&1); rw_rc=$?
 assert_rc "#602 ng retire-window exits 0 on a clean teardown" "$rw_rc" 0
+# your-org/nexus-code#1434 / #1270 residual A: the skeptic CHANNEL is archived,
+# not destroyed — the live path is clear (so every live-path reader sees what
+# it saw after the rm) and the record survives under skeptic/.archive/.
+assert_eq "#1434 the retired channel is GONE from its live path" \
+    "$([[ -d "$ST/skeptic/kompot-panelL" ]] && echo present || echo absent)" "absent"
+assert_eq "#1434 …and ARCHIVED under skeptic/.archive/<key>.retired-<ts>/ (a DONE tombstone survives)" \
+    "$(find "$ST/skeptic/.archive" -maxdepth 1 -name 'kompot-panelL.retired-*' 2>/dev/null | grep -c .)" "1"
+# The FALLBACK is never silent (skeptic w220sk on the W2-20 bundle): with the
+# archive made impossible (a FILE where the .archive dir must go), the channel is
+# still cleared from its live path AND a WARNING names what was destroyed.
+_st1434=$(mktemp -d "${TMPDIR:-/tmp}/bk1434f.XXXXXX"); mkdir -p "$_st1434/skeptic/w1"; echo x > "$_st1434/skeptic/w1/DONE"; : > "$_st1434/skeptic/.archive"
+_err1434=$(bk_prune_window_state "$_st1434" w1 2>&1 >/dev/null)
+assert_eq "#1434 archive impossible -> the live path is still cleared" "$([[ -d "$_st1434/skeptic/w1" ]] && echo present || echo absent)" "absent"
+assert_contains "#1434 …and the fallback rm is LOUD, naming the destroyed channel" "$_err1434" "could not ARCHIVE skeptic channel skeptic/w1"
+rm -rf "$_st1434"
 assert_contains "#602 …and ASSERTS the property, not that the rm's returned 0" \
-    "$rw_out" "no state surface references it"
+    "$rw_out" "pruned and verified clear"
+# your-org/nexus-code#1101 (skeptic F3). The verb used to close by asserting
+# completeness on the strength of iterating BK_RETIRE_SURFACES — the same array
+# the pruner iterates, so the check was blind to exactly what the manifest
+# omits, and an independent scan of the live state dir found SIX families it
+# does not name. The property this assertion is FOR is "the verb states what it
+# actually checked", so it now requires the manifest-independent half to have
+# run and said so. A summary that claims completeness without it is the defect.
+# THE SECOND KEY IS WHAT MAKES THE FIRST ONE MEAN ANYTHING. `pruned and
+# verified clear` is printed by BOTH exit branches, so on its own the assertion
+# above passes even when the verb reports leftovers (skeptic G2 caught exactly
+# that in test-window-key.sh). `unmanifested=<n>` is always present and carries
+# the discriminating VALUE.
+assert_contains "#1101 …and puts the unmanifested COUNT on stdout as a present value" \
+    "$rw_out" "unmanifested="
+# AND THIS FIXTURE LANDS ON THE NON-CLEAN BRANCH ON PURPOSE. `ng skeptic
+# resolve` ran above and left `skeptic/pending/.<w>.cleared-rationale`, which
+# the verb DELIBERATELY does not prune — its own stderr says the ledger "is the
+# durable account of what this window owed and what was validated". Before the
+# widened predicate (skeptic G1) that surface was invisible to the scan, so the
+# verb announced a clean teardown over evidence it had chosen to keep. Now it
+# reports it and declines to rule, which is the whole design.
+assert_contains "#1101/G1 the deliberately-RETAINED skeptic ledger family is REPORTED, not silently kept" \
+    "$rw_out" "skeptic/pending/.kompot-panelL"
+assert_contains "#1101/G1 …and the verb refuses to decide whether it belongs in the manifest" \
+    "$rw_out" "does not decide which"
+assert_not_contains "#1101 …leaving orphan-async-state.tsv clean" \
+    "$(cat "$ST/orphan-async-state.tsv" 2>/dev/null)" "kompot-panelL"
+if [[ -e "$ST/orphan-async-woken/kompot-panelL" ]]; then
+    assert_eq "#1101 …and the post-wake cooldown sidecar pruned" "present" "absent"
+else
+    assert_eq "#1101 …and the post-wake cooldown sidecar pruned" "absent" "absent"
+fi
+
+# ---- the manifest-INDEPENDENT scan: both directions ----------------------
+#
+# BOTH, because a scan that reports EVERYTHING passes the positive control and
+# is useless, and one that reports nothing passes no control at all. The
+# discriminating variable is whether the manifest names the surface.
+mkdir -p "$ST/async-run/kompot-panelL"
+echo x > "$ST/async-run/kompot-panelL/status"
+unman=$(run_hermetic NEXUS_STATE_DIR="$ST" -- bash -c '
+    . "'"$REPO_ROOT"'/monitor/_bookkeeping.sh"
+    bk_state_refs_unmanifested "'"$ST"'" kompot-panelL')
+assert_contains "#1101 the independent scan SEES a surface the manifest omits" \
+    "$unman" "async-run/kompot-panelL"
+# The NEGATIVE control, and the one that matters: a surface the manifest DOES
+# name must never be reported here, or every retirement drowns in noise and the
+# signal is discarded by the first reader.
+echo x > "$ST/heartbeat/kompot-panelL.json"
+unman2=$(run_hermetic NEXUS_STATE_DIR="$ST" -- bash -c '
+    . "'"$REPO_ROOT"'/monitor/_bookkeeping.sh"
+    bk_state_refs_unmanifested "'"$ST"'" kompot-panelL')
+assert_not_contains "#1101 …and does NOT report a MANIFESTED surface" \
+    "$unman2" "heartbeat/kompot-panelL.json"
+
+# ---- the KEY SHAPE: a token boundary, not a prefix (skeptic G1) ----------
+#
+# The first predicate matched a basename that IS the key or BEGINS `<key>.`.
+# Two live families sit outside that shape — the window in the MIDDLE of the
+# basename, or behind a leading dot — and BOTH were invisible to the manifest
+# AND to the scan. The second is the instructive one: it sits directly beside
+# `file:skeptic/pending/{s}`, which IS manifested.
+mkdir -p "$ST/obligations" "$ST/skeptic/pending"
+echo x > "$ST/obligations/kompot-panelL-sk__kompot-panelL__skeptic-verdict.rec"
+echo x > "$ST/skeptic/pending/.kompot-panelL.ledger"
+# THE FALSE-POSITIVE CONTROL, and it is the direction a report must not have:
+# a SIBLING window's file must not be reported when asking about this one. `-`
+# is deliberately not a delimiter, because window names contain it.
+echo x > "$ST/skeptic/pending/.kompot-panelL-sk.ledger"
+unman3=$(run_hermetic NEXUS_STATE_DIR="$ST" -- bash -c '
+    . "'"$REPO_ROOT"'/monitor/_bookkeeping.sh"
+    bk_state_refs_unmanifested "'"$ST"'" kompot-panelL')
+assert_contains "#1101/G1 the scan sees the window MID-basename (obligations/…__w__….rec)" \
+    "$unman3" "__kompot-panelL__skeptic-verdict.rec"
+assert_contains "#1101/G1 …and behind a LEADING DOT, beside a manifested sibling" \
+    "$unman3" "skeptic/pending/.kompot-panelL.ledger"
+assert_not_contains "#1101/G1 CONTROL a SIBLING window's file is NOT reported" \
+    "$unman3" ".kompot-panelL-sk.ledger"
+
+# ---- --strict turns an unmanifested reference into a failure -------------
+#
+# Untested until now (skeptic G4). The default is rc 0 on purpose — an
+# unmanifested reference is not a failed prune — so the flag is the only way a
+# caller can make it one, and an untested flag is a promise nobody checked.
+st_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
+    bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelL --reason t --assume-absent 2>&1); st_rc=$?
+assert_rc "#1101/G4 default: unmanifested references do NOT fail the verb" "$st_rc" 0
+assert_contains "#1101/G4 …and the COUNT is on stdout as a present value" \
+    "$st_out" "unmanifested="
+st2_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
+    bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelL --reason t --assume-absent --strict 2>&1); st2_rc=$?
+assert_rc "#1101/G4 --strict: the same state now FAILS" "$st2_rc" 1
+assert_contains "#1101/G4 …and says --strict is why" "$st2_out" "--strict given"
+
+rm -rf "$ST/async-run" "$ST/heartbeat/kompot-panelL.json" "$ST/obligations" "$ST/skeptic/pending"
 assert_not_contains "#602 …leaving idle-state.tsv clean" \
     "$(cat "$ST/idle-state.tsv" 2>/dev/null)" "kompot-panelL"
+# #977's recording half, which lands regardless of the refusing half: the
+# channel directory is still destroyed by this (now legitimate) teardown, and
+# before this change that destruction left no artefact at all — so the
+# prevalence of the failure was invisible BY CONSTRUCTION.
+assert_contains "#977 the teardown RECORDS the obligation state it destroyed" \
+    "$(cat "$ST/action-log.jsonl" 2>/dev/null)" '"event":"skeptic-obligation-destroyed"'
+assert_contains "#977 …naming the channel dir it removed" \
+    "$(cat "$ST/action-log.jsonl" 2>/dev/null)" '"channel-dir":"present"'
+assert_contains "#977 …and warning on stderr, not only in the log" \
+    "$rw_out" "destroys skeptic obligation state"
+# THE DURABLE HALF SURVIVES THE TEARDOWN, and it is asserted rather than
+# reasoned about. `retire-window` tells the operator on stderr that the
+# discharge ledger and the subject record are NOT pruned — that is a claim
+# about BK_RETIRE_SURFACES (`file:skeptic/pending/{s}` names the MARKER, not
+# the dotfiles beside it), and a claim about a manifest is exactly the kind
+# that a later manifest edit silently falsifies. Without this, #977's whole
+# accounting argument rests on a sentence.
+rm -rf "$ST"; seed_surfaces kompot-panelD
+mkdir -p "$ST/skeptic/pending"
+{ printf 'armed\t%s\t2026-08-26T00:00:00\t977\t/r/d.md\n'          "$(printf 'a%.0s' {1..64})"
+  printf 'discharged\t%s\t2026-08-26T01:00:00\tcredible\t977\tsk-d\tattributed\n' "$(printf 'a%.0s' {1..64})"
+} > "$ST/skeptic/pending/.kompot-panelD.ledger"
+rm -f "$ST/skeptic/pending/kompot-panelD"   # released; only the ledger remains
+rw_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
+    bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelD --reason test --assume-absent 2>&1); rw_rc=$?
+assert_rc "#977 a released window retires" "$rw_rc" 0
+assert_no_file "#977 …the channel dir IS destroyed" "$ST/skeptic/kompot-panelD"
+assert_file_exists "#977 …but the OBLIGATION LEDGER survives the prune" \
+    "$ST/skeptic/pending/.kompot-panelD.ledger"
+assert_contains "#977 …with both its arm and its discharge intact" \
+    "$(cat "$ST/skeptic/pending/.kompot-panelD.ledger" 2>/dev/null)" "discharged"
+assert_contains "#977 …and the destruction event carries the subject it destroyed" \
+    "$(cat "$ST/action-log.jsonl" 2>/dev/null)" '"subject-armed-sha":"aaaaaaaa'
+
+# NEGATIVE CONTROL — a teardown with NOTHING to destroy must not emit the
+# event. Without this, an unconditional emit would pass every assertion above
+# and bury the ~1-in-N retirement that matters in the N that do not.
+rm -rf "$ST"; seed_surfaces kompot-panelQ
+rm -f "$ST/skeptic/pending/kompot-panelQ"; rm -rf "$ST/skeptic/kompot-panelQ"
+rw_out=$(run_hermetic NEXUS_STATE_DIR="$ST" -- \
+    bash "$REPO_ROOT/monitor/ng" retire-window kompot-panelQ --reason test --assume-absent 2>&1); rw_rc=$?
+assert_rc "#977 CONTROL: a window owing nothing retires cleanly" "$rw_rc" 0
+assert_not_contains "#977 CONTROL: …and emits NO destruction event" \
+    "$(cat "$ST/action-log.jsonl" 2>/dev/null)" '"event":"skeptic-obligation-destroyed"'
 
 # --dry-run must report without mutating. A "dry run" that prunes is the
 # same class of lie as a verb reporting work it did not do.
@@ -567,6 +782,63 @@ mk_req() {   # mk_req <state> <report-path>
     printf 'spawn-skeptic\n\nreport-path: %s\n' "$2" > "$f"
     printf '%s' "$f"
 }
+
+# THIS FIXTURE WAS DEAD (your-org/nexus-code#975). `R_ST`, `REPORT` and
+# `mk_req` were defined above and never called: the section header promised the
+# re-fire dedup was covered while the cases below tested only the disposition
+# PARSER. That is worse than an absent test — an auditor reading section headers
+# concludes the `already adjudicated` skip has regression coverage, and a
+# repo-wide `grep -ln "already adjudicated"` over every test file returns
+# nothing. The skip suppresses a REQUIRED skeptic's only push signal, so it is
+# not a corner worth leaving unmeasured.
+#
+# The real function is exercised, not a reimplementation of its predicate: `ng`
+# is sourced (guarded main — the same idiom watcher/test-skeptic-channel.sh
+# uses) in a SUBSHELL so its globals cannot leak into the rest of this file.
+_599_skip() {   # _599_skip <report-path-cited-by-request> <touch-report?>
+    local cited="$1" touch_after="$2"
+    (
+        # shellcheck disable=SC1090
+        source "$REPO_ROOT/monitor/ng" >/dev/null 2>&1
+        STATE_DIR="$R_ST"
+        _SK_SPAWN_REQ=1
+        _SK_SPAWN_TARGET=nexuscode-overlimit
+        _SK_SPAWN_DEPTH=1
+        # An ADJUDICATED sibling: `.done` is terminal, so the earlier
+        # non-terminal guard cannot be what answers here.
+        mk_req done "$cited" >/dev/null
+        # The discriminator is "same report AND untouched since the request".
+        # Order the mtimes explicitly rather than trusting wall-clock: the
+        # fixture is written in the same second as the request.
+        if [[ "$touch_after" == touch ]]; then
+            touch -d "@2000000000" "$REPORT"          # deliverable moved on
+        else
+            touch -d "@1000000000" "$REPORT"          # older than the request
+        fi
+        touch -d "@1500000000" "$R_ST/requests/"*-skeptic-d1.done.md
+        _wrapup_file_spawn_skeptic_request 599 "$REPORT" "" "" "" o/r "" 2>/dev/null
+    )
+}
+
+# POTENCY FIRST: the negative arm must reach the FILING path, or "no skip" and
+# "the function bailed early" are the same bytes — which is exactly how the
+# absence this fixture failed to cover went unnoticed.
+got599=$(_599_skip "$REPORT" touch)
+assert_not_contains "#599 an AMENDED report (mtime past the request) is NOT skipped" \
+    "$got599" "already adjudicated"
+assert_not_contains "#599 …and the amended arm reached the filing path (potency)" \
+    "$got599" "skipped (no require)"
+
+got599=$(_599_skip "$REPORT" keep)
+assert_contains "#599 an UNCHANGED report with an adjudicated request IS skipped" \
+    "$got599" "already adjudicated"
+
+# The join key is (origin, depth, report-path). A request citing a DIFFERENT
+# deliverable must not suppress this one — the over-aggressive-dedup failure the
+# #599 comment calls the worse of the two.
+got599=$(_599_skip "$WORK/some-other-report.md" keep)
+assert_not_contains "#599 an adjudicated request citing a DIFFERENT report does not skip" \
+    "$got599" "already adjudicated"
 
 # The stated disposition reader — the fix for the severity-blind
 # recommendation. A COUNT cannot tell a nit from a merge-blocker; the
@@ -782,8 +1054,26 @@ _sk881_rec() {   # $1 = tag
     printf '%s' "$r"
 }
 
-_out_zero=$(_sk881_run zero "" --skeptic-verdict credible --skeptic-depth 1 --skeptic-findings 0)
-_out_omit=$(_sk881_run omit "" --skeptic-verdict credible --skeptic-depth 1)
+# your-org/nexus-code#1095 SUPERSEDES #881's REMEDY, NOT ITS PROPERTY.
+#
+# #881's property is RECORD FIDELITY: an omitted `--skeptic-findings` and an
+# explicit `0` must stay distinguishable on disk. That is unchanged and is what
+# the comparisons below still test.
+#
+# What changed is the case where NOTHING was stated on EITHER surface. #881
+# answered it by ESCALATING; #1095 measured that the escalation is derived from
+# absence, is therefore unfalsifiable (a finished `no-further-pass` and an
+# abandoned review produce the identical recommendation), and lands on an
+# orchestrator who must then open the report anyway. It is now REFUSED at
+# wrap-up, where the author is still present.
+#
+# So these two runs now STATE A DISPOSITION. Without one they refuse before any
+# record is written, and the fidelity property could not be exercised at all —
+# which is how the supersession first showed up here, as `<NO-RECORD>`. The
+# combination under test is the one that is still reachable and still matters:
+# an omitted COUNT alongside a stated DISPOSITION.
+_out_zero=$(_sk881_run zero no-further-pass --skeptic-verdict credible --skeptic-depth 1 --skeptic-findings 0)
+_out_omit=$(_sk881_run omit no-further-pass --skeptic-verdict credible --skeptic-depth 1)
 _rec_zero=$(_sk881_rec zero)
 _rec_omit=$(_sk881_rec omit)
 
@@ -831,17 +1121,37 @@ assert_not_contains "#881 …and never prints the fabricated zero" \
 assert_contains "#881 CONTROL: an explicit 0 still prints as 0" \
     "$_out_zero" "new findings    : 0"
 
-# The RECURSION GATE. With nothing stated on either surface, no party is
-# on record saying the chain may end, so it must not say so for them.
-assert_not_contains "#881 an unstated count does NOT silently terminate the chain" \
-    "$_out_omit" "no substantive new issues"
-assert_contains "#881 …it escalates instead" "$_out_omit" "$_SK_ESCALATED"
-assert_contains "#881 …and names the absence as the cause, not a finding" \
-    "$_out_omit" "STATED NEITHER A COUNT NOR A DISPOSITION"
-assert_contains "#881 …and does not launder the absence into a discovery" \
-    "$_out_omit" "not because this pass found substantive"
-assert_contains "#881 …and spells out both one-line remedies" \
-    "$_out_omit" "--skeptic-findings 0"
+# The RECURSION GATE, on the case #1095 leaves reachable: a count is unstated
+# but a disposition IS stated, so a party IS on record and the chain may end.
+assert_not_contains "#881 an unstated count is never laundered into a measured zero" \
+    "$_out_omit" "new findings    : 0"
+
+# ---- #1095: STATING NEITHER IS REFUSED, NOT ESCALATED -------------------
+#
+# The third run states NOTHING on either surface — #881's original fixture.
+# #881 escalated here and its own words for that escalation are reused by the
+# refusal, deliberately, so the sentences a reader learned still appear. Only
+# the DELIVERY changed: to the author, at wrap-up, before any state moves.
+#
+# THE PROPERTY IS THE SIDE EFFECTS, NOT THE MESSAGE. A refusal printed after
+# the verdict was logged and the marker `rm`ed would say "no marker was
+# touched" having already cleared it — a check asserting a property it never
+# tested, which is this corpus's dominant defect. So assert the absences.
+_out_none=$(_sk881_run none "" --skeptic-verdict credible --skeptic-depth 1)
+_rc_none=$?
+assert_eq "#1095 stating NEITHER a count nor a disposition REFUSES" "$_rc_none" "1"
+assert_contains "#1095 …naming the absence as the cause, in #881's own words" \
+    "$_out_none" "STATED NEITHER A COUNT NOR A DISPOSITION"
+assert_contains "#1095 …and not laundering it into a discovery" \
+    "$_out_none" "not because this pass found substantive"
+assert_contains "#1095 …spelling out both one-line remedies, unchanged from #881" \
+    "$_out_none" "--skeptic-findings 0"
+assert_contains "#1095 …and the other one" "$_out_none" "disposition: no-further-pass"
+# THE SIDE-EFFECT ASSERTIONS. These are what make the refusal's own claim true.
+assert_contains "#1095 THE PROPERTY: the refusal wrote NO skeptic-verdict record" \
+    "$(_sk881_rec none)" "<NO-RECORD>"
+assert_not_contains "#1095 …and did NOT announce a second pass it never filed" \
+    "$_out_none" "$_SK_ESCALATED"
 
 # CONTROL 1 — the legitimate clean pass is UNCHANGED. wrap-up is on every
 # agent's exit path; a fix that escalates a real 0 would push workers to
@@ -1138,9 +1448,23 @@ assert_contains "#685 …nor is a report that stated no disposition at all" \
 # passing on the greps above — and assert DISTINCTNESS, because the count alone
 # cannot see it: six assignments of the same string still count six. The
 # property the label space needs is that no two causes share a name.
-_ng_label_count=$(printf '%s\n' "$_ng_reasons" | grep -c '_SK_SPAWN_REASONS="' || true)
+# BOTH counts below are OCCURRENCE counts, not line counts (your-org/nexus-code
+# `#1026`). Two `_SK_SPAWN_REASONS="…"` assignments sharing one line used to
+# read as ONE on both axes, by two DIFFERENT mechanisms:
+#
+#   count — `grep -c` counts matching LINES;
+#   uniq  — `sed 's/…/\1/p'` without `g` substitutes only the FIRST match on a
+#           line and prints that line once, so the second label was never even
+#           emitted for `sort -u` to see.
+#
+# The second is the one worth naming: a guard keyed on the `grep -c` spelling
+# alone does not see it, and the site's own comment reasons carefully about
+# distinctness-versus-count without ever considering per-line versus
+# per-occurrence. `grep -o` fixes both — it emits one line per OCCURRENCE, which
+# is simultaneously the right unit for the count and the right feed for `sort -u`.
+_ng_label_count=$(printf '%s\n' "$_ng_reasons" | grep -o '_SK_SPAWN_REASONS="' | grep -c . || true)
 _ng_label_uniq=$(printf '%s\n' "$_ng_reasons" \
-    | sed -n 's/.*_SK_SPAWN_REASONS="\([^"]*\)".*/\1/p' | sort -u | grep -c .)
+    | grep -oE '_SK_SPAWN_REASONS="[^"]*"' | sort -u | grep -c .)
 assert_eq "#681 F4 exactly six causes are assigned (not one unconditional)" \
     "$_ng_label_count" "6"
 assert_eq "#685 …and no two of them share a label (distinctness, not just count)" \
@@ -1341,8 +1665,21 @@ Disposition: no-further-pass')" "no-further-pass"
 # tightened `structural_only` too far would redden here and nowhere else.
 assert_eq "#687 F1 CONTROL: bullet is emphasis/structure, still a field" \
     "$(_disp_after '- Disposition: no-further-pass')" "no-further-pass"
-assert_eq "#687 F1 CONTROL: heading likewise" \
-    "$(_disp_after '## Disposition: no-further-pass')" "no-further-pass"
+# your-org/nexus-code#895 RE-POINTED THIS ONE, and the change is recorded rather
+# than made quietly: it asserted `no-further-pass`, i.e. that a heading is
+# EMPHASIS decorating a statement. That is the classification #895 overturns — a
+# heading DELEGATES the text to a role (it names what a section is about), so it
+# is a title and not the author asserting a value.
+#
+# The control's actual job survives intact, and it is why this is not simply
+# deleted: this group guards against `structural_only` being tightened so far
+# that the parser stops SEEING the line at all. `absent` would mean dropped;
+# `unreadable` means seen and classified. The new classification is asserted in
+# full — every heading level, both directions, plus controls — in the #895 block
+# below. Bullet, bold and the verdict form below are unaffected: they really are
+# emphasis.
+assert_eq "#687 F1 CONTROL: a heading is still SEEN — as a title (#895), not dropped" \
+    "$(_disp_after '## Disposition: no-further-pass')" "unreadable"
 assert_eq "#687 F1 CONTROL: bold likewise" \
     "$(_disp_after '**Disposition: no-further-pass**')" "no-further-pass"
 assert_eq "#687 F1 CONTROL: the same-line verdict form still parses" \
@@ -1419,6 +1756,145 @@ assert_eq "#689 CONTROL: corpus-attested indent 3 is untouched" \
 assert_eq "#689 CONTROL: an indented FRONTMATTER field is not a code block" \
     "$(_disp 'handoff: x
 disposition: no-further-pass')" "no-further-pass"
+
+# ---- #895: A HEADING IS A SECTION TITLE, NOT A STATEMENT --------------------
+#
+# `#` is in `structural_only`'s strip set, so a heading was classified as
+# EMPHASIS and a `## Disposition: <legal token>` parsed as a governing field.
+# `#855` had already ruled the other way at `report-check`, but its carve-out is
+# reachable only from `unreadable` — so the heading's VALUE decided whether the
+# line was a title, and a LEGAL value promoted a section title into a statement.
+#
+# The direction is the one that matters: `no-further-pass` is
+# `retire-preflight.sh`'s "gate does not apply" arm, so a report containing an
+# ordinary heading authorised its own `tmux kill-window`.
+printf '## Disposition: no-further-pass\n' > "$d_report"
+assert_eq "#895 a heading-shaped disposition is NOT a statement" \
+    "$(_disp_state "$d_report")" "unreadable"
+assert_eq "#895 …and says WHY, so the state is not confused with a bad value" \
+    "$(_disp_full "$d_report")" "unreadable body heading-is-a-section-title"
+
+# IT ALSO SILENCED A CONTRADICTING REQUEST. The field scan short-circuits before
+# prose, so adding a section title to a report whose prose asks for another pass
+# suppressed the request — in the permitting direction.
+printf '## Disposition: no-further-pass\n\nA second skeptic pass IS warranted.\n' > "$d_report"
+assert_eq "#895 a heading no longer overrides a prose request for another pass" \
+    "$(_disp_state "$d_report")" "unreadable"
+# …and the same prose ALONE still infers, so the assertion above is about the
+# heading and not about prose having stopped working.
+printf 'A second skeptic pass IS warranted.\n' > "$d_report"
+assert_eq "#895 CONTROL: the same prose alone still infers second-pass" \
+    "$(_disp_state "$d_report")" "second-pass"
+
+# EVERY HEADING LEVEL, because the rule is about the mark and not about `##`.
+for _h in '#' '##' '###' '####' '#####' '######'; do
+    printf '%s Disposition: no-further-pass\n' "$_h" > "$d_report"
+    assert_eq "#895 heading level '$_h' is a title, not a statement" \
+        "$(_disp_state "$d_report")" "unreadable"
+done
+
+# THE UNSAFE DIRECTION IS WHY THIS IS `unreadable` AND NOT A SKIP. A heading
+# saying `second-pass` BLOCKS retirement today; silently dropping it would move
+# that report from NO-GO to proceed. Ignoring text must never relax a gate.
+printf '## Disposition: second-pass\n' > "$d_report"
+assert_eq "#895 a heading-shaped second-pass does NOT become 'absent' (that would UN-block a kill)" \
+    "$(_disp_state "$d_report")" "unreadable"
+
+# BOTH MODES, AND THE FRONTMATTER ONE IS WORSE. This block replaces an
+# assertion I wrote that ENCODED THE DEFECT: it scoped the rule to the body and
+# pinned `### Disposition: no-further-pass` in FRONTMATTER as `no-further-pass`,
+# on the reasoning that YAML has no headings. The premise is right; the
+# conclusion was backwards. In YAML a leading `#` is a COMMENT, so the line is
+# MORE disabled than a heading, not less — and reading it as a statement means
+# COMMENTING A DISPOSITION OUT ACTIVATES IT. The syntax whose entire meaning is
+# "ignore this line" authorised an irreversible `tmux kill-window`.
+#
+# Found by the #955 skeptic, and it is the same defect as #895 one `want` value
+# over: the body spelling was fixed and the more natural one left open.
+#
+# All four frontmatter spellings, because the mark differs from the body one —
+# YAML needs no space after `#` and allows an indent, so `#disposition: x` is a
+# comment in YAML and NOT a heading in markdown. One regex for both modes misses
+# exactly that case.
+for _fm in '# disposition: no-further-pass' \
+           '  # disposition: no-further-pass' \
+           '#disposition: no-further-pass' \
+           '### Disposition: no-further-pass'; do
+    printf -- '---\n%s\n---\n\nbody\n' "$_fm" > "$d_report"
+    assert_eq "#895 frontmatter '$_fm' is a YAML COMMENT, not a statement" \
+        "$(_disp_state "$d_report")" "unreadable"
+done
+printf -- '---\n# disposition: no-further-pass\n---\n\nbody\n' > "$d_report"
+assert_eq "#895 …and the detail names the mark the author actually wrote" \
+    "$(_disp_full "$d_report")" "unreadable frontmatter hash-prefixed-line-is-a-yaml-comment"
+# THE UNSAFE DIRECTION, in frontmatter too: commenting out a `second-pass`
+# must not resolve `absent` and un-block the gate.
+printf -- '---\n# disposition: second-pass\n---\n\nbody\n' > "$d_report"
+assert_eq "#895 a commented-out second-pass does NOT become 'absent' (that would UN-block a kill)" \
+    "$(_disp_state "$d_report")" "unreadable"
+# CONTROL — a commented line must not SHADOW a real field beside it.
+printf -- '---\n# disposition: no-further-pass\ndisposition: second-pass\n---\n\nbody\n' > "$d_report"
+assert_eq "#895 CONTROL: a real frontmatter field beside a commented one still governs" \
+    "$(_disp_full "$d_report")" "second-pass frontmatter stated"
+
+# ---- your-org/nexus-code#962 round 3: the BODY arm drops the space too -------
+#
+# #895 scoped the body to the CommonMark ATX rule (`#{1,6}` then blank), which
+# left `#disposition: no-further-pass` in the BODY reading as a governing field.
+# Measured end-to-end at defbb8e8: `no-further-pass body stated`, then
+# `retire-preflight` rc 0 `safe=1` — a kill authorised by the one spelling whose
+# whole point is "ignore this line". Same asymmetry #895 closed one `want` value
+# over, surviving in the other direction: demonstrated spelling fixed, the more
+# natural one left open.
+#
+# Markdown has no comment syntax, so this shape is genuinely ambiguous; the tie
+# is broken by FAIL DIRECTION, which is the only argument this parser supports.
+for _bd in '#disposition: no-further-pass' \
+           '  #disposition: no-further-pass' \
+           '#Disposition: no-further-pass'; do
+    printf -- '%s\n' "$_bd" > "$d_report"
+    assert_eq "#962 body '$_bd' is a MARK, not a statement" \
+        "$(_disp_state "$d_report")" "unreadable"
+done
+# THE UNSAFE DIRECTION. Resolving it `absent` would UN-block a kill, so the
+# blocking value must stay blocking rather than become quiet.
+printf -- '#disposition: second-pass\n' > "$d_report"
+assert_eq "#962 a commented-out body second-pass does NOT become 'absent'" \
+    "$(_disp_state "$d_report")" "unreadable"
+# DECLARED IMPRECISION, pinned so it cannot drift into a silent surprise: the
+# body detail is SHARED with the ATX case. A second mark was refused because the
+# `<n>h` suffix is `cmd_report_check`s #855 carve-out flag, so splitting it would
+# change WRITE time to improve a hint string. Asserted here so the next reader
+# sees it was a decision.
+printf -- '#disposition: no-further-pass\n' > "$d_report"
+assert_eq "#962 …reported under the shared body detail (declared imprecision, not a new mark)" \
+    "$(_disp_full "$d_report")" "unreadable body heading-is-a-section-title"
+# POTENCY CONTROL. Without this the loop above passes just as well against a
+# parser that has stopped resolving body fields at all.
+printf -- 'disposition: no-further-pass\n' > "$d_report"
+assert_eq "#962 CONTROL: an UNMARKED body field on the same scan still governs" \
+    "$(_disp_full "$d_report")" "no-further-pass body stated"
+# CONTROL — a marked line must not SHADOW a real field beside it.
+printf -- '#disposition: no-further-pass\n\ndisposition: second-pass\n' > "$d_report"
+assert_eq "#962 CONTROL: a real body field beside a marked one still governs" \
+    "$(_disp_state "$d_report")" "second-pass"
+
+# CONTROLS — the fix must not swallow real statements.
+printf 'disposition: no-further-pass\n' > "$d_report"
+assert_eq "#895 CONTROL: an ordinary field is untouched" \
+    "$(_disp_state "$d_report")" "no-further-pass"
+printf '**Disposition**: second-pass\n' > "$d_report"
+assert_eq "#895 CONTROL: the bold form is untouched" \
+    "$(_disp_state "$d_report")" "second-pass"
+# FRONTMATTER still wins outright over a body heading — the corpus shape: two of
+# the three reports carrying a heading-shaped line have a real frontmatter field.
+printf -- '---\ndisposition: no-further-pass\n---\n\n## Disposition: second-pass\n' > "$d_report"
+assert_eq "#895 CONTROL: a real frontmatter field still wins over a body heading" \
+    "$(_disp_full "$d_report")" "no-further-pass frontmatter stated"
+# A heading BESIDE a real body field: the field governs, the title is ignored.
+printf '## Disposition: second-pass\n\ndisposition: no-further-pass\n' > "$d_report"
+assert_eq "#895 CONTROL: a real body field beside a heading still governs" \
+    "$(_disp_state "$d_report")" "no-further-pass"
 
 # (4) FRONTMATTER WINS over the body. Reports are append-only, so the body is a
 # LOG and the frontmatter is the CURRENT-VALUE header. The corpus proof is
@@ -1522,13 +1998,118 @@ _ng_unread_arm=$(sed -n '/YOUR DISPOSITION WAS NOT READ/,/issue=\$issue/p' "$REP
 assert_contains "#685 …and the UNREADABLE decision is logged too" \
     "$_ng_unread_arm" "skeptic-disposition-unreadable"
 
+echo "=== #1246: a report that LABELS ITS ROUNDS can state a disposition ===" 
+
+# THE DEFECT. Rule (4) accepted one non-structural prefix — a bolded
+# `Verdict:` at the head of the line — so `Disposition:` was read only when the
+# line's FIRST colon-delimited key was literally `verdict`. A report only labels
+# its rounds once it HAS more than one, so `no-further-pass`, whose entire
+# purpose is to END a review chain, was unreachable on exactly the multi-round
+# reports that need it. Eight spurious `spawn-skeptic` requests in one day.
+#
+# THE FIXTURE SET IS THE BISECTION TABLE FROM THE ISSUE, because every row is a
+# shape a real report has used. The first two rows are the live line from
+# `walkupsk`, which is the only report in the 1,521-report corpus whose verdict
+# this change moves.
+assert_eq "#1246 the live walkupsk line: a round-labelled verdict with a trailing parenthetical" \
+    "$(_disp '' '**ROUND 2 VERDICT (current): `credible`. Disposition: no-further-pass.**')" "no-further-pass"
+assert_eq "#1246 …the same without the parenthetical" \
+    "$(_disp '' '**ROUND 2 VERDICT: `credible`. Disposition: no-further-pass.**')" "no-further-pass"
+assert_eq "#1246 …a parenthetical with no round number" \
+    "$(_disp '' '**VERDICT (current): `credible`. Disposition: no-further-pass.**')" "no-further-pass"
+assert_eq "#1246 …a leading key that is not the word verdict at all" \
+    "$(_disp '' '**Round 2: `credible`. Disposition: no-further-pass.**')" "no-further-pass"
+assert_eq "#1246 …and another" \
+    "$(_disp '' '**Final: `credible`. Disposition: no-further-pass.**')" "no-further-pass"
+
+# CONTROLS — the two rows that worked BEFORE must still work. A fix that
+# widens a recogniser is only safe if the shapes it already accepted survive,
+# and these are the forms skills/nexus.skeptic actually tells skeptics to write.
+assert_eq "#1246 CONTROL: the plain bolded verdict form still parses" \
+    "$(_disp '' '**Verdict: `credible`. Disposition: no-further-pass.**')" "no-further-pass"
+assert_eq "#1246 CONTROL: a bare unemphasised field still parses" \
+    "$(_disp '' 'Disposition: no-further-pass.')" "no-further-pass"
+
+# NEGATIVE CONTROL 1 — REAL CORPUS PROSE, and the reason this is a leading-KEY
+# rule rather than a sentence-boundary rule. A bare "the prefix ends in a
+# period" test accepts this line, which is a sentence and not a field; it was
+# measured doing so over the corpus. The leading-key regex rejects it on the
+# apostrophe in `D2's`, so no length proxy is needed.
+assert_eq "#1246 NEGATIVE: a prose bullet ending in a sentence is NOT a stated field" \
+    "$(_disp '' "  - D2's \`--clear\` asymmetry is **no longer a blocker**. Both readings documented on \`#568\`, but the framing supports *intent*. Disposition: consolidate preserving current behaviour")" \
+    "absent"
+
+# NEGATIVE CONTROL 2 — A WRAPPED BOLD, i.e. an ODD number of `**` on the line.
+# The bold opened and did not close here, so rule (5) has no structural
+# terminator and the value would run into the next sentence. Leaving the line
+# unrecognised lets the later, properly closed field in the same report speak —
+# which is both the pre-#1246 answer and the right one. `overlaydeploy-sk`
+# line 17 is exactly this shape.
+assert_eq "#1246 NEGATIVE: an UNCLOSED bold is not a field, so a later closed one wins" \
+    "$(_disp_after '**ROUND 3 verdict, superseding: `credible`. Disposition: second-pass. Zero new
+
+**Disposition: no-further-pass.**')" "no-further-pass"
+
+# NEGATIVE CONTROL 3 — rule (3) must survive the widening: a backticked label
+# is a QUOTATION. This is the form a report ABOUT this parser uses.
+assert_eq "#1246 NEGATIVE: a code-span quotation of the new shape is still refused" \
+    "$(_disp '' '`**ROUND 2 VERDICT: `credible`. Disposition: no-further-pass.**`')" "absent"
+
+# NEGATIVE CONTROL 4 — THE LEADING KEY IS AN ALLOWLIST, NOT "SHORT AND CLEAN"
+# (your-org/nexus-code#1257 skeptic F1). The first draft of this rule tested
+# that the leading key was a short clean word. The regex is PREFIX-anchored, so
+# it validated only the span up to the FIRST colon and said nothing about the
+# prose after it — and these two lines, which are plain prose with no field
+# structure at all, were read as a STATED `no-further-pass`.
+#
+# It was LATENT (0 of 1,524 corpus reports moved) and it widened a hole dev
+# already had on lines opening `Verdict:` rather than creating one. Pinned
+# anyway, because the failure direction is SUPPRESSION of a pass somebody is
+# owed, and an unpinned answer there is exactly how the next widening arrives
+# unnoticed. `Note` and `Summary` are not verdict labels and are not in the set.
+assert_eq "#1246/F1 NEGATIVE: prose behind a non-label key is NOT a stated disposition" \
+    "$(_disp '' 'Note: the reviewer was happy. Disposition: no-further-pass.')" "absent"
+assert_eq "#1246/F1 NEGATIVE: …nor behind another plausible-looking one" \
+    "$(_disp '' 'Summary: I read the diff and agreed. Disposition: no-further-pass.')" "absent"
+
+# BOUNDARY PRESERVED — the decision declared at "#684 (2) BOUNDARY" above.
+# An earlier draft of THIS fix bounded the value at a period to rescue a
+# wrapped bold, which silently overturned that decision and turned the one
+# corpus report with this shape (`your-nexus-sandboxkill`) from a loud
+# `unreadable` into a token. Asserted here too, beside the change that nearly
+# broke it, so the two are read together.
+assert_eq "#1246 BOUNDARY: #684 (2) survives — an unbolded token then prose is still unreadable" \
+    "$(_disp '' 'Disposition: no-further-pass. Fixes landed in `ff678db`.')" "unreadable"
+
 # ---- assertion-count floor ---------------------------------------------
 #
 # A missing assert_* helper exits rc 127 and is counted by NOTHING: the
 # file runs, prints nothing alarming, and reports success for tests that
 # never ran. Asserting the COUNT — not just the verdict — is what makes
 # a green result mean "the checks ran and passed".
-MIN_ASSERTIONS=260
+# ---------------------------------------------------------------------------
+echo '=== #1419: the TSV prune and BOTH its verifiers compare the window name, not an escape-processed copy ==='
+# `awk -v w="$window"` escape-processes its value: pruning `a\\b` deleted `a\b`'s
+# row (a DIFFERENT window's) and left the target's, and the two verifiers used
+# the same transform, so they agreed with the wrong answer in both directions.
+ST1419=$(mktemp -d "${TMPDIR:-/tmp}/bk1419.XXXXXX")
+printf 'a\\b\t111\trowA\na\\\\b\t222\trowB\nother\t333\trowC\n' > "$ST1419/idle-state.tsv"
+assert_eq "#1419 verifier sees the a\\b row BEFORE the prune (was blind: 0)" \
+    "$(bk_state_refs_window "$ST1419" 'a\b' 2>/dev/null | grep -c .)" "1"
+assert_eq "#1419 verifier sees the a\\\\b row before the prune" \
+    "$(bk_state_refs_window "$ST1419" 'a\\b' 2>/dev/null | grep -c .)" "1"
+bk_prune_window_state "$ST1419" 'a\\b' >/dev/null 2>&1
+assert_eq "#1419 pruning a\\\\b removes ONLY rowB (was: removed rowA, kept rowB)" \
+    "$(cut -f3 "$ST1419/idle-state.tsv" | tr '\n' ' ')" "rowA rowC "
+assert_eq "#1419 …the verifier no longer references the pruned window" \
+    "$(bk_state_refs_window "$ST1419" 'a\\b' 2>/dev/null | grep -c .)" "0"
+assert_eq "#1419 …and still references the surviving neighbour a\\b" \
+    "$(bk_state_refs_window "$ST1419" 'a\b' 2>/dev/null | grep -c .)" "1"
+assert_eq "#1419 CONTROL: a plain name prunes as before" \
+    "$(bk_prune_window_state "$ST1419" other >/dev/null 2>&1; cut -f3 "$ST1419/idle-state.tsv" | tr '\n' ' ')" "rowA "
+rm -rf "$ST1419"
+
+MIN_ASSERTIONS=304
 if (( PASS + FAIL < MIN_ASSERTIONS )); then
     echo "FAIL: only $((PASS + FAIL)) assertions executed; expected >= $MIN_ASSERTIONS." >&2
     echo "      A green run with too few assertions means checks were SKIPPED," >&2

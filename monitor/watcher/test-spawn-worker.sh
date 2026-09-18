@@ -50,7 +50,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — missing %q\n' "$label" "$needle" >&2
@@ -64,6 +65,102 @@ assert_not_contains() {
         FAIL=$(( FAIL + 1 ))
     else
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    fi
+}
+
+# ---- the force-push PROPERTY predicate (your-org/nexus-code#835) --------
+#
+# Emits one line per UNQUALIFIED force-push prohibition found in the text
+# it is given; emits NOTHING when every prohibition is scoped to a shared
+# branch. It replaces a `assert_not_contains "never force-push;"` that was
+# keyed on the one historical SPELLING: measured at 989b888, three planted
+# blanket bans — including `In practice: never force-push, ever.` appended
+# to the very same bullet as the carve-out — all passed the suite 145/0
+# while the floor told every worker to refuse the rebase CI depends on.
+#
+# Method, stated so its ERROR DIRECTION is checkable rather than implied:
+#   * flatten newlines (the floor is hand-wrapped prose, so a restored ban
+#     arrives split across a line break),
+#   * cut into SEGMENTS on `.;!?` — the segment is the qualification
+#     window, chosen because a fixed ±N-character window leaks the
+#     carve-out's own `**shared**` onto a ban appended right after it,
+#   * a segment is an offender iff it names a force-push AND carries a
+#     prohibition word AND carries no shared-vs-own discriminator.
+#
+# DIRECTION OF ERROR, restated after a skeptic pass measured the first cut
+# wrong in BOTH directions (6 of 11 faithful blanket bans GREEN, and correct
+# scoped text RED). Verified on a 13-segment corpus: 8 of 8 blanket bans
+# DETECTED, 5 of 5 correctly-scoped texts CLEAN.
+#
+# It OVER-matches: a correctly scoped ban whose prohibition and whose
+# qualifier sit in DIFFERENT sentences ("Never force-push. Your own PR
+# branch is the exception.") is reported. That is the direction to err in
+# — a false RED is read, a false GREEN is what this issue was reopened
+# for. It UNDER-matches a ban expressed without negation at all ("always
+# ask the operator before any force-push"), and it will clear a segment
+# that merely MENTIONS `dev` or `main` for an unrelated reason — accepted
+# deliberately, because naming the shared branches is the commonest correct
+# scoping and a false RED on it is what drove the previous cut's rejection
+# of correct text. Extend the word lists rather than widening the window.
+_unqualified_force_push_bans() {
+    printf '%s' "$1" | tr '\n' ' ' | tr -s ' ' | tr '.;!?' '\n\n\n\n' | awk '
+        {
+            raw = $0
+            seg = " " tolower(raw) " "
+            gsub(/[^a-z0-9]+/, " ", seg)
+        }
+        # NAMES A FORCE-PUSH — force-ish AND push-ish anywhere in the segment,
+        # NOT an enumeration of adjacency spellings. The enumerated form missed
+        # `--force` and `forced push` outright (they are not `force push`), so
+        # six of eleven faithful blanket bans passed GREEN.
+        seg !~ / force | forced | forcing | forcepush | forcepushing | fast forward / { next }
+        seg !~ / push | pushes | pushing | pushed / { next }
+        seg !~ / never | not | no | nor | forbid | forbids | forbidden | prohibit | prohibits | prohibited | ban | bans | banned | avoid | avoids | refuse | refuses | reject | rejects | unacceptable | must not | do not | dont / { next }
+        # SCOPED — a shared-vs-own discriminator, OR the ban NAMES the shared
+        # branches, which IS the scoping. Two corrections here:
+        #   * ` shared ` alone was too weak: the HISTORICAL blanket ban
+        #     (`Never force-push, ever — protecting the remote is a shared
+        #     responsibility`) was silenced by an incidental `shared`. It is
+        #     ` shared branch ` now.
+        #   * naming `dev`/`main` was not recognised, so the clearest possible
+        #     scoping (`never force-push \`dev\` or \`main\``) was reported as
+        #     UNQUALIFIED — a false RED on correct text.
+        seg ~  / shared branch | shared branches | someone else | another agent | other agents | not your own | others have | somebody else | your own | own pr | own branch | unshared | dev | main / { next }
+        { gsub(/^[[:space:]]+|[[:space:]]+$/, "", raw); if (raw != "") print raw }
+    '
+}
+assert_no_unqualified_force_push_ban() {
+    local label="$1" hay="$2" offenders prc
+    # This assertion PASSES on an empty result, so every way of producing
+    # an empty result must be loud or it is a check that cannot fail
+    # (your-org/nexus-code#1092, and #835's own retraction). Two of them:
+    # an empty HAY (the caller's extraction returned nothing), and a
+    # producer that DIED (awk/tr rc — the file is `set -o pipefail`, so
+    # the substitution's status is the pipeline's).
+    if [[ -z "$hay" ]]; then
+        printf '  FAIL: %s — EMPTY text; this assertion could only pass VACUOUSLY, fix the CALLER\n' "$label" >&2
+        FAIL=$(( FAIL + 1 )); return
+    fi
+    offenders=$(_unqualified_force_push_bans "$hay"); prc=$?
+    if [[ "$prc" -ne 0 ]]; then
+        printf '  FAIL: %s — predicate pipeline exited %s; an empty result here is NOT a clearance\n' "$label" "$prc" >&2
+        FAIL=$(( FAIL + 1 )); return
+    fi
+    if [[ -z "$offenders" ]]; then
+        printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %s — unqualified force-push prohibition(s):\n' "$label" >&2
+        printf '        %s\n' "$offenders" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
+assert_predicate_fires() {
+    local label="$1" hay="$2"
+    if [[ -n "$(_unqualified_force_push_bans "$hay")" ]]; then
+        printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %s — predicate stayed SILENT on a known blanket ban\n' "$label" >&2
+        FAIL=$(( FAIL + 1 ))
     fi
 }
 
@@ -103,6 +200,11 @@ cp "$_test_dir/../_claude-bin.sh" "$FAKE_NEXUS/monitor/_claude-bin.sh"
 cp "$_test_dir/../_tmux-window.sh" "$FAKE_NEXUS/monitor/_tmux-window.sh"
 # And the shared frontmatter reader (#405 P2) for report resolution.
 cp "$_test_dir/../_fm_lib.sh" "$FAKE_NEXUS/monitor/_fm_lib.sh"
+# your-org/nexus-code#941 — spawn-worker sources monitor/_bookkeeping.sh for
+# the injective window-key encoder (`wk_encode`). It is the WRITER for
+# `windows/<key>.json` and the skeptic markers, so it refuses rather than
+# writing under a key the readers will not look at.
+cp "$_test_dir/../_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
 # The shim-guard TEMPLATE (your-org/nexus-code#589). spawn-worker.sh emits its
 # launcher guard from monitor/guard-block.sh.in and REFUSES rather than
 # emitting an empty block, so this fixture must supply it like any other hard
@@ -612,6 +714,9 @@ fi
 # mergeability (measured: stale for 26h and 36h; refreshed within two
 # minutes of one GET). The carve-out is unaffected: a rebase still makes
 # the push non-fast-forward. Only the mechanism sentence was wrong.
+# (And that sentence is a MODEL with a measured exception — a GET refreshed
+# `mergeable` while the ref's base stayed put — see monitor/_merge_ref_base.sh
+# and your-org/nexus-code#923 before leaning on one-GET-refreshes-it.)
 #
 # The blanket ban is the dangerous regression here, because it READS as
 # correct: a reviewer restoring it sees a safety rule being tightened, not
@@ -636,23 +741,79 @@ if [[ -f "$REAL_FLOOR_SKILL" ]]; then
                     "$floor_body" "another author's commits"
     assert_contains "floor licenses the rebase force-push on your OWN branch" \
                     "$floor_body" "PR branch after rebasing it onto the current base is expected"
-    # The blanket forms, explicitly refused — matched against a
-    # WHITESPACE-FLATTENED copy. The floor is hand-wrapped prose, so the
-    # restored ban would almost certainly arrive split across a line break
-    # ("Never `--no-verify`, never\n  force-push; …"), and a raw substring
-    # check sails straight past it. Found by mutation-testing this very
-    # assertion: reverting the floor left it GREEN while five siblings went
-    # red. A negative assertion that only fires on one line-wrapping of the
-    # text it forbids is not a guard.
+    # ---- THE PROPERTY, not a spelling (#835 reopening) -----------------
+    #
+    # This used to be `assert_not_contains "never force-push;"` and it was
+    # the sentence a close of #835 rested on ("the assert_not_contains
+    # above is what should catch it first"). It could not. It keyed on the
+    # ONE historical spelling, so at 989b888 the shipped guard scored
+    # 145 passed / 0 failed with a blanket ban planted in the floor, three
+    # different ways. The property the floor must hold is: EVERY
+    # force-push prohibition it carries is scoped to a SHARED branch.
+    assert_no_unqualified_force_push_ban \
+        "floor carries NO unqualified force-push prohibition" "$floor_body"
+
+    # The predicate's own liveness, asserted rather than assumed. A
+    # property check that quietly stopped matching would report the floor
+    # clean forever — the exact failure it replaces. These four are the
+    # regression fixtures named in #835's reopening comment: three planted
+    # blanket bans that the spelling-keyed assertion passed, plus the
+    # historical wording from 371b5bd^ that it did catch.
+    assert_predicate_fires "predicate fires: ban appended to the carve-out bullet" \
+        'In practice: never force-push, ever.'
+    assert_predicate_fires "predicate fires: blanket ban in a fresh bullet" \
+        '- **Do not ever force push.** Fix the root cause instead.'
+    assert_predicate_fires "predicate fires: blanket ban wrapped across lines" \
+        'Under no circumstances may you force push to any
+  branch, ever.'
+    assert_predicate_fires "predicate fires: the historical 371b5bd^ wording" \
+        'Never `--no-verify`, never force-push; fix the root cause.'
+    # …and does NOT fire on the shipped scoped sentence in isolation, so a
+    # green above is a measurement and not a predicate that matches nothing.
+    assert_no_unqualified_force_push_ban \
+        "predicate silent on the scoped carve-out sentence" \
+        'Never `--no-verify`; never force-push a **shared** branch (`dev`,
+  `main`, or any branch someone else has pushed commits to) —
+  force-pushing your **own** PR branch after rebasing it onto the
+  current base is expected.'
+
+    # The two historical SPELLING checks are kept as cheap regression
+    # fixtures for the exact text that shipped before 371b5bd. They are
+    # SUBSUMED by the property assertion above and must never again be
+    # cited as the thing that catches a returning ban.
     floor_flat=$(printf '%s' "$floor_body" | tr '\n' ' ' | tr -s ' ')
-    assert_not_contains "floor does NOT carry the blanket 'never force-push;'" \
+    assert_not_contains "floor does NOT carry the blanket 'never force-push;' (spelling fixture)" \
                     "$floor_flat" "never force-push;"
-    assert_not_contains "floor does NOT carry the old 'no-verify, never' blanket" \
+    assert_not_contains "floor does NOT carry the old 'no-verify, never' blanket (spelling fixture)" \
                     "$floor_flat" '`--no-verify`, never force-push'
     # The floor states the boundary only — the runnable precondition is the
     # hook's job. Keeping it out is what holds the per-spawn token cost down.
     assert_not_contains "floor does NOT inline the precondition command" \
                     "$floor_body" "origin/dev..HEAD"
+fi
+
+# The floor is not the only prose surface that describes it. #835's
+# reopening found `docs/operating/spawning-workers.md` describing the
+# INJECTED floor as "no `--no-verify`, no force-push" — unqualified —
+# in the same file that carries the correctly scoped form a few lines
+# later, and both of the close's enumeration keys were structurally
+# blind to it (one classified whole FILES, the other keyed on the
+# historical spelling). The property predicate asks the sentence-level
+# question, so it sees it: run at 989b888 it names that sentence, and
+# it stays silent on the orchestrator's destructive-instruction
+# denylist in the same file, which merely LISTS `force push` as a
+# trigger word and prohibits nothing.
+SPAWN_DOC="$_test_dir/../../docs/operating/spawning-workers.md"
+echo '=== force-push: the operator DOC describes the same boundary (#835) ==='
+if [[ -f "$SPAWN_DOC" ]]; then
+    assert_no_unqualified_force_push_ban \
+        "spawning-workers.md carries NO unqualified force-push prohibition" \
+        "$(cat "$SPAWN_DOC")"
+    assert_contains "spawning-workers.md scopes the ban to a SHARED branch" \
+                    "$(cat "$SPAWN_DOC")" 'force-push to a *shared* branch'
+else
+    printf '  FAIL: %s\n' "spawning-workers.md missing — cannot check the doc surface" >&2
+    FAIL=$(( FAIL + 1 ))
 fi
 if [[ -f "$FOOTGUN_CONF" ]]; then
     conf_body=$(cat "$FOOTGUN_CONF")
@@ -987,6 +1148,38 @@ parse_err() {  # parse_err <args...> → "<rc>|<stderr>"
     printf '%s|%s' "$r" "$e"
 }
 
+# your-org/nexus-code#1471: `--dry-run` outside `--resume` used to be SET, never
+# READ, and the script fell through to a REAL spawn — the one flag meaning
+# "take no action" performed the action. Now refused (exit 22) before anything
+# is composed. Asserted on the SIDE EFFECT too: a stub-tmux spawn attempt must
+# leave no `new-window` in the call log, because the bug's signature was a
+# SUCCESSFUL spawn, not an exit code.
+r=$(parse_err --dry-run)
+case "$r" in
+    22\|*"--dry-run is only meaningful with --resume"*) printf '  PASS: #1471 --dry-run without --resume is REFUSED (exit 22) with its own message\n'; PASS=$(( PASS + 1 )) ;;
+    *) printf '  FAIL: #1471 --dry-run without --resume: expected exit 22 + message, got %s\n' "$r" >&2; FAIL=$(( FAIL + 1 )) ;;
+esac
+: > "$STUB_LOG"
+PATH="$STUB_BIN:$PATH" "$SCRIPT" -n dryrun-win -c "$WORKDIR" -p "$PROMPT_FILE" --dry-run >/dev/null 2>&1; r=$?
+assert_eq "#1471 a real spawn attempt with --dry-run exits 22" "$r" "22"
+assert_not_contains "#1471 …and creates NO window (the side effect, not the code, is the assertion)" "$(cat "$STUB_LOG")" "new-window"
+# The parser's default arm used to PASS THROUGH an unrecognised long option, so
+# a typo (`--dryrun`, `--skpetic-role`) became an ordinary spawn with the
+# intended behaviour absent. Refused now (exit 23); bare positionals and short
+# options still flow to getopts (the CONTROL below).
+r=$(parse_err --dryrun)
+case "$r" in
+    23\|*"unknown option '--dryrun'"*) printf '  PASS: #1471 an unrecognised --long option is REFUSED (exit 23), not passed through\n'; PASS=$(( PASS + 1 )) ;;
+    *) printf '  FAIL: #1471 --dryrun: expected exit 23 + message, got %s\n' "$r" >&2; FAIL=$(( FAIL + 1 )) ;;
+esac
+out=$(parse_out --topic control-topic); r=$?
+assert_eq "#1471 CONTROL: a declared long option still parses (rc 0)" "$r" "0"
+r=$(parse_err --resume=some-window --dry-run)
+case "$r" in
+    22\|*) printf '  FAIL: #1471 CONTROL: --dry-run WITH --resume must not hit the exit-22 refusal, got %s\n' "$r" >&2; FAIL=$(( FAIL + 1 )) ;;
+    *) printf '  PASS: #1471 CONTROL: --dry-run WITH --resume passes the refusal (whatever resume then says is resume'"'"'s business)\n'; PASS=$(( PASS + 1 )) ;;
+esac
+
 # D11: --topic in both spellings must be consumed, not leaked into the prompt
 # body as a positional.
 out=$(parse_out --topic refactor-the-parser)
@@ -1202,6 +1395,21 @@ assert_contains  "#814 …and refuses the FETCH_HEAD mtime probe" "$REAL_FLOOR" 
 # triggers by following this floor's own instruction to push its branch.
 assert_contains  "#814 F2 …and names the WRITE side of the family too" \
                  "$REAL_FLOOR_FLAT" "your own \`git push\`"
+
+# ---- your-org/nexus-code#1153: a skeptic-NAMED window spawned without --skeptic-role is WARNED
+# A window named like a skeptic but spawned bare writes no linkage record, so
+# its target reads "NO live skeptic" and is walked toward retirement while the
+# review is in progress. Warning only, on stderr; the prompt is still composed.
+_o1153=$("$SCRIPT" -n dolimeth-sk -c "$WORKDIR" -p "$PROMPT_FILE" --print-prompt 2>&1 >/dev/null)
+assert_contains "#1153 a '-sk' window without --skeptic-role gets a WARNING naming the flag" \
+                "$_o1153" "WITHOUT --skeptic-role"
+_o1153=$("$SCRIPT" -n dolimethsk2 -c "$WORKDIR" -p "$PROMPT_FILE" --print-prompt 2>&1 >/dev/null)
+assert_contains "#1153 …and so does the hyphen-less 'sk2' spelling this board actually uses" \
+                "$_o1153" "WITHOUT --skeptic-role"
+_o1153=$("$SCRIPT" -n dolimeth -c "$WORKDIR" -p "$PROMPT_FILE" --print-prompt 2>&1 >/dev/null)
+assert_eq "#1153 CONTROL: a plain window name is not warned" "$(grep -c 'WITHOUT --skeptic-role' <<<"$_o1153" || true)" "0"
+_o1153=$("$SCRIPT" -n dolimeth-sk -c "$WORKDIR" -p "$PROMPT_FILE" --skeptic-role --skeptic-target dolimeth --print-prompt 2>&1 >/dev/null)
+assert_eq "#1153 CONTROL: the same name WITH --skeptic-role is not warned" "$(grep -c 'WITHOUT --skeptic-role' <<<"$_o1153" || true)" "0"
 
 # ---- summary ----------------------------------------------------------
 

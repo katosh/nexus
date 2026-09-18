@@ -133,8 +133,16 @@ assert_contains "PARALLEL: the child reports the failure rather than absorbing i
 # its dead `. "$1"` was an UNRESOLVABLE source token that reddened
 # test-ambient-shell-option-scope's graph manifest. Removed rather than
 # manifested — a manifest row for dead code is a row nobody can ever retire.)
+# _occurrences <pattern> <file> — OCCURRENCES, not lines (your-org/nexus-code
+# `#1026`). `grep -c` counts matching LINES, so two constructs sharing one line
+# read as 1 and an `== N` assertion stays green with the construct duplicated.
+# `-F` because every caller passes a LITERAL. On no match grep prints nothing
+# and exits 1, yielding 0 — a replacement, never an appended second value, so
+# no `|| echo 0` belongs here (your-org/nexus-code#725).
+_occurrences() { grep -oF -- "$1" "$2" 2>/dev/null | wc -l | tr -d ' '; }
+
 assert_eq "run_one carries an explicit empty-base refusal (not just call-site checks)" \
-    "$(grep -c 'EMPTY out_file base for' "$RUNNER")" "1"
+    "$(_occurrences 'EMPTY out_file base for' "$RUNNER")" "1"
 
 # ── the tree this suite is about ────────────────────────────────────────
 # The strongest available end-to-end statement: after both probes, the REPO

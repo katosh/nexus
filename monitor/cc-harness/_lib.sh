@@ -17,12 +17,18 @@
 #   CCH_CFG        isolated CLAUDE_CONFIG_DIR (no real creds ever live here)
 #   CCH_WORKDIR    pinned project cwd for the booted claude (pre-trusted)
 #   CCH_STATE_DIR  $CCH_DIR/state (NEXUS_STATE_DIR for pane-state)
-#   CCH_SOCKET     tmux -L socket name (isolated; never the live session)
+#   CCH_SOCKET     tmux -L socket name (unique per run). `default` is
+#                  SYMLINKED to it inside CCH_TMUX_TMPDIR so pane-state.sh's
+#                  bare `tmux` calls land here too (your-org/nexus-code#1042 A)
+#   CCH_TMUX_TMPDIR  private TMUX_TMPDIR — THE isolation boundary. A PATH-front
+#                  shim can be force-fronted over our shadow; it cannot change
+#                  where tmux computes its socket path from.
 #   CCH_SESSION    tmux session name
 #   CCH_MOCK_PORT  port the mock bound (discovered when launched with :0)
 #   CCH_MOCK_PID   pid of the mock backend
 #   CCH_CONTROL    path to the injectable control.json
 #   CCH_TMUXWRAP   PATH-shadow tmux wrapper that injects -L $CCH_SOCKET
+#                  (defence in depth only — NOT the isolation mechanism)
 #   CLAUDE_BIN     resolved real claude binary (override to gate a candidate)
 #
 # Conventions mirror _harness.sh: cch_tmux for socket-scoped tmux,
@@ -42,15 +48,125 @@ CCH_REPO_ROOT=$(cd "$_cch_self_dir/../.." && pwd)
 CCH_MOCK_PY="$_cch_self_dir/mock-backend.py"
 CCH_PANE_STATE="$CCH_REPO_ROOT/monitor/pane-state.sh"
 
-# Resolve the REAL tmux executable, ignoring any shell alias/function
-# (`type -P` returns the PATH binary only). The agent-sandbox ships an
-# aliased `tmux='tmux -2'`; a bare `command -v tmux` would capture the
-# alias and produce a broken wrapper.
+# Is $1 a SCRIPT (has a `#!` magic) rather than a real executable?
+#
+# THIS IS THE SELECTION PREDICATE, and it is deliberately structural rather
+# than a list of known wrapper paths. A tmux SERVER binary is never a shell
+# script; anything that is one is, by construction, a shim that gets to
+# rewrite argv or the environment before the real binary sees them. Naming
+# the shims instead re-opens the hole the moment a new one appears — which is
+# precisely `#1033` (a second tmuxwrap copy) and `#755` (ghwrap picking by
+# identity). Measured on this host, THREE distinct `tmux` scripts sit on an
+# agent's PATH ahead of the real binary, and only one of them is ours:
+#
+#   monitor/tmuxwrap/tmux            nexus board-lethal-kill guard
+#   $CCH_DIR/.bin/tmux               this harness's own socket shadow
+#   .../agent-sandbox/bin/tmux       sandbox shim, injects `-f <sandbox.conf>`
+#
+# That last one is why "not a NEXUS wrapper" was not enough: it carries no
+# nexus marker, answers `-V` as tmux 2.6, and would have been selected — then
+# silently injected its own config file into a harness that passes
+# `-f /dev/null` specifically to run config-free.
+_cch_is_script() {
+    local magic
+    IFS= read -r -N 2 magic < "$1" 2>/dev/null || return 1
+    [[ "$magic" == '#!' ]]
+}
+
+# Narrower companion: is $1 specifically a NEXUS PATH-front shim? Same
+# structural predicate `monitor/tmuxwrap/tmux` applies to itself
+# (`_tw_is_nexus_wrapper`) — marker token, or the wrapper's own path, within
+# the first 40 lines. Sharing the predicate makes this file and the shim
+# agree about what a shim IS by construction rather than by two
+# hand-maintained lists that drift. Used only by the degraded fallback below.
+_cch_is_path_front_shim() {
+    local f="$1" line n=0
+    _cch_is_script "$f" || return 1
+    while (( n < 40 )) && IFS= read -r line; do
+        case "$line" in
+            *NEXUS-PATH-FRONT-WRAPPER-MARKER*) return 0 ;;
+            *monitor/tmuxwrap/tmux*)           return 0 ;;
+        esac
+        n=$((n + 1))
+    done < "$f"
+    return 1
+}
+
+# Resolve the REAL tmux executable — by CAPABILITY, not by IDENTITY.
+#
+# This used to be `type -P tmux`, i.e. "the first thing on PATH called tmux",
+# and on any nexus agent process that is `monitor/tmuxwrap/tmux` — the
+# PATH-FRONT shim, force-fronted into every non-interactive bash by
+# $BASH_ENV (monitor/shellenv/bash_env.sh). The shadow written below was
+# therefore `exec .../monitor/tmuxwrap/tmux -L <socket> "$@"`, whose body
+# contains the literal string `monitor/tmuxwrap/tmux` — which is exactly what
+# the shim's own `_tw_is_nexus_wrapper` gate matches. So the shim classified
+# the harness's OWN injector as "another wrapper", skipped it, and resolved
+# past it to a real tmux with NO `-L` at all. With `$TMUX` set (the harness
+# runs inside a production pane) that lands on the PRODUCTION SOCKET
+# (your-org/nexus-code#1042 A).
+#
+# "The first PATH hit that is not me" is an identity test and it is a known
+# defect class here: ghwrap chose a 2021 client over an installed modern one
+# (`#755`), and two tmuxwrap copies each elected the other as "the real tmux"
+# (`#1033`). Excluding one path BY NAME re-opens the moment a second copy
+# exists. So both gates below are PROPERTIES:
+#
+#   (1) not a PATH-front shim  — structural, shared with the shim itself;
+#   (2) it BEHAVES like tmux   — `-V` reports a tmux version.
+#
+# Neither gate alone is sufficient, and that is worth stating: a shim that
+# passes calls through ALSO answers `-V` correctly, so capability cannot see a
+# transparent proxy; and a non-shim candidate can still be some unrelated
+# `tmux` on PATH, which capability is what rejects.
+#
+# `type -P`-style PATH walking (not `command -v`) so a shell alias/function
+# never answers: the agent-sandbox ships an aliased `tmux='tmux -2'`.
+#
+# Memoised through the ENVIRONMENT, not through a shell global, and the
+# distinction is the whole point (skeptic F4). Nearly every call site is
+# `$(_cch_real_tmux)` — a SUBSHELL — so an assignment made inside the function
+# dies with it and the parent's copy stays empty. Measured: it did. The memo
+# therefore only works if some caller EXPORTS it, which cch_setup now does
+# after its own resolution; subshells then inherit it and neither re-walk PATH
+# nor fork `-V`. A caller that bypasses cch_setup (the isolation suite itself)
+# simply pays the walk each time, which is correct but not free.
+_CCH_REAL_TMUX="${_CCH_REAL_TMUX:-}"
 _cch_real_tmux() {
-    local t
-    t=$(type -P tmux 2>/dev/null) && [[ -n "$t" ]] && { printf '%s' "$t"; return; }
-    for c in /usr/bin/tmux /usr/local/bin/tmux; do
-        [[ -x "$c" ]] && { printf '%s' "$c"; return; }
+    [[ -n "$_CCH_REAL_TMUX" ]] && { printf '%s' "$_CCH_REAL_TMUX"; return 0; }
+    local c d ifs_save
+    local -a cands=()
+    ifs_save="$IFS"; IFS=:
+    for d in ${PATH:-}; do
+        [[ -n "$d" ]] && cands+=("$d/tmux")
+    done
+    IFS="$ifs_save"
+    cands+=(/usr/bin/tmux /usr/local/bin/tmux)
+
+    # Tier 1 — a NON-SCRIPT that answers `-V` as tmux. The `#!` test is a
+    # cheap builtin read, so `-V` only ever forks for a plausible candidate.
+    for c in "${cands[@]}"; do
+        [[ -x "$c" && ! -d "$c" ]] || continue
+        _cch_is_script "$c" && continue
+        [[ "$("$c" -V 2>/dev/null)" == tmux\ * ]] || continue
+        _CCH_REAL_TMUX="$c"
+        printf '%s' "$c"
+        return 0
+    done
+
+    # Tier 2 — DEGRADED. No real binary anywhere: some hosts legitimately
+    # ship tmux as a wrapper script (Nix, some brew layouts). Take a
+    # non-nexus script rather than skipping the whole suite, but SAY SO —
+    # a silent downgrade here is how a harness ends up running against
+    # somebody else's injected config.
+    for c in "${cands[@]}"; do
+        [[ -x "$c" && ! -d "$c" ]] || continue
+        _cch_is_path_front_shim "$c" && continue
+        [[ "$("$c" -V 2>/dev/null)" == tmux\ * ]] || continue
+        echo "cc-harness: WARNING — no real tmux binary on PATH; falling back to the script $c" >&2
+        _CCH_REAL_TMUX="$c"
+        printf '%s' "$c"
+        return 0
     done
     return 1
 }
@@ -113,6 +229,90 @@ cch_resolve_claude() {
         printf '%s' "$local_bin"; return 0
     fi
     return 1
+}
+
+# cch_stage_candidate <version> [<prefix>] — install a CANDIDATE claude into a
+# PRIVATE prefix and print the resulting binary path on stdout.
+#
+# THE ONE ROOT-RESOLUTION-IMMUNE INSTALL (your-org/nexus-code#1002). gate.sh
+# and any ad-hoc probe that needs a candidate binary in hand both go through
+# here, so the form cannot drift between them. The form is
+#
+#     npm install --prefix <prefix> --no-save @anthropic-ai/claude-code@<v>
+#
+# and `--prefix` is the whole safety: without it npm resolves its root by
+# WALKING UP from the cwd to the nearest package.json, which from anywhere
+# under the nexus is the nexus root's — so `cd <dir> && npm install …` in a
+# package.json-less <dir> installs the candidate into the LIVE node_modules,
+# prints `changed 2 packages`, exits 0, and (under --no-save) leaves
+# `git status` clean. Measured 2026-08-25: a gate-RED 2.1.245 sat in the live
+# tree for ~25 s, inside a ~37 s window in which `node_modules/.bin/claude`
+# was twice absent altogether; every spawn resolves that path fresh.
+#
+# VERIFIED, NOT ASSUMED. A mis-rooted install has two visible shapes at the
+# caller — no binary under the prefix (it went elsewhere), or a binary that is
+# not the candidate (the prefix already held something) — and each is refused
+# with its own code, so a 0 from here means the printed path IS the candidate.
+# NOTHING is printed on stdout on any refusal: a caller doing
+# `CLAUDE_BIN=$(cch_stage_candidate …)` must never receive a path it should
+# not export. npm's own output goes to stderr for the same reason.
+#
+# Exit: 0 path printed; 2 usage (no/ill-formed version, or a prefix that IS
+#       the nexus root or its node_modules — the live tree is never a staging
+#       target); 3 the install produced no executable at
+#       <prefix>/node_modules/.bin/claude; 4 that binary does not report
+#       <version>; 5 npm missing, mktemp failed, or the install itself failed
+#       (npm's diagnostics precede this).
+#
+# npm cache: an operator-set npm_config_cache / NPM_CONFIG_CACHE is honoured;
+# otherwise a cache INSIDE the prefix, so the stage is self-contained and never
+# touches $HOME/.npm (read-only on sandboxed hosts, your-org/nexus-code#325).
+# Passed on the command line, never exported: this function is sourced into
+# the caller's shell and must not change its environment.
+cch_stage_candidate() {
+    local version="${1:-}" prefix="${2:-}"
+    local pkg="${CCH_STAGE_PACKAGE:-@anthropic-ai/claude-code}"
+    if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf 'cch_stage_candidate: a version X.Y.Z is required (got %q)\n' "$version" >&2
+        return 2
+    fi
+    if [[ -z "$prefix" ]]; then
+        prefix=$(mktemp -d -t cc-stage-XXXXXX) \
+            || { echo "cch_stage_candidate: mktemp failed (TMPDIR=${TMPDIR:-unset})" >&2; return 5; }
+    fi
+    # Canonicalise WITHOUT creating anything: the refusal below must not leave
+    # an empty `node_modules/` behind in the live tree as its own side effect
+    # (measured — a `mkdir -p` ahead of the check did exactly that).
+    local abs_prefix abs_root
+    abs_prefix=$(readlink -m -- "$prefix") || return 2
+    abs_root=$(readlink -m -- "$CCH_REPO_ROOT") || abs_root="$CCH_REPO_ROOT"
+    if [[ "$abs_prefix" == "$abs_root" || "$abs_prefix" == "$abs_root/node_modules" ]]; then
+        printf 'cch_stage_candidate: REFUSED — prefix %s is the live nexus tree; a candidate is never staged into it (your-org/nexus-code#1002)\n' "$abs_prefix" >&2
+        return 2
+    fi
+    mkdir -p "$abs_prefix" 2>/dev/null \
+        || { printf 'cch_stage_candidate: cannot create prefix %s\n' "$abs_prefix" >&2; return 2; }
+    command -v npm >/dev/null 2>&1 \
+        || { echo "cch_stage_candidate: npm not on PATH" >&2; return 5; }
+    local cache="${npm_config_cache:-${NPM_CONFIG_CACHE:-$abs_prefix/.npm-cache}}"
+    mkdir -p "$cache" 2>/dev/null \
+        || { printf 'cch_stage_candidate: cannot create npm cache dir %s (set npm_config_cache to a writable path)\n' "$cache" >&2; return 5; }
+    echo "cch_stage_candidate: npm install --prefix $abs_prefix --no-save $pkg@$version" >&2
+    if ! npm_config_cache="$cache" npm install --prefix "$abs_prefix" --no-save "$pkg@$version" --loglevel=http >&2; then
+        echo "cch_stage_candidate: candidate install FAILED (npm's output is above)" >&2
+        return 5
+    fi
+    local bin="$abs_prefix/node_modules/.bin/claude" got=""
+    if [[ ! -x "$bin" ]]; then
+        printf 'cch_stage_candidate: REFUSED — the install produced no executable at %s. npm resolved a root other than the prefix (the your-org/nexus-code#1002 shape): check the LIVE node_modules before anything else.\n' "$bin" >&2
+        return 3
+    fi
+    got=$("$bin" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+    if [[ "$got" != "$version" ]]; then
+        printf 'cch_stage_candidate: REFUSED — %s reports %q, not the requested %s; not printing it as the candidate.\n' "$bin" "${got:-<nothing>}" "$version" >&2
+        return 4
+    fi
+    printf '%s\n' "$bin"
 }
 
 # Write $CCH_CFG/settings.json — the isolated USER-SCOPE settings file, the
@@ -178,9 +378,81 @@ cch_setup() {
     CCH_STATE_DIR="$CCH_DIR/state"
     CCH_CONTROL="$CCH_DIR/control.json"
     CCH_LOG="$CCH_DIR/requests.log"
+    # ISOLATION IS BY DIRECTORY, NOT BY PATH ORDERING (your-org/nexus-code#1042 A).
+    #
+    # The harness used to isolate itself with a unique `-L cch-$$-$RANDOM`
+    # socket injected by a PATH shadow. That is a PATH-ordering bet, and the
+    # harness LOSES it: pane-state.sh is a `#!/usr/bin/env bash` script, so
+    # every invocation sources $BASH_ENV, which force-fronts
+    # monitor/tmuxwrap AHEAD of the shadow. The shadow's CONTENTS were never
+    # even consulted — see _cch_real_tmux above for how that reached
+    # production.
+    #
+    # TMUX_TMPDIR cannot be demoted by a PATH shim: EVERY tmux binary,
+    # wrapper or real, computes its socket path from it. That is the whole
+    # reason to move the boundary here — it is a property of the environment,
+    # not of who wins a race on PATH.
+    #
+    # Measured on this host (tmux 2.6), and the reason `env -u TMUX` is not
+    # optional — $TMUX OVERRIDES TMUX_TMPDIR, and the harness always runs
+    # inside a production pane, where $TMUX is always set:
+    #   $TMUX set   + TMUX_TMPDIR set + bare tmux -> PRODUCTION socket
+    #   $TMUX unset + TMUX_TMPDIR set + bare tmux -> $TMUX_TMPDIR, cannot see production
+    #   explicit -L                                -> wins over $TMUX
+    #
+    # The socket keeps a UNIQUE name. Naming it `default` would make every
+    # call site read `-L default`, which is indistinguishable from a call on
+    # the operator's own server — `lint-no-tmux-server-kill.sh` rule4 rejects
+    # exactly that, unexemptably, and it is right to: an isolation that is
+    # invisible at the call site and rests on ambient state is the shape of
+    # the defect this whole change exists to remove. cch_setup instead
+    # symlinks `default` to it INSIDE the private tmpdir once the server is
+    # up (see below) — so the bare `tmux` calls inside pane-state.sh, which
+    # the harness cannot pass flags to, still land here.
+    CCH_TMUX_TMPDIR="$CCH_DIR/tmuxtmp"
     CCH_SOCKET="cch-$$-$RANDOM"
     CCH_SESSION="cch-$$-$RANDOM"
-    mkdir -p "$CCH_CFG" "$CCH_WORKDIR" "$CCH_STATE_DIR" "$CCH_DIR/.bin"
+    mkdir -p "$CCH_CFG" "$CCH_WORKDIR" "$CCH_STATE_DIR" "$CCH_DIR/.bin" \
+             "$CCH_TMUX_TMPDIR"
+    chmod 700 "$CCH_TMUX_TMPDIR"
+
+    # THE SOCKET PATH MUST BE ADDRESSABLE (your-org/nexus-code#991).
+    #
+    # `CCH_DIR` comes from `mktemp -d -t`, i.e. from `$TMPDIR`, and an agent's
+    # `$TMPDIR` is its session scratchpad — ~124 bytes here. Adding
+    # `/cc-harness-XXXXXX/tmuxtmp/tmux-<uid>/cch-<pid>-<rand>` puts the socket
+    # path near 185 bytes against a `sun_path` that holds 107. Every tmux call
+    # then dies `File name too long`, the harness takes its "tmux unavailable"
+    # branch, and NINE cch-realmodel suites reported FAIL over ZERO assertions —
+    # an environment fault presenting as a defect in the code under test.
+    #
+    # Checked HERE rather than at each call site because this is the line that
+    # DECIDES the path; a check anywhere downstream is a check on a value
+    # somebody already committed to.
+    # FAIL CLOSED on an unreachable library, rather than skipping the check.
+    # `[[ -r … ]] && check` reads as caution and behaves as "no check ran",
+    # which is indistinguishable downstream from "the path fits" — the shape
+    # this whole change exists to remove.
+    if [[ ! -r "$_cch_self_dir/../_tmux_socket.sh" ]]; then
+        echo "cch_setup: REFUSING — $_cch_self_dir/../_tmux_socket.sh is unreachable," >&2
+        echo "  so the socket path cannot be measured. A check that did not run is not a pass." >&2
+        return 1
+    fi
+    . "$_cch_self_dir/../_tmux_socket.sh"
+    if ! _cch_sock_verdict=$(tmux_socket_verdict "$CCH_SOCKET" "$CCH_TMUX_TMPDIR"); then
+        {
+            echo "cch_setup: REFUSING — the private tmux socket path does not fit."
+            echo "  ${_cch_sock_verdict}"
+            echo "  sun_path is 108 bytes; 107 is the most a NUL-terminating caller can"
+            echo "  bind. (108 binds with a full-struct addrlen; nothing here does that.)"
+            echo "  CCH_DIR comes from \$TMPDIR (mktemp -d -t); yours is:"
+            echo "    TMPDIR=${TMPDIR:-<unset>}"
+            echo "  This is NOT a failure of the code under test — no tmux call was made."
+            echo "  Remedy: TMPDIR=$(tmux_socket_short_tmpdir "cch") (mkdir it first),"
+            echo "  or run from a shorter scratch root. your-org/nexus-code#991."
+        } >&2
+        return 1
+    fi
 
     # Pre-seed config so the real binary skips ALL first-run gates:
     #   theme picker -> theme + hasCompletedOnboarding
@@ -254,11 +526,30 @@ cch_setup() {
     done
     CCH_MOCK_PORT=$(<"$port_file")
 
-    # PATH-shadow tmux wrapper so pane-state.sh's bare `tmux` calls hit
-    # our isolated socket. Resolve the real tmux at write time.
-    local real_tmux; real_tmux=$(_cch_real_tmux)
+    # PATH-shadow tmux wrapper. DEFENCE IN DEPTH ONLY — it is NOT the
+    # isolation mechanism any more, and must never be treated as one:
+    # $BASH_ENV force-fronts monitor/tmuxwrap ahead of it in every
+    # non-interactive bash, so on an agent process it is simply not reached.
+    # TMUX_TMPDIR (above) is what actually pins the socket. This exists for
+    # the case where it IS reached first — a caller with no $BASH_ENV — and
+    # it pins the SAME socket, so the two routes agree rather than compete.
+    #
+    # It carries the shim marker so _cch_is_path_front_shim and tmuxwrap's
+    # _tw_is_nexus_wrapper both recognise it as a shim by PROPERTY. Note the
+    # marker is why tmuxwrap will not delegate to it — which is correct now
+    # and was the whole bug before, when this file depended on exactly that
+    # delegation without saying so.
+    local real_tmux
+    real_tmux=$(_cch_real_tmux) || {
+        echo "cch_setup: no real tmux binary found (only PATH-front shims)" >&2
+        return 1
+    }
+    # Export so the memo actually reaches the command-substitution subshells
+    # every later cch_tmux uses — see the note on _CCH_REAL_TMUX above.
+    export _CCH_REAL_TMUX="$real_tmux"
     CCH_TMUXWRAP="$CCH_DIR/.bin/tmux"
-    printf '#!/usr/bin/env bash\nexec %q -L %q "$@"\n' "$real_tmux" "$CCH_SOCKET" > "$CCH_TMUXWRAP"
+    printf '#!/usr/bin/env bash\n# NEXUS-PATH-FRONT-WRAPPER-MARKER — cc-harness socket shadow, never "the real tmux".\nexec %q -L %q "$@"\n' \
+        "$real_tmux" "$CCH_SOCKET" > "$CCH_TMUXWRAP"
     chmod +x "$CCH_TMUXWRAP"
 
     # Bring up the isolated server with a detached scratch window. -f
@@ -266,8 +557,31 @@ cch_setup() {
     cch_tmux -f /dev/null new-session -d -s "$CCH_SESSION" \
         -x 120 -y 40 -c "$CCH_WORKDIR" 'sleep 36000'
 
+    # Alias the DEFAULT socket name to ours, inside the private tmpdir.
+    #
+    # This is the seam for the calls the harness does not control:
+    # monitor/pane-state.sh invokes `tmux` BARE, so it can be given an
+    # environment but never a flag. With TMUX_TMPDIR pinned and $TMUX
+    # stripped, a bare call resolves to <tmpdir>/tmux-$UID/default — and this
+    # symlink is what makes that path our server rather than a dead end.
+    # connect(2) resolves symlinks, so the client lands on the real socket
+    # (verified on tmux 2.6, the version on this host).
+    #
+    # Note what this is NOT: it is not a `-L default` pin. The name `default`
+    # appears only as a link inside a directory no other process can reach,
+    # never as an argument at a call site, so every tmux call in this file
+    # still names a socket that is provably ours.
+    local _cch_sockdir="$CCH_TMUX_TMPDIR/tmux-$(id -u)"
+    if [[ -S "$_cch_sockdir/$CCH_SOCKET" ]]; then
+        ln -sfn "$CCH_SOCKET" "$_cch_sockdir/default" 2>/dev/null || true
+    else
+        echo "cch_setup: harness socket missing at $_cch_sockdir/$CCH_SOCKET" >&2
+        return 1
+    fi
+
     export CCH_DIR CCH_CFG CCH_WORKDIR CCH_STATE_DIR CCH_CONTROL CCH_LOG \
-           CCH_SOCKET CCH_SESSION CCH_MOCK_PORT CCH_MOCK_PID CCH_TMUXWRAP
+           CCH_SOCKET CCH_SESSION CCH_MOCK_PORT CCH_MOCK_PID CCH_TMUXWRAP \
+           CCH_TMUX_TMPDIR
 
     trap cch_teardown EXIT
 }
@@ -292,11 +606,56 @@ cch_teardown() {
     fi
 }
 
-# Socket-scoped tmux (uses the real binary directly with -L).
+# Socket-scoped tmux. THREE independent pins, deliberately redundant:
+#   * a real binary (never a PATH-front shim)          — _cch_real_tmux
+#   * `env -u TMUX`   so the ambient production pane's $TMUX cannot win
+#   * TMUX_TMPDIR + -L so the socket PATH is fully determined by the env
+# Drop any one and the remaining two still cannot reach the live server.
 cch_tmux() {
-    local real_tmux; real_tmux=$(_cch_real_tmux)
-    "$real_tmux" -L "$CCH_SOCKET" "$@"
+    local real_tmux
+    real_tmux=$(_cch_real_tmux) || {
+        echo "cch_tmux: no real tmux binary found (only PATH-front shims)" >&2
+        return 127
+    }
+    # FAIL CLOSED on an unset boundary. An empty TMUX_TMPDIR is not "no
+    # preference" — tmux falls back to /tmp/tmux-$UID, which is the LIVE
+    # server's directory, so the one situation where this function does not
+    # know where it is pointing is the one where it must not run. Reachable if
+    # a caller invokes cch_tmux before cch_setup, or after a setup that failed
+    # partway; cheap to check, unrecoverable to get wrong.
+    if [[ -z "${CCH_TMUX_TMPDIR:-}" ]]; then
+        echo "cch_tmux: refusing — CCH_TMUX_TMPDIR is unset (cch_setup not run?)" >&2
+        return 78
+    fi
+    env -u TMUX TMUX_TMPDIR="$CCH_TMUX_TMPDIR" \
+        "$real_tmux" -L "$CCH_SOCKET" "$@"
 }
+
+# Run a shell FUNCTION (or any command) under the harness's tmux binding.
+#
+# `env -u TMUX …` is the right tool for an EXTERNAL command, but `env` execs a
+# program and cannot run a shell function — and the watcher's own functions
+# (`_over_limit_process_wakes`, which resolves a tmux window index) are exactly
+# the things a scenario needs to drive in-process. Without this they inherit
+# the ambient $TMUX and probe the PRODUCTION server, where the harness window
+# does not exist; the probe then reports the window ABSENT, which the state
+# machine reads as a legitimate answer rather than as a failure to look
+# (your-org/nexus-code#1042 A; test-realmodel-overlimit phase D).
+#
+# The binding is applied in a SUBSHELL, so effects that land on DISK survive
+# and in-memory variable changes do not. Every current caller drives a
+# file-backed state machine, which is why that is the right trade — check it
+# still holds before adding a caller that expects a variable back.
+cch_with_tmux_env() (
+    if [[ -z "${CCH_TMUX_TMPDIR:-}" ]]; then
+        echo "cch_with_tmux_env: refusing — CCH_TMUX_TMPDIR is unset" >&2
+        return 78          # same fail-closed reasoning as cch_tmux
+    fi
+    unset TMUX
+    export TMUX_TMPDIR="$CCH_TMUX_TMPDIR"
+    export PATH="$CCH_DIR/.bin:$PATH"
+    "$@"
+)
 
 # Write a control directive (JSON string) for the mock's NEXT request.
 cch_control() {
@@ -343,13 +702,26 @@ cch_boot_worker() {
     if [[ -n "${CCH_SETTINGS:-}" ]]; then
         printf -v settings_arg ' --settings %q' "$CCH_SETTINGS"
     fi
+    # CCH_CLAUDE_ARGS: extra `claude` flags spliced verbatim after
+    # `--dangerously-skip-permissions` — the third opt-in knob, added for
+    # `--plugin-dir <dir>` so the longjob-watch dispatcher plugin
+    # (your-org/nexus-code#1535) can be booted against the mock and its
+    # events COUNTED as API requests. The CALLER shell-quotes; empty leaves
+    # the launch line token-identical to before.
+    if [[ -n "${CCH_CLAUDE_ARGS:-}" ]]; then
+        settings_arg="$settings_arg ${CCH_CLAUDE_ARGS}"
+    fi
     local launch
+    # TMUX_TMPDIR is passed through the `env -i` wall on purpose. `env -i`
+    # strips $TMUX, which tmux had set for this pane, so anything the pane
+    # runs that shells out to tmux — a hook calling pane-state.sh, say —
+    # would otherwise compute the DEFAULT socket dir and land on production.
     printf -v launch 'env -i HOME=%q PATH=%q CLAUDE_CONFIG_DIR=%q \
-ANTHROPIC_BASE_URL=%q ANTHROPIC_AUTH_TOKEN=mock-token \
+TMUX_TMPDIR=%q ANTHROPIC_BASE_URL=%q ANTHROPIC_AUTH_TOKEN=mock-token \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \
 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_BUG_COMMAND=1 \
 %s TERM=%q %q --dangerously-skip-permissions%s' \
-        "$CCH_CFG" "$PATH" "$CCH_CFG" \
+        "$CCH_CFG" "$PATH" "$CCH_CFG" "$CCH_TMUX_TMPDIR" \
         "http://127.0.0.1:$CCH_MOCK_PORT" "${CCH_EXTRA_ENV:-}" \
         "${TERM:-xterm-256color}" "$CLAUDE_BIN" "$settings_arg"
 
@@ -366,10 +738,37 @@ DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_BUG_COMMAND=1 \
 }
 
 # Run the production pane-state.sh against a live window via the wrapper.
+#
+#   cch_pane_state <window-index> [extra pane-state.sh flags…]
+#
+# TWO SEAMS, both added because their absence is what a caller re-rolled this
+# function's body to work around — and the re-rolled copy did not carry the
+# socket pins, so it queried the PRODUCTION server and came back empty
+# (your-org/nexus-code#1042 A; test-realmodel-overlimit phase B):
+#
+#   * extra flags are forwarded BEFORE the window key, which is the argument
+#     order pane-state.sh expects;
+#   * $CCH_PANE_STATE_DIR overrides NEXUS_STATE_DIR for callers that point
+#     pane-state at a synthetic nexus root.
+#
+# If you need a variation this does not offer, ADD IT HERE. A second copy of
+# these three env pins is a second place for them to fall out of date, and
+# they are the only thing standing between this harness and the live board.
 cch_pane_state() {
-    local window="$1"
-    PATH="$CCH_DIR/.bin:$PATH" NEXUS_STATE_DIR="$CCH_STATE_DIR" \
-        "$CCH_PANE_STATE" "$CCH_SESSION:$window"
+    local window="$1"; shift || true
+    # `env -u TMUX` + TMUX_TMPDIR are the load-bearing pins: pane-state.sh
+    # calls tmux BARE, and re-fronts monitor/tmuxwrap over the PATH shadow
+    # below the moment its bash sources $BASH_ENV. Without these two, the
+    # bare call resolves to the ambient $TMUX — the PRODUCTION socket
+    # (your-org/nexus-code#1042 A). The PATH entry stays as a third pin.
+    if [[ -z "${CCH_TMUX_TMPDIR:-}" ]]; then
+        echo "cch_pane_state: refusing — CCH_TMUX_TMPDIR is unset" >&2
+        return 78          # same fail-closed reasoning as cch_tmux
+    fi
+    env -u TMUX TMUX_TMPDIR="$CCH_TMUX_TMPDIR" \
+        PATH="$CCH_DIR/.bin:$PATH" \
+        NEXUS_STATE_DIR="${CCH_PANE_STATE_DIR:-$CCH_STATE_DIR}" \
+        "$CCH_PANE_STATE" "$@" "$CCH_SESSION:$window"
 }
 
 # Convenience: just the state= token.

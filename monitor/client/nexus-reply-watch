@@ -79,6 +79,16 @@
 #   ⚠ BEHAVIOR CHANGE: a consumer that parsed the envelope MUST now pass
 #   `--envelope`; the bare default is the raw body.
 #
+#   THE ONCE-ONLY SENTINEL IS A REPORTABLE RESULT. Re-watching an id whose
+#   terminal event was already delivered emits `state=already-emitted` on
+#   STDOUT and exits 4 — not exit 0 with empty stdout, which was
+#   indistinguishable from a lost reply. `--re-emit` deliberately re-delivers
+#   (it re-reads the reply already on the server; it never re-files anything),
+#   and the emitted line names the sentinel path so it can be removed by hand.
+#   State lives under $NEXUS_REPLY_WATCH_STATE (default
+#   ${XDG_STATE_HOME:-~/.local/state}/nexus-reply-watch), one `<id>.emitted`
+#   marker per consumed id, deliberately NOT under /tmp so it survives a reboot.
+#
 #   Terminal non-reply states carry NO body block:
 #     nexus-reply-watch: state=failed  id=<id> reason=<r> detail="…" ts=<utc>
 #     nexus-reply-watch: state=timeout id=<id> reason=budget_exhausted \
@@ -124,7 +134,27 @@ PROG=nexus-reply-watch
 # the key) and sourced from the same dir. The refactor is behaviour-preserving
 # — the shipped test suite (test-nexus-reply-watch.sh) is the regression guard.
 _wl_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd 2>/dev/null) || _wl_dir=$(dirname -- "$0")
+_wl_path="${NEXUS_WATCH_LIB:-$_wl_dir/_nexus_watch_lib.sh}"
+# CHECK BEFORE SOURCING — see the identical guard in nexus-request. POSIX makes
+# a `.` that cannot find its file abort a non-interactive shell, so under
+# `#!/bin/sh` (dash here) the `|| { … exit 64; }` arm below is DEAD CODE: the
+# shell dies at the dot with rc 2. Measured, same lonely install: bash rc=64,
+# dash rc=2. Loud either way — it names the missing path — but the designed
+# message and exit code must be reachable on the declared interpreter.
+if [ ! -r "$_wl_path" ]; then
+    printf '%s: cannot load _nexus_watch_lib.sh (expected next to this script)\n' "$PROG" >&2
+    printf '%s: looked for: %s\n' "$PROG" "$_wl_path" >&2
+    printf '%s: the client helpers are a SET — nexus-request, nexus-reply-watch and\n' "$PROG" >&2
+    printf '%s: _nexus_watch_lib.sh all install into ONE directory. Re-request the full\n' "$PROG" >&2
+    printf '%s: set from your orchestrator (ng remote client-helper --base64).\n' "$PROG" >&2
+    exit 64
+fi
 # shellcheck source=_nexus_watch_lib.sh
+# The source target is spelled out INLINE rather than via $_wl_path (which holds
+# the identical value, checked just above). The static source-graph resolver
+# reads this token literally: naming a variable here makes the edge unresolvable
+# and lands both scripts in aso-unresolved-sources.manifest for no behavioural
+# gain. Keep the literal — the readability guard above is what changed, not this.
 . "${NEXUS_WATCH_LIB:-$_wl_dir/_nexus_watch_lib.sh}" || {
     printf '%s: cannot load _nexus_watch_lib.sh (expected next to this script)\n' "$PROG" >&2
     exit 64
@@ -132,7 +162,7 @@ _wl_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd 2>/dev/null) || _wl_dir=$(di
 
 die_usage() {
     printf '%s: %s\n' "$PROG" "$*" >&2
-    printf 'usage: %s <id> [--poll S] [--timeout S] [--out FILE] [--stop-file FILE] [--ssh-host ALIAS] [--envelope]\n' "$PROG" >&2
+    printf 'usage: %s <id> [--poll S] [--timeout S] [--out FILE] [--stop-file FILE] [--ssh-host ALIAS] [--envelope] [--re-emit]\n' "$PROG" >&2
     exit 64
 }
 
@@ -148,6 +178,7 @@ timeout=$TIMEOUT_DEFAULT
 out=''
 stop_file=''
 envelope='false'      # default: emit the RAW reply body (the #401 contract)
+re_emit='false'       # --re-emit: ignore an existing once-only sentinel
 ssh_alias="${NEXUS_REMOTE_SSH_ALIAS:-$SSH_ALIAS_DEFAULT}"
 
 case "${1:-}" in
@@ -164,6 +195,12 @@ while [ $# -gt 0 ]; do
         --stop-file) stop_file=${2:-}; shift 2 || die_usage "--stop-file needs a path" ;;
         --ssh-host)  ssh_alias=${2:-}; shift 2 || die_usage "--ssh-host needs an alias" ;;
         --envelope)  envelope='true';  shift ;;
+        # Deliberately re-deliver a reply whose once-only sentinel is already
+        # set. The sentinel makes a re-watch exit WITHOUT re-emitting, which is
+        # correct exactly-once semantics; this is the documented, explicit way
+        # to ask for the body again. It re-READS the reply already on the
+        # server — it never re-files the request.
+        --re-emit)   re_emit='true';   shift ;;
         -h|--help)   usage ;;
         --) shift; break ;;
         *) die_usage "unknown flag: $1" ;;
@@ -204,6 +241,10 @@ resolve_ssh_id || exit 64
 STATE_DIR="${NEXUS_REPLY_WATCH_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/nexus-reply-watch}"
 mkdir -p "$STATE_DIR" 2>/dev/null || STATE_DIR="${TMPDIR:-/tmp}"
 sentinel="$STATE_DIR/$id.emitted"
+# --re-emit: drop the once-only guard for THIS run. Unsetting $sentinel (rather
+# than deleting the file) keeps the guard's own state intact — already_emitted
+# tolerates an unset sentinel — so a subsequent normal watch still short-circuits.
+[ "$re_emit" = true ] && sentinel=''
 
 # ---- temp files + cleanup ---------------------------------------------
 tmp=$(mktemp 2>/dev/null)    || tmp="${TMPDIR:-/tmp}/$PROG.body.$$"     # await envelope buffer
@@ -226,8 +267,10 @@ trap on_signal INT TERM
 # (deliver / compose_reply / emit_replied / already_emitted come from the lib.)
 emit_reply_and_exit() {
     if already_emitted; then
-        log "terminal reply for id=$id already emitted (sentinel present) — exiting without re-emit"
-        exit 0
+        # Route through the shared emitter: this is the call site the sentinel
+        # defect was actually observed at. It used to log to stderr and exit 0
+        # with EMPTY stdout — indistinguishable from a lost reply.
+        emit_already_emitted reply
     fi
     _state=$(reply_state "$tmp")
     if [ "$_state" = replied ]; then

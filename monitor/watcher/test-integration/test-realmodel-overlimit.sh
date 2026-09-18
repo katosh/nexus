@@ -198,8 +198,12 @@ fi
 # check + stamp read, all against the LIVE pane hosting the real binary.
 echo
 echo "--- phase B: production pane-state classifies the live pane over-limit ---"
-ps_out=$(PATH="$CCH_DIR/.bin:$PATH" NEXUS_STATE_DIR="$OL_STATE" \
-    "$CCH_PANE_STATE" "$CCH_SESSION:$IDX" 2>&1)
+# Through cch_pane_state, NOT a hand-rolled copy of its body. The copy that
+# used to be here predated the socket pins in _lib.sh and therefore queried
+# the PRODUCTION tmux server, where this session does not exist — so it
+# returned nothing and both assertions below read as renderer drift
+# (your-org/nexus-code#1042 A).
+ps_out=$(CCH_PANE_STATE_DIR="$OL_STATE" cch_pane_state "$IDX" 2>&1)
 ps_state=$(sed -n 's/.*state=\([^ ]*\).*/\1/p' <<<"$ps_out")
 ps_reset=$(grep -oE 'reset_at=[^ ]+' <<<"$ps_out" | sed 's/^reset_at=//')
 echo "        pane-state: state=${ps_state:-<none>} reset_at=${ps_reset:-<none>}"
@@ -213,9 +217,8 @@ assert_eq "pane-state carries the reset token"            "$WANT_TOKEN" "$ps_res
 # a blank frame downgrades to a loud note, never a silent pass.
 pane_text=$(cch_capture "$IDX")
 if grep -q "hit your" <<<"$pane_text"; then
-    ps2_out=$(PATH="$CCH_DIR/.bin:$PATH" NEXUS_STATE_DIR="$OL_STATE" \
-        "$CCH_PANE_STATE" --over-limit-file "$CCH_DIR/no-such-stamp.json" \
-        "$CCH_SESSION:$IDX" 2>&1)
+    ps2_out=$(CCH_PANE_STATE_DIR="$OL_STATE" cch_pane_state "$IDX" \
+        --over-limit-file "$CCH_DIR/no-such-stamp.json" 2>&1)
     ps2_state=$(sed -n 's/.*state=\([^ ]*\).*/\1/p' <<<"$ps2_out")
     if [[ "$ps2_state" == "over-limit" ]]; then
         echo "  PASS: renderer scrape classifies the REAL painted notice (no stamp)"; PASS=$((PASS+1))
@@ -325,8 +328,11 @@ row=$(_over_limit_load "_orchestrator")
 IFS=$'\t' read -r k w r tok re fs na at <<<"$row"
 _over_limit_write_row "$k" "$w" "$r" "$tok" "$re" "$fs" "$(( $(date +%s) - 1 ))" "$at"
 
-NEXUS_ROOT="$OL_ROOT" PATH="$CCH_DIR/.bin:$PATH" \
-    _over_limit_process_wakes "$WIN"
+# Through cch_with_tmux_env: this function resolves a tmux window index, and
+# on the ambient socket that window does not exist. The probe then answers
+# "absent" — a well-formed answer to the wrong server — so the gate never
+# reopens and nothing is pasted (your-org/nexus-code#1042 A).
+NEXUS_ROOT="$OL_ROOT" cch_with_tmux_env _over_limit_process_wakes "$WIN"
 
 if _over_limit_orchestrator_paused; then
     echo "  FAIL: emit gate still closed after wake — held emits would never flush" >&2

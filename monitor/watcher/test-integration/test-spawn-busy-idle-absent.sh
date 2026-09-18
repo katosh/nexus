@@ -125,7 +125,15 @@ _agent_pid_for_shape() {
     for depth in 0 1 2 3 4 5; do
         [[ -n "${queue// /}" ]] || return 1
         for pid in $queue; do
-            if [[ "$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]')" == claude ]]; then
+            # IDENTITY, NOT NAME (your-org/nexus-code#908). `comm` is the
+            # invocation name: the same binary reads `claude` through the
+            # node_modules/.bin symlink and `claude.exe` by real path, and
+            # cc-harness's own gate sets CLAUDE_BIN to a staged real path —
+            # so an exact `== claude` here waits forever on the very
+            # configuration the gate runs under.
+            if [[ "$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]')" == claude \
+               || "$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]')" == claude.exe \
+               || "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" == *claude-code* ]]; then
                 printf '%s' "$pid"; return 0
             fi
         done

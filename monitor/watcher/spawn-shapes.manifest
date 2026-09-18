@@ -61,10 +61,12 @@
 # ---------------------------------------------------------------------------
 monitor/cc-harness/_lib.sh#1	command	agent	sendkeys	harness-spawn	cc-harness spawns the REAL claude against a mock API; $launch is an `env … $CLAUDE_BIN …` string, so the agent is the pane root.
 monitor/cc-harness/lint-no-tmux-server-kill.sh#1	command	n/a	no-sendkeys	not-a-spawn	A quoted lint FIXTURE string ("… && tmux new-window -dn %s"); the linter matches on it, nothing executes it.
-monitor/spawn-worker.sh#1	bare	shell	sendkeys	production-spawn	The --resume spawn path. Bare new-window, then send-keys the generated launcher: pane root is the login shell.
-monitor/spawn-worker.sh#2	command	n/a	sendkeys	not-a-spawn	Diagnostic string ("tmux new-window failed / returned no window id"). Tokenises as a command form; it is an echo.
-monitor/spawn-worker.sh#3	bare	shell	sendkeys	production-spawn	THE worker spawn. Bare new-window at :1838, remain-on-exit at :1848, send-keys at :1866. Every worker on the board.
-monitor/spawn-worker.sh#4	command	n/a	sendkeys	not-a-spawn	Diagnostic string, as :1410.
+monitor/spawn-worker.sh#1	bare	shell	sendkeys	production-spawn	The trust-overlay RECOVERY respawn (your-org/nexus-code#1334, _sw_trust_respawn): after the kill and a read-back re-seed, bare new-window under the SAME name, remain-on-exit, then send-keys the kept launcher — the worker spawn shape re-created. Ordinals shifted here when this site was added ABOVE the two production sites; the four rows below were re-attributed, not renumbered blind.
+monitor/spawn-worker.sh#2	command	n/a	sendkeys	not-a-spawn	Diagnostic string in _sw_trust_respawn ("recovery: tmux new-window failed / returned no window id"). Tokenises as a command form; it is a printf.
+monitor/spawn-worker.sh#3	bare	shell	sendkeys	production-spawn	The --resume spawn path. Bare new-window, then send-keys the generated launcher: pane root is the login shell.
+monitor/spawn-worker.sh#4	command	n/a	sendkeys	not-a-spawn	Diagnostic string on the --resume path ("tmux new-window failed / returned no window id"). Tokenises as a command form; it is an echo.
+monitor/spawn-worker.sh#5	bare	shell	sendkeys	production-spawn	THE worker spawn. Bare new-window, remain-on-exit, send-keys the launcher. Every worker on the board.
+monitor/spawn-worker.sh#6	command	n/a	sendkeys	not-a-spawn	Diagnostic string on the fresh path, as the --resume one.
 monitor/svc.sh#1	command	n/a	no-sendkeys	not-a-spawn	Inside a heredoc printed to stderr — a REFUSAL message telling the operator what to run. Not a call.
 monitor/watcher/entry.sh#1	bare	n/a	no-sendkeys	not-a-spawn	Inside a heredoc printed to stderr — the "run it in another window" hint. Not a call.
 monitor/watcher/_respawn.sh#2	command	n/a	sendkeys	not-a-spawn	Log-message string ("tmux new-window failed for '$target'").
@@ -77,13 +79,29 @@ monitor/watcher/test-integration/test-realmodel-apispoof.sh#1	command	agent	no-s
 monitor/watcher/test-integration/test-realmodel-overlimit.sh#1	command	agent	no-sendkeys	harness-spawn	cc-harness scenario; $launch is the real claude invocation.
 monitor/watcher/test-integration/test-slow-grind-respawn.sh#1	command	n/a	no-sendkeys	not-a-spawn	Inside the PATH-shadow tmux wrapper: the forced-failure message it prints instead of spawning.
 monitor/watcher/test-pane-state.sh#1	command	shell	no-sendkeys	fixture-other	Builds a window on a private socket to exercise the #140 bogus-index refusal; the pane is never expected to host an agent.
+monitor/watcher/test-bash-footgun-guard.sh#1	bare	n/a	no-sendkeys	not-a-spawn	Guard PAYLOAD string (your-org/nexus-code#889): a JSON .tool_input.command handed to bash-footgun-guard to assert the tmux rows fire. Nothing executes tmux; this suite never starts a server.
+monitor/watcher/test-bash-footgun-guard.sh#2	bare	n/a	no-sendkeys	not-a-spawn	Guard PAYLOAD string, as #1 — the CONTROL asserting a targeted kill chained with new-window stays clean.
 monitor/watcher/test-respawn.sh#1	command	n/a	sendkeys	not-a-spawn	assert_contains needle — asserts the RECORDED tmux invocation, does not make one.
 monitor/watcher/test-spawn-fresh-orchestrator.sh#1	command	n/a	sendkeys	not-a-spawn	assert_contains needle.
+monitor/watcher/test-spawn-fresh-orchestrator.sh#2	bare	n/a	sendkeys	not-a-spawn	assert_contains needle (test 12 potency control). Same shape as #1: a string literal checked against the stub's call log, not an invocation.
+monitor/watcher/test-spawn-fresh-orchestrator.sh#3	bare	n/a	sendkeys	not-a-spawn	assert_contains needle (test 13 potency control, your-org/nexus-code#1327). Same shape as #1 and #2: a string literal checked against the stub's call log, not an invocation.
 monitor/watcher/test-spawn-worker-resume.sh#1	command	n/a	sendkeys	not-a-spawn	assert_contains needle.
 monitor/watcher/test-spawn-worker-resume.sh#2	bare	n/a	sendkeys	not-a-spawn	assert_contains needle.
 monitor/watcher/test-spawn-worker-resume.sh#3	bare	n/a	sendkeys	not-a-spawn	assert_contains needle.
+monitor/watcher/test-spawn-worker-trust-seed.sh#1	indirect	n/a	no-sendkeys	not-a-spawn	Echoed section label that happens to contain the literal `tmux new-window`; prints text, creates nothing.
+monitor/watcher/test-spawn-worker-trust-seed.sh#2	command	n/a	no-sendkeys	not-a-spawn	grep -c needle counting the guarded window-creation sites in spawn-worker.sh; reads source, does not spawn.
+monitor/watcher/test-spawn-worker-trust-seed.sh#3	command	n/a	no-sendkeys	not-a-spawn	grep -B6 needle for the same structural assertion; reads source, does not spawn.
+monitor/watcher/test-spawn-worker-trust-verify.sh#1	bare	shell	sendkeys	not-a-spawn	grep -c needle over the STUB tmux log (tmux_count new-window); reads a log, creates nothing.
+monitor/watcher/test-spawn-worker-trust-verify.sh#2	bare	shell	sendkeys	not-a-spawn	Same needle, narrowed to the -n wB form to count the recovery respawn in the stub log; reads a log, creates nothing.
+monitor/watcher/test-spawn-worker-trust-verify.sh#3	bare	shell	sendkeys	not-a-spawn	Same needle counting windows on the bounded-failure arm; reads a log, creates nothing.
 monitor/watcher/test-spawn-worker.sh#1	command	n/a	sendkeys	not-a-spawn	assert_contains needle.
+monitor/watcher/test-tmux-selection-restore.sh#1	command	agent	no-sendkeys	fixture-other	your-org/nexus-code#1528: the fixture's `newwin` helper — a `sleep` as the window command, so every board window has a stable name and never exits; stands in for orchestrator/services/worker/watchdog windows whose SELECTION is what is under test. The production new-window is _respawn.sh's, driven unmodified in part B. No agent, no classification.
 monitor/watcher/test-tmux-window-resolver.sh#1	bare	shell	no-sendkeys	fixture-other	Creates a decoy window whose NAME collides, to test name resolution. No agent, no classification.
+monitor/watcher/test-tmux-window-resolver.sh#2	bare	shell	no-sendkeys	fixture-other	Part I (your-org/nexus-code#944): a second window in a SECOND fixture session, so a session:window key can be judged against the session it names. No agent, no classification.
+monitor/watcher/test-tmux-window-resolver.sh#3	bare	shell	no-sendkeys	fixture-other	Part I (your-org/nexus-code#944): plants a name/index COLLISION in that second session, named after the measured index of its sibling, so the ambiguity refusal can be exercised across sessions. No agent, no classification.
+monitor/watcher/test-tmux-window-resolver.sh#4	bare	shell	no-sendkeys	fixture-other	Part J (your-org/nexus-code#1318): plants the NAME side of a CROSS-SESSION collision — a window in a THIRD session named after an index that exists in the first. Neither session alone shows a collision, which is the whole arrangement. No agent, no classification.
+monitor/watcher/test-tmux-window-resolver.sh#5	bare	shell	no-sendkeys	fixture-other	Part J (your-org/nexus-code#1318): pads a fourth session until one of ITS indices is nobody's window NAME, so the non-widening control measures a clean key rather than the collision it exists to exclude. Bounded, and a loud setup abort if the bound is reached. No agent, no classification.
 monitor/watcher/test-version-restart.sh#1	command	n/a	no-sendkeys	not-a-spawn	assert-style needle for the services-window hint.
 monitor/watcher/_version_restart.sh#1	command	n/a	no-sendkeys	not-a-spawn	printf of a SUGGESTED recovery command for the operator to run by hand.
 monitor/watcher/_version_restart.sh#2	command	n/a	no-sendkeys	not-a-spawn	printf of a SUGGESTED recovery command, wid-guarded variant.
+monitor/watcher/test-spawn-shape-manifest.sh#1	bare	shell	no-sendkeys	fixture-other	Not a spawn at all: the literal text of the FIXTURE this suite plants for its own #1483 positive control, inside a printf that writes a throwaway file into a scratch git repo. It never executes, and the classifier is right to see it -- the token is in the source. Classified rather than exempted because an allowlist keyed on this file's NAME would be a hole shaped like whoever wrote it.

@@ -39,6 +39,10 @@ pass() { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
 fail() { printf '  FAIL: %s\n' "$1" >&2; FAIL=$(( FAIL + 1 )); }
 ck()   { if [[ "$2" == "$3" ]]; then pass "$1 (got '$2')"; else fail "$1 — got '$2' want '$3'"; fi; }
 ck_has() {
+    if [[ -z "${3:-}" ]]; then
+        fail "$(printf '%s — EMPTY needle: `grep -qF ""` matches anything, so this assertion could only have passed VACUOUSLY (your-org/nexus-code#1110). Fix the CALLER: its expected value came back empty; check the rc of whatever produced it.' "$1")"
+        return
+    fi
     if grep -qF -- "$3" <<<"$2"; then pass "$1"
     else fail "$(printf '%s — %q not found in %q' "$1" "$3" "$2")"; fi
 }
@@ -46,6 +50,35 @@ ck_not_has() {
     if grep -qF -- "$3" <<<"$2"; then
         fail "$(printf '%s — %q unexpectedly present' "$1" "$3")"
     else pass "$1"; fi
+}
+# THE ATTRIBUTION, NOT ONE REGISTER OF ITS PROSE (your-org/nexus-code#1040).
+#
+# D1-D3 used to pin the literal string `EAGAIN in this run`. That is the defect
+# this repo names in its own words — "a test that pins PROSE it does not assert
+# anything about turns every honesty improvement into a false red" — and it
+# fired: `#1040` conditions the note on measured fork-headroom, so under the
+# HEALTHY headroom these fixtures have BY CONSTRUCTION (they test spelling
+# recognition, not exhaustion) the note now reads "the EAGAIN strerror appears
+# in this run — but fork-headroom=… is HEALTHY". Three assertions went red for a
+# suite whose subject had not changed and whose file was byte-identical.
+#
+# A CONJUNCTION, and the second half is what makes it safe. Asserting only that
+# the spelling is echoed on `matched:` is defeated by a mutant that strips the
+# whole attribution block and keeps the echo — `#655` coverage silently lost,
+# green suite. So: the note must ALSO have made an EAGAIN claim, in EITHER
+# register. Both registers are enumerated here on purpose; a third one added
+# later reds this line, which is the right place to notice it.
+ck_attributes() {   # ck_attributes <label> <note> <spelling-that-must-be-echoed>
+    local label="$1" note="$2" spelling="$3"
+    if ! grep -qE '^[[:space:]]*\*\*\* (EAGAIN in this run|the EAGAIN strerror appears in this run)' <<<"$note"; then
+        fail "$label — the note made NO EAGAIN attribution in either register"
+        return
+    fi
+    if ! grep -qF -- "$spelling" <<<"$note"; then
+        fail "$(printf '%s — the spelling %q was not echoed on the matched: line' "$label" "$spelling")"
+        return
+    fi
+    pass "$label"
 }
 
 WORK=$(mktemp -d -t nexus-655-headroom-XXXXXX)
@@ -184,15 +217,58 @@ ck_has "C2 it exits 77 (SKIP), not 1 — a starved run is not a defect report" \
 # severe starvation still dies of EAGAIN — which is exactly why
 # _rt_resource_note's detector had to be widened to the property, since
 # that is the regime where the attribution is all the operator gets.
-c3=$(bash -c 't=$(ps -Lu "$(id -u)" -o pid= | grep -c .)
-              ulimit -Su $(( t + 128 )) 2>/dev/null || exit 66
-              exec bash '"'$RSE'" 2>&1)
-c3rc=$?
+# THE MARGIN IS CHECKED AFTER THE CAP, NOT ASSUMED (your-org/nexus-code#1436).
+# A fixed `t + 128` was chosen when this board was small. On a busy primary
+# (~7,000 uid tasks, a dozen agent windows) the task count moves by MORE than
+# the margin between the sample and the exec — so the child landed in the
+# <= 64 regime at random and died 254 where C3 expects a clean 77, on every
+# full local run, at load ~34. The guard was doing the right thing; the case
+# was measuring the board's volatility and reporting it as a defect.
+#
+# So the case now (a) caps at a margin sitting in the MIDDLE of the window the
+# guard needs — above the ~96 floor where `th_fork_headroom` can still fork
+# its own `ps`, below the 256 the measured suite declares — and (b) RE-SAMPLES
+# inside the child, after the cap and immediately before exec: if the count
+# has already moved the headroom out of that window, the child exits 67 with
+# both readings and the case retries. After N attempts it SKIPS with the
+# measured volatility beside the constant, which is a statement about the
+# board and not about the guard. `exit 66` (cannot lower ulimit) is unchanged.
+C3_MARGIN=176; C3_FLOOR=96; C3_DECLARED=256; C3_TRIES=5
+c3rc=67; c3=""; c3_attempts=0; c3_volatility=""
+while (( c3_attempts < C3_TRIES )) && (( c3rc == 67 )); do
+    c3_attempts=$(( c3_attempts + 1 ))
+    c3=$(bash -c 't=$(ps -Lu "$(id -u)" -o pid= | grep -c .)
+                  ulimit -Su $(( t + '"$C3_MARGIN"' )) 2>/dev/null || exit 66
+                  t2=$(ps -Lu "$(id -u)" -o pid= 2>/dev/null | grep -c .) || t2=""
+                  [[ "$t2" =~ ^[0-9]+$ ]] || { echo "C3-VOLATILE sampled=$t resampled=? (ps could not fork: headroom already gone)"; exit 67; }
+                  h=$(( t + '"$C3_MARGIN"' - t2 ))
+                  if (( h < '"$C3_FLOOR"' || h >= '"$C3_DECLARED"' )); then
+                      echo "C3-VOLATILE sampled=$t resampled=$t2 headroom-at-exec=$h window=['"$C3_FLOOR"','"$C3_DECLARED"')"
+                      exit 67
+                  fi
+                  exec bash '"'$RSE'" 2>&1)
+    c3rc=$?
+    # A 254 carrying bash's own EAGAIN wording is the child dying BEFORE the
+    # re-sample could run — the count rose past the margin in the millisecond
+    # between the cap and the first fork. Same volatility, one regime lower,
+    # and no line of the child's is reachable to say so; classified here.
+    if (( c3rc == 254 )) && grep -qE 'fork: retry|Resource temporarily unavailable' <<<"$c3"; then
+        c3="C3-VOLATILE the child died of EAGAIN (rc 254) before it could re-sample — headroom was already below the fork floor at exec"
+        c3rc=67
+    fi
+    (( c3rc == 67 )) && c3_volatility+="${c3_volatility:+; }attempt $c3_attempts: $(grep -o 'C3-VOLATILE.*' <<<"$c3")"
+done
 if (( c3rc == 66 )); then
     pass "C3 skipped — cannot lower ulimit on this host"
     pass "C4 skipped — cannot lower ulimit on this host"
+elif (( c3rc == 67 )); then
+    # A SKIP with the numbers: the board moved the task count by more than the
+    # margin on every attempt. Not a pass, not a defect — coverage NOT taken.
+    th_skip "C3 starved run exits 77 (SKIP) instead of dying with EAGAIN" \
+        "task-count volatility exceeded the ${C3_MARGIN}-task margin on ${C3_TRIES}/${C3_TRIES} attempts (loadavg $(cut -d' ' -f1-3 /proc/loadavg)); $c3_volatility"
+    th_skip "C4 and says why, in numbers" "same — the starved regime could not be staged on this board"
 else
-    ck "C3 starved run exits 77 (SKIP) instead of dying with EAGAIN" "$c3rc" 77
+    ck "C3 starved run exits 77 (SKIP) instead of dying with EAGAIN (attempt $c3_attempts of $C3_TRIES, margin $C3_MARGIN)" "$c3rc" 77
     ck_has "C4 and says why, in numbers" "$c3" "RESOURCE PRECONDITION NOT MET"
 fi
 
@@ -218,15 +294,16 @@ mk_log() { printf '%s\n' "$2" > "$WORK/$1.err"; : > "$WORK/$1.out"; }
 # D1: bash's spelling — the one the old fixed-string detector caught.
 mk_log bashy 'bash: fork: retry: Resource temporarily unavailable'
 d1=$(_rt_resource_note "$WORK/bashy")
-ck_has "D1 bash's 'fork: retry:' spelling is attributed" "$d1" "EAGAIN in this run"
+ck_attributes "D1 bash's 'fork: retry:' spelling is attributed" \
+   "$d1" "bash: fork: retry:"
 
 # D2: THE REGRESSION. coreutils' spelling, emitted by `timeout` — which is
 # how run_one invokes every test under PER_TEST_TIMEOUT. The old detector
 # was silent here and the run read as a plain red.
 mk_log timeouty 'timeout: fork system call failed: Resource temporarily unavailable'
 d2=$(_rt_resource_note "$WORK/timeouty")
-ck_has "D2 coreutils' 'fork system call failed' spelling is attributed" \
-   "$d2" "EAGAIN in this run"
+ck_attributes "D2 coreutils' 'fork system call failed' spelling is attributed" \
+   "$d2" "fork system call failed"
 ck_has "D2 the matched line is echoed, so the reader can judge the attribution" \
    "$d2" "fork system call failed"
 
@@ -234,8 +311,8 @@ ck_has "D2 the matched line is echoed, so the reader can judge the attribution" 
 # an unlisted wording is covered by construction, which is the entire
 # reason not to keep a list.
 mk_log novel 'sh: cannot fork: Resource temporarily unavailable'
-ck_has "D3 an un-enumerated spelling is still attributed" \
-   "$(_rt_resource_note "$WORK/novel")" "EAGAIN in this run"
+ck_attributes "D3 an un-enumerated spelling is still attributed" \
+   "$(_rt_resource_note "$WORK/novel")" "sh: cannot fork:"
 
 # D4: no EAGAIN → no attribution. Without this the detector could be
 # firing on everything and D1-D3 would be vacuous.
@@ -255,6 +332,16 @@ ck_has "D5 loadavg is retained (correlate, not cause — still worth recording)"
    "$d4" "loadavg="
 
 # ---------------------------------------------------------------------------
-printf '\n=== summary: %d passed, %d failed ===\n' "$PASS" "$FAIL"
-if (( FAIL == 0 )); then echo "ALL TESTS PASSED"; exit 0; fi
+# The footer carries the SKIP count when C3/C4 could not be staged (#1436), in
+# the same shape `th_summary_and_exit` prints, so the case-skip is visible at
+# the foot and to the runner's case-skip accounting rather than only inline.
+if (( ${SKIP:-0} > 0 )); then
+    printf '\n=== summary: %d passed, %d failed, %d SKIPPED (precondition absent — NOT covered) ===\n' "$PASS" "$FAIL" "$SKIP"
+else
+    printf '\n=== summary: %d passed, %d failed ===\n' "$PASS" "$FAIL"
+fi
+if (( FAIL == 0 )); then
+    if (( ${SKIP:-0} > 0 )); then echo "ALL TESTS PASSED ($SKIP case(s) SKIPPED — NOT covered)"; else echo "ALL TESTS PASSED"; fi
+    exit 0
+fi
 exit 1

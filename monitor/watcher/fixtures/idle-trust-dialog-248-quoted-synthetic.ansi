@@ -1,0 +1,9 @@
+● Read(reports/nexus_2026-08-28_trust-248.md)
+  From 2.1.248 the dialog drops its ordinals:
+    ❯ No, exit
+      Yes, I trust this folder
+    Enter to confirm · Esc to cancel
+  pane-state read it as `empty`, so nothing unstuck it.
+
+❯ 
+─

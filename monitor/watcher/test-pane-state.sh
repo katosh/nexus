@@ -2,9 +2,12 @@
 # Fixture-driven tests for monitor/pane-state.sh.
 #
 # Each fixture under monitor/watcher/fixtures/*.ansi is a real or
-# synthesized tmux capture-pane -e -p output. The expected state for
-# each fixture is encoded in its filename prefix (`autosuggest-`,
-# `busy-`, `idle-`, `user-typing-`, `blocked-`, `absent-`).
+# synthesized tmux capture-pane -e -p output. The expected state for each
+# fixture comes from monitor/watcher/pane-state-fixtures.manifest — DATA,
+# independent of the fixture's filename (your-org/nexus-code#1176). It used to
+# be derived from a filename PREFIX, which meant the suite could not disagree
+# with the classifier about anything nameable and could not express the one
+# case this corpus is most valuable for: "looks like X, must classify as Y".
 #
 # Run: bash monitor/watcher/test-pane-state.sh
 # Expected: ALL TESTS PASSED on stdout, exit 0.
@@ -19,63 +22,366 @@ FIX_DIR="$_test_dir/fixtures"
 PASS=0
 FAIL=0
 
+# assert_state <fixture> <want> [<env-assignment>...] [--] [<extra-arg>...]
+#
+# `env` and `args` come from the manifest, so a capture can be read under more
+# than one scenario (a process tree, a ledger) without needing a second copy of
+# the bytes. Both default to empty, which is the bare reading.
 assert_state() {
-    local fixture="$1" want="$2"
+    local fixture="$1" want="$2"; shift 2
+    local -a envv=() extra=()
+    while (( $# > 0 )); do
+        [[ "$1" == "--" ]] && { shift; break; }
+        envv+=("$1"); shift
+    done
+    extra=("$@")
+    local label
+    label=$(basename "$fixture")
+    (( ${#envv[@]} || ${#extra[@]} )) && label="$label [${envv[*]} ${extra[*]}]"
     local out got
-    out=$("$HELPER" --fixture "$fixture" --window 9 --name testwin --active 0 2>&1) || {
-        printf '  FAIL: %s — helper exited nonzero: %s\n' "$(basename "$fixture")" "$out" >&2
+    out=$(env "${envv[@]}" "$HELPER" --fixture "$fixture" \
+              --window 9 --name testwin --active 0 "${extra[@]}" 2>&1) || {
+        printf '  FAIL: %s — helper exited nonzero: %s\n' "$label" "$out" >&2
         FAIL=$(( FAIL + 1 ))
         return
     }
     got=$(awk -F'[ =]' '{print $2}' <<<"$out")
     if [[ "$got" == "$want" ]]; then
-        printf '  PASS: %-50s state=%s\n' "$(basename "$fixture")" "$got"
+        printf '  PASS: %-50s state=%s\n' "$label" "$got"
         PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %-50s got=%s want=%s (full: %s)\n' \
-            "$(basename "$fixture")" "$got" "$want" "$out" >&2
+            "$label" "$got" "$want" "$out" >&2
         FAIL=$(( FAIL + 1 ))
     fi
 }
 
-# Filename prefix → expected state.
-expected_state_for() {
-    local base
-    base=$(basename "$1")
-    case "$base" in
-        autosuggest-*) echo autosuggest-only ;;
-        busy-*)        echo busy ;;
-        idle-*)        echo idle ;;
-        user-typing-*) echo user-typing ;;
-        blocked-*)     echo blocked ;;
-        absent-*)      echo absent ;;
-        over-limit-*)  echo over-limit ;;
-        # Added by your-org/nexus-code#896. These six fixtures had no arm, so
-        # `expected_state_for` returned "" and the loop SKIPped them — six
-        # committed captures asserting nothing, and six panes a classifier
-        # change could silently flip. The prefix was missing, not the
-        # coverage: every one of them already classifies
-        # `working-background`.
-        working-background-*) echo working-background ;;
-        *) echo "" ;;
-    esac
+MANIFEST="$_test_dir/pane-state-fixtures.manifest"
+
+# The manifest's data rows, TAB-separated: fixture, expect, env, args, why.
+# Comments and blank lines dropped here so every consumer sees the same rows.
+_ps_manifest_rows() {
+    grep -v '^[[:space:]]*#' "$MANIFEST" | grep -v '^[[:space:]]*$'
 }
 
 [[ -x "$HELPER" ]] || { echo "helper not executable: $HELPER" >&2; exit 1; }
 [[ -d "$FIX_DIR" ]] || { echo "fixtures dir missing: $FIX_DIR" >&2; exit 1; }
 
-echo "=== fixture classification ==="
+# The fixture corpus, as ONE function, because two things need it: the
+# classification loop below and the `--population` declaration. A second
+# implementation of "which fixtures exist" is exactly the drift the protocol's
+# one rule exists to forbid.
+_ps_fixture_files() {
+    ( shopt -s nullglob; printf '%s\n' "$FIX_DIR"/*.ansi )
+}
+
+# --- the `--population` protocol (your-org/nexus-code#803) -----------------
+#
+# WHY THIS SUITE NEEDED IT (your-org/nexus-code#1171 skeptic blocker). This is
+# the PRIMARY suite for `pane-state.sh`, and it declared no population — so it
+# was one of the ~356 suites INVISIBLE to `guards-for-diff`: absent from
+# `SELECTED` and from `CONSIDERED AND EXCLUDED` alike, hence indistinguishable
+# from a considered exclusion. A change carrying the largest edit to
+# `pane-state.sh` in that PR reported `13 of 13 selected guards PASS, exit 0`
+# while THIS suite went red. That green was true and irrelevant — `#1078`
+# exactly.
+#
+# The fixture directory is IN the population, and that is the load-bearing
+# part rather than an afterthought: a fixture with no manifest row makes this
+# suite RED, so ADDING A FILE HERE IS A CODE CHANGE to this suite's
+# assertions. That is how the `#1171` blocker happened — a fixture landed
+# whose name asserted the opposite of its purpose, and back then the name WAS
+# the assertion. The manifest is in the population for the same reason: it is
+# now where every expectation lives.
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    _ps_fixture_files
+    printf '%s\n' "$HELPER" "$MANIFEST"
+}
+gp_handle "$@"
+
+# ===========================================================================
+# fixture classification — expectations come from the MANIFEST, not the name
+# ===========================================================================
+#
+# your-org/nexus-code#1176. Everything below is fail-CLOSED in both
+# directions: an unruled fixture is RED (never SKIP, which is what `#896`
+# could only turn into an unasserted capture), and a row naming a fixture that
+# does not exist is RED too.
+
+echo "=== manifest integrity ==="
+[[ -r "$MANIFEST" ]] || { echo "manifest missing: $MANIFEST" >&2; exit 1; }
+
 shopt -s nullglob
-fixtures=("$FIX_DIR"/*.ansi)
+fixtures=()
+while IFS= read -r _psf; do [[ -n "$_psf" ]] && fixtures+=("$_psf"); done < <( _ps_fixture_files )
 (( ${#fixtures[@]} > 0 )) || { echo "no fixtures found" >&2; exit 1; }
-for f in "${fixtures[@]}"; do
-    want=$(expected_state_for "$f")
-    [[ -z "$want" ]] && {
-        printf '  SKIP: %s (unrecognised filename prefix)\n' "$(basename "$f")"
-        continue
+
+manifest_rows=$(_ps_manifest_rows)
+manifest_n=$(grep -c . <<<"$manifest_rows" || true)
+
+# Non-degeneracy floor before ANY set comparison. Two empty enumerations
+# compare EQUAL, which is the confident-zero shape this repo keeps meeting:
+# a broken reader would read as "the manifest covers everything".
+if (( manifest_n >= 40 )) && (( ${#fixtures[@]} >= 40 )); then
+    printf '  PASS: enumerations are non-degenerate (%d manifest rows, %d fixtures; floor 40)\n' \
+        "$manifest_n" "${#fixtures[@]}"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: %d manifest rows / %d fixtures — enumeration is suspect, refusing to compare\n' \
+        "$manifest_n" "${#fixtures[@]}" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# Every row must have all five columns, a `why`, and an `expect` that
+# `pane-state.sh` can actually produce. A typo in `expect` is a row that can
+# never pass and never says why.
+ps_states=$(bash "$HELPER" --states 2>/dev/null | sort)
+[[ -n "$ps_states" ]] || { echo "pane-state.sh --states printed nothing" >&2; exit 1; }
+malformed=0
+while IFS=$'\t' read -r m_fix m_want m_env m_args m_why; do
+    [[ -n "$m_fix" ]] || continue
+    if [[ -z "$m_want" || -z "$m_env" || -z "$m_args" || -z "$m_why" ]]; then
+        printf '    row for %q is missing a column (expect=%q env=%q args=%q why=%q)\n' \
+            "$m_fix" "${m_want:-}" "${m_env:-}" "${m_args:-}" "${m_why:-}" >&2
+        malformed=$(( malformed + 1 )); continue
+    fi
+    grep -qx -- "$m_want" <<<"$ps_states" || {
+        printf '    row for %q expects %q, which is not in `pane-state.sh --states`\n' "$m_fix" "$m_want" >&2
+        malformed=$(( malformed + 1 ))
     }
-    assert_state "$f" "$want"
+done <<<"$manifest_rows"
+if (( malformed == 0 )); then
+    printf '  PASS: every row is 5 columns, carries a rationale, and expects a declared state\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: %d malformed manifest row(s) — see above\n' "$malformed" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# Set equality, both directions, by BASENAME.
+have_fix=$(for f in "${fixtures[@]}"; do basename "$f"; done | sort -u)
+ruled_fix=$(cut -f1 <<<"$manifest_rows" | sort -u)
+unruled=$(comm -23 <(printf '%s\n' "$have_fix") <(printf '%s\n' "$ruled_fix"))
+stale=$(comm -13 <(printf '%s\n' "$have_fix") <(printf '%s\n' "$ruled_fix"))
+if [[ -z "$unruled" ]]; then
+    printf '  PASS: every fixture has at least one manifest row\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: fixture(s) with NO manifest row — a capture asserting nothing:\n%s\n' \
+        "$(sed 's/^/    /' <<<"$unruled")" >&2
+    printf '    → add a row to %s. It must say what the capture LOOKS like and\n' "$MANIFEST" >&2
+    printf '      why the verdict is what it is. Do not rename the file instead.\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+if [[ -z "$stale" ]]; then
+    printf '  PASS: every manifest row names a fixture that exists\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: manifest row(s) naming a fixture that does not exist:\n%s\n' \
+        "$(sed 's/^/    /' <<<"$stale")" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# Exactly ONE bare row per fixture. Zero is a capture only ever read under
+# contrived conditions; two is two answers to one question.
+bare_dupes=$(awk -F'\t' '$3 == "-" && $4 == "-" {print $1}' <<<"$manifest_rows" | sort | uniq -c \
+             | awk '$1 != 1 {print $1" x "$2}')
+bare_missing=$(comm -23 <(printf '%s\n' "$have_fix") \
+                        <(awk -F'\t' '$3 == "-" && $4 == "-" {print $1}' <<<"$manifest_rows" | sort -u))
+if [[ -z "$bare_dupes" && -z "$bare_missing" ]]; then
+    printf '  PASS: every fixture has exactly one unconditional (bare) row\n'; PASS=$(( PASS + 1 ))
+else
+    [[ -n "$bare_missing" ]] && printf '  FAIL: fixture(s) with no BARE row:\n%s\n' "$(sed 's/^/    /' <<<"$bare_missing")" >&2
+    [[ -n "$bare_dupes"   ]] && printf '  FAIL: fixture(s) with more than one BARE row:\n%s\n' "$(sed 's/^/    /' <<<"$bare_dupes")" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# --- the #1208 scenario harness -------------------------------------------
+#
+# Builds, for the manifest's `@…@` placeholders, a REAL reproduction of
+# your-org/nexus-code#1208 rather than a description of one:
+#
+#   * a live process tree  shell -> `claude` -> background wait shell, whose
+#     wait shell's argv is the `until [ -s "$T/status" ]; do sleep …; done`
+#     loop the incident actually left behind — the async-run token is IN THE
+#     ARGV, which is what makes it resolvable at all;
+#   * an async-run ledger for that token whose verdict is `died`: a pid that
+#     is gone, a recorded pidstart, and NO status file.
+#
+# The tree is the SAME for both rows; the ledger is the only variable. That is
+# deliberate — a differential pair that varies one axis is the only shape whose
+# green means what it says.
+#
+# Every process here is one this suite launched, is bounded by its own
+# `sleep`, and is torn down by pid immediately after the loop.
+_ps_h_dir=$(mktemp -d)
+_ps_h_pid=""
+_ps_async_state="$_ps_h_dir/state"
+_ps_async_win=testwin          # == the `--name` assert_state passes, so a fix
+                               # resolving by either channel finds the ledger
+_ps_async_token=ar-abdb92e13667
+# A SECOND token and tree, identical in every way except the ledger verdict:
+# this one's pid is alive with a matching start-time, so async-run says
+# `running`. It is both the authority probe and the non-vacuity control, and
+# it makes the VERDICT the single axis the differential varies. The first cut
+# of this harness varied the presence of `NEXUS_STATE_DIR` in the environment
+# instead -- which is not the axis the fix keys on: the wait wrapper's argv
+# carries an ABSOLUTE token path, so resolution works with no async-run
+# environment at all. That is why the live incident resolved from a watcher
+# process that had never heard of the window.
+_ps_run_token=ar-0123456789ab
+_ps_h_pid2=""
+_ps_run_pid=""
+_ps_harness_ok=0
+if command -v pgrep >/dev/null 2>&1 && [[ -r /proc/$$/stat ]]; then
+    _ps_bash_bin=$(command -v bash)
+    if cp "$_ps_bash_bin" "$_ps_h_dir/claude" 2>/dev/null; then
+        # `wk_encode` is the injective window-key encoder every window-keyed
+        # surface uses (#941); async-run resolves its directory with it, so the
+        # ledger must be written under the same key rather than a guess.
+        . "$_repo_root/monitor/_bookkeeping.sh" 2>/dev/null || true
+        if declare -F wk_encode >/dev/null 2>&1; then
+            _ps_tokdir="$_ps_async_state/async-run/$(wk_encode "$_ps_async_win")/$_ps_async_token"
+            mkdir -p "$_ps_tokdir"
+            # A pid that is gone, with a recorded start-time so the verdict is
+            # `died` (killed before writing status) and not `running`.
+            echo 4194303 > "$_ps_tokdir/pid"
+            echo 1        > "$_ps_tokdir/pidstart"
+            echo 1        > "$_ps_tokdir/started"
+            "$_ps_h_dir/claude" -c "bash -c 'T=$_ps_tokdir; until [ -s \"\$T/status\" ]; do sleep 30; done' & sleep 240" \
+                >/dev/null 2>&1 &
+            _ps_h_pid=$!
+
+            # The `running` sibling: a real, self-bounding process of ours,
+            # with its real /proc start-time recorded, so async-run's pid
+            # IDENTITY check passes and the verdict is genuinely `running`.
+            sleep 240 >/dev/null 2>&1 &
+            _ps_run_pid=$!
+            _ps_runtokdir="$_ps_async_state/async-run/$(wk_encode "$_ps_async_win")/$_ps_run_token"
+            mkdir -p "$_ps_runtokdir"
+            echo "$_ps_run_pid" > "$_ps_runtokdir/pid"
+            awk '{print $22}' "/proc/$_ps_run_pid/stat" 2>/dev/null > "$_ps_runtokdir/pidstart"
+            echo 1 > "$_ps_runtokdir/started"
+            "$_ps_h_dir/claude" -c "bash -c 'T=$_ps_runtokdir; until [ -s \"\$T/status\" ]; do sleep 30; done' & sleep 240" \
+                >/dev/null 2>&1 &
+            _ps_h_pid2=$!
+            # Wait for the child shell to exist rather than sleeping blind.
+            for _ps_i in $(seq 1 100); do
+                [[ -n "$(pgrep -P "$_ps_h_pid" 2>/dev/null)" ]] \
+                  && [[ -n "$(pgrep -P "$_ps_h_pid2" 2>/dev/null)" ]] && break
+                sleep 0.3
+            done
+            _ps_harness_ok=1
+        fi
+    fi
+fi
+if (( _ps_harness_ok == 1 )); then
+    # The harness must be measured, not assumed: `bg_reliable=1` is what says
+    # the process-tree walk was authoritative. Without it the footer fallback
+    # would drive the verdict and both scenario rows would be reading the
+    # fixture's `1 shell` footer instead of the tree they were built for.
+    # Probe the RUNNING tree, not the dead one. `bg_shells=`/`bg_reliable=`
+    # ride only on a `working-background` emit, so probing the dead tree would
+    # conflate "the walk was not authoritative" with "the fix correctly stopped
+    # calling this work in flight" -- and would report the FIX as a broken
+    # harness. The running tree is authoritative AND still working-background,
+    # so it separates the two.
+    _ps_probe=$("$HELPER" --fixture "$FIX_DIR/wrapped-up-one-shell-dead-async-1208.ansi" \
+                          --window 9 --name testwin --active 0 --pane-pid "$_ps_h_pid2" 2>&1)
+    if grep -q 'bg_reliable=1' <<<"$_ps_probe" && grep -q 'bg_shells=1' <<<"$_ps_probe"; then
+        printf '  PASS: #1208 harness built an authoritative tree (bg_shells=1 bg_reliable=1)\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: #1208 harness tree not authoritative — the scenario rows below would read the FOOTER, not the tree (got: %s)\n' \
+            "$_ps_probe" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+    _ps_rverdict=$(NEXUS_STATE_DIR="$_ps_async_state" NEXUS_WORKER_WINDOW="$_ps_async_win" \
+                  bash "$_repo_root/monitor/async-run.sh" --status-line "$_ps_run_token" 2>&1)
+    if [[ "$_ps_rverdict" == running\|* ]]; then
+        printf '  PASS: #1208 harness control ledger reports `running` for %s\n' "$_ps_run_token"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: #1208 harness CONTROL verdict is %q, want running|… — the non-vacuity control is vacuous\n' \
+            "$_ps_rverdict" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+    # And the ledger must actually say `died`, or the row below asks nothing.
+    _ps_verdict=$(NEXUS_STATE_DIR="$_ps_async_state" NEXUS_WORKER_WINDOW="$_ps_async_win" \
+                  bash "$_repo_root/monitor/async-run.sh" --status-line "$_ps_async_token" 2>&1)
+    if [[ "$_ps_verdict" == died\|* ]]; then
+        printf '  PASS: #1208 harness ledger reports `died` for %s\n' "$_ps_async_token"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: #1208 harness ledger verdict is %q, want died|… — the scenario row is vacuous\n' \
+            "$_ps_verdict" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+else
+    printf '  FAIL: could not build the #1208 harness (pgrep/proc/wk_encode unavailable) — refusing to report its rows as green\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# Placeholder expansion. An unrecognised `@NAME@` is RED rather than passed
+# through as a literal: a silently-unexpanded placeholder becomes a filename
+# nothing reads, and the row then measures the bare case while claiming a
+# scenario.
+_ps_expand() {
+    local v="$1"
+    v="${v//@ASYNC_STATE@/$_ps_async_state}"
+    v="${v//@ASYNC_WIN@/$_ps_async_win}"
+    v="${v//@ASYNC_TOKEN@/$_ps_async_token}"
+    v="${v//@BG_WAIT_PANE_PID@/$_ps_h_pid}"
+    v="${v//@BG_RUN_PANE_PID@/$_ps_h_pid2}"
+    printf '%s' "$v"
+}
+
+echo
+echo "=== fixture classification (manifest-driven) ==="
+checked=0
+while IFS=$'\t' read -r m_fix m_want m_env m_args m_why; do
+    [[ -n "$m_fix" && -n "$m_want" ]] || continue
+    [[ -f "$FIX_DIR/$m_fix" ]] || continue   # already RED above as a stale row
+    row_env=(); row_args=()
+    if [[ "$m_env" != "-" ]]; then
+        read -r -a row_env <<<"$(_ps_expand "$m_env")"
+    fi
+    if [[ "$m_args" != "-" ]]; then
+        read -r -a row_args <<<"$(_ps_expand "$m_args")"
+    fi
+    # Herestring, not a pipe: under this file's `set -uo pipefail` a `grep -q`
+    # that matches early closes the pipe and the producer takes SIGPIPE, so
+    # pipefail reports 141 and the `if` silently takes the ELSE arm — here that
+    # means an UNEXPANDED PLACEHOLDER passes the screen (#1214). These two
+    # values are short enough that today it does not fire, which is exactly why
+    # the form must not be left in place: the safety is accidental, and it ends
+    # the day a manifest row grows past the pipe buffer.
+    if grep -q '@[A-Z_]*@' <<<"${row_env[*]:-} ${row_args[*]:-}"; then
+        printf '  FAIL: %s — unexpanded placeholder in env/args (%s | %s)\n' \
+            "$m_fix" "${row_env[*]:-}" "${row_args[*]:-}" >&2
+        FAIL=$(( FAIL + 1 )); continue
+    fi
+    checked=$(( checked + 1 ))
+    assert_state "$FIX_DIR/$m_fix" "$m_want" "${row_env[@]}" -- "${row_args[@]}"
+done <<<"$manifest_rows"
+
+# A vanished loop body is a green suite that asserted nothing (#807). Pin the
+# count against the row count the manifest itself declares.
+if (( checked == manifest_n )); then
+    printf '  PASS: every one of the %d manifest rows was exercised\n' "$checked"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: exercised %d of %d manifest rows — assertions went missing\n' "$checked" "$manifest_n" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# Tear the harness down by PID — processes this suite launched, nothing else.
+for _ps_victim in "$_ps_h_pid" "$_ps_h_pid2" "$_ps_run_pid"; do
+    [[ -n "$_ps_victim" ]] || continue
+    pkill -P "$_ps_victim" >/dev/null 2>&1 || true
+    kill "$_ps_victim" >/dev/null 2>&1 || true
+    wait "$_ps_victim" 2>/dev/null || true
 done
+rm -rf "$_ps_h_dir"
 
 echo
 echo "=== output format ==="
@@ -525,7 +831,39 @@ fi
 #     stamp is present, pane-state must emit state=blocked so
 #     _unstick.sh case B can fire its auto-Enter cascade. Once the
 #     menu is dismissed (no overlay text), the stamp takes over.
-blocked_fixture=$(ls "$FIX_DIR"/blocked-*.ansi 2>/dev/null | head -1)
+# TWO defects in one line, both fixed here (your-org/nexus-code#1214 D1).
+#
+# (a) NULLGLOB + A COMMAND WITH A MEANINGFUL BARE FORM. This read
+#     `ls "$FIX_DIR"/blocked-*.ansi 2>/dev/null | head -1`. `shopt -s nullglob`
+#     is set FILE-WIDE at line 115 -- NOT the subshell-scoped
+#     `( shopt -s nullglob; … )` at line 75, which an earlier version of this
+#     comment cited and which does NOT reach here. The wrong line pointed at
+#     the wrong CONCLUSION, not merely a wrong number: a reader sent to 75
+#     would have decided the hazard was contained to a subshell. So when the
+#     glob matches NOTHING it
+#     VANISHES rather than staying literal -- `ls` then runs BARE, lists the
+#     CURRENT WORKING DIRECTORY, and `head -1` takes its first entry. Measured:
+#     the assertion ran against CHANGELOG.md. The honest `else` SKIP branch below
+#     is unreachable whenever the cwd is non-empty, which it always is.
+#     The general shape, worth grepping for beyond this file because nullglob is
+#     a repo-wide convention here: A GLOB THAT CAN LEGITIMATELY MATCH NOTHING,
+#     FEEDING A COMMAND THAT DOES SOMETHING MEANINGFUL WITH NO ARGUMENTS
+#     (`ls`/`du` act on the cwd; `cat`/`grep`/`wc` read stdin). Six such sites
+#     across four files at this commit -- see the PR.
+#
+# (b) A FIFTH FILENAME-DERIVED EXPECTATION. `blocked-*` picks the fixture BY
+#     NAME and then asserts it classifies as `blocked` -- the scheme `#1176`
+#     removes, in the file that removes it, for the fourth time on this branch.
+#
+# The manifest answers both: it names the fixture, so no glob, and it carries
+# the expectation, so no prefix. A bash loop, not `$(...)`, so there is no
+# command with a bare form to fall back to.
+blocked_fixture=""
+while IFS=$'\t' read -r _bf _bw _be _ba _br; do
+    [[ "$_bw" == "blocked" && "$_be" == "-" && "$_ba" == "-" ]] || continue
+    [[ -f "$FIX_DIR/$_bf" ]] || continue
+    blocked_fixture="$FIX_DIR/$_bf"; break
+done <<<"$manifest_rows"
 if [[ -n "$blocked_fixture" ]]; then
     out=$("$HELPER" --fixture "$blocked_fixture" --window 9 --name olwin --active 0 \
                     --over-limit-file "$ol_tmp" \
@@ -1049,7 +1387,7 @@ echo
 echo "=== async-signal idle refinement (issue #183) ==="
 # Refinement applies when the renderer (or heartbeat) would have
 # emitted `idle`. The four refined classes:
-#   working-background  monitor_handles>0 OR background_bash_count>0
+#   working-background  footer Monitor token OR a live background shell (#1374: never the heartbeat)
 #   working-self-paced  scheduled_wakeup_at > now
 #   idle-orphan-async   external_waits != [] AND no monitor/wakeup
 #   idle                none of the above
@@ -1061,25 +1399,32 @@ ASYNC_NOW=2000000000
 async_hb="$async_tmp/async.json"
 
 write_async_hb() {
-    # Args: <state> <age> <monitor_handles> <bg_count> <scheduled_wakeup_at|-> <external_waits_json>
-    local state="$1" age="$2" mon="$3" bg="$4" swa="$5" waits="$6"
+    # Args: <state> <age> <ignored> <ignored> <scheduled_wakeup_at|-> <external_waits_json>
+    # Positions 3 and 4 used to plant `monitor_handles` / `background_bash_count`
+    # — fields NO production writer has ever emitted (your-org/nexus-code#1374),
+    # so a fixture carrying them asserted a path production could not take.
+    # They are accepted and ignored so the call sites read unchanged; the
+    # heartbeat written here is the WRITER's schema, nothing more.
+    local state="$1" age="$2" swa="$5" waits="$6"
     local last_activity=$(( ASYNC_NOW - age ))
     if [[ "$swa" == "-" ]]; then
         jq -nc \
             --arg s "$state" --argjson la "$last_activity" --arg w test \
-            --argjson m "$mon" --argjson b "$bg" \
             --argjson ew "$waits" \
-            '{state:$s, last_activity:$la, window:$w, monitor_handles:$m, background_bash_count:$b, external_waits:$ew}' \
+            '{state:$s, last_activity:$la, window:$w, external_waits:$ew, dismissed_waits:[]}' \
             > "$async_hb"
     else
         jq -nc \
             --arg s "$state" --argjson la "$last_activity" --arg w test \
-            --argjson m "$mon" --argjson b "$bg" \
             --argjson swa "$swa" --argjson ew "$waits" \
-            '{state:$s, last_activity:$la, window:$w, monitor_handles:$m, background_bash_count:$b, scheduled_wakeup_at:$swa, external_waits:$ew}' \
+            '{state:$s, last_activity:$la, window:$w, scheduled_wakeup_at:$swa, external_waits:$ew, dismissed_waits:[]}' \
             > "$async_hb"
     fi
 }
+# The two handle signals are driven by their REAL sources (#1374): a Monitor
+# handle by the pane footer's `· 1 monitor ·` token, a background shell by
+# the process-tree override.
+mon_footer_fixture="$FIX_DIR/working-background-monitor-synthetic.ansi"
 
 assert_async_state() {
     local label="$1" want_state="$2" want_extra="$3"; shift 3
@@ -1115,15 +1460,23 @@ assert_async_state() {
     fi
 }
 
-# (1) working-background: monitor handle live.
-write_async_hb idle_prompt 5 1 0 - '[]'
-assert_async_state "monitor_handles=1 → working-background" \
-    working-background ""
+# (1) working-background: monitor handle live — in the FOOTER, its only source.
+write_async_hb idle_prompt 5 0 0 - '[]'
+assert_async_state "footer '· 1 monitor ·' → working-background" \
+    working-background "" --fixture "$mon_footer_fixture"
 
-# (1b) working-background: background bash live.
-write_async_hb idle_prompt 5 0 2 - '[]'
-assert_async_state "background_bash_count=2 → working-background" \
-    working-background ""
+# (1b) working-background: background bash live — in the PROCESS TREE.
+write_async_hb idle_prompt 5 0 0 - '[]'
+assert_async_state "process tree bg_shells=2 → working-background" \
+    working-background "" --bg-shells 2
+
+# (1c) #1374: a heartbeat that PLANTS the never-written fields is NOT a signal.
+#      Production could never take this path; a fixture that did was asserting
+#      a defence that did not exist.
+jq -nc --argjson la "$(( ASYNC_NOW - 5 ))" \
+    '{state:"idle_prompt", last_activity:$la, window:"test", monitor_handles:1, background_bash_count:2, external_waits:[], dismissed_waits:[]}' > "$async_hb"
+assert_async_state "#1374 planted monitor_handles/background_bash_count → plain idle (no such arm)" \
+    idle ""
 
 # (2) working-self-paced: scheduled_wakeup_at > now.
 write_async_hb idle_prompt 5 0 0 "$(( ASYNC_NOW + 300 ))" '[]'
@@ -1152,11 +1505,11 @@ write_async_hb idle_prompt 5 0 0 - '[]'
 assert_async_state "empty external_waits → plain idle" \
     idle ""
 
-# (4) Priority: monitor handle beats external_waits.
-write_async_hb idle_prompt 5 1 0 - \
+# (4) Priority: monitor handle (footer) beats external_waits.
+write_async_hb idle_prompt 5 0 0 - \
     '[{"kind":"slurm","id":"99999","desc":""}]'
 assert_async_state "monitor + waits → working-background wins" \
-    working-background ""
+    working-background "" --fixture "$mon_footer_fixture"
 
 # (4b) scheduled_wakeup beats external_waits.
 write_async_hb idle_prompt 5 0 0 "$(( ASYNC_NOW + 60 ))" \
@@ -1164,15 +1517,49 @@ write_async_hb idle_prompt 5 0 0 "$(( ASYNC_NOW + 60 ))" \
 assert_async_state "wakeup + waits → working-self-paced wins" \
     working-self-paced ""
 
-# (5) Stale heartbeat: refinement skipped — falls through to renderer
-#     (idle from the fixture). The async-signal staleness defaults to
-#     60 s; bump the age past it.
-write_async_hb idle_prompt 5 0 0 - \
-    '[{"kind":"slurm","id":"x","desc":""}]'
-# Override last_activity to be way in the past for the async window.
+# (5) THE TWO HORIZONS ARE NOT ONE HORIZON (your-org/nexus-code#1220).
+#
+# This case used to be a single assertion: heartbeat 3600 s old, an
+# `external_waits` array present, expect `idle` — i.e. it PINNED the very
+# behaviour #1220 reports as the defect, that a declared wait goes invisible
+# once the worker falls quiet. It passed for eighteen months while ten real
+# waits sat hidden for 18.9 h on a live window. Rewritten to assert the
+# property rather than the old number, in BOTH directions.
+#
+# The distinction the code now makes: the 60 s horizon expires signals that
+# GRANT AN EXEMPTION (`monitor_handles`, `background_bash_count`,
+# `scheduled_wakeup_at` -> `working-background` / `working-self-paced`, both
+# in `_BK_ACTIVE_STATES`, both refusing a kill). `external_waits` grants no
+# exemption — `idle-orphan-async` is in `_BK_KILL_OK_STATES` next to plain
+# `idle` — so expiring it deletes a declaration instead of withdrawing a
+# privilege, and gets its own, far longer horizon.
+
+# (5a) The EXEMPTION-granting signals still expire at 60 s. This is the half
+#      the short horizon is actually for, and it must not regress.
+write_async_hb idle_prompt 5 3 0 - '[]'
 jq -c '.last_activity = (.last_activity - 3600)' "$async_hb" \
     > "$async_hb.tmp" && mv "$async_hb.tmp" "$async_hb"
-assert_async_state "stale async signals → renderer fallback (idle)" \
+assert_async_state "5a stale monitor handles STILL expire → idle" \
+    idle ""
+
+# (5b) A declared wait SURVIVES the same 3600 s quiet. A worker blocked on an
+#      external wait is quiet BECAUSE it is blocked, so quiet cannot be the
+#      evidence that no wait is outstanding.
+write_async_hb idle_prompt 5 0 0 - \
+    '[{"kind":"slurm","id":"x","desc":""}]'
+jq -c '.last_activity = (.last_activity - 3600)' "$async_hb" \
+    > "$async_hb.tmp" && mv "$async_hb.tmp" "$async_hb"
+assert_async_state "5b declared wait SURVIVES 3600s quiet → idle-orphan-async" \
+    idle-orphan-async "orphan_kinds=slurm:x"
+
+# (5c) …and it is a HORIZON, not the absence of one. Past 48 h an abandoned
+#      heartbeat stops declaring. Without this arm the fix would be
+#      indistinguishable from removing the check altogether.
+write_async_hb idle_prompt 5 0 0 - \
+    '[{"kind":"slurm","id":"z","desc":""}]'
+jq -c '.last_activity = (.last_activity - 200000)' "$async_hb" \
+    > "$async_hb.tmp" && mv "$async_hb.tmp" "$async_hb"
+assert_async_state "5c wait past the 48h horizon expires → idle" \
     idle ""
 
 # (6) Custom async-staleness lets a row in.
@@ -1294,9 +1681,9 @@ fi
 
 # (10c) Monitor-handle working-background carries NO bg_cpu (it is
 #       self-waking and must never be subjected to the shell
-#       orphan-grace). Heartbeat monitor_handles=1, bg=0.
-write_async_hb idle_prompt 5 1 0 - '[]'
-out=$("$HELPER" --fixture "$idle_fixture" \
+#       orphan-grace). Footer `· 1 monitor ·`, no shell.
+write_async_hb idle_prompt 5 0 0 - '[]'
+out=$("$HELPER" --fixture "$mon_footer_fixture" \
                 --window 9 --name montest --active 0 \
                 --heartbeat-file "$async_hb" \
                 --now "$ASYNC_NOW" --bg-cpu 9999 2>&1)
@@ -1309,15 +1696,15 @@ else
     FAIL=$(( FAIL + 1 ))
 fi
 
-# (10d) shell-count from heartbeat (background_bash_count=3) → shell
+# (10d) shell-count from the process tree (bg_shells=3) → shell
 #       driver → bg_cpu present.
-write_async_hb idle_prompt 5 0 3 - '[]'
+write_async_hb idle_prompt 5 0 0 - '[]'
 out=$("$HELPER" --fixture "$idle_fixture" \
                 --window 9 --name bgtest --active 0 \
                 --heartbeat-file "$async_hb" \
-                --now "$ASYNC_NOW" --bg-cpu 555 2>&1)
+                --now "$ASYNC_NOW" --bg-shells 3 --bg-cpu 555 2>&1)
 if grep -qF 'state=working-background' <<<"$out" && grep -qF 'bg_cpu=555' <<<"$out"; then
-    printf '  PASS: heartbeat background_bash_count → shell-driven bg_cpu\n'
+    printf '  PASS: process-tree shell count → shell-driven bg_cpu\n'
     PASS=$(( PASS + 1 ))
 else
     printf '  FAIL: heartbeat bg-count bg_cpu — (full: %s)\n' "$out" >&2
@@ -1447,11 +1834,11 @@ if [[ -f "$spurious_foot" ]]; then
 fi
 
 # (11c) Monitor is NOT visible to the process tree — a reliable tree
-#       count of 0 must NOT suppress a live Monitor handle (heartbeat
-#       monitor_handles=1). Still working-background, and (Monitor-driven)
+#       count of 0 must NOT suppress a live Monitor handle (footer
+#       `· 1 monitor ·`). Still working-background, and (Monitor-driven)
 #       carries NO bg_cpu.
-write_async_hb idle_prompt 5 1 0 - '[]'
-out=$("$HELPER" --fixture "$idle_fixture" \
+write_async_hb idle_prompt 5 0 0 - '[]'
+out=$("$HELPER" --fixture "$mon_footer_fixture" \
                 --window 9 --name pt-mon --active 0 \
                 --heartbeat-file "$async_hb" \
                 --now "$ASYNC_NOW" --bg-shells 0 2>&1)
@@ -1506,8 +1893,8 @@ fi
 
 # (12c) Monitor-handle working-background carries NEITHER bg_shells nor
 #       bg_reliable (it is not shell-driven).
-write_async_hb idle_prompt 5 1 0 - '[]'
-out=$("$HELPER" --fixture "$idle_fixture" \
+write_async_hb idle_prompt 5 0 0 - '[]'
+out=$("$HELPER" --fixture "$mon_footer_fixture" \
                 --window 9 --name bgfields-mon --active 0 \
                 --heartbeat-file "$async_hb" \
                 --now "$ASYNC_NOW" --bg-shells 0 2>&1)
@@ -1537,12 +1924,39 @@ if command -v tmux >/dev/null 2>&1; then
     bogus_tmpdir=$(mktemp -d)
     bogus_sock="nexus-pane-state-140-$$-$RANDOM"
     bogus_session="ps140"
-    bogus_tmux_bin=$(command -v tmux)
-    cat > "$bogus_tmpdir/tmux" <<TMUXSHIM
-#!/usr/bin/env bash
-exec "$bogus_tmux_bin" -L "$bogus_sock" "\$@"
-TMUXSHIM
-    chmod +x "$bogus_tmpdir/tmux"
+    # THE REAL BINARY, NOT `command -v tmux` (your-org/nexus-code#1105).
+    # Under an agent, `command -v tmux` is monitor/tmuxwrap/tmux. Interpolating
+    # it into the shim below puts the wrapper's own path in the shim's body;
+    # tmuxwrap's gate-3 then classifies THE SHIM as a wrapper, skips it, and
+    # resolves the real tmux WITH NO -L. $BASH_ENV re-fronts tmuxwrap ahead of
+    # this fixture's PATH prepend in every child shell, so `pane-state.sh` ran
+    # its query against the OPERATOR'S LIVE SERVER — where `ps140:0` does not
+    # exist — and the two assertions below failed about the wrong server.
+    # Measured: 196/2 for every agent in the sandbox, 198/0 outside it, with
+    # $BASH_ENV the only discriminating variable. Invisible to CI, which does
+    # not set it.
+    . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_tmux-fixture.sh"
+    bogus_tmux_bin=$(nx_real_tmux_bin) || {
+        echo "SKIP: no real tmux BINARY on PATH (only wrappers) — cannot isolate this fixture" >&2
+        bogus_tmux_bin=""
+    }
+    # BRACES (your-org/nexus-code#1115 skeptic F2). The belt above stops
+    # tmuxwrap's gate-3 skipping this shim; braces make a pin lost to some
+    # FUTURE force-front harmless rather than board-reaching. Without them this
+    # fixture's servers live in /tmp/tmux-<uid>/ right beside the board's own
+    # `default` socket. $TMUX outranks $TMUX_TMPDIR (#644), so the unset is not
+    # optional. This is the only tmux server this suite creates (grepped: the
+    # sole `-L` sites are this shim and cleanup_bogus), so scoping the change
+    # here cannot perturb another fixture.
+    export TMUX_TMPDIR="$bogus_tmpdir/tt"
+    mkdir -p "$TMUX_TMPDIR"
+    unset TMUX
+    # nx_write_tmux_shim REFUSES a wrapper-built shim, so the construction that
+    # caused #1105 cannot reappear here silently.
+    nx_write_tmux_shim "$bogus_tmpdir" "$bogus_tmux_bin" "$bogus_sock" || {
+        echo "ENV-FAIL: could not write the private-tmux shim" >&2
+        exit 1
+    }
     cleanup_bogus() {
         # Pin the socket EXPLICITLY (-L), never via the PATH shim. The shim's
         # creation above is unchecked and this same function `rm -rf`s the dir
@@ -1555,6 +1969,21 @@ TMUXSHIM
         rm -rf "$bogus_tmpdir"
     }
     trap cleanup_bogus EXIT
+
+    # THE ALARM (your-org/nexus-code#1105, #1115 skeptic F2). Assert that the
+    # pin actually survives into a FRESH `bash` — which is how this suite
+    # invokes $HELPER, and is exactly where the pin was silently displaced
+    # before. A subshell would NOT reproduce the condition: $BASH_ENV is
+    # sourced at the start of a non-interactive shell, so only a new bash
+    # re-fronts monitor/tmuxwrap ahead of this fixture's PATH.
+    _ps_want_sock="$TMUX_TMPDIR/tmux-$(id -u)/$bogus_sock"
+    if nx_assert_tmux_pinned "$bogus_tmpdir" "$_ps_want_sock" 2>/dev/null; then
+        printf '  PASS: ISOLATION CONTROL — a child `bash` reaches the FIXTURE socket, not the board (#1105)\n'
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: ISOLATION CONTROL — $HELPER would query a DIFFERENT tmux server than this fixture (#1105); every assertion below would be about that server\n' >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
 
     # Bring up an isolated tmux server. `-f` neutralises the operator's
     # personal tmux.conf so it can't perturb window names or base-index —
@@ -1784,6 +2213,76 @@ if grep -qF 'bg_oldest_start=1699999999' <<<"$out"; then
 else
     printf '  FAIL: bg_oldest_start not emitted — %s\n' "$out" >&2
     FAIL=$(( FAIL + 1 ))
+fi
+
+echo
+echo "=== bg_cpu_bp / bg_wedged: elapsed-vs-CPU names a BLOCKED child (your-org/nexus-code#1446) ==="
+# The 5h36m waiter: 428 jiffies over 20,160 s = 0.02% CPU = 2 bp. Three
+# `grep -r … | head` stalls and this waiter all read `working-background`
+# with nothing in the line to tell them from real compute.
+_wg_now=1700000000
+out=$("$HELPER" --fixture "$idle_fixture" --window 9 --name bgwedge --active 0 \
+                --heartbeat-file "$async_tmp/missing.json" --now "$_wg_now" \
+                --bg-shells 1 --bg-cpu 428 --bg-oldest-start $(( _wg_now - 20160 )) 2>&1)
+if grep -qF 'bg_cpu_bp=2 ' <<<"$out" && grep -qF 'bg_wedged=1' <<<"$out"; then
+    printf '  PASS: 428 jiffies over 5h36m → bg_cpu_bp=2 bg_wedged=1\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: wedged waiter not flagged — %s\n' "$out" >&2; FAIL=$(( FAIL + 1 ))
+fi
+# your-org/nexus-code#1460: the line carries a MEMBERSHIP digest of the walked
+# pid tree, so the watcher can tell a static tree (a wedge) from turnover (a
+# driver blocked in wait()). Overrides carry it through; absent, it reads `-`.
+if grep -qF ' bg_members=- ' <<<"$out "; then
+    printf '  PASS: bg_members=- when no digest was measured (override path, #1460)\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: bg_members field missing or not - — %s\n' "$out" >&2; FAIL=$(( FAIL + 1 ))
+fi
+out_m=$("$HELPER" --fixture "$idle_fixture" --window 9 --name bgwedge --active 0 \
+                --heartbeat-file "$async_tmp/missing.json" --now "$_wg_now" \
+                --bg-shells 1 --bg-cpu 428 --bg-oldest-start $(( _wg_now - 20160 )) \
+                --bg-members 4242424242 2>&1)
+if grep -qF 'bg_members=4242424242' <<<"$out_m"; then
+    printf '  PASS: --bg-members rides the line as bg_members= (#1460)\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: bg_members override not emitted — %s\n' "$out_m" >&2; FAIL=$(( FAIL + 1 ))
+fi
+# CONTROL 1: a genuinely computing child (50% CPU) over the same episode is NOT wedged.
+out=$("$HELPER" --fixture "$idle_fixture" --window 9 --name bgbusy --active 0 \
+                --heartbeat-file "$async_tmp/missing.json" --now "$_wg_now" \
+                --bg-shells 1 --bg-cpu 1008000 --bg-oldest-start $(( _wg_now - 20160 )) 2>&1)
+if grep -qF 'bg_cpu_bp=5000 ' <<<"$out" && grep -qF 'bg_wedged=0' <<<"$out"; then
+    printf '  PASS: a 50%% CPU child over the same episode is measured (5000 bp) and NOT wedged\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: computing child mis-flagged — %s\n' "$out" >&2; FAIL=$(( FAIL + 1 ))
+fi
+# CONTROL 2: a YOUNG episode at near-zero CPU is not wedged yet — a job that
+# just started is allowed to be waiting on I/O for the first ten minutes.
+out=$("$HELPER" --fixture "$idle_fixture" --window 9 --name bgyoung --active 0 \
+                --heartbeat-file "$async_tmp/missing.json" --now "$_wg_now" \
+                --bg-shells 1 --bg-cpu 1 --bg-oldest-start $(( _wg_now - 300 )) 2>&1)
+if grep -qF 'bg_cpu_bp=0 ' <<<"$out" && grep -qF 'bg_wedged=0' <<<"$out"; then
+    printf '  PASS: a 5-minute-old idle child is measured (0 bp) but NOT yet wedged\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: young episode mis-flagged — %s\n' "$out" >&2; FAIL=$(( FAIL + 1 ))
+fi
+# CONTROL 3: no episode start → "not measured" is distinguishable from "not wedged".
+out=$("$HELPER" --fixture "$idle_fixture" --window 9 --name bgnostart --active 0 \
+                --heartbeat-file "$async_tmp/missing.json" --now "$_wg_now" \
+                --bg-shells 1 --bg-cpu 1 --bg-oldest-start 0 2>&1)
+if grep -qF 'bg_cpu_bp=- ' <<<"$out" && grep -qF 'bg_wedged=0' <<<"$out"; then
+    printf '  PASS: unknown episode start → bg_cpu_bp=- (not measured), not wedged\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: unknown-start case — %s\n' "$out" >&2; FAIL=$(( FAIL + 1 ))
+fi
+# POTENCY: the threshold is a knob; raising it flips control 2 to wedged, so
+# the flag is computed from the inputs rather than hard-wired to 0.
+out=$(NEXUS_BG_WEDGE_MIN_ELAPSED=60 "$HELPER" --fixture "$idle_fixture" --window 9 --name bgyoung2 --active 0 \
+                --heartbeat-file "$async_tmp/missing.json" --now "$_wg_now" \
+                --bg-shells 1 --bg-cpu 1 --bg-oldest-start $(( _wg_now - 300 )) 2>&1)
+if grep -qF 'bg_wedged=1' <<<"$out"; then
+    printf '  PASS: POTENCY — with the min-elapsed knob at 60 s the same young episode IS wedged\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: knob did not flip the verdict — %s\n' "$out" >&2; FAIL=$(( FAIL + 1 ))
 fi
 
 echo
@@ -2113,9 +2612,17 @@ echo "=== #896: a select-dialog is recognised STRUCTURALLY, not by its wording =
 # always fires is the same defect as one that never does, failing toward the
 # other side.
 md_live="$FIX_DIR/blocked-workspace-trust-realmodel.ansi"
+# The SECOND live capture (your-org/nexus-code#1112). 2.1.248 dropped the `N.`
+# ordinals from this dialog and reordered its options, breaking the ordinal-keyed
+# form of condition (b) and putting every trust-dialog pane back on `empty`. Both
+# captures are committed and both must classify, because the operator's pin is
+# 2.1.246 and the candidate stream is >=2.1.248: a fix that trades one rendering
+# for the other is not a fix.
+md_live248="$FIX_DIR/blocked-workspace-trust-realmodel-248.ansi"
 md_unnamed="$FIX_DIR/blocked-unnamed-dialog-synthetic.ansi"
 md_quoted="$FIX_DIR/idle-trust-dialog-quoted-synthetic.ansi"
-for _f in "$md_live" "$md_unnamed" "$md_quoted"; do
+md_quoted248="$FIX_DIR/idle-trust-dialog-248-quoted-synthetic.ansi"
+for _f in "$md_live" "$md_live248" "$md_unnamed" "$md_quoted" "$md_quoted248"; do
     [[ -f "$_f" ]] || { echo "needs $_f" >&2; exit 1; }
 done
 
@@ -2126,6 +2633,17 @@ if grep -qF 'state=blocked' <<<"$out" && grep -qF 'overlay=workspace-trust' <<<"
     ok "the live-captured trust dialog → state=blocked overlay=workspace-trust"
 else
     bad "live trust dialog" "want state=blocked + overlay=workspace-trust, got: $out"
+fi
+
+# (1b) THE SAME DIALOG AS 2.1.248 RENDERS IT — no ordinals, options reordered,
+#      everything else identical. Also a real capture from the real binary
+#      (2.1.248 in a throwaway prefix, one sequential harness boot), not a
+#      transcription. This is the assertion #1112 exists for.
+out=$("$HELPER" --fixture "$md_live248" --window 9 --name mdwin --active 0 2>&1)
+if grep -qF 'state=blocked' <<<"$out" && grep -qF 'overlay=workspace-trust' <<<"$out"; then
+    ok "the 2.1.248 trust dialog (ordinals DROPPED) → state=blocked overlay=workspace-trust"
+else
+    bad "2.1.248 trust dialog" "want state=blocked + overlay=workspace-trust, got: $out"
 fi
 
 # (2) THE CLASS ASSERTION. A dialog whose wording appears in no Claude Code
@@ -2192,6 +2710,18 @@ else
     bad "quoted trust dialog" "want state=idle and no overlay=, got: $out"
 fi
 
+# (3b) THE SAME, FOR THE UNNUMBERED RENDERING — and it matters MORE than (3).
+#      Widening (b) from `❯ N.` to a column-aligned cursor row makes this frame
+#      EASIER to match, so the live-vs-quoted guard is now carrying more weight
+#      than it was. This pane keeps its footer INSIDE the bottom slice and its
+#      REPL row below it, so (c) is the condition doing the rejecting here.
+out=$("$HELPER" --fixture "$md_quoted248" --window 9 --name mdwin --active 0 2>&1)
+if grep -qF 'state=idle' <<<"$out" && ! grep -qF 'overlay=' <<<"$out"; then
+    ok "a pane QUOTING the 2.1.248 (unnumbered) dialog stays idle (no overlay= claim)"
+else
+    bad "quoted 2.1.248 dialog" "want state=idle and no overlay=, got: $out"
+fi
+
 # (4) The four near-misses, one per condition. Each must classify as it did
 #     before this change — the `busy-` prefix loop above already asserts that;
 #     what these add is that none of them acquired an `overlay=` claim, which
@@ -2199,6 +2729,7 @@ fi
 declare -A md_near=(
     ["busy-menu-no-footer-synthetic.ansi"]="a menu-shaped list with no Enter/Esc affordance"
     ["busy-footer-plain-list-synthetic.ansi"]="a footer over a list with no highlighted choice"
+    ["busy-footer-aligned-list-no-cursor-synthetic.ansi"]="a footer over a COLUMN-ALIGNED list with no cursor (the shape the ordinal-free rule must still refuse)"
     ["busy-footer-single-option-synthetic.ansi"]="a footer over a SINGLE option (one choice is not a menu)"
     ["busy-esc-to-interrupt-menu-synthetic.ansi"]="the spinner's own lowercase 'esc to interrupt'"
     ["busy-dialog-quoted-midrender-synthetic.ansi"]="a BUSY pane quoting the dialog, mid-render (no chevron at all)"
@@ -2233,26 +2764,59 @@ fi
 #     exactly the `blocked-*` set may carry an `overlay=`, and nothing else may.
 #     This is the assertion that notices a future widening of the arm even if
 #     nobody thinks to add a fixture for what it broke.
-md_leaked=0 md_missing=0
+# THE EXPECTATION COMES FROM THE MANIFEST, NOT FROM THE FILENAME
+# (your-org/nexus-code#1214 skeptic F2). This sweep used to read
+# `case "$(basename "$md_f")" in blocked-*)`, which is the FILENAME-PREFIX
+# scheme `#1176` removed -- surviving inside the very file that removed it, and
+# ruling on all 57 fixtures. It made the manifest's own promise ("a fixture's
+# name is now free to DESCRIBE the capture") false as shipped, and it was
+# exercised by a rename: renaming `blocked-askuq-synthetic.ansi` with its
+# manifest row updated and the classifier byte-identical turned the suite red
+# for the wrong reason.
+#
+# The BARE row (env `-`, args `-`) is the one that speaks for the fixture read
+# with no scenario, which is exactly how this sweep reads it.
+#
+# A fixture with NO manifest row is RED, not silently non-blocked: an unknown
+# expectation must never take the permissive arm.
+md_leaked=0 md_missing=0 md_unknown=0
+_md_want() {                       # _md_want <basename> -> bare-row want, or ""
+    local want="" b="$1" m_f m_w m_e m_a m_r
+    while IFS=$'\t' read -r m_f m_w m_e m_a m_r; do
+        [[ "$m_f" == "$b" ]] || continue
+        [[ "$m_e" == "-" && "$m_a" == "-" ]] || continue
+        want="$m_w"; break
+    done <<<"$manifest_rows"
+    printf '%s' "$want"
+}
 for md_f in "$FIX_DIR"/*.ansi; do
     out=$("$HELPER" --fixture "$md_f" --window 9 --name mdwin --active 0 2>&1)
-    case "$(basename "$md_f")" in
-        blocked-*)
-            grep -qF 'overlay=' <<<"$out" || {
-                md_missing=$(( md_missing + 1 ))
-                printf '  note: %s is blocked-* but carries no overlay=: %s\n' "$(basename "$md_f")" "$out" >&2
-            } ;;
-        *)
-            grep -qF 'overlay=' <<<"$out" && {
-                md_leaked=$(( md_leaked + 1 ))
-                printf '  note: %s is NOT blocked-* but claims an overlay: %s\n' "$(basename "$md_f")" "$out" >&2
-            } ;;
-    esac
+    md_b=$(basename "$md_f")
+    md_w=$(_md_want "$md_b")
+    if [[ -z "$md_w" ]]; then
+        md_unknown=$(( md_unknown + 1 ))
+        printf '  note: %s has no bare manifest row — expectation UNKNOWN, refusing to assume\n' "$md_b" >&2
+    elif [[ "$md_w" == "blocked" ]]; then
+        grep -qF 'overlay=' <<<"$out" || {
+            md_missing=$(( md_missing + 1 ))
+            printf '  note: %s is manifest-blocked but carries no overlay=: %s\n' "$md_b" "$out" >&2
+        }
+    else
+        grep -qF 'overlay=' <<<"$out" && {
+            md_leaked=$(( md_leaked + 1 ))
+            printf '  note: %s is manifest-%s but claims an overlay: %s\n' "$md_b" "$md_w" "$out" >&2
+        }
+    fi
 done
-if (( md_leaked == 0 && md_missing == 0 )); then
-    ok "overlay= appears on exactly the blocked-* fixtures and no others (swept all $(ls -1 "$FIX_DIR"/*.ansi | wc -l))"
+if (( md_leaked == 0 && md_missing == 0 && md_unknown == 0 )); then
+    ok "overlay= appears on exactly the manifest-blocked fixtures and no others (swept all ${#fixtures[@]})"
 else
-    bad "overlay sweep" "$md_leaked non-blocked fixtures claimed an overlay, $md_missing blocked fixtures carried none"
+    # NAME EVERY COUNTER THE CONDITION TESTS (your-org/nexus-code#1214 D4).
+    # This message omitted md_unknown, so a fixture with NO manifest row --
+    # the arm added to stop an unknown expectation taking the permissive
+    # branch -- failed with "0 non-blocked … 0 blocked …", i.e. a failure
+    # reporting two zeroes and never naming its own cause.
+    bad "overlay sweep" "$md_leaked manifest-non-blocked fixtures claimed an overlay, $md_missing manifest-blocked fixtures carried none, $md_unknown fixtures had NO manifest row (expectation unknown — refused rather than assumed)"
 fi
 
 # (6) EACH of the three conditions is load-bearing, proven by mutation against
@@ -2292,10 +2856,13 @@ targets = {
   #     measuring nothing, which is the failure mode this whole section is
   #     shaped against.
   'slice': [SLICE],
-  # (b1) the `❯ N.` highlighted-choice requirement
-  'chevron': [WORKING, "    grep -qE '^[[:space:]]*❯ +[0-9]+\\.[[:space:]]' <<<\"$above\" || return 1\n"],
-  # (b2) the two-option floor
-  'siblings': [WORKING, "    (( options >= 2 )) || return 1\n"],
+  # (b1) the highlighted-choice requirement. No longer keyed on `N.` ordinals
+  #      (your-org/nexus-code#1112) — 2.1.248 dropped those — so the guard being
+  #      removed is now the emptiness check on the cursor-row search.
+  'chevron': [WORKING, '    [[ -n "$sel_line" ]] || return 1\n'],
+  # (b2) the sibling floor: one option is not a menu. Under #1112 the sibling is
+  #      identified by COLUMN ALIGNMENT rather than by carrying an ordinal.
+  'siblings': [WORKING, '    grep -qE "$sib_re" <<<"$above" || return 1\n'],
   # (c) live-vs-quoted: no REPL row below the footer
   'repl': ['    if grep -qF "❯${NBSP}" <<<"$(tail -n +"$(( footer_ln + 1 ))" <<<"$plain")"; then\n'
            '        return 1\n'
@@ -2345,8 +2912,8 @@ fi
 # inline `$md_high` pane above.
 md_cases=(
     "slice|-|the navigation-footer requirement (present, and near the end)"
-    "chevron|busy-footer-plain-list-synthetic.ansi|the highlighted-choice (❯ N.) requirement (with the agent-is-working test already removed)"
-    "siblings|busy-footer-single-option-synthetic.ansi|the two-option floor (with the agent-is-working test already removed)"
+    "chevron|busy-footer-aligned-list-no-cursor-synthetic.ansi|the highlighted-choice (❯) requirement (with the agent-is-working test already removed)"
+    "siblings|busy-footer-single-option-synthetic.ansi|the sibling floor (with the agent-is-working test already removed)"
     "repl|idle-trust-dialog-quoted-boundary-synthetic.ansi|the live-vs-quoted REPL-row test"
     "case|busy-esc-to-interrupt-menu-synthetic.ansi|the footer's case-sensitivity (with the agent-is-working test already removed)"
     "working|busy-dialog-quoted-midrender-synthetic.ansi|the agent-is-working test"
@@ -2374,6 +2941,44 @@ for md_case in "${md_cases[@]}"; do
 done
 rm -f "$md_mut" "$md_high"
 
+# (6b) THE #1112 GATE, in the direction that actually failed. Every mutation
+#      above removes a condition and watches a near-miss become `blocked` —
+#      the "can it stay silent?" direction. The 2.1.248 regression failed the
+#      OTHER way: a condition that was too NARROW, so a live dialog stayed
+#      `empty`. A removal mutation cannot see that, because removing a
+#      too-narrow condition only makes it fire more.
+#
+#      So this one RE-INSTATES the ordinal requirement #1112 removed —
+#      reproducing the exact pre-fix source — and asserts the split it caused:
+#      the 2.1.246 capture still classifies, the 2.1.248 capture does NOT. A
+#      fix that quietly kept keying on `N.` and passed (1b) some other way
+#      would fail here, and so would one that stopped classifying 2.1.246.
+md_mut=$(mktemp)
+python3 - "$HELPER" "$md_mut" <<'PY_ORD'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+s = open(src).read()
+old = """    sel_line=$(grep -E '^ *\u276f +[^ ]' <<<"$above" | tail -1)\n"""
+if s.count(old) != 1:
+    sys.exit("MUTATION TARGET NOT FOUND: cursor-row search, found %d" % s.count(old))
+new = """    sel_line=$(grep -E '^ *\u276f +[0-9]+\\.[ ]' <<<"$above" | tail -1)\n"""
+open(dst, 'w').write(s.replace(old, new, 1))
+PY_ORD
+if [[ ! -s "$md_mut" ]]; then
+    bad "mutation (ordinals)" "could not re-instate the ordinal requirement — this assertion has gone vacuous"
+elif ! bash -n "$md_mut" 2>/dev/null; then
+    bad "mutation (ordinals)" "the mutated helper does not parse; the mutation missed its target"
+else
+    out246=$(bash "$md_mut" --fixture "$md_live" --window 9 --name mdwin --active 0 2>&1)
+    out248=$(bash "$md_mut" --fixture "$md_live248" --window 9 --name mdwin --active 0 2>&1)
+    if grep -qF 'overlay=workspace-trust' <<<"$out246" && ! grep -qF 'overlay=' <<<"$out248"; then
+        ok 're-instating the chevron-plus-ordinal requirement reproduces #1112 exactly: 2.1.246 still classifies, 2.1.248 goes blind'
+    else
+        bad "mutation (ordinals)" "want 2.1.246 blocked and 2.1.248 unclaimed; got 246=[$out246] 248=[$out248]"
+    fi
+fi
+rm -f "$md_mut"
+
 # (7) `blocked` is refused by the kill gate, and widening it took nothing off
 #     the allowlist. `empty` — the state these panes used to report — is
 #     INDETERMINATE and already refused, so this change moves a pane from one
@@ -2397,6 +3002,70 @@ if [[ -f "$_repo_root/monitor/_bookkeeping.sh" ]]; then
     fi
 else
     bad "kill gate" "monitor/_bookkeeping.sh missing — the allowlist assertions did not run"
+fi
+
+# (7b) your-org/nexus-code#1340 — THE END-TO-END SAFETY PROPERTY, asserted on
+#      the CHAIN rather than on the state token.
+#
+#      Every assertion above this one is about what `pane-state.sh` PRINTS.
+#      The property `#1340` is about is what the kill gate then DOES with it:
+#      a worker retrying under `/low-priority` is mid-turn with a visibly
+#      incrementing attempt counter, it read `state=idle`, and `idle` is on
+#      `_BK_KILL_OK_STATES`. Pinning only the classifier would leave the
+#      dangerous half — the composition — unasserted, and the composition is
+#      where the 2026-06-15 incident lived.
+#
+#      THE NEGATIVE CONTROL IS THE OTHER HALF AND IS NOT OPTIONAL. "Every
+#      throttled pane is refused" is satisfied by a gate that refuses
+#      everything, which would wedge the window-cleanup loop instead of
+#      retiring live workers — the issue names that as the other way to be
+#      wrong. So a genuinely idle pane must still classify `idle` AND still be
+#      kill-AUTHORISED, through the same two steps.
+if [[ -f "$_repo_root/monitor/_bookkeeping.sh" ]]; then
+    _1340_verdict() {   # _1340_verdict <fixture-basename> -> "<state>|<gate>"
+        local _st _g
+        _st=$(bash "$HELPER" --fixture "$FIX_DIR/$1" 2>/dev/null \
+              | sed -n 's/.*state=\([A-Za-z-]*\).*/\1/p')
+        if bk_pane_kill_authorized "$_st"; then _g=AUTHORIZED; else _g=refused; fi
+        printf '%s|%s' "$_st" "$_g"
+    }
+    # The capitalised variant is in this loop DELIBERATELY: it is the one the
+    # first cut of the detector got wrong, and its whole value is that it is
+    # driven to the AUTHORIZER, not just to the classifier.
+    for _thr in throttled-low-priority-retry-synthetic.ansi \
+                throttled-low-priority-first-attempt-synthetic.ansi \
+                throttled-low-priority-capitalised-synthetic.ansi; do
+        _v=$(_1340_verdict "$_thr")
+        if [[ "$_v" == "busy|refused" ]]; then
+            ok "#1340 $_thr -> $_v (a throttled worker is not kill-authorised)"
+        else
+            bad "kill gate" "#1340 $_thr -> $_v, want busy|refused — a live worker retrying for capacity is kill-authorised"
+        fi
+    done
+    # …and the field carries the extra bit, so an operator reading the board
+    # can tell "throttled" from "working" without a second probe.
+    # HERESTRING, NOT A PIPE. `grep -q` exits on its first match and SIGPIPEs
+    # the producer, so under `pipefail` the pipeline reports 141 — a FALSE
+    # FAILURE on the very input that matched. `test-sigpipe-assertion-lint`
+    # caught both of this band's first-cut instances.
+    _1340_out=$(bash "$HELPER" --fixture "$FIX_DIR/throttled-low-priority-retry-synthetic.ansi" 2>/dev/null)
+    if grep -qF 'throttled=1' <<<"$_1340_out"; then
+        ok "#1340 the throttled pane carries throttled=1 (a FIELD, not a new state token)"
+    else
+        bad "kill gate" "#1340 the throttled pane carries no throttled=1 field"
+    fi
+    _v=$(_1340_verdict idle-empty-synthetic.ansi)
+    if [[ "$_v" == "idle|AUTHORIZED" ]]; then
+        ok "#1340 NEGATIVE CONTROL idle-empty-synthetic -> $_v (a quiet pane is still retirable)"
+    else
+        bad "kill gate" "#1340 NEGATIVE CONTROL idle-empty-synthetic -> $_v, want idle|AUTHORIZED — the fix made every quiet pane active, which wedges the cleanup loop"
+    fi
+    _1340_busy=$(bash "$HELPER" --fixture "$FIX_DIR/busy-encode-win5.ansi" 2>/dev/null)
+    if grep -qF 'throttled=1' <<<"$_1340_busy"; then
+        bad "kill gate" "#1340 an ORDINARY busy pane was labelled throttled=1 — the detector fires on any spinner"
+    else
+        ok "#1340 NEGATIVE CONTROL an ordinary busy pane carries no throttled=1"
+    fi
 fi
 
 # (8) NOTHING AUTO-ANSWERS IT, AND NO ARM FIRES ON A WORKING PANE.

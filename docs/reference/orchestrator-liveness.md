@@ -108,13 +108,18 @@ All under `monitor.watcher.*` (env override in parentheses):
    absolute deadline. Violated ⇒ the rescue never fires before the
    kill. Surfaced as a startup `WARN` (evaluated on the *effective*,
    post-clamp dead_threshold).
-2. `full_state_emit_interval + loop_interval < dead_threshold` — the
+2. `compose_emit gap < dead_threshold`, where the gap is the
+   full-state **heartbeat** plus one loop tick — the
    structural-coherence constraint that the 2026-06-15 incident
-   violated (660 ≥ 300). **ENFORCED at startup, not merely warned**:
+   violated (660 ≥ 300). The heartbeat is `full_state_emit_interval`
+   rounded up to cover `full_state.safety_floor_seconds`
+   (`ceil(900/600)*600 = 1200` s with defaults), so the gap is
+   `1200 + 60 = 1260` s. **ENFORCED at startup, not merely warned**:
    `main.sh` clamps the effective dead_threshold up to
-   `full_state_emit_interval + interval + dead_threshold_floor_margin`
-   (720 s with defaults) so a static-workspace paste always resets the
-   clock before the deadline. See "The fix" below.
+   `heartbeat + interval + dead_threshold_floor_margin`
+   (`1200 + 60 + 60 = 1320` s with defaults) so a static-workspace
+   paste always resets the clock before the deadline. See "The fix"
+   below.
 3. `dead_threshold < stale_paste_ceiling` (300 < 1800) — otherwise the
    ceiling masks the dead-threshold check and the wedge detector never
    fires. The clamp in (2) preserves this: if raising dead_threshold
@@ -150,9 +155,10 @@ regressing commit.
 
 **Layer 1 (primary, eliminates the race at the source): the startup
 clamp.** `main.sh` raises the *effective* dead_threshold to
-`full_state_emit_interval + interval + dead_threshold_floor_margin`
-(720 s with defaults) whenever the configured value would sit at or
-below the maximum compose_emit gap. With the deadline above the gap, a
+`heartbeat + interval + dead_threshold_floor_margin`
+(1320 s with defaults, the heartbeat being 1200 s) whenever the
+configured value would sit at or below the maximum compose_emit gap
+(1260 s with defaults). With the deadline above the gap, a
 static-workspace full-state paste **always** resets `last_paste_ts`
 before the deadline, so the false positive is **structurally
 impossible** — not merely intercepted at runtime. The clamp is a pure
@@ -215,9 +221,11 @@ unconditional suppression — not recommended).
 
 The Layer-1 clamp picks a safe effective deadline automatically, but
 you can set your own: raise `orchestrator_dead_threshold_seconds`
-above `full_state_emit_interval + interval` (the clamp then leaves
-your value untouched), or lower `monitor.full_state_emit_interval_seconds`
-so a configured-low deadline is coherent. Either way the real
+above the compose_emit gap (`heartbeat + interval`; the clamp then
+leaves your value untouched), or lower
+`monitor.full_state_emit_interval_seconds` /
+`monitor.full_state.safety_floor_seconds` so a configured-low deadline
+is coherent. Either way the real
 wedge-recovery path (waiting → unstick → one-shot re-submit, all
 firing well before the deadline) is unaffected — the deadline is only
 the absolute backstop.

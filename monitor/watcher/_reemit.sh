@@ -91,6 +91,12 @@
 #   MONITOR_EMIT_COOLDOWN_SECONDS   re-emit cadence (shared, default 300)
 #   MONITOR_REEMIT_GH_CMD           gh command name (test-injection hook)
 #   log                             watcher logger (function; optional)
+#
+# One cross-file FUNCTION dependency: `_mention_target_key`
+# (`_emit_filters.sh`) resolves a mention block's reactable object. It is
+# defined there, not here, because `_filter_reemit_backoff` keys its stamp on
+# the same derivation and a second copy would drift (your-org/nexus-code#1500).
+# `_reemit_gc` checks for it and fails CLOSED if it is missing.
 
 _reemit_registry_path() { printf '%s\n' "${STATE_DIR}/unacked-mentions.lines"; }
 _reemit_lock_path()     { printf '%s\n' "${STATE_DIR}/unacked-mentions.lock"; }
@@ -303,25 +309,84 @@ _reemit_pending() {
     return 0
 }
 
-# _reemit_reaction_state <repo> <comment_id>   (stdout: rocket|eyes|none)
+# _reemit_reaction_state <repo> <id> [target-key]   (stdout: rocket|eyes|none)
 #
-# Classifies the live, non-self (i.e. bot) reaction on a comment for the
-# two-tier re-emit policy (your-org/nexus-code#360). Prints exactly one of:
+# Classifies the live, non-self (i.e. bot) reaction on a mention's REACTABLE
+# OBJECT for the two-tier re-emit policy (your-org/nexus-code#360). Prints
+# exactly one of:
 #   rocket  — a 🚀 by a login != USER_LOGIN is present  → STOP (evict).
 #   eyes    — a 👀 by a login != USER_LOGIN, no such 🚀  → SLOW (6h) tier.
 #   none    — neither                                    → FAST (5min) tier.
 # 🚀 dominates 👀 (a done mention that was also eyed is still done). Uses the
 # same non-self predicate as `snapshot_github`, robust to the `[bot]` login
-# suffix. Returns 2 on gh failure WITHOUT printing (caller treats as
-# "unknown" — neither evicts nor reclassifies). REST returns lowercase
-# `eyes`/`rocket`.
+# suffix. REST returns lowercase `eyes`/`rocket`.
+#
+# TARGET SELECTION (your-org/nexus-code#1500). `<target-key>` is
+# `_mention_target_key`'s output for the entry's emit-block header and
+# decides WHICH endpoint is asked — a mention's `id=` is not always a
+# comment database id, and asking the comment endpoint about an issue
+# NUMBER is a permanent 404, not a missing reaction:
+#   issue:<n>            → repos/{repo}/issues/{n}/reactions
+#   comment:<id>         → repos/{repo}/issues/comments/{id}/reactions
+#   review_comment:<id>  → repos/{repo}/pulls/comments/{id}/reactions
+#   none:<…>             → no reactable object exists; no call is made.
+# Omitting the argument keeps the historical `comment:<id>` contract, so
+# callers written before this parameter existed behave exactly as before.
+#
+# RETURN CODES — the 404 / transient split is the point of this function's
+# rewrite, so read them rather than testing for non-zero:
+#   0  classified; one of rocket|eyes|none printed.
+#   2  TRANSIENT gh failure (network, 5xx, rate limit, auth) — nothing
+#      printed, caller treats it as "unknown": neither evicts nor
+#      reclassifies. THIS ARM MUST STAY FAIL-SOFT. It is correct, and a
+#      change that let a flaky `gh` retire a live mention would be worse
+#      than the bug this rewrite fixes.
+#   3  the block shape has NO reactions endpoint (a top-level PR review) or
+#      carries no usable identity. Nothing printed and NO API call made —
+#      permanent for this entry, and the caller logs it.
+#   4  PERMANENT HTTP 404 at the endpoint we resolved. Nothing printed; the
+#      caller logs it LOUDLY. Split from 2 deliberately: a 404 here is not a
+#      flaky network but either a DELETED object or an id vocabulary this
+#      function has mapped wrongly — exactly the state that made #1500
+#      invisible: on the wire it is indistinguishable from "try again later",
+#      and "later" never comes.
+#      It is still NOT an eviction. Evicting on 404 would retire a live
+#      mention the first time GitHub served a spurious one, and the
+#      MONITOR_REEMIT_MAX_AGE_SECONDS valve already bounds an entry that can
+#      never be acked. Loud beats destructive; the operator gets a named
+#      line in watcher.log, throttled to the caller's per-entry recheck
+#      cadence (≤ one per cooldown).
 _reemit_reaction_state() {
-    local repo="$1" cid="$2"
+    local repo="$1" cid="$2" target="${3:-}"
     local gh_cmd="${MONITOR_REEMIT_GH_CMD:-gh}"
-    [[ -n "$repo" && -n "$cid" ]] || return 2
-    local out rc=0
-    out=$("$gh_cmd" api "repos/$repo/issues/comments/$cid/reactions" 2>/dev/null) || rc=$?
-    (( rc == 0 )) || return 2
+    [[ -n "$repo" ]] || return 3
+    [[ -n "$target" ]] || target="comment:${cid}"
+    local api=""
+    case "$target" in
+        issue:[0-9]*)          api="repos/$repo/issues/${target#issue:}/reactions" ;;
+        review_comment:[0-9]*) api="repos/$repo/pulls/comments/${target#review_comment:}/reactions" ;;
+        comment:[0-9]*)        api="repos/$repo/issues/comments/${target#comment:}/reactions" ;;
+        # `none:` and anything unrecognised: fail CLOSED — never guess an
+        # endpoint. Guessing is what produced the permanent 404.
+        *)                     return 3 ;;
+    esac
+    local out err rc=0
+    err=$(mktemp "${TMPDIR:-/tmp}/reemit-react.XXXXXX" 2>/dev/null) || err=""
+    if [[ -n "$err" ]]; then
+        out=$("$gh_cmd" api "$api" 2>"$err"); rc=$?
+    else
+        out=$("$gh_cmd" api "$api" 2>/dev/null); rc=$?
+    fi
+    if (( rc != 0 )); then
+        local is404=0
+        if [[ -n "$err" ]] && grep -q 'HTTP 404' "$err" 2>/dev/null; then
+            is404=1
+        fi
+        [[ -n "$err" ]] && rm -f "$err" 2>/dev/null
+        (( is404 )) && return 4
+        return 2
+    fi
+    [[ -n "$err" ]] && rm -f "$err" 2>/dev/null
     printf '%s' "$out" | jq -r --arg u "${USER_LOGIN:-}" '
         [.[] | select((.user.login // "") != $u) | .content] as $r
         | if ($r | index("rocket")) then "rocket"
@@ -384,6 +449,13 @@ _reemit_target_state() {
 #            throttled to ≤ one call per un-acked entry per cooldown — the
 #            ONLY path that catches a 🚀/👀 placed by something that doesn't
 #            write processed-comments (a direct `gh api`/MCP react).
+#            WHICH endpoint that query hits is decided per-entry by
+#            `_mention_target_key` on the entry's stored emit-block header
+#            (your-org/nexus-code#1500): an issue-keyed mention resolves to
+#            `issues/{n}/reactions`, a comment to `issues/comments/{id}`, a
+#            review comment to `pulls/comments/{id}`. Before that, every
+#            entry was asked about as a COMMENT, so an `issue_new` mention
+#            404'd forever and could be evicted by neither a rocket nor eyes.
 # Safe to call every compose_emit fire (cheap: one file scan; live rechecks
 # are throttled and only when MONITOR_REEMIT_LIVE_RECHECK=true).
 _reemit_gc() {
@@ -429,6 +501,19 @@ _reemit_gc() {
         # un-acked entry is rechecked once per cooldown regardless of how
         # often it surfaces, so the bot's 👀/🚀 is honored within one
         # cooldown — matching `snapshot_github`'s live-reaction suppression.
+        # HARD DEPENDENCY, checked rather than assumed: the reaction-target
+        # derivation lives in `_emit_filters.sh` (one definition, shared with
+        # the backoff stamp — see `_mention_target_key`). main.sh sources that
+        # file first, so this holds in production; a standalone `. _reemit.sh`
+        # that forgets it would otherwise silently resolve EVERY entry to the
+        # comment endpoint, which IS your-org/nexus-code#1500. Fail CLOSED and
+        # loudly instead: skip the live recheck (the local processed-comments
+        # and max-age paths below are unaffected).
+        if ! declare -F _mention_target_key >/dev/null 2>&1; then
+            _reemit_log "reemit-gc: WARN _mention_target_key undefined (_emit_filters.sh not sourced) — live reaction recheck SKIPPED rather than defaulting every entry to the comment endpoint (your-org/nexus-code#1500)."
+            live_recheck="false"
+        fi
+
         local live_evict="${reg}.live.$$"
         local live_eyes="${reg}.liveeyes.$$"
         local live_eyes_closed="${reg}.liveeyesclosed.$$"
@@ -440,7 +525,7 @@ _reemit_gc() {
             # (the target issue/PR number) needed for the closed-target check.
             # `mid` is the meta's comment id; it is consumed (set empty) on the
             # first block line so the trailing `  body:` line is skipped.
-            local mid mrepo last_recheck mdirect ln st
+            local mid mrepo last_recheck mdirect ln st mkey rrc
             mid=""; mrepo=""; last_recheck=0; mdirect="yes"
             while IFS= read -r ln; do
                 if [[ "$ln" == \#\ meta\ * ]]; then
@@ -472,7 +557,32 @@ _reemit_gc() {
                 # Record that this entry was rechecked at `now` so the awk
                 # rewrite advances its `last_recheck=` stamp.
                 printf '%s\n' "$cmid" >> "$rechecked"
-                st=$(_reemit_reaction_state "$mrepo" "$cmid") || st=""
+                # WHICH object carries the reaction is a property of the
+                # BLOCK, not of the meta line (your-org/nexus-code#1500). The
+                # registry stores the emit-block header verbatim, so the kind
+                # is already here — `_mention_target_key` reads it, and the
+                # same derivation feeds the backoff stamp in
+                # `_emit_filters.sh`, so the two cannot drift apart.
+                mkey=$(_mention_target_key "$ln")
+                st=$(_reemit_reaction_state "$mrepo" "$cmid" "$mkey")
+                rrc=$?
+                # Read the classifier's rc, not merely "did it fail". A
+                # TRANSIENT failure must stay silent and fail-soft (a flaky
+                # `gh` retiring a live mention would be worse than the bug);
+                # a PERMANENT one must be LOUD, because a silent permanent
+                # failure is what pinned #1499 to the 5-minute FAST tier with
+                # nothing but the 3-day max-age valve to end it — a ceiling of
+                # 259200/300 = 864 emits for one mention.
+                case "$rrc" in
+                    0) ;;
+                    4)  st=""
+                        _reemit_log "reemit-gc: WARN reaction probe for id=${cmid} (${mrepo} target=${mkey}) returned HTTP 404 — that object does not exist at the endpoint this target resolves to. The entry cannot be reclassified by a 👀/🚀 and will re-emit until MONITOR_REEMIT_MAX_AGE_SECONDS evicts it (your-org/nexus-code#1500)."
+                        ;;
+                    3)  st=""
+                        _reemit_log "reemit-gc: WARN no reactions endpoint for id=${cmid} (${mrepo} target=${mkey}) — this block shape has no reactable object (a top-level PR review, or a block with neither n= nor id=). Entry stays on its cadence until max-age (your-org/nexus-code#1500)."
+                        ;;
+                    *)  st="" ;;
+                esac
                 case "$st" in
                     rocket) printf '%s\n' "$cmid" >> "$live_evict" ;;
                     eyes)

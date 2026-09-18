@@ -125,6 +125,163 @@ export MOCK_TMUX_WINDOWS="$LIVE"
 assert_parked    worker-f "template-named live skeptic → exempt despite no spawn log"
 assert_notorphan worker-f "template-named live skeptic → not orphaned"
 
+# ---- Scenario 8: STALE marker + LIVE skeptic → parked (your-org/nexus-code#1039)
+# THE #1039 case, and the combination no scenario above covered: the worker's
+# own await loop has stopped re-touching the marker (its own timeout, not an
+# error), so the marker ages past `hang` — while the skeptic is still reviewing
+# in a live window. The age gate used to `return 1` here BEFORE the liveness
+# question was put, so a protected window was presented as an ordinary idle
+# worker, inviting exactly the nudge-or-retire path the exemption prevents.
+#
+# Note this is scenario 5 with ONE variable changed — the skeptic window's
+# liveness — which is what makes the pair a control rather than two anecdotes.
+echo "=== 8. stale marker + LIVE skeptic → exempt (#1039) ==="
+mk_marker worker-h "$(( NOW - 2401 ))"            # await loop exited ~40 min ago
+log_request worker-h "$(( NOW - 3000 ))"
+log_spawn   worker-h sk-worker-h "$(( NOW - 2900 ))"
+LIVE=$'worker-h\nsk-worker-h\norchestrator'      # skeptic window is ALIVE
+export MOCK_TMUX_WINDOWS="$LIVE"
+assert_parked    worker-h "stale marker but live skeptic → parked/exempt"
+assert_notorphan worker-h "stale marker + live skeptic → not orphaned"
+
+# ...and the LABEL, not merely the gate. The two disagreed in the field and
+# only the gate was tested, so assert the basis the row will carry.
+if [[ "${_IDLE_SKEPTIC_PARK_BASIS:-}" == "skeptic-live" ]]; then
+    ok "stale marker + live skeptic → basis is 'skeptic-live' (label qualifies the exemption)"
+else
+    bad "stale marker + live skeptic → basis was '${_IDLE_SKEPTIC_PARK_BASIS:-<unset>}', expected 'skeptic-live'"
+fi
+
+# MUST-NOT-FIRE control: the ORDINARY park (fresh marker + live skeptic) must
+# keep the plain basis, or the qualification becomes noise on every row.
+_idle_skeptic_parked worker-a "$NOW" $'worker-a\nworker-a-skeptic\norchestrator' >/dev/null 2>&1
+if [[ "${_IDLE_SKEPTIC_PARK_BASIS:-}" == "await" ]]; then
+    ok "fresh marker + live skeptic → basis is 'await' (qualification does NOT fire)"
+else
+    bad "fresh marker + live skeptic → basis was '${_IDLE_SKEPTIC_PARK_BASIS:-<unset>}', expected 'await'"
+fi
+
+# And the basis must be CLEARED on a non-park verdict, so a stale value from a
+# previous window can never decorate a later row.
+_idle_skeptic_parked worker-g "$NOW" $'worker-g\norchestrator' >/dev/null 2>&1
+if [[ -z "${_IDLE_SKEPTIC_PARK_BASIS:-}" ]]; then
+    ok "non-park verdict clears the basis (no carry-over onto another window)"
+else
+    bad "non-park verdict left basis='${_IDLE_SKEPTIC_PARK_BASIS}' — would decorate an unrelated row"
+fi
+
+# ---- Scenario 9: the RENDERED label, not just the predicate --------------
+# `render_idle_section`'s awk is what the orchestrator actually reads. Feed it
+# the transition row shape and assert the basis reaches the emitted text.
+echo "=== 9. rendered label carries the basis (#1039) ==="
+_stale_detail="skeptic reviewing (live skeptic window); worker await marker STALE — exempt on the skeptic, not on an active await loop"
+list_idle_transitions() { printf 'worker-h\tparked-awaiting-skeptic\t2401\t%s\n' "$_stale_detail"; }
+row=$(render_idle_section)
+case "$row" in
+    *"parked-awaiting-skeptic"*"await marker STALE"*)
+        ok "emitted row names the stale-await basis" ;;
+    *) bad "emitted row did not carry the basis: [$row]" ;;
+esac
+# NOTE the emptiness guard: without it this arm PASSES on an empty row, i.e. it
+# would be a check that cannot fail — the defect this whole branch is about.
+if [[ -z "$row" ]]; then
+    bad "emitted row was EMPTY — the negative assertion below would pass vacuously"
+else
+    case "$row" in
+        *"idle 2254s"*|*"WITHOUT wrap-up"*)
+            bad "emitted row still reads as an ordinary idle worker: [$row]" ;;
+        *) ok "emitted row is NOT presented as an ordinary idle worker" ;;
+    esac
+fi
+# Must-not-fire: an ordinary park with no detail keeps the plain wording.
+list_idle_transitions() { printf 'worker-a\tparked-awaiting-skeptic\t120\t\n'; }
+row=$(render_idle_section)
+case "$row" in
+    *"await marker STALE"*) bad "ordinary park wrongly rendered with the stale-await qualifier: [$row]" ;;
+    *"parked-awaiting-skeptic"*) ok "ordinary park renders with the plain wording" ;;
+    *) bad "ordinary park did not render at all: [$row]" ;;
+esac
+unset -f list_idle_transitions
+
+# ---- Scenario 8: CHANNEL evidence (your-org/nexus-code#1153) ------------
+#
+# `_idle_skeptic_live_window` answers from a SPAWN LINKAGE RECORD, written only
+# by `spawn-worker.sh --skeptic-role`. A skeptic spawned with a bare -n/-c/-p
+# works end to end and writes none — so the detector called a LIVE reviewer an
+# orphan and advised the operator to clear a live obligation.
+echo "=== 8. #1153 channel traffic THIS round → not orphaned ==="
+mk_marker worker-i "$NOW"
+log_request worker-i "$(( NOW - 1200 ))"          # round opened 20 min ago
+LIVE=$'worker-i
+orchestrator'                    # NO linkage, NO -skeptic window
+export MOCK_TMUX_WINDOWS="$LIVE"
+# CONTROL FIRST: with no channel at all this fixture IS an orphan. Without this
+# the assertion below could pass because the fixture never qualified.
+assert_orphan    worker-i "#1153 CONTROL: no channel dir → still orphaned"
+mkdir -p "$STATE_DIR/skeptic/worker-i"
+: > "$STATE_DIR/skeptic/worker-i/req-001-probe.ack.md"
+touch -d "@$(( NOW - 600 ))" "$STATE_DIR/skeptic/worker-i/req-001-probe.ack.md"
+assert_notorphan worker-i "#1153 live channel traffic this round → NOT orphaned"
+
+# ---- Scenario 8b: the PARK half of #1153 (residual 1) --------------------
+#
+# The orphan arm above reads channel traffic; the park EXEMPTION did not, so a
+# skeptic spawned without `--skeptic-role` kept its target parked only until
+# the orphan grace lapsed — then the target proceeded toward retirement while
+# its skeptic was mid-pass. Same fixture shape, past grace, no linkage.
+echo "=== 8b. #1153 channel traffic THIS round, PAST grace → still PARKED ==="
+mk_marker worker-i2 "$NOW"
+log_request worker-i2 "$(( NOW - 1200 ))"         # round opened 20 min ago (> 600 grace)
+LIVE=$'worker-i2\norchestrator'
+export MOCK_TMUX_WINDOWS="$LIVE"
+# CONTROL FIRST: no channel, past grace, no linkage → NOT parked (the pre-fix
+# reading; without this the assertion below could pass on the grace arm).
+assert_unparked worker-i2 "#1153 CONTROL: past grace, no channel → not parked"
+mkdir -p "$STATE_DIR/skeptic/worker-i2"
+: > "$STATE_DIR/skeptic/worker-i2/req-001-probe.ack.md"
+touch -d "@$(( NOW - 600 ))" "$STATE_DIR/skeptic/worker-i2/req-001-probe.ack.md"
+assert_parked worker-i2 "#1153 channel traffic this round, past grace → PARKED (exempt)"
+if [[ "${_IDLE_SKEPTIC_PARK_BASIS:-}" == "channel" ]]; then ok "#1153 …and the basis names the evidence: channel"; else bad "#1153 basis is [${_IDLE_SKEPTIC_PARK_BASIS:-}], want channel"; fi
+# CONTROL 2: traffic OLDER than this round's request (a prior-round leftover,
+# #975's shape) does NOT grant the park — the arm is scoped to the round.
+mk_marker worker-i3 "$NOW"
+log_request worker-i3 "$(( NOW - 1200 ))"
+LIVE=$'worker-i3\norchestrator'
+export MOCK_TMUX_WINDOWS="$LIVE"
+mkdir -p "$STATE_DIR/skeptic/worker-i3"
+: > "$STATE_DIR/skeptic/worker-i3/req-001-old.answered.md"
+touch -d "@$(( NOW - 4000 ))" "$STATE_DIR/skeptic/worker-i3/req-001-old.answered.md"
+assert_unparked worker-i3 "#1153 CONTROL: prior-round leftover traffic → NOT parked (#975 scope kept)"
+# CONTROL 3: a STALE marker (the worker's own await died) still lapses even
+# with fresh channel traffic — the genuine-hang path is untouched.
+mk_marker worker-i4 "$(( NOW - 100000 ))"
+log_request worker-i4 "$(( NOW - 1200 ))"
+LIVE=$'worker-i4\norchestrator'
+export MOCK_TMUX_WINDOWS="$LIVE"
+mkdir -p "$STATE_DIR/skeptic/worker-i4"
+: > "$STATE_DIR/skeptic/worker-i4/req-001-probe.ack.md"
+touch -d "@$(( NOW - 600 ))" "$STATE_DIR/skeptic/worker-i4/req-001-probe.ack.md"
+assert_unparked worker-i4 "#1153 CONTROL: stale marker + fresh channel → NOT parked (hang path kept)"
+
+# ---- Scenario 9: STALE channel leftovers must NOT exempt (#975) ----------
+#
+# `close` does NOT remove `req-*.md`, so an unscoped "any request file exists"
+# predicate — which is what #1153 itself proposes — is satisfied forever after
+# round one. This is the non-vacuity control that separates the shipped fix
+# from that proposal: a leftover from a PRIOR round must still read orphaned,
+# or the re-armed never-spawned park becomes unreachable and retire-preflight
+# can never release.
+echo "=== 9. #975 stale channel leftovers do NOT exempt ==="
+mk_marker worker-j "$NOW"
+log_request worker-j "$(( NOW - 1200 ))"          # THIS round opened 20 min ago
+LIVE=$'worker-j
+orchestrator'
+export MOCK_TMUX_WINDOWS="$LIVE"
+mkdir -p "$STATE_DIR/skeptic/worker-j"
+: > "$STATE_DIR/skeptic/worker-j/req-001-old.open.md"
+touch -d "@$(( NOW - 10800 ))" "$STATE_DIR/skeptic/worker-j/req-001-old.open.md"
+assert_orphan    worker-j "#975 a PRIOR round's leftover does NOT exempt"
+
 # ---- Scenario 7: no marker at all → not parked, not orphaned ------------
 echo "=== 7. no marker → not parked, not orphaned ==="
 LIVE=$'worker-g\norchestrator'

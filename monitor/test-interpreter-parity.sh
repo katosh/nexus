@@ -143,6 +143,29 @@ else
 $out"
 fi
 
+echo "--- 3c. zsh SPECIFICALLY is refused (your-org/nexus-code#1382) ---"
+# 3b's `#!/bin/sh` stub fails the probe outright (rc != 0), so it proves the
+# guard rejects an interpreter that produces NOTHING — not one that is not
+# bash. zsh diverges: both expansions are empty and the format string still
+# emits its literal `.`, so the probe returned "." and an emptiness check let
+# it through with a banner reading `(bash .)`. zsh is the interpreter this
+# workspace defaults to for agents, so it is the negative control that matters.
+# Self-skipping, loudly, where zsh is absent — a control that cannot run is
+# unmeasured, not passed.
+if command -v zsh >/dev/null 2>&1; then
+    out=$(NEXUS_TEST_SHELL="$(command -v zsh)" \
+          bash "$RUNNER" --jobs 1 "$TMP/test-noop.sh" 2>&1); rc=$?
+    if (( rc == 2 )) && grep -q 'did not report a BASH_VERSINFO' <<<"$out" \
+       && ! grep -q '=== interpreter:' <<<"$out"; then
+        ok "zsh → exit 2 before any banner (the probe's literal '.' is not a version)"
+    else
+        bad "zsh refusal" "expected exit 2 + the BASH_VERSINFO message and NO banner, got rc=$rc:
+$out"
+    fi
+else
+    echo "  SKIP: no zsh on this host — the zsh negative control is UNMEASURED here"
+fi
+
 # ===========================================================================
 # 4. THE DECLARATION. A run whose interpreter differs from the pin must SAY SO.
 # ===========================================================================

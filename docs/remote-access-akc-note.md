@@ -40,7 +40,7 @@ identity available to own the file.
 
 This was reproduced hermetically against a throwaway `sshd` 7.6p1: even
 `/bin/true` (owned by `nobody`, the sandbox's mapping of real root) is rejected
-as an AKC. It also surfaced live — a confirmed off-host client (source = an sn2
+as an AKC. It also surfaced live — a confirmed off-host client (source = an bastion
 bastion) hit exactly this: self-enroll was denied at the **auth layer**, before
 any token could be read.
 

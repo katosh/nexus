@@ -1,0 +1,25 @@
+# claude-md-entry-budget.manifest — the size budget for `## Common gotchas`
+# entries in CLAUDE.md, recorded as DATA so a PR can be measured against it.
+#
+# Enforced by:  bash monitor/watcher/test-claude-md-entry-budget.sh
+#
+# ── WHY (your-org/nexus-code#904) ──────────────────────────────────────────
+# CLAUDE.md went 705 -> 2,339 lines in three weeks ENTIRELY inside one
+# section, because the working convention was "append the full incident
+# narrative to ## Common gotchas". Every entry was individually justified and
+# the section still tripled. A one-off trim (PR #1473, 2,339 -> 1,256) resets
+# the level and does not touch the RATE. This budget is the rate control the
+# operator chose (#904, 2026-09-05): a guard that PRINTS every entry's size on
+# every run and reds only past a GENEROUS ceiling — a number placed where the
+# decision is made, not a hard cap set on a guess that gets routed around.
+#
+# ── CENSUS at dev 2a299572 (2026-09-06) ────────────────────────────────────
+# 31 entries; the largest is 104 lines (GREP-BRE-DIALECT, which carries two
+# executed marker blocks); next 82, 77, 65, 56. The ceilings below sit ABOVE
+# the census on purpose: today's tree passes, and an entry that arrives at the
+# ceiling is one that has already outgrown the section's purpose (a rule, its
+# measurement, its remedy) and belongs in a skill with a one-line row here.
+#
+# ── COLUMNS  key=value ─────────────────────────────────────────────────────
+entry_lines_ceiling=120
+entries_ceiling=40

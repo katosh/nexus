@@ -82,15 +82,39 @@ HARNESS_STUB_CLAUDE_SRC="$_harness_self_dir/stub-claude.sh"
 # only at the level of "one harness_setup per scenario" — multiple
 # calls in the same process leak state.
 harness_setup() {
+    # shellcheck source=../_tmux-fixture.sh
+    . "$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)/_tmux-fixture.sh"
+    HARNESS_TMUX_REALBIN=$(nx_real_tmux_bin) || {
+        echo "harness: no real tmux BINARY on PATH (only wrappers) — refusing to run unisolated (your-org/nexus-code#1105)" >&2
+        return 1
+    }
     HARNESS_DIR=$(mktemp -d -t nexus-watcher-integ-XXXXXX)
     HARNESS_STATE_DIR="$HARNESS_DIR/monitor/.state"
     HARNESS_BIN="$HARNESS_DIR/.bin"
     HARNESS_SOCKET="nexus-integ-$$-$RANDOM"
     HARNESS_SESSION="nexus-integ-$$-$RANDOM"
-    # tmux stores its socket under $TMPDIR/tmux-$(id -u)/ by default;
-    # we resolve the canonical path so the harness can `rm` it on
-    # teardown even when the server crashes mid-run.
-    HARNESS_SOCK="${TMPDIR:-/tmp}/tmux-$(id -u)/$HARNESS_SOCKET"
+    # BRACES (your-org/nexus-code#1105, #1115 skeptic F1). A PRIVATE
+    # TMUX_TMPDIR and a scrubbed $TMUX, so that if this harness's `tmux` shim
+    # is ever displaced from $PATH the unpinned client lands on a private,
+    # ABSENT socket and errors — instead of on the operator's board. That is
+    # not hypothetical: this harness had the belt broken (its shim named the
+    # wrapper, so tmuxwrap's gate-3 skipped it), ZERO braces and no alarm,
+    # while `test-slow-grind-respawn.sh` drives
+    # `main.sh --target orchestrator` through a FRESH bash — and
+    # `_paste_to_target_unlocked` is the exact function that pasted into the
+    # live orchestrator pane on 2026-08-27.
+    #
+    # $TMUX outranks $TMUX_TMPDIR (#644), which is why the unset is not
+    # optional. HARNESS_SOCK is derived from the SAME variable below rather
+    # than from $TMPDIR: the two must not be able to disagree about where the
+    # socket is.
+    export TMUX_TMPDIR="$HARNESS_DIR/tt"
+    mkdir -p "$TMUX_TMPDIR"
+    unset TMUX
+    # tmux stores its socket under $TMUX_TMPDIR/tmux-$(id -u)/; we resolve the
+    # canonical path so the harness can `rm` it on teardown even when the
+    # server crashes mid-run.
+    HARNESS_SOCK="$TMUX_TMPDIR/tmux-$(id -u)/$HARNESS_SOCKET"
 
     mkdir -p "$HARNESS_DIR/monitor/watcher" \
              "$HARNESS_DIR/reports" \
@@ -141,11 +165,16 @@ CLAUDEWRAP
     # tmux wrapper. Routes every `tmux ...` call to the dedicated
     # socket. Used both by scenarios (via harness_tmux) and by any
     # production code under test that calls bare `tmux`.
-    cat > "$HARNESS_BIN/tmux" <<TMUXWRAP
-#!/usr/bin/env bash
-exec $(command -v tmux) -L "$HARNESS_SOCKET" "\$@"
-TMUXWRAP
-    chmod +x "$HARNESS_BIN/tmux"
+    # BELT. `$(command -v tmux)` here expands AT WRITE TIME, in the agent's
+    # shell, to monitor/tmuxwrap/tmux — so the planted shim NAMED the wrapper,
+    # tmuxwrap's gate-3 classified the shim as a wrapper and skipped it, and a
+    # bare `tmux` inside any fresh `bash` reached the real tmux with NO -L.
+    # nx_write_tmux_shim REFUSES a wrapper-built shim, so this construction
+    # cannot come back silently. (The lint that finds it corpus-wide is
+    # test-tmux-shim-gate3-safety.sh; the two defences are deliberately
+    # independent.)
+    nx_write_tmux_shim "$HARNESS_BIN" "$HARNESS_TMUX_REALBIN" "$HARNESS_SOCKET" \
+        || { echo "harness: could not write the private-tmux shim" >&2; return 1; }
 
     export HARNESS_DIR HARNESS_STATE_DIR HARNESS_BIN \
            HARNESS_SOCK HARNESS_SOCKET HARNESS_SESSION

@@ -1,5 +1,5 @@
 ---
-description: "nexus bot identity for all GitHub writes: monitor/ng for nexus repo, GH_TOKEN=$(mint-token.sh) gh for cross-repo. Never plain gh."
+description: "nexus bot identity for all GitHub writes: monitor/ng for nexus repo, GH_TOKEN=$(mint-token.sh) gh for cross-repo. Never plain gh. Also: which real `gh` client the wrapper selects and why the floor is a capability rather than a version boundary, the per-attempt job-log trap (`gh run view --job` serves the LATEST attempt regardless of the job id — use `gh api .../jobs/<id>/logs`), and reading a user-pasted `user-attachments` asset, which poisons the session if fetched directly."
 ---
 
 # nexus.bot — GitHub identity for spawned agents
@@ -93,8 +93,10 @@ function only shadows `gh` inside the zsh shells that source it; the
 wrapper, being on PATH, is inherited by EVERY child an agent spawns
 (bash subshells, `python subprocess`, Makefiles). The classification
 + token logic is single-sourced in `monitor/gh-shim.sh`, which the
-wrapper sources after resolving the real `gh` (first on PATH that is
-not itself — recursion-safe).
+wrapper sources after resolving the real `gh` — the first candidate on
+`PATH` that is not itself AND meets the declared capability floor (see
+"Which `gh` client the wrapper runs" below). Passing the resolved
+ABSOLUTE path into the shim is what makes it recursion-safe.
 
 What it does, per invocation:
 
@@ -116,20 +118,49 @@ What it does, per invocation:
   and correct callers (incl. `GH_TOKEN=$(./monitor/mint-token.sh)
   gh …`) set it explicitly; the wrapper never double-injects.
 
-Verb classification (err toward WRITE on ambiguity):
+Verb classification is **FAIL-CLOSED, and the table below is the READ
+side** (`monitor/gh-shim.sh` branch 3, `<your-org>/nexus-code#568` A3). The
+classifier does not enumerate writes: it enumerates the reads and
+defaults **everything else to WRITE** — an unenumerated subcommand, a
+subcommand a future `gh` adds, a command group the shim has never heard
+of. This document enumerates the same side the code does, so the two
+cannot disagree about what the DEFAULT is. It used to list the WRITE
+side, and that list went stale the moment an arm was added: `gh project
+item-create`, `gh codespace create`, `gh release delete-asset`, `gh repo
+deploy-key add` and `gh agent-task create` all posted as the OPERATOR
+until the polarity was inverted.
 
-| Group | Classified WRITE when subcommand / form is… |
+| Group | Classified READ (runs as the operator) when the subcommand is… |
 |---|---|
-| `pr` | create·edit·merge·comment·close·reopen·ready·review |
-| `issue` | create·edit·comment·close·reopen·lock·unlock·delete·transfer·pin·unpin·develop |
-| `release` | create·edit·delete·upload |
-| `repo` | create·edit·delete·archive·unarchive·rename·fork·sync·set-default |
-| `label` | create·edit·delete·clone |
-| `gist` | create·edit·delete·rename |
-| `secret`/`variable` | set·delete·remove |
-| `workflow`/`run`/`cache`/`gpg-key`/`ssh-key` | run·enable·disable / cancel·rerun·delete / delete / add·delete |
-| `api` | `--method`/`-X` in {POST,PATCH,PUT,DELETE}; OR a request body (`-f/-F/--field/--raw-field`, or `--input <file>`) with no explicit GET (gh defaults those to POST); OR **`api graphql`** (mutations are hard to tell from queries — graphql defaults to the bot) |
-| everything else (reads, `gh auth`, `status`, `search`, …) | run as operator, own config restored (no bot token) |
+| whole groups | `auth` · `alias` · `config` · `extension` · `completion` · `help` · `version` · `status` · `search` · `browse` — read-only, or purely local `gh` state. `gh auth token` is load-bearing: it is the user-PAT path `ng fetch-asset` depends on. |
+| `pr` | list · view · diff · checks · status · checkout |
+| `issue` | list · view · status |
+| `release` | list · view · download |
+| `repo` | list · view · clone · license · gitignore; `deploy-key`/`autolink` → list · view |
+| `label` · `secret` · `variable` · `cache` · `gpg-key` · `ssh-key` · `org` | list |
+| `gist` | list · view · clone |
+| `workflow` · `agent-task` | list · view |
+| `run` | list · view · watch · download |
+| `codespace` | list · view · logs · ports · code · ssh · jupyter |
+| `project` | list · view · item-list · field-list |
+| `ruleset` | list · view · check |
+| `attestation` | verify · download · trusted-root |
+| `api` | a plain GET: no `--method`/`-X` in {POST,PATCH,PUT,DELETE}, not `graphql`, and no request body (`-f`/`-F`/`--field`/`--raw-field`/`--input`). **`api graphql` is a WRITE** — mutations are hard to tell from queries, so graphql defaults to the bot. |
+| no group token | `gh` bare, or flags only (`gh --version`, `gh --help`). An UNRECOGNISED group is a WRITE. |
+
+`gh <group>` with no subcommand prints help and is a read. Everything
+not in that table is a WRITE and runs on the bot token.
+
+**A fail-closed WRITE verdict announces itself on stderr** — `gh-shim:
+\`gh <group> <sub>\` is not on any read allowlist — classified WRITE
+(fail-closed), using the BOT identity.` — except for the long-familiar
+writes (`pr create`, `issue comment`, `release upload`, …), which stay
+quiet. Set `GH_SHIM_QUIET=1` if you parse stderr. The cost of the
+inversion, stated honestly: a READ mis-classified as a WRITE runs under
+the bot's installation token and can 404 on a repo where the bot is not
+installed. That failure is LOUD and immediate; the one it replaced was
+silent by construction (the `#497` signature). The remedy for both is
+`GH_IMPERSONATE=1 GH_IMPERSONATE_REASON='…'`.
 
 Scope: the wrapper is **inert for the watcher** (it runs with
 `WATCHER_WINDOW` set and presets `GH_TOKEN` inline, so its
@@ -154,8 +185,9 @@ GH_IMPERSONATE=1 GH_IMPERSONATE_REASON="external repo, no bot install; operator 
   gh issue comment -R TrigosTeam/foo 5 --body-file note.md
 ```
 
-A reason is **required** (the shim refuses without one), and every
-impersonated call is appended to `monitor/.state/impersonate.log`.
+A reason is **required** — without `GH_IMPERSONATE_REASON` the shim
+refuses at **exit 3** and never reaches `gh` — and every impersonated
+call is appended to `monitor/.state/impersonate.log`.
 A `--dangerously-impersonate` pseudo-flag is an equivalent trigger
 (stripped before `gh` sees it). Note the auto-inject already makes
 this case self-correcting: a bot token 404s on a repo it can't see,
@@ -184,7 +216,7 @@ Run from the nexus root (`monitor/ng <verb> ...` or
 |------------|---------|-------------------|
 | `ng pr create --head <branch> [--base main] --title "…" --body-file b.md` | Open a PR | PR URL |
 | `ng pr edit <n> [--title "…"] [--body-file b.md]` | Edit a PR | PR URL |
-| `ng pr merge <n> [--squash\|--merge\|--rebase] [--delete-branch]` | Merge a PR | merge SHA |
+| `ng pr merge <n> [--squash\|--merge\|--rebase] [--sha <head>] [--base-sha <base>\|--verify-base] [--delete-branch]` | Merge a PR. `--sha` pins the head you verified (#628); `--verify-base` re-checks the BASE inside the verb, ms before the PUT — prefer it, the verdict→merge window has been measured at 4s (#880) | merge SHA |
 | `ng pr view <n>` | Brief PR summary | `#<n> state=… author=… title=…` |
 | `ng issue create --title "…" --body-file b.md [--label foo]…` | Create an issue | issue URL |
 | `ng issue comment <n> --body-file b.md` | Comment on an issue | comment URL |
@@ -201,26 +233,31 @@ Run from the nexus root (`monitor/ng <verb> ...` or
 | `ng log-action <agent> --event <name> [--note <t>] [--extra k=v]…` | Append one JSONL action-trace line | (silent) |
 | `ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--retain <reason>\|--no-retain]` | Universal end-of-task hand-off: uploads the report, posts a templated link comment, rockets the trigger comment, logs the wrap-up, AND auto-logs a `window-retain` event for the source tmux window (reason `wrap-up-<YYYY-MM-DD>` unless `--retain` overrides; `--no-retain` opts out). The retain mutes the wrapped row for `monitor.retain_ttl_seconds` (default 24 h) so the orchestrator can `claude --continue` against a follow-up user comment instead of spawning a fresh worker every time. | per-step status lines on stdout |
 
-### `react` silence
+### `react` confirmation
 
-`ng react` exits 0 on success but prints nothing on the happy path —
-trust the exit code. There's a documented friction request to add a
-`reacted <content> on comment <id>` confirmation; until then, scripts
-must check `$?` rather than parsing stdout.
+`ng react` prints `reacted <content> on comment <id>` on the happy path
+(`ng react-issue` prints `reacted <content> on issue <n>`) and exits 0.
+The POST failing is a `die`, so `$?` remains the thing to branch on;
+the line is for a human reading the pane.
 
-### Verbs landing soon (`<operator>/ng-omnibus`, not yet merged)
+### Cross-repo verbs — shipped
 
-- `ng preflight <repo>` — hits `/installation/repositories` and prints
-  whether the bot is installed on the target repo. Lets cross-repo
-  writes fail fast instead of returning a confusing GraphQL 403.
-- `ng show <comment-id>` — read-only fetch that bypasses the eligibility
-  filter, so an agent can quote a prior bot-authored comment.
-- `--repo OWNER/NAME` flag on `ng pr ...` and `ng issue ...` —
-  retargets the verb at a sibling <your-org> repo without falling back
-  to raw `gh api`.
+These three are merged and available; the `GH_TOKEN=…` escape hatch
+below is now only for verbs `ng` genuinely does not cover:
 
-Until these merge, cross-repo writes use the `GH_TOKEN=…` escape
-hatch below.
+- `ng preflight <owner/repo>` — prints
+  `bot installed: yes|NO (<repo>) — repository_selection=<…>`. Lets a
+  cross-repo write fail fast instead of returning a confusing GraphQL
+  403.
+- `ng show <comment-id> [--meta]` — read-only fetch that bypasses the
+  eligibility filter, so an agent can quote a prior bot-authored
+  comment. `--meta` adds the `updated_at` CAS snapshot that
+  `ng comment-edit --expect-updated-at` consumes.
+- `--repo OWNER/NAME` on most `pr`/`issue`/`show` verbs — retargets at
+  a sibling repo. Unset, a WRITE verb prefers `github.repo` from config
+  and **refuses** (rather than misroutes) when the cwd's git origin is
+  a different github repo; a READ verb prefers the cwd's origin with a
+  one-line stderr warning.
 
 ## Embedding local files (the asset-repo rule)
 
@@ -475,6 +512,23 @@ Three traps that have each produced a wrong action (a duplicate post, a
   appending your own comment** over mutating a shared one when the
   content can stand alone.
 
+- **A backticked `#N` in a PR body or comment creates NO cross-reference
+  event on the issue — an owned issue then reads as UNOWNED**
+  (<your-org>/nexus-code#1396). This workspace's citation style writes
+  `` `#1329` `` to stop `#N` becoming a list marker, and that is right in
+  `CLAUDE.md` and in prose *about* a number; it is wrong in the one place
+  that establishes ownership. Two-sided control on live PRs: a body with
+  eleven backticked `#N` and one bare left ZERO `cross-referenced` events
+  on the two issues it fixed; a body writing `**#N**` in bold left one on
+  each. The TITLE is not a cross-reference source at all (bare `#N` there:
+  nothing). So write at least one issue number BARE or bold in every PR
+  body and every comment that claims or discharges an issue, and never
+  rely on the title. If an ownership check is ever automated, key it on
+  `gh pr list --search <N>` — which sees backticked PRs — not on the
+  issue's cross-reference list, which does not. (`ng wrap-up`'s templated
+  link comment writes no `#N` of its own: it quotes the report's H1 and
+  `## Summary`, so a bare `#N` in your Summary is what reaches the issue.)
+
 - **The watcher-emit `body` field is TRUNCATED — re-fetch before quoting
   an operator comment into a worker brief.** The `--- eligible github
   comments ---` snippet cuts multi-paragraph asks with `…`; quoting it
@@ -483,6 +537,51 @@ Three traps that have each produced a wrong action (a duplicate post, a
   the full text — `gh api repos/<owner>/<repo>/issues/comments/<id> --jq
   '.body'` — before pasting it into a prompt. If you must shorten, label
   the truncation so the worker knows to re-fetch.
+
+## Which `gh` client the wrapper runs, and the job-log traps
+
+The wrapper picks the real client by **capability, not identity** — the first
+candidate on `PATH` meeting a declared version floor
+(`NEXUS_GH_MIN_VERSION`, default `2.86.0`; `monitor/gh-capable.sh`), not merely
+the first one that is not itself.
+
+It used to be the latter, which silently selected the agent-sandbox's
+`/app/bin/gh` **1.13.0 (2021)** over an installed 2.89.0 whenever `PATH`
+ordered them that way (`<your-org>/nexus-code#755`). At 1.13.0,
+`gh run view --job <id> --log` returns **ZERO lines at rc 0**,
+`gh run view <run> --log` returns two of ten jobs, and `gh pr checks` prints
+`pass` for a check whose REST conclusion is `skipped`. Five `gh` clients are
+installed on the reporting host, and the truncation is **not** 1.x-only —
+`2.14.7` also returns two of ten — which is why the floor sits at the oldest
+version measured correct rather than at the major-version boundary.
+
+`gh api` is byte-identical across clients, which is why it is the right call
+shape whenever an empty answer would be meaningful.
+
+**And `gh api` is the only shape that is per-ATTEMPT correct:
+`gh run view --job <id> --log` IGNORES the job id and serves the run's LATEST
+attempt** (`#1408`). Measured on 2.89.0: a job whose own API conclusion is
+`failure` read `397 tests; 0 failed`, 143,369 B, byte-identical across two job
+ids of one run, while the REST form returned distinct payloads matching each
+job's conclusion. So read a job log with:
+
+```zsh
+GH_TOKEN=$("$NEXUS_ROOT"/monitor/mint-token.sh) \
+    gh api repos/OWNER/REPO/actions/jobs/<job-id>/logs
+```
+
+never `gh run view --job … --log`, on ANY client. It is invisible on
+single-attempt runs, which is why it survives until a re-run — the moment the
+attempts disagree.
+
+Two corollaries for anything that screens job logs:
+
+- **A `log_bytes >= 20 KB` floor screens only the EMPTY tail** (`#755`'s
+  zero-line client). It cannot see a large, well-formed, WRONG-ATTEMPT log, so
+  do not describe it as a check that the log is the right one.
+- **A log byte count is METHOD-DEPENDENT** — `gh run view` prefixes every line
+  with job and step names, ~80% larger — so a published count carries its
+  method beside it or is not checkable.
 
 ## See Also
 

@@ -34,6 +34,17 @@
 #   0  all checked components converged
 #   1  timed out with at least one component still down
 #   2  usage / environment error
+#  79  NOT CHECKED — the services registry EXISTS and could not be READ, so
+#      no statement about service health is available. Never folded into 0.
+#      (your-org/nexus-code#1266. `[[ -f ]]` is true for an unreadable file,
+#      so the parser's guard did not cover the `done < "$file"` redirection;
+#      the failed parse yielded zero rows and this script printed "services
+#      healthy" and exited 0 while a registered service was genuinely down.
+#      Measured with the registry BYTES constant and the MODE the only
+#      variable: 0644 -> exit 1 naming the service; 0000 -> exit 0 "healthy".)
+#      A CONFIRMED failure OUTRANKS it: if any other component is also down,
+#      the verdict is 1, because "part of this could not be checked and part
+#      of it FAILED" is a failure.
 #
 # Honors the same env overrides as bootstrap-recover.sh: NEXUS_ROOT,
 # NEXUS_STATE_DIR, NEXUS_SERVICES_REGISTRY, RECOVER_TARGET_WINDOW.
@@ -83,9 +94,22 @@ _check_orchestrator() {
 
 # All registry services healthy. Missing/empty registry → satisfied.
 # Emits the names of any UNHEALTHY services on stdout (for the summary).
+#
+# An UNREADABLE registry is NOT satisfied and is not a service failure
+# either — it is "could not look" (rc 79 from the parser; see the
+# registry-READABILITY contract in bootstrap-recover.sh). It is recorded in
+# SERVICES_NOT_CHECKED rather than returned, because this function's stdout
+# is the unhealthy-name list and its rc is not consulted by _check_services.
+# Returning 0 here without the flag is the whole of #1266.
+SERVICES_NOT_CHECKED=0
 _unhealthy_services() {
-    local rows name workdir launch health logfile
-    rows=$(_recover_parse_registry "$SERVICES_REGISTRY") || return 0
+    local rows rc name workdir launch health logfile
+    rows=$(_recover_parse_registry "$SERVICES_REGISTRY"); rc=$?
+    if (( rc == 79 )); then
+        SERVICES_NOT_CHECKED=1
+        return 0
+    fi
+    (( rc == 0 )) || { SERVICES_NOT_CHECKED=1; return 0; }
     [[ -z "$rows" ]] && return 0
     while IFS=$'\t' read -r name workdir launch health logfile; do
         [[ -z "$name" ]] && continue
@@ -93,8 +117,20 @@ _unhealthy_services() {
     done <<<"$rows"
 }
 
+# rc 0 == "checked, and every service is healthy". An unreadable registry is
+# never rc 0 here: SERVICES_NOT_CHECKED is set INSIDE the $( ) subshell by
+# _unhealthy_services, so it cannot propagate out — the flag is re-derived in
+# THIS scope from the parser's own rc. Reading the subshell's copy would be a
+# silent always-0, i.e. the defect re-introduced one layer down.
 _check_services() {
-    local bad; bad=$(_unhealthy_services)
+    local bad rc
+    _recover_parse_registry "$SERVICES_REGISTRY" >/dev/null 2>&1; rc=$?
+    if (( rc != 0 )); then
+        SERVICES_NOT_CHECKED=1
+        return 1
+    fi
+    SERVICES_NOT_CHECKED=0
+    bad=$(_unhealthy_services)
     [[ -z "${bad// }" ]]
 }
 
@@ -133,12 +169,25 @@ down=()
 if (( CHECK_ORCH )) && (( ! o_ok )); then
     down+=("orchestrator (window '$TARGET_WINDOW' not present — the watcher spawns it within ~10s; check the cockpit)")
 fi
+svc_not_checked=0
 if (( ! s_ok )); then
     bad_svcs=$(_unhealthy_services)
-    down+=("services: ${bad_svcs:-unknown} (see monitor/svc.sh status)")
+    if (( SERVICES_NOT_CHECKED )); then
+        svc_not_checked=1
+        down+=("services: NOT CHECKED — the registry at $SERVICES_REGISTRY exists and could not be read (mode/ACL/ESTALE). No statement about service health is available; this is NOT a report that services are healthy.")
+    else
+        down+=("services: ${bad_svcs:-unknown} (see monitor/svc.sh status)")
+    fi
 fi
 
 echo "[verify-stack] stack did NOT fully converge after ${TIMEOUT}s:" >&2
 for d in "${down[@]}"; do echo "[verify-stack]   - $d" >&2; done
 echo "[verify-stack] inspect with: monitor/svc.sh status  |  monitor/ng watcher-status" >&2
+
+# A CONFIRMED failure outranks NOT-CHECKED: 79 only when the services leg is
+# the ONLY thing wrong and the reason is that it could not be read.
+if (( svc_not_checked )) && (( ${#down[@]} == 1 )); then
+    echo "[verify-stack] verdict: NOT CHECKED (79) — services unreadable; nothing else is down." >&2
+    exit 79
+fi
 exit 1

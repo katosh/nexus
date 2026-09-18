@@ -47,7 +47,7 @@
           { "type": "command",
             "command": "(mkdir -p \"$NEXUS_ROOT/monitor/.state\" && touch \"$NEXUS_ROOT/monitor/.state/orchestrator-heartbeat\" &) >/dev/null 2>&1" },
           { "type": "command",
-            "command": "rm -f \"$NEXUS_ROOT/monitor/.state/over-limit/${NEXUS_ORCHESTRATOR_WINDOW:-orchestrator}.json\"" }
+            "command": "$NEXUS_ROOT/monitor/hooks/stamp-clear.sh over-limit" }
         ]
       }
     ],

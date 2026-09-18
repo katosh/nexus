@@ -34,7 +34,8 @@ FAIL=0
 # definition, and the kind that quietly diverges (your-org/nexus-code#568 D8).
 assert_contains() {
     local label="$1" haystack="$2" needle="$3"
-    if [[ "$haystack" == *"$needle"* ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" && "$haystack" == *"$needle"* ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else printf '  FAIL: %s — needle %q not in %q\n' "$label" "$needle" "$haystack" >&2; FAIL=$(( FAIL + 1 )); fi
 }
 assert_ok() { local l="$1"; shift; if "$@"; then printf '  PASS: %s\n' "$l"; PASS=$(( PASS+1 )); else printf '  FAIL: %s\n' "$l" >&2; FAIL=$(( FAIL+1 )); fi; }

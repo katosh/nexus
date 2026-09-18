@@ -91,6 +91,19 @@
 
 set -u
 
+# --- RE-ENTRY BOUND (your-org/nexus-code#1033) -------------------------------
+# Backstop for any resolution CYCLE the content check cannot see — including one
+# whose other end is not a copy of this file at all. Forkless; bounded small on
+# purpose, because a large bound turns a loud instant refusal into a silent burn.
+_nw_depth="${NEXUS_NOTIFYWRAP_DEPTH:-0}"
+case "$_nw_depth" in ''|*[!0-9]*) _nw_depth=0 ;; esac
+if [ "$_nw_depth" -ge "${NEXUS_NOTIFYWRAP_DEPTH_MAX:-4}" ]; then
+    printf '%s shim: REFUSING — re-entered %s times without reaching a real binary; that is a resolution CYCLE (your-org/nexus-code#1033), not a slow call.\n' \
+        "sandbox-notify" "$_nw_depth" >&2
+    exit 127
+fi
+export NEXUS_NOTIFYWRAP_DEPTH=$((_nw_depth + 1))
+
 _nw_msg="$*"
 _nw_state_dir="${NEXUS_NOTIFY_STATE_DIR:-${NEXUS_ROOT:-}/monitor/.state}"
 _nw_decisions="$_nw_state_dir/notify-decisions.jsonl"
@@ -317,10 +330,43 @@ _nw_resolve_real() {
             _nwr_crp=$(_nw_rp "$_nwr_cand" 2>/dev/null || true)
             [ "$_nwr_crp" = "$_nwr_self" ] && continue
         fi
+        # Third gate: a candidate that IS a nexus wrapper is never the real one.
+        _nw_is_nexus_wrapper "$_nwr_cand" && continue
         _nw_real="$_nwr_cand"; break
     done
     IFS=$_nwr_oifs
 }
+
+# --- IS THIS CANDIDATE A NEXUS WRAPPER? (your-org/nexus-code#1033) -----------
+# The gates below ask "is this candidate the same FILE as me?" — a directory
+# string compare and a realpath compare. Both answer the ALIASING case (#568 A5:
+# one file, two names). Neither answers the INVERSE: two DIFFERENT files that
+# are both copies of this wrapper — a second clone, a worktree, /tmp/devcheck.
+# That passes both gates, so copy A selects copy B as "the real sandbox-notify" and
+# execs it while B execs A. Measured for the tmux sibling: 7,705 processes, PID
+# space wrapped, one agent dead (#1033). Measured here for THIS wrapper with
+# two distinct copies on PATH: an unbounded exec spin — ONE process, no growth,
+# never returns, invisible to any process-count check.
+#
+# The discriminator is CONTENT, not identity: match the file's own
+# self-identifying path comment, which sits within the first lines of every
+# revision. Deliberately NOT a marker introduced by this fix — a marker is an
+# opt-in that only the ALREADY-FIXED copy carries, and the copy you actually
+# meet during a rollout is the unfixed one. (That exact mistake was made and
+# measured on the tmux sibling before this form replaced it.)
+_nw_is_nexus_wrapper() {
+    IFS= read -r -N 2 _nw_magic < "$1" 2>/dev/null || return 1
+    [ "$_nw_magic" = '#!' ] || return 1         # ELF / not a script at all
+    _nw_scan=0
+    while [ "$_nw_scan" -lt 40 ] && IFS= read -r _nw_line; do
+        case "$_nw_line" in
+            *monitor/notifywrap/sandbox-notify*) return 0 ;;
+        esac
+        _nw_scan=$((_nw_scan + 1))
+    done < "$1"
+    return 1
+}
+
 _nw_rp() {
     if readlink -f / >/dev/null 2>&1; then
         readlink -f "$1" 2>/dev/null && return 0
@@ -392,7 +438,8 @@ _nw_under_test() {
     _nw_p=$$; _nw_d=0
     while [ "$_nw_d" -lt 12 ] && [ -n "$_nw_p" ] && [ "$_nw_p" != "0" ] \
           && [ "$_nw_p" != "1" ]; do
-        _nw_cl=$(tr '\0' ' ' < "/proc/$_nw_p/cmdline" 2>/dev/null \
+        # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+        _nw_cl=$( { tr '\0' ' ' < "/proc/$_nw_p/cmdline"; } 2>/dev/null \
                  | cut -d' ' -f1-3) || break
         case "$_nw_cl" in
             */claude|*/claude\ *|*node_modules/.bin/claude*) return 1 ;;

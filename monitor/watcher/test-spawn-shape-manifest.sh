@@ -30,9 +30,16 @@
 set -uo pipefail
 
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-REPO_ROOT=$(cd "$_test_dir/../.." && pwd)
+# THE TWO INPUTS ARE OVERRIDABLE SO THIS SUITE CAN BE POINTED AT A FIXTURE
+# (your-org/nexus-code#1483). They default to the real tree and the real
+# manifest, so every ordinary run is byte-for-byte what it was; the overrides
+# exist ONLY for the positive control at the bottom of this file, which
+# re-invokes this suite against a planted tree to prove the `UNCLASSIFIED` arm
+# can actually fire. A guard never seen to fail is not evidence, and an inert
+# check and a clean tree look identical.
+REPO_ROOT="${SSM_REPO_ROOT_OVERRIDE:-$(cd "$_test_dir/../.." && pwd)}"
 CLASSIFIER="$_test_dir/spawn-shapes.sh"
-MANIFEST="$_test_dir/spawn-shapes.manifest"
+MANIFEST="${SSM_MANIFEST_OVERRIDE:-$_test_dir/spawn-shapes.manifest}"
 
 # --- the `--population` protocol (your-org/nexus-code#803) -----------------
 #
@@ -211,7 +218,7 @@ done
 #
 # So the expectation is arithmetic over data the suite already derived:
 #
-#     4 fixed  = enumeration-non-degenerate (§1)
+#     7 fixed  = enumeration-non-degenerate (§1)
 #              + manifest/classifier agreement (§2)
 #              + the two SET assertions for 'shell' and 'agent' (§3)
 #     + one per distinct production root
@@ -224,8 +231,102 @@ done
 # Checked only when FAIL == 0. On a red run the arithmetic legitimately differs
 # — §2's agreement assertion is skipped when drift is detected — and a count
 # mismatch reported on top of a real failure would only obscure it.
+# ---- 5. POSITIVE CONTROL (your-org/nexus-code#1483) -----------------------
+#
+# THE ONE `none` ROW IN THE R4 CENSUS. This suite's red arm —
+# `UNCLASSIFIED call site (add a row to spawn-shapes.manifest)` — had never
+# been shown to fire. Every other check here compares a classifier against a
+# manifest and passes when they agree, and an INERT check agreeing with a
+# manifest is indistinguishable from a correct one. `#1477` is the standing
+# example: a suite green throughout an 18-hour outage caused by the guard it
+# tests.
+#
+# THE PLANT IS IN A FIXTURE TREE, NEVER THE REAL ONE: a scratch git repo with
+# one file carrying a spawn call site, and a manifest that does not mention it.
+# The suite re-invokes ITSELF against those two overrides — so what is proven
+# is that THIS FILE's own arm fires, not that some re-implementation of it
+# would.
+#
+# ASSERTED ON THE MESSAGE, NOT ON THE EXIT CODE. A three-file fixture also
+# trips the non-degeneracy floor (`fact_rows >= 10`), so rc 1 alone would be
+# satisfied by a suite whose UNCLASSIFIED arm was deleted — the control would
+# pass while proving nothing. The NEGATIVE arm is the other half: with a
+# manifest row present, that same string must be ABSENT, which is what
+# separates "the arm fires on a missing row" from "the arm fires always".
+#
+# Guarded against recursion by the override itself: the inner run has
+# SSM_REPO_ROOT_OVERRIDE set and skips this section.
+if [[ -z "${SSM_REPO_ROOT_OVERRIDE:-}" ]]; then
+    echo
+    echo "=== 5. positive control: the UNCLASSIFIED arm fires on a planted site ==="
+    _pc_dir=$(mktemp -d)
+    _pc_tree="$_pc_dir/tree"
+    mkdir -p "$_pc_tree"
+    # `git -c`, never the global config: nothing validates a commit's author and
+    # this repo has two commits authored `d@e` from a probe that wrote
+    # ~/.gitconfig (your-org/nexus-code#1244). No commit is made here anyway —
+    # `git ls-files` reads the INDEX, so `git add` alone is enough.
+    git -C "$_pc_tree" init -q 2>/dev/null
+    mkdir -p "$_pc_tree/monitor"
+    printf '#!/usr/bin/env bash\ntmux new-window -t "$S" -n "$W"\n' > "$_pc_tree/monitor/planted.sh"
+    git -C "$_pc_tree" add -A 2>/dev/null
+    # A fixture that is not its OWN repository root would send `git ls-files` up
+    # to the ENCLOSING repo and enumerate THIS repo's files — a confident wrong
+    # answer at rc 0 (CLAUDE.md, `git -C <non-repo>` walks up). Check it before
+    # believing anything the inner run says.
+    _pc_top=$(git -C "$_pc_tree" rev-parse --show-toplevel 2>/dev/null)
+    if [[ "$_pc_top" != "$_pc_tree" ]]; then
+        note_fail "positive control PRECONDITION: fixture is not its own repo root (toplevel=$_pc_top) — the plant would be read from the enclosing repo"
+        note_fail "positive control: skipped, precondition failed"
+        note_fail "positive control NEGATIVE arm: skipped, precondition failed"
+    else
+        printf '# fixture manifest, deliberately empty of rows\n' > "$_pc_dir/empty.manifest"
+        _pc_out=$(SSM_REPO_ROOT_OVERRIDE="$_pc_tree" SSM_MANIFEST_OVERRIDE="$_pc_dir/empty.manifest" \
+                    bash "${BASH_SOURCE[0]}" 2>&1)
+        if [[ "$_pc_out" == *"UNCLASSIFIED call site"* && "$_pc_out" == *"monitor/planted.sh"* ]]; then
+            note_pass "a planted call site absent from the manifest IS reported UNCLASSIFIED"
+        else
+            note_fail "a planted call site absent from the manifest was NOT reported UNCLASSIFIED — this suite's red arm is inert"
+        fi
+        # NEGATIVE arm: with the row present the arm must go quiet. Without this
+        # the positive above is satisfied by an arm that fires unconditionally.
+        # `awk NR==1`, NOT `| head -1`. `head` closes the pipe at its Nth
+        # line, the writer learns via EPIPE on its NEXT write, and under
+        # `pipefail` that inverts the pipeline's status — your-org/nexus-code#622,
+        # and `early-exit-readers.manifest` records every such site so a new
+        # one is a decision rather than an accident. This one WAS an accident:
+        # the local band caught it as a population change on
+        # `test-early-exit-reader-manifest.sh`, which is the guard doing
+        # exactly its job. awk reads the stream to EOF, so there is no early
+        # close to record.
+        _pc_rows=$(SSM_REPO_ROOT_OVERRIDE="$_pc_tree" bash "$CLASSIFIER" "$_pc_tree" 2>/dev/null)
+        _pc_site=$(printf '%s\n' "$_pc_rows" | awk -F'\t' 'NR==1 { print $1 }')
+        if [[ -n "$_pc_site" ]]; then
+            printf '%s\tbare\tshell\tsendkeys\tfixture-other\tplanted by the #1483 positive control\n' \
+                "$_pc_site" >> "$_pc_dir/empty.manifest"
+            _pc_out2=$(SSM_REPO_ROOT_OVERRIDE="$_pc_tree" SSM_MANIFEST_OVERRIDE="$_pc_dir/empty.manifest" \
+                        bash "${BASH_SOURCE[0]}" 2>&1)
+            if [[ "$_pc_out2" != *"UNCLASSIFIED call site"* ]]; then
+                note_pass "…and goes quiet once the row is added (the arm keys on the ROW, not on the fixture)"
+            else
+                note_fail "the UNCLASSIFIED arm still fires with a matching manifest row — it is not keyed on the row"
+            fi
+        else
+            note_fail "positive control: the classifier found NO call site in the fixture, so neither arm was exercised"
+        fi
+        # The plant must be the classifier's own reading of the fixture, not an
+        # artefact of reading the real tree through a walk-up.
+        if [[ "$_pc_site" == monitor/planted.sh* ]]; then
+            note_pass "…and the site the control exercised is the PLANTED one, not one from the real tree"
+        else
+            note_fail "positive control read site '$_pc_site', which is not the planted file — the fixture was not isolated"
+        fi
+    fi
+    rm -rf "$_pc_dir"
+fi
+
 n_prod_roots=$(printf '%s' "$prod_roots" | grep -c . || true)
-EXPECTED=$(( 4 + n_prod_roots ))
+EXPECTED=$(( 7 + n_prod_roots ))
 
 echo
 echo "=== summary: $PASS passed, $FAIL failed ($(( PASS + FAIL )) assertions; expected $EXPECTED) ==="
@@ -234,7 +335,7 @@ if (( FAIL > 0 )); then
     exit 1
 fi
 if (( PASS + FAIL != EXPECTED )); then
-    printf 'ASSERTION COUNT MISMATCH — %d ran, %d expected (4 fixed + %d production root(s)).\n' \
+    printf 'ASSERTION COUNT MISMATCH — %d ran, %d expected (7 fixed + %d production root(s)).\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" "$n_prod_roots" >&2
     printf '  Some assertion did not execute. A green over an assertion that never ran is\n' >&2
     printf '  this suite'"'"'s own defect class, one level up.\n' >&2

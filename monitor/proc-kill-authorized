@@ -214,7 +214,8 @@ _session_of() {
         [[ -d "/proc/$pid" ]] && return 4
         return 3
     }
-    read -r line < "/proc/$pid/stat" 2>/dev/null || return 4
+    # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+    { read -r line < "/proc/$pid/stat"; } 2>/dev/null || return 4
     [[ -n "$line" ]] || return 4
     [[ "$line" == *") "* ]] || return 4
     rest=${line##*") "}
@@ -231,7 +232,8 @@ _session_of() {
 _ppid_of() {
     local pid="$1" line rest
     [[ -r "/proc/$pid/stat" ]] || return 1
-    read -r line < "/proc/$pid/stat" 2>/dev/null || return 1
+    # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+    { read -r line < "/proc/$pid/stat"; } 2>/dev/null || return 1
     [[ "$line" == *") "* ]] || return 1
     rest=${line##*") "}
     set -- $rest
@@ -264,6 +266,110 @@ _resolve_self() {
     _collect_ancestors
 }
 
+# _detached_hint <pid> <sid> — a DIAGNOSTIC SUFFIX for the `not-owned` arm.
+# Prints the empty string when it has nothing to say.
+#
+# THIS CHANGES NO VERDICT (your-org/nexus-code#1235). It runs INSIDE the
+# already-decided `not-owned` refusal, strictly after the deny, and returns
+# text. There is no new arm, so the allowlist doctrine's third property — no
+# SAFE arm may precede a DENY arm that could fire on the same input (#1121) —
+# is satisfied vacuously: there is no new SAFE arm to mis-order. The pid is
+# refused before, during and after this call.
+#
+# WHY IT IS NEEDED. A refusal that says "not yours" reads IDENTICALLY whichever
+# explanation is true, and nothing downstream disagrees. An orphan survived
+# TWELVE HOURS because its own launcher hit this refusal at ten minutes old,
+# took the sibling-agent reading the message offers, and moved on. The message
+# was correct; it was the two readings being indistinguishable that cost the
+# window.
+#
+# WHAT THE EVIDENCE IS. `#851`'s header rejects the ppid WALK as a substitute
+# for the session predicate, and it is right to: reparenting sets ppid to 1, so
+# a walk can never authorise your own reparented process. But this is not a
+# walk and not a substitute. It is ONE extra read, used only to ATTRIBUTE a
+# refusal that has already happened — and in exactly the case that cost the
+# twelve hours, the ppid link is INTACT and points straight at the launcher.
+#
+# Measured on a live 28-hour production orphan (window `olayingestsk2`):
+#
+#     pid  15225   sess 15225   <- IS its own session leader
+#     ppid 32500   sess 17396   <- its launcher's own `claude` process
+#
+# Parentage intact, ownership denied. Controls, planted on this host: a
+# `setsid`-detached child the prober owned FIRED (ppid's session == prober's);
+# three genuine foreign session leaders (24619, 3765, 545) were correctly
+# SILENT.
+#
+# It is deliberately hedged to "yours" and not to a mechanism, because two
+# different things produce this signature and this probe cannot separate them:
+# a Bash tool call the harness backgrounded, and something you `setsid`-detached
+# yourself. Both escapes are named. What it DOES establish is the negative that
+# was missing — it is not a sibling's.
+#
+# ------------------------------------------------------------------------
+# TWO ARMS, AND THE SECOND IS THE ONE THE TITLE CASE NEEDS (#1235, follow-up).
+#
+# ARM 1 -- parent is in MY OWN session. This is the in-call `setsid` shape,
+# and it is the only arm the first fix shipped.
+#
+# ARM 2 -- parent is one of MY OWN ANCESTORS and is NOT itself a session
+# leader. This is the shape the HARNESS produces, and arm 1 cannot reach it:
+# every Bash tool call on this host is its OWN session leader, so a
+# backgrounded call's leader has the shared `claude` process as its parent,
+# and that process sits in a GRANDPARENT session. Measured at 989b888 with a
+# faithful three-level fixture (leader S -> non-leader C -> setsid children):
+#
+#     S 21163 sess 21163   <- pane-shell stand-in, a session LEADER
+#     C 22363 sess 21163   <- `claude` stand-in, NOT a leader
+#     L 22562 sess 22562  ppid 22363   <- the backgrounded orphan
+#     P 23223 sess 23223  ppid 22363   <- a LATER tool call, the prober
+#
+#   arm 1 alone: session(22363)=21163 != MY_SESSION 23223  -> SILENT.
+#
+# WHY NOT THE OBVIOUS FORM. This issue's own text proposes comparing
+# `session(ppid)` against the sessions of the prober's ANCESTORS. That form
+# was CONSTRUCTED AND REJECTED ON MEASUREMENT, not on taste: the tmux server
+# (pid 12, session 12) is an ancestor of every agent on this host, and ELEVEN
+# live sibling pane shells were measured as session leaders whose parent IS
+# pid 12. Its session is therefore in every agent's ancestor-session set, so
+# that form claims every OTHER agent's pane shell as "yours" -- restoring
+# #1235's ambiguity in the opposite direction, on the exact class the
+# negative control exists to protect. Comparing the PPID against the ancestor
+# PIDS fails identically, for the same pid 12.
+#
+# The `not itself a session leader` clause is what excludes it, and it is not
+# a heuristic about tmux: a process that is a session leader AND spawns
+# session leaders is a MULTIPLEXER, serving sessions it does not belong to.
+# Your own harness process is the opposite shape -- it sits INSIDE a session
+# and backgrounds a call out of it. `test-proc-kill-authorized.sh` T12 plants
+# both children of that fixture and asserts the pair.
+#
+# STILL CHANGES NO VERDICT. Arm 2 adds no arm to `_verdict`; it only widens
+# what this string-returning helper is willing to SAY, strictly inside a
+# refusal that has already returned `not-owned` rc 1.
+_detached_hint() {
+    local pid="$1" sid="$2" pp ppsid why
+    # Only meaningful when the refused pid is a session leader: that is what
+    # "it LEFT a session" looks like. A pid merely sitting in some other
+    # session is the ordinary sibling case and gets no hint.
+    [[ "$sid" == "$pid" ]] || return 0
+    pp=$(_ppid_of "$pid") || return 0
+    # ppid 1 means REPARENTED: the link is gone and no claim can be made.
+    # Silence here is the honest answer, not a missing feature.
+    [[ -n "$pp" ]] && [[ "$pp" =~ ^[0-9]+$ ]] && (( pp > 1 )) || return 0
+    ppsid=$(_session_of "$pp") || return 0
+    if [[ "$ppsid" == "$MY_SESSION" ]]; then
+        why="its parent $pp IS in your session $MY_SESSION"
+    elif [[ "$_ancestors" == *" $pp "* ]] && [[ "$ppsid" != "$pp" ]]; then
+        # Arm 2. The parent launched YOU too, and it is not a multiplexer.
+        why="its parent $pp is one of YOUR OWN ANCESTORS -- it launched you as well -- sitting in session $ppsid rather than your $MY_SESSION, and it is not itself a session leader"
+    else
+        return 0
+    fi
+    printf ' NOT-A-SIBLING: pid %s is its OWN session leader and %s, so this is YOUR process that LEFT your session. Two things do that, and this cannot tell them apart: the harness BACKGROUNDED a Bash tool call (it becomes a session leader, state Ss) -- stop that with the harness-native TaskStop, which can stop what it launched; or you setsid-detached it yourself (a service, the watcher) -- stop that with monitor/svc.sh. Do NOT hand-roll a signal past this refusal' \
+        "$pid" "$why"
+}
+
 # _verdict <pid> -> echoes "<kind> <detail>"; rc 0 only for `authorized`.
 _verdict() {
     local pid="$1" sid rc
@@ -283,11 +389,20 @@ _verdict() {
         3) printf 'absent no-such-pid-may-have-been-reused'; return 1 ;;
         4) printf 'unreadable session-not-readable-or-not-numeric'; return 1 ;;
         0) : ;;
+        # UNREACHABLE BY CONSTRUCTION, AND KEPT ANYWAY. `_session_of` returns
+        # only 0, 3 or 4 -- asserted from the source by
+        # `test-proc-kill-authorized.sh` T16, which reads its `return` codomain
+        # rather than trusting this comment. This arm therefore cannot be
+        # exercised in situ, and the suite exercises it by FAULT INJECTION and
+        # says so. It stays because the doctrine is an allowlist with a
+        # default-DENY terminal arm: the day `_session_of` grows a fifth return
+        # value, the answer must already be `refuse`, not `fall through`.
         *) printf 'unreadable probe-returned-%s' "$rc"; return 1 ;;
     esac
 
     if [[ "$sid" != "$MY_SESSION" ]]; then
-        printf 'not-owned session-%s-is-not-ours-%s' "$sid" "$MY_SESSION"; return 1
+        local _hint; _hint=$(_detached_hint "$pid" "$sid")
+        printf 'not-owned session-%s-is-not-ours-%s%s' "$sid" "$MY_SESSION" "$_hint"; return 1
     fi
     if [[ "$_ancestors" == *" $pid "* ]]; then
         printf 'self pid-is-this-process-or-an-ancestor'; return 1
@@ -338,6 +453,34 @@ authorized_count=0
 for p in "${pids[@]}"; do
     out=$(_verdict "$p"); vrc=$?
     kind=${out%% *}
+    # FAIL CLOSED ON A VERDICT THAT WAS NEVER PRODUCED (your-org/nexus-code#1278).
+    #
+    # `out=$(_verdict "$p")` is a COMMAND SUBSTITUTION, and a command
+    # substitution that cannot be created at all -- no free descriptor for the
+    # pipe (EMFILE), no free slot for the fork (EAGAIN) -- leaves `out` EMPTY
+    # and sets `$?` to **0**. The old shape read that 0 as `authorized` and
+    # emitted the pid. Measured on this host against the UNMODIFIED helper, one
+    # nonexistent pid, `ulimit -n` the only variable:
+    #
+    #     ulimit -n 5   ->  rc 1  kind=caller-session-unknown   --filter emits nothing
+    #     ulimit -n 4   ->  rc 0  kind=<empty>                  --filter emits 999999
+    #
+    # So under descriptor pressure the guard printed a pid it had NEVER LOOKED
+    # AT onto the stdout that `kill $(… --filter)` consumes -- and 999999 is
+    # the pid class T5 exists for, the one that may have been REUSED. A
+    # default-deny predicate that permits when it cannot run is not
+    # default-deny; it is the incident with extra steps.
+    #
+    # The check is `kind == authorized`, not `out is non-empty`: emptiness is a
+    # presence test wearing a validity test's name. `_verdict` returns 0 from
+    # exactly one place, and that place prints `authorized …`, so on every
+    # reachable path this narrows nothing. It only ever converts "I could not
+    # obtain a verdict" from a permit into a refusal.
+    if (( vrc == 0 )) && [[ "$kind" != "authorized" ]]; then
+        vrc=1
+        out="verdict-unavailable could-not-obtain-a-verdict-for-this-pid-refusing"
+        kind=${out%% *}
+    fi
     if (( vrc == 0 )); then
         authorized_count=$(( authorized_count + 1 ))
         if [[ "$mode" == filter ]]; then

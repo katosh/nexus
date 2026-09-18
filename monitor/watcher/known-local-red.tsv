@@ -1,0 +1,35 @@
+# known-local-red.tsv — the LOCAL known-red set, as DATA (your-org/nexus-code#1445).
+#
+# A full local suite run on an operator's live board is not green on pristine
+# `dev`, and the standing rule is "iterate locally, the PR is the last step".
+# An unqualified "the local suite must be green" is therefore unsatisfiable,
+# and a bare `N failed` is a count a worker must interpret — which is a count a
+# worker WILL misinterpret, in both directions: dismiss a real red as "one of
+# the usual", or chase an inherited one into someone else's code.
+#
+# So the set is written down where the runner can read it. At the foot of a
+# run, `watcher/run-tests.sh` partitions the FAILING SET against these rows and
+# prints, beside the count, which failures are in this set and which are
+# UNEXPLAINED. The local gate is `failing set ⊆ known-local-red set`; a member
+# outside it blocks the push. DIFF THE SETS, NEVER THE COUNTS — equal totals
+# can share zero members (#1150).
+#
+# THIS IS NOT AN ALLOWLIST FOR CI. The runner still exits 1 on any failure; a
+# row here changes what is PRINTED, never the verdict. CI never reads this
+# file's classes (it has no live tmux server and no board load), and a suite
+# listed here still reds on a runner if it is genuinely broken.
+#
+# Columns (tab-separated): suite<TAB>class<TAB>issue<TAB>reason
+#   suite   `<dir>/<file>` as the runner tags it: `watcher/test-x.sh` or
+#           `monitor/test-x.sh` (basename of the parent dir + basename).
+#   class   load       — passes in isolation; reds under board load
+#           live-tmux  — asserts against a clean tmux server; a live board has one
+#           host       — a property of this host's configuration, not of the tree
+#   issue   the tracker that expires the row (`#N`); a row with no live issue
+#           is a dismissal, and `test-known-local-red.sh` refuses it.
+#   reason  one line, human-readable, the mechanism not the symptom.
+#
+# A row is a MEASUREMENT with a date, not a permanent exemption: re-derive it
+# when the issue it names closes. Enforced by monitor/watcher/test-known-local-red.sh
+# (every row names an existing suite, a valid class and an issue; the runner's
+# classification is driven against a planted manifest).

@@ -34,7 +34,8 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PASS=0; FAIL=0
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$((PASS+1))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$((PASS+1))
     else printf '  FAIL: %s\n         expected: %s\n         in:\n%s\n' "$label" "$needle" "$hay" >&2; FAIL=$((FAIL+1)); fi
 }
 assert_not_contains() {
@@ -67,6 +68,10 @@ export STATE_DIR REPO USER_LOGIN BOT_LOGIN \
        MONITOR_REEMIT_NOEYES_MINUTES MONITOR_REEMIT_NOROCKET_HOURS \
        MONITOR_REEMIT_EVICT_EYES_ON_CLOSED
 
+# `_emit_filters.sh` first: it defines `_mention_target_key`, which
+# `_reemit_gc` uses to resolve each entry's reactable object and refuses to
+# run the live recheck without (your-org/nexus-code#1500).
+. "$_test_dir/_emit_filters.sh"
 . "$_test_dir/_reemit.sh"
 
 reg="$STATE_DIR/unacked-mentions.lines"

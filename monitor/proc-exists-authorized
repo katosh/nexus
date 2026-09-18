@@ -1,0 +1,616 @@
+#!/usr/bin/env bash
+# monitor/proc-exists-authorized — "is the job I am waiting on still
+# running?", answered by something ARGV CANNOT FORGE
+# (your-org/nexus-code#1073).
+#
+# The sibling of monitor/proc-kill-authorized. That one gates KILLS; this one
+# gates CONTROL FLOW, which is the gap #1073 names: nothing consulted an
+# authorization filter before deciding whether to keep waiting.
+#
+# ---------------------------------------------------------------------------
+# THE DEFECT THIS CLOSES
+# ---------------------------------------------------------------------------
+#
+# A process-EXISTENCE predicate keyed on a command line matches SIBLING AGENTS'
+# ARGV, because agent prompts quote verbatim the very thing being watched. A
+# skeptic window ran, as a wait for a background job:
+#
+#     until ps -eo args= | grep -q '[g]uards-for-diff'; do sleep 5; done
+#
+# Running the identical predicate while that loop was live matched THREE
+# processes. Two were `claude` — the literal `guards-for-diff` sat in their
+# PROMPTS. Only the third was a real run. Re-measured while writing this:
+# `claude`'s argv is the prompt (one live pid carried 15265 argv bytes), and a
+# CORRECTLY BRACKETED `pgrep -af "[g]uards-for-diff"` still matched three live
+# `claude` processes.
+#
+# Three properties make it resistant to the obvious fixes, and this tool
+# answers all three:
+#
+#   1. `proc-kill-authorized` does not cover it — it gates kills.
+#   2. BRACKETING IS CORRECT AND INSUFFICIENT. `[g]` stops the grep matching
+#      ITSELF. It does nothing about a sibling whose prompt holds the bare
+#      literal — a population that GROWS WITH EVERY WORKER SPAWNED. Measured
+#      both halves: bracketing took the observer's own phantom hit from 3 to 0,
+#      and left the three prompt-carried hits untouched.
+#   3. IT FAILS IN BOTH DIRECTIONS, so inverting the loop is not a fix.
+#      `until … grep -q` exits IMMEDIATELY on a prompt match when the job never
+#      started — the caller proceeds as though it completed. `while … grep -q`
+#      waits FOREVER while any agent holds the string in argv. A wait loop of
+#      exactly that shape held a window for 5h20m reading `working-background`.
+#
+# ---------------------------------------------------------------------------
+# WHAT IT KEYS ON INSTEAD
+# ---------------------------------------------------------------------------
+#
+# Three handles, strongest first. The mode you are allowed to use is a function
+# of the handle you have, which is the point — the tool's SHAPE carries the
+# lesson:
+#
+#   --token <t>   an `async-run.sh` token. pid + kernel start-time identity,
+#                 and a STATUS FILE, so `terminal` and `died` stay distinct.
+#   --pid <n>     a pid you recorded at launch, WITH its kernel start-time
+#                 (`--start-time`, the value async-run.sh writes to its job's
+#                 `pidstart` file) so a RECYCLED pid cannot read as `running`.
+#                 A bare `--pid` whose number is occupied is REFUSED (rc 3):
+#                 without the start-time the tool cannot tell YOUR job from
+#                 whatever now wears its number, and `running` is the one
+#                 answer that condition cannot support
+#                 (your-org/nexus-code#1351). `--unsafe-no-identity` makes
+#                 that omission an explicit decision rather than a default.
+#   --match <ere> an argv match, but SESSION-SCOPED: only processes in the
+#                 caller's own session count, and self + ancestors are excluded.
+#
+# `--match` is the weakest and it is deliberately CRIPPLED in the direction
+# that fails silently — see "THE ASYMMETRY" below. It exists because a worker
+# denied any safe spelling writes `ps | grep` instead.
+#
+# WHY SESSION OWNERSHIP DEFEATS THE SIBLING MATCH, restated from
+# proc-kill-authorized because it is the same load-bearing fact:
+#
+#     A process can only ever LEAVE your session, never JOIN it.
+#
+# `setsid()` creates a NEW session; nothing moves a process into an existing
+# one it was not born into. A sibling agent's `claude` — and every shell it
+# spawns — is therefore in a session that is not yours, no matter what its argv
+# says. The predicate cannot produce a false PERMIT by argv collision. It can
+# only produce a false ABSENT, which is why the asymmetry below exists.
+#
+# THE OBSERVER CANNOT MATCH ITSELF, BY CONSTRUCTION. `/proc/<pid>/cmdline` is
+# read directly — no `ps` child, no `grep` child — so there is no observer
+# process holding the pattern in its argv. Bracketing is not needed and is not
+# advised: it is a workaround for a self-match this tool does not have. Our own
+# pid and every ancestor are excluded explicitly on top of that.
+#
+# ---------------------------------------------------------------------------
+# THE ASYMMETRY — why --until-gone REFUSES --match
+# ---------------------------------------------------------------------------
+#
+# The two wait directions are NOT equally safe under a name, and collapsing
+# them is how #1073 fails both ways:
+#
+#   --until-present --match   SOUND. A sibling's argv is in a foreign session,
+#                             so it cannot satisfy the condition early. The
+#                             worst case is a TIMEOUT, which is loud.
+#
+#   --until-gone    --match   UNSOUND, AND IT IS THE MANUFACTURED-SUCCESS
+#                             DIRECTION. "No process in my session matches"
+#                             is not "the job is gone": an `async-run.sh` job
+#                             is `setsid`-detached into its OWN session, so it
+#                             is invisible to a session-scoped match and would
+#                             read as gone the instant you asked. Every visible
+#                             artefact would then say the work finished, and
+#                             the only evidence otherwise is an absence.
+#
+# So `--until-gone` REQUIRES an identity handle (`--pid` / `--token`) and
+# refuses `--match` at rc 2. You cannot establish that something is GONE from
+# a name — absence of an owned match is not absence of the job.
+#
+# ---------------------------------------------------------------------------
+# EXIT CODES — three of the five are NOT answers
+# ---------------------------------------------------------------------------
+#
+#   0  PRESENT / the awaited condition became true
+#   1  ABSENT — positively established (the handle was resolvable and says so)
+#   2  usage error, including a mode combination this tool refuses
+#   3  REFUSED — could not determine. NEITHER present NOR absent. Includes a
+#      MALFORMED `--match` ERE: a pattern that will not compile is a question
+#      that was never asked, and answering it `absent` would be this tool's own
+#      defect class (see the note on `_resolve_match`).
+#   4  TIMEOUT — the wait budget elapsed with the condition unmet
+#
+# `3` is the code that breaks the both-directions failure. A shell `until`
+# loops on non-zero and a `while` loops on zero, so ANY two-valued predicate is
+# read backwards by one of them. Here "I could not look" is neither, and the
+# WAIT MODES OWN THE LOOP so the caller never gets to choose the polarity.
+#
+# Every mode also prints one machine-readable line on stdout:
+#
+#     verdict=<running|absent|terminal|died|refused|timeout> <key=value>…
+#
+# `died` is `async-run.sh`'s: the RECORDED pid is gone and NO status file was
+# written, so its output is presumed TRUNCATED, not empty. It is reported as its
+# own word rather than folded into `absent`, because a truncated intermediate
+# passes every emptiness check.
+#
+# It is a CLASSIFICATION OVER THE RECORDED PID, not a fact about the work: the
+# usual cause is a kill before the job could report, but a LIVE job can have a
+# recorded pid that names a corpse (async-run's parent records the setsid
+# WRAPPER, the runner overwrites it), and re-reading does not discriminate.
+# See your-org/nexus-code#1237 F1/F9 — the overclaim was here, on the very path
+# the corrected `foreground-sleep` guidance now prescribes, so a reader got the
+# overclaim first and its correction second.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS DOES NOT COVER, stated because an unstated hole is worse
+# ---------------------------------------------------------------------------
+#
+#  * IT CANNOT SEE A `setsid`-DETACHED JOB UNDER `--match`. Services, the
+#    watcher, and everything launched through `async-run.sh` are session
+#    leaders of their own sessions. `--match` says so LOUDLY: when it finds
+#    zero owned matches but N unowned ones it names them and points at
+#    `--token`, rather than printing a bare, plausible zero.
+#  * OWNERSHIP IS NOT IDENTITY. `--match` answers "something I own matches this
+#    pattern", not "my job". Two of your own jobs sharing a substring are
+#    indistinguishable to it. Use `--token`/`--pid` when that matters.
+#  * TOCTOU. Every verdict describes the instant it was read.
+
+set -uo pipefail
+
+_self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || _self_dir="."
+
+_usage() {
+    cat >&2 <<'EOF'
+usage: proc-exists-authorized --token <async-run-token> [wait-opts]
+       proc-exists-authorized --pid <pid> --start-time <ticks> [wait-opts]
+       proc-exists-authorized --pid <pid> --unsafe-no-identity [wait-opts]
+       proc-exists-authorized --match <ere> [--list] [--until-present …]
+
+  Answers "is the job I am waiting on still running?" by SESSION OWNERSHIP and
+  pid IDENTITY — never by a command-line string alone, which also matches
+  SIBLING AGENTS' argv (your-org/nexus-code#1073).
+
+wait options (the tool owns the loop, so the polarity cannot be written wrong):
+  --until-present            block until the handle resolves to running
+  --until-gone               block until it resolves to not-running.
+                             REQUIRES --pid/--token; REFUSES --match.
+  --timeout <s>              wait budget, default 900. 0 = unbounded (explicit).
+  --interval <s>             poll interval, default 5.
+  --quiet                    suppress the stdout verdict line; rc is the answer.
+
+pid identity:
+  --start-time <ticks>       the pid's kernel start-time (field 22 of
+                             /proc/<pid>/stat). async-run.sh records it as
+                             `<job-dir>/pidstart`; by hand, read it at launch.
+                             A bare --pid on an OCCUPIED number is REFUSED (rc 3):
+                             the number alone cannot say whose process it is.
+  --unsafe-no-identity       answer `running` for a bare --pid anyway. Explicit,
+                             because a recycled pid then reads as your job.
+
+exit: 0 present/condition met · 1 absent · 2 usage · 3 REFUSED (could not
+      determine — neither present nor absent) · 4 timeout
+EOF
+    exit 2
+}
+
+# ---- /proc primitives -----------------------------------------------------
+#
+# Parsed AFTER THE LAST ") ", never by field index: field 2 is `comm` in
+# parentheses and comm may contain spaces AND parentheses. Same parse, and the
+# same reason, as monitor/proc-kill-authorized.
+
+# _stat_fields <pid> -> echoes "state ppid pgrp session … " (post-comm tail)
+#                       rc 3 = no such pid, rc 4 = present but unreadable
+_stat_fields() {
+    local pid="$1" line
+    if [[ ! -r "/proc/$pid/stat" ]]; then
+        [[ -d "/proc/$pid" ]] && return 4
+        return 3
+    fi
+    # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305). This
+    # helper's whole contract is that a zero it cannot vouch for is never printed
+    # bare, so a diagnostic it leaks on a routine pid race is the one place a
+    # REAL diagnostic would be learned-away.
+    { read -r line < "/proc/$pid/stat"; } 2>/dev/null || return 4
+    [[ -n "$line" && "$line" == *") "* ]] || return 4
+    printf '%s' "${line##*") "}"
+    return 0
+}
+
+_session_of() {
+    local rest rc
+    rest=$(_stat_fields "$1"); rc=$?
+    (( rc == 0 )) || return "$rc"
+    # shellcheck disable=SC2086
+    set -- $rest                       # $1 state $2 ppid $3 pgrp $4 session
+    [[ $# -ge 4 && "$4" =~ ^[0-9]+$ ]] || return 4
+    printf '%s' "$4"
+}
+
+_ppid_of() {
+    local rest rc
+    rest=$(_stat_fields "$1"); rc=$?
+    (( rc == 0 )) || return 1
+    # shellcheck disable=SC2086
+    set -- $rest
+    [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "$2"
+}
+
+# _starttime_of <pid> -> field 22 overall = field 20 of the post-comm tail.
+# Clock ticks since boot; immutable for the life of the process, which is what
+# makes a RECYCLED pid distinguishable from the original.
+_starttime_of() {
+    local rest rc
+    rest=$(_stat_fields "$1"); rc=$?
+    (( rc == 0 )) || return 1
+    # shellcheck disable=SC2086
+    set -- $rest
+    [[ $# -ge 20 && "${20}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "${20}"
+}
+
+# _argv_of <pid> -> the process's full argv, NULs rendered as spaces.
+_argv_of() {
+    local pid="$1"
+    [[ -r "/proc/$pid/cmdline" ]] || return 1
+    # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+    { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null || return 1
+}
+
+# ---- self-attribution -----------------------------------------------------
+#
+# "Can I even look?" is asked before any negative observation is trusted. A
+# /proc we cannot read makes EVERY pid look absent, and a confident absent is
+# this workspace's dominant defect class.
+MY_SESSION=""
+_ancestors=" $$ "
+_proc_usable=0
+
+_resolve_self() {
+    [[ -d "/proc/$$" ]] && _proc_usable=1
+    MY_SESSION=$(_session_of "$$") || MY_SESSION=""
+    local cur="$$" i pp
+    for i in $(seq 1 64); do
+        pp=$(_ppid_of "$cur") || break
+        [[ -n "$pp" ]] || break
+        _ancestors="${_ancestors}${pp} "
+        (( pp <= 1 )) && break
+        cur="$pp"
+    done
+}
+
+# ---- verdict emission -----------------------------------------------------
+
+QUIET=0
+_emit() {   # <verdict> <detail…>
+    (( QUIET == 1 )) && return 0
+    printf 'verdict=%s %s\n' "$1" "$2"
+}
+
+# ---- resolvers ------------------------------------------------------------
+#
+# Each sets VERDICT (running|absent|terminal|died|refused) and DETAIL, and
+# returns the rc that verdict maps to. `refused` is rc 3 everywhere.
+
+VERDICT=""; DETAIL=""
+
+# _resolve_pid <pid> [<expected-starttime>]
+_resolve_pid() {
+    local pid="$1" want="${2:-}" have rc
+    if (( _proc_usable == 0 )); then
+        VERDICT=refused; DETAIL="proc-unreadable cannot-see-/proc/self"; return 3
+    fi
+    if ! [[ "$pid" =~ ^[0-9]+$ ]] || (( pid <= 1 )); then
+        VERDICT=refused; DETAIL="not-a-pid pid=$pid"; return 3
+    fi
+    have=$(_starttime_of "$pid"); rc=$?
+    if (( rc != 0 )); then
+        # No start-time: either the pid is gone, or it exists and is opaque.
+        if [[ -d "/proc/$pid" ]]; then
+            VERDICT=refused; DETAIL="pid=$pid exists-but-unreadable"; return 3
+        fi
+        VERDICT=absent; DETAIL="pid=$pid no-such-pid"; return 1
+    fi
+    if [[ -n "$want" ]]; then
+        if [[ "$have" != "$want" ]]; then
+            # Same NUMBER, different process. Reporting this as `running` is
+            # the recycled-pid false positive async-run.sh's identity check
+            # exists to prevent.
+            VERDICT=absent
+            DETAIL="pid=$pid recycled starttime=$have expected=$want"
+            return 1
+        fi
+        VERDICT=running; DETAIL="pid=$pid starttime=$have identity=verified"
+        return 0
+    fi
+    # NO START-TIME, AND THE NUMBER IS OCCUPIED (your-org/nexus-code#1351).
+    # This arm used to answer `running` at rc 0 while WRITING into DETAIL that
+    # the identity was unverified — a channel no caller's `case $?` reads. A
+    # recycled pid then read as the caller's job: `--until-gone` spun forever
+    # on it (the 5h20m / 28h wedge class this tool exists to end), and a
+    # one-shot answered PRESENT for a job whose status file said `rc=1 ended`.
+    # "The pid exists" is the only fact available here, and it is not the
+    # question asked. REFUSE, unless the caller has made the omission explicit.
+    if (( UNSAFE_NO_IDENTITY == 1 )); then
+        VERDICT=running; DETAIL="pid=$pid starttime=$have identity=UNVERIFIED-by-request"
+        return 0
+    fi
+    VERDICT=refused
+    DETAIL="pid=$pid starttime=$have identity=unverified no-start-time-given"
+    if (( QUIET == 0 )); then
+        printf 'proc-exists-authorized: REFUSED — pid %s is occupied, but with no --start-time this\n' "$pid" >&2
+        printf '  tool cannot tell YOUR job from whatever now wears its number. A pid is\n' >&2
+        printf '  recycled the moment it dies, so `running` is the one answer this condition\n' >&2
+        printf '  cannot support (your-org/nexus-code#1351).\n' >&2
+        printf '    async-run.sh jobs: pass --token <t>, or --start-time "$(cat <job-dir>/pidstart)"\n' >&2
+        printf '    hand-launched:     record field 22 of /proc/<pid>/stat at launch and pass it\n' >&2
+        printf '    to accept the risk: --unsafe-no-identity (explicitly; a recycled pid then reads as yours)\n' >&2
+    fi
+    return 3
+}
+
+# _resolve_token <token> — delegate to async-run.sh, which owns the status file
+# and therefore the only mechanism that can tell `terminal` from `died`.
+_resolve_token() {
+    local token="$1" line verdict detail runner
+    runner="$_self_dir/async-run.sh"
+    if [[ ! -x "$runner" ]]; then
+        VERDICT=refused; DETAIL="token=$token async-run.sh-not-executable at=$runner"; return 3
+    fi
+    line=$("$runner" --status-line "$token" 2>/dev/null) || line=""
+    if [[ -z "$line" ]]; then
+        VERDICT=refused; DETAIL="token=$token status-line-empty"; return 3
+    fi
+    verdict=${line%%|*}; detail=${line#*|}
+    case "$verdict" in
+        running)  VERDICT=running;  DETAIL="token=$token $detail"; return 0 ;;
+        terminal) VERDICT=terminal; DETAIL="token=$token $detail"; return 1 ;;
+        died)
+            VERDICT=died; DETAIL="token=$token $detail"
+            printf 'proc-exists-authorized: token=%s DIED — gone with no status file written.\n' "$token" >&2
+            printf '  `died` is a CLASSIFICATION OVER THE RECORDED PID, not a fact about the work:\n' >&2
+            printf '  the usual cause is a kill before it could report (OOM, node failure, kill -9),\n' >&2
+            printf '  but a LIVE job can have a recorded pid that names a corpse, and re-reading does\n' >&2
+            printf '  NOT discriminate — measured `died` through +19s, then terminal rc=0 at +22s.\n' >&2
+            printf '  Treat its output as TRUNCATED, not empty: a partial intermediate passes\n' >&2
+            printf '  every emptiness check and silently shortens every number derived from it.\n' >&2
+            return 1 ;;
+        *)        VERDICT=refused; DETAIL="token=$token $verdict:$detail"; return 3 ;;
+    esac
+}
+
+# _ere_ok <ere> — rc 0 iff bash's own regex engine accepts the pattern.
+#
+# Validated with THE ENGINE THAT WILL DO THE MATCHING (`[[ =~ ]]`), never a
+# proxy such as `grep -E`: a proxy that disagreed at the margin would MOVE the
+# failure rather than remove it, and the margin is exactly where this bites.
+# bash returns >1 from `[[ =~ ]]` when regcomp rejects the pattern, and 0/1 for
+# a valid one; the empty subject is deliberate, since compilability is the only
+# question here.
+_ere_ok() {
+    local _r
+    { [[ "" =~ $1 ]]; } 2>/dev/null
+    _r=$?
+    (( _r <= 1 ))
+}
+
+# _resolve_match <ere> — SESSION-SCOPED argv match.
+#
+# Sets MATCHED_PIDS (owned) and UNOWNED_N (matched the pattern, not ours).
+#
+# ── THIS ARM WAS GOT WRONG ONCE, AND IT IS WORTH KNOWING HOW ────────────────
+#
+# The first version of this loop wrote `[[ "$argv" =~ $re ]] || continue`.
+# bash returns **2** from `[[ =~ ]]` on a MALFORMED regex and **1** on a
+# well-formed non-match, and `|| continue` fuses the two. So an invalid ERE
+# scanned nothing, matched nothing, and returned `verdict=absent` at **rc 1** —
+# which this file's own header defines as "ABSENT, positively established".
+#
+# Measured, on the SAME live owned process, at the same instant:
+#
+#     --match 'owned_<nonce>'    -> verdict=running  owned_pids=11638  rc 0
+#     --match 'owned_<nonce>['   -> verdict=absent   owned_pids=none   rc 1
+#
+# Two spellings of one intent, opposite answers, no error, no warning. And
+# `scanned_hits` — the field added to this very output to distinguish "looked
+# and excluded" from "never looked" — read **0**, so the tool's own
+# non-vacuity signal CORROBORATED the wrong answer.
+#
+# That is `#1073`'s defect class re-instantiated inside the tool written to
+# close it: a predicate confidently asserting an absence it never established,
+# at the exit code reserved for "positively established". It was written by
+# someone with the whole class in front of them, on purpose-built machinery,
+# and it survived 46 passing assertions. The lesson is not "be careful" — it is
+# that AN ERROR PATH FUSED INTO A DATA PATH IS INVISIBLE TO EVERY TEST THAT
+# ONLY EXERCISES THE DATA PATH. The regex was always valid in every test, so
+# nothing ever asked what happened when it was not.
+#
+# Hence two independent gates below, not one: the pattern is compiled and
+# rejected BEFORE any scan, and the in-loop status is still discriminated
+# rather than `|| continue`d.
+MATCHED_PIDS=""
+UNOWNED_N=0
+UNOWNED_SAMPLE=""
+_resolve_match() {
+    local re="$1" pid argv sid seen=0 _mrc
+    MATCHED_PIDS=""; UNOWNED_N=0; UNOWNED_SAMPLE=""
+    if (( _proc_usable == 0 )); then
+        VERDICT=refused; DETAIL="proc-unreadable cannot-see-/proc/self"; return 3
+    fi
+    if [[ -z "$MY_SESSION" ]]; then
+        # A comparison with an unknown left side is not a comparison.
+        VERDICT=refused; DETAIL="caller-session-unknown own-session-unreadable"; return 3
+    fi
+    # GATE 1 — compile before scanning. A pattern that cannot be compiled is a
+    # question that was never asked, which is neither present nor absent.
+    if ! _ere_ok "$re"; then
+        VERDICT=refused; DETAIL="match invalid-ere ere=$re"; return 3
+    fi
+    for pid in /proc/[0-9]*; do
+        pid=${pid#/proc/}
+        argv=$(_argv_of "$pid") || continue
+        [[ -n "$argv" ]] || continue          # kernel threads have empty cmdline
+        # GATE 2 — discriminate the status; never `|| continue`. Gate 1 should
+        # make this unreachable, and it is kept anyway: `continue` is the exact
+        # construct that fused rc 2 into rc 1, so the shape is not reintroduced
+        # here on the assumption that something upstream caught it.
+        if ! [[ "$argv" =~ $re ]]; then
+            _mrc=$?
+            if (( _mrc > 1 )); then
+                VERDICT=refused; DETAIL="match ere-rejected-mid-scan rc=$_mrc ere=$re"; return 3
+            fi
+            continue
+        fi
+        seen=$(( seen + 1 ))
+        # Ourselves and our ancestors hold the pattern in argv BY CONSTRUCTION
+        # (it is the command line that invoked us). Never a hit.
+        [[ "$_ancestors" == *" $pid "* ]] && continue
+        sid=$(_session_of "$pid") || continue
+        if [[ "$sid" == "$MY_SESSION" ]]; then
+            [[ "$pid" == "$MY_SESSION" ]] && continue   # our own session leader
+            MATCHED_PIDS="${MATCHED_PIDS}${pid} "
+        else
+            UNOWNED_N=$(( UNOWNED_N + 1 ))
+            [[ -z "$UNOWNED_SAMPLE" ]] && UNOWNED_SAMPLE="$pid"
+        fi
+    done
+    if [[ -n "$MATCHED_PIDS" ]]; then
+        VERDICT=running
+        DETAIL="match owned_pids=${MATCHED_PIDS% } unowned=$UNOWNED_N scanned_hits=$seen"
+        return 0
+    fi
+    VERDICT=absent
+    DETAIL="match owned_pids=none unowned=$UNOWNED_N scanned_hits=$seen"
+    # A ZERO THIS TOOL CANNOT VOUCH FOR IS SAID OUT LOUD. `unowned>0` means the
+    # pattern matched real processes that are not in your session — a sibling
+    # agent's prompt, or your OWN setsid-detached job, which is invisible here.
+    if (( UNOWNED_N > 0 )) && (( QUIET == 0 )); then
+        printf 'proc-exists-authorized: NOTHING OWNED matched, but %d process(es) DID match the\n' "$UNOWNED_N" >&2
+        printf '  pattern in another session (first: pid %s). This is a REFUSAL to guess, not\n' "$UNOWNED_SAMPLE" >&2
+        printf '  proof the job is gone. Two things look like this:\n' >&2
+        printf '    * a SIBLING agent whose prompt quotes your pattern — correctly excluded;\n' >&2
+        printf '    * YOUR OWN setsid-detached job (async-run.sh, a service, the watcher) —\n' >&2
+        printf '      wrongly excluded, because it left your session at launch.\n' >&2
+        printf '  If it is yours, ask by handle: --token <t> (async-run.sh) or --pid <n>.\n' >&2
+    fi
+    return 1
+}
+
+# ---- argument parsing -----------------------------------------------------
+
+mode=""; handle=""; want_start=""
+wait_dir=""; timeout=900; interval=5; list=0
+UNSAFE_NO_IDENTITY=0
+
+while (( $# > 0 )); do
+    case "$1" in
+        --token)      [[ $# -ge 2 ]] || _usage; mode=token; handle="$2"; shift 2 ;;
+        --pid)        [[ $# -ge 2 ]] || _usage; mode=pid;   handle="$2"; shift 2 ;;
+        --match)      [[ $# -ge 2 ]] || _usage; mode=match; handle="$2"; shift 2 ;;
+        --start-time) [[ $# -ge 2 ]] || _usage; want_start="$2"; shift 2 ;;
+        --unsafe-no-identity) UNSAFE_NO_IDENTITY=1; shift ;;
+        --until-present) wait_dir=present; shift ;;
+        --until-gone)    wait_dir=gone;    shift ;;
+        --timeout)    [[ $# -ge 2 ]] || _usage; timeout="$2";  shift 2 ;;
+        --interval)   [[ $# -ge 2 ]] || _usage; interval="$2"; shift 2 ;;
+        --list)       list=1; shift ;;
+        --quiet)      QUIET=1; shift ;;
+        -h|--help)    _usage ;;
+        *)            _usage ;;
+    esac
+done
+
+[[ -n "$mode" ]] || _usage
+[[ "$timeout"  =~ ^[0-9]+$ ]] || _usage
+[[ "$interval" =~ ^[1-9][0-9]*$ ]] || _usage
+[[ -n "$want_start" && "$mode" != pid ]] && _usage
+[[ "$UNSAFE_NO_IDENTITY" == 1 && "$mode" != pid ]] && _usage
+# An EMPTY --start-time is the omission wearing a flag (#1351: a wrong state
+# filename yielded "" and silently disarmed the guard). Same arm as no flag.
+[[ -n "$want_start" && ! "$want_start" =~ ^[0-9]+$ ]] && _usage
+
+# THE REFUSAL THAT IS THE WHOLE DESIGN. See "THE ASYMMETRY" in the header.
+if [[ "$wait_dir" == gone && "$mode" == match ]]; then
+    cat >&2 <<'EOF'
+proc-exists-authorized: REFUSED — `--until-gone` cannot be answered by `--match`.
+
+  "No process in MY session matches" is not "the job is gone". Your own
+  setsid-detached job (async-run.sh, a service, the watcher) left your session
+  at launch and is invisible to a session-scoped match, so this would report
+  GONE the instant you asked — the MANUFACTURED-SUCCESS direction, where every
+  visible artefact says the work finished and the only evidence is an absence.
+
+  Wait on a handle instead:
+      proc-exists-authorized --until-gone --token <async-run-token>
+      proc-exists-authorized --until-gone --pid <recorded-pid> --start-time <t>
+
+  If you have neither, you did not record one at launch. Relaunch through
+  `monitor/async-run.sh --desc "<what>" -- <cmd>`, which mints a token and
+  keeps the exit status (your-org/nexus-code#1071).
+EOF
+    exit 2
+fi
+
+_resolve_self
+
+_resolve_once() {
+    case "$mode" in
+        token) _resolve_token "$handle" ;;
+        pid)   _resolve_pid   "$handle" "$want_start" ;;
+        match) _resolve_match "$handle" ;;
+    esac
+}
+
+# ---- one-shot -------------------------------------------------------------
+
+if [[ -z "$wait_dir" ]]; then
+    _resolve_once; rc=$?
+    if (( list == 1 && rc == 0 )) && [[ "$mode" == match ]]; then
+        for p in $MATCHED_PIDS; do printf '%s\n' "$p"; done
+    fi
+    _emit "$VERDICT" "$DETAIL"
+    exit "$rc"
+fi
+
+# ---- wait modes: the tool owns the loop -----------------------------------
+#
+# The caller never writes `until`/`while` around this, so the polarity cannot
+# be inverted and a REFUSAL cannot be read as either answer: rc 3 STOPS the
+# wait rather than spinning on it.
+
+_deadline_note() {
+    if (( timeout == 0 )); then
+        printf 'proc-exists-authorized: waiting for %s, UNBOUNDED (--timeout 0 was explicit).\n' "$wait_dir" >&2
+    else
+        printf 'proc-exists-authorized: waiting for %s, budget %ss, poll %ss.\n' "$wait_dir" "$timeout" "$interval" >&2
+    fi
+}
+_deadline_note
+
+_elapsed=0
+while :; do
+    _resolve_once; rc=$?
+    if (( rc == 3 )); then
+        # Could not determine. NOT a reason to keep waiting — a wait that
+        # spins on an unanswerable predicate is the 5h20m wedge.
+        _emit refused "$DETAIL waited=${_elapsed}s"
+        printf 'proc-exists-authorized: REFUSED after %ss — the handle could not be resolved.\n' "$_elapsed" >&2
+        printf '  Stopping rather than spinning: an unanswerable predicate polled forever is\n' >&2
+        printf '  the wedge this tool exists to prevent (your-org/nexus-code#1073).\n' >&2
+        exit 3
+    fi
+    if [[ "$wait_dir" == present ]] && (( rc == 0 )); then
+        _emit "$VERDICT" "$DETAIL waited=${_elapsed}s"; exit 0
+    fi
+    if [[ "$wait_dir" == gone ]] && (( rc == 1 )); then
+        _emit "$VERDICT" "$DETAIL waited=${_elapsed}s"; exit 0
+    fi
+    if (( timeout > 0 )) && (( _elapsed >= timeout )); then
+        _emit timeout "$DETAIL waited=${_elapsed}s budget=${timeout}s"
+        printf 'proc-exists-authorized: TIMEOUT after %ss waiting for %s.\n' "$_elapsed" "$wait_dir" >&2
+        exit 4
+    fi
+    sleep "$interval"
+    _elapsed=$(( _elapsed + interval ))
+done

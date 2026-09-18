@@ -58,6 +58,26 @@ set -uo pipefail
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$_test_dir/../.." && pwd)
 CLAUDE_MD="$REPO_ROOT/CLAUDE.md"
+
+# ── this suite DECLARES its own population (the --population protocol) ──────
+# your-org/nexus-code#1219. CLAUDE.md is the document this suite EXECUTES, so
+# an edit to the fenced block it pins is exactly the edit that can change its
+# verdict — and until #1219 no such edit could SELECT it: a suite that declares
+# no population is INVISIBLE to `guards-for-diff` rather than excluded by it
+# (#1078), appearing in neither SELECTED nor CONSIDERED AND EXCLUDED, so its
+# absence reads as a considered exclusion. `gp_handle` adds this suite's own
+# path and `monitor/_guard_population.sh` for free; everything else is declared
+# because this suite READS ITS BYTES to reach a verdict.
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    printf '%s\n' \
+        CLAUDE.md \
+        monitor/ng \
+        monitor/_bookkeeping.sh \
+        monitor/_nexus-root.sh
+}
+gp_handle "$@"
+bash "$(dirname "${BASH_SOURCE[0]}")/claude-md-block-coverage.sh" 618-REMEDIES   # the entry's UNCHECKED share, in this suite's own output (#1239)
 NG_REAL="$_test_dir/../ng"
 
 # The real grep binary, resolved WITHOUT any wrapper.
@@ -79,7 +99,8 @@ assert_gt() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if "$REAL_GREP" -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && "$REAL_GREP" -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else printf '  FAIL: %s\n           expected substring: %s\n           in: %s\n' "$label" "$needle" "$hay" >&2; FAIL=$(( FAIL + 1 )); fi
 }
 note_skip() { printf '  SKIP: %s\n' "$1"; SKIP=$(( SKIP + 1 )); }
@@ -99,6 +120,8 @@ cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
 # `ng` refuses to start unless _bookkeeping.sh is readable beside it
 # (#601 #605 #629 #631).
 cp "$_test_dir/../_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
+# your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+cp "$_test_dir/../_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 cat > "$FAKE_NEXUS/config/load.sh" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in

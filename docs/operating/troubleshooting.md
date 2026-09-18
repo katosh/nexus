@@ -78,8 +78,11 @@ monitor/svc.sh restart watcher
 
 Fix the TARGET in config (`monitor.target_window` in `config/nexus.yml`, or
 `MONITOR_TARGET`) — do not pass `--target <window>` on the command line. That
-is the `#459` anti-pattern; the launcher derives the target from config and
-now exits 2 on a hard-coded one.
+is the `#459` anti-pattern. What the launcher actually refuses is narrower
+than the convention: `_require_arg`
+(`monitor/watcher/launcher.sh:111-117`) exits 2 on an EMPTY `--target` /
+`--window` — the shape an unset variable expands to — while a non-empty
+hard-coded value is still accepted and still beats config.
 
 **Prevention.** Don't rename the orchestrator's window. The default name `orchestrator` is what the launcher and the watcher both expect; if you must rename, override consistently via `MONITOR_TARGET` or `monitor.target_window` in `config/nexus.yml`.
 
@@ -168,8 +171,10 @@ Then check perms (`chmod u+w monitor/.state/last-ack.txt` if needed) and disk sp
 tail -40 monitor/.state/watcher.log
 # Look for the respawn target reason, the immediately preceding error.
 
-tmux capture-pane -t claude -p -S -200
-# If a fresh claude is still up, see what it's wedged on.
+tmux capture-pane -t orchestrator -p -S -200
+# If a fresh orchestrator is still up, see what it's wedged on.
+# (`claude` is the RETIRED legacy window name — see the note beside
+#  `target_window` in config/nexus.example.yml.)
 ```
 
 Once fixed, the crash-loop guard clears on the next successful paste-to-target — no manual reset needed. The sliding-window also empties by time as old respawn entries age out.

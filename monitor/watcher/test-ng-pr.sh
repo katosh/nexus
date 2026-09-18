@@ -60,16 +60,56 @@ make_gh_stub "$STUB_DIR/gh" "$CAPTURE" --with-body-capture "$BODY_CAPTURE" <<'CA
         printf '%s' '{"sha":"abc1234deadbeef","merged":true}'
         ;;
     */pulls/*)
+        # `_merge_ref_base` asks this endpoint for the base BRANCH NAME via
+        # `--jq .base.ref`; `cmd_pr_merge` wants the whole object. ONE
+        # GitHub-shaped object, served through `ghs_emit`, answers both: the
+        # caller's own expression is EVALUATED (your-org/nexus-code#932), so
+        # the #880 workaround — `if [[ "$jq_expr" == *base.ref* ]]; then
+        # printf 'main'` — is gone, and a selection defect in the expression
+        # is now VISIBLE to this suite instead of digested away.
         if [[ "$method" == "PATCH" ]]; then
-            printf '%s' '{"html_url":"https://mock.example/pulls/42-edited","number":42}'
+            ghs_emit <<< '{"html_url":"https://mock.example/pulls/42-edited","number":42}'
         elif [[ "$method" == "GET" ]]; then
-            printf '%s' '{"number":42,"state":"open","user":{"login":"the-author"},"head":{"ref":"feature-branch","sha":"fetchedhead000"},"base":{"ref":"main"},"title":"a pr title"}'
+            ghs_emit <<< '{"number":42,"state":"open","user":{"login":"the-author"},"head":{"ref":"feature-branch","sha":"fetchedhead000"},"base":{"ref":"main"},"title":"a pr title"}'
         else
-            printf '%s' '{}'
+            ghs_emit <<< '{}'
         fi
         ;;
     */pulls)
         printf '%s' '{"html_url":"https://mock.example/pulls/42","number":42}'
+        ;;
+    */actions/runs?head_sha=*)
+        # your-org/nexus-code#880's --verify-base runs the REAL _merge_ref_base,
+        # which needs the run list (with its TOTALCOUNT header), the jobs list
+        # and a job log. Empty by default so every pre-existing case keeps its
+        # meaning: no runs -> `unread` -> permit -> the merge proceeds untouched.
+        printf 'TOTALCOUNT 1\n'
+        printf '%s\n' "${MOCK_MRB_RUN:-}"
+        ;;
+    */actions/runs/*/jobs*)
+        printf '%s\n' "${MOCK_MRB_RUN:-}"
+        ;;
+    */actions/jobs/*/logs*)
+        printf '%s\n' "${MOCK_MRB_LOG:-}"
+        ;;
+    */git/ref/heads/*)
+        # Two callers, one endpoint: `_merge_ref_base` asks with
+        # `--jq .object.sha` (wants a bare sha), `cmd_pr_merge --base-sha` asks
+        # without and pipes through a local jq (wants the object). ONE
+        # GitHub-shaped object through `ghs_emit` serves both (#932): the jq
+        # caller's expression is evaluated for real, so a `.object.sha` that
+        # stopped selecting the sha would red here instead of being digested.
+        # your-org/nexus-code#880's --base-sha pin reads the LIVE TIP of the base
+        # branch from the SINGULAR `git/ref/heads/<b>` endpoint. Distinct from the
+        # PLURAL `git/refs/heads/<b>` arm below, which is the DELETE target for
+        # --delete-branch; the two never collide as glob patterns.
+        # MOCK_BASE_TIP_UNREADABLE models the endpoint failing, which must produce
+        # a REFUSAL and never a fallback to the PR object's frozen `.base.sha`.
+        if [[ "${MOCK_BASE_TIP_UNREADABLE:-0}" == "1" ]]; then
+            echo 'gh: mock failure reading the base ref' >&2
+            exit 1
+        fi
+        ghs_emit <<< "{\"object\":{\"sha\":\"${MOCK_BASE_TIP:-livebase777}\"}}"
         ;;
     */git/refs/heads/*)
         printf '%s' '{}'
@@ -92,6 +132,10 @@ run_ng() {
         PATH="$STUB_DIR:$PATH" \
         MOCK_REVIEWER_FAIL="${MOCK_REVIEWER_FAIL:-0}" \
         MOCK_MERGE_409="${MOCK_MERGE_409:-0}" \
+        MOCK_BASE_TIP="${MOCK_BASE_TIP:-livebase777}" \
+        MOCK_BASE_TIP_UNREADABLE="${MOCK_BASE_TIP_UNREADABLE:-0}" \
+        MOCK_MRB_RUN="${MOCK_MRB_RUN:-}" \
+        MOCK_MRB_LOG="${MOCK_MRB_LOG:-}" \
         -- "$NG" "$@" ) >"$_out_tmp" 2>"$_err_tmp"
     _rc=$?
     _stdout=$(<"$_out_tmp"); _stderr=$(<"$_err_tmp")
@@ -319,6 +363,213 @@ MOCK_MERGE_409=1 run_ng out err rc pr merge 42 --sha stalehead111
 assert_eq        "exit 1 (merge rejected)"           "$rc" "1"
 assert_contains  "names the head-moved rejection"    "$err" "REJECTED"
 assert_contains  "tells the operator to re-verify"   "$err" "Re-verify the NEW head"
+
+# ---- Test 17c: cmd_pr_merge — the #880 BASE-sha PIN --------------------
+# The other half of 17b. `--sha` pins the HEAD the caller verified; `--base-sha`
+# pins the BASE that head's green was computed against, which GitHub does NOT
+# check: it 409s a moved head, and it 409s a base that moved CONFLICTINGLY, but
+# a base that advanced and still merges cleanly is accepted silently. That is
+# the whole hazard — measured on this repo, `#870` merged onto `4ed5aa1e` five
+# minutes after `dev` left `a74805b5`, which is the base its suite ran against.
+
+echo '=== ng pr merge 42 --base-sha <live tip> → base pin holds, merge proceeds ==='
+MOCK_BASE_TIP=livebase777 run_ng out err rc pr merge 42 --sha verifiedhead999 --base-sha livebase777
+assert_eq        "exit 0"                            "$rc" "0"
+assert_contains  "stdout still prints the merge SHA" "$out" "abc1234deadbeef"
+assert_contains  "stderr confirms the base pin held" "$err" "base pin OK"
+calls=$(<"$CAPTURE")
+assert_contains  "the live tip is read from the SINGULAR ref endpoint, not the PR's frozen .base.sha" \
+                 "$calls" "/git/ref/heads/main"
+assert_contains  "and the merge PUT still fires"     "$calls" "-X PUT /repos/default-org/default-repo/pulls/42/merge"
+
+echo '=== ng pr merge 42 --base-sha <stale> → REFUSED, and no PUT is sent ==='
+MOCK_BASE_TIP=basemovedaaa run_ng out err rc pr merge 42 --sha verifiedhead999 --base-sha livebase777
+assert_eq        "exit 1 (base moved)"               "$rc" "1"
+assert_contains  "names the rejection"               "$err" "REJECTED: the BASE moved"
+assert_contains  "names the sha the caller verified" "$err" "livebase777"
+assert_contains  "…and the sha the branch is at now" "$err" "basemovedaaa"
+assert_contains  "says GitHub would NOT have told you, which is the reason the flag exists" \
+                 "$err" "merges CLEANLY"
+# THE LOAD-BEARING ASSERTION. A refusal that still sends the PUT is not a
+# refusal; it is a merge with a complaint attached. `#870` is exactly the merge
+# this must not perform.
+calls=$(<"$CAPTURE")
+assert_not_contains "NO merge PUT was sent"          "$calls" "-X PUT"
+
+echo '=== ng pr merge 42 --base-sha with an unreadable tip → refuses, no fallback ==='
+MOCK_BASE_TIP_UNREADABLE=1 run_ng out err rc pr merge 42 --sha verifiedhead999 --base-sha livebase777
+assert_eq        "exit 1 (fail-closed)"              "$rc" "1"
+assert_contains  "refuses rather than guessing"      "$err" "REFUSED"
+assert_contains  "and names WHY a fallback to .base.sha is not acceptable" \
+                 "$err" "cannot detect base movement"
+calls=$(<"$CAPTURE")
+assert_not_contains "NO merge PUT on an unreadable tip" "$calls" "-X PUT"
+
+echo '=== ng pr merge 42 WITHOUT --base-sha → the base is never read (opt-in) ==='
+# THE CONTROL FOR THE OTHER FAILURE DIRECTION. A base check that fired on every
+# merge would block the board every time `dev` moved during a review, and a gate
+# that always fires is a gate somebody disables — strictly worse than not having
+# it. So the default path must be byte-for-byte what it was: no ref read, no
+# extra API call, no refusal.
+run_ng out err rc pr merge 42 --sha verifiedhead999
+assert_eq        "exit 0 — unchanged default"        "$rc" "0"
+calls=$(<"$CAPTURE")
+assert_not_contains "no base-tip read without the flag" "$calls" "/git/ref/heads/"
+assert_not_contains "and no base refusal"            "$err" "BASE moved"
+
+# ---- Test 17d: cmd_pr_merge — --verify-base, the SHA-FREE form ---------
+# `--base-sha` makes the caller carry a sha from whenever `ci-attempts` last
+# ran. Measured, that window has been as short as NINETEEN SECONDS (`#890`), so
+# "re-read the tip immediately before merging" is advice an agent can follow and
+# still lose. `--verify-base` re-derives the answer milliseconds before the PUT.
+#
+# The stub serves the merge-ref endpoints so the REAL `_merge_ref_base` runs:
+# a `stale` head (the run tested an old base) must REFUSE, a `current` head must
+# proceed, and — the load-bearing one — a refusal must send NO PUT.
+MRB_H=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+MRB_O=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+echo '=== ng pr merge 42 --verify-base with a STALE merge ref → REFUSED, no PUT ==='
+MOCK_BASE_TIP=livebase777 MOCK_MRB_RUN=9001 MOCK_MRB_LOG="HEAD is now at ec3412f Merge $MRB_H into $MRB_O" \
+    run_ng out err rc pr merge 42 --sha verifiedhead999 --verify-base
+assert_eq        "exit 1 (base check withheld)"      "$rc" "1"
+assert_contains  "names the refusal and its source"  "$err" "REFUSED by --verify-base"
+assert_contains  "…and reports the state it got"     "$err" "stale"
+calls=$(<"$CAPTURE")
+assert_not_contains "NO merge PUT was sent"          "$calls" "-X PUT"
+
+echo '=== ng pr merge 42 --verify-base with a CURRENT merge ref → proceeds ==='
+# Same fixture, only the live tip changed to what the run actually tested. This
+# is the control that keeps 17d from passing against a --verify-base that simply
+# always refuses — which would be the gate-always-fires failure at the merge verb.
+MOCK_BASE_TIP="$MRB_O" MOCK_MRB_RUN=9001 MOCK_MRB_LOG="HEAD is now at ec3412f Merge $MRB_H into $MRB_O" \
+    run_ng out err rc pr merge 42 --sha verifiedhead999 --verify-base
+assert_eq        "exit 0"                            "$rc" "0"
+assert_contains  'says the base was VERIFIED, a word reserved for `current`' \
+                 "$err" "--verify-base VERIFIED"
+calls=$(<"$CAPTURE")
+assert_contains  "and the merge PUT fires"           "$calls" "-X PUT"
+
+echo '=== ng pr merge 42 without --verify-base → the base check does not run ==='
+run_ng out err rc pr merge 42 --sha verifiedhead999
+assert_eq        "exit 0 — unchanged default"        "$rc" "0"
+assert_not_contains "no base-check chatter"          "$err" "--verify-base"
+
+echo '=== ng pr merge 42 --verify-base on an UNREAD base → proceeds, but does NOT say OK ==='
+# `permit` is not `verified`. `unread` (logs expired) must not block — blocking
+# would break the verb on every older head — but it must not be reported as a
+# check that passed either. That conflation is the one this whole branch exists
+# to remove; saying "OK" here would reintroduce it in the merge verb.
+MOCK_BASE_TIP="$MRB_O" MOCK_MRB_RUN=9001 MOCK_MRB_LOG="no checkout line in this log at all" \
+    run_ng out err rc pr merge 42 --sha verifiedhead999 --verify-base
+assert_eq        "exit 0 — an unread base does not block"  "$rc" "0"
+assert_contains  "…and is reported as NOT CHECKED"         "$err" "--verify-base NOT CHECKED"
+assert_not_contains "…never as VERIFIED"                   "$err" "--verify-base VERIFIED"
+calls=$(<"$CAPTURE")
+assert_contains  "…and the merge still proceeds"           "$calls" "-X PUT"
+
+echo '=== ng pr merge 42 --sha / --base-sha with a MISSING VALUE → refuses (S5) ==='
+# `${2:-}` + `shift 2` on a final flag silently yielded an EMPTY pin and shifted
+# past the end, so the merge ran UNPINNED while looking pinned.
+run_ng out err rc pr merge 42 --sha
+assert_eq        "exit 64 (EX_USAGE) on a valueless --sha"      "$rc" "64"
+assert_contains  "…naming the flag"                  "$err" "--sha requires a value"
+run_ng out err rc pr merge 42 --base-sha
+assert_eq        "exit 64 (EX_USAGE) on a valueless --base-sha" "$rc" "64"
+assert_contains  "…naming the flag"                  "$err" "--base-sha requires a value"
+calls=$(<"$CAPTURE")
+assert_not_contains "and NO merge PUT was sent"      "$calls" "-X PUT"
+
+echo '=== ng pr merge 42 --sha "" → refuses TOO: an empty pin is not a pin ==='
+# THE GUARD ASKS TWO QUESTIONS AND THEY ARE NOT THE SAME QUESTION. The cases
+# above supply NO value (arity); this one supplies an EMPTY value (semantics).
+# Both must refuse, for different reasons, and a fix that answers only one of
+# them looks correct from whichever side its author tested:
+#   * emptiness alone breaks `ng log-action --note ""`, a documented caller —
+#     which is exactly what the first cut of this class fix did;
+#   * arity alone lets `--sha ""` through, and an empty pin merges UNPINNED
+#     while reading as pinned, which is the original S5 defect restored.
+# So the discriminating pair is asserted here, next to its counterpart in
+# `test-ng-log-action.sh`, rather than left to whichever half got attention.
+run_ng out err rc pr merge 42 --sha ""
+# EX_USAGE here too (your-org/nexus-code#990). A SUPPLIED-BUT-EMPTY value and a
+# MISSING one are different questions — that is what this assertion and its
+# `--note ""` counterpart in test-ng-log-action.sh exist to discriminate — but
+# they are the same USER-VISIBLE CONDITION: the flag did not receive a usable
+# value. Leaving this at 1 would have replaced the two-SCRIPT split #990 reports
+# with a two-BRANCH split inside `_need_val`, which is harder to see and no more
+# correct. `--note ""` still exits 0, because `--note` is `ng`'s single
+# `--allow-empty` opt-out and that arm returns before the emptiness check.
+#
+# This assertion is why a wording-keyed sweep is not a population: the #990
+# census found the two MISSING-value pins in this file by their "requires a
+# value" text and explicitly flagged its own result as a FLOOR. This one says
+# "EMPTY", matched no such search, and was found only by running the suite.
+assert_eq        "exit 64 (EX_USAGE) on an EMPTY --sha" "$rc" "64"
+assert_contains  "…and says the value may not be empty" "$err" "--sha requires a non-empty value"
+calls=$(<"$CAPTURE")
+assert_not_contains "and NO merge PUT was sent for an empty pin" "$calls" "-X PUT"
+
+echo '=== ng pr merge 42 --verify-base with the LIBRARY MISSING → refuses, no PUT ==='
+# Absence of the checker is not evidence the base is fine. This case was found
+# by accident — `setup_fake_nexus` did not copy `_merge_ref_base.sh`, so the
+# fail-closed arm fired on every --verify-base test and the fixture defect
+# presented as a verdict. The fixture now copies the library, and the genuinely
+# missing case is exercised ON PURPOSE by deleting it, so the arm stays covered
+# instead of being covered by an accident nobody would notice going away.
+mv "$FAKE_NEXUS/monitor/_merge_ref_base.sh" "$WORK/_merge_ref_base.sh.hidden"
+MOCK_BASE_TIP="$MRB_O" MOCK_MRB_RUN=9001 MOCK_MRB_LOG="HEAD is now at ec3412f Merge $MRB_H into $MRB_O" \
+    run_ng out err rc pr merge 42 --sha verifiedhead999 --verify-base
+mv "$WORK/_merge_ref_base.sh.hidden" "$FAKE_NEXUS/monitor/_merge_ref_base.sh"
+assert_eq        "exit 1 (fail-closed on a missing checker)" "$rc" "1"
+assert_contains  "says the checker is missing"       "$err" "_merge_ref_base.sh is missing"
+assert_contains  "…and why that is a refusal"        "$err" "absence of the checker is not evidence"
+calls=$(<"$CAPTURE")
+assert_not_contains "NO merge PUT without a checker" "$calls" "-X PUT"
+
+# ---- Test 17e: the VALUELESS-FLAG class, guarded as a class (skeptic S5) ----
+#
+# THE INSTANCE WAS NOT THE BUG. Two flags were fixed by name while 67 arms three
+# lines away kept the same defect — the fourth time in one day a fix closed the
+# instances a reviewer named and left the class open. So this is a SOURCE LINT
+# over every value-taking arm in `ng`, not a list of the flags anybody thought
+# to test.
+#
+# The mechanism, reproduced in isolation before fixing: `shift 2` with ONE
+# positional left FAILS and does NOT shift, so the parse loop spins on the same
+# token — 2000+ iterations with `$1` still `--repo`. `${2:-}` hides the other
+# half, an empty value that reads as a supplied one.
+echo '=== every value-taking arm in ng refuses a missing value (class lint) ==='
+unguarded=$(grep -nE '\$\{2:-\}"?\)?; *([a-z_]+=[0-9]+; *)?shift 2' "$FAKE_NEXUS/monitor/ng" \
+            | grep -v '_need_val' || true)
+# SCOPE, in the assertion text itself: this greps `monitor/ng`. `ng` delegates
+# many verbs to scripts under `monitor/` that parse their own flags and are NOT
+# covered here — `#924` owns those, and two of them (`guards-for-diff --base`,
+# `ci-attempts --repo`) still spin. An assertion that said "in ng" would claim
+# the verb surface while measuring one file, which is the overclaim this PR was
+# reviewed for one layer up.
+assert_eq "no value-taking arm IN monitor/ng ITSELF uses the bare \${2:-} + shift 2 idiom — the CLASS is closed within this file, not just the reported instances (delegated scripts: #924)" \
+          "${unguarded:-none}" "none"
+# The lint is a source check, so it needs a positive control: a planted arm must
+# be SEEN. Otherwise a regex that matches nothing passes forever.
+planted="$WORK/ng-planted"
+sed 's#^\(\s*\)--repo) _need_val --repo .*$#\1--repo) repo_arg="${2:-}"; shift 2 ;;#' \
+    "$FAKE_NEXUS/monitor/ng" > "$planted"
+planted_hits=$(grep -nE '\$\{2:-\}"?\)?; *shift 2' "$planted" | grep -vc '_need_val' || true)
+assert_eq "…and the lint's own regex SEES a planted unguarded arm — it is checking, not merely silent" \
+          "$([[ "${planted_hits:-0}" -ge 1 ]] && echo saw-it || echo blind)" "saw-it"
+
+# Behavioural spot-check on the stubbed verbs: a valueless flag must refuse and
+# must not spin. Bounded by `timeout` so a regression FAILS rather than hangs
+# the suite.
+for _f in --repo --sha --base-sha; do
+    _rc=0
+    timeout 15 env NEXUS_STATE_DIR="$WORK/state" PATH="$STUB_DIR:$PATH" \
+        "$NG" pr merge 42 "$_f" >/dev/null 2>&1 || _rc=$?
+    # 124 = timed out, i.e. STILL SPINNING; 0 = accepted a missing value.
+    assert_eq "ng pr merge 42 $_f refuses a missing value rather than spinning or merging unpinned (rc=$_rc)" \
+              "$([[ "$_rc" != 0 && "$_rc" != 124 ]] && echo refused || echo "bad-rc-$_rc")" "refused"
+done
 
 # ---- Test 18: cmd_pr_view — one-liner from canned meta -----------------
 

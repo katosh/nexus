@@ -10,7 +10,1921 @@ for the current release convention.
 
 ## [Unreleased]
 
+### Changed — cc-auto-update deployment gate: the board arms are gone; the board is recorded, not gated on (w239 D13)
+
+`monitor/cc-auto-update-apply.sh` `_deployment_gate` no longer defers on the
+live-window COUNT (`max_live_windows`), on a window that does not positively
+assert it is dead (board-not-quiet, `#1113`), or on a board it cannot
+enumerate. Operator decision, 2026-09-12: *"a cc-update will not kill the
+worker, and if they, for whatever reason, would crash, then the orchestrator
+can continue them with no context lost."* The premise was measured before the
+arms went, at `8d0cff30`: every kill primitive on the restart path enumerated
+(the watcher is reaped by process group behind an argv-identity check that
+refuses a group with no watcher member — rc 2 against a worker pane's own pgid;
+the orchestrator is killed by window name after an exact-name index resolution
+and a baseline pane-pid re-read); `restart-orchestrator` and
+`launcher.sh --replace` driven on a private tmux with worker windows alive,
+every worker keeping its window id, pane pid and child; `spawn-worker.sh
+--resume <sid>` driven end-to-end against an argv-recording stub. Not proved
+and not claimed: that Claude Code restores the conversation on `--resume`.
+The two PR arms (restart-path PR, PR-under-active-review) and their cap-3
+bounded deferral are unchanged. The board is still enumerated and written to
+every apply record (`live_windows=`, `unquiet_windows=[…]`, new
+`board_probe=`); an unenumerable board records `live_windows=UNMEASURED` and
+files a defect instead of deferring. `monitor.cc_auto_update.max_live_windows`
+/ `CC_AUTO_MAX_LIVE_WINDOWS` are no longer read (commented out in the example
+config). One residual named rather than fixed: tmux 2.6 resolves
+`kill-window -t <name>` by PREFIX when no exact-named window exists (measured:
+with `orchestrator` gone it killed `orchestrator-sk`); the apply path is
+guarded twice, and ID-targeting the kill is the follow-up. Also corrects the
+header's "#503 decapitated 15 agents": #503 decapitated the WATCHER while 15
+agents were mid-flight; no agent was killed. `test-cc-auto-update.sh` cases
+G3, G2b, Q1, Q2, Q4–Q6, Q9c, Q10, P1, P2, O2, O3 and the #1438 gate cases are
+flipped or re-based onto the PR arms; each flipped case fails on the pre-change
+tree.
+
+### Fixed — `#1497`: assert-shims-wrapped's probe shells run DETACHED from the tty and KILLABLE
+
+`monitor/assert-shims-wrapped.sh` ran its login+interactive probe as a bare
+`timeout 40 $SHELL -lic …`. Inside a tmux pane — where every launcher runs the
+guard — GNU `timeout` puts that interactive shell in a background process group
+of the pane's tty, job control stops it before the `-c` command runs, the
+SIGTERM at 40 s is ignored by an initialised interactive shell, and with no `-k`
+the guard waits forever. Measured 2026-09-06/08 (zsh 5.4.2, bash 4.4, coreutils
+8.28): two orchestrator boots of one nexus hung there (`pane-state` reading
+`unknown reason=live-descendant`, every emit `FAILED rc=4`); on the other runs
+the same probe cost 43 s and came back EMPTY, a guard blind on the surface it
+exists to check. Both probes now go through `_asw_probe_exec` =
+`setsid -w timeout -k 5 40 … </dev/null` — `setsid` outside so the shell has no
+controlling tty (the footing Claude Code's own snapshot subprocess has),
+`timeout` inside so its group-kill reaches descendants the shell spawned before
+wedging. `NEXUS_ASSERT_PROBE_TIMEOUT` / `NEXUS_ASSERT_PROBE_KILL_GRACE` expose
+the two numbers for tests. `test-assert-shims-wrapped.sh` case 13 pins it: a pty
+positive control, the probe shell observing NO controlling tty under that pty,
+and a SIGTERM-ignoring probe killed at timeout+grace; against the unpatched
+guard the last two arms fail.
+
+### Added — `#1490`: `tee /dev/stderr` REOPENS fd 2 and truncates the log — the construct is now linted repo-wide
+
+`tee` OPENS its file argument. `/dev/stderr` is a PATH to whatever fd 2 points
+at, and an open of a regular file TRUNCATES it, so a service launched
+`>>"$log" 2>&1` loses its entire history on the FIRST line it emits — rc 0,
+nothing on stderr. Measured: a seeded 40-line log came back as **1 line**.
+`tmpfs-guard` was the host, and it is the worst possible one: a guard whose
+job is to describe an ACCUMULATING condition, destroying its own evidence on
+every finding. Both its sites now go through a new `emit_both`, which writes to
+fd 1 and `>&2` — a DUP, never an open.
+
+**The axis is wider than the issue's title, and it was measured rather than
+reasoned.** `tee /dev/fd/2` truncates identically, and so does a plain
+`> /dev/stderr` REDIRECT with no `tee` anywhere; `>>`, `tee -a` and `>&2` do
+not. A lint keyed on `tee` would have certified the redirect form clean, so
+`monitor/watcher/tee-reopen-lint.sh` keys on REOPENING BY PATH.
+`test-tee-reopen-lint.sh` drives both directions over planted fixtures and
+declares its population at birth.
+
+The lint's own first draft was a **silent zero**, and it is pinned as a case:
+run against a fixture lacking `_shell_quotes.awk`, `shf_strip_comments` REFUSED
+correctly and loudly, the diagnostic went to a `2>/dev/null`, the stripped text
+was empty, and the lint reported a clean sweep over a tree holding two known
+violations. The refusal was never lost — it was merely off the path that
+produced the answer, which is all a silent zero needs.
+
+### Changed — `#1501`: `mint-token.sh` now REFUSES an exposed bot key (exit 4) — and deliberately does NOT refuse a merely loose mode
+
+The script checked `-f` and `-r` only, while the words *"should be 600"* sat in
+the unreadable-key FAILURE MESSAGE and two documents asserted it rejects a
+loose key mode. A documented guarantee with no enforcing branch is worse than a
+documented gap: a gap invites scrutiny, a false guarantee deflects it.
+
+**What is enforced is narrower than `mode == 600`, and that is the point.** A
+file mode is the LAST gate, not the only one: the issue was filed as an
+exposure on `stat` of the FILE (644) and withdrawn once the ancestors were read
+— `~/.claude` is 700, traversal denied, the bits inert. So the gate walks the
+ancestors and refuses only on a POSITIVELY ESTABLISHED exposure (world bits AND
+an unbroken world-traversable path). Group access is reported, never acted on;
+an ancestor it cannot `stat` is `unknown`, which is neither. `--check-key`
+prints the full verdict without minting (0 ok, 4 exposed, 5 tolerated-but-worth-
+seeing). The anti-false-refusal control is pinned as hard as the refusal:
+`mint-token.sh` is on the path of every GitHub write here, so refusing an
+airtight setup would be a self-inflicted outage in answer to a non-problem.
+
+**FIVE documents now describe what the code does, not the two the issue named.**
+A sweep for docs CLAIMING an enforcement cannot see a doc asserting its
+ABSENCE, and there were three of those — `monitor/install-prompt.md`,
+`monitor/BOT_SETUP.md` and `monitor/BOT_ADMIN_GUIDE.md`, the last two found
+only by re-sweeping for the INVERSE wording (*"does not enforce"*, *"happily
+sign"*, *"nothing warns you"*). **After a behaviour change the stale docs sit on
+BOTH sides of it**, and the side you did not search for is the side you miss.
+
+### Fixed — `#1495`: the disposition DEADLOCK — a settled `require` gate refused both dispositions
+
+`_disposition_gate_conflict`'s `require` arm read the SPAWN RECORD alone and
+treated it as a permanent present-tense obligation, so a window whose required
+pass had HAPPENED and been settled could state NEITHER value: `second-pass`
+refused by `retire-preflight` 1c, `no-further-pass` refused here. Reachable
+only after everything went right. The arm is now resolution-aware, exactly as
+the marker arm beside it already was — a spawn-time property is evidence about
+what was DEMANDED, never about what is OUTSTANDING — and only a positive
+`resolved` releases (`none`, `re-armed` and `unknown` still conflict).
+
+The refusal also **names the ledger and prints the outstanding arm's sha**. The
+settlement discharges the worker's own report AS IT STOOD AT ARMING TIME, that
+sha lives in exactly one place, and the append-only convention keeps the
+report's current sha moving — so a worker that had followed every convention
+could not derive the citation from anything it held, and the refusal named the
+ledger zero times. The one instance on record was solved by reading the ledger
+on a hunch.
+
+### Fixed — `#1491`: `ng wrap-up` verifies the comment target BEFORE it arms anything
+
+A wrap-up passed `--repo <asset-repo>`; that flag selects the ISSUE-THREAD
+target, the issue lived elsewhere, the comment POST 404'd — and the run had
+ALREADY released the skeptic marker and went on to write a ledger entry. The
+thread was never told. `wrap-up` now asks whether the target repo contains the
+issue before Step 0b, and refuses naming the flag that was mis-read. Three-
+valued: only a POSITIVE 404 refuses; a probe that fails for any other reason
+warns and proceeds, because a failure to LOOK is not a finding and blocking a
+hand-off on an unanswered question is the more expensive error.
+
+Restores the companion rule from `#1050`: order any two-part operation so the
+failure mode is the OBSERVABLE one.
+
+### Changed — `#1494`: three guards enrolled — including both that CI reddened on while the index could not see them
+
+On PR `#1493`, `guards-for-diff` returned rc 0 with 28 guards SELECTED and
+green; CI then reddened on two suites, and NEITHER appeared in `SELECTED` or in
+`CONSIDERED AND EXCLUDED`. A suite that declares no population is INVISIBLE,
+not excluded, and the two are indistinguishable in the output while meaning
+opposite things. `test-count-fallback-lint.sh`, `test-tmux-shim-gate3-safety.sh`
+(a SAFETY guard whose failure mode is a client reaching the operator's real
+tmux board) and `test-cc-auto-update.sh` (the largest suite exercising that
+diff's own subject) now declare. `count-fallback-lint.sh` grew a `--files`
+mode so the declaration forwards to the lint's own selection rather than
+copying it. Declaring 75 → 79; the census `unreviewed-ceiling` 394 → 391.
+
+**NOT `#1301` item 2, and the distinction is the point.** That item named three
+DIFFERENT suites — `test-argloop-progress-guard.sh`, `test-shell-files.sh`,
+`test-skeptic-evidence-class-agreement.sh` — enrolled by `f77f18d8` on
+2026-09-02, a week before this bundle and an ANCESTOR of its base. Verified:
+`git merge-base --is-ancestor f77f18d8 1fadbc67` → yes, and all three already
+declare at `1fadbc67`. The three enrolled HERE were `decl=0 pop=0` at that same
+base, so the WORK is this bundle's and the ISSUE LABEL was not. A fix is a
+property of a tree in the same way a count is.
+
+`#1301` item 1 — a per-diff NAMED blind spot — is untouched and stays open:
+there is still no readership approximation whose direction of error anyone can
+state, and the obvious proxy fails on `#1171`, the case that motivated it.
+
+### Added — `#1483`: the last two `none` positive-control rows are now plants; `none-ceiling` 2 → 0
+
+`test-spawn-shape-manifest.sh` plants a spawn call site absent from the manifest
+in a scratch git repo and asserts the `UNCLASSIFIED` arm fires;
+`test-skeptic-evidence-class-agreement.sh` deletes one evidence class from ONE
+of the two `retire-preflight` arms in a copy and asserts the membership
+comparison names it. Both assert on the MESSAGE rather than the exit code — a
+small fixture also trips other arms, so rc 1 alone would be satisfied by a
+suite whose red arm had been deleted — and both carry a NEGATIVE arm (an
+unmodified copy through the same override) so "caught the plant" is
+distinguishable from "reddens on any copy". The spawn-shape control's fixture
+text is itself a spawn call site, so it is classified in
+`spawn-shapes.manifest` rather than exempted by name.
+
+
+### Changed — `#1264` R4 / `#1474`: a `none` positive-control row must be OWNED; the CI log tail proves nothing
+
+`test-guard-positive-controls.sh` now reds a `none` row whose reason carries
+neither a tracker ref (`#NNN`) nor an `until:YYYY-MM-DD` expiry — an unowned
+exemption is inherited rather than re-justified (`#1469`). The one such row,
+`test-spawn-shape-manifest.sh`, now points at `#1483`. `ci-band-coverage.sh`
+states in its header and its `complete` output that the verdict SET, not the
+log tail, is the evidence: measured on `#1482`'s own cancelled band, a mid-run
+kill missing 22 suites ended with the same cleanup lines as a teardown kill.
+
+### Added — `#1264` R4/R5: every guard declares its positive control; every enumeration feeding a decision is a set-equality ratchet — with their sweeps
+
+`guard-positive-controls.manifest` + `test-guard-positive-controls.sh`: one row
+per declaring guard (70 at the census, 74 with this PR's own suites), the
+verbatim assertion label of the planted violation it catches, set equality both
+ways against `guard-populations.manifest`, a `none-ceiling` ratchet (1:
+`test-spawn-shape-manifest.sh` has no plant). `test-skills-catalog.sh`: the
+skills catalog is checked against the shipped `skills/*/` directories both ways
+(it was missing `nexus.ci-triage` and `nexus.claims`; fixed).
+`suite-declarations.manifest` + `test-suite-declaration-census.sh` (`#1301`
+item 3): every tracked suite either declares a population or has an explicit
+row — 394 `unreviewed` at the census, a ceiling that only goes down; a new suite
+can no longer land silently in the index's blind spot.
+
+### Added — `#1474`: `monitor/ci-band-coverage.sh` tells a cosmetic ceiling kill from a coverage gap
+
+A cancelled unit band renders `fail` either way; the tool compares the SET of
+suites carrying a verdict in the job log against the population discovered at
+the head (two sources, refused when they disagree) and reports `complete`
+(teardown kill, cosmetic), `mid-run-kill` (members named) or `incomplete`.
+Measured on this bundle's own PRs: #1479 zsh 13 suites never reached; #1480
+bash 447 of 447 verdicted. Set membership, never a count.
+
+### Added — `#904`: a size budget for `## Common gotchas` entries in `CLAUDE.md`
+
+`test-claude-md-entry-budget.sh` prints every entry's size on every run and reds
+only past the generous ceilings in `claude-md-entry-budget.manifest` (120 lines
+per entry, 40 entries; census max 104 / 31). The remedy for a red is a skill
+plus a one-line row, not shorter prose.
+
+### Fixed — `#1477`: the frozen-snapshot leg of `assert-shims-wrapped.sh` refused every spawn for 18 h on a FOREIGN snapshot, and could refuse `_respawn.sh` (PR 1479)
+
+Self-heal is a hard invariant on that leg: with `NEXUS_IS_ORCHESTRATOR=1` a
+BURIAL is a warning plus a durable `guard-unverified.log` row, never a refusal.
+A snapshot with NO shim dir anywhere in its PATH while the live probes are clean
+is FOREIGN (written by a `claude` launched outside the nexus) and warns; the same
+with the probes not run is NOT CHECKED (79). `spawn-worker.sh` carries the
+spawning agent's own snapshot into the launcher (`NEXUS_SPAWNER_SNAPSHOT`), which
+the guard ranks above the mtime proxy and reports. The suite gained a
+NON-HERMETIC arm over the real host's newest snapshot (SKIP counted where there
+is no CC home). GUIDE Divergence 5 rewritten: never launch `claude` by hand from
+a plain shell in a nexus.
+
+### Changed — cc-update: clone freshness is never a verdict input (PR 1480)
+
+Operator directive on `<your-org>/nexus-code#1475`: the LOCAL gate decides; a local
+GREEN bumps however far behind `origin/dev` the clone is, and a local RED blocks
+on the local classifier — a fresh-tip control changes the remedy named, never the
+verdict. Pinned in `test-cc-auto-update.sh` on the `safe-bumped` row.
+
+### Fixed — `#1471`: `spawn-worker.sh --dry-run` without `--resume` spawned a REAL worker
+
+Refused (exit 22) before anything is composed; an unrecognised `--` option is
+refused (exit 23) instead of passed through. Asserted on the side effect: a
+stub-tmux spawn attempt leaves no `new-window`.
+
+### Fixed — `#1478`: the `N awaiting-input` prelude scalar counted the orchestrator's own `idle_prompt`
+
+Excluded by the watcher's paste-target identity (`$TARGET`, default
+`orchestrator`), in both the jq and the awk arm. And `STATE_DIR` unset no longer
+resolves any `_idle_probe.sh` state path to the current directory — the four
+stray state files found at the operator's repo root shared one mtime — but to an
+announced per-user scratch fallback.
+
+### Added — `#1423`: a healthcheck can say "I am UP and the condition I watch is PRESENT" (exit 100)
+
+`_service_health.sh` treats exit 100 as a FINDING: no incident, no grace, no
+restart; the emit says "is UP and reports a FINDING", carries the check's stderr,
+re-surfaces only when the text changes, clears itself when the check goes green,
+and never offers `svc.sh restart`. `tmpfs-guard.sh --check` exits 100 on a
+threshold breach (3 stays "could not measure"); `bootstrap-recover.sh` treats 100
+as not-down. Documented in `services.registry.example`.
+
+### Fixed — `#1423` / `#1474`: the test harness leaked two zero-byte files per process into `/tmp`
+
+`_test_helpers.sh` reaps its own `.th-ledger.*` / `.th-ports.*` on EXIT when the
+suite installs no trap (`th_trap_exit` chains for suites that do), and
+`run-tests.sh` gives every suite ONE short private root (`/tmp/nxt-<uid>-…`)
+as both `TMPDIR` and `TMUX_TMPDIR`, reaped when the suite exits. Measured live
+before the fix: 37,727 ledgers and 21,537 ports files. The first cut rooted the
+private dir under the log directory and reddened all six CI bands (`#1481`):
+tmux fixtures blew the 108-byte `sun_path`, one suite asserted its fixture is
+under `/tmp`, one capped a diagnostic at 300 B — a suite's assumptions about
+`$TMPDIR` are part of the harness contract. `nx_tmux_fixture_init` no longer
+derives its socket dir from the caller's workdir at all.
+
+### Changed — `#1448`: `cc-auto-update-apply.sh safe` REQUIRES the gate log's geometry stamp
+
+Evidence without a `=== gated-tui:` line is refused on the bump path
+(`gated-tui-stamp-missing`), the way the tree stamp is; the attribution note
+records `tui=<mode>`. Previously the field was additive and unstamped evidence
+was accepted unremarked.
+
+### Fixed — `#1334`: a worker could boot into the workspace-trust dialog with the seed present, and nothing recovered it
+
+**Two layers, and the primary is a single environment variable.** Every
+launcher `spawn-worker.sh` generates now sets `CLAUDE_CODE_SANDBOXED=1` on the
+claude invocation. Measured on the real 2.1.261 binary: the flag is read at the
+head of the trust gate and returns "trusted" before
+`projects.<cwd>.hasTrustDialogAccepted` is consulted, so the dialog cannot
+appear whatever happened to the seed. It is a claim about the environment, and
+it is TRUE here — workers run under a kernel-enforced sandbox — so setting it
+informs the tool rather than defeating a check. Its marginal effect was
+measured with the real worker configuration (`--dangerously-skip-permissions`
++ `worker-settings.json`), one variable at a time: the trust gate moved and
+nothing else did — print-mode project-permission-rule gating was unchanged
+by the flag in both directions (that path keys on the config key itself),
+the `/cd` move dialog and post-move pane were byte-identical, and the normal
+boot frame was byte-identical. Because it is undocumented and read at three
+sites in a binary re-pinned weekly, a real-binary CANARY
+(`test-integration/test-realmodel-trust-sandboxed-env.sh`, gated) pins its
+semantics: key absent + flag → idle; key absent alone → the dialog. Belongs on
+`skills/nexus.cc-update/GUIDE.md`'s collision list.
+
+**The fallback is a bounded detect-and-recover loop after the launcher is
+sent, at BOTH window-creation sites** (fresh and `--resume`). It polls
+`pane-state.sh` to the first positive state (~1–3 s on the normal path);
+`empty` is tolerated to `NEXUS_SPAWN_TRUST_VERIFY_SECONDS` (default 20) and
+then reported UNVERIFIED at exit 0 — never a manufactured failure. On the
+exact pair `state=blocked overlay=workspace-trust` it reads the key from disk
+BEFORE acting and prints AND action-logs `trust-key-at-detection=…` — the
+discriminating measurement the issue prescribed, now taken automatically on
+every field occurrence — then kills the window, re-seeds through
+`ensure-workdir-trusted.sh`, READS THE KEY BACK, re-creates the window under
+the same name (anchors and provenance are name-keyed) and re-sends the kept
+launcher; `--session-id` reuse after a kill at the dialog was measured safe
+(no transcript exists yet). Bounded at `NEXUS_SPAWN_TRUST_MAX_RECOVER`
+(default 2), then **exit 21** with a diagnostic and the window left in place.
+
+**The kill is a stated exemption from `bk_pane_kill_authorized`, not a
+weakening of it.** `blocked` stays off the allowlist and `_bookkeeping.sh` is
+untouched. The kill fires only on that exact overlay pair, and only after a
+no-work-lost precondition asserted immediately before it: zero transcript for
+the session id (fresh), the resumed transcript's size+mtime unchanged since
+the launcher was sent (`--resume`), or no transcript under the workdir's
+project slug newer than a pre-send stamp (loop wrapper). A transcript that
+exists or moved means something ran, the detection is wrong, and recovery is
+REFUSED at exit 21. The unit suite drives every arm, including that refusal;
+two code mutants (predicate disabled, precondition disabled) flipped exactly
+the predicted 27 and 5 assertions.
+
+**The precondition's probes use `find -H`, and the loop-wrapper arm is coarse
+on purpose — which makes that arm largely INERT on a busy board.** As first
+pushed, the fresh-path probe was a confident zero on this host: the config
+dir's `projects` is a SYMLINK and GNU `find` does not descend a symlinked
+starting point, so the check passed for a transcript that existed (found by the
+skeptic pass; measured bare `0`, `-H` `1` against a real transcript). Every
+probe now uses `-H`, and the fixture asserts the symlink shape in BOTH
+directions. The loop-wrapper arm no longer re-implements the binary's
+undocumented project-slug encoding (a wrong slug failed OPEN); it refuses on ANY
+transcript under `projects/*/` newer than the pre-send stamp. State the
+consequence plainly rather than counting the loop as coverage it does not
+provide: **the wrapper path's recovery is ACTIVITY-DEPENDENT — it refuses
+whenever a sibling transcript happens to be written inside the stamp window,
+a function of what other windows are doing at that instant, not of how many
+exist. Measured by the skeptic on the live board: 5 live windows, stamps at
+3/10/20 s, 0 of 3 windows had any transcript newer than the stamp, with 7
+transcripts touched in the prior hour — so an earlier "usually refuses" was
+wrong and is withdrawn. When it does refuse it fails to a VISIBLE dead worker
+(the dialog stays on screen, `state=blocked overlay=workspace-trust`, exit 21)
+rather than to a silent kill, and the PRIMARY mechanism for that path is the
+launcher flag, not the loop.** The wrapper is opt-in and off by default. A
+refused recovery costs one spawn; a wrong kill costs a worker's session.
+
+**A hypothesis retired.** The issue's surviving explanation — claude rewrites
+`.claude.json` wholesale from stale memory — is NOT supported: with a claude
+sitting at the dialog, keys seeded externally for other directories survived
+its dialog-accept write, its graceful-exit write and a fresh-startup write,
+and the file's inode changed on every write (temp+rename). The residual that
+cannot be excluded that way is a narrow read-modify-write interleave claude
+takes no lock against; the loop is correct under either.
+
+### Fixed — `#1207`: the armed state had a second writer that could not name a subject
+
+Builds directly on the `#1199`/`#1191`/`#1190` work in this same section and
+closes the hole it documented rather than repaired.
+
+**The root cause.** The armed state has TWO writers: `ng wrap-up
+--skeptic-decision require` wrote the marker AND an `armed` ledger row, while
+`spawn-worker.sh --skeptic-role` wrote the marker ALONE. `spawn-worker`'s own
+comment says it is "the ONLY thing that restores the block" for a
+second-or-later pass — so every re-validation round, the rounds that exist
+*because* something was already found wrong, armed with nothing the ledger could
+credit. Measured on the live board: `annz36` logged `subject-armed-sha:"-"` at
+verdict time with no `skeptic-request` event at all, and `.ncpanestate.ledger`
+carries ONE `armed` row against FOUR rounds of review, so all six delivered
+verdicts read `asserted-not-armed` — the arm never moved while the report was
+amended under it. A new `ng skeptic-arm` verb owns the row format and
+`spawn-worker.sh` now records the arm against `PRIOR_REPORT_RESOLVED`, the report
+the reviewer is actually pointed at. The append is skipped when the artefact is
+already outstanding: a second arm for one artefact IS
+`ambiguous-N-arms-outstanding`, so an unconditional append would trade pole A of
+`#1156` for pole B.
+
+**A verdict on a key with NO ledger is now recorded too, reversing a control
+pinned by the `#1191` fix.** That fix recorded the `no-open-arm` shape (a ledger
+exists, nothing outstanding) and deliberately kept dropping the no-ledger shape,
+reasoning that "`spawn-worker.sh` re-establishes markers without a subject, and a
+`-` row on a key nothing ever armed would assert a verdict about a window with no
+history". That premise IS the `#1207` mechanism, now removed at the source. And
+the row asserts something narrower than the premise allows: not that the key was
+armed, but that A VERDICT WAS DELIVERED — true, since
+`_skeptic_record_discharge` is reached only from the wrap-up verdict path.
+Dropping it made the key report `evidence=none`, documented as "a POSITIVE claim
+(nothing has ever settled this key)", whose instruction is *get a review* — for
+work a reviewer already finished. The row carries subject `-`, so the inertness
+argument already asserted for the `no-open-arm` row holds identically: it can
+close no arm and authorise no suppression. New class `verdict-without-arm`, kept
+distinct from `no-open-arm` because the causes and the remedies differ.
+
+**`superseded=0` where the question does not apply.** `sup_state` is computed
+only when a cleanly-matched row exists, so an all-unmatched ledger falls through
+to `0`, glossed "the attributed row is fine" with `attributed_verdict=-` on the
+same line. 19 of 64 live ledgers print that pair; 14 carry a delivered verdict.
+The value stays `0`; `superseded_why=no-attributed-row-to-supersede` carries the
+honesty. Orthogonal to `standing_stale`.
+
+**`ng obligation settle` cannot release a counterpart in `await`.**
+`skeptic-channel.sh close` is the sole writer of the `DONE` sentinel and
+`obligations.sh` writes nothing under `skeptic/<task>/`. `settle` now says so at
+settle time, complementing the `retire-preflight` await clause.
+
+### Fixed — two refusal paths that told the operator the opposite of the truth
+
+**`_sk_ev_explain`'s default arm was DEAD, so delivered classes went unexplained.**
+It was a five-class allowlist with `*) [[ -n "$_SK_EV_SUPERSEDED" ]] || return 0`.
+`_sk_ev_load` normalises `_SK_EV_SUPERSEDED` to the empty string for every value
+except `1` and a qualifying `?`, so the escape almost never fired and any class
+outside the five names was SILENT — a false NEGATIVE. Measured as stderr bytes,
+driving `_sk_ev_explain` against planted ledgers, base `7151a13` vs head:
+`no-open-arm` 0 → 917, `unmatched-other` 0 → 832,
+`prior-verdict-other-artefact` 0 → 835, with a control class already in the
+allowlist printing on both trees. `no-open-arm` is the sharp one — added to the
+classifier and to the sides authority by the change that introduced it, and never
+reaching this arm, so a verdict of that class was delivered, recorded, and
+explained to nobody. Now an allowlist with a default-DENY.
+
+*Correction:* an earlier revision of this entry claimed the opposite — that the
+arm fired on EVERY class and printed "A VERDICT IS ON THE RECORD … evidence=none"
+on an armed-only ledger — and quoted output for it. **That does not reproduce**:
+measured silent (0 bytes) on `dev` 50c36ef, on base `7151a13` and on head. The
+figure came from a probe that hand-set `_SK_EV_SUPERSEDED="0"`, a state
+normalisation never produces, and was written up as a live measurement. The code
+change is unaffected; only its justification was wrong.
+
+**The "ONE AUTHORITY" for evidence classes reached one of its four consumers.**
+`_skeptic_evidence_sides` is read by `monitor/ng` and its own suite;
+`retire-preflight.sh`'s two `case` arms hand-maintain copies and both were
+missing `unmatched-other` and `prior-verdict-other-artefact` — and `no-open-arm`
+was added to the classifier and to the authority without reaching either. Both
+arms have a permissive default, so for those classes the operator was told to
+"discharge with a verdict or settle" with no mention that the creditor's ledger
+already records one. Lists reconciled, and
+`monitor/watcher/test-skeptic-evidence-class-agreement.sh` now checks the
+four-way agreement as SET EQUALITY.
+
+Also removes a shadowed duplicate `_skeptic_artefact_sha` in `monitor/ng` — two
+byte-identical definitions, only the second ever ran — and guards against the
+class returning.
+
+### Fixed — the vacuous-evidence cluster: four checks that reported success while having examined nothing (`#1145`, `#1121`, `#1119`, `#1130`)
+
+**`#1145` — two suites were tallied PASS after ZERO checks.** `#568 A6` added the
+runner's third state and fixed the RUNNER; `test-public-guard-refusal.sh` and
+`test-integration/test-jupyter-service-real.sh` never adopted the CONVENTION that
+state depends on, so the hole stayed open for months exactly where the runner's
+header says it was closed — named by the census on every run, and green every
+time. `exit 0` -> `exit 77`, and the `ALL TESTS PASSED (0 checks …)` banner is
+DELETED rather than reworded, because that string is what humans and scrapers
+grep for. **The population question is answered on the LEDGER** (`status=PASS`
+with `assertions=0`), which is a property rather than a spelling: **0** vacuous
+passes across the fast band (376 selected, 352 PASS / 23 SKIP) and **0** across
+`SLOW_TESTS=1` (375 selected, 354 PASS / 16 SKIP), with two planted controls —
+one printing a zero-check banner, one with no footer at all — proving the census
+names both shapes. **And the census is now RED rather than merely printed:**
+`run-tests.sh` exits 1 on a non-empty zero-assertion list. No suppression knob;
+the fix is one character in the declining suite.
+
+**`#1121` — the allowlist doctrine's THIRD property**, in `CLAUDE.md` and executed
+by `test-claude-md-arm-order-shadowing.sh`: *no SAFE arm may precede a DENY arm
+that could fire on the same input*. The pair the doctrine was always stated as —
+allowlist, default-deny — was satisfied EXACTLY by a classifier that pronounced
+the most direct expression of its hazard SAFE, because a permissive arm returned
+first. **The scoping half is what stops the rule being misapplied:** the hazard
+lives where arms are PATTERNS, not equality. `bk_pane_kill_authorized`'s
+ALLOW-first ordering is sound because its two state lists are measured DISJOINT
+under `==`, and would stop being sound the day either gained a glob.
+
+**`#1119` — `is_routing_body` inverted to `is_mock_body`.** A hand-off DENYLIST
+with a permissive default, deciding 86% of its corpus, is replaced by POSITIVE
+PROOF: every simple command must be a keyword, a builtin, a body-local function,
+or a named external that cannot execute another program (`awk`, `sed`, `find`,
+`xargs`, `env` and the shells are deliberately EXCLUDED, and that exclusion list
+is the load-bearing half). It found a LIVE escape in production code:
+`monitor/cc-harness/demo.sh` resolved its shim target with `type -P tmux`, which
+in this workspace is the PATH-front `monitor/tmuxwrap`, and under `--here` wrote
+`exec <wrapper> "$@"` with **no `-L` pin**. Fixed via the shared
+`nx_real_tmux_bin`. It does NOT reproduce the false positive that sank the naive
+fix — `test-paste-followup.sh:94` is asserted as a control.
+
+**`#1130` — the pipefail axis enrolled on a QUOTED DATA STRING.** Scoping decided
+and stated: *an executed command string is its own pipefail scope*. Manifest
+114 -> 115: **+1** the true positive at `test-service-health-selfmatch.sh:156`,
+**-2** prose banners. Three readings were measured before one shipped — deleting
+quoted spans loses 28 of 114 rows (a reader's KIND is decided by its quoted
+ARGUMENTS), per-line masking loses one, carrying the mask alone loses eight — so
+"quoted" is believed only when both readings agree.
+
+Two shared primitives repaired underneath, both measured: `shf_strip_comments`
+took its cross-line quote carry from the WHOLE line, so an apostrophe in comment
+prose leaked every following comment as code (`#1177`); and `_shell_quotes.awk`
+called `"$(cmd | head -1)"` TEXT, losing nine live early-exit-reader sites.
+
+Assertion counts rose 17->24, 23->28, +11 new. Every guard proven able to FAIL by
+a planted fixture AND a recorded mutation DIFF — six mutants, six reds.
+
+### Added — a written rollback procedure, and an upgrade page that names the new loud refusals (`#1151`)
+
+Prerequisites 3 and 5 of the `dev` -> `main` promotion evaluation.
+
+**`docs/operating/rollback.md` is new.** There was no rollback procedure
+anywhere in the repo — no tag, no release, no candidate branch — so a
+promotion was a one-way door. The page defaults to **reverting the merge**
+rather than force-pushing `main`, because `nexus-code` ships as a rolling
+`main` that other operators clone directly: once anyone has pulled, a
+rewrite of the remote does not rewrite their tree, it only guarantees their
+next pull conflicts. It also documents the trap that bites afterwards — a
+reverted merge is still in `main`'s ancestry, so the eventual re-merge of
+`dev` brings back the fix and **none** of the reverted commits, silently and
+without a conflict, unless you revert the revert.
+
+**`docs/operating/upgrading.md` gained two sections.** The file's blob was
+byte-identical at `main` and `dev` across all 1003 commits of the gap, and
+warned about none of the refusals added in that span. It now covers
+`assert-shims-wrapped.sh` (exit 79 = NOT CHECKED, deliberately not 0),
+`spawn-worker.sh` (19 = unwritable `NEXUS_STATE_DIR`, 78 = missing guard
+template), `guards-for-diff.sh` (0/2/3/4/5, four of which are not
+clearances), `tmux-socket-fits.sh` (3 = path over the 107-byte `sun_path`
+budget), `mutation-gate.sh` (3/5), `public-mirror/build.sh` (6/7, and that
+it destroys the checkout it runs from), and the two `proc-*-authorized`
+helpers. It also states the reassuring half explicitly: **no config
+migration** — `config/nexus.example.yml` carries the same six top-level keys
+at both refs, having grown only in defaulted sub-keys.
+
+`config/load.sh --check-identity`'s exit 4 is listed under *what did not
+change*: it is present at both refs and only looks new to someone meeting it
+for the first time after a long jump.
+
+
+### Fixed — the `ng dashboard` verbs accepted input they could not honour and reported success anyway (`#1118`, `#1058`, `#959`, `#958`)
+
+One defect on four surfaces, and the unifying sentence is **presence is not
+uniqueness**. `cmd_dashboard_put`'s precondition asserted the markers were
+PRESENT and never that they were UNIQUE — verbatim what `#1058` says about
+`validate` and section headings.
+
+**`#1118` — a put that published nothing, at rc 0, with three surfaces agreeing.**
+**The cap is the mechanism, always** — the first version of this entry said the
+opposite. Reproduced end-to-end against a stateful fake forge: a body with two
+END markers LANDS (198,268 -> 198,301 B); a body with two START markers is
+doubled by `_splice_body` (198,246 -> **396,127 B**) and swallowed; and a
+perfectly healthy single marker pair at 240,117 B merges to 263,350 B and is
+swallowed with rc 0, empty stderr and the freshness stamp written. So a
+duplicated END alone is harmless, a duplicated START is a cause of the SIZE, and
+the false step was "198,236 bytes, 64 KB under the cap, therefore not the cap" —
+the cap applies to the MERGED body, which was never measured. The refusal fires
+at `> 262144` and the swallow begins at `> 262144` (`put` refuses over the cap
+and warns from 90%, splitting the total into dashboard region vs the prose
+outside it so the operator can see whether trimming the dashboard can help).
+
+The general fix is a **read-back from an INDEPENDENT GET**. The first version of
+this shipped a read-back against the PATCH *response*, which the skeptic pass
+measured to be structurally incapable of catching a swallow: an over-cap PATCH
+returns 200 whose `.body` is **the body you sent** while the store keeps the old
+one (`response_echoed_sent = YES` in every case measured on scratch issue
+`#1128`; the limit is 262,144 **bytes** — 262,144 lands, 262,145 swallows). Six
+tests "proved" that read-back worked against a mock that had the forge backwards.
+There are now three guards, each named by what it actually catches: the size
+refusal (the cap), a response comparison (corruption on *our* side — `jq -Rs`
+silently substitutes invalid UTF-8 at rc 0), and an independent GET (the store,
+and therefore any swallow). Cache and freshness stamp are written only once
+verified. `rc 4` means *could not verify*, deliberately distinct from *failed*.
+The GET is `#1010`'s `cmp` run in the opposite direction — that one refuses a
+no-op that would buy false freshness; this one refuses a claim of success.
+
+Two further causes the read-back covers, found while building it: `jq -Rs |
+gh api --input -` is a **pipeline**, so a dead producer fed the PATCH empty
+stdin while the pipeline reported rc 0 — and a body-less PATCH returns 200 with
+the issue unchanged, which is the reported signature at any size. The payload is
+now built to a file and the producer's rc tested. `jq -Rs` also silently
+substitutes invalid UTF-8 (rc 0), which the read-back catches and no size check
+could.
+
+**`#1058` — `validate` answered presence and called it OK.** Now fails on a
+duplicated required section (naming line numbers), names near-miss headings
+(`## 🛑 Infra — …` is that section by intent and invisible to `grep -Fx`),
+reports same-named sections that differ after their separator as a NOTE — the
+shape actually reported — and stops printing a bare `OK` over any finding. Every
+verdict now carries body size and section counts.
+
+**`#959` — `put` accepted a full issue body and nested the markers.** Refused at
+the input, and `get` now refuses to hand back a region containing a marker: `get`
+produces what `put` consumes, so the compounding is one round-trip away and
+`get` is where the cycle starts. `_splice_body` emits at most once so a
+pre-existing nesting degrades instead of compounding. Deriving the population by
+the property rather than by marker name found **two more** unguarded splice sites
+`#959` did not enumerate — `cmd_nexus_identity` and `cmd_interactive_sessions`,
+both upserting into the same overview issue, both discarding the PATCH response
+entirely. Both now share one guard and one verified-PATCH helper.
+
+**`#958` — `validate` read stdin and blamed the dashboard.** With no
+`--body-file` it now validates the **live** dashboard, which is what the verb
+name implies; `--body-file -` explicitly asks for stdin. Empty-input diagnostics
+name the input, never the subject. `--body-file -` was documented in three
+places and did not work at all — it died `body file not found: -`.
+
+**Also fixed, found while repairing the live board:** the required-section check
+ran against the dashboard REGION, so a `## Identity` pointer whose generated
+block legitimately sits *above* the START marker was reported missing on every
+put, forever — a warning structurally incapable of being right, in the
+reassuring direction. It now searches the whole issue body, and when given only
+a region it says what it could not see instead of asserting absence.
+
+`#1010`'s UNCHANGED guard was exercised live and is correct; it is untouched.
+
+### Fixed — three checks that reported a status they never measured (`#1056`, `#1078`, `#1053`)
+
+One defect in three places: a confident answer about something the check did not
+examine. Bundled so none of them reads as a local slip.
+
+**`#1056` — `_nexus_fs_evidence` read `tail`'s status, not `df`'s.**
+`if dfline=$(df -Ph "$path" 2>/dev/null | tail -1)` tests the pipe terminator,
+which essentially always succeeds, so on a failing `df` the SUCCESS arm ran with
+an empty `dfline` and printed `fs_source=` / `fs_avail=` blank — indistinguishable
+from a filer that answered, inside the probe whose whole job is to prove a write
+failure is not a storage outage. Restructured to capture `df`'s own status, and
+to treat a successful-but-empty `df` as `unknown` too. `set -o pipefail` was NOT
+used: `_lib.sh`'s header requires it to be safe to source from a shell that has
+already configured its options.
+
+**The issue's scope number was wrong and the swallow was LATENT, not live.**
+`#1056` reported `_lib.sh` "referenced by 130 files, 112 of which set file-scope
+pipefail, leaving roughly 18 sourcing contexts where the swallow is live". That
+counts files MENTIONING the string `_lib.sh`, not files sourcing it. Re-derived
+at `7c073a3` by actual source edges: **21** true sourcers of
+`monitor/watcher/_lib.sh`, and **0** of them lack `pipefail` — so every shipped
+call path already reached the honest `unknown` arm. The mutation test proves it:
+against the restored defect, `[B/pipefail]` PASSES while `[B/nopipefail]` fails.
+The defect is therefore the DEPENDENCY, not the reachability — a site whose
+correctness rests on the sourcer having enabled an option the file's own header
+disclaims. New suite `test-fs-evidence-df-status.sh` pins the option-independence.
+
+**`#1078` — `test-ng-usage-flag-coverage.sh` declared no population.** It now
+implements the `--population` protocol via its own `_ng_surface_scripts`
+enumerator (the FULL `ng` surface by both delegation forms, not the narrower
+`_delegated_scripts` walk), plus a `guard-populations.manifest` row. Verified
+against `#1065`'s 14-file diff: the suite is now SELECTED and its `because it
+reads` line names `monitor/send.sh` — the exact file whose addition reddened it.
+
+**`#1078`'s residual gap was in `CLAUDE.md`, and the tool was honest.** The
+contract file enumerated 2, 3 and 4 as non-clearances and said nothing about
+**0**. Added that sentence. Re-measured at `7c073a3`: the blind-spot section is
+byte-identical (556 bytes) at exit 0 and exit 3, so 0 deserves the same
+suspicion. Written without an enrolment ratio, because
+`test-claude-md-guards-for-diff.sh` Claim 7 forbids an `N of M` literal in that
+bullet — it would rot within a day.
+
+**`#1053` — already fixed by `#1054`; verified by execution, and its stated
+mechanism corrected.** The ask ("`--run` should REFUSE, or explicitly qualify, a
+population guard's green while untracked files are in the diff") is implemented
+at `7c073a3` and fires. Measured with a planted probe, content held constant and
+trackedness the only variable: untracked it is named under `BLIND TO`, its green
+prints as `UNVERIFIED`, and `--run` exits 4; staged it goes red. **No code change
+was made**, because the correct one already exists.
+
+Its mechanism sentence is wrong, though: "a guard can be selected BECAUSE OF an
+untracked file and then run blind over a tree that does not contain it" describes
+two mutually exclusive conditions. Selection is `changed ∩ population`, so a
+guard selected because of a file necessarily has that file in its population and
+is therefore NOT blind to it. Measured on one run: `early-exit-reader-manifest`
+was selected because of a TRACKED file and blind to the untracked probe;
+`stub-claude-manifest` was selected because of the untracked probe and not blind
+to it — its population walks the working tree, not `git ls-files`. The
+consequence `#1053` describes is real; the route to it is one step different, and
+tracked-only enumeration is a per-guard property rather than a universal one.
+
+Found while fixing `#1056` and filed rather than folded in: `#1106`, where
+`early-exit-readers.sh`'s pipefail axis is decided by a bare grep over whole files,
+so a COMMENT naming `set -o pipefail` enrols a file onto a checked manifest's axis.
+Latent today (115 rows either way, every comment-only match already on the axis by
+inheritance) and reproducible (115 → 116 from one planted comment line). The `#1056`
+fix comment names the option by description only for this reason.
+
+### Changed — test-knob-default-agrees now DERIVES its knob table: 2 hand rows to 99 (`#995`)
+
+The guard hand-enumerated its knobs — two rows — with no assertion that the
+enumeration was complete. It had already missed a knob for exactly that reason
+once (`#966`'s own new knob re-instantiated the hazard the fix was for), and
+`KNOBS`' comment "Adding a knob means adding a row" is the instruction that had
+already been forgotten. Re-derived at `3458180`, `_config.sh` resolves **99**
+knobs with a numeric literal default. The guard covered 2.
+
+**"Paste more rows" was not the fix, and that is the whole difficulty `#995`
+identified.** Adding one legitimate row for a knob with the identical hazard
+turned the guard red on **non-vacuity, not drift**:
+`MONITOR_OVER_LIMIT_MAX_ATTEMPTS` has no `_config.sh` validation fallback at all
+(spelling B absent **by design**) and its docstring is whitespace-padded past
+the `E` regex. Its four real spellings all say `4` and agree. The five-spelling
+model was specific to the two knobs it was written for.
+
+What makes it extend is treating absence as a first-class state — legal, but not
+free. Two independent properties:
+
+- **AGREEMENT** — every PRESENT spelling of a knob's default names one number.
+  Absence is not disagreement.
+- **PRESENCE** — *which* spellings each knob has is pinned in
+  `knob-default-spellings.manifest`. So a rename or reflow that makes an
+  extraction silently return `""` reddens NAMING the knob, instead of collapsing
+  the comparison to a smaller set that agrees. That was the vacuity failure the
+  old per-spelling assertions existed to prevent, and it is the thing "just
+  don't require every spelling" would have thrown away.
+
+A, B, C and E are now derived; **D alone keeps a hand table**, because it names
+a function-scoped local that cannot be discovered — `_emit_filters.sh` holds two
+functions whose local is `cooldown`, at 300 and at 900, so a file-scoped scan
+reports a false disagreement. That is the one place enumeration is still right.
+
+- **`E` tolerates the padding these docstrings actually use.** The old form
+  required one space; the repo's docstrings are column-aligned, arrow-annotated
+  and backticked. At `3458180` the single-space form finds an `E` for **7** of
+  99 knobs, the tolerant form for **17**.
+- **Completeness is asserted, not assumed.** A derived list has the hand list's
+  failure one level down: a knob written in a spelling the row regex does not
+  recognise drops out silently and looks exactly like a knob that is not there.
+  So the shape is counted independently — every `$("$_cfg" <key> <numeric>)`
+  occurrence — and the parser must claim all 99.
+- **No live drift.** 0 of 99 knobs divergent at `3458180`, and the zero is from
+  an instrument shown to fire: the control mutates a real copy of `_config.sh`
+  and runs the *same extractor* over it, requiring the victim to be named. Two
+  end-to-end mutants on the real tree are killed — a consumer-side `${VAR:-N}`
+  drift (agreement reddens) and a deleted docstring (the mask ratchet reddens,
+  diffing `A-CE` → `A-C-`).
+- `MONITOR_OVER_LIMIT_MAX_ATTEMPTS` — the knob `#995` used to show the model did
+  not extend — is now covered, mask `A-CE`, green.
+
+The mask distribution is the argument against pasting rows: only **6** of 99
+knobs carry all four derivable spellings, and **20** carry `A` alone. Most knobs
+legitimately have nothing to compare.
+
+Three of this repo's own documented traps were hit while writing it, and each is
+now recorded at the line that suffered it: `IFS=$'\t' read` COLLAPSES empty
+fields (tab is IFS whitespace in bash), which shifted every column after the
+first absent spelling and produced "93 of 99 divergent" on a tree whose real
+answer is 0; `"$ce$d"` glued two command substitutions into one row because the
+trailing newline is stripped; and a sed program built in DOUBLE quotes had
+`$_cfg` expanded by the shell before sed ever saw it, so the mutation control
+mutated nothing and passed for the wrong reason.
+
+### Fixed — a predicate keyed on a string cannot tell the THING from the DESCRIPTION of the thing (`#1073`, `#1059`, `#1057`)
+
+Three issues, one causal chain, so they land together rather than in a sequence
+where each half is inert without the others.
+
+- **`monitor/proc-exists-authorized` — a sanctioned existence check
+  (`#1073`).** A process-EXISTENCE predicate keyed on a command line matches
+  SIBLING AGENTS' argv, because agent prompts quote verbatim the thing being
+  watched and `claude`'s argv **is** its prompt (one live pid measured at 15,265
+  argv bytes). `proc-kill-authorized` does not reach it: that gates KILLS, and
+  nothing consulted an authorization filter before deciding whether to keep
+  WAITING. Measured on this board 2026-08-27, with a real job running: a
+  correctly bracketed `ps -eo pid=,args= | grep -c '[g]uards-for-diff'`
+  returned **12**, three of them live sibling `claude` processes in other
+  sessions. The new helper keys on session ownership and pid identity, reads
+  `/proc` directly (so it has no observer to self-match), and **owns the loop**
+  — the caller never writes the `until`/`while`, so the polarity cannot be
+  inverted. `--until-gone --match` is REFUSED at rc 2 on purpose: "nothing I
+  own matches" is not "the job is gone", and a `setsid`-detached job of your
+  own is invisible to any session-scoped match. Five exit codes, three of which
+  are not answers — `3` (REFUSED, could not determine) is what breaks the
+  both-directions failure, since a shell `until` loops on non-zero and a
+  `while` loops on zero, so any two-valued predicate is read backwards by one
+  of them.
+
+- **Every matching guard rule is now delivered, not just the first (`#1057`).**
+  `deliver()` ended in `exit 0`, so arm order was a silent priority list that
+  nothing declared and nothing tested. Measured over **104,113** real
+  `Bash`/`Monitor` command strings from 856 Claude Code transcripts:
+  **7.8% of all warned-about commands (784 of 10,016) tripped more than one arm
+  and were told about one.** Per-arm, `pipe-status` lost **428** deliveries,
+  `git-push` 21.9%, `tmux-kill-session` 50% — and `tmux-kill-pane` **100% (0 of
+  4)**, always eaten by `tmux-kill-server` above it. That family is the only one
+  whose consequence the conf calls unrecoverable, and it was deliberately split
+  into four tags (`#951` F2) so one verb could not spend the family's warning;
+  row order re-introduced exactly that *within* the family. The cap is now 3
+  (covering 104,099 of 104,113 commands in full) and, crucially, **announced**:
+  withheld tags are NAMED in the payload and are not marked seen. A cap
+  inferred from absence would be the same defect one level up.
+
+- **`procmatch-self` no longer punishes the remedy it prescribes (`#1059`) —
+  and the fix is the MESSAGE, not the trigger.** The arm told readers to
+  "bracket the pattern" and then fired on exactly that; two agents in two
+  sessions hit it independently, one on its first command. Suppressing on
+  brackets — the issue's suggested direction — was measured **wrong**:
+  bracketing closes the observer's own hit (3 → 0) and does nothing about a
+  sibling's prompt-carried hit, so suppressing would have closed `#1059` by
+  opening `#1073` wider. The arm therefore fires on both spellings and says
+  something DIFFERENT to each; the bracketed variant credits the half that is
+  closed and names the half that is not. The matcher also widened: `\bgrep\b`
+  does not hold between `f` and `g`, so `fgrep`/`egrep`/`rg` were silent while
+  carrying the identical hazard. `awk`/`sed` are a declared residual, pinned as
+  a NEGATIVE, because `ps … | awk '{print $1}'` is the kill-list idiom
+  `CLAUDE.md` blesses.
+
+- **A new `procmatch-wait-ps` arm** for a wait loop keyed on `ps … | grep`,
+  which previously received `procmatch-self`'s message — advice that does not
+  touch the hazard, for a construct whose failure is silent non-termination.
+  It could only be added once `#1057` was fixed: a new arm competing for a
+  single delivery slot would have been a regression.
+
+`CLAUDE.md` gains the entry, in a delimited block executed against real
+own-session and foreign-session plants by
+`monitor/watcher/test-claude-md-procmatch-argv.sh`, so it is checked rather
+than asserted.
+
+### Fixed — undefined-helper-lint: inert heredoc text could exempt a whole suite, and nothing could tell UNKNOWN from clean (`#1030`)
+
+Two defects in `#989`'s `UNKNOWN` arm. **This is not a revert of `#989`** — that
+change shrank the blind spot from 40% of suites to 8.3% at zero call-site cost,
+and the pre-fix state was an active false positive. This is the residue that
+shipped with it.
+
+**F1 — the exemption fired on text that never executes.** The SOURCE scan read
+the raw file; the CALL scan read `th_strip_heredocs "$f"`. Three lines apart. So
+inert heredoc text decided whether a whole suite was checked or exempted: a
+fixture containing `source "$LIB"` sets `unresolved_here`, and every finding in
+that file is downgraded from UNDEFINED to UNKNOWN. The asymmetry is older than
+`#989`; what `#989` changed is the consequence — an unresolved source used to
+merely omit names from `reachable`, and now decides the verdict.
+
+Re-derived at `3458180` using the lint's own resolver (one `printf` inside it,
+so the population is the lint's and not a re-implementation): **169 suites, 14
+with an unresolved source, 3 of them only because of heredoc text** —
+`test-ambient-shell-option-scope.sh` (25 directives → 3 under the stripper),
+`test-helper-honesty.sh` (6 → 2), `test-version-restart.sh` (5 → 2). The other
+11 are byte-identical before and after: their `. "$LIB"` lines sit inside
+`bash -c '…'` blocks, which are not heredocs, and their exemptions are
+legitimate. After the fix: **11 exempt, and none newly so.**
+
+**The lint exempted ITSELF**, through a fixture added by the change under
+review. `#989` added a `<<'FXC'` heredoc to `test-helper-honesty.sh` — the
+lint's own test suite — whose body contains `source "$LIB"`. Reproduced at
+`3458180` and closed, same plant, two files, one run apart:
+
+| plant `_argloop_stuck "…"` in | before | after |
+|---|---|---|
+| `test-helper-honesty.sh` (the lint's own suite) | rc 0, "1 call site UNKNOWN" | **rc 1, named as an offence** |
+| `test-ng-close.sh` (not exempt — the control) | rc 1, named | rc 1, named (unchanged) |
+
+**No silent fallback.** The old line was
+`body=$(th_strip_heredocs "$f" 2>/dev/null) || body=$(cat "$f")`, and that `||`
+is a silent revert to the raw file. It defeats the F1 fix *without breaking its
+invariant* — both scans still read the same text — while the content goes back
+to raw. A strip failure is now "could not look" for that file: counted, named,
+REFUSED (exit 2). Same for an empty body from a non-empty file, which the old
+`[[ -n "$body" ]] || continue` dropped in silence. Both arms are prospective:
+0 of 169 suites hit either at `3458180`.
+
+**That `||` was load-bearing, and what it was hiding is the finding.** In the
+lint's own FIXTURE corpus the helper is a two-line stub (`assert_eq`,
+`th_skip`), so `th_strip_heredocs` was **undefined** there — `type -t` empty,
+the call returning rc 127 and zero bytes. Every `#989` fixture assertion has
+been scanning raw, unstripped files for its whole life, and nothing said so.
+The lint's potency harness was running the defect the lint exists to prosecute.
+The fixture now carries the real helper and the real `_shell_quotes.awk`.
+
+**F2 — nothing could tell UNKNOWN from clean.** `UNKNOWN` keeps rc 0 by design
+and the summary always contains "suites"; those two facts were exactly what the
+lint's only consumer asserted, and both hold identically at `0 UNKNOWN` and at
+`N`. The `%d UNKNOWN` field was printed and read by nobody. The lint was in no
+gate: `run-tests.sh`'s glob is `test-*.sh` (no match), and it is named in
+neither `run-tests.sh`, `.github/workflows/`, nor `guard-populations.manifest`.
+
+- **`uhl-unknown-callsites.manifest`** — the residue is DATA. `--unknown-set`
+  emits it; a normal run compares and exits **4** on disagreement. 4, not 1:
+  this file already insists a REFUSAL must not be mistaken for a FINDING, and a
+  residue that moved is a third thing again.
+- **Keyed on the CALL-SITE list, not the unresolved-SOURCE set** — an offence
+  planted in a file already carrying an unresolvable source adds no source
+  directive, so a source-set ratchet would miss the very mutant that motivates
+  one. And on `<file>\t<name>`, not `file:line`: line numbers churn, and a
+  noisy ratchet gets regenerated reflexively.
+- **`test-helper-honesty.sh` now declares its population**, so
+  `ng guards-for-diff` can select it — forwarding to the lint's own
+  `--population` rather than restating it.
+
+Sixteen new assertions, every one with a control that varies the axis the
+mechanism varies on: the ratchet is driven by mutating the MANIFEST with the
+corpus held constant, and the strip refusal by removing the shared quote
+machine — which is also, exactly, how the fixture corpus had been failing all
+along.
+
+
+### Added — the `idle-orphan-async` loop closes itself (`#1071`)
+
+Six workers, four windows, three clones, two repos, under three hours, all on
+2026-08-26: each ended a turn holding external waits whose jobs had already
+ended, and **each was unblocked only because the orchestrator noticed a row and
+pasted.** The fourth landed ten minutes AFTER the issue was filed, in a worker
+whose prompt carried the injected rule.
+
+Every control existed and every control fired. The worker floor states the
+ownership rule and is auto-injected; `hooks/async-launch-detect.sh` re-injects
+it at the launch; the watcher detects the stall precisely, naming the exact
+wait ids. **All three are advisory**, so the loop closed only when a
+human-equivalent read the row. Three of those six workers produced the
+session's sharpest findings while breaking the rule — this was never a
+discipline problem, and "tell the worker harder" is the remedy that had already
+failed six times.
+
+Two halves, because they fix different things and only one of them is
+sufficient on its own for anything.
+
+- **`monitor/watcher/_orphan_async.sh` — the watcher now owns a wake loop for
+  this class**, the same treatment `over-limit` has had since `#87`, and
+  deliberately built in that file's shape. It fixes the STALL. Three gates, all
+  asserted in both arms and all mutation-tested:
+  - **it never wakes a worker whose job is still running.** Every wait is
+    resolved first and a single `running` verdict suppresses the wake
+    entirely. `idle-orphan-async` means *this worker has no way to wake*; it
+    has never meant *the job is over*, and a self-healer that reaps live work
+    is strictly worse than the stall it replaces.
+  - **it never delivers into a pane with input queued** (`queued=1`), and
+    re-probes that the pane still reads the class before pasting. `#1065`'s
+    contract exists for this; a self-healing loop that double-delivers is
+    worse than the stall.
+  - **it never clears a wait.** The brief resumes first and names
+    `declare-no-wait.sh` last, as the exception, with its precondition
+    attached. Clearing a wait on a job that IS running destroys the only
+    record that work is outstanding.
+
+- **`monitor/async-run.sh` — a launcher that RETAINS the exit status.** This is
+  the half that fixes TRUSTWORTHINESS, and nothing else in the change does.
+  `--status <token>` answers three ways where a bare `nohup` answers one:
+  `running`, `terminal rc=N`, and **`died`** — gone, and killed before it could
+  report. That third verdict is the one the four `nohup` instances could not
+  produce, and the reason it matters is that **an absent process is not a
+  completed job**: a producer killed mid-write leaves a TRUNCATED, plausible
+  intermediate, not an empty one, so it passes every emptiness check and
+  silently shortens every number downstream. One of the six producers was at
+  28 GB RSS against a 92.6 GB archive on a shared node, so OOM was live and
+  unfalsifiable from inside the worker. Slurm already had this property via
+  `sacct`; `setsid` + a status file gives it to local background work. Liveness
+  is checked by pid IDENTITY (`/proc/<pid>/stat` field 22), not `kill -0`, so a
+  recycled pid cannot turn a `died` into a confident `running`.
+
+  **Measured while building it, and it corrects the folklore:** a bare
+  `nohup … &` child SURVIVES the Bash tool call (reparented to init, ppid 1).
+  What dies is the parent shell that would have reaped it. So the defect is not
+  that the job is killed — it is that nothing anywhere records how it ended.
+  The new `async-status` footgun row says exactly that, because a message
+  claiming the job is killed sends the worker to fix the wrong thing.
+
+- **One wait per JOB, not per CALL** (`monitor/hooks/async-launch-detect.sh`).
+  A 15-job submission grid is a single Bash call carrying fifteen
+  `Submitted batch job` lines; the hook took the first and synthesised a
+  `syn-` token for the rest. A `syn-` id has no job behind it, so nothing can
+  look it up — per-call tokenisation was manufacturing the unresolvable wait at
+  exactly the shape (a dose grid) that is COMMON for this work. Every id is now
+  parsed, and dismissal is per id, so `declare-no-wait` on one grid job no
+  longer clears the other fourteen.
+
+- **`sbatch --parsable` prints a BARE id**, which the canonical
+  `Submitted batch job <id>` regex does not match — so it minted an
+  unresolvable `syn-` token. **This, not per-call tokenisation, is the
+  mechanism that produced the observed `slurm:syn-…` tokens**; corroborated
+  live, and the two fixes address different paths. The bare-id reading is
+  gated on `--parsable` appearing in the command, deliberately: a general
+  numeric rule would register stray stdout as a job id, and a WRONG id is
+  strictly worse than a `syn-` because `sacct` may resolve it to another
+  job's `COMPLETED` and tell the worker its data is good.
+
+- **The emit no longer offers clearing as a co-equal option.** The removal is
+  asymmetric rather than stylistic: resuming a still-running worker costs one
+  turn, clearing its wait destroys the record — and the emit cannot tell the
+  cases apart, because it reports the absence of a resume mechanism, never the
+  end of a job.
+
+**Corrected after review.** The wake brief opened with `NONE of them is still
+running` **unconditionally** — including when every wait resolved
+`unresolvable`, the ordinary case for the `syn-` waits this issue is about.
+Neither `unresolvable` (nothing was retained; the state is UNKNOWN) nor `died`
+(no status written) entails "not running", and the loop wakes when nothing
+resolved `running`, which is a different claim. That was this change's own
+thesis — an absent record is not a finished job — inverted in the one artefact a
+worker reads, and it would have had a worker consume a live job's partial
+output. The header is now conditional; `RESUME YOUR TASK NOW` is unchanged,
+because resuming is correct in every case and only the status claim was wrong.
+
+**What this does NOT close, stated because half a fix presented as a whole one
+is the failure mode this issue is about.** The footgun row is a `warn`, and
+`warn` is advisory exactly like the three controls that already failed — it is
+not the terminal half and must not be read as one. `deliver` marks a tag seen
+BEFORE exiting, so even a `block` would be a one-shot speed bump. The terminal
+half is the wake loop, which needs nothing from the worker at all. And for a
+wait whose launcher retained no status, the wake loop can only report
+`unresolvable`; it cannot reconstruct what was destroyed at launch. Only using
+the status-preserving launcher does that, and only prospectively.
+
+
+### Fixed — sigpipe lint: the header promised coverage the regex did not deliver (`#1029`)
+
+`monitor/watcher/test-sigpipe-assertion-lint.sh`'s COVERAGE BOUNDARY said it
+covers "**ANY** producer piped into `grep` with a `q` flag". The regex matched a
+BARE `grep` sitting immediately after the pipe and carrying a SHORT `q` flag.
+**Six spellings squarely inside that promise evaded it**, and all six carry the
+real hazard — measured, not asserted: match on line 1 of a 200 001-byte payload
+under `set -uo pipefail` with the status consumed, `rc=141` for every one, i.e.
+pipeline FAILURE on a string that DOES match.
+
+The gap that matters is not the regex's. `head` and `grep -m1` also evade, and
+they are fine, because the header **declares** them out of scope. A declared gap
+is a boundary; an undeclared one is a false promise — and the header is what the
+next author reads before deciding whether their construct is covered. That is
+why the header amendment was the mandatory half and the regex the optional one.
+Both landed.
+
+- **The boundary is now ENUMERATED, and every member is planted as a control.**
+  Eleven reader spellings (short-flag clusters in either order, `--quiet`,
+  `--silent`, `command`/`env` and the other command-word prefixes,
+  path-qualified `/bin/grep`, `VAR=val` assignment prefixes, and combinations)
+  and four pipe spellings (same-line, `\`-continuation, `|&`, and the
+  trailing-pipe split). Twelve new controls, each asserted to be caught at a
+  named file and line. The enumeration is executed, not asserted in prose.
+- **The trailing-pipe split needed more than a regex**, which is why it outlived
+  the other five: the pipe ends line N and the reader opens line N+1, and no
+  single-line matcher can express that. The scan now keeps the previous line and
+  pairs a single trailing pipe (never `||`) with a following covered reader. It
+  is the exact mirror of the `\`-continuation direction `#630` closed.
+- **`| sort -u` and one shared reader fragment.** `_GREPQ_READER` is defined once
+  and used by both passes and by both scans (code and docs), so the same-line and
+  split spellings cannot drift into two transcriptions of one idea — the `#616`
+  lesson, where a control exercising a COPY of the matcher let
+  `echo "$var" | grep -q` survive.
+- **What is still NOT covered is now named**: a reader the source text does not
+  spell as `grep` (`"$GREP" -q`, `eval`, an alias, `xargs grep -q`, and the
+  `egrep`/`fgrep`/`zgrep`/`rg`/`ug` variants). The variant row is a measured
+  boundary — `git grep -nE '\|[[:space:]]*(e|f|z)grep[[:space:]]+-[A-Za-z]*q'
+  -- monitor` returns zero at `3458180` — not a hidden hole.
+
+**Widening the matcher immediately surfaced TWO LIVE SITES**, neither a plant,
+both sitting inside the boundary sentence and outside the predicate the whole
+time:
+
+| site | spelling |
+|---|---|
+| `monitor/remote-forced-command.sh:410` | `\| LC_ALL=C grep -q` |
+| `monitor/watcher/test-tmux-window-resolver.sh:784` | `\| LC_ALL=C command grep -q` |
+
+**Both are defence in depth, not live fail-opens.** An earlier draft of this
+entry called the first "fails OPEN on a security check". That was overstated,
+and the correction is recorded rather than quietly dropped, because an
+overstated severity that becomes a lineage's canonical example is worse than no
+example — it is the sentence everyone cites.
+
+`remote-forced-command.sh:410` is the non-printable-byte refusal on the remote
+channel's forced command, and `set -uo pipefail` **is** in scope (line 111) with
+the pipeline's status **as** the `if` condition — so an inverted verdict would
+take the ELSE branch and admit the byte. It cannot fire *there*: three lines
+above, `case "$CMD" in *$'\n'*) refuse 12 …` rejects any embedded newline and
+`refuse` exits, so `$CMD` is **single-line by construction**, and grep must read
+a complete line before it can match. `test-tmux-window-resolver.sh:784` decodes
+one source line, so its payload is a few hundred bytes — far below the buffer
+the hazard needs.
+
+Measured on the exact source shape, `set -uo pipefail`, non-printable byte at
+position 1, **ten trials per size** (it is a race, so one sample is not a
+measurement):
+
+| payload | result |
+|---|---|
+| single-line, 1 KB · 70 KB · 200 KB · 2 MB | REFUSED 10/10 at every size |
+| multi-line, 8 KB · 32 KB · 60 KB | REFUSED 10/10 |
+| multi-line, 65 KB | ADMITTED 2/10 |
+| multi-line, 70 KB | ADMITTED 6/10 |
+| multi-line, 100 KB · 200 KB | ADMITTED 10/10 (`rc=141`) |
+
+So the hazard is real, requires **multi-line** input, and its onset is the
+64 KiB pipe buffer — a probabilistic transition band, not a threshold. That
+refines `#1029`'s own framing: `printf` does keep writing past the match, but
+whether that write *blocks* long enough to see EPIPE is governed by the buffer.
+The durable discriminator remains match **position** — a match on the last line
+can never fire, at any size.
+
+The conversion is still right, and that is why these sites are converted rather
+than annotated: what protects line 410 is a newline refusal three lines away,
+belonging to a different concern. Move it, weaken it, or copy the idiom to a
+site with no such guard, and the hazard is live with nothing saying so. Both
+were shown byte-equivalent to the herestring form first, across control bytes,
+UTF-8, tab, embedded newline and empty input (`grep` strips line terminators, so
+the added newline changes no verdict). Reverting either conversion, one at a
+time, reddens case 2 by name: rc 1, exactly one `FAIL: sigpipe idiom`.
+
+**And the trailing-pipe pass fired on the remedy it prescribes.** `|` is
+markdown's column separator, so every table row ends in one, and a table above a
+shell snippet made the pass flag the lint's own prescribed replacement —
+measured: `monitor/flags.md:6:grep -q needle <<<"$var"`. That is `#1059`
+recurring in a different lint hours after its fix merged as `#1090`. The pass
+now excludes markdown table rows and refuses to carry a pipe from a prose
+comment into a code line, with a **negative and a positive control on each
+axis** — because "stop flagging the table" is also satisfied by switching the
+pass off, and only the pair rules that out.
+
+One trap recorded because it bit inside this change and is invisible: awk
+DYNAMIC regexes degrade `\|` to a plain `|` with a warning, which turned
+`(^|[^|])\|&?[[:space:]]*$` into an alternation matching the EMPTY STRING at
+the end of every line — a precondition true everywhere, so the conjunction
+reported its second half alone. **274 false hits** on this tree with the
+backslash spelling, **0** with `[|]`. Same family as everything else in this
+file: a predicate quietly wider than the property it stands for.
+
+
+### Fixed — verification surfaces that lied about themselves (`#895`, `#884`, `#885`, `#940`)
+
+Four surfaces that report on OTHER work. Each failed in the direction of
+"everything is fine", and `#895` failed in the direction of authorising a kill.
+
+- **A report could authorize its own retirement** (`#895`). `#` is in
+  `_skeptic_stated_disposition`'s `structural_only` strip set, so a markdown
+  HEADING was classified as EMPHASIS and `## Disposition: no-further-pass`
+  parsed as a governing field statement. Measured end-to-end: `ng
+  skeptic-disposition` returned `state=no-further-pass … detail=stated`, which
+  is `retire-preflight.sh`'s "gate does not apply" arm — a section title
+  clearing the window's own `tmux kill-window`. It also SILENCED a contradicting
+  request: the field scan short-circuits before prose, so the same body without
+  the heading returns `second-pass prose inferred`, and adding a title overrode
+  an author asking for another pass.
+
+  The repo had already made this ruling and applied it in ONE place: `#855`
+  carved headings out at `report-check`, but that carve-out is reachable only
+  from `unreadable` — so a heading with an ILLEGAL value was a title while the
+  same heading with a LEGAL one was promoted to a statement. **The value decided
+  whether the line was a title.**
+
+  **A `#`-prefixed line is now refused in BOTH parse modes, and the frontmatter
+  half is the worse one.** The first version of this fix scoped the rule to
+  `want == "body"`, reasoning that frontmatter is YAML and `###` is not a heading
+  there. The premise is right and the conclusion was backwards: in YAML a leading
+  `#` is a **comment**, so the line is *more* disabled than a heading, not less —
+  and reading it as a statement meant **commenting a disposition out activated
+  it**. The syntax whose entire meaning is "ignore this line" authorised an
+  irreversible `tmux kill-window`, and commenting a field out is the most natural
+  way there is to neutralise one. Measured at the first head: `# disposition:
+  no-further-pass`, its indented form, `#disposition: …` and `### Disposition: …`
+  all returned `no-further-pass frontmatter stated`, unchanged from `e256d4a`.
+  Caught by the `#955` skeptic; it is `#895` itself, one `want` value over.
+
+  **Round 3 removed the space requirement from the body arm too** (`#962`). The
+  mode-specific version above still read `#disposition: no-further-pass` in the
+  BODY as a governing field — measured end-to-end at `defbb8e8`:
+  `no-further-pass body stated`, then `retire-preflight` rc 0 `safe=1`. That is
+  the same asymmetry, surviving in the other direction: the demonstrated
+  spelling fixed, the more natural one left open, on the irreversible path.
+  Markdown has no comment syntax, so the shape is genuinely ambiguous; the tie
+  is broken by FAIL DIRECTION, which is the only argument this parser supports.
+  Both arms are now one regex and the MODE still picks the detail string. **A
+  non-ATX body line reports the shared body detail** — a declared imprecision,
+  not an oversight: a second mark was refused because the `<n>h` suffix is
+  `report-check`'s `#855` carve-out flag, so splitting it would change write
+  time to improve a hint string. Pinned by its own assertion.
+
+  Re-measured on the LIVE corpus rather than a frozen snapshot, with a positive
+  control in the same run: **0 of 1,166 reports change verdict**
+  (`2026-08-15T12:21Z`). Note the predicate — `^[[:space:]]*#[^[:space:]#].*disposition:`
+  returns 0 against the literal string `#disposition: x`, because it requires a
+  character *between* the `#` and the word. It cannot match the spelling it
+  costs.
+
+  The modes need different marks in what they are CALLED, and one regex would
+  have missed the frontmatter gap when the arms still differed: an ATX heading
+  requires the space (`#{1,6}` then blank), a YAML comment does not and may be
+  indented — so `#disposition: x` is a comment in YAML and not a heading in
+  markdown. Frontmatter resolves
+  `unreadable frontmatter hash-prefixed-line-is-a-yaml-comment`, body resolves
+  `unreadable body heading-is-a-section-title`; the detail names the mark the
+  author actually wrote, because the remedies differ. A commented line beside a
+  real field does not shadow it.
+
+  A heading now resolves `unreadable body heading-is-a-section-title`.
+  Deliberately `unreadable` and not a skip: `## Disposition: second-pass`
+  currently BLOCKS retirement, and silently dropping it would move that report
+  from NO-GO to proceed — ignoring text must never relax a gate. Write time is
+  unchanged by construction: `unreadable source=body` is exactly the state
+  `#855`'s carve-out consumes, so an ordinary worker writing `### Disposition:
+  fix at source` still passes `report-check`. **Zero of 1,133 corpus reports
+  change verdict** (frozen snapshot; the three carrying a heading-shaped line
+  are fenced or already governed by frontmatter), asserted differentially.
+
+- **A comment claiming an invariant nothing asserted** (`#955` skeptic round 3).
+  `ci-head-attempts.sh` stated the `unexecuted`-only wording was preserved
+  "BYTE-FOR-BYTE … asserted differentially in test-ci-head-attempts.sh". Both
+  halves were false. Measured across all 42 fixtures at `423f92e` vs `50d1621`,
+  **6 outputs changed** — five the intended `#884`/`#885` cases, and one the rc-9
+  stale-merge-ref arm (`unexecuted`-only) where folding the count into
+  `_excl_count_phrase` moved a LINE BREAK. Cosmetic, and unavoidable while the
+  phrase is dynamic. Nothing in the suite compares bytes
+  (`grep -c 'diff <('` → 0). The comment now says what is preserved (the
+  WORDING) and what is not (the wrapping), and the wording is pinned by a real
+  assertion on that arm, including the ABSENCE of the non-verdict clause. An
+  over-claiming comment in the PR that exists to remove over-claiming
+  verification surfaces was the whole point of correcting it rather than
+  deleting it.
+
+- **Universal claims qualified for one member of the excluded set and not the
+  other** (`#884`). A run that COMPLETED with a conclusion that is neither
+  `success` nor `failure` was marked `--  … — not a verdict` in the rows,
+  counted into `concluded_n`, and counted by nothing else — so at rc 0
+  `ci-head-attempts.sh` printed `every completed run at this head is a
+  FIRST-PASS success` three lines under its own row saying otherwise. Five claim
+  sites each branched on `(( unexecuted ))` privately, so the second member was
+  never taught to four of them. Membership and its wording now live in one place
+  (`_excl_any` / `_excl_clause` / `_excl_count_phrase`) and the sites ask; a
+  third member is qualified into all five by construction. Output with nothing
+  excluded is byte-identical.
+
+- **A shared disclosure audited by whether it is CALLED** (`#885`). Presence was
+  never the property. Verified on the audit arm: with a GATING band that
+  concluded `failure` having executed ZERO steps, the audit reports
+  `UNEXECUTED-RUN … ABSENCE of verdict (exit 4)`, the verdict says `the
+  expected-band audit above did NOT come back clean (rc 4)`, and the shared note
+  said `That does NOT drive the verdict above` — all in one output. The
+  unexecuted run was the sole cause of the verdict it disclaimed. Causality is a
+  property of the ARM, so it is now the caller's to state
+  (`independent|drives|unknown`); the audit arm says `unknown`, because its rc 4
+  may come from an unexecuted run OR a missing band and this helper cannot tell
+  which. An absent argument resolves to `unknown` — the previous default was a
+  CLAIM.
+
+- **`#656`'s `comment_st=edited` arm was asserted nowhere** (`#940`).
+  `grep -n 'EDITED|comment_st=edited|composed body changed'` over
+  `test-ng-wrap-up.sh` returned empty, so the `#656`/`#873` "they compose to
+  cover the whole case" claim rested on an untested mechanism. Now driven
+  behaviourally — the comment must CARRY the correction, via PATCH on the
+  existing comment, with no duplicate POST — plus a discriminator (an
+  asset-link-only re-wrap must log `updated`, not `edited`) and the failure
+  direction (`MOCK_PATCH_FAIL_ON=2` fails the body edit while the re-point
+  succeeds; the verb must exit non-zero and not claim publication). No assertion
+  greps `ng` for the string: that would be a presence test, i.e. `#885` one
+  level up.
+
+### Added — the disposition gate records what it read (`#962`)
+
+`retire-preflight.sh`'s check 1c decided whether an irreversible
+`tmux kill-window` may proceed and **wrote nothing**. Every other check on that
+path leaves a trace — 1b clears a marker, the releases write a
+`.cleared-rationale`, the kill itself logs `window-close` — so this was the one
+decision on the kill path that could not be reconstructed afterwards.
+
+Measured cost, and it is why this is worth its own change: asked how many
+retirements were authorised on a disposition belonging to a **different task**,
+one of two candidate windows was **UNDETERMINABLE** — not because nothing
+happened, but because no record of the decision exists. The other was answerable
+only because a `window-close` happened to be logged ten hours later. The action
+log holds 210 `window-close` events spanning 2026-05-08 → 2026-08-15 and **zero**
+on 2026-08-08/09, which is exactly the window the unanswerable case falls in.
+
+`skeptic-disposition-gate` now records the window, the state, the probe rc, the
+report that governed and that report's mtime, on **every** evaluation.
+
+- **It records; it never decides.** Kill semantics are untouched — asserted on
+  both verdicts, since a record written only when the gate proceeds would be the
+  same blind spot in a smaller costume.
+- **Emitted BEFORE the probe-failure arm**, so the `unknown` / could-not-run case
+  is recorded too. "The gate could not look" is the answer a later audit most
+  needs, and an after-the-arm placement drops precisely it. Pinned by its own
+  assertion, and by a mutant that moves the emit after the arm and fails that
+  assertion alone.
+- **Fail-open, deliberately**, against this file's usual direction: a logging
+  failure is not evidence about the window, and letting it block would turn a
+  full disk into a board-wide stall. Bounded (`timeout`) and detached from the
+  script's exit status. Asserted with a genuinely broken log path, not argued.
+
+Groundwork for `#962` proper: it converts that class from *unknowable* to
+*countable* without touching the parser or the gate's decision, so it can land
+ahead of any semantic change.
+
+
 ### Fixed
+
+- **A `watcher_alert=` block re-emitted on every `comment_surface` fire, so a
+  GitHub outage stormed the operator channel the alert exists to protect.**
+  Measured on the 2026-08-17 GraphQL 503: ONE escalation produced **62 pastes
+  in ten minutes**, every one byte-identical and carrying the same frozen
+  `held_s=2403` (<your-org>/nexus-code#966). The recovery then did it again,
+  harder — **51 pastes** of a block generated exactly once. Across the whole
+  100-minute outage the operator channel carried **113 pastes conveying two
+  generator edges**; post-change the same outage delivers **5**
+  (1 escalation + 3 restatements with live `held_s` + 1 recovery, under the
+  measured ~602 s poll cadence — 4 if the last restatement is edged out by
+  drift, which it nearly is).
+
+  **The frozen value is the diagnosis, and it points away from the obvious
+  suspect.** `_graphql_note_failure` is already edge-triggered and worked
+  perfectly throughout — `announced=` never moved off its 10:45:41 value, which
+  is precisely why `held_s` never advanced. So the filed remedy ("honour
+  `announced` on the emit path") described a contract that was already
+  honoured, and a generator-side fix had nothing to fix. The same is true of
+  the siblings: `graphql-backoff` keys a sentinel on (surface, armed),
+  `rate-limit` on (surface, reset), and `ingest-recovered` deletes its state
+  file as it emits. All four generators are edge-triggered; all four storm.
+
+  **The defect is delivery.** `_compose_gh_now` `cat`s
+  `<stage>/github_poll.out` without consuming it, and `github_poll` refreshes
+  that file only every 600 s, so every `comment_surface` fire (15 s base, 5 s
+  under the nudge override) re-reads the same bytes. That replay is *correct*
+  for comments, which the pipeline damps — but every hop of
+  `_gh_filter_dedup_pipeline` dispatches on the recognised emit-header shapes
+  `^(issue|pr|pr_review|issue_new|mention|cross_repo)=` and takes its DEFAULT
+  ARM on anything else, so an alert was forwarded by all eight. (The predicate
+  is the default arm, **not** id-keying: only the five damping hops key on
+  `id=<N>`; `_filter_to_user_author` keys on `author=`, `_filter_skip_marker`
+  on body content, `_filter_cross_repo_surface` on the mention shapes, and all
+  three would have forwarded an alert that DID carry an id.) So it passed, and
+  `_v2_task_comment_surface` pastes unconditionally (its dedup gate is
+  deliberately bypassed for comment-bearing bodies). Nothing in the chain could
+  express an alert. The storm ended only when the 600 s tick happened to
+  replace the staged bytes with an empty file — an external event, not a
+  damper. `compose_emit` saw the same content and *did* suppress it
+  (`emit-dedup: suppressed identical-hash emit`); only the comment path had no
+  gate.
+
+  `_filter_alert_cooldown` (hop 8) supplies the identity the pipeline was
+  missing, keyed on the alert's actual state-machine subject — its **surface** —
+  rather than on a comment id it will never have. A **kind** change passes
+  immediately, so a recovery is never swallowed by the hold its own degraded
+  alert took out (an `ingest-recovered` lost that way is strictly worse than
+  the storm: the operator cannot then distinguish "recovered" from "watcher
+  died"). Changed **content** passes immediately, so a re-nag at a new
+  `held_s` is never delayed. Otherwise the block is held for
+  `MONITOR_ALERT_EMIT_COOLDOWN_SECONDS` — default **900**, a bound set by the
+  600 s staging window rather than by taste: below it, one staged generation
+  still lands twice.
+
+  **Coverage boundary, stated exactly.** This closes the replay of a staged
+  alert through `_gh_filter_dedup_pipeline`, which is the path all four current
+  alert kinds take, and it is keyed on the `watcher_alert=` shape rather than
+  on any one kind — so a future alert joins the damper by construction. It does
+  NOT give the operator a lever to mute a specific alert by hand:
+  `ng suppress-emit` still accepts only `comment:<id>`, and the `signature:`
+  prefix `_filter_suppression`'s header reserves is still unimplemented
+  (`#966` item 2's residual). It also does not touch the GraphQL-only ingest
+  path, so an outage still degrades comment freshness — it is merely quiet
+  about it now.
+
+  The fixture was written FIRST and witnessed the storm (6 fires → 6 emits;
+  siblings 4 → 4) before the fix existed, and it carries a negative control
+  that reproduces `#966` on demand by setting the knob to `0`. Removing the
+  pipeline hop re-fails it, so the wiring is load-bearing and not merely the
+  function. Extended `test-comment-surface.sh`, whose case (4) already owned
+  the cooldown-exclusivity contract alert blocks were escaping.
+
+- **…and the silent half of the same outage: a still-degraded surface restated
+  only once an hour.** `monitor.graphql.degraded_remind_seconds` (
+  `MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS`) default **3600 → 900**.
+
+  The storm and this are two halves of one incident, and fixing only the first
+  makes the second worse. Measured 2026-08-17: the escalation announced at
+  10:45:41, the emit stream stormed until ~10:56, then went quiet for the rest
+  of the hour while `issue_comments` kept failing — `count` 5 → 8 by 11:15:40,
+  zero recoveries. **Silence is not neutral here**: a real recovery *does* emit
+  `ingest-recovered`, so an operator reading quiet as resolution is reading the
+  design correctly and being misled. Across one outage the channel was
+  unreadable while storming and misleading once quiet.
+
+  **This is a period change, not a new mechanism** — and that distinction is
+  the finding. `announced=` + the remind window is a working re-nag; the
+  25-minute observation that prompted this sat *inside* the 3600 s default
+  rather than outside a broken feature, so "it goes silent" was measuring the
+  interval, not an absence. Worth stating because the remedy that follows from
+  "no restatement exists" (make escalation purely edge-triggered, mirroring
+  `_graphql_note_success`) would have **deleted** the restatement and made the
+  silent half permanent.
+
+  900 is bounded on both sides. Below 600 buys nothing: `_graphql_note_failure`
+  is only called from the `github_poll` path, so the effective period is the
+  window rounded UP to a multiple of the 600 s poll — 900 restates every second
+  poll (~20 min), not every 15. Above ~1800 a restatement stops reading as a
+  heartbeat and starts reading as a new incident.
+
+  Each restatement recomputes `held_s` from `first`, so it carries a **live**
+  age rather than the frozen `held_s=2403` the storm repeated — a heartbeat
+  that repeats a stale number is just a slower storm, so the fixture asserts
+  the values are distinct AND strictly increasing, behind an explicit vacuity
+  guard (with one emitted block those two assertions are 1-of-1 unique and
+  trivially sorted — they would pass while witnessing nothing, and that is the
+  default state of the code they guard).
+
+  The two halves compose, and the conjunction is what an operator experiences:
+  `test-comment-surface.sh` (5c) drives a whole simulated outage through the
+  real generator and the real pipeline on one shimmed clock, and asserts the
+  stream carries **exactly one delivery per generator EDGE** — escalate,
+  restate, recover — across eleven pipeline re-reads. Reverting the default to
+  3600 re-fails it, so the change is load-bearing in both suites.
+
+### Added
+
+- **`test-knob-default-agrees.sh` — a knob's default is spelled in five places,
+  and only one of them is the one production reads.** `_config.sh` sets AND
+  EXPORTS every `MONITOR_*` knob at startup, so the `${MONITOR_…:-N}` fallback
+  in the consuming function is unreachable under the running watcher — while
+  being exactly the branch a unit test takes, because suites source the consumer
+  directly and never load `_config.sh`. The two can diverge with the suite
+  staying green, in the direction that matters: the tests move and production
+  does not.
+
+  Both instances came from <your-org>/nexus-code#966 itself. The first
+  (`MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS`) was caught by hand and prompted a
+  knob-SPECIFIC guard. The fix's own new knob
+  (`MONITOR_ALERT_EMIT_COOLDOWN_SECONDS`) then re-instantiated the hazard, and
+  that guard could not see it — **a fix re-instantiating the defect class it
+  closes, and a guard too narrow to notice**. Demonstrated as a surviving
+  mutant: mutating the PRODUCTION default 900 → 1800 produced **0 failures**
+  across three suites, while mutating the DEAD copy 900 → 0 produced **9**.
+
+  So the guard is table-driven over knobs — the only version that could have
+  caught the second instance — holding five spellings together per knob
+  (config-lookup default, config validation fallback, the consumer's
+  `${…:-N}`, the consumer's own validation fallback, and the docstring naming a
+  number). Adding a knob is one row. It asserts AGREEMENT, never a value:
+  pinning the number would add a sixth place to forget.
+
+  Two vacuity traps surfaced inside the guard while writing it, both caught by
+  its own non-vacuity assertions rather than by inspection — the `_config.sh`
+  validation fallback is written `[[ … ]] || VAR=N` so a line-start anchor
+  extracted nothing, and the agreement check used `sort -u | grep -c .`, which
+  DROPS an empty value and so passed on four spellings while never reading the
+  fifth. A guard that cannot distinguish agreement from absence reads as
+  coverage while providing none.
+
+  Not a substitute for the class remedy: only knobs somebody enrols are
+  covered. A lint over every `${MONITOR_*:-…}` whose variable is also assigned
+  in `_config.sh` needs no enrolment step and remains the right end state.
+
+### Fixed
+
+- **The footgun guard was registered on `Bash` alone, and a matched-but-seen
+  rule ended the whole hook.** Two independent reachability defects in
+  `bash-footgun-guard.sh`, found while auditing a 5h20m self-matching wait-loop
+  wedge (`#927`).
+  (1) `Monitor` carries `.tool_input.command` into the same shell as `Bash`,
+  so every rule in the conf was reachable through an unguarded path —
+  measured: the byte-identical command warned via `Bash` and was silent via
+  `Monitor`. Worse, the conf's own `foreground-sleep` row *sends workers to
+  `Monitor` by name* to wait on async work, which is precisely where the
+  wedging shape is written; 67 windows had received that advice. The guard is
+  now registered `Bash|Monitor` and gates on a tool allowlist. `PreToolUse`
+  does fire for `Monitor` (`tool_name=Monitor`) — verified against the real
+  binary, not assumed.
+  (2) `already_seen "$tag" && exit 0` left the entire hook rather than the row,
+  so the first already-seen match disarmed every later rule for that command —
+  including the three in-code checks, which sit after the conf loop and were
+  the most exposed. 207 of 421 live windows carried two or more sentinels, i.e.
+  were already in that muted regime. A seen tag now skips its row and the scan
+  continues. The noise budget is unchanged: still at most ONE reminder per
+  command, since a wall of reminders is how a guard gets switched off — the fix
+  changes which one you get from *none* to *the first you have not seen*.
+  `block` severity now outranks row order so a severe rule added late in the
+  conf cannot be pre-empted by an advisory above it.
+  Not fixed here, same shape, filed separately: `gh-write-guard.sh:38` and
+  `async-launch-detect.sh:86` are also `Bash`-only, and `Monitor`'s own
+  documentation demonstrates `gh api` poll loops. The latter is `#936` rather
+  than folded in, because it feeds `external_waits` → `idle-orphan-async`,
+  which is on the kill allowlist (`_BK_KILL_OK_STATES`) — widening it changes
+  retirement AUTHORIZATION, not just detection.
+
+  **On the incident that prompted this, since the naive reading is wrong in
+  both directions.** The miss had TWO causes, and separating them needs the
+  DEPLOYED tree rather than the commit graph:
+  - `procmatch-wait` did not exist in the deployed tree. The wedge launched
+    06:58:09 with `3a5d2d9` checked out (`procmatch-wait=0`); the rule first
+    deployed at 08:12:37 (`79fabfd`) — a margin of **1h14m**. `3bbcfc0` was
+    *authored* 2026-08-09 and merged with *committer* date 2026-08-14 07:36;
+    neither dates when it could first fire. **Deployment is the axis**, and
+    it has to be measured by walking EVERY reflog entry across the window —
+    a sampled subset can only ever report the transition at its own last
+    sampled ref, which is a probe whose shape guarantees its answer.
+  - `pkill-self` DID exist and FAILED TO MATCH. The deployed row was
+    `\bpgrep[[:space:]]+-[a-zA-Z]*f`, requiring `-…f` immediately after the
+    command, so `pgrep -u "$USER" -f …` was silent. `3bbcfc0` closed that gap
+    too, as its subject says; all four flag orders now warn.
+
+  So the accurate statement is "no deployed rule **matched**", not "no rule
+  addressed this" — the guard came closer than the absence alone suggests.
+
+- **A registry healthcheck could report `healthy` forever with nothing running**
+  (`#891`). `bash -c "$health"` puts the entire health string — pattern included
+  — into a process's argv, so a `pgrep -f` healthcheck matches ITSELF. The
+  failure direction is what makes it worse than its siblings: it is a **boolean
+  that is always true**, so the supervisor never restarts the dead service and
+  nothing logs a fault. `#869` (kill-side ownership) and `#871` (the wait-side
+  hook guard) both miss it, being neither a kill nor a wait.
+  **The safe set is narrower than the issue stated.** bash only sheds the string
+  by EXEC'ing, and it only execs a BARE simple command — measured on bash
+  4.4.20, nothing running, rc=1 correct: `pgrep -f M` → 1, but
+  `pgrep -f M >/dev/null` → **0**, `… 2>/dev/null` → **0**, `… && true` → 0,
+  `( … )` → 0, `exec pgrep -f M` → 1. A redirection is idiomatic in a
+  healthcheck, so "keep it simple" was never a usable rule. Both sites now feed
+  the script over a pipe (`bash <(printf '%s' "$health")`), so the argv carries
+  no pattern under any shape; process substitution writes nothing to disk, which
+  a temp-file variant would — and that would fail closed under the read-only-FS
+  degraded mode (`#473`), restarting working services exactly when the tree can
+  least cope.
+  **TWO sites, not one.** `#891` names `bootstrap-recover.sh:358`;
+  `monitor/watcher/_service_health.sh:287` carries a deliberate inline replica
+  and is the consequential one — it runs every ~120s and drives auto-restart.
+  Both fixed and both exercised. Live registry audited: 9 of 9 services use bare
+  simple health strings, so this was **latent, not silencing** anything today.
+  Declared out of scope, with controls proving each is a different mechanism:
+  status masking (`cmd ; true`, `cmd | head` return the last stage's status —
+  `false | head -1` is rc 0 with no process predicate at all) and
+  `ps … | grep P` (the self-match is grep's argv inside ps's OUTPUT, guarded at
+  authorship by `procmatch-self`).
+
+### Added
+
+- **tmux server lethality is now guarded in the SESSION, not only linted in the
+  corpus** (`#889`). `bash-footgun-guard` had no tmux pattern at all: the board
+  could be ended by a command no guard inspected.
+  `monitor/cc-harness/lint-no-tmux-server-kill.sh` scans FILES; nothing read the
+  live command a worker was about to run. Four rows, classification aligned with
+  that lint's scanner so the two can be diffed: `kill-server` with no `-L`/`-S`
+  on the same command, and `kill-session`/`kill-window`/`kill-pane` with no
+  `-t`.
+  **Placed FIRST in the conf and asserted there**, behaviourally and textually.
+  Rows are first-match-wins, so position IS priority, and this is the only
+  footgun in the file whose consequence is unrecoverable from inside the sandbox
+  (`bwrap` is PID 1 running tmux under `--die-with-parent`). On 2026-08-09 the
+  server died and took the watcher, all 17 worker windows, the services window
+  and the operator's own session.
+  **THE 08-09 CAUSE REMAINS UNATTRIBUTED** — the watcher died mid-write, its log
+  ends cleanly at 19:58:11 with no cause recorded, and no worker transcript
+  contains a kill verb. These rows guard a CLASS; the messages say so, and an
+  assertion pins that they do not imply a known mechanism.
+  The premise behind the untargeted rows was verified once out of band on a
+  private `-S` socket asserted unequal to the board's: an untargeted
+  `kill-window` on the last window of the last session leaves "no server
+  running", while a targeted kill with a second window present does not. The
+  shipped suite hands STRINGS to the guard and never invokes tmux.
+  Seven legitimate forms are pinned as controls (`list-windows`, an alias to a
+  non-kill, `kill-window -t a:2`, `kill-window -a -t a:1`, a targeted kill
+  chained with `new-window`, `display-message -p`, `kill-session -t <absent>`)
+  plus the prescribed pinned-private-server idiom, because a guard that flags
+  correct window management on a 19-window board is suppressed by the first
+  person under time pressure — which removes the only protection against an
+  unrecoverable event.
+
+- **`ng wrap-up` could publish NOTHING and still exit `0`, when the report had
+  genuinely changed** (<your-org>/nexus-code#862). Two conventions, each correct,
+  jointly silent: reports are **append-only**, and the link comment is composed
+  from `## Summary` alone. So a superseding verdict written where the convention
+  says to write it — appended further down — leaves the composed body
+  byte-identical. `wrap-up` re-pointed the asset link, printed
+  `unchanged … nothing to publish` (literally true), and returned `0`. The
+  report moved, the thread did not, and nobody was told; the only artefact was
+  an absence.
+
+  `#656` had already closed the adjacent case where `## Summary` *itself*
+  changed — that now edits the comment in place. This is the residue the
+  append-only convention actively produces.
+
+  The fix is a **discrimination**, not a new warning. `upload-asset.sh` pins the
+  existing asset head for byte-identical reports and commits otherwise, so the
+  asset URL moves **iff** the report did:
+
+  | asset moved | meaning | behaviour |
+  |---|---|---|
+  | no | honest idempotent retry | quiet, **exit 0** — `unchanged` |
+  | yes | report changed, composed body did not | `NOTHING PUBLISHED`, **exit 3** |
+
+  Exit `3` is distinct from `1` so a caller can tell *"a step failed, retry it"*
+  from *"nothing failed, nothing published, go and say it yourself"* — re-running
+  this one unchanged reproduces it exactly. The stderr block names the
+  append-only collision as the cause and gives three ways out. The action log
+  records `comment=nothing-published`, so the distinction survives into what the
+  orchestrator reads rather than living only on stdout.
+
+  `test-ng-wrap-up.sh` previously **asserted the defect** — its own comment said
+  *"the report gets materially corrected"* while requiring exit `0` and the word
+  `unchanged`. It now asserts the corrected contract, alongside the pre-existing
+  honest-retry control (same mock sha ⇒ still quiet, still `0`), so the pair
+  discriminates rather than merely passing.
+
+- **The merge-ref base check could report `current` from a round whose tests
+  never ran, and a `current` verdict never said when it expired.** `#837`
+  shipped `_merge_ref_base` with a named limit — *"if two runs at one head
+  tested DIFFERENT bases, this reports the first one it finds"* — resolved in
+  the DEFAULT-UNSAFE direction. Three separately-measured facts compose into a
+  silent false clear: `actions/runs?head_sha=` returns **newest-first**, so
+  "the first one it finds" is systematically the FRESHEST base;
+  `conclusion=="success"` does **not** identify the run that supplied the
+  verdict (`ci-signal` and `conflict-markers` fire unconditionally and DO print
+  the checkout line); and later rounds routinely have `tests` **skipped** while
+  a cheap workflow succeeds. So the check could read its base from a round whose
+  suite never executed and report `Merge-ref base: VERIFIED`.
+  The fix **stops picking**: every selected run is read, and a disagreement is
+  its own fail-closed verdict (`divergent`, `ng ci-attempts` rc **10**) rather
+  than a silent preference for the freshest. Identifying "the verdict run" is
+  deliberately not attempted — it is not determinable from run metadata, which
+  is how the gap arose; agreement makes the question moot and disagreement is
+  reported, not resolved. The caller's gate changed from a **denylist**
+  (`[[ $_MRB_STATE == stale ]]`, permissive default arm — under which
+  `divergent` would have cleared the head while printing `NOT CHECKED`) to an
+  **allowlist with a default-DENY arm** owned by the library
+  (`_mrb_clearance_disposition`), so the next state added is fail-closed by
+  construction.
+  **The first cut of that fix contained the defect it was fixing**, found by an
+  independent review pass and fixed here: "every selected run" was still a
+  NEWEST-FIRST WINDOW OF EIGHT. On this PR's own head that window admitted eight
+  cheap runs and excluded **both** runs that executed tests — `#882` verbatim,
+  reachable by editing a PR description four times. Both caps (runs and jobs) are
+  gone; a genuinely truncated API page (`total_count > 100`) reports `unread`,
+  because a population nobody enumerated cannot support "they all agree". Every
+  count now carries its **denominator** (`N of M`) — the first cut printed
+  `8 successful run(s) read` where 8 was the CAP, and a bare count reads as
+  completeness.
+  Separately, a `current` verdict is **point-in-time** and nothing re-checked it
+  between the verdict and the merge. Measured against ground truth — the base
+  each run checked out versus the FIRST PARENT of the merge commit that landed —
+  over **every** merge into `dev` in
+  `[2026-08-10T00:47:22Z, 2026-08-14T17:18:41Z]` — from the merge that introduced
+  the check to the last merge before CI failed repo-wide, measured
+  `2026-08-14T18:53:54Z` against `dev` `e256d4a9865`: **5 of 17 (29%) landed on a
+  base their green never tested** (`#870`, `#871`, `#890`, `#869`, `#899`).
+  Windows of 5m00s, 8m10s, 19s, 15m42s and **4s**; every one a clean merge with
+  no conflict and no red. (17 excludes `#837`, which introduced the check and so
+  could not be gated by it; including it, 5 of 18. The range is stated because a
+  rate without one cannot be checked or extended — three successively wider
+  populations gave 1/6, 4/15 and 5/17, each larger than the last.) `ci-attempts` now prints the
+  base sha **in full** beside the clearance with an explicit expiry sentence, so
+  a caller can COMPARE rather than remember. `ng pr merge` grows two opt-in
+  guards: `--base-sha <verified-base>`, and — because a **19-second** window is
+  not something an agent can be instructed around — `--verify-base`, which runs
+  the base check inside the merge verb milliseconds before the PUT, so there is
+  no sha to carry and no interval to lose. Opt-in
+  deliberately: a base check firing on every merge would block the board every
+  time `dev` moved during a review, and a gate that always fires is a gate
+  somebody disables. Both suites were ALSO blind to the layer the selection lives in: their stubs
+  never evaluated `--jq`, so restoring `.[0:8]` *in the jq expression* left every
+  assertion green — the fix was correct and completely unguarded. The merge-ref
+  stubs in **`test-merge-ref-base.sh` and `test-ci-head-attempts.sh`** now serve
+  GitHub-shaped JSON through **real `jq` with the real expression the library
+  passed**, and that mutation is red in both. Counts DERIVED from the mutation
+  harness rather than transcribed — restoring `.[0:8]` to the run-selection jq at
+  `dff4873`, anchor verified to match exactly once and the tree verified clean
+  before and after (`<your-org>/nexus-code#938`):
+
+  ```
+  clean    test-merge-ref-base.sh     59 passed, 0 failed
+           test-ci-head-attempts.sh   ALL TESTS PASSED (50)
+  mutant   test-merge-ref-base.sh     56 passed, 3 failed
+           test-ci-head-attempts.sh   49 passed, 1 FAILED   <- witness: "878 boundary fixture"
+  ```
+
+  The caller suite fails on ONE named assertion, not two — and the earlier figure
+  in this entry (`3 and 2 … 54/0 and 48/48`) was stale in three places at once.
+  That is worth stating rather than silently overwriting: this entry describes a
+  guard whose claim outran its measurement, and a hand-copied count in its own
+  CHANGELOG is the same defect one layer out. Two residuals closed with it: the **jobs** page
+  is bounded at 100 exactly as the runs page is (a truncated job list is now
+  named, with its count, rather than absorbed into a bare shortfall — and a
+  fixture now puts a checkout line in the **8th** job, so the job-side slice is
+  load-bearing rather than merely absent), and a
+  **non-numeric** `total_count` — what jq emits for an absent field — was
+  **fatal**, not silent: under `set -u` (which `ci-head-attempts.sh` sets),
+  `(( total_count > 100 ))` on `null` is `bash: null: unbound variable`, rc 127,
+  measured on bash 4.4.20; without `set -u`, and under zsh 5.4.2 with it, the
+  same expression returns rc 1 and passes silently. A crash on the live path, a
+  silent pass elsewhere, a verdict in neither.
+  Also: **all 75 value-taking flag arms in `monitor/ng` itself** now refuse a
+  missing value instead of spinning the parse loop forever — `shift 2` with one
+  positional left FAILS without shifting, reproduced in isolation at 2000+
+  iterations with `$1` unchanged — guarded as a CLASS with a source lint (plus a
+  planted-regression control, since a lint that matches nothing passes forever)
+  rather than at the two arms a reviewer happened to name.
+
+  **The first cut of that guard checked a PROXY, and its own suite said so for a
+  day before anything read it.** `[[ -n "$2" ]]` answers *is the value
+  non-empty*; it was read as answering *does a value exist*. Those agree on every
+  instance anybody reported and diverge on a SUPPLIED EMPTY one — and
+  `ng log-action --note ""` is a documented, tested caller of exactly that shape
+  (`cmd_log_action` accepts it and omits the key via its `if $note != ""`
+  branch). So the sweep turned a valid call into a hard error:
+  `test-ng-log-action.sh` **26/2 on this branch, 28/0 on `dev`** — red since the
+  sweep commit, and invisible because this PR's last CI verdict predates it. A
+  gate that checks a proxy rather than the property is the defect one layer out
+  from the one this entry is about, which is why it is closed as a class here
+  rather than exempted at the one arm a suite happened to cover.
+  Neither predicate alone is correct, and each failure mode is invisible from the
+  other side: emptiness alone breaks `--note ""`; **arity alone lets `--sha ""`
+  through, and an empty pin merges UNPINNED while reading as pinned** — the
+  original S5 defect restored. `_need_val <flag> "$#" "${2:-}" [--allow-empty]`
+  now asks both. Arity reads the CALLER's `$#`, which is precisely the condition
+  under which `shift 2` succeeds, so the guard and the mechanism ask the same
+  question instead of one standing in for the other. Non-empty is ON by default;
+  `--note` is the single opt-out, spelled like the existing `bk_require_int
+  --allow-empty` convention so a loosening is a visible per-flag decision.
+  Three assertions added, each mutation-tested against a DISTINCT mutant probed
+  at parse time — arity-only (`--sha ""` no longer refused), emptiness-only
+  (`--note ""` refused), and `--note` unguarded, which **times out at rc 124**:
+  the spinning parse loop this whole class is about, reproduced directly rather
+  than described.
+
+  The numbers name **what each command counts**, because the earlier phrasings
+  did not and were narrowed three times for it — the sentence said *arms* while
+  the number counted the `_need_val` **idiom**. At `dff4873`:
+
+  ```
+  # value-taking arms in monitor/ng               73 line-start + 2 single-line `case` = 75
+  grep -cE '^[[:space:]]*(--[a-zA-Z0-9-]+\|)*--[a-zA-Z0-9-]+\).*shift 2' monitor/ng   -> 73
+  # of those, guarded by the shared helper
+  grep -c '_need_val --' monitor/ng                                                   -> 73
+  # and by an inline check (cmd_respawn's --window/--workdir, which predate the helper)
+  grep -cE '^[[:space:]]*--[a-zA-Z0-9-]+\).*\[\[ -n "\$\{2:-\}" \]\] \|\| die.*shift 2' monitor/ng -> 2
+  # unguarded
+  (arms matching neither)                                                             -> 0
+  ```
+
+  So: **75 arms, 73 via `_need_val`, 2 inline, 0 unguarded.** The earlier `68`
+  and `72` were both real measurements of narrower things — the rewrite's own
+  tally, and the helper idiom — quoted as if they described the arm population.
+  (`#911` is the standing question that keeps catching this: a number is only as
+  wide as the command under it.)
+  The 75th arm is the argument for guarding a class rather than a list, and it
+  arrived from OUTSIDE this branch: `--not-a-skeptic-verdict` (`#879`) landed on
+  `dev` while this PR was open, unguarded, in the middle of the arm block this
+  branch had just closed — a defect neither side contains, manufactured by the
+  merge seam. Its author could not have seen the lint; the lint is precisely what
+  sees it. Resolved with `_need_val` at the rebase; the class lint's planted-arm
+  control was re-run against this tree to confirm it would have failed had it not
+  been.
+  **SCOPE, stated because the method is a single-file grep and the verb surface
+  is larger:** this covers the arms parsed inside `monitor/ng`. `ng` DELEGATES
+  many verbs to scripts under `monitor/`, which parse their own flags and are
+  NOT covered. Measured over the `_facade` targets `ng` actually delegates to
+  (14 scripts; `grep -oE '_facade [a-z0-9_.-]+\.(sh|py)' monitor/ng | sort -u`),
+  at `dff4873`: **37 value-taking arms not using `_need_val`, across 8 of them** — `pane-state.sh`
+  16, `paste-followup.sh` 7, `retire-preflight.sh` 5, `guards-for-diff.sh` 3,
+  `lit.sh` 3, and one each in `ci-head-attempts.sh`, `reports-roll.sh`,
+  `user-pat.sh`. **The predicate is "does not use `_need_val`", NOT "hangs"** —
+  those are different populations and only the first is what the command counts.
+  Two spin TODAY: `ng guards-for-diff --base` and `ng ci-attempts --repo`, both
+  timed out at 12s by exactly the mechanism above; others refuse by other means
+  (`retire-preflight.sh` guards all five of its arms with `shift 2 || usage`;
+  `paste-followup.sh` uses neither idiom and still refuses at rc 1, measured).
+  Naming the predicate rather than its consequence, because "unguarded" read as
+  "will hang" and that is the same one-notch widening this paragraph exists to
+  legislate against — the last instance of it, inside the paragraph that names
+  it.
+  (An earlier draft of this paragraph said *103 across 24 files*. That was
+  measured with the pathspec `git ls-files "monitor/*.sh"`, which matches
+  **464** files because git's `*` crosses `/` — **339 of them the test suite
+  under `monitor/watcher/`**. A bare unreproducible number, introduced by the
+  fix for a bare unreproducible number, in the entry about exactly that.) **`#924` owns that remainder** and is being
+  fixed across `ng` and its delegated scripts; it is deliberately not touched
+  here, to avoid colliding with that work.
+  The overclaim was caught *because* the method was named beside the number —
+  "every value-taking flag arm in `ng`" reads as universal, and running the
+  command it cites is what showed it measures one file. A bare `72` would have
+  read as authoritative and been uncheckable, which is the argument for carrying
+  the command, demonstrated on the entry that adopted the practice; `--verify-base` reports `NOT CHECKED` rather than `OK` when
+  the base could not be read (`permit` is not `verified`); and all three flags
+  are documented in `docs/reference/ng-cli.md`, `skills/nexus.bot/SKILL.md` and
+  `monitor/agent-prompt.md` — a flag nobody can discover is a flag nobody uses.
+  Coverage — counts and the commands that produced them, because a bare number
+  cannot be rechecked (`bash <suite>`, at `dff4873`, against `dev` `e256d4a`): `test-merge-ref-base.sh` 14 → **59** assertions
+  (the suite previously had **no** case where two runs yield different bases,
+  which is why the limit went unexercised, and no case where a head carries more
+  runs than a cap admits), `test-ci-head-attempts.sh` 44 → **50**, `test-ng-pr.sh`
+  81 → **129**, `test-ng-log-action.sh` 28 → **31**; every new arm mutation-tested, including a control that restores the
+  `.[0:8]` window and confirms it clears a head whose only test runs sat at a
+  stale base.
+  Closes `<your-org>/nexus-code#878`, `#882`, `#880` (closed by hand on merge — `Closes #N` is inert on this repo).
+- **A bare `ok`/`bad`/`pass`/`fail` in a suite exited 127 counted by NOTHING, so
+  the suite reported success for a check that never ran** (`<your-org>/nexus-code#922`).
+  The mechanism to catch this already existed — `command_not_found_handle` in
+  `monitor/watcher/_test_helpers.sh`, with the `#805` ledger closing the subshell
+  hole — but its **boundary was a NAME PREFIX** (`assert_*|th_*`) while the rule
+  it states is "a missing assertion helper must fail the suite". `ok` is an
+  assertion helper by function and not by spelling, so it fell through to the
+  default arm. A boundary drawn narrower than its mechanism, which is the defect
+  class the file exists to catch.
+  Not hypothetical: the **headline assertion of `#881`** was written this way
+  during `#907`. The suite went `222 -> 251 passed, 0 failed` with the one check
+  the whole issue rested on silently absent, and the assertion-count floor could
+  not see it — a 127 leaves no trace in the verdict **or** the count.
+  **The added names are MEASURED, not guessed.** They are exactly the
+  assertion-shaped names that some helper-sourcing suite defines locally and the
+  helper does not export, which is the mechanism by which a name "looks
+  available". At `e256d4a`, across the suites that source the helper (133 at `d102a7f`; the `143` first reported was a MENTION count — see `#939` F4)
+  (`git ls-files -- 'monitor/**/*.sh' 'monitor/*.sh' | xargs grep -l
+  _test_helpers.sh | wc -l`, cross-checked by shebang enumeration at 473 shell
+  files): `pass` 14 suites, `fail` 14, `ok` 5, `bad` 4. **`pass` and `fail` are
+  nearly three times as common as the two the issue named.** None is a real
+  command on this host, so all four reach the handler.
+  A **misspelled `assert_eqq` was ALREADY caught** by the prefix — measured, not
+  assumed — so this widens the population rather than fixing the typo case.
+  The negative control is load-bearing and preserved: an absent **binary** is
+  still stock behaviour (127, no counted failure), because several suites invoke
+  absent binaries on purpose.
+  **What the runtime handler still does not catch**, stated because that is the
+  whole lesson: a helper name that is neither `assert_*`, `th_*`, nor one of the
+  four — a suite-local `expect`, `check`, `verify`. It can only fire for names
+  somebody enumerated, and at call time an unknown missing name is
+  indistinguishable from a deliberately-absent binary.
+
+- **`make_gh_stub`'s generated stub read stdin to EOF on a GET with no piped
+  body, hanging whenever the SUITE's own stdin was an open pipe**
+  (`<your-org>/nexus-code#921`). The stub keyed on `[ -t 0 ]` — "stdin is not a
+  terminal, therefore a body is coming" — which is a **proxy, and the wrong
+  one**. Whether a suite hung depended on how the suite itself was invoked, so
+  it presented as an intermittent flake that reads as "the runner was loaded".
+  It cost ~40 minutes on `#900`, where a source mutation was the obvious suspect
+  and was innocent.
+  Fixed on the axis the mechanism varies on: **the verb decides**. Real `gh`
+  reads stdin for `--input -` and nothing else, so the stub does too;
+  `--input <file>` reads that file; every other invocation does not touch stdin
+  and therefore cannot block on it. `--input` is split out of the `-H|-f` argv
+  group and `-F` is now consumed (it was unhandled).
+  **One deliberate, measured behaviour change:** a body piped *without*
+  `--input` is no longer drained, so the writer sees SIGPIPE exactly as it would
+  against real `gh`. The old stub drained unconditionally to prevent that.
+  Reachability was measured before the trade was accepted — at `e256d4a` no
+  production `ng` call site and none of the 10 `make_gh_stub` suites pipes a body
+  without `--input` — and the behaviour is **pinned by an assertion**, so a
+  future change re-examines the trade instead of meeting a mystery 141.
+
+### Fixed (round 2 — `sk939` review of `#939`)
+
+- **The `#922` sentinel was a pid-keyed file in the shared `/tmp`, and `#939`'s
+  own new suite manufactured 7 of them per run** (`#939` F1, blocking). The
+  sentinel is created by `command_not_found_handle` and removed only by
+  `th_summary_and_exit`, so any process that trips the handler without
+  summarising leaks one — and the new suite trips it deliberately, in `bash -c`
+  children that never summarise. **67 had accumulated in `/tmp`.** With
+  `pid_max` 36864 on this host, a leftover turns a later, *wholly clean* suite
+  RED when the number comes round, with a diagnostic pointing at FAIL lines that
+  were never printed. That is precisely the trade this PR elsewhere argues is
+  the worse one — a harness that fails legitimate suites gets disabled — landing
+  in the file 133 suites source.
+  Three fixes, because cleanup alone only narrows the window: the 67 were
+  **deleted** (ownership established by uid, exact pattern, dead pid, and an
+  mtime window matching the authoring session — one had to be re-checked because
+  its pid churned *between two checks*, which is the hazard in miniature); the
+  suite now scopes `TMPDIR` for its children into `$WORK`, so their state lands
+  where the existing EXIT trap already removes it (**not** a second trap — bash
+  keeps one per shell and 121 of these suites own theirs); and the key is now
+  **pid + process start time**, which cannot be reused, so a leak that does
+  happen is litter rather than a landmine.
+  The summary diagnostic no longer promises "see the FAIL lines above" — a
+  message that sends a reader hunting for output that does not exist makes them
+  doubt their own eyes rather than the harness.
+
+- **The lint's implemented boundary was narrower than the one its header
+  stated** (`#939` F2) — `#922`'s own defect reproduced inside its fix. The
+  call-site regex required a first argument starting with a quote, `$`, or
+  alphanumeric, so `ck -v "x"` and `ck /tmp/x` were missed *at line start, in
+  command position*: inside the stated rule, outside the implementation. 2 of 7
+  shapes caught. Flag-first and path-first are now matched (4 of 7). A **bare**
+  call at end-of-line is deliberately still not, and the reason is measured
+  rather than assumed: adding it flagged four sites in `test-remote-service.sh`,
+  all of them Python's `pass` statement inside `python3 -c "…"` blocks, which
+  heredoc-stripping does not reach. The residue is named in the header.
+
+- **The lint claimed test coverage it did not have** (`#939` F3). A comment said
+  the REFUSE arms were "exercised by the unit checks below"; **zero** assertions
+  asserted rc 2. In a PR about checks that never ran being reported as checks
+  that passed, that is the same defect at the documentation layer. The arms are
+  now driven — a stub `git` makes the enumeration come back empty — with a
+  negative control proving the same invocation is clean without the stub, and an
+  assertion that a refusal (2) is not reported as a finding (1).
+
+- **`143` was a MENTION count, not a SOURCE count** (`#939` F4).
+  `grep -l '_test_helpers.sh'` matches comments and lint patterns too. The real
+  population is **133 sourcing of 145 mentioning** at `d102a7f`; the 12 extras
+  include `test-cc-auto-update.sh`, which states that it does *not* source the
+  helper. The lint used the mention set and then treated the helper's exports as
+  reachable in all of it — a soundness hole the population claim concealed.
+  Detection now requires an actual source operator, allowing `&&`-chained and
+  variable-indirect forms and paths containing spaces
+  (`. "$(dirname "${BASH_SOURCE[0]}")/_test_helpers.sh"` — a naive
+  `[^[:space:]]*` path pattern under-counted 133 as 102). Every "143" in the
+  code, tests and docs is corrected.
+
+- **`#921` keyed on one SPELLING of the verb rather than the verb** (`#939` F5).
+  `--input=-` is standard cobra syntax that real `gh` honours, and this repo
+  already knows it (`monitor/gh-shim.sh` enumerates `--input|--input=*`). The
+  stub matched only the space-separated token, so the attached form silently
+  truncated the body capture and never read stdin — converting the old *hang*
+  class into a *wrong-answer* class. Latent, not live: no current caller uses it.
+
+### Added
+
+- **`monitor/watcher/undefined-helper-lint.sh`** — the static half of `#922`,
+  covering the general case the runtime handler cannot. It **derives** the
+  cross-suite name population from the corpus instead of from a list: any name
+  some helper-sourcing suite defines as a function, that the helper does not
+  export, is a name that "looks available" from anywhere else.
+  Clean at `d102a7f`: **133** suites, 457 cross-suite names, 9 real commands
+  excluded, 38 exports, **0 offences** — an empty findings list, and a real
+  answer: this is a recurrence guard, not a repair, because no suite currently
+  carries the defect.
+  **The false-positive work is the substance.** The first draft produced ~130
+  false positives against that zero-offence corpus, which would have got the
+  lint disabled by the first person under time pressure — removing it entirely.
+  Four exclusions, each traced to a measured cause: real commands on PATH
+  (`timeout` is a shim function in 7 suites, so every legitimate `timeout` call
+  was flagged); sourced libraries resolved by **basename** (`wait_for` lives in
+  `test-integration/_harness.sh`, reached through an unexpandable
+  `"$_test_dir/..."`); heredoc bodies, stripped with the helper's own
+  `th_strip_heredocs` rather than a second regex; and functions pulled in by
+  extraction (`source <(sed -n '/^name() {/,/^}/p' …)`), which no path resolver
+  can follow.
+  Fails **loud** rather than clean when it cannot look (`#906` B): exit 2 REFUSED
+  if the suite enumeration, the export parse, or the candidate derivation comes
+  back empty. A checker that silently finds nothing is the same defect it hunts.
 
 
 - **`run-tests.sh` could print a `FAIL`, report `0 failed`, and exit `0` — and
@@ -104,6 +2018,70 @@ for the current release convention.
   condition against the pane only that condition rejects. It also gave the six
   `working-background-*` fixtures a prefix arm — they had none, so the loop
   silently SKIPped them and six committed captures were asserting nothing.
+
+- **`--not-a-skeptic-verdict` cleared the opting-out window's OWN
+  skeptic-pending marker, letting a window discharge a verdict it genuinely
+  owed** (`<your-org>/nexus-code#879` F1, found by the post-hoc skeptic on `#907`).
+  The opt-out falls through to the producer path, and three producer branches
+  `rm -f "$pending_dir/${sw_safe}"` — `denied-spawn` (spawn mode `deny`),
+  `denied-auto` (`--skeptic-decision deny`) and the operator waive. `sw_safe` is
+  the opting-out window itself, so a window whose marker was seeded when a
+  depth-2 skeptic was spawned against it could clear that obligation by
+  declaring "this wrap-up is not a verdict", and `retire-preflight.sh` flipped
+  `safe=0` to `safe=1`.
+  **Strictly worse than the defect `#879` fixed:** it converts a *forced false
+  verdict*, which is visible in the record, into a *silent absent* one, which is
+  not — and it lands in the gate every retirement decision is made from.
+  The verb, `monitor/README.md` **and** `skills/nexus.skeptic/SKILL.md` all
+  stated that no skeptic marker is cleared, so three documents asserted the
+  opposite of the code. **The code moved to meet the documents**, because the
+  documented behaviour is the correct one: an opt-out is a statement about *this
+  hand-off*, not a release of a *pending obligation*. All three removals now go
+  through one `_sk_keep_own_marker` helper — centralised rather than inlined
+  three times, since the bug *was* three sites and a guard that must be repeated
+  is a guard that gets missed on the fourth — which suppresses the removal under
+  the opt-out and prints `SKEPTIC MARKER KEPT`. The waive is guarded too: the
+  promise as written is unconditional, and the error directions are asymmetric —
+  a marker wrongly kept is a blocked retirement the operator can see, a marker
+  wrongly cleared is a silent false release. Controls assert an ordinary
+  spawn-deny and auto-deny still clear the marker, so the guard cannot become a
+  board-wide retirement block.
+  The original test could not have caught this: it asserted the *stamped
+  target's* marker under `mode=require` — the one producer branch that writes a
+  marker rather than clearing one. Wrong axis, wrong mode.
+
+- **The orchestrator-facing `recommendation:` line claimed "derived from a
+  findings COUNT" on the producer path, where no count exists** (`#879` F2). The
+  `#881` fix taught that line not to describe an absence as a measurement, but
+  applied it to the role path only; the arm is reached from both. On the producer
+  path `derived` is `require` and comes from the window's **spawn mode** — no
+  count is consulted at all, so the sentence named a computation the verb does
+  not perform. Same defect one arm over: a derivation named after the wrong input
+  is no more true than an absence named as a measurement.
+
+- **`docs/reference/ng-cli.md` never learned `--not-a-skeptic-verdict`**
+  (`#879` F4, `#883`'s class). Added to the synopsis and the skeptic-gate prose,
+  along with the `#881` semantics for `--skeptic-findings`.
+
+### Corrected
+
+- **The `#881` retrospective was over-claimed and is retracted in part.** It
+  reported that the historical defaulted-vs-supplied `findings` split is
+  *unrecoverable*. Scoped to the **action log** that is true and stands — 335 of
+  338 records carry a byte-identical key set. Extended to "no artefact on disk",
+  it is **false**: the reports corpus classifies roughly a quarter to a third of
+  the population, because skeptic reports often state their own count in prose
+  (`sk907`: 99/338; independent re-measurement: 82/338 — the two disagree sharply
+  on composition, 58/41 vs 76/6, so the *direction* of the split remains
+  unmeasured and should not be quoted). Retraction on `#881`, correction in the
+  `#907` PR body.
+  The instructive part is the failure mode, not the number: **"unrecoverable"
+  was the reassuring answer** — it closes a question rather than opening one, so
+  nobody re-tests it. The narrow claim was rigorous and the broad claim inherited
+  its credibility without inheriting any of its evidence. `#907`'s own report had
+  already named the reports corpus as the untested avenue and published the
+  absolute claim anyway. A negative result must be scoped to the evidence that
+  produced it, **in the sentence** rather than in a caveat further down.
 
 - **`ng wrap-up` recorded an OMITTED `--skeptic-findings` as a measured `0`,
   and fed that number to the gate that decides whether a second skeptic pass

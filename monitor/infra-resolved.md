@@ -32,8 +32,9 @@ every operator clones — where this file now lives) and the per-operator
 asset+issue repos (e.g. `<your-org>/<your-nexus>`). Rows dated
 **≤ 2026-04-28** cite **pre-migration `<your-org>/<your-nexus>`** PR
 numbers and commit hashes — and some of those commits do **not** resolve
-in `nexus-code` history (the migration did not carry full history; e.g.
-`b685ef5` is absent). Rows dated **≥ 2026-05-10** cite
+in `nexus-code` history (the migration did not carry full history —
+`b685ef5`, `3a69e67` and `8fe57a1` are all absent; verified with
+`git cat-file -e <sha>^{commit}` at `a3177ef6`). Rows dated **≥ 2026-05-10** cite
 **`<your-org>/nexus-code`** PR numbers and merge commits. Cross-repo
 references are written `owner/repo#N`.
 
@@ -75,6 +76,9 @@ cluster) were deliberately left out of Resolved.
 | 2026-06-05 | `install-claude-local.sh` `npm install` aborts with `EROFS` writing the default `$HOME/.npm` cache on read-only-`$HOME` sandbox / HPC hosts, breaking the fresh-operator bootstrap before any package fetch                                                      | closes `<your-org>/nexus-code#230`                                                                                                            | `<your-org>/nexus-code` PR #231 (`39928a4`) — exports project-local `npm_config_cache`                            |
 | 2026-06-10 | Bash-tool process-kill footguns absent from the worker floor: `pkill -f`/`pgrep -f` self-kill (the worker's full prompt rides in `claude`'s argv), and `jobs -p` empty in each fresh Bash-tool shell so `kill $(jobs -p)` no-ops and leaks busy-loops. Retires the `#236` §4 process-kill one-offs (not the `cd <clone> &&` push rule — that part of B13 is still open). | `<your-org>/<your-nexus>#236` §4 high-impact one-offs (operator-witnessed 2026-06-09)                                                          | `<your-org>/nexus-code` PR #246 (`6ae3b28`) — two floor bullets in `skills/nexus.worker-defaults`                 |
 | 2026-06-11 | After `git pull`, the running watcher / services cockpit / registered services kept executing OLD code until a manual restart                                                                  | closes `<your-org>/<your-nexus>#186`                                                                                                           | `<your-org>/nexus-code` PR #254 (`221f693`) — version-aware per-component drift detection + self-restart (default on) |
+| 2026-06-24 | `compose_emit`'s awk filter pipeline tripped gawk's invalid-multibyte decoder on byte-truncated non-ASCII comment-body previews (chronic `Invalid multibyte data detected` log noise + locale-undefined regex/token matching), coincident with a watcher-wedge → supervisor-revive incident | closes `<your-org>/nexus-code#354` | `<your-org>/nexus-code` PR #354 (`6d506129`) — `LC_ALL=C` on every body-decoding compose_emit awk + a `_run_bounded` guard so the filter pipeline cannot stall the cycle-end heartbeat |
+| 2026-06-25 | skeptic-pending markers leaked on essentially every skeptic retirement: `ng retire-preflight` returned `safe=0 (skeptic has not returned a verdict — marker live)` for skeptics + targets that had already verdicted, forcing a manual `rm monitor/.state/skeptic/pending/<name>` each time | `<your-org>/nexus-code#363` | `<your-org>/nexus-code` PR #363 (`a527c093`) — clear ALL chain markers on a verdict; re-establish the block from `spawn-worker.sh` only when a next skeptic actually spawns |
+| 2026-07-25 | Dead shell functions left behind by refactors: `_remote_enroll_marker` + `_remote_pending_token_exists` in `monitor/_remote_lib.sh`, and the test-only `_reemit_acked_live` shim in `monitor/watcher/_reemit.sh` | `nexus-usage_2026-07-24_144705_unused-parts.md` (Tier 0); skeptic verdict `<your-nexus>-usage_2026-07-24_150325_skeptic-deadcode-verdict.md`; closes `<your-org>/nexus-code#563` | `<your-org>/nexus-code` PR #565 (`0894d72d`) — all three removed; none is present at `a3177ef6` |
 
 ## In-flight (not yet merged)
 
@@ -107,47 +111,13 @@ under their old names:
 
 Newly opened, awaiting merge:
 
-- 2026-06-24 — `compose_emit` awk filter pipeline trips gawk's
-  invalid-multibyte decoder on byte-truncated non-ASCII comment-body
-  previews (chronic `Invalid multibyte data detected` log noise +
-  locale-undefined regex/token matching), coincident with a
-  watcher-wedge → supervisor-revive incident. Fixed at the source with
-  `LC_ALL=C` on every body-decoding compose_emit awk (mirrors the
-  `_reemit.sh` re-feed precedent) plus a `_run_bounded` guard so the
-  filter pipeline can never stall the cycle-end heartbeat. In-flight
-  `<operator>/compose-emit-multibyte` (`<your-org>/nexus-code#354`). Move up
-  into the Resolved table with the merge commit when it lands.
-- 2026-06-25 — skeptic-pending markers LEAKED on essentially every
-  skeptic retirement: `ng retire-preflight` returned `safe=0 (skeptic
-  has not returned a verdict — marker live)` on skeptics + targets that
-  had already verdicted, forcing a manual `rm
-  monitor/.state/skeptic/pending/<name>` each time. Root cause: `ng
-  wrap-up`'s verdict path speculatively wrote retire-blocking markers
-  (the skeptic's own + a re-assert of the original) for a merely
-  RECOMMENDED second-pass skeptic the orchestrator routinely declined,
-  with no path to clear them. Fixed by clearing ALL chain markers on the
-  verdict (a returned verdict satisfies the gate) and RE-establishing the
-  block from `spawn-worker.sh` only when an actual next skeptic is
-  spawned. In-flight `<operator>/skeptic-marker-cleanup`. Move up into the
-  Resolved table with the merge commit when it lands.
-- 2026-07-24 — **dead shell functions** left behind by refactors: two
-  provably-uncalled helpers in `monitor/_remote_lib.sh`
-  (`_remote_enroll_marker`, dead-from-birth — its `enroll-<hash>@nexus-
-  remote` marker is inlined at every call site; and
-  `_remote_pending_token_exists`, orphaned when the AuthorizedKeysCommand
-  gate was retired to a fail-closed tombstone in `2c124ec`), plus the
-  test-only `_reemit_acked_live` back-compat shim in
-  `monitor/watcher/_reemit.sh` (production caller superseded by the
-  three-way `_reemit_reaction_state` in `6417849`/`#360`). Neither remote
-  deletion touches a live security invariant; the shim's live-ack
-  behaviour is covered through the production `_reemit_gc` path.
-  Enumerated in `reports/nexus-usage_2026-07-24_144705_unused-parts.md`
-  (Tier 0) and skeptic-validated CREDIBLE-WITH-CAVEATS in
-  `reports/<your-nexus>-usage_2026-07-24_150325_skeptic-deadcode-verdict.md`.
-  In-flight `<operator>/cleanup-563-deadcode`
-  (`<your-org>/nexus-code#565`, not auto-merged — gated on operator
-  review). Move up into the Resolved table with the merge commit when it
-  lands.
+*(None at `a3177ef6`.)* The three entries that stood here — `#354`
+`<operator>/compose-emit-multibyte`, `#363` `<operator>/skeptic-marker-cleanup`
+and `#565` `<operator>/cleanup-563-deadcode` — have all merged and are now
+rows in the Resolved table above. Each was confirmed with
+`git merge-base --is-ancestor <merge-sha> HEAD` at `a3177ef6`; this is a
+per-row check, **not** a fresh reconciliation pass over the whole
+merged-PR set (the header above still records 2026-06-18 for that).
 
 **Current open backlog.** As of 2026-06-17 the authoritative
 open-infrastructure backlog is the fleet meta-review at

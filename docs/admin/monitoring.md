@@ -24,10 +24,21 @@ codes carry a coarse classification so scripts can branch:
 
 | Exit | Meaning |
 |---|---|
-| `0` | Heartbeat fresh (within poll interval). |
-| `1` | Heartbeat stale, less than 5× poll interval. |
-| `2` | Heartbeat very stale, ≥ 5× poll interval. |
+| `0` | Heartbeat fresh — age ≤ `2 × monitor.interval_seconds + 15`. |
+| `1` | Heartbeat stale — age ≤ 5× poll interval. |
+| `2` | Heartbeat older than 5× poll interval, **or** the recorded pid is no longer a live watcher and no instance lock is held. |
 | `3` | No heartbeat file present. |
+| `4` | **WEDGED** — the pid is live and the heartbeat beats, but progress *and* cycle have both stalled past the measured-period cutoff. |
+
+The boundary is inclusive at the top: at exactly 5× the interval the
+bucket is still `1`. The thresholds live in `_watcher_alive`
+(`monitor/watcher/_lib.sh`), whose bucket `ng watcher-status` returns
+verbatim; a caller may raise — never lower — the `2` cutoff by passing
+its own dead cutoff, which the watcher supervisor does so it cannot
+race the watcher's own hang-watchdog. Bucket `4` is deliberately
+distinct from `2`: a wedged watcher is not dead, and the supervisor
+(with `monitor/revive-watcher.sh`) owns it — see
+[Reference → Watcher protocol](../reference/watcher-protocol.md#liveness-signals).
 
 Humans read the stdout block; scripts branch on `$?`. Run it from a
 cron, a Slack-bot probe, or any other automation that wants a
@@ -45,7 +56,7 @@ with the env var taking precedence.
 | `watcher.lock` | PID-based lock preventing two watchers on the same state dir. Stale if its PID is gone. |
 | `watcher-target` | The tmux window the watcher pastes reports into (typically `orchestrator`). Written at watcher startup; should match the orchestrator's window. |
 | `watcher.log` | Append-only watcher activity: startup, every emit, paste-to-target outcomes, respawns. |
-| `watcher-alerts.log` | `[iso] WARN <surface> graphql_rate_limit\|graphql_failure\|empty_stderr ...`. One line per surface-level anomaly. **Empty file = healthy** on the GraphQL surfaces. |
+| `watcher-alerts.log` | `[iso] WARN <surface> graphql_rate_limit\|graphql_failure\|graphql_backoff_*\|graphql_degraded_escalated\|graphql_partial_walk ... ` (plus `[iso] ALERT ...` lines from the watcher loop itself). One line per surface-level anomaly. **Empty file = healthy** on the GraphQL surfaces. |
 | `graphql-backoff-<surface>` | Reset epoch (digits only) for a rate-limit hit on `issue_comments`, `pr_comments`, or `new_issues`. Present means the corresponding `_snapshot_<surface>` is short-circuited until `now ≥ reset + 30 s`. |
 | `graphql-alert-emitted-<surface>-<epoch>` | Flag file: the rate-limit sentinel for this `(surface, reset)` pair has been emitted once. Prevents per-poll alert storms. |
 | `action-log.jsonl` | Append-only JSONL action trace: `{ts, agent, event, ...}` per meaningful action. |
@@ -153,7 +164,7 @@ Webhook → Active toggle is off. See
 ### Cause: bot install scope is wrong
 
 If `ng preflight "$(./config/load.sh github.repo)"` returns
-`bot installed no`, the App is not installed on the asset+issue
+`bot installed: NO`, the App is not installed on the asset+issue
 repo. Re-do
 [GitHub App → Step 7](github-app.md#step-7-install-the-app-on-your-assetissue-repo).
 
@@ -245,7 +256,7 @@ Line shape: `[<iso>] WARN <surface> <classification> [details...]`.
 |---|---|---|---|
 | `graphql_rate_limit` | `issue_comments` / `pr_comments` / `new_issues` | Bot installation's GraphQL bucket exhausted. Backoff active. | Wait until `reset_iso`. Reduce active worker count if it's chronic. |
 | `graphql_failure` | (same) | Other (non-rate-limit) GraphQL error. Throttled at 1/10 min. | Investigate the bot's GraphQL availability; usually GitHub-side noise. |
-| `empty_stderr` | (same) | `gh api graphql` produced no stderr but failed. Edge case (e.g. transport-level error). Throttled. | Usually transient. |
+| `graphql_failure empty_stderr` | (same) | Not a separate classification — it is the *detail* the `graphql_failure` writer substitutes when `gh api graphql` failed but produced no stderr. Edge case (e.g. transport-level error). | Usually transient. |
 
 Empty file means the GraphQL surfaces are healthy. A line appearing
 mid-shift is the signal to investigate before silence becomes
@@ -253,20 +264,41 @@ operationally invisible.
 
 ## Heartbeat semantics in detail
 
-The watcher touches `monitor/.state/watcher-heartbeat` every poll
-cycle (every `monitor.interval_seconds`, default 60 s) with:
+**A fresh heartbeat is not liveness on its own.** Since
+nexus-code#491 the heartbeat is a *pure* liveness ticker and the
+verdict is taken over a **triple** — `watcher-heartbeat` (the process
+exists), `watcher-progress` (the loop is advancing), `watcher-cycle`
+(a full compose cycle completed, plus the measured loop period). A
+beating heartbeat over a loop that has stopped advancing is exactly
+the **WEDGED** case, not a healthy one.
+
+`monitor/.state/watcher-heartbeat` is written by a background ticker
+(`monitor.watcher.heartbeat_tick_seconds`, default 20 s, `setsid`
+outside the watcher's process group) at a **constant** cadence — not
+once per poll cycle — so no amount of loop workload can starve it.
+Its body is `key=value` lines:
 
 ```
-<PID>
-<ISO timestamp>
+pid=<PID>
+ts=<ISO timestamp>
+target=<target window>
 ```
 
-The monitor agent reads this on every wake via
-`monitor/watcher/bootstrap.sh`. If `mtime` is stale by more than
-`2 ×` the poll interval (or the file is missing), bootstrap writes
-a `reports/nexus_*_watcher-incident.md` evidence package and
-respawns the watcher via `monitor/watcher/launcher.sh`. The agent
-reads the report and decides between two paths:
+`_watcher_liveness_verdict` (`monitor/watcher/_lib.sh`, single-sourced
+for `svc.sh`, `watcher-supervise-tick.sh`, `revive-watcher.sh` and
+`ng`) renders the triple as **UP** / **BUSY** / **WEDGED** / **DOWN**.
+BUSY means alive *and* advancing but slower than nominal — healthy
+under load; **do not restart a BUSY watcher.**
+
+The monitor agent reads the same probe on every wake via
+`monitor/watcher/bootstrap.sh`. Bootstrap respawns **only on
+established death** (the `_watcher_alive` buckets 2/3 — pid gone, or
+no heartbeat at all); it explicitly refuses to touch a BUSY (bucket 1)
+or WEDGED (bucket 4) watcher, logging instead and leaving the wedged
+case to the supervisor / `revive-watcher.sh`. When it does respawn, it
+writes a `reports/nexus_*_watcher-incident.md` evidence package and
+relaunches via `monitor/watcher/launcher.sh`. The agent reads the
+report and decides between two paths:
 
 - **Benign respawn** — log via `monitor/ng log-action monitor --event watcher-respawn` and continue.
 - **Suspected bug** — spawn a `watcher-fix` worker with the

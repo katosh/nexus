@@ -99,7 +99,12 @@ jobs:
         # auto-skips when zsh is absent). ubuntu-latest ships bash + curl
         # + openssl + gh already. Same install as tests.yml.
         run: |
-          sudo apt-get update
+          # <your-org>/nexus-code#1505: drop the runner image's unused third-party apt
+          # source before updating (its index outage fails `apt-get update` at exit 100
+          # for packages this build never installs), then retry a transient index
+          # failure a bounded number of times. NOT `|| true`: that hides a real failure.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          for i in 1 2 3; do sudo apt-get update && break; [ "$i" -lt 3 ] || exit 1; sleep 15; done
           sudo apt-get install -y --no-install-recommends jq tmux zsh
 
       - name: Run the full watcher unit suite (gate deploy on green)

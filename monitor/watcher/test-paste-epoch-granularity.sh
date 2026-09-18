@@ -110,6 +110,22 @@ if [[ "$cmd" == "list-windows" ]]; then
             # the same way the code under test did.
             d="${fmt#*'#{window_id}'}"; d="${d%%'#{window_name}'*}"
             for w in ${MOCK_TMUX_WINDOWS:-}; do printf '@3%s%s\n' "$d" "$w"; done ;;
+        *window_index*)
+            # The INDEX shape (your-org/nexus-code#905).
+            # `resolve_window_key` / `resolve_window_index` ask for
+            # `#{window_index}<delim>#{window_name}`, which carries no
+            # `window_id` — without this arm it fell through to the default
+            # below and came back a BARE name with no delimiter, which the
+            # resolver rightly refused as unsplittable ("Window presence is
+            # UNKNOWN, not absent"), so the paste never happened. Answer it
+            # the way real tmux does: index, delimiter, name — one row per
+            # window, indices distinct. Delimiter EXTRACTED from the
+            # requested format, never assumed, for the reason above.
+            d="${fmt#*'#{window_index}'}"; d="${d%%'#{window_name}'*}"
+            i=0
+            for w in ${MOCK_TMUX_WINDOWS:-}; do
+                printf '%s%s%s\n' "$i" "$d" "$w"; i=$(( i + 1 ))
+            done ;;
         *)           printf '%s\n' "${MOCK_TMUX_WINDOWS:-}" ;;
     esac
     exit 0

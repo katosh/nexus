@@ -53,6 +53,84 @@ HOLD_SECONDS="${STUB_CLAUDE_HOLD_SECONDS:-30}"
 EXIT_AFTER_BUSY="${STUB_CLAUDE_EXIT_AFTER_BUSY:-0}"
 TICK_SECONDS="${STUB_CLAUDE_TICK_SECONDS:-1}"
 
+# ---------------------------------------------------------------------------
+# NON-INTERACTIVE PROBE ARMS — answer and EXIT, never fall through to the
+# REPL render + `sleep "$HOLD_SECONDS"` below.
+#
+# Everything after this block IGNORES argv, which is right for a REPL launch
+# (a prompt, `--dangerously-skip-permissions`, `--name <win>`, `--continue`)
+# and WRONG for a CAPABILITY PROBE, whose whole contract is that the process
+# prints and TERMINATES. Production probes the binary BEFORE it spawns
+# anything:
+#
+#   monitor/_claude-bin.sh:93   help_out=$("${CLAUDE_BIN}" --help 2>/dev/null)
+#     reached from monitor/watcher/_respawn.sh's `_respawn_compose_launcher`,
+#     INSIDE the disowned async respawn subshell that holds the single-flight
+#     in-flight lock, and BEFORE `tmux new-window`.
+#   monitor/cc-auto-update-apply.sh:1370, monitor/cc-restart-watchdog-loop.sh:75,
+#   monitor/cc-harness/gate.sh:163, monitor/cc-harness/demo.sh:198 — `--version`,
+#     the same shape.
+#
+# With no arm here, `--help` fell through to the idle hold and returned the
+# REPL frame after HOLD_SECONDS. Measured at 703483b5, your-org/nexus-code#1102:
+# `stub-claude.sh --help` -> rc=0, 205 bytes, 30.01 s; and inside
+# test-slow-grind-respawn.sh, `launching async respawn` at 23:13:27 ->
+# `tmux new-window failed` at 23:13:57, exactly 30 s later, with
+# `launch deferred (in flight)` logged 23x. Nothing leaked the lock — its
+# holder was blocked in this sleep. `_CLAUDE_NAME_FLAG_CACHED` lives in that
+# subshell, so every respawn re-paid it.
+#
+# TWO defects, one cause: the frame carries no `--name`, so
+# `claude_supports_name_flag` also answered NO after paying the 30 s, and the
+# respawned orchestrator silently lost its `--name` (your-org/nexus-code#1047).
+# A stub must not answer a capability question about a flag it accepts — and
+# it accepts every flag, because it ignores argv.
+#
+# Scoped to the flags that are PROBES. A REPL launch never passes `--help` or
+# `--version`, so no input reaches both this block and the render below; the
+# arms are exact-equality, not patterns, which is what makes that claim hold
+# (CLAUDE.md, arm-order shadowing). `--` ends the scan the way an option
+# parser does, so a PROMPT after it can contain anything.
+#
+# The help text is a verbatim-shaped SUBSET of real `claude --help`
+# (2.1.246 on this host): the `Usage:`/`Options:` frame plus the flags the
+# spawn surfaces actually pass or probe for. `_claude-bin.sh` matches the
+# literal `--name <name>`, and real Claude Code prints
+# `  -n, --name <name>   Set a display name for this session`.
+# ---------------------------------------------------------------------------
+STUB_CLAUDE_VERSION="${STUB_CLAUDE_VERSION:-2.1.246 (Claude Code)}"
+
+stub_print_help() {
+    cat <<'STUB_HELP'
+Usage: claude [options] [command] [prompt]
+
+Claude Code - starts an interactive session by default, use -p/--print for
+non-interactive output
+
+Arguments:
+  prompt                                Your prompt
+
+Options:
+  -c, --continue                        Continue the most recent conversation
+  --dangerously-skip-permissions        Bypass all permission checks.
+  -h, --help                            Display help for command
+  -n, --name <name>                     Set a display name for this session
+  -p, --print                           Print response and exit
+  --settings <file-or-json>             Path to a settings JSON file or a JSON
+                                        string
+  -v, --version                         Output the version number
+STUB_HELP
+}
+
+for _stub_arg in "$@"; do
+    case "$_stub_arg" in
+        --)          break ;;
+        -h|--help)   stub_print_help; exit 0 ;;
+        -v|--version) printf '%s\n' "$STUB_CLAUDE_VERSION"; exit 0 ;;
+    esac
+done
+unset _stub_arg
+
 # ANSI building blocks pinned to the regexes pane-state.sh greps for.
 # Edit-with-caution: if pane-state.sh changes its renderer detection,
 # the stub must change in lockstep so scenarios stay honest.

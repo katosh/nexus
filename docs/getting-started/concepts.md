@@ -81,7 +81,7 @@ The bot-maintained section of the overview issue body, between the two HTML-comm
 <!-- NEXUS_DASHBOARD_END -->
 ```
 
-Sections — the six-heading schema `ng dashboard validate` enforces with `grep -Fx`: `## Identity`, `## Infra`, `## Services`, `## In-flight`, `## Awaiting operator`, `## Recent landings`. Scaffold with `ng dashboard scaffold`. Updated via `monitor/ng dashboard put`, which re-fetches the body, splices a new middle, and PATCHes — preserving any static prose outside the markers. The overview issue itself is **routing-only**; content threads belong on dedicated per-task issues. See [Operating → Dashboard](../operating/dashboard.md).
+Sections — the six-heading schema `ng dashboard validate` enforces (each heading must appear exactly ONCE, searched across the whole issue body): `## Identity`, `## Infra`, `## Services`, `## In-flight`, `## Awaiting operator`, `## Recent landings`. Scaffold with `ng dashboard scaffold`. Updated via `monitor/ng dashboard put`, which re-fetches the body, splices a new middle, and PATCHes — preserving any static prose outside the markers. The overview issue itself is **routing-only**; content threads belong on dedicated per-task issues. See [Operating → Dashboard](../operating/dashboard.md).
 
 ### Wrap-up
 
@@ -104,7 +104,7 @@ A file under `skills/nexus.*/SKILL.md` carrying a piece of behaviour every agent
 
 A few terms that surface in deeper docs:
 
-- **Target window** — the tmux window the watcher pastes into. Default `orchestrator` (`monitor.target_window`). Set per-launcher-invocation via `./watcher/launcher.sh --target <name>`.
+- **Target window** — the tmux window the watcher pastes into. Default `orchestrator` (`monitor.target_window`). Overridable per launcher invocation with `monitor/watcher/launcher.sh --target <name>` — but prefer the config key: an *empty* `--target` (an unset variable interpolated by a runbook line) is refused at exit 2 rather than silently overriding the configured default.
 - **Trigger comment** — the eligible GitHub comment that initiated a piece of work. Workers `--trigger-comment <id>` it in their `ng wrap-up` so the bot rockets the right comment at hand-off.
 - **Heartbeat** — `monitor/.state/watcher-heartbeat` is touched (PID + ISO timestamp) every watcher poll. Agents read its mtime to detect a dead watcher.
 - **Mutual liveness** — the contract that the orchestrator and watcher each check the other is alive. Orchestrator → watcher: `monitor/watcher/bootstrap.sh` every turn. Watcher → orchestrator: respawn after `monitor.agent_missing_respawn_delay` confirming polls of a *missing* window (plus a pre-launch re-verification), and a hook-driven liveness state machine for the window-present-but-inert case. External tie-breaker: the operator on GitHub. Full contract: [`monitor/README.md` § Mutual-liveness contract](https://github.com/<your-org>/nexus-code/blob/main/monitor/README.md#mutual-liveness-contract).

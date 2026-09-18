@@ -305,4 +305,38 @@ assert_eq "(k) stop-file → clean exit 143" "$RC" "143"
 assert_empty "(k) stop-file exit emits nothing on stdout" "$kout"
 assert_no_file "(k) stop-file consumed" "$stopf"
 
+# ── (m) THE ONCE-ONLY SENTINEL IS A REPORTABLE RESULT, NOT A SILENCE ───
+# Re-watching a consumed id used to exit 0 with EMPTY stdout — byte-identical to
+# what a LOST reply looks like, so an agent retrying a watch concluded the reply
+# had vanished. A success signal shaped exactly like a loss signal. This pins the
+# replacement contract; without it the exit-4 path and --re-emit ship untested.
+printf '0\t%s\n' "$reply_a_env" > "$WORK/steps_m"
+export STUB_RESULTS="$raw_a"; unset STUB_RESULTS_RC
+run_watch t-sent "$WORK/steps_m" --poll 5 --timeout 30
+assert_eq "(m) first watch delivers normally" "$RC" "0"
+assert_contains "(m) …and emits the body" "$OUT" "Here is your answer: 42."
+assert_file_exists "(m) …leaving the once-only sentinel" "$WORK/state/t-sent.emitted"
+
+# The re-watch: distinguishable by EXIT CODE and by STDOUT, not only by a log.
+run_watch t-sent "$WORK/steps_m" --poll 5 --timeout 30
+assert_eq "(m) re-watch exits 4, NOT 0" "$RC" "4"
+assert_contains "(m) …with a terminal state line on STDOUT" "$OUT" "state=already-emitted"
+assert_contains "(m) …naming the sentinel path" "$OUT" "sentinel=$WORK/state/t-sent.emitted"
+assert_not_contains "(m) …and does NOT re-emit the body" "$OUT" "--- reply-body "
+assert_contains "(m) …stderr says how to re-deliver" "$ERROUT" "--re-emit"
+# THE CONTROL that makes the above mean something: stdout must not be empty,
+# which is the exact shape the fix removed.
+if [[ -n "$OUT" ]]; then
+    _th_pass; echo "  PASS: (m) re-watch stdout is NON-empty (the pre-fix shape was empty)"
+else
+    _th_fail; echo "  FAIL: (m) re-watch stdout is empty — indistinguishable from a lost reply"
+fi
+
+# --re-emit deliberately re-delivers, re-reading the reply already on the
+# server; it never re-files the request.
+run_watch t-sent "$WORK/steps_m" --poll 5 --timeout 30 --re-emit
+assert_eq "(m) --re-emit delivers again, exit 0" "$RC" "0"
+assert_contains "(m) …re-emitting the body" "$OUT" "Here is your answer: 42."
+assert_contains "(m) …as a normal replied emit" "$OUT" "state=replied id=t-sent"
+
 th_summary_and_exit

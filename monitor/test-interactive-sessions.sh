@@ -37,6 +37,19 @@ export NEXUS_STATE_DIR="$TMP/ng-state"
 mkdir -p "$NEXUS_STATE_DIR"
 
 # ── load _write_provenance_record from spawn-worker.sh ────────────────────────
+# The window-key encoder must come first: since your-org/nexus-code#941 the
+# extracted function keys its output file with `wk_encode`, which lives in
+# _bookkeeping.sh and is loaded by spawn-worker.sh's PREAMBLE — the half this
+# eval-extract deliberately does not run. Without it `$(wk_encode …)` is an
+# undefined command, the substitution yields the EMPTY string, and every record
+# lands at `<windows>/.json`: T1, T2 and T6 all fail, and they fail for a
+# reason that looks nothing like "the encoder was missing".
+# shellcheck source=monitor/_bookkeeping.sh
+source "$SCRIPT_DIR/_bookkeeping.sh"
+declare -F wk_encode >/dev/null 2>&1 || {
+    printf 'FAIL  setup: wk_encode not available after sourcing _bookkeeping.sh\n' >&2
+    exit 1
+}
 # Extract the function definition (the first ^}$ at column 0 closes it).
 eval "$(awk '/^_write_provenance_record\(\)/,/^}$/' "$SPAWN_SH")"
 
@@ -65,14 +78,30 @@ else
     fi
 fi
 
-# ── T2: window name sanitization ─────────────────────────────────────────────
+# ── T2: window name encoding ─────────────────────────────────────────────────
+# WAS "special chars → _". your-org/nexus-code#941 replaced that mapping
+# because it is MANY-TO-ONE: `a.b` and `a_b` collided on one state file, and
+# nine call sites key an irreversible decision (verdict clearing, state prune)
+# on it. The encoding is now percent-encoding, and the property under test is
+# INJECTIVITY, not merely "no punctuation in the filename" — so the second leg
+# below is the one that would have caught the original defect.
 WIN2="my window/name:odd"
 _write_provenance_record "$NEXUS_ROOT" "$WIN2" "" "task" "/wd" "/pf" ""
-SAFE="my_window_name_odd"
+SAFE="my%20window%2Fname%3Aodd"
 if [[ -f "$WINDOWS_DIR/${SAFE}.json" ]]; then
-    ok "T2: window name sanitized (special chars → _)"
+    ok "T2: window name percent-encoded (space→%20, /→%2F, :→%3A)"
 else
-    fail "T2: expected sanitized file $WINDOWS_DIR/${SAFE}.json not found (got: $(ls "$WINDOWS_DIR/"))"
+    fail "T2: expected encoded file $WINDOWS_DIR/${SAFE}.json not found (got: $(ls "$WINDOWS_DIR/"))"
+fi
+
+# T2b: the point of the change — two names the OLD sanitiser mapped together
+# must now land in two distinct files.
+_write_provenance_record "$NEXUS_ROOT" "coll.ide" "" "task" "/wd" "/pf" ""
+_write_provenance_record "$NEXUS_ROOT" "coll_ide" "" "task" "/wd" "/pf" ""
+if [[ -f "$WINDOWS_DIR/coll%2Eide.json" && -f "$WINDOWS_DIR/coll_ide.json" ]]; then
+    ok "T2b: 'coll.ide' and 'coll_ide' no longer share one state file"
+else
+    fail "T2b: injectivity lost — got: $(ls "$WINDOWS_DIR/")"
 fi
 
 # ── T3: tombstone recipe writes .handled.json with required keys ─────────────

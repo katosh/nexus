@@ -47,6 +47,7 @@ set -uo pipefail
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 NG_REAL="$_test_dir/../ng"
 BK_REAL="$_test_dir/../_bookkeeping.sh"
+NR_REAL_1077="$_test_dir/../_nexus-root.sh"
 
 # Resolve the real grep executable (this runs under bash, so `command -v
 # grep` already yields the binary, not the operator's ugrep wrapper).
@@ -67,7 +68,8 @@ assert_ne() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if "$REAL_GREP" -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && "$REAL_GREP" -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else printf '  FAIL: %s\n           expected substring: %s\n           in: %s\n' "$label" "$needle" "$hay" >&2; FAIL=$(( FAIL + 1 )); fi
 }
 assert_not_contains() {
@@ -85,6 +87,8 @@ FAKE_NEXUS="$WORK/nexus"
 mkdir -p "$FAKE_NEXUS/monitor" "$FAKE_NEXUS/config" "$FAKE_NEXUS/reports" "$FAKE_NEXUS/work/myproj"
 cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
 cp "$BK_REAL" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
+# your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+cp "$NR_REAL_1077" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 NG="$FAKE_NEXUS/monitor/ng"
 
 cat > "$FAKE_NEXUS/config/load.sh" <<'STUB'

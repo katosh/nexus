@@ -31,7 +31,8 @@ PASS=0
 FAIL=0
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if [[ "$hay" == *"$needle"* ]]; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" && "$hay" == *"$needle"* ]]; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — %q not found in:\n%s\n' "$label" "$needle" "$hay" >&2

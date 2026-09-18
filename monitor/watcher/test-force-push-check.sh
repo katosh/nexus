@@ -270,7 +270,19 @@ fi
 # CODE only — the header comment names these configs precisely to explain why
 # they are NOT consulted, and grepping the whole file would flag that prose and
 # make the assertion fire on its own documentation.
-_code=$(sed 's/#.*//' "$CHECK")
+# WHOLE-LINE comments only — never `sed 's/#.*//'` (your-org/nexus-code
+# `#1023`, `#1024`). That strip is not shell-aware: it cuts from the first `#`
+# on a line regardless of quoting, and this repo writes issue refs inside
+# operator strings by convention, so a `#` in a STRING deletes every token to
+# its right from the check's view. The bypass then need only land in the part
+# already deleted.
+#
+# Residual, declared rather than implied: a TRAILING comment on a code line is
+# no longer stripped, so prose sitting after code on the same line can still be
+# matched. Closing that needs a real tokeniser, not a line-based idiom; the
+# header prose this exclusion exists for is whole-line, so the safe primitive
+# covers the actual case.
+_code=$(grep -v '^[[:space:]]*#' "$CHECK")
 if grep -qE 'git config .*(push\.default|pushRemote|pushDefault)|branch\.[^ ]*\.merge' <<<"$_code"; then
     bad "re-implementation" "the check re-derives push-target config by hand"
 else
@@ -308,6 +320,256 @@ stub_rc=0; PATH="$STUBDIR:$PATH" bash "$CHECK" origin feature >/dev/null 2>&1 ||
 # created by count_dryruns, so anything unreadable surfaces as a loud mismatch.
 _dryruns=$(wc -l < "$COUNTFILE")
 assert_eq "the remote is observed exactly ONCE per check" "$_dryruns" "1"
+
+# ---------------------------------------------------------------------------
+# TRANSPORT x PORCELAIN FLAG — the product, executed (your-org/nexus-code#898)
+# ---------------------------------------------------------------------------
+#
+# "The axis the mechanism varies on is transport x porcelain flag, a product.
+# Every published verdict so far varied only the flag." Every rig above is a
+# local path, and the defect is INVISIBLE on local paths — which is why a green
+# suite described one row of a table.
+#
+# The `To` line git prints, against the CONFIGURED url, measured by driving a
+# real `git push --dry-run --porcelain` at a real remote in each form. These
+# are transcriptions of what git printed, NOT strings this test derived the way
+# the script derives them (that would confirm the parse, not the behaviour):
+#
+#   abs path    /p/bare.git                              -> /p/bare.git          SAME
+#   file://     file:///p/bare.git                       -> file:///p/bare.git   SAME
+#   rel path    ../bare.git                              -> ../bare.git          SAME
+#   scp SSH     git@github.com:your-org/nexus-code.git   -> github.com:…          DIFFERENT
+#   ssh:// SSH  ssh://git@github.com/your-org/…          -> ssh://github.com/…    DIFFERENT
+#
+# Both SSH forms are anonymised. The four independent reports all named only
+# the scp-style one.
+
+echo "--- transport x flag: every local transport, every reachable flag ---"
+for _tp in abs file rel; do
+    # `=`, `*`, ` ` — the cheap flags, on one rig per transport.
+    rig "tp-$_tp"
+    case "$_tp" in
+        abs)  _u="$RIG/origin.git" ;;
+        file) _u="file://$RIG/origin.git" ;;
+        rel)  _u="../origin.git" ;;
+    esac
+    cd "$RIG/A"; git remote set-url origin "$_u"
+
+    rc=0; bash "$CHECK" --quiet origin dev >/dev/null 2>&1 || rc=$?
+    assert_rc "[$_tp] '=' up-to-date => 0" 0 "$rc"
+
+    git checkout -qb "brand-new-$_tp" >/dev/null 2>&1; echo n > n.txt; git add -A; git commit -qm n
+    rc=0; bash "$CHECK" --quiet origin "brand-new-$_tp" >/dev/null 2>&1 || rc=$?
+    assert_rc "[$_tp] '*' new ref => 3" 3 "$rc"
+
+    git checkout -q dev >/dev/null 2>&1; echo ff > ff.txt; git add -A; git commit -qm ff
+    rc=0; bash "$CHECK" --quiet origin dev >/dev/null 2>&1 || rc=$?
+    assert_rc "[$_tp] ' ' fast-forward => 0" 0 "$rc"
+
+    # `+` REBASE — a FRESH rig, because the sequence above leaves branch state
+    # that made an earlier draft's rebase a NO-OP: `local == remote`,
+    # `remoteonly=0`, so the row asserted rc 0 against a push that moved
+    # nothing and passed under the identity predicate too. Caught by the
+    # mutation, which is what mutations are for. The precondition is asserted
+    # now, so a vacuous rebase is a RED rather than a quiet pass.
+    rig "reb-$_tp"
+    case "$_tp" in
+        abs)  _u="$RIG/origin.git" ;;
+        file) _u="file://$RIG/origin.git" ;;
+        rel)  _u="../origin.git" ;;
+    esac
+    cd "$RIG/A"; git remote set-url origin "$_u"
+    git checkout -q dev >/dev/null 2>&1
+    git checkout -qb reb >/dev/null 2>&1; echo r > r.txt; git add -A; git commit -qm "replayed work"
+    git push -q origin reb >/dev/null 2>&1
+    git checkout -q dev >/dev/null 2>&1; echo adv > adv.txt; git add -A; git commit -qm advance
+    git checkout -q reb >/dev/null 2>&1; git rebase -q dev >/dev/null 2>&1
+    _only=$(git rev-list --count HEAD..origin/reb 2>/dev/null)
+    assert_eq "[$_tp] PRECONDITION: the rebase really superseded a remote commit" \
+        "$( [ "${_only:-0}" -ge 1 ] && echo superseded || echo "vacuous:${_only:-?}" )" superseded
+    rc=0; bash "$CHECK" --quiet origin reb >/dev/null 2>&1 || rc=$?
+    assert_rc "[$_tp] '+' post-REBASE => 0 (change replayed, nothing lost)" 0 "$rc"
+
+    # `+` DESTRUCTIVE — same rig, a tip whose change appears nowhere upstream.
+    git checkout -qb wipe dev >/dev/null 2>&1; echo w > w.txt; git add -A; git commit -qm "unrelated"
+    rc=0; bash "$CHECK" --quiet origin wipe:reb >/dev/null 2>&1 || rc=$?
+    assert_rc "[$_tp] '+' destructive overwrite => 1" 1 "$rc"
+
+    rc=0; bash "$CHECK" --quiet origin ":reb" >/dev/null 2>&1 || rc=$?
+    assert_rc "[$_tp] '-' ref deletion => 1" 1 "$rc"
+done
+
+# ---------------------------------------------------------------------------
+# THE SSH ROW, hermetically: which URL does the check FETCH from?
+# ---------------------------------------------------------------------------
+#
+# A live SSH server is not available here, and a fixture that fakes one via
+# `insteadOf` does NOT reproduce the defect — measured: under a rewrite the
+# `To` line prints the REWRITTEN url, so it agrees with `get-url` and the
+# stripping never appears. So the SSH row is driven with a PATH-front `git`
+# stub, the same instrument this file already uses for the `!` and unknown-flag
+# arms, emitting the porcelain block real git printed for a real SSH remote.
+#
+# The assertion is on the URL the check FETCHES FROM — the one observable that
+# distinguishes "parsed the display line" from "asked git to resolve it".
+_ssh_probe() {   # _ssh_probe <script> <configured-url> <To-url> -> fetched url
+    _sp_dir=$(mktemp -d)
+    git init -q "$_sp_dir/repo"
+    ( cd "$_sp_dir/repo"
+      git config user.email a@b; git config user.name t
+      git remote add origin "$2"
+      echo x > f; git add -A; git commit -qm one >/dev/null 2>&1 )
+    mkdir -p "$_sp_dir/bin"
+    _real_git=$(command -v git)
+    cat > "$_sp_dir/bin/git" <<STUB
+#!/usr/bin/env bash
+if [ "\$1" = push ]; then
+    printf 'To %s\n' "$3"
+    printf '+\trefs/heads/b:refs/heads/b\tabc1234...def5678 (forced update)\n'
+    printf 'Done\n'
+    exit 0
+fi
+if [ "\$1" = fetch ]; then
+    for a in "\$@"; do case "\$a" in -*|fetch) continue ;; *) printf '%s\n' "\$a" > "$_sp_dir/fetched"; break ;; esac; done
+    exit 1
+fi
+exec "$_real_git" "\$@"
+STUB
+    chmod +x "$_sp_dir/bin/git"
+    if [ "${4:-named}" = bare ]; then
+        ( cd "$_sp_dir/repo"; PATH="$_sp_dir/bin:$PATH" bash "$1" --quiet >/dev/null 2>&1 )
+    else
+        ( cd "$_sp_dir/repo"; PATH="$_sp_dir/bin:$PATH" bash "$1" --quiet origin b >/dev/null 2>&1 )
+    fi
+    cat "$_sp_dir/fetched" 2>/dev/null
+    rm -rf "$_sp_dir"
+}
+
+echo "--- transport x flag: the SSH row (stub-driven, measured porcelain) ---"
+_scp_cfg='git@github.com:your-org/nexus-code.git'
+_scp_to='github.com:your-org/nexus-code.git'
+assert_eq "scp-style SSH: the check fetches the CONFIGURED url, not the To line" \
+    "$(_ssh_probe "$CHECK" "$_scp_cfg" "$_scp_to")" "$_scp_cfg"
+
+_ssh_cfg='ssh://git@github.com/your-org/nexus-code.git'
+_ssh_to='ssh://github.com/your-org/nexus-code.git'
+assert_eq "ssh:// SSH is anonymised too, and is also resolved correctly" \
+    "$(_ssh_probe "$CHECK" "$_ssh_cfg" "$_ssh_to")" "$_ssh_cfg"
+
+# F3 (your-org/nexus-code#930): the BARE push — no repository argument — is the
+# form the force-push hook names FIRST ("or none, for a bare push") and the one
+# a rebase-then-push produces. Both rows above pass `origin b`, so they exercise
+# only the NAMED branch of _push_url_for; `_strip_userinfo` and the `git remote`
+# reconciliation loop — the block carrying the longest comment in the diff —
+# were dead as far as this suite was concerned. Two independent mutants of that
+# block stayed 57/0 green.
+assert_eq "bare push (no repository arg) reconciles the anonymised url too" \
+    "$(_ssh_probe "$CHECK" "$_scp_cfg" "$_scp_to" bare)" "$_scp_cfg"
+
+# MUTATION, inline: the SHIPPED derivation (parse the To line) fetches the
+# stripped url. Without this the two assertions above could pass against any
+# script that happened to echo its argument.
+# The mutant restores the SHIPPED derivation: take the URL straight from the
+# display line. Targeted at the resolution, not the arg parse — an earlier
+# draft neutered `_repo_arg` and the no-arg reconciliation simply recovered the
+# right URL anyway, so the mutant was inert and said so.
+_mut=$(mktemp); sed 's|^_url=$(_push_url_for .*|_url="$_disp_url"|' "$CHECK" > "$_mut"
+assert_eq "MUTANT (To-line derivation): fetches the user-STRIPPED url" \
+    "$(_ssh_probe "$_mut" "$_scp_cfg" "$_scp_to")" "$_scp_to"
+rm -f "$_mut"
+
+echo "--- the predicate's edges: duplicate patch-ids, and what a replay is ---"
+
+# F1 (your-org/nexus-code#930) — DUPLICATE patch-ids must not share one witness.
+# A revert-then-re-land on the remote gives remote-only pids {P, Q, P} while a
+# rebased copy of the first two carries {Q, P, …}. Under plain SET membership
+# the third commit matched the single local P that the first had already used,
+# the check said SAFE, and the push rewrote the remote back across the re-land.
+# The match CONSUMES its witness now. This row is that push.
+rig dup
+cd "$RIG/A"
+git checkout -q dev >/dev/null 2>&1
+echo 1 > f.txt; git add -A; git commit -qm dupbase
+_dupbase=$(git rev-parse HEAD)
+git checkout -qb b >/dev/null 2>&1
+echo 2 > f.txt; git add -A; git commit -qm "R1 change it"; _R1=$(git rev-parse HEAD)
+echo 1 > f.txt; git add -A; git commit -qm "R2 revert it"; _R2=$(git rev-parse HEAD)
+echo 2 > f.txt; git add -A; git commit -qm "R3 RE-LAND it"
+git push -q origin b >/dev/null 2>&1
+git checkout -q -b mine "$_dupbase" >/dev/null 2>&1
+echo e > e.txt; git add -A; git commit -qm "E my work"
+git cherry-pick "$_R1" >/dev/null 2>&1; _cp1=$?
+git cherry-pick "$_R2" >/dev/null 2>&1; _cp2=$?
+assert_eq "PRECONDITION: both cherry-picks applied (else the duplicate never forms)" \
+    "$_cp1$_cp2" "00"
+_dups=$(git rev-list mine..origin/b | while read -r _c; do
+            git show "$_c" 2>/dev/null | git patch-id --stable 2>/dev/null | cut -d' ' -f1
+        done | sort | uniq -d | grep -c .)
+assert_eq "PRECONDITION: the remote really carries a DUPLICATE patch-id" \
+    "$( [ "${_dups:-0}" -ge 1 ] && echo duplicated || echo "none:${_dups:-?}" )" duplicated
+rc=0; bash "$CHECK" --quiet origin mine:b >/dev/null 2>&1 || rc=$?
+assert_rc "duplicate patch-ids: one local witness clears only ONE dropped commit => 1" 1 "$rc"
+
+# F5 (your-org/nexus-code#930) — an option's SEPARATE value must not be taken
+# for the repository. `--receive-pack git-receive-pack origin feature` made
+# `_resolve_remote_arg` return `git-receive-pack`, and the old arm returned that
+# token verbatim at rc 0, so the `|| _url="$_disp_url"` fallback never fired —
+# a comment claimed that degradation happened before it was true. Asserted
+# against the NO-OPTION control, which is stronger than a bare rc: the option
+# must not change the verdict at all.
+rig optval; dirty "$RIG" origin; cd "$RIG/A"
+git checkout -q feature >/dev/null 2>&1; echo ov > ov.txt; git add -A; git commit -qm mine-ov
+rc_opt=0; bash "$CHECK" --quiet --receive-pack git-receive-pack origin feature >/dev/null 2>&1 || rc_opt=$?
+rc_ctl=0; bash "$CHECK" --quiet origin feature >/dev/null 2>&1 || rc_ctl=$?
+assert_rc "a separate-value option before the repository still gives a verdict" 1 "$rc_opt"
+assert_eq "…and the SAME verdict as without the option" "$rc_opt" "$rc_ctl"
+
+# F2 (your-org/nexus-code#930) — a remote with TWO URLs. `set-url --add` is a
+# supported feature (push to mirrors); git then emits one `To` BLOCK PER URL,
+# while this check has one `_url` and one FETCH_HEAD. Measured on the shipped
+# code AND on `e256d4a`: a clean fast-forward on url1 with a DIRTY forced update
+# on url2 returned 0 SAFE, and the push removed the sibling's commit from url2.
+# Pre-existing, but it is "compared the wrong REMOTE" — the very class this
+# change claims to close — so one destination per verdict, or no verdict.
+rig twourl
+cd "$RIG/A"
+git push -q "$RIG/other.git" dev >/dev/null 2>&1
+git remote set-url --add origin "$RIG/other.git"
+# dirty the SECOND url only, so url1 stays a plausible clean answer
+( cd "$RIG/B_other" 2>/dev/null || git clone -q "$RIG/other.git" "$RIG/B2" 2>/dev/null
+  cd "$RIG/B2" 2>/dev/null && git config user.name D && git config user.email d@e \
+    && git checkout -q feature && echo s2 > s2.txt && git add -A \
+    && git commit -qm SIBLING_ON_U2 && git push -q origin feature ) >/dev/null 2>&1
+git checkout -q feature >/dev/null 2>&1; echo x2 > x2.txt; git add -A; git commit -qm mine2
+_blocks=$(git push --dry-run --porcelain --force origin feature 2>&1 | grep -c '^To ')
+assert_eq "PRECONDITION: git really emits one To block per url" \
+    "$( [ "${_blocks:-0}" -ge 2 ] && echo multi || echo "single:${_blocks:-?}" )" multi
+rc=0; bash "$CHECK" --quiet origin feature >/dev/null 2>&1 || rc=$?
+assert_rc "a multi-URL remote is REFUSED, not answered for one url => 2" 2 "$rc"
+
+# F4 (your-org/nexus-code#930) — the boundary, pinned rather than assumed.
+# Every rebase row above replays a diff that applies byte-for-byte (disjoint
+# files), which is the EASY half of the factor. A replay needing conflict
+# resolution produces a different diff, so its patch-id differs and the verdict
+# is UNSAFE. Safe direction, but it is a large slice of real force-pushes and
+# the docs must not imply otherwise.
+rig conf
+cd "$RIG/A"
+git checkout -q dev >/dev/null 2>&1
+echo base > c.txt; git add -A; git commit -qm cbase; git push -q origin dev >/dev/null 2>&1
+git checkout -qb cf >/dev/null 2>&1; echo mine > c.txt; git add -A; git commit -qm "my line"
+git push -q origin cf >/dev/null 2>&1
+git checkout -q dev >/dev/null 2>&1; echo theirs > c.txt; git add -A; git commit -qm "their line"
+git checkout -q cf >/dev/null 2>&1
+git rebase dev >/dev/null 2>&1
+if [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; then
+    echo resolved > c.txt; git add c.txt; GIT_EDITOR=true git rebase --continue >/dev/null 2>&1
+fi
+assert_eq "PRECONDITION: the conflicted rebase completed" \
+    "$( [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ] && echo stuck || echo completed )" completed
+rc=0; bash "$CHECK" --quiet origin cf >/dev/null 2>&1 || rc=$?
+assert_rc "a rebase needing CONFLICT RESOLUTION is UNSAFE (boundary, not a bug)" 1 "$rc"
+
 # CONTROL: without this, a stub that broke the check would still report "1"
 # while measuring a run that never reached the classifier.
 assert_eq "CONTROL: the counting stub is transparent (same verdict as unstubbed)" \
@@ -317,7 +579,7 @@ assert_eq "CONTROL: the counting stub is transparent (same verdict as unstubbed)
 # RAN; a case that stops running is silently absent from that number unless it
 # is compared against a declared total. Bump deliberately when adding a case;
 # a DROP means a case died.
-_EXPECTED_ASSERTIONS=32
+_EXPECTED_ASSERTIONS=66
 _ran=$(( PASS + FAIL ))
 assert_eq "every declared assertion executed ($_EXPECTED_ASSERTIONS)" "$_ran" "$_EXPECTED_ASSERTIONS"
 

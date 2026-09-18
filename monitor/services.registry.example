@@ -24,6 +24,64 @@
 #               within the session; this registry survives the session
 #               itself dying).
 #   healthcheck shell command run in <workdir>; exit 0 == healthy.
+#               exit 100 == a FINDING (your-org/nexus-code#1423): the service is
+#               ALIVE and the condition it watches is PRESENT — its stderr is the
+#               finding. The watcher opens no incident, never restarts, and
+#               renders "UP and reports a FINDING" (no DOWN, no restart remedy),
+#               clearing itself when the check goes green. For MONITORS
+#               registered as services (tmpfs-guard --check). Any other
+#               non-zero == DOWN.
+#
+#               TWO OPTIONAL PROTOCOL LINES ON STDERR, both stripped from the
+#               rendered emit. A service that writes neither behaves exactly as
+#               before, so adopting them is opt-in per service:
+#
+#                 finding-key: <stable token>
+#                   The SUPPRESSION key. Without it the whole message is the
+#                   key — and a message carrying a live counter re-fires on
+#                   counter noise: measured on tmpfs-guard, `entries 14129` ->
+#                   `14127` re-emitted the finding two minutes later while the
+#                   state a reader cares about had changed zero times. The
+#                   framework cannot GUESS which part of a message is stable
+#                   and a digit-stripping heuristic would merge findings that
+#                   differ only in a number that matters, so the SERVICE
+#                   declares it — the same way it already declares its payload
+#                   by what it writes to stderr. Build it from the SITUATION
+#                   (a band, a condition set), never from a measurement.
+#
+#                 finding-band: <non-negative integer>
+#                   A monotone severity. Its one job is that a MUTE recorded at
+#                   one band BREAKS when the situation crosses into a worse one.
+#                   Declare none and any key change breaks the mute instead,
+#                   which errs toward EMITTING — the safe direction.
+#
+#               MUTING A FINDING. An operator who has judged and accepted a
+#               finding may silence it by writing
+#               `<state-dir>/service-health/<name>.finding-mute`:
+#
+#                   service=tmpfs-guard
+#                   owner=operator
+#                   reason=other users' memory on a shared node; not ours to reap
+#                   until=2026-10-01          # this or tracker= (or both)
+#                   tracker=your-org/nexus-code#1423
+#                   band=1                    # the band it was accepted at
+#
+#               Four rules, each from something that bit this repo:
+#                 * it must EXPIRE — an open-ended mute is an unowned
+#                   exemption (#1486, where one row records in its own note
+#                   that no rationale is on file), so the SAME predicate #1482
+#                   applies to a `none` row applies here: a tracker ref or an
+#                   `until:` date;
+#                 * it must carry an OWNER and a REASON, for the same reason;
+#                 * it BREAKS when the band worsens — a mute keyed on "over
+#                   threshold" would sit silently through 10% -> 77%, making
+#                   the mute the mechanism by which the incident the monitor
+#                   exists to catch goes unreported;
+#                 * `muted` and `cleared` are DISTINGUISHABLE in the record —
+#                   different files, different events, different words.
+#               An INVALID or EXPIRED mute is IGNORED LOUDLY, never obeyed
+#               quietly: a suppression that fails open hides the thing it was
+#               asked to hide for a reason nobody stated.
 #               Keep it cheap and fast (short curl timeout / pgrep /
 #               test -f) — it runs on every recovery sweep.
 #
@@ -101,6 +159,29 @@
 #               recover / svc.sh / version-restart ignore it (they read it
 #               into a throwaway var so it can't corrupt their logfile).
 #
+# THE COCKPIT'S DETAIL COLUMN — declare your endpoint, do not spell your
+# healthcheck for it (your-org/nexus-code#1144). `monitor/svc.sh` shows a
+# copy-pasteable URL in DETAIL. It reads that URL from the healthcheck COMMAND
+# TEXT, which means the cell is a property of HOW THE HEALTHCHECK IS SPELLED
+# rather than of the service: an inline `curl -fsS … http://localhost:PORT/`
+# renders a URL, and a SCRIPT healthcheck renders `-`, indistinguishable from a
+# service that genuinely serves nothing.
+#
+# That inverts the incentive, because a script is usually the BETTER probe and
+# is sometimes the only correct one — an auth-gated service would see 401 from a
+# bare `curl -fsS`, report unhealthy forever and restart-loop. So do NOT weaken a
+# healthcheck to get a URL in the cockpit. Instead drop the URL in your service's
+# own tree:
+#
+#     <workdir>/.deploy/endpoint      one line, one http(s) URL
+#
+# svc.sh reads it when the healthcheck names no URL, and applies the same
+# external-bind rewrite (localhost -> FQDN when the port is bound beyond
+# loopback) that makes the cell copy-pasteable. A line that is not URL-shaped is
+# REFUSED and the cell shows `-` — the file's bytes reach a terminal, so shape is
+# validated rather than mere non-emptiness. Display-only: nothing about this file
+# changes what is probed, and healthcheck commands are never rewritten.
+#
 # Lines beginning with `#` and blank lines are ignored. A line with
 # fewer than the four required TAB fields is skipped with a warning,
 # never fatal. 4-field rows remain valid — the 5th + 6th fields are additive.
@@ -110,24 +191,52 @@
 #     monitor/bootstrap-recover.sh --dry-run    # decide + log, no launch
 #
 # ---------------------------------------------------------------------
-# EXAMPLE ENTRIES (an example operator stack). Uncomment +
+# EXAMPLE ENTRIES (this operator's stack as of 2026-06-09). Uncomment +
 # adjust paths in your real `monitor/services.registry`. The columns
 # below are TAB-separated; if you copy them, make sure your editor
 # keeps the tabs. The trailing 5th column is the optional <logfile>; the
 # 6th is the optional <policy> (auto-restart | emit-only).
 #
-# dolimap-serve   $NEXUS_ROOT/work/myproj/website   ./serve-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8765/   $NEXUS_ROOT/work/myproj/website/serve.log
+# mysite-serve   $NEXUS_ROOT/work/myproject/website   ./serve-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8765/   $NEXUS_ROOT/work/myproject/website/serve.log
 #
 # Same service, but pinned emit-only (watcher emits + lets the orchestrator
 # decide instead of auto-restarting — the 6th column):
-# dolimap-serve   $NEXUS_ROOT/work/myproj/website   ./serve-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8765/   $NEXUS_ROOT/work/myproj/website/serve.log   emit-only
+# mysite-serve   $NEXUS_ROOT/work/myproject/website   ./serve-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8765/   $NEXUS_ROOT/work/myproject/website/serve.log   emit-only
 #
 # JupyterLab services (jupyter-*) are NOT hand-written here: run
 # `monitor/jupyter-up.sh <project-dir>` and it appends/maintains the
 # row itself (and `--down` removes it). A maintained row looks like:
 # jupyter-myproj   $NEXUS_ROOT/work/myproj   /abs/path/monitor/labsh-supervised.sh   /abs/path/monitor/jupyter-health.sh   $NEXUS_ROOT/work/myproj/.jupyter/labsh-service.log
-# deploy-watch    $NEXUS_ROOT/work/myproj/website   ./deploy-watch.sh   pgrep -f deploy-watch.sh   $NEXUS_ROOT/work/myproj/website/deploy.log
-# annzarro        $NEXUS_ROOT/work/annzarro   ./run-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8766/   $NEXUS_ROOT/work/annzarro/annzarro.log
+#
+# DO NOT COPY THIS ROW (your-org/nexus-code#1222). It is kept, struck through,
+# because it is what an operator registry actually contains today and the fix
+# is only findable next to the mistake:
+#
+#   deploy-watch  …/website  ./deploy-watch.sh  pgrep -f deploy-watch.sh  …/deploy.log
+#                                               ^^^^^^^^^^^^^^^^^^^^^^^^
+# `claude`s argv IS its prompt, and an agent whose prompt merely QUOTES the
+# script name satisfies that pattern. Measured on a live board by reading
+# /proc/*/cmdline directly: FIVE processes matched `deploy-watch.sh`, of which
+# exactly ONE was the service and TWO were live agents in other tmux windows.
+# So if the real service died, the healthcheck would still go green on an
+# agent alone: no incident opened, no relaunch, nothing emitted.
+#
+# This is NOT the #891 self-match, which was fixed by running the probe via
+# `bash <(printf …)` so the pattern is no longer in the probe process own argv.
+# This is the SIBLING match (#1073), and no spelling fixes it — `[d]eploy-watch`
+# included — because the population that matches GROWS WITH EVERY WORKER SPAWNED
+# and is authored by agents with no relationship to this predicate.
+#
+# Ask instead whether THE PROCESS YOU RECORDED is still alive. The supervisor
+# writes its pid; `kill -0` answers about that pid and nothing else:
+# deploy-watch    $NEXUS_ROOT/work/myproject/website   ./deploy-watch.sh   test -f .deploy-watch.pid && kill -0 "$(cat .deploy-watch.pid)" 2>/dev/null   $NEXUS_ROOT/work/myproject/website/deploy.log
+#
+# A heartbeat-freshness check is the other sound form, and is what a sibling
+# service in this workspace already uses: the supervisor touches a stamp each
+# loop, and the healthcheck asserts the stamp is younger than one interval.
+# Both ask about a thing; `pgrep -f` asks about a STRING, and a string cannot
+# distinguish the thing from a description of the thing.
+# myviewer        $NEXUS_ROOT/work/myviewer   ./run-supervised.sh   curl -fsS -o /dev/null --max-time 3 http://localhost:8766/   $NEXUS_ROOT/work/myviewer/myviewer.log
 #
 # The confined remote SSH endpoint (agent-channel RFC Part A) is NOT
 # hand-written either: run `monitor/remote-up.sh` and it appends/maintains
@@ -139,3 +248,19 @@
 # listening and the healthcheck treats not-running as healthy. A maintained
 # row looks like (TAB-separated):
 # nexus-remote-ssh   $NEXUS_ROOT   /abs/path/monitor/remote-sshd-supervised.sh   /abs/path/monitor/remote-ssh-health.sh   $NEXUS_ROOT/monitor/.state/remote-ssh.log   emit-only
+# tmpfs guard — TWO rows, and only the read-only one is on by default
+# (your-org/nexus-code#1441). `tmpfs-check` REPORTS: its launch loops
+# `--check` and never deletes anything; its healthcheck goes non-zero when
+# /tmp crosses a threshold, which escalates through `--- service health ---`
+# to the orchestrator — the surface the operator already watches. It is
+# `emit-only`: a reporter is never blind-restarted. The row exits non-zero
+# when unhealthy; the supervisor reads the SCRIPT's status, never a
+# pipeline's (`--check | tail -5` reports tail's rc — #1424).
+tmpfs-check	$NEXUS_ROOT	$NEXUS_ROOT/monitor/tmpfs-guard.sh --check-daemon	$NEXUS_ROOT/monitor/tmpfs-guard.sh --check --quiet	$NEXUS_ROOT/monitor/.state/tmpfs-guard.log	emit-only
+# `tmpfs-reap` DELETES: `--daemon` loops `--reap` under the default-deny
+# predicate over the family list `REAP_FAMILIES_DEFAULT` in
+# monitor/tmpfs-guard.sh — well-chosen for the nexus it was measured on, a
+# GUESS about anyone else's /tmp. Deliberately COMMENTED OUT here: enabling it
+# means reading that list first, and presence of the row is the enable signal
+# (the same convention nexus-remote-ssh documents above). Uncomment to opt in.
+# tmpfs-reap	$NEXUS_ROOT	$NEXUS_ROOT/monitor/tmpfs-guard.sh --daemon	$NEXUS_ROOT/monitor/tmpfs-guard.sh --check --quiet	$NEXUS_ROOT/monitor/.state/tmpfs-guard.log

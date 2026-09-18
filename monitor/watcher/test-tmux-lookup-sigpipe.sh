@@ -248,7 +248,38 @@ fi
 missing=()
 for h in _respawn.sh _unstick.sh _cc_auto_update.sh; do
     grep -qE "^[[:space:]]*(\.|source) .*${h//./\\.}" "$MAIN" || missing+=("$h")
-    if grep -q 'pipefail' "$REPO_ROOT/monitor/watcher/$h" 2>/dev/null; then
+    # MATCH THE MECHANISM, NOT THE WORD (your-org/nexus-code#1326-adjacent; the
+    # substring-vs-mechanism shape #821 already records in the summary-honesty
+    # classifier, where matching the WORD `EXPECTED` anywhere in a file counted
+    # `EXPECTED_TARGET` and `UNEXPECTEDLY` as count guards).
+    #
+    # This arm protects a real premise — these three helpers set no shell
+    # options, so they run under main.sh's pipefail — and the premise is worth
+    # protecting. But a bare `grep -q pipefail` fires on PROSE: a comment
+    # explaining why a pipeline was avoided reds the suite while the premise it
+    # asserts is untouched. Measured on this tree: `_cc_auto_update.sh` carries
+    # exactly one occurrence, a comment, and sourcing the file changes NO shell
+    # option (pipefail off -> off, full `set +o` set byte-identical) while still
+    # INHERITING a caller's pipefail. The premise held; only the probe failed.
+    #
+    # So: strip comments, then require an actual `set` that names pipefail.
+    # This is STRICTLY MORE PRECISE, not weaker — a real `set -o pipefail`,
+    # `set -uo pipefail` or `set +o pipefail` still reds, including after a
+    # `;`/`&&`/`|`. Proven both ways by the planted-mutant pair below in
+    # test-tmux-lookup-sigpipe-helper-opts.sh.
+    # NO PIPE. `sed … | grep -q` is what a first draft of this arm used, and it
+    # was DEFEATED BY THE VERY DEFECT THIS SUITE POLICES: `grep -q` closes the
+    # pipe on its first match, `sed` takes EPIPE, and under this file's own
+    # `pipefail` the pipeline reports 141 — so the `if` takes the FALSE branch
+    # WITH THE MATCH ALREADY FOUND. Measured: rc=0 without pipefail, rc=141
+    # with it, same command, same file. A planted `set -o pipefail` therefore
+    # went UNDETECTED and the suite printed ALL TESTS PASSED.
+    #
+    # So the comment-stripping is done inside the pattern instead: `^[^#]*`
+    # forbids a `#` anywhere earlier on the line, which is what makes a prose
+    # mention inert without a second process to be killed.
+    if grep -qE '^[[:space:]]*set[[:space:]]+[-+][A-Za-z]*[[:space:]]+pipefail|^[^#]*[;&|][[:space:]]*set[[:space:]]+[-+][A-Za-z]*[[:space:]]+pipefail' \
+         "$REPO_ROOT/monitor/watcher/$h" 2>/dev/null; then
         bad "helper opts/$h" "$h now sets its own pipefail — re-check whether it still inherits"
     fi
 done

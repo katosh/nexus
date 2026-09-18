@@ -57,20 +57,29 @@ window="${NEXUS_WORKER_WINDOW:-}"
 [[ -n "$window" ]] || exit 0
 
 # State-dir precedence mirrors worker-heartbeat.sh / ng so tests can
-# pin a hermetic NEXUS_STATE_DIR.
-if [[ -n "${NEXUS_STATE_DIR:-}" ]]; then
-    state_dir="$NEXUS_STATE_DIR"
-elif [[ -n "${NEXUS_ROOT:-}" ]]; then
-    state_dir="$NEXUS_ROOT/monitor/.state"
-else
-    exit 0
-fi
+# pin a hermetic NEXUS_STATE_DIR. Resolved by `_stamp_path.sh`, which the
+# `Stop`-hook CLEAR (`stamp-clear.sh`) also sources — your-org/nexus-code#1143.
+# This stamp carried the SAME split-brain the over-limit one did, one line
+# below it in `worker-settings.json`: this writer honoured the override and its
+# clear hardcoded `$NEXUS_ROOT/monitor/.state`, so under any override the clear
+# addressed a file nobody wrote and silently succeeded.
+#
+# The WINDOW is deliberately still `NEXUS_WORKER_WINDOW` alone rather than
+# `stamp_window`: this hook is worker-only by design, and widening it would
+# start writing turn-failure stamps for the orchestrator pane. `stamp-clear.sh`
+# resolving WIDER than this writer is safe in the only direction it differs —
+# removing a file that does not exist is a no-op.
+_self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || exit 0
+[[ -r "$_self_dir/_stamp_path.sh" ]] || exit 0
+# shellcheck source=/dev/null
+. "$_self_dir/_stamp_path.sh" || exit 0
+state_dir=$(stamp_state_dir) || exit 0
 
 command -v jq >/dev/null 2>&1 || exit 0
 
-# Locate the pure classifier next to this script.
-_self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || _self_dir=""
-if [[ -n "$_self_dir" ]] && [[ -r "$_self_dir/_cause_classify.sh" ]]; then
+# Locate the pure classifier next to this script. `_self_dir` is resolved
+# above, where a failure already exited — so it is non-empty here.
+if [[ -r "$_self_dir/_cause_classify.sh" ]]; then
     # shellcheck source=/dev/null
     . "$_self_dir/_cause_classify.sh"
 else

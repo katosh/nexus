@@ -54,6 +54,24 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$_test_dir/../.." && pwd)
 CLAUDE_MD="$REPO_ROOT/CLAUDE.md"
 
+# ── this suite DECLARES its own population (the --population protocol) ──────
+# your-org/nexus-code#1219. CLAUDE.md is the document this suite EXECUTES, so
+# an edit to the fenced block it pins is exactly the edit that can change its
+# verdict — and until #1219 no such edit could SELECT it: a suite that declares
+# no population is INVISIBLE to `guards-for-diff` rather than excluded by it
+# (#1078), appearing in neither SELECTED nor CONSIDERED AND EXCLUDED, so its
+# absence reads as a considered exclusion. `gp_handle` adds this suite's own
+# path and `monitor/_guard_population.sh` for free; everything else is declared
+# because this suite READS ITS BYTES to reach a verdict.
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    printf '%s\n' \
+        CLAUDE.md \
+        monitor/watcher/_test_helpers.sh
+}
+gp_handle "$@"
+th_claude_md_block_coverage ANCESTOR-TIMELINE   # the entry's UNCHECKED share, in this suite's own output (#1239)
+
 WORK=$(mktemp -d -t nexus-ancestor-XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 

@@ -15,6 +15,37 @@ migrate only where it genuinely unifies.**
 
 ---
 
+## What actually shipped — read this before the body
+
+Everything below §1 is the **original proposal text, verbatim, against
+`dev` @ `48d3e7c`**. Its measurements (`≈41 leaf verbs`, `3829-line bash
+dispatcher`, `ng:3789`, `ng:256`, `README.md:1115`) describe that baseline
+and **are not current**: `monitor/ng` is now ~14.8 k lines dispatching
+**59** operational verbs. Treat every number and `path:line` in the body
+as historical. The design *conclusion* — facade-over-scripts, migrate
+nothing — is what survived and what this record exists to explain.
+
+Verified against `dev` @ `a3177ef6`:
+
+| Recommendation | Status |
+|---|---|
+| §5.1 land `ng retire-preflight` | **shipped** |
+| §5.2 wrap `pane-state`, `write-probe`, `declare-wait`, `declare-no-wait`, `paste-followup` | **shipped**, all five, as `_facade` `exec`s |
+| §5.3 categorized `ng --help` verb index | **shipped** as `_verb_index`; also reachable as `ng verbs` / `ng help` / `ng -h` |
+| §5.4 migrate nothing | **held.** `_facade` is the convention, and its own comment says so: *"Adding logic to these is a smell — fix the script instead."* |
+| §5.5 `ng user-pat` | **shipped**, spelled as proposed |
+| §5.5 `ng mint-token` | **shipped under a different name: `ng token`.** `ng mint-jwt` remains the JWT-only shim, so the symmetry gap the proposal named is closed — just not with the verb it named |
+| §5.5 `NG_REPO` default | **not implemented.** The identifier appears nowhere in the tree outside this file. Every write verb still takes `--repo` per call, resolved by `_resolve_repo write`; the `#108` footgun is closed by *refusing* a cwd/`$REPO` mismatch rather than by a configurable default |
+| §3d exit-code standardization (`2` = usage error) | **shipped with a different code, and narrower.** The usage/failure split exists but is **`64` (EX_USAGE)**, not `2` — `<your-org>/nexus-code#990` aligned `ng` with the sixteen other scripts here that already used `64`. It covers exactly one condition: a flag given no value, or an empty value where the contract requires one (`_die_usage`, `_argloop_stuck`). The **general** refusal path, `die()`, is still `exit 1`, so an eligibility rejection and a runtime failure remain indistinguishable. Individual verbs grew richer codes independently (`wrap-up` `3`, `comment-edit` `4`, `dashboard put` `4`, `upload` `4`/`7`, `guards-for-diff` `0`–`5`, `watcher-status` `0`–`4`) — per-verb, not to this scheme |
+| §3b document that every mutating verb takes `--repo` | **shipped** — [ng CLI § Conventions](reference/ng-cli.md#conventions) |
+| §4 doc-update list | **partly.** `docs/reference/ng-cli.md` replaced the `monitor/README.md` verb table as the reference surface, but it carries a prose section for only some of the 59 verbs by design — see its own [Quick reference](reference/ng-cli.md#quick-reference) for the current split. `ng verbs` (`_verb_index`) is the *intended* complete index and is **not** currently complete: measured at `a3177ef6` it omits `close-set`, `reports-for-window`, `send`, `skeptic-arm` and `stranded-branches`, all of which dispatch. The only surface that decides what dispatches is the `case "$sub"` in `main()` |
+
+**Do not delete this file.** It is the ADR for *why* `ng` is a facade over
+standalone scripts rather than a monolith — the question recurs every time
+someone proposes folding a `monitor/*.sh` into `ng`.
+
+---
+
 ## 1. The surface today
 
 `monitor/ng` is a 3829-line bash dispatcher exposing **≈41 leaf verbs** (29

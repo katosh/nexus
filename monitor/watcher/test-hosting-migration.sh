@@ -111,12 +111,67 @@ MAIN="$_script_dir/main.sh"
 
 # The compute site must be the startup sweep (exactly one call of each
 # helper in main.sh), keyed on the launcher's env contract.
-n_detect=$(grep -c '_hosting_is_legacy ' "$MAIN" || true)
-n_render=$(grep -c '_hosting_render_migration_notice ' "$MAIN" || true)
-if [[ "$n_detect" == "1" && "$n_render" == "1" ]]; then
-    pass "main.sh computes the notice at exactly one site (startup sweep) — once per lifecycle by construction"
+#
+# TWO assertions, because the claim has two halves and a census can only pin
+# one of them (your-org/nexus-code#1026).
+#
+#   MEMBERSHIP  — "exactly one call of each helper". A census CAN pin this,
+#                 but only in the right UNIT: `grep -c` counts matching LINES,
+#                 so `_hosting_is_legacy a; _hosting_is_legacy b` reads as 1
+#                 and the assertion stays green with the call duplicated.
+#                 Occurrences, not lines.
+#
+#   PLACEMENT   — "…the startup sweep", i.e. once per LIFECYCLE and not per
+#                 CYCLE. No count of any kind answers this: relocating the one
+#                 call into the cycle loop leaves every global count at 1 and
+#                 the notice nags forever. The count is therefore paired with a
+#                 REGION-scoped census below, which is the form that does pin
+#                 it: membership-in-a-region IS a census question, and its
+#                 expectation is ZERO — the one direction immune to the
+#                 line-vs-occurrence defect above, since any occurrence yields
+#                 at least one line.
+#
+# This is NOT a behavioural test and does not claim to be. main.sh runs its
+# whole loop at source time, so the property is not drivable without extracting
+# a seam; the region census is the strongest textual proxy available and its
+# limit is stated rather than implied: it sees a relocation INTO the cycle
+# loop, and does not see one into any other per-cycle path main.sh may grow.
+
+# _occurrences <pattern> <file> — OCCURRENCES, not lines (your-org/nexus-code#1026).
+# `grep -o` prints one line per MATCH. On no match it prints nothing and exits
+# 1, so this yields 0 — a replacement, not an appended second value, which is
+# why no `|| echo 0` belongs here (your-org/nexus-code#725).
+_occurrences() { grep -o -- "$1" "$2" 2>/dev/null | wc -l | tr -d ' '; }
+
+# _cycle_loop_body <file> — main.sh's per-cycle loop, addressed by its unique
+# top-level anchor rather than by a line number. Checked, not assumed: `^while
+# true; do` and its `^done` each occur exactly once in main.sh, asserted below
+# so this helper reddens if that stops being true instead of silently
+# returning the wrong region.
+_cycle_loop_body() { sed -n '/^while true; do/,/^done/p' "$1"; }
+
+n_anchor=$(grep -c '^while true; do' "$MAIN")
+if [[ "$n_anchor" == "1" ]]; then
+    pass "main.sh's cycle-loop anchor is unique (the region census below addresses a real region)"
 else
-    fail "expected exactly one detect+render site in main.sh (got detect=$n_detect render=$n_render)"
+    fail "cycle-loop anchor is not unique (got $n_anchor) — the region census below is meaningless"
+fi
+
+n_detect=$(_occurrences '_hosting_is_legacy ' "$MAIN")
+n_render=$(_occurrences '_hosting_render_migration_notice ' "$MAIN")
+if [[ "$n_detect" == "1" && "$n_render" == "1" ]]; then
+    pass "main.sh calls each hosting helper exactly ONCE (occurrences, not lines)"
+else
+    fail "expected exactly one detect+render call in main.sh (got detect=$n_detect render=$n_render)"
+fi
+
+_loop_body=$(_cycle_loop_body "$MAIN")
+n_detect_loop=$(printf '%s\n' "$_loop_body" | grep -c '_hosting_is_legacy ' || true)
+n_render_loop=$(printf '%s\n' "$_loop_body" | grep -c '_hosting_render_migration_notice ' || true)
+if [[ "$n_detect_loop" == "0" && "$n_render_loop" == "0" ]]; then
+    pass "neither hosting helper is called from the CYCLE loop (once per lifecycle, not per cycle)"
+else
+    fail "hosting helper called from the cycle loop — the notice would nag every cycle (detect=$n_detect_loop render=$n_render_loop)"
 fi
 
 # compose_report must own a dedicated section for it…

@@ -110,7 +110,13 @@ assert_file_exists "authorized_keys written" "$AK"
 line=$(grep 'alice@nexus-remote' "$AK")
 assert_contains "enrolled line uses the CHANNEL forced command" "$line" "remote-forced-command.sh alice"
 assert_contains "enrolled line carries restrict"                "$line" "restrict"
-assert_contains "enrolled line carries the CLIENT key"          "$line" "$(awk '{print $2}' "$WORK/client.pub")"
+# EMPTY needle => vacuous PASS (`grep -qF ""` matches any non-empty haystack),
+# and the ssh-keygen that writes client.pub has its rc unchecked
+# (your-org/nexus-code `#1024`). Prove the needle before trusting the match.
+_client_key=$(awk '{print $2}' "$WORK/client.pub" 2>/dev/null)
+assert_eq "client pubkey field is non-empty (else the next assert is vacuous)" \
+    "$([ -n "$_client_key" ] && echo yes || echo no)" "yes"
+assert_contains "enrolled line carries the CLIENT key"          "$line" "$_client_key"
 assert_eq "token consumed (window closed)" "$(pending_count)" "0"
 assert_eq "enroll line pruned after consume" "$(enroll_lines)" "0"
 
@@ -213,6 +219,81 @@ else printf '  PASS: no plaintext token persisted on disk\n'; PASS=$((PASS+1)); 
 if grep -rqF 'BEGIN OPENSSH PRIVATE KEY' "$PDIR" 2>/dev/null; then
     printf '  FAIL: an enroll PRIVATE key was found on disk under principals_dir\n' >&2; FAIL=$((FAIL+1))
 else printf '  PASS: no enroll private key persisted on disk\n'; PASS=$((PASS+1)); fi
+
+echo "== 14. 'COULD NOT DETERMINE' IS NOT 'REFUSED' (your-org/nexus-code#1189) =="
+# WHAT THIS SECTION IS ABOUT. This suite went red exactly once inside a
+# `--jobs 4` band — `FAIL: valid self-enroll rc0 — rc 3 want 0`, then three
+# consequent failures because authorized_keys was never written — and 4/4 green
+# standalone. The flake itself is NOT reproduced here and is not what these
+# assertions test: `/proc/loadavg` is not namespaced, so the pressure came from
+# other tenants of the shared node and cannot be summoned on demand.
+#
+# What IS testable, and is the actual defect, is the ARTEFACT: two conditions in
+# which nothing about the token was examined were both published as a verdict
+# ABOUT THE TOKEN. That is testable deterministically by making each condition
+# happen on purpose, and it is the fix that matters — a retry or a loosened
+# assertion would have converted a real signal into a permanent green, which is
+# this bundle's own defect class manufactured deliberately.
+SHIM="$WORK/shim"; mkdir -p "$SHIM"
+# (a) the hashing tool RUNS AND PRODUCES NOTHING — the fork-failure signature.
+printf '#!/bin/sh\nexit 1\n' > "$SHIM/sha256sum"; chmod +x "$SHIM/sha256sum"
+o9=$(inv judy); t9=$(tokof "$o9"); H9=$(hashof "$t9")   # hashof BEFORE the shim is on PATH
+PATH="$SHIM:$PATH" sess "$H9" "" "$(printf '%s\n%s' "$t9" "$CPUB")" >/dev/null 2>&1
+_rc_nohash=$?
+assert_rc "unhashable token → rc6 (NOT rc3 'does not match')" "$_rc_nohash" "6"
+assert_not_contains "judy NOT enrolled when the hash could not be computed" "$(cat "$AK")" "judy@nexus-remote"
+assert_eq "judy's token NOT burned by an internal failure" \
+    "$(ls "$PDIR/enroll/$H9.token" 2>/dev/null | wc -l | tr -d ' ')" "1"
+# (b) THE ARM AN EMPTINESS CHECK CANNOT REACH. A TRUNCATED hash is non-empty,
+# so `[[ -z "$h" || "$h" != "$HASH" ]]` passes its first test, fails its second,
+# and reports a wrong token with total confidence. Only a SHAPE check sees it.
+printf '#!/bin/sh\nprintf "%%s  -\\n" deadbeef\n' > "$SHIM/sha256sum"
+PATH="$SHIM:$PATH" sess "$H9" "" "$(printf '%s\n%s' "$t9" "$CPUB")" >/dev/null 2>&1
+assert_rc "TRUNCATED hash → rc6 (the arm -z can never reach)" "$?" "6"
+rm -f "$SHIM/sha256sum"
+# (c) CONTROL — the same call with no shim ENROLLS. Without this the two rc6
+# assertions above would also hold for a session that refused everything, and a
+# potency control that never invokes the success path proves nothing.
+sess "$H9" "" "$(printf '%s\n%s' "$t9" "$CPUB")" >/dev/null 2>&1
+_rc_ok=$?
+assert_rc "CONTROL: unshimmed, the identical call enrolls (rc0)" "$_rc_ok" "0"
+assert_contains "…and judy IS in authorized_keys" "$(cat "$AK")" "judy@nexus-remote"
+# (d) CONTROL — a REAL mismatch is still rc3. The new arm must not have
+# swallowed the verdict it was carved out of.
+o10=$(inv ken); t10=$(tokof "$o10"); H10=$(hashof "$t10")
+o11=$(inv leo); t11=$(tokof "$o11")
+sess "$H10" "" "$(printf '%s\n%s' "$t11" "$CPUB")" >/dev/null 2>&1
+_rc_mismatch=$?
+assert_rc "CONTROL: a genuine token mismatch is STILL rc3" "$_rc_mismatch" "3"
+
+# (e) the CHILD fails for a NON-TOKEN reason. `remote-enroll.sh`'s `die` exits
+# 1, and `_with_ak_lock` turns a lock it cannot take into rc 9 -> die -> 1. A
+# flock that refuses models the loaded-host lock contention exactly, and the old
+# tail collapsed it into `exit 3` — "the token is invalid, expired, or already
+# used" — for a token that was perfectly valid.
+printf '#!/bin/sh\nexit 1\n' > "$SHIM/flock"; chmod +x "$SHIM/flock"
+o12=$(inv mabel); t12=$(tokof "$o12"); H12=$(hashof "$t12")
+_ak_before=$(grep -c . "$AK" 2>/dev/null; true)
+PATH="$SHIM:$PATH" sess "$H12" "" "$(printf '%s\n%s' "$t12" "$CPUB")" >/dev/null 2>&1
+_rc_lock=$?
+assert_rc "child write/lock failure → rc7 (NOT rc3 'token invalid')" "$_rc_lock" "7"
+assert_not_contains "mabel NOT enrolled — rc7 is still FAIL-CLOSED" "$(cat "$AK")" "mabel@nexus-remote"
+assert_eq "no line added to authorized_keys under rc7" "$(grep -c . "$AK" 2>/dev/null; true)" "$_ak_before"
+rm -f "$SHIM/flock"
+# (f) CONTROL — with flock unshimmed the same principal's next invite enrolls,
+# so the rc7 above is attributable to the shim and not to anything ambient.
+o13=$(inv nora); t13=$(tokof "$o13"); H13=$(hashof "$t13")
+sess "$H13" "" "$(printf '%s\n%s' "$t13" "$CPUB")" >/dev/null 2>&1
+assert_rc "CONTROL: unshimmed flock, the identical shape enrolls (rc0)" "$?" "0"
+# (g) THE FOUR OUTCOMES MUST BE FOUR, and this reads the rcs THIS RUN OBSERVED
+# — not four literals compared with themselves, which would assert nothing and
+# would be exactly the vacuous green this bundle exists to remove. Success,
+# token-refused, cannot-hash and cannot-write are the four situations an
+# operator has to tell apart; the old code published one token for all four.
+_rc_seen=$(printf '%s\n' "$_rc_ok" "$_rc_mismatch" "$_rc_nohash" "$_rc_lock" | sort -u | tr '\n' ' ')
+assert_eq "the 4 observed outcomes are 4 DISTINCT rcs, not one collapsed token" \
+    "$_rc_seen" "0 3 6 7 "
+rmdir "$SHIM" 2>/dev/null || true
 
 # ──────────────────────────────────────────────────────────────────────
 # LIVE-sshd integration (opt-in): prove the ROOT CAUSE (sshd refuses the

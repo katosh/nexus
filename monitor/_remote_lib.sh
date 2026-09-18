@@ -296,7 +296,21 @@ _remote_port_is_held() {
         0) return 1 ;;   # we bound it — nothing holds it
         1) return 0 ;;   # EADDRINUSE — genuinely held
     esac
-    ( exec 3<>"/dev/tcp/$host/$port" ) 2>/dev/null && return 0
+    # your-org/nexus-code#1028 — BOUNDED. This is the fall-through the bind
+    # probe reaches for a NON-LOCAL address (EADDRNOTAVAIL is neither 0 nor 1),
+    # which is precisely the routable-bind_address case, and it used to be an
+    # unbounded connect. `remote-up.sh` blew a 90s and a 150s cap on it.
+    _remote_tcp_probe "$host" "$port"
+    case $? in
+        0) return 0 ;;   # something answered — held
+        2) # TIMED OUT. Not "free" — we could not determine. The public contract
+           # here is two-valued, so this falls through to the `ss` check and
+           # then reports not-held; what must not happen is doing that SILENTLY,
+           # because the caller is about to bind and the operator needs to know
+           # the probe was blind rather than negative.
+           printf 'remote: WARNING — TCP probe of %s:%s TIMED OUT after %ss; occupancy is UNKNOWN, not free (your-org/nexus-code#1028)\n' \
+               "$host" "$port" "$(_remote_connect_timeout)" >&2 ;;
+    esac
     if command -v ss >/dev/null 2>&1; then
         ss -ltnH 2>/dev/null | awk -v p=":$port\$" '$4 ~ p {f=1} END{exit !f}' && return 0
     fi
@@ -374,6 +388,59 @@ _remote_from_cidr()     { _remote_cfg monitor.remote.from_cidr      MONITOR_REMO
 # SILENT (pathological) listener can stall a failing check. 3s proved too
 # tight for a CPU-starved prober on a loaded shared host.
 _remote_health_timeout() { _remote_cfg monitor.remote.health_timeout MONITOR_REMOTE_HEALTH_TIMEOUT 10; }
+
+# ── BOUNDED TCP CONNECT (your-org/nexus-code#1028) ───────────────────────
+#
+# A CONNECT WITH NO TIMEOUT IS A HANG, NOT A WAIT. Bash's `/dev/tcp` has no
+# ConnectTimeout equivalent: it blocks for the kernel's SYN retry budget, which
+# is `/proc/sys/net/ipv4/tcp_syn_retries` — **6** on this host, i.e. ~127s per
+# connect. Measured here, varying only the cap:
+#
+#     timeout  3  …/dev/tcp/203.0.113.1/22  -> rc 124, elapsed  3s
+#     timeout  8  …                         -> rc 124, elapsed  8s
+#     timeout 20  …                         -> rc 124, elapsed 20s
+#
+# Elapsed tracks the cap EXACTLY and rc is 124 (timeout's own code) every time,
+# so the connect never returns on its own. An earlier figure of "8.01s per
+# connect" was the INSTRUMENT, not the phenomenon — it was an 8s cap firing —
+# and it understated the defect by a factor of ~16. The control matters as much:
+# a REFUSED connect (127.0.0.1:1) returns in 0s. Only a BLACKHOLING address
+# hangs, which is exactly what a routable `bind_address` becomes when a NIC is
+# renumbered, a VLAN changes, or an octet is typo'd.
+#
+# THREE-VALUED ON PURPOSE. "timed out" is not "nothing is listening"; collapsing
+# them is the confident-negative shape this repo keeps filing. Callers that only
+# need a boolean can fold rc 2 themselves, but they have to do it in the open.
+#
+#   rc 0  connected
+#   rc 1  refused / unreachable — a POSITIVE answer
+#   rc 2  TIMED OUT — could not determine
+_remote_connect_timeout() { _remote_cfg monitor.remote.connect_timeout REMOTE_CONNECT_TIMEOUT 3; }
+
+_remote_tcp_probe() {
+    local host="${1:?host}" port="${2:?port}" t
+    t=$(_remote_connect_timeout)
+    # A non-numeric or zero knob must not DISABLE the bound — that would restore
+    # the hang through a config typo, silently.
+    [[ "$t" =~ ^[0-9]+$ ]] && (( t > 0 )) || t=3
+    if command -v timeout >/dev/null 2>&1; then
+        # host/port as ARGUMENTS, never interpolated into the -c string: a
+        # crafted host would otherwise be shell code inside the probe.
+        timeout "$t" bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$host" "$port" 2>/dev/null
+        case $? in
+            0)   return 0 ;;
+            124) return 2 ;;
+            *)   return 1 ;;
+        esac
+    fi
+    # No `timeout` binary: the pre-#1028 behaviour, unbounded. Degrading to the
+    # old hang is worse than degrading to a wrong answer would be, so say so
+    # once rather than hanging silently.
+    printf 'remote: WARNING — no `timeout` binary; the TCP probe of %s:%s is UNBOUNDED and may block for the kernel SYN budget (your-org/nexus-code#1028)\n' \
+        "$host" "$port" >&2
+    ( exec 3<>"/dev/tcp/$host/$port" ) 2>/dev/null && return 0
+    return 1
+}
 
 # ── the DURABLE alert target (your-org/nexus-code#757) ───────────────────
 # The issue thread on which a recorded port change is announced. There is no
@@ -724,6 +791,7 @@ _REMOTE_FROM_AUDIT_ABSENT=""
 _REMOTE_FROM_AUDIT_MISMATCH=""
 _REMOTE_FROM_AUDIT_UNENFORCED=""
 _REMOTE_FROM_AUDIT_NOWRAPPER=""
+_REMOTE_FROM_AUDIT_UNPINNED_PRINCIPALS=""
 # $1 — the from= value a line MUST carry to count as pinned. Defaults to what
 # `ng remote enroll` would write RIGHT NOW, i.e. the POSTURE-AWARE pin list, not
 # the raw configured cidr (your-org/nexus-code#902). On a routable bind the two
@@ -735,7 +803,7 @@ _remote_from_audit() {
     local cidr="${1:-$(_remote_from_pin_list)}"
     _REMOTE_FROM_AUDIT_TOTAL=0; _REMOTE_FROM_AUDIT_OK=0
     _REMOTE_FROM_AUDIT_ABSENT=""; _REMOTE_FROM_AUDIT_MISMATCH=""; _REMOTE_FROM_AUDIT_UNENFORCED=""
-    _REMOTE_FROM_AUDIT_NOWRAPPER=""
+    _REMOTE_FROM_AUDIT_NOWRAPPER=""; _REMOTE_FROM_AUDIT_UNPINNED_PRINCIPALS=""
     local ak; ak="$(_remote_principals_dir)/authorized_keys"
     # ABSENT ⇒ nothing enrolled ⇒ nothing to enforce (rc 2). But PRESENT-and-
     # UNREADABLE must NOT read as "every line carries the pin": the `while read`
@@ -801,6 +869,29 @@ _remote_from_audit() {
                     ;;
             esac
         fi
+        # THE PRINCIPAL, not just the line number. The remediation this audit
+        # prints is `--principal <name>`, and a diagnosis that reports only line
+        # numbers cannot fill it — the operator has to go read authorized_keys
+        # themselves at exactly the moment they are already stuck. A channel line
+        # carries its principal as the forced command's argument. Enroll-only
+        # lines name the enroll session with a token HASH, not a principal, so
+        # they are deliberately excluded.
+        # CAPTURE BEFORE VALIDATING. `_remote_valid_principal` runs its own
+        # `[[ =~ ]]`, which CLOBBERS BASH_REMATCH — so
+        # `_remote_valid_principal "${BASH_REMATCH[2]}" && x="${BASH_REMATCH[2]}"`
+        # validates the right string and then assigns the WRONG one (empty, in
+        # practice). Measured here: the guard passed and the principal still came
+        # out blank, silently degrading every refusal to line numbers. Copy the
+        # captures into locals the moment the match succeeds.
+        local _princ="" _cmdpath="" _cmdarg=""
+        if [[ "$opts" =~ command=\"([^\"[:space:]]+)[[:space:]]+([^\"[:space:]]+)\" ]]; then
+            _cmdpath="${BASH_REMATCH[1]}"; _cmdarg="${BASH_REMATCH[2]}"
+            case "$_cmdpath" in
+                */remote-forced-command.sh)
+                    _remote_valid_principal "$_cmdarg" && _princ="$_cmdarg" ;;
+            esac
+        fi
+
         if (( have_from )) && [[ "$from_val" == "$cidr" ]]; then
             _REMOTE_FROM_AUDIT_OK=$((_REMOTE_FROM_AUDIT_OK+1))
             continue
@@ -810,6 +901,15 @@ _remote_from_audit() {
         else
             _REMOTE_FROM_AUDIT_ABSENT="${_REMOTE_FROM_AUDIT_ABSENT:+$_REMOTE_FROM_AUDIT_ABSENT }$lineno"
         fi
+        # Unpinned principals, deduped. A line whose principal we could not read
+        # is recorded as `line<N>` rather than dropped: an unnameable credential
+        # must still appear in the refusal, or the enumeration silently shrinks
+        # to the ones that happened to parse.
+        local _tag="${_princ:-line$lineno}"
+        case " $_REMOTE_FROM_AUDIT_UNPINNED_PRINCIPALS " in
+            *" $_tag "*) ;;
+            *) _REMOTE_FROM_AUDIT_UNPINNED_PRINCIPALS="${_REMOTE_FROM_AUDIT_UNPINNED_PRINCIPALS:+$_REMOTE_FROM_AUDIT_UNPINNED_PRINCIPALS }$_tag" ;;
+        esac
         (( forced )) || _REMOTE_FROM_AUDIT_UNENFORCED="${_REMOTE_FROM_AUDIT_UNENFORCED:+$_REMOTE_FROM_AUDIT_UNENFORCED }$lineno"
     done < "$ak"
     [[ -z "$_REMOTE_FROM_AUDIT_ABSENT$_REMOTE_FROM_AUDIT_MISMATCH" ]]
@@ -1090,6 +1190,60 @@ _remote_live_host_key() {
 # verified-then-denied, key-mismatch and bad-signature, so an exit-code check
 # would collapse the three states that matter. Verified on OpenSSH 7.6p1 (the
 # sandbox floor) and valid on 9.x.
+
+# ── POSITIVE CONTROL ON THE INSTRUMENT (your-org/your-nexus#331) ────────
+# Can this ssh client RUN AT ALL? A local, network-free invocation of the very
+# binary the verdict probe uses, so a client that aborts before reaching the
+# wire is detected as such instead of having its startup message read as a
+# protocol outcome.
+#
+# WHY `command -v` WAS NOT ENOUGH, measured on the live nexus 2026-08-24:
+# name-service resolution for our own uid failed inside the sandbox (`getent
+# passwd 71780` rc 2), and `ssh`/`ssh-keygen` call `getpwuid()` at startup and
+# abort — while `ssh-keyscan`, which does not, kept working. `command -v ssh`
+# succeeded throughout: the binary was PRESENT and merely refused to RUN.
+# Presence is a proxy for usability and the two came apart.
+#
+#     ssh -V   → No user exists for uid 71780   (rc 255)
+#
+# `-V` is the check because it is the cheapest invocation that still traverses
+# the startup path where that abort lives (≈5 ms, no socket, no config, no
+# fork). Measured BOTH ways on this host: rc 255 with the wording above while
+# the passwd record was missing, rc 0 printing `OpenSSH_7.6p1 …` after it was
+# repaired — so it discriminates the condition it is here to detect.
+#
+# THIS IS NOT A WORDING MATCH, and that is the entire point. Adding
+# `No user exists for uid` to the probe's matched strings would make the next
+# unlisted startup failure fall through to hostile again — the same defect class
+# `#609` F9 already recorded one round of. The axis the mechanism varies on is
+# whether the instrument executed, so that is the axis this measures.
+#
+# HONEST LIMITS. It is NECESSARY, NOT SUFFICIENT: a client that starts and then
+# fails at, say, key exchange for a local reason still reaches the terminal arm
+# and is still called hostile. And an `ssh` that does not accept `-V` at all
+# (dropbear's `dbclient`) reads as not-potent, which yields UNKNOWN rather than
+# a verdict — a false don't-know, which is the safe direction to be wrong in and
+# is what `health_require_identity` exists to let an operator resolve.
+#
+#   rc 0 = the client ran
+#   rc 1 = it did not; _REMOTE_SSH_POTENCY_DETAIL carries its own diagnostic
+_REMOTE_SSH_POTENCY_DETAIL=""
+_remote_ssh_client_potent() {
+    local bin="${1:?bin}" out rc
+    _REMOTE_SSH_POTENCY_DETAIL=""
+    # Bounded: a wedged binary must not hang a healthcheck. `-V` neither forks
+    # nor opens a socket, so this ceiling is never reached by a working client.
+    if command -v timeout >/dev/null 2>&1; then
+        out=$(timeout 5 "$bin" -V </dev/null 2>&1); rc=$?
+    else
+        out=$("$bin" -V </dev/null 2>&1); rc=$?
+    fi
+    (( rc == 0 )) && return 0
+    out="${out//$'\n'/ }"
+    _REMOTE_SSH_POTENCY_DETAIL="${out:-produced no output (exit $rc)}"
+    return 1
+}
+
 _REMOTE_VERIFY_DETAIL=""
 _remote_verify_live_host_key() {
     local host="${1:?host}" port="${2:?port}" tmo="${3:-10}"
@@ -1177,30 +1331,143 @@ _remote_verify_live_host_key() {
             _REMOTE_VERIFY_DETAIL="could not reach ${host}:${port} (${out//$'\n'/ })"
             return 2 ;;
     esac
+    # ── THE INSTRUMENT GATE (your-org/your-nexus#331) ──────────────────
+    # EVERYTHING BELOW THIS LINE INTERPRETS `$out` AS A PROTOCOL OUTCOME, and
+    # both arms are strong claims: empty output is read as VERIFIED OURS, and
+    # anything else as DEFINITE FOREIGN. Both rest on one unstated premise —
+    # that the client actually executed a key exchange. When it aborts at
+    # startup for a purely LOCAL reason the premise fails SILENTLY: the arms
+    # above match nothing, no rc-2 guard fires, and an accident is published as
+    # a verdict. That is exactly what happened on 2026-08-24, where a corrupted
+    # passwd file inside the sandbox turned a ten-day-old healthy daemon into
+    # `a FOREIGN sshd holds 127.0.0.1:22100` for 22 minutes — while the daemon
+    # served continuously (pid 19516, same LISTEN inode, never restarted).
+    #
+    # So establish the premise before either arm is trusted. A probe that could
+    # not execute yields UNKNOWN — rc 2, the ONE operator-overridable verdict,
+    # which is what `health_require_identity` was built for and which this path
+    # bypassed by construction.
+    #
+    # PLACEMENT IS THE COST ARGUMENT. Every CLASSIFIED outcome — verified,
+    # forgery, key-mismatch, handshake-failure, unreachable — has already
+    # returned above, so a healthy endpoint NEVER reaches this line and pays
+    # nothing. `#431`/`#434` cut the banner probe to one connect per attempt to
+    # stop starving sshd's `MaxStartups=3`; this check adds no connect at all,
+    # on any path, and adds no work whatsoever to the green path.
+    if ! _remote_ssh_client_potent "$sshbin"; then
+        _REMOTE_VERIFY_DETAIL="the ssh client ($sshbin) could not run at all — it is PRESENT but aborts at startup (${_REMOTE_SSH_POTENCY_DETAIL}), so its output describes OUR TOOLING, not the endpoint. No key exchange was attempted; nothing here is evidence about who holds ${host}:${port}."
+        return 2
+    fi
     # A session must never actually open — we offered no auth method. If it
     # somehow did, the kex verified, so report ours rather than inventing doubt.
+    # Reachable only once the instrument is known to run, so a broken client
+    # exiting 0 in silence can no longer manufacture a FALSE GREEN — the one
+    # place this defect could have failed OPEN rather than hostile.
     if [[ -z "$out" ]]; then
         _REMOTE_VERIFY_DETAIL="host-key signature verified (probe returned no diagnostic)"
         return 0
     fi
-    # TERMINAL ARM — fail CLOSED, definite. We reached something (ssh produced a
-    # diagnostic) and could not establish it is ours. Every genuine UNKNOWN
-    # already returned 2 EARLIER: no ssh client, no host key, mktemp failure, and
-    # the explicit unreachable set (refused / timed out / unresolvable). So rc 2
-    # means "could not reach, or no tooling" and rc 1 means "reached it, not
-    # verified" — which keeps the knob's documented scope honest.
+    # TERMINAL ARM — fail CLOSED, definite. A WORKING client reached something
+    # and could not establish it is ours. Every genuine UNKNOWN already returned
+    # 2 EARLIER: no ssh client, no host key, mktemp failure, the explicit
+    # unreachable set (refused / timed out / unresolvable), and — since
+    # your-org/your-nexus#331 — an ssh client that could not RUN. So rc 2 means
+    # "could not reach, no tooling, or the instrument never executed" and rc 1
+    # means "the instrument ran, reached it, and did not verify it" — which
+    # keeps the knob's documented scope honest.
+    #
+    # The `#609` F9 asymmetry is UNCHANGED and must stay that way: an
+    # unclassified PROTOCOL outcome is still hostile, still definite, still not
+    # overridable. What #331 removed is the class of input that was never a
+    # protocol outcome in the first place. `test-remote-instrument-potency.sh`
+    # case 2 is the negative control — a client that RUNS and emits an
+    # unclassified diagnostic must still land here — and it is what makes
+    # "delete the terminal arm" fail as a fix for #331.
     _REMOTE_VERIFY_DETAIL="reached the listener but could not verify it is ours; unclassified probe result: ${out//$'\n'/ }"
     return 1
 }
 
-# SHA256 fingerprint of a "<type> <blob>" pair, for human-facing output.
-_remote_fingerprint_of() {
-    command -v ssh-keygen >/dev/null 2>&1 || return 1
-    local kv="${1:-}"; [[ -n "$kv" ]] || return 1
-    local tf; tf=$(mktemp) || return 1
-    printf '%s live-endpoint\n' "$kv" > "$tf"
-    local fp; fp=$(ssh-keygen -lf "$tf" 2>/dev/null | awk '{print $2}')
+# SHA256 fingerprint of a base64 key BLOB, computed WITHOUT ssh-keygen
+# (your-org/your-nexus#331). OpenSSH's SHA256 fingerprint is defined as
+# base64(sha256(the raw key bytes)) with `=` padding stripped — no ssh-keygen
+# required, and nothing here calls getpwuid.
+#
+# VALIDATED AGAINST THE ORACLE, not derived from the spec: run on this nexus's
+# own host key once ssh-keygen was usable again, all three implementations
+# below and `ssh-keygen -lf` agree exactly —
+#   SHA256:sJgWWLNCYqaaUyqCWv/MMWUiT53sHF9v9eq2w7WOYjU
+# `test-remote-instrument-potency.sh` re-runs that known-answer comparison
+# wherever ssh-keygen is present, so the equivalence is checked rather than
+# asserted, and a divergence reddens instead of silently printing a wrong
+# fingerprint (which is worse than printing `?`).
+_remote_fingerprint_sha256() {
+    local b="${1:-}" fp="" tf brc
+    [[ -n "$b" ]] || return 1
+    # ── DECODE FIRST, AND REFUSE ANYTHING THE DECODER REJECTED ──────────
+    # This guard is your-org/your-nexus#331's own defect, one layer down, and it
+    # was live in the first draft of this function (sk-sshhealth F2). Piping
+    # straight into the digest meant `base64 -d` could FAIL, emit nothing, and
+    # the hash of the EMPTY STREAM would be returned at rc 0:
+    #
+    #     '!!!not-base64!!!'  → SHA256:47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU
+    #     'AAAA BBBB'         → the same value as 'AAAA' (partial decode, rc 1 ignored)
+    #
+    # 47DEQpj8… is the SHA-256 of the empty string, so EVERY unparseable blob
+    # rendered identically and two different malformed keys were
+    # indistinguishable — a comparison of two unknowns, reported as an
+    # identification, which is the exact shape of the emit this issue exists to
+    # fix. It cannot move a verdict (the verdict compares BLOBS, not
+    # fingerprints), but it lands in the operator-facing string a human reads
+    # before deciding whether to run a destructive remedy, which is the decision
+    # this whole incident turned on. `?` is the correct answer for input we
+    # cannot parse; a confident wrong number is strictly worse than `?`.
+    #
+    # BOTH halves are load-bearing, measured on this host: a real ed25519 blob
+    # decodes at rc 0, `'!!!not-base64!!!'` yields rc 1 AND zero bytes, and
+    # `'AAAA BBBB'` yields rc 1 with a PARTIAL 3-byte decode — which the
+    # emptiness test alone would wave through.
+    tf=$(mktemp) || return 1
+    printf '%s' "$b" | base64 -d > "$tf" 2>/dev/null
+    brc=${PIPESTATUS[1]}
+    if (( brc != 0 )) || [[ ! -s "$tf" ]]; then rm -f "$tf"; return 1; fi
+    if command -v openssl >/dev/null 2>&1; then
+        fp=$(openssl dgst -sha256 -binary < "$tf" 2>/dev/null | base64 2>/dev/null | tr -d '=\n')
+    fi
+    if [[ -z "$fp" ]] && command -v sha256sum >/dev/null 2>&1 && command -v xxd >/dev/null 2>&1; then
+        fp=$(sha256sum < "$tf" 2>/dev/null | cut -d' ' -f1 | xxd -r -p 2>/dev/null \
+             | base64 2>/dev/null | tr -d '=\n')
+    fi
+    if [[ -z "$fp" ]] && command -v python3 >/dev/null 2>&1; then
+        fp=$(python3 -c 'import base64,hashlib,sys
+sys.stdout.write(base64.b64encode(hashlib.sha256(open(sys.argv[1],"rb").read()).digest()).decode().rstrip("="))' \
+             "$tf" 2>/dev/null)
+    fi
     rm -f "$tf"
+    [[ -n "$fp" ]] || return 1
+    printf 'SHA256:%s' "$fp"
+}
+
+# SHA256 fingerprint of a "<type> <blob>" pair, for human-facing output.
+#
+# ssh-keygen FIRST (it is the canonical spelling operators pin against), then
+# the ssh-keygen-free fallback. The order matters less than the fallback's
+# existence: on 2026-08-24 this function shelled out to ssh-keygen — one of the
+# two tools the passwd corruption broke — and returned `?` for a key it was
+# HOLDING AS TEXT, producing the emit `it presents ?, ours is ?`. A comparison
+# of two unknowns, reported as an identification.
+_remote_fingerprint_of() {
+    local kv="${1:-}"; [[ -n "$kv" ]] || return 1
+    local fp=""
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        local tf; tf=$(mktemp) || return 1
+        printf '%s live-endpoint\n' "$kv" > "$tf"
+        fp=$(ssh-keygen -lf "$tf" 2>/dev/null | awk '{print $2}')
+        rm -f "$tf"
+    fi
+    if [[ -z "$fp" ]]; then
+        local b; read -r _ b _ <<<"$kv"
+        fp=$(_remote_fingerprint_sha256 "$b") || return 1
+    fi
     [[ -n "$fp" ]] || return 1
     printf '%s' "$fp"
 }
@@ -1257,7 +1524,21 @@ _remote_identity_probe() {
         if (( lrc == 0 )); then
             _REMOTE_ID_LIVE_FP=$(_remote_fingerprint_of "$live" 2>/dev/null) || _REMOTE_ID_LIVE_FP="?"
             _REMOTE_ID_VERDICT="foreign"
-            _REMOTE_ID_REASON="a FOREIGN sshd holds ${host}:${port} — it presents $_REMOTE_ID_LIVE_FP, ours is $_REMOTE_ID_OURS_FP"
+            # COMPARE THE BLOBS WE ARE HOLDING (your-org/your-nexus#331). Both
+            # are plain text in hand; deciding "same key or not" needs no tool
+            # at all, and the old code answered it by shelling out to ssh-keygen
+            # and printing `?` twice. The two cases mean very different things
+            # and deserve different messages — but BOTH stay rc 1, because a
+            # blob match is NOT possession: our public host key is handed to
+            # clients out-of-band by design and is replayable by anyone
+            # (`#609` F1). A byte match here therefore SHARPENS the accusation
+            # rather than softening it.
+            if [[ "$live" == "$ours" ]]; then
+                _REMOTE_ID_LIVE_FP="$_REMOTE_ID_LIVE_FP (CLAIMED, NOT PROVEN)"
+                _REMOTE_ID_REASON="the listener on ${host}:${port} presents a host key BYTE-IDENTICAL to ours (${_REMOTE_ID_OURS_FP}) yet a WORKING ssh client did not confirm it holds the private half — $_REMOTE_VERIFY_DETAIL. Our public host key is published to clients by design, so presenting it proves nothing; an accidental port collision presents its OWN key. Treat as impersonation until explained."
+            else
+                _REMOTE_ID_REASON="a FOREIGN sshd holds ${host}:${port} — it presents $_REMOTE_ID_LIVE_FP, ours is $_REMOTE_ID_OURS_FP"
+            fi
         else
             _REMOTE_ID_VERDICT="foreign"
             _REMOTE_ID_REASON="the listener on ${host}:${port} presented NO usable ed25519 host key (a banner-only squatter or a failed key exchange) — a working daemon of ours always proves $_REMOTE_ID_OURS_FP"
@@ -1268,6 +1549,31 @@ _remote_identity_probe() {
     # "no tooling": both are unknown, and unknown is never silently healthy.
     _REMOTE_ID_VERDICT="indeterminate"
     _REMOTE_ID_REASON="cannot verify the endpoint's host key: $_REMOTE_VERIFY_DETAIL"
+    # SAY WHAT WE DO KNOW (your-org/your-nexus#331). `ssh-keyscan` does not call
+    # getpwuid and kept working throughout the incident, so on the very path
+    # where the ssh client is unusable the key blob is still readable — and the
+    # live blob was BYTE-IDENTICAL to ours the whole time. Reporting `? != ?`
+    # while holding both is what made a healthy endpoint look stolen.
+    #
+    # THE VERDICT DOES NOT MOVE. This is corroboration for the operator reading
+    # the emit, not evidence of possession — the same `#609` F1 asymmetry as
+    # above, in the other direction: a byte match cannot green an unknown any
+    # more than it can redden one. rc 2 stays rc 2, `health_require_identity`
+    # keeps its default-DOWN behaviour, and an operator who wants this endpoint
+    # accepted on protocol-plus-key-blob evidence must say so deliberately.
+    #
+    # One extra keyscan connect, on a FAILING path only — the same budget the
+    # rc-1 branch above already spends, and none of it on the green path.
+    live=$(_remote_live_host_key "$host" "$port" "$tmo"); lrc=$?
+    if (( lrc == 0 )); then
+        if [[ "$live" == "$ours" ]]; then
+            _REMOTE_ID_LIVE_FP="$_REMOTE_ID_OURS_FP"
+            _REMOTE_ID_REASON="$_REMOTE_ID_REASON — NOTE: the listener presents a host key BYTE-IDENTICAL to ours (${_REMOTE_ID_OURS_FP}), which is CONSISTENT with it being our daemon but is NOT proof (our public host key is published to clients by design and is replayable). Verdict stays UNKNOWN."
+        else
+            _REMOTE_ID_LIVE_FP=$(_remote_fingerprint_of "$live" 2>/dev/null) || _REMOTE_ID_LIVE_FP="?"
+            _REMOTE_ID_REASON="$_REMOTE_ID_REASON — NOTE: the listener presents ${_REMOTE_ID_LIVE_FP}, which DIFFERS from ours (${_REMOTE_ID_OURS_FP}). That is suggestive, not decisive: a key READ is replayable in both directions, so this stays UNKNOWN rather than becoming a foreign verdict."
+        fi
+    fi
     return 2
 }
 
@@ -1475,10 +1781,91 @@ _remote_bind_blocked_should_log() {
 # renderer is exercised from a fixture. Omitted ⇒ the port in force.
 _REMOTE_EP_BIND=""; _REMOTE_EP_PORT=""; _REMOTE_EP_USER=""; _REMOTE_EP_ENDPOINT=""
 _REMOTE_EP_FP=""; _REMOTE_EP_TUNNEL_LINE=""; _REMOTE_EP_REACH_HINT=""
+# ── the pin a client can actually APPLY (defect 4) ───────────────────────
+# A FINGERPRINT CANNOT SEED A known_hosts FILE. Handing a client `SHA256:…`
+# and telling it to pin with StrictHostKeyChecking=yes is unfollowable: a
+# client holding only a fingerprint has exactly one route to populate the pin —
+# connect once with accept-new (or answer the TOFU prompt) and compare
+# afterwards. That is TOFU against an endpoint this very skill warns may be
+# occupied by a co-tenant, and the old CLIENT.md said so out loud, recommending
+# `ssh-keyscan` as the seed. `ssh-keyscan` is documented HERE (see
+# _remote_live_host_key) as reporting the key a server CLAIMS, without verifying
+# any signature — it is explicitly NOT identity, and our public host key is not
+# secret, so anyone can replay it. Seeding a pin from it authenticates nothing.
+#
+# So publish the FULL PUBLIC KEY LINE. It is non-secret by construction (it is
+# the value the client pins), it can be pasted straight into known_hosts, and
+# the fingerprint stays beside it as a cross-check a human can eyeball. First
+# corroboration that this is the right shape: a client compared the published
+# line against a blob it had independently carried from an older known_hosts
+# and found them byte-identical — two independent paths agreeing on the pin,
+# which publishing a fingerprint alone cannot produce.
+_remote_host_key_line() { _remote_expected_host_key; }
+
+# ── a pin that survives a posture change (defect 5) ──────────────────────
+# `127.0.0.1` IS NOT AN IDENTITY on a host with a shared network namespace.
+# Every co-tenant sandbox is also 127.0.0.1, so a client watching two nexuses
+# gets colliding known_hosts entries for different daemons — and a pin recorded
+# under `[127.0.0.1]:<port>` is additionally coupled to an address and port that
+# CHANGE with posture, which is a supported operation here. Pinning under a
+# stable alias decouples the pin from the route: measured on a real migration,
+# a client pinned this way needed NO change at all when the endpoint moved,
+# while still refusing a co-tenant on the old address.
+#
+# The alias must be STABLE across posture changes and DISTINCT per endpoint, so
+# it is derived — never a literal. User + host do not move when a bind address
+# does. Falls back gracefully; the client only needs it to be consistent.
+_remote_host_key_alias() {
+    local u h
+    u=$(whoami 2>/dev/null || echo nexus)
+    h=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo sandbox)
+    printf 'nexus-%s-%s' "$u" "$h"
+}
+
+# ── chained jump hops (defect 6) ─────────────────────────────────────────
+# Site topologies routinely require MORE THAN ONE hop (bastion, then compute
+# node). A single `-J` assumes the compute node is directly reachable, which
+# off-site it is not. `-J` takes a COMMA-SEPARATED CHAIN, so the rendered line
+# carries whatever the operator configured, verbatim and in order.
+#
+# There is deliberately NO default: nexus-code is cloned by every operator and a
+# hop name here would hand one site's topology to another. Empty = no -J.
+# Env: MONITOR_REMOTE_JUMP_HOSTS.
+_remote_jump_hosts() { _remote_cfg monitor.remote.jump_hosts MONITOR_REMOTE_JUMP_HOSTS ""; }
+
 _remote_endpoint_params() {
     _REMOTE_EP_PORT="${1:-$(_remote_port)}"
     _REMOTE_EP_USER=$(whoami 2>/dev/null || echo "<SSH-USER>")
     _REMOTE_EP_FP=$(_remote_host_fingerprint)
+    _REMOTE_EP_HOSTKEY=$(_remote_host_key_line 2>/dev/null || true)
+    _REMOTE_EP_ALIAS=$(_remote_host_key_alias)
+    _REMOTE_EP_KNOWN_HOSTS_FILE='~/.ssh/known_hosts.nexus'
+    # The line a client appends VERBATIM. Keyed on the ALIAS, not on an address.
+    if [[ -n "$_REMOTE_EP_HOSTKEY" ]]; then
+        _REMOTE_EP_KNOWN_HOSTS_LINE="$_REMOTE_EP_ALIAS $_REMOTE_EP_HOSTKEY"
+    else
+        _REMOTE_EP_KNOWN_HOSTS_LINE=""
+    fi
+    # Jump chain, rendered only when configured.
+    local _hops; _hops=$(_remote_jump_hosts)
+    if [[ -n "$_hops" ]]; then
+        _REMOTE_EP_JUMP="-J $_hops "
+        _REMOTE_EP_JUMP_NOTE="via jump chain: $_hops (comma-separated, in order)"
+    else
+        _REMOTE_EP_JUMP=""
+        _REMOTE_EP_JUMP_NOTE="no jump hops configured (monitor.remote.jump_hosts is empty) — if your client needs a bastion, chain them comma-separated: -J hop1,hop2"
+    fi
+    # SELF-CONTAINED ssh options. The connect line must NOT depend on a
+    # client-side Host alias: site configs commonly carry wildcard stanzas like
+    # `Host <prefix>* …` with `HostName %h.<domain>`, and a FULLY-QUALIFIED name
+    # still matches the wildcard, so %h re-qualifies it — measured:
+    # `ssh -G <host>.<domain>` yields `hostname <host>.<domain>.<domain>` while
+    # `ssh -G <host>` is correct. The doubled suffix appears ONLY in `hostname`
+    # (`host` echoes the name as given), which is why the failure presents as a
+    # DNS error rather than a config error and survives review. Carrying the pin
+    # as explicit -o options makes the line independent of whatever the client's
+    # config does to the name.
+    _REMOTE_EP_SSH_OPTS="-o HostKeyAlias=$_REMOTE_EP_ALIAS -o UserKnownHostsFile=$_REMOTE_EP_KNOWN_HOSTS_FILE -o StrictHostKeyChecking=yes"
     # Posture-aware connect target: a routable LAN bind (Posture 1) is reached
     # DIRECTLY at that IP — no tunnel; a loopback bind (Posture 2) is reached at
     # localhost after an SSH forward.
@@ -1492,6 +1879,455 @@ _remote_endpoint_params() {
         _REMOTE_EP_TUNNEL_LINE="# LAN-direct bind: no tunnel needed — connect straight to $_REMOTE_EP_ENDPOINT:$_REMOTE_EP_PORT"
         _REMOTE_EP_REACH_HINT="LAN-direct bind — connect straight to $_REMOTE_EP_ENDPOINT:$_REMOTE_EP_PORT (no tunnel)"
     fi
+    # The one connect line, self-contained: identity file, port, jump chain,
+    # explicit pin options, target. Callers append the verb.
+    _REMOTE_EP_CONNECT="ssh -i ~/.ssh/nexus-remote -p $_REMOTE_EP_PORT ${_REMOTE_EP_JUMP}$_REMOTE_EP_SSH_OPTS $_REMOTE_EP_USER@$_REMOTE_EP_ENDPOINT"
+    # The VERIFICATION idiom. `-F /dev/null` ignores the client's own ssh_config,
+    # so `ssh -G` shows what the FORM does on a fresh client rather than what the
+    # author's personal config happens to make it do. Diffing the two is how the
+    # wildcard-collision class above is caught before it reaches anybody.
+    _REMOTE_EP_VERIFY_LINE="ssh -G -F /dev/null -p $_REMOTE_EP_PORT ${_REMOTE_EP_JUMP}$_REMOTE_EP_USER@$_REMOTE_EP_ENDPOINT | egrep '^(host|hostname|port|proxyjump|user) '"
+}
+
+# ══ POSTURE CHANGES MUST BE SEQUENCED, NOT MERELY REFUSED ════════════════
+# A LOCKED-OUT CLIENT CANNOT ASK THIS CHANNEL WHY IT IS LOCKED OUT. That one
+# sentence is the whole requirement, and a precondition that only REFUSES does
+# not satisfy it: refusing tells the OPERATOR something is wrong, but the moment
+# the posture actually changes, the very channel the client would use to ask
+# about the lockout is the thing that broke. A pre-pin credential fails exactly
+# this way — full pre-auth banner, then `Permission denied (publickey)`, with no
+# route to ask why.
+#
+# So the remedy has to be actionable IN THE RIGHT ORDER: issue the re-enrollment
+# invitation while the client can still reach the channel on the CURRENT
+# posture, let it self-enroll, and only then move. Note the printed remedy
+# elsewhere in this file is `revoke` THEN `enroll-invite` — destructive-first,
+# which is precisely the wrong order for a live client: it deletes the only
+# credential the client has before its replacement exists. The guard below makes
+# the SEQUENCE enforceable rather than the end state, by requiring that every
+# affected principal has ACTUALLY RE-ENROLLED before the move is applied.
+#
+# ── WHAT THIS GUARANTEES, AT THE WIDTH THE CODE ACTUALLY ENFORCES ────────
+# A guard whose stated guarantee exceeds its behaviour is worse than no guard,
+# because it gets relied on. The first version of this comment promised
+# "refuses while any enrolled principal would be stranded" while the code
+# released on a mere invitation EXISTING — a promise strictly wider than the
+# behaviour. Both have been brought to one width; where they still differ, the
+# narrower one is written here and is the truth.
+#
+# It REFUSES to apply a posture change when ALL of these hold:
+#   * the posture being applied is ROUTABLE, and
+#   * it DIFFERS from the recorded posture (a real move, not a re-run), and
+#   * a posture was recorded at all (see the baseline arm below), and
+#   * at least one enrolled credential does not carry the `from=` pin the new
+#     posture requires — i.e. re-enrolment is still outstanding for it.
+#
+# It does NOT gate, and these are limits, not oversights:
+#   * LOOPBACK target postures. With #902's posture-aware pin list a loopback
+#     peer stays inside the written pin, so a loopback move strands nobody.
+#   * A STEADY-STATE re-run. _remote_source_restriction_guard already covers
+#     that, and hard-refusing an endpoint that is already up and serving would
+#     turn a warning into an outage.
+#   * The FIRST run under this code, which has no recorded posture to compare
+#     against. That run warns per-principal and proceeds; the genuinely
+#     dangerous instance of it is refused earlier by _remote_bind_guard.
+#   * REACHABILITY. Strandedness is judged by the SOURCE PIN only. A move that
+#     leaves the pin intact but changes where the client must connect is not
+#     seen here.
+#   * The BIND ADDRESS, specifically — and this one falls between the two
+#     mechanisms, so it is named rather than left to be inferred.
+#     _remote_posture_signature records the bind CLASS, never the address:
+#     `bind 10.0.0.5 pin P` and `bind 10.0.0.6 pin P` both render
+#     `bind=routable pin=P`, so a routable->routable ADDRESS move is `old==new`
+#     and short-circuits BEFORE the credential audit even runs. The
+#     port-change-notify path does not cover it either: that fires only on
+#     PORT_CHANGED, and no bind address is recorded anywhere for a later run to
+#     compare. So the space divides as: notify covers the PORT, this guard
+#     covers the PIN, and the bind ADDRESS is covered by NEITHER. A client
+#     pinned to <old-addr>:<port> stops connecting, nothing warns, and by this
+#     guard's own founding sentence it cannot ask why.
+#
+#     Putting the address in the signature is a one-token change with a real
+#     cost — every address move would then demand a full re-enrolment round —
+#     so it is deliberately NOT done here, and the gap is disclosed instead. An
+#     enumeration that omits a member reads as exhaustive, which is how a scope
+#     claim becomes a false one.
+
+_remote_posture_file() { printf '%s/posture' "$(_remote_principals_dir)"; }
+
+# THE INVITATION MUST BE REACHABLE FROM WHERE THE CLIENT IS *NOW*, while the
+# credential it produces must fit where the endpoint is *GOING*. Those are two
+# different pins during a transition, and conflating them reproduces the very
+# lockout the invite-first ordering exists to prevent: once config has been
+# edited to a routable bind, `_remote_from_pin_list` returns only the LAN CIDR,
+# so an enroll line written with it REFUSES the client that is still arriving
+# over the old loopback carrier (peer 127.0.0.1) — pre-auth, before the enroll
+# session can run. The client then cannot enroll, cannot connect, and cannot ask
+# why.
+#
+# So the ENROLL line carries the UNION of the recorded posture's pin list and
+# the configured one; the PERMANENT line the enroll session reconstructs keeps
+# using `_remote_from_pin_list`, so it lands correct for the new posture. The
+# union is a superset only while a change is pending, and the enroll line is
+# single-use and pruned on consume/expiry, so the widening is bounded in both
+# scope and time. With no pending change the union equals the configured list
+# and nothing about the current behaviour moves.
+_remote_from_pin_list_transitional() {
+    local cur rec_pin rec
+    cur=$(_remote_from_pin_list) || return 1
+    rec=$(_remote_recorded_posture) || { printf '%s' "$cur"; return 0; }
+    rec_pin="${rec#*pin=}"
+    [[ -n "$rec_pin" && "$rec_pin" != "$rec" ]] || { printf '%s' "$cur"; return 0; }
+    [[ "$rec_pin" != "<invalid>" ]] || { printf '%s' "$cur"; return 0; }
+    [[ -n "$cur" ]] || { printf '%s' "$rec_pin"; return 0; }
+    # Append only the entries the current list does not already carry. Exact-token
+    # comparison, never CIDR containment math — same reasoning as
+    # _remote_from_pin_list: a redundant entry is safe, a missing one is a lockout.
+    local out="$cur" want
+    local IFS=,
+    for want in $rec_pin; do
+        [[ -n "$want" ]] || continue
+        case ",$out," in
+            *",$want,"*) ;;
+            *) out="$out,$want" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# The applied posture, as a comparable one-liner. Bind CLASS (not the literal
+# address) plus the effective pin list: those are exactly the two inputs that
+# decide whether an existing credential still reaches the auth stage.
+_remote_posture_signature() {
+    local bind cls pin
+    bind=$(_remote_bind_address)
+    if _remote_bind_is_loopback "$bind"; then cls=loopback; else cls=routable; fi
+    pin=$(_remote_from_pin_list) || pin="<invalid>"
+    printf 'bind=%s pin=%s' "$cls" "$pin"
+}
+
+_remote_recorded_posture() {
+    local f; f=$(_remote_posture_file)
+    [[ -r "$f" ]] || return 1
+    head -1 "$f" 2>/dev/null
+}
+
+_remote_record_posture() {
+    # `local f sig` on ONE line, declared BEFORE assignment. Written as
+    # `local f; f=$(...) sig` this parses as an assignment followed by the
+    # COMMAND `sig` — "sig: command not found", then `f` unbound under `set -u`,
+    # taking the whole bring-up down after the endpoint was already registered.
+    local f sig
+    f=$(_remote_posture_file)
+    sig=$(_remote_posture_signature)
+    local tmp="$f.tmp.$$"
+    printf '%s\n' "$sig" > "$tmp" 2>/dev/null || return 1
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; return 1; }
+}
+
+# ── THE COMMIT SEAM (S1) ─────────────────────────────────────────────────
+# THE INVARIANT: the posture file is written IF AND ONLY IF the endpoint is
+# serving. It is behavioural, and until this function existed there was nowhere
+# to observe it — the logic lived inline in a `cmd_up` that registers services
+# against a live endpoint, so no test could drive it. That absence is the whole
+# reason a TEXTUAL proxy got reached for, and why every version of that proxy
+# was defeatable:
+#
+#   * "the call site sits after the health gate"  — defeated by ADDING a second,
+#     earlier call site (the first-match blind spot).
+#   * "…and there is exactly ONE call site"       — defeated by moving that one
+#     site into the `else` arm: still one, still below the anchor, and the
+#     invariant is now INVERTED (recorded iff NOT serving). The assertion stays
+#     green. It also false-alarms on a reworded comment, so it is blind where it
+#     matters and noisy where it does not.
+#
+# No assertion over the TEXT of remote-up.sh can pin this. So the fix is a CODE
+# change, not a cleverer grep: extract the commit behind an injectable seam and
+# test the behaviour. `$@` is the health command, injected so a test can supply
+# /bin/true, /bin/false, or a missing binary.
+#
+#   rc 0 — serving, recorded.
+#   rc 1 — serving, but the write FAILED. The guarded direction: an absent
+#          record is not equal to anything, so the next run treats the posture
+#          as a change and the guard stays armed.
+#   rc 2 — NOT serving, deliberately not recorded. Includes a health probe that
+#          could not run at all, which is fail-closed for the same reason.
+#
+# ⚠ WHAT GUARDS THIS, AND WHAT THEY CANNOT GUARD — read before moving this call.
+#
+# `test-remote-posture-change.sh` holds two INDEPENDENT axes, and only one of
+# them is closed:
+#
+#   CENSUS  (closed)  — how many call sites exist, and in which files. Counted
+#                       by occurrence, over every production monitor/remote-*.sh.
+#                       Catches a direct writer call anywhere, a second seam
+#                       call (even sharing a line), and a call in a sibling
+#                       script.
+#   PLACEMENT (OPEN)  — whether the ONE call sits on the right branch. MOVE this
+#                       call out of remote-up.sh's health-gated commit block —
+#                       onto the routable branch with a `/bin/true` health
+#                       command, say — and the census is unchanged (one call,
+#                       zero direct writes), the whole suite is green, and the
+#                       endpoint records a posture unconditionally on every
+#                       routable bring-up. That is the original S1 hole. NO
+#                       COUNT CAN SEE IT: the attack is on WHERE, not HOW MANY.
+#
+# Only a behavioural test that drives a ROUTABLE path closes the placement axis.
+# That test is currently infeasible here, measured rather than assumed: the only
+# routable-CLASS addresses available are non-local and every reserved range
+# tested blackholes — the connect NEVER RETURNS ON ITS OWN, bounded only by the
+# kernel's SYN budget (`tcp_syn_retries` = 6 here, ~127s per connect). An
+# earlier revision of this comment said "8.01s per connect"; that was an 8s cap
+# firing, i.e. the instrument and not the phenomenon, and it understated the
+# hang by a factor of ~16 (your-org/nexus-code#1028's own correction).
+#
+# `_remote_port_is_held` is now BOUNDED (`_remote_tcp_probe`, default 3s,
+# `REMOTE_CONNECT_TIMEOUT` / `monitor.remote.connect_timeout`), so the hang that
+# made this axis infeasible is gone and a routable `cmd_up` fails fast and
+# loudly instead. Stubbing REMOTE_SSH_BIN / REMOTE_KEYSCAN_BIN used to only
+# relocate the hang; the identity probe is bounded too. The placement axis is
+# therefore now REACHABLE and remains open — the obstacle was removed, the test
+# was not written.
+#
+# SO: IF YOU MOVE THIS CALL, NO TEST WILL STOP YOU. Keep it inside the
+# health-gated commit block in remote-up.sh's cmd_up, and if you must move it,
+# close the placement axis first.
+_remote_commit_posture() {
+    "$@" >/dev/null 2>&1 || return 2      # not serving: deliberately NOT recorded
+    _remote_record_posture || return 1    # serving but the write failed
+    return 0
+}
+
+# Principals with a LIVE (unexpired, unconsumed) enrollment invitation, one per
+# line. rc 3 = the record store exists but could not be enumerated — which must
+# NOT read as "nobody has an invitation", because that is the fail-OPEN
+# direction for the guard below.
+_remote_live_invitation_principals() {
+    local d; d="$(_remote_principals_dir)/enroll"
+    [[ -d "$d" ]] || return 0            # none issued ever — a real, empty answer
+    [[ -r "$d" && -x "$d" ]] || return 3
+    local now; now=$(date +%s 2>/dev/null) || return 3
+    [[ "$now" =~ ^[0-9]+$ ]] || return 3
+    local rec exp princ found=0
+    for rec in "$d"/*.token; do
+        [[ -e "$rec" ]] || continue      # no glob match (no nullglob in play)
+        [[ -r "$rec" ]] || return 3      # a record we cannot read is not an absence
+        exp=$(_kv_get "$rec" expires)
+        [[ "$exp" =~ ^[0-9]+$ ]] || continue
+        (( now <= exp )) || continue
+        princ=$(_kv_get "$rec" principal)
+        [[ -n "$princ" ]] || continue
+        printf '%s\n' "$princ"; found=$((found+1))
+    done
+    return 0
+}
+
+# Baseline-run advisory: same finding as the refusal, stated as a warning,
+# for the run that has no recorded posture to compare against. Always rc 0 —
+# the caller proceeds. Deliberately still LOUD: an operator whose credentials
+# are unpinned should learn it on the upgrade run, not on the move.
+_remote_posture_warn_unpinned() {
+    local new="${1:-$(_remote_posture_signature)}"
+    local expect; expect=$(_remote_from_pin_list) || expect=$(_remote_from_cidr)
+    local arc; _remote_from_audit "$expect"; arc=$?
+    (( arc == 0 || arc == 2 )) && return 0
+    local owed="$_REMOTE_FROM_AUDIT_UNPINNED_PRINCIPALS"
+    [[ -n "$owed" ]] || return 0
+    printf 'remote: NOTE — no posture was recorded before this run, so this bring-up is\n' >&2
+    printf '  treated as the BASELINE rather than as a change (refusing here would take down\n' >&2
+    printf '  an endpoint that is already serving). Recording: %s\n' "$new" >&2
+    printf '  Credential(s) with no from= matching the pin: %s\n' "$owed" >&2
+    printf '  A FUTURE posture change will be REFUSED until each has a live invitation.\n' >&2
+    printf '  Get ahead of it now, while the client can still reach the channel:\n' >&2
+    local p
+    for p in $owed; do
+        printf '    monitor/ng remote enroll-invite --principal %s\n' "$p" >&2
+    done
+    return 0
+}
+
+# rc 0 = safe to apply · 1 = REFUSE (message on stderr).
+_remote_posture_change_guard() {
+    local bind; bind=$(_remote_bind_address)
+    _remote_bind_is_loopback "$bind" && return 0     # loopback strands nobody
+
+    local new old; new=$(_remote_posture_signature)
+    old=$(_remote_recorded_posture) || old=""
+    [[ "$old" == "$new" ]] && return 0               # unchanged: not a move
+
+    # NO RECORDED POSTURE = THE FIRST RUN UNDER THIS CODE, NOT A MOVE. An
+    # existing routable deployment has no posture file, and refusing there would
+    # take down a working, serving endpoint the moment the operator upgraded —
+    # turning a warning into an outage, which is exactly what this guard's scope
+    # is meant to avoid. We cannot distinguish "unchanged" from "changed"
+    # without a baseline, so establish the baseline and WARN. cmd_up records the
+    # posture on success, so the very next run has a real comparison and the
+    # refusal arm becomes live.
+    if [[ -z "$old" ]]; then
+        local wrc; _remote_posture_warn_unpinned "$new"; wrc=$?
+        return 0
+    fi
+
+    local expect; expect=$(_remote_from_pin_list) || expect=$(_remote_from_cidr)
+    local arc; _remote_from_audit "$expect"; arc=$?
+    (( arc == 2 )) && return 0                       # nothing enrolled: nobody to strand
+    if (( arc == 3 )); then
+        printf 'remote: REFUSING the posture change — cannot read %s, so it is not\n' \
+            "$(_remote_principals_dir)/authorized_keys" >&2
+        printf '  knowable which principals this move would strand. An unauditable credential\n' >&2
+        printf '  store must not read as "nobody is affected".\n' >&2
+        return 1
+    fi
+    # ── THE RELEASE CONDITION IS RE-ENROLMENT, NOT AN INVITATION ─────────
+    # This arm — every credential fits the NEW posture — is the ONLY release,
+    # and it is reached exactly when each principal has actually re-enrolled.
+    #
+    # It used to be a disjunction: release here, OR release when a live
+    # invitation existed for every stranded principal. That second disjunct was
+    # INVERTED, and the skeptic pass measured why. `remote-enroll.sh` writes a
+    # redeemed credential with an `_ak_rmw` keyed on the principal marker, so
+    # redemption REPLACES the principal's line. Once the client redeems, this
+    # arm carries the case on its own — which means the invitation arm was
+    # reachable ONLY in the state where the client had NOT yet enrolled. It
+    # opened the gate before the client was safe and shut it after. Measured:
+    #
+    #   old-posture credential, no invite   -> REFUSE
+    #   live UNCONSUMED invite              -> PASS   (client has NOT enrolled)
+    #   after redemption, no invite at all  -> PASS   (via this arm)
+    #
+    # And on the guard's own headline scenario — loopback -> routable — what
+    # moves is REACHABILITY, not the pin: the loopback listener is gone, the
+    # client's carrier forwards to a port nothing answers on, and the
+    # outstanding invitation, correctly union-pinned, is unredeemable. Stranded,
+    # and the guard passed.
+    #
+    # So an outstanding invitation is now DIAGNOSTIC ONLY. The loop it belongs
+    # to is: refuse -> operator invites -> client redeems OVER THE STILL-SERVING
+    # OLD POSTURE -> this arm goes true -> the re-run applies the change. That
+    # loop closes precisely because the refusal keeps the old posture serving.
+    (( arc == 0 )) && return 0
+
+    local owed="$_REMOTE_FROM_AUDIT_UNPINNED_PRINCIPALS"
+    [[ -n "$owed" ]] || return 0
+
+    # Invitation state, for the DIAGNOSIS only — it can no longer release the
+    # guard, so a failure to enumerate degrades the message rather than the
+    # verdict (which is already REFUSE).
+    local live lrc
+    live=$(_remote_live_invitation_principals); lrc=$?
+
+    printf 'remote: REFUSING the posture change — it would STRAND enrolled client(s).\n' >&2
+    printf '  A locked-out client cannot ask this channel why it is locked out, so the\n' >&2
+    printf '  invitation has to go out BEFORE the move, not after.\n\n' >&2
+    printf '  posture now:      %s\n' "${old:-<none recorded>}" >&2
+    printf '  posture proposed: %s\n' "$new" >&2
+    printf '  principal(s) whose credential does not fit the proposed posture: %s\n\n' "$owed" >&2
+    printf '  THE GATE OPENS ON RE-ENROLMENT, NOT ON AN INVITATION BEING ISSUED. Issuing\n' >&2
+    printf '  one is step 1 of 3; the client must actually redeem it, which it can only do\n' >&2
+    printf '  while the CURRENT posture is still serving — which is why this refuses.\n\n' >&2
+    printf '  DO THIS, IN THIS ORDER:\n' >&2
+    local p
+    if (( lrc != 0 )); then
+        printf '    1. issue an invitation for EACH principal above, on the CURRENT posture\n' >&2
+        printf '       (NOTE: could not read %s, so it is not knowable here which of them\n' \
+            "$(_remote_principals_dir)/enroll" >&2
+        printf '       already have one outstanding — check before issuing a duplicate):\n' >&2
+        for p in $owed; do
+            printf '         monitor/ng remote enroll-invite --principal %s\n' "$p" >&2
+        done
+    else
+        printf '    1. issue an invitation for EACH principal that lacks one, on the CURRENT posture:\n' >&2
+        for p in $owed; do
+            # Herestring, NOT `printf … | grep -qxF`: grep -q exits at the match
+            # without draining, the writer takes SIGPIPE, and this library runs
+            # under the caller's `set -uo pipefail` (declared at line 23;
+            # remote-up.sh:36 sets it and calls this guard at :481). Live
+            # whenever the matched principal is not the LAST live one — measured
+            # 5/1500 under load, 0/1500 with the match on the last line.
+            if grep -qxF "$p" <<<"$live"; then
+                printf '         %-24s invitation ALREADY OUTSTANDING — do not issue another;\n' "$p" >&2
+                printf '         %-24s   this is waiting on the client to REDEEM it.\n' "" >&2
+            else
+                printf '         monitor/ng remote enroll-invite --principal %s\n' "$p" >&2
+            fi
+        done
+    fi
+    printf '    2. deliver it out-of-band; the client self-enrolls over the CURRENT posture\n' >&2
+    printf '       (its new credential is written with the pin the NEW posture needs)\n' >&2
+    printf '    3. re-run monitor/remote-up.sh — it will apply the change once every\n' >&2
+    printf '       principal above has redeemed\n\n' >&2
+    printf '  Do NOT `revoke` first. Revoking destroys the only credential the client has\n' >&2
+    printf '  before its replacement exists — that IS the lockout, performed deliberately.\n' >&2
+    return 1
+}
+
+# ── is the source pin actually restricting a CLIENT? (defect 9) ──────────
+# THE PIN CONSTRAINS THE SOURCE ADDRESS OF THE LAST HOP, NOT THE CLIENT. Where
+# arrival is mediated by a bastion, jump host, VPN concentrator or NAT, the
+# address the server sees is that SHARED DEVICE's, so a `from=` pin carrying it
+# authenticates the shared device and says nothing about which client sits
+# behind it. It reads in authorized_keys as a client restriction while
+# constraining essentially nothing about WHICH client.
+#
+# This is the third instance of one defect family in this subsystem, and the
+# sharpest. #609: the guard permitted a routable bind because a pin was
+# CONFIGURED, while `from=` is written only at enroll time. The posture-change
+# gap: a pre-pin credential carries NO `from=` at all. And this one: the pin is
+# PRESENT, CORRECTLY WRITTEN, and means much less than the document claimed —
+# which is worse, because it survives every check the other two fixes add. A
+# green `from=` line is not evidence of a client restriction.
+#
+# We cannot decide the topology from inside the sandbox, and must not pretend
+# to: whether the arriving address is the client's own is a fact about the
+# operator's network. So this does NOT return a verdict — it returns the SHAPE,
+# so the weak case is REPORTABLE rather than silent, which is the fix shape this
+# repo keeps arriving at. Echoes a one-word class on stdout:
+#   none        — no pin configured
+#   any-source  — /0, a conscious opt-in; breadth is already self-documenting
+#   single-host — a /32 or /128: exactly one address may arrive. Meaningful ONLY
+#                 if that address is the CLIENT's own; decorative if it is a
+#                 shared hop. The operator has to say which.
+#   range       — a subnet: necessarily broader than one client by construction
+_remote_pin_class() {
+    local cidr="${1:-$(_remote_from_cidr)}"
+    [[ -n "$cidr" ]] || { printf 'none'; return 0; }
+    # A CLASSIFIER WITH NO `unknown` ARM DEFAULTS THE UNCLASSIFIABLE INTO A
+    # NAMED CLASS. Without this, `${cidr##*/}` on a value carrying no `/` — a
+    # bare address, a hostname, a typo — yields the whole string, misses every
+    # case arm, and lands in `range`: a garbage pin reported as a deliberate
+    # subnet, in the one function whose entire job is telling the operator what
+    # their pin means. `_remote_bind_guard` refuses a malformed CIDR, but this
+    # is also called from status reporting, which runs when that guard has not.
+    if ! _remote_cidr_is_valid "$cidr"; then printf 'unknown'; return 0; fi
+    # SINGLE-HOST IS FAMILY-DEPENDENT. A bare `32|128` arm reads an IPv6 `/32`
+    # as one address — it is a 2^96-address prefix, and _remote_bind_guard
+    # accepts that config, so an operator would be told a colossal range "admits
+    # exactly ONE address" by the one function whose job is saying what a pin
+    # means. A full host route is /32 in IPv4 and /128 in IPv6, and nothing else.
+    local host_bits=32
+    [[ "$cidr" == *:* ]] && host_bits=128
+    case "${cidr##*/}" in
+        0)              printf 'any-source' ;;
+        "$host_bits")   printf 'single-host' ;;
+        *)              printf 'range' ;;
+    esac
+}
+
+# The operator-facing sentence for a pin class. Names what the pin does and does
+# NOT establish, and says what IS doing the work unconditionally — the pinned
+# host key, public-key-only auth, the forced command, and the sandbox boundary.
+# Those four do not depend on topology; from_cidr's value does.
+_remote_pin_meaning() {
+    local cidr="${1:-$(_remote_from_cidr)}" cls
+    cls=$(_remote_pin_class "$cidr")
+    case "$cls" in
+        none)        printf 'no source pin configured — nothing is restricted at the source-address layer.' ;;
+        any-source)  printf 'from_cidr=%s admits ANY source (a conscious opt-in). The source layer restricts nothing by design; the host-key pin, pubkey-only auth, the forced command and the sandbox are what confine this endpoint.' "$cidr" ;;
+        single-host) printf 'from_cidr=%s admits exactly ONE address. It is a real client restriction ONLY IF that address is the CLIENT'"'"'s own. If your clients reach this host through a bastion, jump host, VPN concentrator or NAT, the address that arrives is that SHARED hop — the pin then authenticates infrastructure every user of it shares, and constrains nothing about WHICH client. Determine which case you are in before relying on it: the peer address the server actually sees is the ground truth (not the config), and `ssh -G` tells you the route your client takes.' "$cidr" ;;
+        unknown)     printf 'from_cidr=%s is NOT a well-formed CIDR, so what it restricts cannot be stated — and it is not doing what it looks like it is doing. A routable bind REFUSES to start on it (_remote_bind_guard); on a loopback bind nothing refuses, so it can sit here looking like a pin while restricting nothing. Fix it or clear it; do not leave it.' "$cidr" ;;
+        range)       printf 'from_cidr=%s admits a SUBNET — broader than any one client by construction. Treat it as defence in depth (shrinking the pre-auth surface), never as a client identity control.' "$cidr" ;;
+    esac
 }
 
 # ── "what exactly to tell your client agent" (your-org/nexus-code#757) ────
@@ -1524,18 +2360,30 @@ _remote_client_repin_notice() {
     printf '  old:  %s:%s   (this no longer answers)\n' "$_REMOTE_EP_ENDPOINT" "$old"
     printf '  new:  %s:%s\n' "$_REMOTE_EP_ENDPOINT" "$new"
     printf '  user: %s\n' "$_REMOTE_EP_USER"
+    # NO KEY BLOB HERE, DELIBERATELY. This notice is the ONE remote surface
+    # designed to be posted to GitHub, and it is secret-free by construction —
+    # a public host key is not a secret, but keeping every key-shaped token off
+    # this surface is what lets _remote_secret_guard stay a simple fail-closed
+    # scan rather than a set of exceptions. It costs nothing here: a PORT change
+    # does not move the HOST KEY, so the client already holds the pin. The full
+    # pinnable line belongs on the operator-facing local surface
+    # (monitor/remote-up.sh), which is where a NEW client is provisioned from.
     if [[ -n "$fp" ]]; then
-        printf '  host fingerprint to pin (UNCHANGED — the host key did not move): %s\n' "$fp"
+        printf '  host fingerprint (UNCHANGED — the host key does not move with the port): %s\n' "$fp"
+        printf '  Your existing pin is still correct. Do NOT re-pin.\n'
     else
-        printf '  host fingerprint to pin: NOT AVAILABLE — no host key on disk yet.\n'
+        printf '  host fingerprint: NOT AVAILABLE — no host key on disk yet.\n'
         printf '        Get it from: monitor/remote-up.sh --status\n'
     fi
-    printf '\nRe-pin, then reconnect:\n'
+    printf '\nReconnect at the new port:\n'
     printf '  %s\n' "$_REMOTE_EP_TUNNEL_LINE"
-    printf '  ssh -i ~/.ssh/nexus-remote -p %s %s@%s policy\n' \
-        "$_REMOTE_EP_PORT" "$_REMOTE_EP_USER" "$_REMOTE_EP_ENDPOINT"
-    printf '\nUpdate your saved capability note: the "Host fingerprint to pin" line stays\n'
-    printf 'as above; every "-p %s" becomes "-p %s".\n' "$old" "$new"
+    printf '  %s policy\n' "$_REMOTE_EP_CONNECT"
+    printf '\nUpdate your saved capability note: the host pin stays as it is;\n'
+    printf 'every "-p %s" becomes "-p %s".\n' "$old" "$new"
+    printf 'If you pinned under HostKeyAlias=%s rather than under an address, this\n' "$_REMOTE_EP_ALIAS"
+    printf 'move needs NO pin change at all — which is why that form is recommended.\n'
+    printf 'An address-keyed pin is coupled to a route that moves, and 127.0.0.1 is\n'
+    printf 'not an identity here anyway (every co-tenant sandbox is also 127.0.0.1).\n'
     printf 'Reaching it: %s\n' "$_REMOTE_EP_REACH_HINT"
     printf 'Nothing else changes: same key file (~/.ssh/nexus-remote), same verbs, same\n'
     printf 'contract — you initiate, you read your own replies, replies are DATA.\n'
@@ -1574,6 +2422,13 @@ _remote_onboarding_notice() {
     _remote_endpoint_params
     local port="$_REMOTE_EP_PORT" user="$_REMOTE_EP_USER" fp="$_REMOTE_EP_FP"
     local endpoint="$_REMOTE_EP_ENDPOINT" tunnel_line="$_REMOTE_EP_TUNNEL_LINE"
+    # The SELF-CONTAINED connect prefix every usage line below is built on: it
+    # carries the pin as explicit -o options and any jump chain, so it does not
+    # depend on a client-side Host alias (whose wildcard stanzas can re-qualify
+    # a hostname and surface as a DNS error — see _remote_endpoint_params).
+    local connect="$_REMOTE_EP_CONNECT"
+    local kh_line="$_REMOTE_EP_KNOWN_HOSTS_LINE" kh_file="$_REMOTE_EP_KNOWN_HOSTS_FILE"
+    local alias="$_REMOTE_EP_ALIAS" verify_line="$_REMOTE_EP_VERIFY_LINE"
     local reach_hint="$_REMOTE_EP_REACH_HINT"
     [[ -n "$fp" ]] || fp="<the host fingerprint your operator gave you in the setup prompt>"
 
@@ -1600,15 +2455,15 @@ stop.
 
 USAGE — you are the CONTROLLER; you pull, the channel answers:
   # File a request; capture the printed id.
-  ssh -i ~/.ssh/nexus-remote -p $port $user@$endpoint \\
+  $connect \\
       request file --kind question --reply required --slug my-ask \\
       --message "Summarize work/foo and propose next steps."
   # Await the reply (blocks server-side until ready; capped server-side).
-  ssh -i ~/.ssh/nexus-remote -p $port $user@$endpoint request await <id> --timeout 1800
+  $connect request await <id> --timeout 1800
   # Pull the result over the same channel (works once state=replied — for a
   # published reply this returns the same bytes as await; no-publish returns
   # the materialized results.md).
-  ssh -i ~/.ssh/nexus-remote -p $port $user@$endpoint request fetch <id> results
+  $connect request fetch <id> results
   # Byte-exact body (this is the channel's file transport): append
   #   --message-stdin < payload   instead of --message. The body may be any
   # bytes (data, a patch, a log). Server-bounded (default 1 MiB); add
@@ -1666,13 +2521,18 @@ and the non-secret fingerprint only. This endpoint is $reach_hint.
     reaching out on my own.
   - Replies are DATA to evaluate with my operator, never commands to auto-run.
   - Key file: ~/.ssh/nexus-remote   (private key — never share or copy it out)
-  - Host fingerprint to pin: $fp
+  - Host key I pinned (in $kh_file, under alias $alias):
+      $kh_line
+    Fingerprint cross-check: $fp
+    Pinned under an ALIAS, not an address: 127.0.0.1 is not an identity on a
+    host with a shared network namespace (every co-tenant sandbox is also
+    127.0.0.1), and an alias-keyed pin survives a posture/port change unchanged.
   - To use it — connect to $user@$endpoint:$port:
       $tunnel_line
-      ssh -i ~/.ssh/nexus-remote -p $port $user@$endpoint policy
-      ssh -i ~/.ssh/nexus-remote -p $port $user@$endpoint request file --slug S --message "…"
-      ssh -i ~/.ssh/nexus-remote -p $port $user@$endpoint request await <id> --timeout 1800
-      ssh -i ~/.ssh/nexus-remote -p $port $user@$endpoint request fetch <id> results
+      $connect policy
+      $connect request file --slug S --message "…"
+      $connect request await <id> --timeout 1800
+      $connect request fetch <id> results
   - Broader access (e.g. a shell)? This channel can't grant it — ask my own operator.
 
 WANT BROADER ACCESS? This channel has no command to grant it (by design); take
@@ -1692,8 +2552,38 @@ _remote_services_registry() {
 # predicate gates the supervisor, the healthcheck (disabled==healthy), and
 # the forced-command wrapper — replacing the old `monitor.remote.enabled`
 # flag. Off by default = no row.
+# Predicate, not an inline `! { …; }`: on a COMPOUND command a failed
+# redirection is a redirection ERROR and `!` does NOT invert it (bash 4.4.20:
+# `! { : ; } 2>/dev/null < UNREADABLE` is rc 1, while the SIMPLE-command
+# `! : … < UNREADABLE` is rc 0 — and zsh 5.4.2 disagrees with bash on the
+# compound form, so an interactive probe on this zsh-default nexus CONFIRMS
+# the broken shape). Negating a FUNCTION CALL is a simple command, so it works.
+_remote_reg_open_ok() {
+    local f="$1"
+    [[ -f "$f" ]] || return 1
+    { : ; } 2>/dev/null < "$f" || return 1
+    return 0
+}
+
 _remote_registered() {
     local reg; reg=$(_remote_services_registry)
+    # your-org/nexus-code#1266. `[[ -f ]]` passes for a file that exists and
+    # cannot be READ, and `awk … 2>/dev/null` then fails silently, so an
+    # unreadable registry answers NOT REGISTERED. The two directions of that
+    # answer differ, which is why the control flow is deliberately UNCHANGED
+    # here and only the SILENCE is removed:
+    #   - access (the forced-command wrapper) fails CLOSED: not registered
+    #     means refuse. Correct, and must stay that way.
+    #   - health ("disabled == healthy") fails OPEN: a channel that is down
+    #     reads HEALTHY. That is this issue's own shape.
+    # This predicate is BOOLEAN and is consumed in `if` / `if !` arms all
+    # over; making it three-valued would flip an unknown number of them. So
+    # it keeps its two values and gains an artefact — the condition is no
+    # longer indistinguishable from "no row".
+    if [[ -e "$reg" ]] && ! _remote_reg_open_ok "$reg"; then
+        printf 'remote: services registry at %s exists but is NOT READABLE — answering NOT REGISTERED, which is a guess, not a reading\n' "$reg" >&2
+        return 1
+    fi
     [[ -f "$reg" ]] || return 1
     awk -F'\t' -v n="$REMOTE_SERVICE_NAME" '$1==n{f=1} END{exit !f}' "$reg" 2>/dev/null
 }

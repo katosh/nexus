@@ -82,6 +82,15 @@ fi
 install_clean_temps "$target"
 
 if [[ -e "$target" ]]; then
+    # UNDETERMINED IS NOT "NOT A REPO", AND THIS GATE MOVES A DIRECTORY ASIDE.
+    # `install_dir_is_repo` fails closed, so an unexaminable target already
+    # takes the careful branch; refusing outright is better still, because the
+    # careful branch's own answer ("unexpected remote") would be a guess about
+    # a directory nobody could read. your-org/nexus-code#1243 round 2.
+    install_dir_repo_state "$target"
+    if [[ $? -eq 3 ]]; then
+        die "refusing to touch $target — could NOT determine whether it is a git repository (unreadable?). That is not the same as 'not a repo', and this path is about to be renamed aside."
+    fi
     if install_dir_is_repo "$target" && ! install_remote_matches "$target" "$REMOTE_ID"; then
         die "refusing to overwrite $target — git repo with unexpected remote ($(git -C "$target" config --get remote.origin.url 2>/dev/null || echo none)). Move it aside and re-run."
     fi

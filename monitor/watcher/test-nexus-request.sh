@@ -255,9 +255,19 @@ printf 'replied\n' > "$WORK/steps_g"
 export STUB_ID="t-g" STUB_STATE_STEPS="$WORK/steps_g" STUB_RESULTS="$reply_a" STUB_NOSLEEP=1
 run_req g --slug oncetest --reply required --message "should not re-emit" --poll 1 --timeout 30
 unset STUB_NOSLEEP
-assert_eq       "(g) exit 0 when sentinel present"      "$RC" "0"
+# CONTRACT CHANGE, deliberate: this used to assert exit 0 with empty stdout.
+# That is correct exactly-once semantics and an UNREADABLE signal — `exit 0, no
+# output` is byte-identical to what a LOST reply looks like, so an agent
+# retrying a watch concluded the reply had vanished. The state is now
+# REPORTABLE: a distinct exit code and a terminal line on STDOUT naming the
+# sentinel. The exactly-once property itself is unchanged, which is what the
+# no-re-emit assertion below still pins.
+assert_eq       "(g) exit 4 when sentinel present"      "$RC" "4"
+assert_contains "(g) stdout says already-emitted"       "$OUT" "state=already-emitted"
+assert_contains "(g) …and names the sentinel path"      "$OUT" "sentinel="
 assert_not_contains "(g) no reply-body re-emitted"      "$OUT" "--- reply-body "
 assert_contains "(g) logs the short-circuit"            "$ERROUT" "already emitted"
+assert_contains "(g) …and says how to re-deliver"       "$ERROUT" "--re-emit"
 
 # ── (h) fetch-results transport drop → await-envelope fallback, once ───
 env_h="$WORK/reply_h.env"

@@ -164,11 +164,29 @@ while IFS= read -r f; do
             STALE:*) stales+="${r#STALE:}"$'\n' ;;
         esac
     done < <(scan_ports "$f")
+# THE WIDE PATHSPEC HERE IS DELIBERATE (your-org/nexus-code#1111). git matches
+# pathspecs with `fnmatch` WITHOUT `FNM_PATHNAME`, so this `*` CROSSES `/` and
+# the enumeration also picks up `monitor/watcher/test-integration/_harness.sh`
+# and `.../stub-claude.sh`, which are a shared library and a `claude` shim
+# rather than suites. `#1111` narrowed the SUITE-COUNT sites to
+# `:(glob)**/test-*.sh` because their label says "tracked test suites" and
+# their number is quoted as a measurement. This site is NOT one of those: it
+# enumerates a corpus TO LINT, and `_harness.sh` is 510 lines carrying exactly
+# the constructs scanned for here. Narrowing it would DELETE COVERAGE from the
+# one file most worth scanning, dressed up as a consistency fix. Leave it wide.
 done < <(git ls-files -- '*test-*.sh')
 
 if (( n_files >= 200 )); then
     _th_pass
-    printf '  PASS: the corpus was actually enumerated (%d test files)\n' "$n_files"
+    # "paths matching *test-*.sh", not "test files" (your-org/nexus-code#1111).
+    # git's pathspec `*` crosses `/`, so this corpus also contains
+    # `test-integration/_harness.sh` and `.../stub-claude.sh`, which are a
+    # shared library and a shim. Scanning them is CORRECT — _harness.sh is 510
+    # lines carrying exactly the constructs linted here — so the definition
+    # stays wide and the label is what changes. No count is named: a literal
+    # "2 non-suites" here would be the stale-constant defect of #1041 item 4,
+    # committed inside the fix for its sibling.
+    printf '  PASS: the corpus was actually enumerated (%d paths matching *test-*.sh)\n' "$n_files"
 else
     printf '  FAIL: enumeration returned %d files (expected >=200) — the scan is blind\n' "$n_files" >&2
     _th_fail

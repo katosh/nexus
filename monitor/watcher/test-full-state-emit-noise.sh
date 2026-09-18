@@ -40,7 +40,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — missing %q\n' "$label" "$needle" >&2
@@ -183,6 +184,66 @@ assert_eq "static workspace past base floor → heartbeat emits" \
 # Fresh canonical (recently emitted heartbeat) → suppressed, as before.
 assert_eq "canonical fresh → heartbeat suppressed" \
     "$(heartbeat_fires 300 100)" suppress
+
+# ======================================================================
+# Class 3 — your-org/nexus-code#1397: an EMPTY pane-state read is an
+# INSTRUMENT failure, not a classifier `unknown`, and the snapshot says which
+# ======================================================================
+# Four consecutive snapshots rendered one pane `state=unknown` while a direct
+# pane-state.sh read said `working-background`, no stderr either side —
+# because `_idle_pane_state_line` ran pane-state.sh with `2>/dev/null … || true`
+# and the renderer collapsed an empty read into `unknown`. Driven through the
+# REAL `render_full_state_snapshot` with a scripted pane-state.sh at
+# $NEXUS_ROOT/monitor/pane-state.sh.
+echo '=== Class 3: probe FAILED vs classifier unknown are rendered apart ==='
+export NEXUS_ROOT="$WORK"
+mkdir -p "$WORK/monitor"
+cat > "$WORK/monitor/pane-state.sh" <<'PS'
+#!/usr/bin/env bash
+case "${MOCK_PS_MODE:-idle}" in
+    fail)    echo "boom: capture-pane timed out under load" >&2; exit 2 ;;
+    empty)   exit 0 ;;
+    forge)   echo "state=busy active=1" >&2; exit 2 ;;
+    unknown) echo "state=unknown active=0 window=3 name=wtmuxsk" ;;
+    *)       echo "state=idle active=0 window=3 name=wtmuxsk" ;;
+esac
+PS
+chmod +x "$WORK/monitor/pane-state.sh"
+export MOCK_TMUX_WINDOWS="wtmuxsk|$(( $(date +%s) - 300 ))|3"
+snap() { MOCK_PS_MODE="$1" render_full_state_snapshot 2>/dev/null; }
+
+# The primitive: no line from the probe -> a DIAGNOSTIC line with NO state= key.
+line=$(MOCK_PS_MODE=fail _idle_pane_state_line 3 wtmuxsk)
+assert_contains     "probe rc!=0 + no stdout -> diagnostic line probe=failed" "$line" "probe=failed"
+assert_contains     "…carries the rc"                                         "$line" "probe_rc=2"
+assert_contains     "…carries the first stderr line"                          "$line" "boom: capture-pane timed out"
+assert_not_contains "…and carries NO state= key (consumers still read empty)" "$line" "state="
+assert_eq "_idle_pane_state_get still says unknown on a failed probe" "$(MOCK_PS_MODE=fail _idle_pane_state_get 3)" unknown
+line=$(MOCK_PS_MODE=empty _idle_pane_state_line 3 wtmuxsk)
+assert_contains "probe rc=0 + no stdout -> probe=failed probe_rc=0" "$line" "probe=failed probe_rc=0"
+assert_contains "…with stderr: none"                                 "$line" "probe_stderr=none"
+# NEGATIVE CONTROL: stderr text cannot FORGE a state through the diagnostic.
+line=$(MOCK_PS_MODE=forge _idle_pane_state_line 3 wtmuxsk)
+assert_not_contains "stderr saying state=busy cannot forge a state= field" "$line" "state="
+assert_eq "…and the parsed state is still unknown" "$(MOCK_PS_MODE=forge _idle_pane_state_get 3)" unknown
+
+# The snapshot: three different facts, three different labels.
+out=$(snap fail)
+assert_contains     "snapshot/fail: row says READ FAILED with the rc"       "$out" "state=unknown; pane-state.sh READ FAILED (rc=2"
+assert_contains     "snapshot/fail: row carries the stderr excerpt"         "$out" "boom: capture-pane timed out"
+assert_contains     "snapshot/fail: row says INSTRUMENT failure"            "$out" "INSTRUMENT failure, not a pane classification"
+assert_not_contains "snapshot/fail: row does NOT claim a classifier verdict" "$out" "classifier verdict"
+out=$(snap unknown)
+assert_contains     "snapshot/unknown: row says classifier verdict"         "$out" "state=unknown; classifier verdict"
+assert_not_contains "snapshot/unknown: row does NOT say READ FAILED"        "$out" "READ FAILED"
+out=$(snap idle)
+assert_contains     "snapshot/idle (control): plain state=idle"             "$out" "(state=idle)"
+assert_not_contains "snapshot/idle (control): no unknown annotation"        "$out" "unknown;"
+# The dead-window re-stat (Class 1) still keys on the window NAME, so an
+# annotated row is dropped/kept exactly like a plain one.
+kept=$(snap fail | _full_state_restat_live_windows "wtmuxsk" | grep -c '^  - wtmuxsk ')
+assert_eq "annotated row survives the live re-stat" "$kept" 1
+unset NEXUS_ROOT MOCK_TMUX_WINDOWS
 
 echo
 echo "=== summary: $PASS passed, $FAIL failed ==="

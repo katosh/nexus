@@ -44,7 +44,22 @@
 
 set -uo pipefail
 _script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-_nexus_root=$(cd "$_script_dir/.." && pwd)
+# your-org/nexus-code#1084 / #577. THE STATE THIS TICK WRITES BELONGS TO THE
+# PRIMARY. This file had zero $NEXUS_ROOT references and rooted itself at its
+# own script location, so run from a secondary clone it wrote the supervision
+# heartbeat — and escalated incidents — under `work/<clone>/monitor/.state`,
+# where the orchestrator never looks. That is the #577 harm: not destruction,
+# but state written where nothing reads it, which is indistinguishable from a
+# supervisor that had nothing to say.
+#
+# `nexus_primary_root` de-nests a candidate out of any `<primary>/work/<clone>`
+# it sits under. Sourced, never re-implemented: two resolvers disagreeing is
+# what #1077 was.
+# shellcheck source=_nexus-root.sh
+source "$_script_dir/_nexus-root.sh"
+_nexus_root=$(nexus_primary_root "${NEXUS_ROOT:-$_script_dir/..}") \
+    || _nexus_root=$(cd "$_script_dir/.." && pwd)
+[[ -n "$_nexus_root" ]] || _nexus_root=$(cd "$_script_dir/.." && pwd)
 _cfg="$_nexus_root/config/load.sh"
 # shellcheck source=watcher/_lib.sh
 source "$_script_dir/watcher/_lib.sh"

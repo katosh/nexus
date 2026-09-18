@@ -61,6 +61,17 @@
 
 set -uo pipefail
 
+# ARGUMENT-LOOP PROGRESS GUARD (your-org/nexus-code#924). Each argument loop
+# below asserts that every iteration consumes at least one argument. Without it
+# a value-taking flag given LAST spins forever — `shift 2` with `$#` == 1 is
+# refused, so the arm re-matches — and a hang here is worse than an error
+# because nothing on this board surfaces it. Full rationale: monitor/ng.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
+
 _script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=_remote_lib.sh
 source "$_script_dir/_remote_lib.sh"
@@ -170,7 +181,7 @@ _mint_token() {
 # ── issue-token ───────────────────────────────────────────────────────
 cmd_issue_token() {
     local principal="" ttl=""
-    while (( $# > 0 )); do
+    _argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
         case "$1" in
             --principal) principal="${2:-}"; shift 2 || die "--principal needs a value" ;;
             --ttl)       ttl="${2:-}";       shift 2 || die "--ttl needs seconds" ;;
@@ -228,7 +239,7 @@ _safe_pubkey() {
 # ── enroll ────────────────────────────────────────────────────────────
 cmd_enroll() {
     local pubkey="" token="" principal="" token_stdin=0
-    while (( $# > 0 )); do
+    _argloop_prev_2=-1; while (( $# > 0 )); do (( $# != _argloop_prev_2 )) || _argloop_stuck "$1"; _argloop_prev_2=$#
         case "$1" in
             --pubkey)    pubkey="${2:-}";    shift 2 || die "--pubkey needs a file" ;;
             --token)     token="${2:-}";     shift 2 || die "--token needs a value" ;;
@@ -361,7 +372,7 @@ cmd_enroll() {
 #     are stripped.
 cmd_enroll_invite() {
     local principal="" ttl=""
-    while (( $# > 0 )); do
+    _argloop_prev_3=-1; while (( $# > 0 )); do (( $# != _argloop_prev_3 )) || _argloop_stuck "$1"; _argloop_prev_3=$#
         case "$1" in
             --principal) principal="${2:-}"; shift 2 || die "--principal needs a value" ;;
             --ttl)       ttl="${2:-}";       shift 2 || die "--ttl needs seconds" ;;
@@ -385,7 +396,14 @@ cmd_enroll_invite() {
     # between them — an enroll line the client cannot reach is exactly as fatal
     # as a channel line it cannot reach.
     local from_cidr; from_cidr=$(_remote_from_cidr)
-    local from_list; from_list=$(_remote_from_pin_list) \
+    # TRANSITIONAL pin for the ENROLL line only. During a pending posture change
+    # the client is still arriving over the OLD route, so a line pinned solely to
+    # the NEW posture's CIDR refuses it pre-auth and the invitation cannot be
+    # redeemed — the lockout the invite-first ordering exists to prevent,
+    # reproduced inside its own remedy. The union covers both; the PERMANENT line
+    # the enroll session reconstructs still uses _remote_from_pin_list, so it
+    # lands correct for the new posture. With no pending change the two are equal.
+    local from_list; from_list=$(_remote_from_pin_list_transitional) \
         || die "enroll-invite: from_cidr has illegal characters: $from_cidr"
     local from_opt=""
     [[ -n "$from_list" ]] && from_opt="from=\"$from_list\""
@@ -541,7 +559,7 @@ cmd_gc_tokens() {
 #                       own) the belt is REQUIRED to deny a shell.
 cmd_carrier_authline() {
     local pubkey="" port="" comment="nexus-remote-carrier" explicit=0 shell_belt=1
-    while (( $# > 0 )); do
+    _argloop_prev_4=-1; while (( $# > 0 )); do (( $# != _argloop_prev_4 )) || _argloop_stuck "$1"; _argloop_prev_4=$#
         case "$1" in
             --pubkey)        pubkey="${2:-}";  shift 2 || die "--pubkey needs <file|->" ;;
             --port)          port="${2:-}";    shift 2 || die "--port needs a value" ;;
@@ -616,7 +634,7 @@ cmd_carrier_authline() {
 # ── revoke ────────────────────────────────────────────────────────────
 cmd_revoke() {
     local principal=""
-    while (( $# > 0 )); do
+    _argloop_prev_5=-1; while (( $# > 0 )); do (( $# != _argloop_prev_5 )) || _argloop_stuck "$1"; _argloop_prev_5=$#
         case "$1" in
             --principal) principal="${2:-}"; shift 2 || die "--principal needs a value" ;;
             *) die "revoke: unknown flag: $1" ;;

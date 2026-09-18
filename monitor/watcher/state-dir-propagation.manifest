@@ -1,0 +1,20 @@
+# state-dir-propagation.manifest — KNOWN members of the #1335 class that do
+# NOT yet propagate their resolved state dir to their `ng log-action` children.
+#
+# Read by monitor/watcher/test-state-dir-propagation.sh. A member is a shell
+# file under monitor/ that RESOLVES a state dir (`STATE_DIR=…`,
+# `_resolve_state_dir`, or a `--state-dir` flag) AND invokes `ng log-action`.
+# It is COMPLIANT when it `export`s NEXUS_STATE_DIR, or every invocation line
+# (or its `\`-continued predecessor) carries a `NEXUS_STATE_DIR=` prefix.
+#
+# RATCHET, in both directions: a non-compliant member NOT listed here is a
+# red (a new instance of the class); a listed member that has become
+# compliant, or is no longer a member, is ALSO a red (remove the line — a
+# stale allowance is a permit nobody audits). One path per line, followed by
+# a tab and the reason it is still here.
+#
+# The fix is one line per file: `export NEXUS_STATE_DIR="$STATE_DIR"` right
+# after the script resolves STATE_DIR (retire-preflight.sh and
+# paste-followup.sh are the worked examples). Do NOT add `--state-dir` to
+# the call — `cmd_log_action` rejects it, and under a `timeout ( … )`
+# subshell that is a silent per-gate failure (#1369).

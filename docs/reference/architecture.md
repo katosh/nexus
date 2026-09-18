@@ -101,9 +101,16 @@ nothing is lost when a paste fails.
 
 The watcher is the only component that polls GitHub on a timer; the
 orchestrator and workers are event-driven and turn-based. It also
-touches `monitor/.state/watcher-heartbeat` every cycle so the
-orchestrator can detect a dead loop without a separate liveness
-service. See [Watcher protocol](watcher-protocol.md) for the
+publishes a **liveness triple** — `monitor/.state/watcher-heartbeat`
+(beaten by a constant-cadence background ticker,
+`monitor.watcher.heartbeat_tick_seconds`, default 20 s),
+`watcher-progress` (bumped as the loop advances) and `watcher-cycle`
+(bumped per completed compose cycle, carrying the measured loop
+period) — from which `_watcher_liveness_verdict` renders
+**UP / BUSY / WEDGED / DOWN**. A fresh heartbeat over a loop that has
+stopped advancing is WEDGED, not healthy, which is why the verdict
+reads all three files rather than the heartbeat alone. See
+[Watcher protocol](watcher-protocol.md) for the
 snapshot shape, the eligibility filter, the emit classes, the
 rate-limit cascade, and the auto-unstick paths.
 
@@ -293,9 +300,12 @@ sequenceDiagram
 
 - **Agent to watcher.** Every turn the orchestrator runs
   `monitor/watcher/bootstrap.sh`. The shared `_watcher_alive` helper
-  in `_lib.sh` returns one of four buckets (fresh / stale /
-  very-stale / no heartbeat) using heartbeat age and the recorded
-  pid (identity-validated against the self-published
+  in `_lib.sh` returns one of five buckets as its **exit code** — `0`
+  fresh, `1` stale-but-alive, `2` very-stale/DEAD, `3` no heartbeat
+  file, `4` WEDGED (`#491`: the pid is live and the liveness ticker
+  beats, but nothing has advanced for a generous multiple of the
+  observed loop period) — using heartbeat age and the recorded pid
+  (identity-validated against the self-published
   `monitor/.state/watcher.pid` — the watcher has no tmux window to
   check). On anything but fresh, bootstrap writes an incident report
   under `reports/` and respawns the watcher headless via
@@ -346,7 +356,10 @@ how to handle a leaked private key — see
 
 ## Clone isolation and watcher-touching work
 
-The watcher sources its ~20 helper modules (`_lib.sh`, `_github.sh`,
+The watcher sources its helper modules — 34 `source` statements in
+`monitor/watcher/main.sh` at `a3177ef6`, derived with
+`grep -cE '^\s*(\.|source) ' monitor/watcher/main.sh`; the list below
+is a sample, not the set (`_lib.sh`, `_github.sh`,
 `_unstick.sh`, `_idle_probe.sh`, `_deliveries.sh`, `_mentions.sh`,
 `_scheduler.sh`, `_config.sh`, `_emit_filters.sh`, `_emit_dedup.sh`,
 `_compose_nudge.sh`, `_orchestrator_liveness.sh`, `_over_limit.sh`,

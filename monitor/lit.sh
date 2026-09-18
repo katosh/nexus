@@ -96,6 +96,17 @@
 
 set -uo pipefail
 
+# ARGUMENT-LOOP PROGRESS GUARD (your-org/nexus-code#924). Each argument loop
+# below asserts that every iteration consumes at least one argument. Without it
+# a value-taking flag given LAST spins forever — `shift 2` with `$#` == 1 is
+# refused, so the arm re-matches — and a hang here is worse than an error
+# because nothing on this board surfaces it. Full rationale: monitor/ng.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
+
 _script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 _cfg="$_script_dir/../config/load.sh"
 
@@ -222,8 +233,18 @@ command -v jq  >/dev/null 2>&1 || die "jq not found (required)"
 command -v curl >/dev/null 2>&1 || die "curl not found (required)"
 
 # --- nexus root -------------------------------------------------------------
+# your-org/nexus-code#1084 / #577. $NEXUS_ROOT is read but was taken VERBATIM.
+# A worker spawned with NEXUS_ROOT pointing at `<primary>/work/<clone>` — or one
+# that computes it from its own location — resolved the reference library to the
+# CLONE's, not the primary's, so `ng lit add` grew a library nothing else reads.
+# De-nest through the shared resolver rather than trusting the candidate.
+# shellcheck source=_nexus-root.sh
+source "$_script_dir/_nexus-root.sh"
 _nexus_root() {
-    if [[ -n "${NEXUS_ROOT:-}" ]]; then printf '%s' "$NEXUS_ROOT"; return; fi
+    if [[ -n "${NEXUS_ROOT:-}" ]]; then
+        local p; p=$(nexus_primary_root "$NEXUS_ROOT") || p=""
+        printf '%s' "${p:-$NEXUS_ROOT}"; return
+    fi
     local r; r=$("$_cfg" nexus.root 2>/dev/null) || r=""
     if [[ -n "$r" ]]; then printf '%s' "${r/#\~/$HOME}"; return; fi
     # script lives at <root>/monitor/lit.sh
@@ -622,7 +643,7 @@ _search_error() {
 
 cmd_search() {
     local q="" source="all" limit=10 year="" human=0
-    while [[ $# -gt 0 ]]; do
+    _argloop_prev_1=-1; while [[ $# -gt 0 ]]; do [[ $# -ne $_argloop_prev_1 ]] || _argloop_stuck "$1"; _argloop_prev_1=$#
         case "$1" in
             --source) source="$2"; shift 2 ;;
             --limit)  limit="$2";  shift 2 ;;
@@ -1132,7 +1153,7 @@ _lit_write_ref() {
 
 cmd_add() {
     local human=0 pid=""
-    while [[ $# -gt 0 ]]; do
+    _argloop_prev_2=-1; while [[ $# -gt 0 ]]; do [[ $# -ne $_argloop_prev_2 ]] || _argloop_stuck "$1"; _argloop_prev_2=$#
         case "$1" in
             --human) human=1; shift ;;
             --*) die "unknown flag: $1" ;;

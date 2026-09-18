@@ -124,6 +124,50 @@ SSHD=$(locate_sshd) || {
 [[ -f "$HOST_KEY" ]] || { log "FATAL: host key absent: $HOST_KEY (run: ng remote gen-host-key)"; exit 1; }
 [[ -f "$AUTH_KEYS" ]] || { log "WARNING: no authorized_keys at $AUTH_KEYS — no client can connect until 'ng remote enroll' adds one"; }
 
+# THE CREDENTIAL STORE MUST OUTLIVE THE DAEMON, OR THE DAEMON MUST NOT OUTLIVE
+# THE STORE (your-org/nexus-code#1034 recommendation 4). The orphan #1034
+# found was a live sshd whose AuthorizedKeysFile pointed into a directory that
+# had been reaped — a listening endpoint that could authenticate nobody, and
+# that stopped being reachable only because an unrelated cleanup happened to
+# take its keys. Had the directory survived, so would an auth surface nobody
+# was accountable for. So on EVERY supervision tick this supervisor re-checks
+# that the store it handed sshd still exists, and if it does not it stops sshd
+# and EXITS rather than serving on. Two conditions, each stated:
+#   * the principals directory is gone — the whole store was reaped;
+#   * authorized_keys existed when sshd was launched and is gone now — an
+#     absent file at LAUNCH is the ordinary pre-enrolment state (warned above,
+#     allowed), so absence only counts once presence has been observed.
+# Exit 78 (EX_CONFIG), the same code the bind-blocked arm uses for "an operator
+# must resolve this": the recovery sweep relaunches, and on relaunch
+# `_remote_principals_guard` refuses a missing store with its own reason.
+AUTH_KEYS_SEEN=0
+[[ -f "$AUTH_KEYS" ]] && AUTH_KEYS_SEEN=1
+_AUTH_STORE_REASON=""
+auth_store_intact() {
+    if [[ ! -d "$PRINCIPALS_DIR" ]]; then
+        _AUTH_STORE_REASON="principals_dir $PRINCIPALS_DIR is GONE (the whole credential store was removed)"
+        return 1
+    fi
+    if [[ -f "$AUTH_KEYS" ]]; then
+        AUTH_KEYS_SEEN=1
+    elif (( AUTH_KEYS_SEEN )); then
+        _AUTH_STORE_REASON="AuthorizedKeysFile $AUTH_KEYS existed at launch and is GONE"
+        return 1
+    fi
+    return 0
+}
+stop_on_missing_store() {   # call after auth_store_intact returned 1
+    log "STOPPING: $_AUTH_STORE_REASON — an sshd whose AuthorizedKeysFile is gone can authenticate"
+    log "  nobody and serves an endpoint no one is accountable for (your-org/nexus-code#1034 rec. 4)."
+    log "  Not relaunching from here; exiting 78. Restore the store (or 'ng remote gen-host-key' +"
+    log "  'ng remote enroll'), then 'monitor/remote-up.sh' relaunches it."
+    if [[ -n "${SSHD_CHILD:-}" ]]; then
+        kill -TERM "$SSHD_CHILD" 2>/dev/null
+        wait "$SSHD_CHILD" 2>/dev/null
+    fi
+    exit 78
+}
+
 # Hardened, self-contained sshd argv. -f /dev/null => ignore the system
 # sshd_config entirely; every policy is an explicit -o (§4.3). No global
 # ForceCommand (per-key command= is authoritative — see the header).
@@ -303,6 +347,7 @@ while true; do
         log "service '$REMOTE_SERVICE_NAME' deregistered — exiting 0 (no relaunch)."
         exit 0
     fi
+    auth_store_intact || stop_on_missing_store      # #1034 rec. 4 (outer loop)
     # HIGH gate (defense-in-depth; remote-up.sh checks this too): never listen
     # on a wildcard bind, nor a routable LAN bind without a from_cidr pin. This
     # sensitive endpoint is fail-closed on exposure — surface unhealthy, don't
@@ -358,6 +403,7 @@ while true; do
             wait "$SSHD_CHILD" 2>/dev/null
             exit 0
         fi
+        auth_store_intact || stop_on_missing_store  # #1034 rec. 4 (every tick, sshd up)
     done
     wait "$SSHD_CHILD"; rc=$?
     SSHD_CHILD=''

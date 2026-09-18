@@ -35,7 +35,7 @@ _payload=$(head -c 65536 2>/dev/null || true)
 [ -n "$_payload" ] || exit 0
 
 _tool=$(printf '%s' "$_payload" | jq -r '.tool_name // empty' 2>/dev/null) || _tool=""
-[ "$_tool" = "Bash" ] || exit 0
+[ "$_tool" = "Bash" ] || [ "$_tool" = "Monitor" ] || exit 0
 
 _cmd=$(printf '%s' "$_payload" | jq -r '.tool_input.command // empty' 2>/dev/null) || _cmd=""
 [ -n "$_cmd" ] || exit 0

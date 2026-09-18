@@ -18,8 +18,9 @@
 #                                             keyed on (kind, id);
 #                                             idempotent.
 #   declare-wait.sh --remove <kind> <id>      remove entry by key
-#                                             (silent no-op if
-#                                             missing).
+#                                             (no-op if missing — but
+#                                             a LOUD one: exit 4, see
+#                                             Exit codes below).
 #   declare-wait.sh --clear                   drop all entries.
 #   declare-wait.sh --list                    print current entries
 #                                             as one-line JSON.
@@ -34,10 +35,16 @@
 #
 # `kind` is intentionally open (no enum) so future wait shapes
 # don't need a watcher change. The classifier only counts entries.
+# That openness is deliberate and is PRESERVED: the shape floor in
+# `monitor/_wait_id.sh` constrains the CHARACTER CONTENT of `kind` and
+# `id`, never the vocabulary. It is shared with `declare-no-wait.sh`
+# precisely so the two verbs cannot drift — a floor on the dismiss
+# side alone would let a worker declare a wait it could not then
+# dismiss, which is worse than no floor at all.
 #
 # Atomicity: read existing heartbeat → mutate `external_waits` →
 # write to `<file>.$$.tmp` → rename. Other heartbeat fields
-# (state, last_activity, monitor_handles, scheduled_wakeup_at,
+# (state, last_activity, scheduled_wakeup_at,
 # session_id, window) are preserved verbatim across the rewrite —
 # this script never touches them. The matching guarantee on the
 # PostToolUse hook side: `monitor/worker-heartbeat.sh` preserves
@@ -54,9 +61,22 @@
 #
 # Exit codes:
 #   0  success (mutation applied or list emitted)
-#   2  bad usage / missing required env / jq missing
+#   2  bad usage / missing required env / jq missing / REFUSED on
+#      shape (your-org/nexus-code#1326 — see `monitor/_wait_id.sh`)
+#   4  `--remove` matched nothing. The docstring above used to promise
+#      a "silent no-op if missing", and that promise is the same
+#      defect `#1326` names one verb over: a caller cannot tell
+#      "removed" from "there was nothing to remove", because both were
+#      rc 0 and silent. The removal is still a no-op; it is no longer
+#      silent.
 
 set -u
+
+# Shared (kind, id) shape floor — see `monitor/_wait_id.sh`.
+_dw_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=/dev/null
+. "$_dw_dir/_wait_id.sh"
+_wait_id_prog='declare-wait.sh'
 
 usage() {
     cat >&2 <<'EOF'
@@ -69,8 +89,11 @@ usage: declare-wait.sh <kind> <id> [<desc>]
   watcher can distinguish working-background / working-self-paced /
   idle-orphan-async from plain idle.
 
-  See `skills/nexus.worker-defaults/SKILL.md` "Owning async
-  external work" for the contract.
+  See `skills/nexus.worker-defaults/SKILL.md`, `## Worker floor`,
+  "Own your async work …" for the contract.
+
+  Exit 4 means the mutation matched nothing — see Exit codes in
+  the file header (your-org/nexus-code#1326).
 EOF
     exit 2
 }
@@ -176,14 +199,30 @@ case "${1:-}" in
         kind="${2:-}"
         id="${3:-}"
         [[ -n "$kind" && -n "$id" ]] || usage
+        # NO SHAPE GATE ON THE REMOVE PATH — see the matching comment in
+        # `declare-no-wait.sh` (your-org/nexus-code#1373 skeptic finding 2).
+        # Gating removal strands a malformed row written by the pre-fix code.
         existing=$(read_existing)
         if [[ "$existing" == '{}' ]]; then
             existing=$(seed_skeleton)
         fi
+        had=$(printf '%s' "$existing" | jq -r \
+            --arg k "$kind" --arg i "$id" \
+            '[(.external_waits // [])[] | select(.kind == $k and .id == $i)] | length')
+        [[ "$had" =~ ^[0-9]+$ ]] || had=0
         updated=$(printf '%s' "$existing" | jq -c \
             --arg k "$kind" --arg i "$id" \
             '.external_waits = ((.external_waits // []) | map(select(.kind != $k or .id != $i)))')
-        write_atomic "$updated"
+        write_atomic "$updated" || exit 2
+        if (( had == 0 )); then
+            printf 'declare-wait.sh: MATCHED NOTHING — (%s, %s) was not in external_waits for window %s.\n' \
+                "$kind" "$id" "$window" >&2
+            rows=$(printf '%s' "$existing" | jq -r \
+                '(.external_waits // []) | if length == 0 then "    (none)"
+                                           else map("    \(.kind):\(.id)") | join("\n") end' 2>/dev/null)
+            printf '  external_waits on record for this window:\n%s\n' "${rows:-    (unreadable)}" >&2
+            exit 4
+        fi
         ;;
 
     --help|-h)
@@ -203,6 +242,7 @@ case "${1:-}" in
         id="${2:-}"
         desc="${3:-}"
         [[ -n "$kind" && -n "$id" ]] || usage
+        wait_id_check "$kind" "$id" || exit 2
         existing=$(read_existing)
         if [[ "$existing" == '{}' ]]; then
             existing=$(seed_skeleton)

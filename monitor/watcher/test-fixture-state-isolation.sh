@@ -54,6 +54,8 @@ build_fixture() {   # <dir>
     mkdir -p "$d/monitor" "$d/config"
     cp "$NG_REAL" "$d/monitor/ng"
     cp "$REPO_ROOT/monitor/_bookkeeping.sh" "$d/monitor/_bookkeeping.sh"
+    # your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+    cp "$REPO_ROOT/monitor/_nexus-root.sh" "$d/monitor/_nexus-root.sh"
     cat > "$d/config/load.sh" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in

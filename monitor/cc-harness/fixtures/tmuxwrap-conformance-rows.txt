@@ -1,0 +1,25 @@
+# Conformance table for test-tmuxwrap-lint-conformance.sh (your-org/nexus-code#892).
+#
+# Held in a .txt FIXTURE rather than inline in the test, for the same reason the
+# lint keeps incident-644-*.sh.txt out of tree: these rows ARE tmux command lines,
+# and a shell file containing them is read by lint-no-tmux-server-kill.sh as a
+# corpus of real calls. That is the lint's own "DATA IS NOT CODE" boundary applied
+# to the one file that must, by construction, carry the banned forms verbatim.
+#
+# Format:  <label>|<command line as the LINT reads it>|<argv after the `tmux` word>
+# The line and the argv are spelled out separately because the lint reads a LINE
+# and the shim reads ARGV — that difference is the whole reason the test exists.
+bare kill-server|tmux kill-server|kill-server
+kill-server behind a prefix|PATH="$b:$PATH" tmux kill-server|kill-server
+-L default (rule4)|tmux -L default kill-server|-L default kill-server
+-S …/default (rule4)|tmux -S /tmp/board/default kill-server|-S /tmp/board/default kill-server
+untargeted kill-window|tmux kill-window|kill-window
+untargeted kill-session|tmux kill-session|kill-session
+untargeted kill-pane|tmux kill-pane|kill-pane
+# --- tmux's REAL grammar (your-org/nexus-code#892, skeptic F2/F3) ------------
+# Both forms were CONFIRMED bypasses of the shim AND invisible to the lint.
+# They are pinned here so the two can never drift apart on them again.
+abbreviated kill-server|tmux kill-ser|kill-ser
+one-letter abbreviation|tmux k|k
+kill-server later in a \; sequence|tmux list-windows \; kill-server|list-windows ; kill-server
+abbreviated kill later in a sequence|tmux list-windows \; kill-ser|list-windows ; kill-ser

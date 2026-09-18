@@ -88,7 +88,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — missing %q\n' "$label" "$needle" >&2
@@ -137,6 +138,11 @@ cp "$_test_dir/../guard-block.sh.in" "$FAKE_NEXUS/monitor/guard-block.sh.in"
 cp "$_test_dir/../_claude-bin.sh"  "$FAKE_NEXUS/monitor/_claude-bin.sh"
 cp "$_test_dir/../_tmux-window.sh" "$FAKE_NEXUS/monitor/_tmux-window.sh"
 cp "$_test_dir/../_fm_lib.sh"      "$FAKE_NEXUS/monitor/_fm_lib.sh"
+# your-org/nexus-code#941 — spawn-worker sources monitor/_bookkeeping.sh for
+# the injective window-key encoder (`wk_encode`). It writes `windows/<key>.json`
+# and the skeptic markers, so it refuses rather than writing under a key the
+# readers will not look at.
+cp "$_test_dir/../_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
 chmod +x "$FAKE_NEXUS/monitor/spawn-worker.sh"
 SCRIPT="$FAKE_NEXUS/monitor/spawn-worker.sh"
 

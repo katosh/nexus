@@ -41,7 +41,7 @@ pass() { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
 fail() { printf '  FAIL: %s\n' "$1" >&2; FAIL=$(( FAIL + 1 )); }
 assert_eq()       { local v="${2:0:60}"; [[ "$2" == "$3" ]] && pass "$1 (=${v})" || fail "$1: got '${2:0:200}' want '${3:0:200}'"; }
 assert_ne()       { [[ "$2" != "$3" ]] && pass "$1" || fail "$1: '$2' should differ from '$3'"; }
-assert_contains() { [[ "$2" == *"$3"* ]] && pass "$1" || fail "$1: '$2' missing '$3'"; }
+assert_contains() { [[ -n "$3" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2; [[ -n "$3" && "$2" == *"$3"* ]] && pass "$1" || fail "$1: '$2' missing '$3'"; }
 assert_not_contains() { [[ "$2" != *"$3"* ]] && pass "$1" || fail "$1: '$2' should NOT contain '$3'"; }
 assert_rc()       { assert_eq "$1" "$2" "$3"; }
 
@@ -214,13 +214,36 @@ grep -q 'watcher-last-emit-cycle' "$MAIN_SH" \
 # (c) compose_emit bumps the heartbeat at its cycle tail — AFTER the
 #     emit-decision gate — so a QUIET (found-nothing) cycle, which falls
 #     through that gate, still proves the loop works.
+# STRUCTURAL, and it says so — a source-text check may SUPPLEMENT a
+# behavioural one, never replace it (your-org/nexus-code#1016). What it can
+# pin is CONTAINMENT: is the bump inside the gated block, or after it. What no
+# text assertion here can pin is that the bump EXECUTES on a quiet cycle; that
+# needs a driveable seam, and `_v2_task_compose_emit` does not have one.
+#
+# The old form compared `tail -1`'s line number against the GATE'S OPENING
+# LINE. Measured on main.sh: the gate opens at 4390 and its block closes at
+# 4575, inside a function spanning 4137-4593 — so a bump moved INSIDE the gated
+# block still satisfied `bump > gate` while proving the exact opposite of the
+# claim, since a quiet cycle falls THROUGH that gate and would never reach it.
+# Anchoring on the block's CLOSING `fi` (matched by indentation) is what makes
+# the assertion mean what its label says.
 compose_body=$(_extract_fn "$MAIN_SH" _v2_task_compose_emit)
 gate_ln=$(printf '%s\n' "$compose_body" | grep -nE 'local_diff.*\|\|.*gh_now' | head -1 | cut -d: -f1)
+# the `fi` closing that gate: first one at the gate's own indentation
+gate_end_ln=$(printf '%s\n' "$compose_body" | awk -v g="${gate_ln:-0}" '
+    NR == g { match($0, /^[[:space:]]*/); ind = RLENGTH; next }
+    NR >  g && ind != "" && $0 ~ /^[[:space:]]*fi[[:space:]]*$/ {
+        match($0, /^[[:space:]]*/); if (RLENGTH == ind) { print NR; exit }
+    }')
 tail_bump_ln=$(printf '%s\n' "$compose_body" | grep -n 'bump_heartbeat' | tail -1 | cut -d: -f1)
-if [[ -n "$gate_ln" && -n "$tail_bump_ln" ]] && (( tail_bump_ln > gate_ln )); then
-    pass "compose_emit bumps heartbeat at cycle tail (quiet cycle still proves liveness)"
+# `^[0-9]+$`, not `[[ -n ]]`: an empty capture cannot arithmetic-evaluate, and
+# `(( "" > "" ))` is a silent pass. This is the form test-watcher-supervise.sh
+# uses and the reason it is the positive control for this shape.
+if [[ "$gate_ln" =~ ^[0-9]+$ && "$gate_end_ln" =~ ^[0-9]+$ && "$tail_bump_ln" =~ ^[0-9]+$ ]] \
+   && (( tail_bump_ln > gate_end_ln )); then
+    pass "compose_emit bumps heartbeat AFTER the gate's closing fi (a quiet cycle reaches it)"
 else
-    fail "compose_emit must bump_heartbeat after the emit-decision gate (gate=$gate_ln bump=$tail_bump_ln)"
+    fail "compose_emit must bump_heartbeat outside the emit-decision gate (gate=$gate_ln end=$gate_end_ln bump=$tail_bump_ln)"
 fi
 # (d) The inline full-state / prelude renders inside compose_emit are
 #     wall-clock bounded (skeptic #2c) — they probe O(workers) panes and run in

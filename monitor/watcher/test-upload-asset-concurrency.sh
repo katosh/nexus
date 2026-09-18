@@ -78,6 +78,11 @@ setup_fake_nexus() {
 
     cp "$_real_script" "$FAKE_NEXUS/monitor/upload-asset.sh"
     chmod +x "$FAKE_NEXUS/monitor/upload-asset.sh"
+    # your-org/nexus-code#1077: upload-asset.sh sources the SHARED primary-root
+    # resolver (monitor/_nexus-root.sh) and REFUSES to run without it, because a
+    # script that cannot tell which nexus an asset belongs to must not guess.
+    # The fake nexus is an install, so it ships the helper alongside the script.
+    cp "$_test_dir/../_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 
     cat > "$FAKE_NEXUS/monitor/mint-token.sh" <<'STUB'
 #!/usr/bin/env bash

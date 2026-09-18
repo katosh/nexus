@@ -22,7 +22,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else printf '  FAIL: %s\n           expected: %s\n' "$label" "$needle" >&2; FAIL=$(( FAIL + 1 )); fi
 }
 assert_not_contains() {
@@ -43,6 +44,8 @@ cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
 # it (your-org/nexus-code#601/#605: degrading to the silent-coercion
 # behaviour it replaces is worse than refusing). Copy it alongside.
 cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
+# your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+cp "$(dirname "$NG_REAL")/_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 NG="$FAKE_NEXUS/monitor/ng"
 
 # Pin the state dir into the fixture (your-org/nexus-code#833). Copying `ng`
@@ -165,6 +168,27 @@ sed -i '/^session-id:/d' "$NOSID"
 run_check out err rc "$NOSID"
 assert_eq        "exit 1 with missing session-id"     "$rc" "1"
 assert_contains  "stderr names session-id"            "$err" "session-id"
+
+# ---- your-org/nexus-code#1140: fanout: is optional, but shaped when present ----
+
+echo '=== frontmatter fanout: well-formed passes, malformed and inverted refuse ==='
+FAN_OK="$WORK/fanout-ok.md"
+write_complete_report "$FAN_OK"
+sed -i 's/^status:.*/&\nfanout: 3 spawned \/ 2 returned/' "$FAN_OK"
+run_check out err rc "$FAN_OK"
+assert_eq        "exit 0 with a well-formed fanout:"  "$rc" "0"
+FAN_BAD="$WORK/fanout-bad.md"
+write_complete_report "$FAN_BAD"
+sed -i 's/^status:.*/&\nfanout: three of them/' "$FAN_BAD"
+run_check out err rc "$FAN_BAD"
+assert_eq        "exit 1 with a malformed fanout:"    "$rc" "1"
+assert_contains  "stderr states the required shape"   "$err" "<N> spawned / <M> returned"
+FAN_INV="$WORK/fanout-inv.md"
+write_complete_report "$FAN_INV"
+sed -i 's/^status:.*/&\nfanout: 2 spawned \/ 3 returned/' "$FAN_INV"
+run_check out err rc "$FAN_INV"
+assert_eq        "exit 1 when returned exceeds spawned" "$rc" "1"
+assert_contains  "stderr names the inversion"          "$err" "exceeds spawned"
 
 # ---- Test 5: session-id = "unknown" → exit 1 --------------------------
 
@@ -510,15 +534,37 @@ printf '\n### Disposition: merge\n' >> "$HDBODY"
 run_check out err rc "$HDBODY"
 assert_eq "heading-shaped ILLEGAL value in BODY → exit 0 (carve-out intact)" "$rc" "0"
 
-# CONTROL 2 — a LEGAL token in frontmatter is untouched by the scoping, because
-# it never reaches this arm at all: the parser returns it `stated`, not
-# `unreadable`. Pins that the fix discriminates on READABILITY, not on `###`.
+# CONTROL 2 — SUPERSEDED by your-org/nexus-code#895 as corrected by the #955
+# skeptic, and re-pointed rather than deleted so the reasoning is on the record.
+#
+# It asserted that a LEGAL token in a `###`-prefixed FRONTMATTER line stays
+# `stated`, to pin that the #855 fix "discriminates on READABILITY, not on
+# `###`". That premise no longer holds, and it should not: in YAML a leading `#`
+# is a COMMENT, so such a line is a DISABLED field regardless of how legal its
+# value is. Leaving it `stated` meant commenting a disposition out ACTIVATED it
+# — `retire-preflight`'s proceed arm reached by the one syntax whose entire
+# meaning is "ignore this line".
+#
+# So the discrimination is now on the MARK in frontmatter and on READABILITY
+# elsewhere, and write time must refuse: the author wrote a field we cannot read
+# as one, and the remedy is theirs (uncomment it, or delete it). CONTROL 1 above
+# still pins that the BODY carve-out is intact, so this change cannot be
+# satisfied by having simply deleted the carve-out.
 HDFMOK="$WORK/dispo-heading-frontmatter-ok.md"
 write_complete_report "$HDFMOK"
 awk 'NR==1{print; print "### Disposition: no-further-pass"; next} {print}' \
     "$HDFMOK" > "$HDFMOK.tmp" && mv "$HDFMOK.tmp" "$HDFMOK"
 run_check out err rc "$HDFMOK"
-assert_eq "heading-shaped LEGAL value in FRONTMATTER → exit 0" "$rc" "0"
+assert_eq       "commented-out LEGAL disposition in FRONTMATTER → exit 1 (#895/#955)" "$rc" "1"
+assert_contains "…and names the field, so the author can act on it"  "$err" "disposition"
+# The plain YAML-comment spelling, which is the one a human actually writes when
+# disabling a line — and the one #955 measured as still authorising a kill.
+HDFMC="$WORK/dispo-commented-frontmatter.md"
+write_complete_report "$HDFMC"
+awk 'NR==1{print; print "# disposition: no-further-pass"; next} {print}' \
+    "$HDFMC" > "$HDFMC.tmp" && mv "$HDFMC.tmp" "$HDFMC"
+run_check out err rc "$HDFMC"
+assert_eq 'a `# disposition:` YAML comment in FRONTMATTER → exit 1, not a silent pass' "$rc" "1"
 
 echo '=== the fail-CLOSED empty-locator arm is REACHABLE — and these kill it ==='
 # Skeptic Finding 3 on #855, and a correction of my own reasoning rather than a
@@ -665,8 +711,18 @@ LOC4="$WORK/dispo-loc-heading-named.md"
 write_complete_report "$LOC4"
 printf '\n### Disposition: fix at source (one-liner)\n\nDisposition: no-further-pass\n' >> "$LOC4"
 run_check out err rc "$LOC4"
-assert_eq       "heading + canonical LEGAL field → exit 1"        "$rc" "1"
-assert_contains "…and the poisoning HEADING is named in the message" "$err" "fix at source"
+# your-org/nexus-code#895 SUPERSEDED THIS, and it is a strictly better answer to
+# the complaint this case was written about. The comment above says the author
+# "was told an ALREADY-CORRECT line was unreadable, with no way to reach a
+# passing state"; #855 answered that by NAMING the heading in the message. #895
+# removes the cause: a heading is a section title, so it is no longer consumed
+# as a field, so it cannot poison the verdict at all. The real
+# `Disposition: no-further-pass` below it governs, and the report passes.
+#
+# The naming machinery is unaffected and still covered — cases (a) and (b) above
+# drive it for genuinely unreadable fields, which is what it is for.
+assert_eq "heading + canonical LEGAL field → exit 0 (the heading no longer poisons it, #895)" \
+    "$rc" "0"
 
 # …and the carve-out still holds: a heading with no other candidate is allowed.
 LOC5="$WORK/dispo-loc-heading-only.md"
@@ -797,6 +853,142 @@ echo '=== report-check agrees with the READ-time parser, by construction ==='
 # would just be the tests above again.
 assert_contains "report-check delegates to the shared parser" \
     "$(sed -n '/^cmd_report_check()/,/^}/p' "$NG")" "_skeptic_stated_disposition"
+
+echo '=== #1363: `no-further-pass` is REFUSED against a live or required skeptic gate ==='
+# `retire-preflight.sh` reads `disposition:` as its FIRST gate, and
+# `no-further-pass` is the PERMISSIVE value — a report saying it while a
+# skeptic is required or pending for its window removes a retirement gate the
+# marker on disk says is owed. Keyed on the report's own frontmatter
+# `window:` (here `foo-window`), the field `ng reports-for-window` uses to
+# find this report for that gate.
+_G1363="$FAKE_NEXUS/monitor/.state"
+_g1363_reset() { rm -rf "$_G1363/skeptic" "$_G1363/windows"; mkdir -p "$_G1363/skeptic/pending" "$_G1363/windows"; }
+_g1363_report() {   # <path> <disposition>
+    write_complete_report "$1"
+    awk -v D="disposition: $2" '!done && /^status: completed$/ { print; print D; done=1; next } { print }' \
+        "$1" > "$1.tmp" && mv "$1.tmp" "$1"
+}
+G1363="$WORK/g1363.md"
+# (1) a LIVE pending marker for the report's window
+_g1363_reset; : > "$_G1363/skeptic/pending/foo-window"
+_g1363_report "$G1363" no-further-pass
+run_check out err rc "$G1363"
+assert_eq       "#1363 marker live + no-further-pass → exit 1"            "$rc" "1"
+assert_contains "#1363 …the refusal names the contradiction"              "$err" "CONTRADICTS a skeptic gate for window foo-window"
+assert_contains "#1363 …and the marker as its reason"                     "$err" "skeptic-pending marker is LIVE"
+# (2) a spawn-stamped `require`, no marker yet (the first-pass shape: the
+#     marker is written by the wrap-up this report is about to go through)
+_g1363_reset
+printf '{ "window": "foo-window", "skeptic_mode": "require", "skeptic_role": false }\n' > "$_G1363/windows/foo-window.json"
+run_check out err rc "$G1363"
+assert_eq       "#1363 spawn-stamped require + no-further-pass → exit 1"  "$rc" "1"
+assert_contains "#1363 …naming the stamp as the reason"                   "$err" "spawned with --skeptic require"
+# CONTROLS — each one is a way the fix could over-refuse.
+_g1363_reset; : > "$_G1363/skeptic/pending/foo-window"
+_g1363_report "$G1363" second-pass
+run_check out err rc "$G1363"
+assert_eq       "#1363 CONTROL: marker live + second-pass → exit 0 (the honest value)" "$rc" "0"
+_g1363_reset
+_g1363_report "$G1363" no-further-pass
+run_check out err rc "$G1363"
+assert_eq       "#1363 CONTROL: no marker, no stamp + no-further-pass → exit 0" "$rc" "0"
+_g1363_reset; : > "$_G1363/skeptic/pending/foo-window"
+printf '{ "window": "foo-window", "skeptic_mode": "auto", "skeptic_role": true, "skeptic_target": "victim" }\n' > "$_G1363/windows/foo-window.json"
+run_check out err rc "$G1363"
+assert_eq       "#1363 CONTROL: a skeptic-ROLE window is exempt (its verdict path clears its own marker)" "$rc" "0"
+_g1363_reset; : > "$_G1363/skeptic/pending/foo-window"
+run_check out err rc "$G1363" --skeptic-gate-settling
+assert_eq       "#1363 CONTROL: --skeptic-gate-settling (a waive/satisfied wrap-up) skips the check" "$rc" "0"
+# No `window:` field → nothing to compare against; left alone (wrap-up
+# repeats the check keyed on the invoking pane).
+_g1363_reset; : > "$_G1363/skeptic/pending/foo-window"
+sed -i '/^window:/d' "$G1363"
+run_check out err rc "$G1363"
+assert_eq       "#1363 CONTROL: no window: field → cannot compare → exit 0" "$rc" "0"
+_g1363_reset
+
+echo '=== #1495: a SETTLED require gate no longer refuses `no-further-pass` ==='
+# THE DEADLOCK. Before this, the `require` arm read the SPAWN RECORD ALONE and
+# treated it as a permanent present-tense obligation, so a window whose
+# required pass had HAPPENED and been SETTLED could state NEITHER disposition:
+#
+#   second-pass       refused by retire-preflight 1c ("no further pass recorded")
+#   no-further-pass   refused HERE, by the spawn stamp
+#
+# Reachable only after everything went right, and the refusal's own remedy
+# ("settle the gate first") named a condition the reader had already met.
+# `ng wrap-up`, reading the same fact, printed "REQUIRE GATE ALREADY RESOLVED".
+#
+# The shape of a settlement on disk (what `--skeptic-satisfied` writes): the
+# marker REMOVED and a `.cleared-rationale` sidecar present.
+_g1495_settled() {   # marker absent + a current resolution record
+    _g1363_reset
+    printf '{ "window": "foo-window", "skeptic_mode": "require", "skeptic_role": false }\n' \
+        > "$_G1363/windows/foo-window.json"
+    printf 'satisfied by <report>\nverdict evidence: verdicts=1 evidence=attributed\n' \
+        > "$_G1363/skeptic/pending/.foo-window.cleared-rationale"
+    # THE ACTION LOG MUST EXIST AND BE EMPTY, NOT BE ABSENT, and the difference
+    # is the whole design of `_skeptic_last_chain_event_epoch`: an ABSENT log
+    # is `unknown` ("I could not look"), a READABLE log naming no superseding
+    # event is `none` ("nothing has superseded"). Only the second may release.
+    # A fixture that omitted the file would exercise the unknown arm and prove
+    # nothing about a settlement.
+    : > "$_G1363/action-log.jsonl"
+}
+_g1495_settled
+_g1363_report "$G1363" no-further-pass
+run_check out err rc "$G1363"
+assert_eq "#1495 require + SETTLED gate + no-further-pass → exit 0 (the deadlock is broken)" "$rc" "0"
+
+# CONTROLS. Each is a way this fix could UNDER-refuse, which is the dangerous
+# direction: releasing a gate that is genuinely still owed.
+_g1363_reset
+printf '{ "window": "foo-window", "skeptic_mode": "require", "skeptic_role": false }\n' \
+    > "$_G1363/windows/foo-window.json"
+run_check out err rc "$G1363"
+assert_eq       "#1495 CONTROL: require + NO resolution record still refuses"  "$rc" "1"
+assert_contains "#1495 …and says the gate is not settled"                      "$err" "NOT settled"
+
+# RE-ARMED: a resolution exists but a marker was written AFTER it. Only a
+# positive `resolved` may release; `re-armed` must not.
+_g1495_settled
+sleep 1
+: > "$_G1363/skeptic/pending/foo-window"
+run_check out err rc "$G1363"
+assert_eq "#1495 CONTROL: a resolution SUPERSEDED by a newer marker still refuses" "$rc" "1"
+
+# THE CITATION MUST BE DISCOVERABLE FROM THE REFUSAL. The settlement discharges
+# a specific sha — the worker's own report as it stood AT ARMING TIME — which
+# lives in exactly one place, the ledger. The append-only convention keeps the
+# report's current sha moving, so a worker that followed every convention could
+# not derive the citation from anything it held; the one instance on record was
+# solved by reading the ledger on a hunch. The refusal named it ZERO times.
+_g1363_reset
+printf '{ "window": "foo-window", "skeptic_mode": "require", "skeptic_role": false }\n' \
+    > "$_G1363/windows/foo-window.json"
+_SHA1495=$(printf 'a%.0s' {1..64})
+printf 'armed\t%s\t2026-09-09T00:00:00Z\n' "$_SHA1495" \
+    > "$_G1363/skeptic/pending/.foo-window.ledger"
+run_check out err rc "$G1363"
+assert_eq       "#1495 …still refuses (this case is about the MESSAGE, not the verdict)" "$rc" "1"
+assert_contains "#1495 the refusal names the settlement verb"      "$err" "--skeptic-satisfied-by"
+assert_contains "#1495 …and prints the OUTSTANDING ARM's sha"      "$err" "$_SHA1495"
+assert_contains "#1495 …and names the ledger the sha came from"    "$err" ".foo-window.ledger"
+assert_contains "#1495 …calling it OUTSTANDING, which is what was asked"  "$err" "ONE OUTSTANDING ARM"
+
+# CONTROL: a DISCHARGED arm is not an outstanding one. The obvious helper
+# (`_skeptic_current_arm_sha`) returns the last `armed` row WHETHER OR NOT it
+# was discharged, so a message built on it would name a sha as "outstanding"
+# that nothing establishes as outstanding — this file's own defect class, in a
+# message written to fix a discoverability problem.
+printf 'armed\t%s\t2026-09-09T00:00:00Z\ndischarged\t%s\t2026-09-09T01:00:00Z\n' \
+    "$_SHA1495" "$_SHA1495" > "$_G1363/skeptic/pending/.foo-window.ledger"
+run_check out err rc "$G1363"
+assert_not_contains "#1495 CONTROL: a DISCHARGED sha is NOT offered as outstanding" \
+    "$err" "ONE OUTSTANDING ARM"
+assert_contains     "#1495 CONTROL: …and the refusal says so rather than going quiet" \
+    "$err" "NO outstanding arm could be read"
+_g1363_reset
 
 # ---- summary ------------------------------------------------------------
 

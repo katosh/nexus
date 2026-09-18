@@ -15,6 +15,13 @@
 #   7.  fetch: selector enum enforced; traversal id refused; extra arg refused
 #   8.  attach: disabled by default (rc13); when enabled, PINNED to
 #       `tmux attach -t nexus -r` with NO client args forwarded (un-wideable)
+#  10.  EVERY refusal arm fires, asserted by its OWN message — 38 of the 43
+#       arms share rc12, so an rc-only assertion cannot say which one ran
+#  11.  RATCHET (your-org/nexus-code#1279): the set of `refuse` arms in the
+#       wrapper must equal the manifest, and every arm declared `covered`
+#       must appear in this run's audit log. Adding a guard to the
+#       confinement boundary without testing it is now a RED, not an
+#       out-of-band audit finding.
 #
 # Hermetic: drives the REAL Phase-1 inbox (request-channel.sh via ng) under
 # a fixture NEXUS_STATE_DIR; tmux is a PATH-shadow stub recording argv. No
@@ -246,7 +253,7 @@ aid=$(fc alice 'request file --reply required --slug owned --message mine')
 _claim "$aid"
 "$RC" reply "$aid" --message "here is your answer" >/dev/null
 # alice can read her own reply (rc0)
-out=$(fc alice "request await $aid --timeout 0"); arc=$?
+arc=0; out=$(fc alice "request await $aid --timeout 0") || arc=$?   # #1403
 assert_rc "owner await rc0" "$arc" "0"
 assert_contains "owner sees ## Reply" "$out" "here is your answer"
 # bob cannot read alice's reply (ownership check, rc5)
@@ -266,7 +273,7 @@ nid=$(fc carol 'request file --reply required --no-publish --slug nopub --messag
 _claim "$nid"
 printf 'final results here\n' > "$WORK/results.src"
 "$RC" reply "$nid" --no-publish --results "$WORK/results.src" --message "see fetch" >/dev/null
-out=$(fc carol "request fetch $nid results"); frc=$?
+frc=0; out=$(fc carol "request fetch $nid results") || frc=$?   # #1403
 assert_rc "owner fetch results rc0" "$frc" "0"
 assert_contains "fetched results content" "$out" "final results here"
 fc dave "request fetch $nid results" >/dev/null 2>&1
@@ -350,7 +357,7 @@ assert_no_file "refused attach never invoked tmux" "$WORK/tmux-argv"
 
 echo "== 8b. self-describing policy notice (NO in-nexus expansion intake) =="
 # bare connection (no command) → LEAN policy notice, rc0
-out=$(SSH_ORIGINAL_COMMAND='' PATH="$STUB:$PATH" bash "$FC" alice </dev/null); rc=$?
+rc=0; out=$(SSH_ORIGINAL_COMMAND='' PATH="$STUB:$PATH" bash "$FC" alice </dev/null) || rc=$?   # #1403
 assert_rc "bare connection → rc0 (informational)" "$rc" "0"
 assert_contains "notice states command policy"      "$out" "command policy: channel-only"
 assert_contains "notice states RESTRICTED access"   "$out" "RESTRICTED"
@@ -363,7 +370,7 @@ assert_not_contains "bare connection omits the full onboarding" "$out" "RECAP, n
 
 echo "== 8c. policy/help/onboarding deliver the FULL post-connect onboarding =="
 # explicit `policy` verb → lean notice header PLUS the moved usage material.
-out=$(SSH_ORIGINAL_COMMAND='policy' PATH="$STUB:$PATH" bash "$FC" alice </dev/null); prc=$?
+prc=0; out=$(SSH_ORIGINAL_COMMAND='policy' PATH="$STUB:$PATH" bash "$FC" alice </dev/null) || prc=$?   # #1403
 assert_rc "policy verb rc0" "$prc" "0"
 assert_contains "policy keeps the notice header"   "$out" "nexus remote agent channel"
 assert_contains "policy includes onboarding recap" "$out" "RECAP, not a new contract"
@@ -397,5 +404,231 @@ assert_contains "log records a REFUSED line" "$logc" "REFUSED"
 assert_contains "log records principal"      "$logc" "principal=alice"
 # the request BODY must never be logged (it may carry task content)
 assert_not_contains "message body NOT in audit log" "$logc" "Summarize work foo please"
+
+
+# ── REFUSAL-ARM COVERAGE (your-org/nexus-code#1279) ────────────────────
+# 38 of the 43 refusal arms in the wrapper share rc12, so an rc-only
+# assertion cannot say WHICH guard fired — a test asserting rc12 can be
+# satisfied by a completely different arm, which is how four arms sat
+# unexercised behind a green suite. Assert the arm's OWN message too.
+assert_refused() {
+    local label="$1" want_rc="$2" needle="$3" principal="$4" cmd="$5" input="${6-}"
+    local err rc
+    rc=0; err=$(fc "$principal" "$cmd" "$input" 2>&1 >/dev/null) || rc=$?   # #1403
+    if [[ "$rc" == "$want_rc" && "$err" == *"$needle"* ]]; then
+        printf '  PASS: %s\n' "$label"; PASS=$((PASS+1))
+    else
+        printf '  FAIL: %s — rc %s want %s; stderr=[%s] wanted substring [%s]\n' \
+            "$label" "$rc" "$want_rc" "$err" "$needle" >&2; FAIL=$((FAIL+1))
+    fi
+}
+
+echo "== 10a. value-consuming flags: the value-missing arms (#1279 class) =="
+# MECHANISM: these arms are `shift 2 || refuse`, and `shift 2` fails ONLY when
+# the flag is the LAST token. With any token after it the flag consumes that
+# token instead — and after `--message` (terminal by design) a trailing flag is
+# merely body text, rc0. So the flag must be final, or the arm is not reached.
+assert_refused "--kind as the final token → needs a value"     12 "--kind needs a value"     alice 'request file --slug x --kind'
+assert_refused "--slug as the final token → needs a value"     12 "--slug needs a value"     alice 'request file --slug'
+assert_refused "--priority as the final token → needs a value" 12 "--priority needs a value" alice 'request file --slug x --priority'
+assert_refused "--reply as the final token → needs a value"    12 "--reply needs a value"    alice 'request file --slug x --reply'
+assert_refused "--timeout as the final token → needs seconds"  12 "--timeout needs seconds"  alice 'request await abc123 --timeout'
+
+echo "== 10b. request file: field validation arms =="
+assert_refused "no --slug at all → --slug is required" 12 "request file: --slug is required"            alice 'request file --kind question --message hi'
+assert_refused "--slug charset enforced"               12 "request file: --slug must be [A-Za-z0-9_-]"  alice 'request file --slug bad/slug --message hi'
+assert_refused "--kind must be a kebab token"          12 "request file: --kind must be a kebab token"  alice 'request file --slug x --kind BadKind --message hi'
+assert_refused "--message present but empty"           12 "request file: --message is empty"            alice 'request file --slug x --message'
+# #1279 arm (line 202 at 989b8880): the --priority enum's default-deny.
+assert_refused "#1279: --priority enum rejects a third value" 12 "request file: --priority must be normal|high" \
+    alice 'request file --slug x --priority urgent --message hi'
+# POSITIVE CONTROL — the enum is not merely refusing everything: both
+# allowed values must still be ACCEPTED end-to-end.
+pnid=$(fc alice 'request file --slug pri-normal --priority normal --message hi'); assert_rc "--priority normal accepted rc0" "$?" "0"
+assert_file_exists "--priority normal request written" "$REQ/$pnid.new.md"
+phid=$(fc alice 'request file --slug pri-high --priority high --message hi');     assert_rc "--priority high accepted rc0"   "$?" "0"
+assert_file_exists "--priority high request written"   "$REQ/$phid.new.md"
+
+# #1279 arm (line 292): NO body supplied at all — neither --message nor
+# --message-stdin. The `case "$msg_mode"` default-deny arm.
+bodyless_pre=$(find "$REQ" -maxdepth 1 -name '*.new.md' 2>/dev/null | wc -l)
+assert_refused "#1279: request file with no body at all" 12 "request file: a body is required" \
+    alice 'request file --slug nobody --kind question'
+bodyless_post=$(find "$REQ" -maxdepth 1 -name '*.new.md' 2>/dev/null | wc -l)
+assert_eq "no request created for a bodyless request file" "$bodyless_post" "$bodyless_pre"
+
+echo "== 10c. request file: body staging failure is refused, not ignored =="
+# mktemp must fail: point the principals dir BELOW a regular file so the
+# defensive mkdir -p cannot create it. (A chmod-500 dir would work too but
+# would defeat the suite's `rm -rf "$WORK"` EXIT trap.)
+: > "$WORK/notadir"
+stage_err=$(SSH_ORIGINAL_COMMAND='request file --slug stage --message-stdin' \
+    MONITOR_REMOTE_PRINCIPALS_DIR="$WORK/notadir/sub" PATH="$STUB:$PATH" \
+    bash "$FC" alice </dev/null 2>&1 >/dev/null); stage_rc=$?
+assert_rc "unstageable body refused rc12" "$stage_rc" "12"
+assert_contains "…with the staging arm's own message" "$stage_err" "request file: cannot stage the body"
+
+echo "== 10d. await: the flag loop's DEFAULT-DENY arm (#1279) =="
+assert_refused "await with no id"                    12 "request await: <id> required"              alice 'request await'
+# #1279 arm (line 309). A default-deny arm that nothing had ever taken is
+# precisely the arm that cannot be assumed to work. Two shapes reach it.
+# `--timeout 0` is NOT decoration: it bounds what happens when the arm is
+# BROKEN. A neutered default-deny arm (`*) shift ;;`) falls through to a real
+# `ng request await`, which with no timeout BLOCKS — so the suite would hang
+# instead of failing, and a hang is a far worse signal than a red. Bounded,
+# the mutant returns rc4 promptly and the assertion fails cleanly.
+assert_refused "#1279: await default-deny — unknown flag" 12 "request await: disallowed flag/argument" alice 'request await abc123 --timeout 0 --bogus'
+assert_refused "#1279: await default-deny — bare extra positional" 12 "request await: disallowed flag/argument" alice 'request await abc123 --timeout 0 extra'
+assert_refused "await --timeout must be an integer"  12 "request await: --timeout must be an integer" alice 'request await abc123 --timeout 5s'
+
+echo "== 10e. fetch: missing id =="
+assert_refused "fetch with no id" 12 "request fetch: <id> required" alice 'request fetch'
+
+echo "== 10f. command-line byte screen (#1279) + the no-verb arm =="
+# #1279 arm (line 411). It sits one line below the newline-smuggling check
+# that IS covered (section 2c). It screens the TOKEN STREAM — four vectors:
+assert_refused "#1279: SOH 0x01 control byte" 12 "non-printable byte in command" alice $'request file --slug x --message a\x01b'
+assert_refused "#1279: ESC 0x1b (terminal-escape injection vector)" 12 "non-printable byte in command" alice $'request file --slug x --message a\x1b[31mb'
+assert_refused "#1279: DEL 0x7f"              12 "non-printable byte in command" alice $'request file --slug x --message a\x7fb'
+assert_refused "#1279: raw high byte 0x80"    12 "non-printable byte in command" alice $'request file --slug x --message a\x80b'
+# POSITIVE CONTROL — the screen is not simply refusing everything: a TAB is
+# C-locale [:space:] and must still pass, or the guard would be over-broad.
+tabid=$(fc alice $'request file --slug tabbody --message a\tb'); assert_rc "TAB in an inline body still accepted (screen not over-broad)" "$?" "0"
+assert_file_exists "tab-body request written" "$REQ/$tabid.new.md"
+# The screen is DELIBERATELY LC_ALL=C (see the wrapper's locale note), so a
+# multi-byte UTF-8 character on the COMMAND LINE is refused as a raw high
+# byte. Pinned because clients hit it, and because it is the boundary of what
+# this arm claims: it guards TOKENS, not body content…
+assert_refused "multi-byte UTF-8 on the command line refused (LC_ALL=C, by design)" \
+    12 "non-printable byte in command" alice $'request file --slug x --message caf\xc3\xa9'
+# …and the byte-exact body channel is the counterpart: the SAME bytes ride
+# --message-stdin untouched, because stdin is not the command line. Asserting
+# the pair stops the screen from being mistaken for a body sanitizer.
+u8id=$(fc alice 'request file --slug utf8-stdin --message-stdin' 'café — π'); assert_rc "the same UTF-8 rides --message-stdin (rc0)" "$?" "0"
+assert_contains "utf-8 body preserved byte-exact through stdin" "$("$RC" show "$u8id")" "café — π"
+# The no-verb arm: CMD is non-empty (so it is past the bare-connection
+# branch) yet splits to zero tokens.
+assert_refused "whitespace-only command → no verb" 12 "no verb" alice '   '
+
+echo "== 11. RATCHET: every refusal arm is declared AND exercised (#1279) =="
+# THE CLASS FIX. #1279 was found by an out-of-band coverage+mutation audit;
+# nothing in the suite could have reported it, so a NEW unexercised arm would
+# be another audit finding rather than a red. This section closes that:
+#
+#   (a) POPULATION — the set of `refuse` arms in the wrapper must equal the
+#       manifest below. Add, delete or reword an arm and this goes RED, so a
+#       new guard cannot be added to the confinement boundary without a
+#       deliberate decision about whether it is tested.
+#   (b) EXERCISE — every arm marked `covered` must appear in THIS run's audit
+#       log. `refuse()` logs `REFUSED(<code>): <message>` before exiting, so
+#       the log is a precise record of which arms actually fired — unlike line
+#       coverage, which cannot separate `[[ check ]] || refuse` on one line
+#       and reported 15 of these arms as covered when they had never run.
+#
+# Two arms are `exempt`, each with its reason recorded inline.
+_arm_needle() {   # <code> <source message> → the literal audit-log needle
+    local code="$1" msg="$2" pre="${msg%%\$*}"
+    # One arm's message STARTS with a variable ("$VERB takes no arguments").
+    # Key it on a spelling this suite actually produces, so it cannot be
+    # falsely attested by the neighbouring "attach takes no arguments" arm.
+    [[ -z "$pre" ]] && { printf 'REFUSED(%s): policy%s' "$code" "${msg#\$VERB}"; return; }
+    printf 'REFUSED(%s): %s' "$code" "$pre"
+}
+
+# Extract with grep -o (not a line-oriented sed): line 202 packs a whole
+# case/esac onto one line, and a future line could carry two arms.
+grep -o 'refuse [0-9]\{1,3\} "[^"]*"' "$FC" \
+    | sed 's/refuse \([0-9]*\) "\(.*\)"/\1@@\2/' | sort > "$WORK/arms.extracted"
+
+# Manifest: <status>@@<exit code>@@<message exactly as written in the source>.
+# `@@` is safe as a separator — no arm message contains `@`.
+sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' > "$WORK/arms.manifest.raw" <<'MANIFEST'
+covered@@12@@--kind needs a value
+covered@@12@@--slug needs a value
+covered@@12@@--priority needs a value
+covered@@12@@--reply needs a value
+covered@@12@@--origin is forced server-side (cannot be client-supplied)
+covered@@12@@--principal is not accepted from a remote client
+covered@@12@@--file (server path) is not accepted; use --message / --message-stdin
+covered@@12@@stdin sentinel '-' not accepted; use --message-stdin
+covered@@12@@request file: disallowed flag/argument: '$1'
+covered@@12@@request file: --slug is required
+covered@@12@@request file: --slug must be [A-Za-z0-9_-]
+covered@@12@@request file: --kind must be a kebab token
+covered@@12@@request file: --priority must be normal|high
+covered@@12@@request file: --reply accepts required|optional|none
+covered@@12@@request file: cannot stage the body
+covered@@12@@request file: body exceeds ${cap} bytes (REMOTE_BODY_MAX_BYTES)
+covered@@12@@request file: --checksum requires --message-stdin (an inline body is whitespace-joined from argv, so there is no byte-exact client-side reference to verify against)
+covered@@12@@request file: --message is empty
+covered@@12@@request file: ambiguous '-' body; use --message-stdin
+covered@@12@@request file: a body is required (--message TEXT… or --message-stdin)
+covered@@12@@request await: <id> required
+covered@@12@@request await: illegal id (must be [A-Za-z0-9_-])
+covered@@12@@--timeout needs seconds
+covered@@12@@request await: --interval is server-controlled
+covered@@12@@request await: --principal is forced server-side
+covered@@12@@request await: disallowed flag/argument: '$1'
+covered@@12@@request await: --timeout must be an integer
+covered@@12@@request fetch: <id> required
+covered@@12@@request fetch: illegal id (must be [A-Za-z0-9_-])
+covered@@12@@request fetch: selector must be progress|results|status
+covered@@12@@request fetch: unexpected argument: '${1:-}'
+covered@@13@@attach is disabled (monitor.remote.allow_attach != true; request-only posture)
+# EXEMPT — reaching this needs a PATH with NO tmux, and the nexus shell
+#          prelude ($BASH_ENV) re-prepends monitor/tmuxwrap into every
+#          non-interactive bash: measured, a curated 1193-binary PATH
+#          excluding /usr/bin/tmux STILL resolved tmux. Not buildable
+#          hermetically here. Its sibling rc13 arm (attach disabled) IS
+#          covered, so the attach gate itself is exercised.
+exempt@@13@@tmux not found — cannot attach
+covered@@10@@remote channel not registered (the service is not enabled)
+covered@@11@@missing/invalid principal in authorized_keys command= (got: '${PRINCIPAL}')
+# EXEMPT — gate 3 (source-address pin) is asserted in
+#          test-remote-source-enforcement.sh. THIS fixture pins
+#          from_cidr="" and supplies SSH_CLIENT on purpose (header note),
+#          so the arm cannot fire here by construction.
+exempt@@14@@source address rejected: $_REMOTE_SRC_REASON
+covered@@12@@newline in command (argument smuggling)
+covered@@12@@non-printable byte in command
+covered@@12@@no verb
+covered@@12@@unknown request subcommand: '${SUB}' (allowed: file|await|fetch)
+covered@@12@@$VERB takes no arguments
+covered@@12@@attach takes no arguments
+covered@@12@@unknown verb: '${VERB}' (allowed: request file|await|fetch; policy|help|onboarding; attach)
+MANIFEST
+
+sed 's/^[a-z]*@@//' "$WORK/arms.manifest.raw" | sort > "$WORK/arms.declared"
+
+# (a) POPULATION ratchet.
+undeclared=$(comm -23 "$WORK/arms.extracted" "$WORK/arms.declared")
+stale=$(comm -13 "$WORK/arms.extracted" "$WORK/arms.declared")
+if [[ -z "$undeclared" ]]; then printf '  PASS: every refuse arm in the wrapper is declared\n'; PASS=$((PASS+1))
+else printf '  FAIL: refuse arm(s) NOT in the manifest — declare covered/exempt:\n%s\n' "$undeclared" >&2; FAIL=$((FAIL+1)); fi
+if [[ -z "$stale" ]]; then printf '  PASS: no stale manifest entry\n'; PASS=$((PASS+1))
+else printf '  FAIL: manifest declares arm(s) absent from the wrapper:\n%s\n' "$stale" >&2; FAIL=$((FAIL+1)); fi
+# Population sanity: a silently empty extraction would pass both set
+# comparisons against an equally empty manifest.
+armcount=$(wc -l < "$WORK/arms.extracted")
+if (( armcount >= 40 )); then printf '  PASS: extraction found %s refusal arms (sane, non-empty)\n' "$armcount"; PASS=$((PASS+1))
+else printf '  FAIL: extraction found only %s refusal arms — the instrument is broken\n' "$armcount" >&2; FAIL=$((FAIL+1)); fi
+
+# (b) EXERCISE: each `covered` arm must have fired in THIS run.
+missed=""; covered_n=0; badneedle=""
+while IFS= read -r line; do
+    [[ "$line" == covered@@* ]] || continue
+    body="${line#covered@@}"; code="${body%%@@*}"; msg="${body#*@@}"
+    covered_n=$((covered_n + 1))
+    needle=$(_arm_needle "$code" "$msg")
+    # SHAPE, not emptiness-as-validity: `grep -qF -- ""` matches EVERY line, so
+    # an empty or malformed needle would turn this whole check into a vacuous
+    # pass — the failure mode that looks exactly like success.
+    [[ "$needle" =~ ^REFUSED\([0-9]+\):\ .+$ ]] || badneedle+="  ${code}: ${msg} -> [${needle}]"$'\n'
+    grep -qF -- "$needle" "$NEXUS_REMOTE_LOG" || missed+="  ${code}: ${msg}"$'\n'
+done < "$WORK/arms.manifest.raw"
+if [[ -z "$badneedle" ]]; then printf '  PASS: every derived audit-log needle is well-formed (non-vacuous)\n'; PASS=$((PASS+1))
+else printf '  FAIL: malformed/empty needle(s) — the exercise check below would be vacuous:\n%s' "$badneedle" >&2; FAIL=$((FAIL+1)); fi
+if [[ -z "$missed" ]]; then printf '  PASS: all %s arms declared covered actually fired in this run\n' "$covered_n"; PASS=$((PASS+1))
+else printf '  FAIL: arm(s) declared covered but never fired (unexercised guard on the confinement boundary):\n%s' "$missed" >&2; FAIL=$((FAIL+1)); fi
 
 th_summary_and_exit

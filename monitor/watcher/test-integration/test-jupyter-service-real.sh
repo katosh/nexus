@@ -36,12 +36,18 @@
 
 set -uo pipefail
 
+# EXIT 77, NOT 0 (your-org/nexus-code#1145, adopting #568 A6). Both arms below
+# DECLINE TO RUN and assert nothing. `exit 0` made the runner tally them PASS
+# — `assertions=?`, wall 0.01s, and a green that certifies no property. Its 14
+# sibling scenarios under this directory already decline with 77 and are
+# correctly tallied SKIP in the same run, which is what made these stragglers
+# rather than a design gap.
 if [[ "${RUN_INTEGRATION:-0}" != "1" ]]; then
     echo "SKIP: integration scenario (set RUN_INTEGRATION=1 to run)"
-    exit 0
+    exit 77
 fi
 for bin in labsh uv python3 curl; do
-    command -v "$bin" >/dev/null 2>&1 || { echo "SKIP: $bin not on PATH"; exit 0; }
+    command -v "$bin" >/dev/null 2>&1 || { echo "SKIP: $bin not on PATH"; exit 77; }
 done
 
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)

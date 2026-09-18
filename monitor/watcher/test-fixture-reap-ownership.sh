@@ -179,6 +179,102 @@ sleep 0.2
 assert_eq "after all three refusals the bystander is STILL alive" "$(live "$P4")" alive
 
 echo
+echo "=== arm 4b: THE OBSERVER MUST NOT BE IN THE PREDICATE (#913) ==="
+#
+# The gap that shipped: arm 4 pins that the sweep does not reach outside its
+# root, and never asks what happens when the CALLER is inside it. Removing the
+# argv witness removed one way to self-match; it did not remove self-matching.
+# With the caller's cwd inside the root, every process the scan forks in order
+# to look inherits that cwd and is scanned as a fixture process — and in the
+# documented `n=$(…)` shape the reaper SIGKILLed its own invoking subshell
+# (rc 137, verdict never returned).
+#
+# EMPTY root, so the correct answer is unambiguously zero and any non-zero
+# result is the observer counting itself.
+
+R_OBS="$TMP/observer"; mkdir -p "$R_OBS"
+
+# (a) the documented call shape, run from INSIDE the root. rc 137 = 128+SIGKILL.
+obs_n=$( cd "$R_OBS" && th_reap_fixture_root "$R_OBS" KILL 4 )
+obs_rc=$?
+assert_eq "the \$( ) call shape survives being run from inside its own root" \
+    "$( (( obs_rc == 137 )) && echo "SIGKILLED-BY-ITSELF" || echo "rc=$obs_rc" )" "rc=0"
+assert_eq "…and reports zero owned processes on an EMPTY root" "${obs_n:-<none>}" 0
+
+# (b) the same from a ( ) SUBSHELL sitting in the root — strictly stronger than
+#     a main shell, since the subshell is excluded by BASHPID only if the
+#     exclusion is right: must not invent a leak.
+( cd "$R_OBS" && th_reap_fixture_root "$R_OBS" KILL 4 >/dev/null )
+assert_rc "a ( ) subshell inside the root does not report a false leak" $? 0
+
+# (c) THE PRIMITIVE'S BOUNDARY, stated as an assertion rather than a hope.
+#     `_th_reap_scan` is private and cannot be made safe for an ARBITRARY
+#     caller standing in the root: a pure enumerator has no way to know which
+#     processes are its caller's own frames. Measured — with the caller inside
+#     the root, `$( cd R && _th_reap_scan R | tr … )` still returns two pids,
+#     the command-substitution subshell and the `tr`, both of which inherited
+#     the caller's cwd and are, by the predicate, genuinely "in the root".
+#     What IS guaranteed: from outside the root it answers correctly, and the
+#     PUBLIC entry point is safe from inside (a, b, d above). Anything that
+#     needs the scan from inside a root must go through it.
+obs_scan=$( _th_reap_scan "$R_OBS" | tr '\n' ' ' )
+assert_eq "the scan returns nothing for an empty root, asked from outside it" \
+    "$( [[ -z "${obs_scan// /}" ]] && echo empty || echo "saw:$obs_scan" )" empty
+
+# (d) POSITIVE TWIN — the same observer position must still reap a real victim,
+#     so (a)-(c) cannot pass by the sweep having become inert.
+R_OBS2="$TMP/observer-live"; make_idler "$R_OBS2"
+P_OBS=$(spawn_orphaned "$R_OBS2")
+assert_eq "victim is up before the observer-in-root sweep" "$(live "$P_OBS")" alive
+obs2_n=$( cd "$R_OBS2" && th_reap_fixture_root "$R_OBS2" KILL 4 )
+obs2_rc=$?
+assert_rc "…the sweep still returns a verdict from inside the root" "$obs2_rc" 0
+sleep 0.4
+assert_eq "…and the victim is GONE (the sweep is not inert)" "$(live "$P_OBS")" dead
+assert_eq "…having signalled at least one process" \
+    "$( (( ${obs2_n:-0} >= 1 )) && echo signalled || echo "none:${obs2_n:-}" )" signalled
+
+echo
+echo "=== arm 4c: the MULTI-ROOT scan, in the leak detector's exact shape (#913 G1) ==="
+#
+# The end-of-run LEAK check in test-svc-orphan-reconcile.sh used to carry its
+# own copy of this /proc walk — excluding only `$$`, never leaving the root,
+# i.e. `#913`'s shape sixty lines from the primitive hardened against it. It is
+# routed through `_th_reap_scan` now, so this is where that property is pinned:
+# a second copy of the walk is a second place to get the observer wrong.
+
+R_M1="$TMP/multi-a"; R_M2="$TMP/multi-b"; mkdir -p "$R_M1" "$R_M2"
+make_idler "$R_M1"; make_idler "$R_M2"
+P_M1=$(spawn_orphaned "$R_M1")
+P_M2=$(spawn_orphaned "$R_M2")
+
+multi=$( cd / 2>/dev/null; _th_reap_scan "$R_M1" "$R_M2" | tr '\n' ' ' )
+assert_contains "one walk answers for the FIRST root"  "$multi" "$P_M1"
+assert_contains "…and for the SECOND root"             "$multi" "$P_M2"
+
+# THE OBSERVER PROPERTY, in the detector's exact consumer shape: a
+# process-substitution reader whose enclosing shell sits inside a checked root.
+# Empty roots, so the correct answer is unambiguously zero.
+R_ME="$TMP/multi-empty"; mkdir -p "$R_ME"
+me_n=0
+while read -r _mp; do me_n=$(( me_n + 1 )); done \
+    < <(cd "$R_ME" 2>/dev/null && cd / 2>/dev/null; _th_reap_scan "$R_ME")
+assert_eq "a reader inside a checked root sees no false survivors" "$me_n" 0
+
+# Mutation, inline: WITHOUT the consumer's `cd /`, the reader's own process
+# substitution is itself in the root and is counted. This is the measurement
+# that condemned the old inlined detector (1 false survivor from a main shell,
+# 2 from a `$( )`).
+mu_n=0
+while read -r _mp; do mu_n=$(( mu_n + 1 )); done \
+    < <(cd "$R_ME" 2>/dev/null; _th_reap_scan "$R_ME")
+assert_eq "…and WITHOUT that cd / it counts its own reader (the pre-fix shape)" \
+    "$( (( mu_n > 0 )) && echo counts-itself || echo "clean:$mu_n" )" counts-itself
+
+th_reap_fixture_root "$R_M1" KILL 4 >/dev/null
+th_reap_fixture_root "$R_M2" KILL 4 >/dev/null
+
+echo
 echo "=== arm 5: the sweep reports FAILURE rather than claiming a clean run ==="
 
 # A root whose processes cannot be killed must not read as a fixed point.
@@ -301,7 +397,7 @@ echo
 # `th_abort` — would otherwise show up as a SMALLER green rather than a red.
 # Pinning the total makes a truncated run a failure. `+ 1` counts this
 # assertion itself.
-EXPECTED_ASSERTIONS=38
+EXPECTED_ASSERTIONS=50
 _ran=$(( PASS + FAIL + 1 ))
 assert_eq "assertion count is pinned at EXPECTED_ASSERTIONS (a truncated run must be a red, not a smaller green)" \
     "$_ran" "$EXPECTED_ASSERTIONS"

@@ -128,6 +128,227 @@ reset_state() {
 }
 
 # ===========================================================================
+echo "## FINDING (your-org/nexus-code#1423): healthcheck exit 100 = alive, condition present"
+# A monitor registered as a service (tmpfs-guard --check) says two different
+# things with one exit code: "I am down" and "the thing I watch is present".
+# Rendered as DOWN, the second sent readers to `svc.sh restart` — a remedy that
+# changes nothing. Exit 100 is the third word. The fixture healthcheck reads a
+# mode file: absent → healthy; present → its text is the finding, exit 100.
+reset_state
+FINDMODE="$WD/finding"
+printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+touch "$OKFLAG"
+printf 'tmpfs-guard: UNHEALTHY: /tmp is over threshold — entries 14094 > 6000\n' > "$FINDMODE"
+NEXUS_TEST_NOW=1000 _service_health_check_tick
+assert_no_file "a finding opens NO incident (no .state)" "$SHDIR/myservice.state"
+assert_file_exists "a finding is recorded in its own sidecar" "$SHDIR/myservice.finding"
+assert_eq      "no svc.sh restart on a finding" "$(wc -l < "$SVC_CALLS")" "0"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null); erc=$?
+assert_eq      "finding emit rc=0 (something to surface)" "$erc" "0"
+assert_contains "finding emit says UP + FINDING, not an outage" "$emit" "is UP and reports a FINDING"
+assert_contains "finding emit carries the healthcheck's own text" "$emit" "entries 14094 > 6000"
+assert_not_contains "finding emit never says DOWN" "$emit" "DOWN"
+assert_not_contains "finding emit never offers svc.sh restart as the remedy" "$emit" "restart now:"
+assert_contains "finding emit says a restart changes nothing" "$emit" "do NOT svc.sh restart"
+emit2=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null); erc2=$?
+assert_empty   "same finding text ⇒ re-nag guarded (second emit empty)" "$emit2"
+assert_eq      "same finding ⇒ emit rc=1" "$erc2" "1"
+printf 'tmpfs-guard: UNHEALTHY: /tmp is over threshold — entries 20000 > 6000\n' > "$FINDMODE"
+NEXUS_TEST_NOW=1060 _service_health_check_tick
+emit3=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "a CHANGED finding text re-surfaces" "$emit3" "entries 20000 > 6000"
+assert_eq      "still no svc.sh restart after a changed finding" "$(wc -l < "$SVC_CALLS")" "0"
+rm -f "$FINDMODE"
+NEXUS_TEST_NOW=1120 _service_health_check_tick
+assert_no_file "check green ⇒ the finding sidecar is gone" "$SHDIR/myservice.finding"
+emit4=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null); erc4=$?
+assert_contains "cleared ⇒ ONE breadcrumb naming the finding" "$emit4" "finding CLEARED"
+assert_contains "the breadcrumb carries the last text" "$emit4" "entries 20000 > 6000"
+emit5=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_empty   "cleared breadcrumb surfaces once" "$emit5"
+assert_eq      "events file carries finding + finding-cleared" "$(grep -cE $'\t(finding|finding-cleared)\t' "$SHDIR/myservice.events")" "3"
+# The incident machine is unaffected: a NON-100 failure of the same fixture
+# still opens an incident (the control that this is a third word, not a
+# relaxation of the second).
+reset_state
+printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+rm -f "$OKFLAG"
+NEXUS_TEST_NOW=1000 _service_health_check_tick
+assert_file_exists "CONTROL: a plain non-zero still opens an incident" "$SHDIR/myservice.state"
+set_policy ""
+
+# ===========================================================================
+echo "## FINDING: the STABLE SUPPRESSION KEY (your-org/nexus-code#1423)"
+# The finding's dedupe key used to be its own rendered text, and the text
+# carries live counters. MEASURED on tmpfs-guard: `14129` at 05:00:39 and
+# `14127` at 05:02:39 re-fired the finding within two minutes, while the state
+# a reader cares about — still over threshold — had changed zero times. A
+# finding that arrives repeatedly with no change in meaning is the fastest way
+# to train a reader to skip it, which is the same failure the DOWN-plus-
+# useless-restart wording had, arriving from the other direction.
+reset_state
+FINDMODE="$WD/finding"
+printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+touch "$OKFLAG"
+{ printf 'tmpfs-guard: FINDING: /tmp is under MEMORY PRESSURE — entries 14129 > 6000\n'
+  printf 'finding-key: tmpfs:/tmp:band=high:conds=tmp_capacity\n'
+  printf 'finding-band: 2\n'; } > "$FINDMODE"
+NEXUS_TEST_NOW=1000 _service_health_check_tick
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "a keyed finding still surfaces the first time" "$emit" "is UP and reports a FINDING"
+assert_not_contains "the finding-key: protocol line is NOT rendered as prose" "$emit" "finding-key:"
+assert_not_contains "the finding-band: protocol line is NOT rendered as prose" "$emit" "finding-band:"
+# THE ENTRY: the counter moves, the KEY does not.
+{ printf 'tmpfs-guard: FINDING: /tmp is under MEMORY PRESSURE — entries 14127 > 6000\n'
+  printf 'finding-key: tmpfs:/tmp:band=high:conds=tmp_capacity\n'
+  printf 'finding-band: 2\n'; } > "$FINDMODE"
+NEXUS_TEST_NOW=1120 _service_health_check_tick
+emit2=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null); erc2=$?
+assert_empty "a COUNTER drift under an unchanged key does NOT re-surface (the #1423 defect)" "$emit2"
+assert_eq    "…and the emit reports nothing to say (rc 1)" "$erc2" "1"
+# POTENCY: it is the KEY that suppresses, not the emit being broken.
+{ printf 'tmpfs-guard: FINDING: /tmp is under MEMORY PRESSURE — entries 14127 > 6000\n'
+  printf 'finding-key: tmpfs:/tmp:band=critical:conds=tmp_capacity,node_memory\n'
+  printf 'finding-band: 3\n'; } > "$FINDMODE"
+NEXUS_TEST_NOW=1240 _service_health_check_tick
+emit3=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "POTENCY: a CHANGED key re-surfaces immediately" "$emit3" "is UP and reports a FINDING"
+# The BODY is the product for a finding: the whole stderr, not a 300-char cut.
+reset_state
+printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+touch "$OKFLAG"
+{ printf 'tmpfs-guard: FINDING: /tmp is under MEMORY PRESSURE — band high\n'
+  printf 'finding-key: k1\nfinding-band: 2\n'
+  printf '  top families BY BYTES:\n'
+  printf '    olay-guard    6.0 GiB   532   operator   18%%\n'
+  printf '    owners by bytes: operator=33.4 GiB(100%%)\n'; } > "$FINDMODE"
+NEXUS_TEST_NOW=1000 _service_health_check_tick
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "the finding body is rendered, not truncated to the verdict line" "$emit" "owners by bytes: operator=33.4 GiB(100%)"
+assert_contains "…under a details: heading"                                       "$emit" "details:"
+assert_file_exists "…and stored in its own sidecar (a key=value file cannot hold it)" "$SHDIR/myservice.finding-body"
+
+# ===========================================================================
+echo "## FINDING: unhealthy -> finding is a VOCABULARY TRANSITION, not a recovery (#1423)"
+# MEASURED, both rows at the SAME SECOND on the live board:
+#   05:00:39  finding    healthcheck exit 100 (alive, condition present)
+#   05:00:39  recovered  recovered with NO live supervisor — cause UNKNOWN
+# The condition never cleared; the healthcheck's exit code changed, 1 -> 100.
+# The recovered path then prescribes `ng service-incident`, which generates an
+# operator template saying RESTART THE WORKSPACE — the exact action the finding
+# path forbids three lines above it in the same emit.
+reset_state
+set_policy emit-only
+printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\temit-only\n' "$WD" "$WD" > "$REGISTRY"
+rm -f "$OKFLAG" "$FINDMODE"
+NEXUS_TEST_NOW=1000 _service_health_check_tick          # detected: incident opens
+NEXUS_TEST_NOW=1100 _service_health_check_tick          # past grace: escalates
+assert_file_exists "CONTROL: a real incident is open before the transition" "$SHDIR/myservice.state"
+_service_health_emit_section "$SHDIR" "$ROOT" >/dev/null 2>&1 || true
+# Now the SAME condition, reported with the new vocabulary.
+{ printf 'tmpfs-guard: FINDING: /tmp is over threshold\nfinding-key: k1\nfinding-band: 2\n'; } > "$FINDMODE"
+NEXUS_TEST_NOW=1200 _service_health_check_tick
+assert_no_file  "the incident is CLOSED, not left open" "$SHDIR/myservice.state"
+assert_file_exists "…and a finding sidecar exists instead" "$SHDIR/myservice.finding"
+assert_eq "NO 'recovered' event is recorded for a transition that restored nothing" \
+    "$(grep -c $'\trecovered\t' "$SHDIR/myservice.events" 2>/dev/null || true)" "0"
+assert_eq "a 'reclassified' event IS recorded" \
+    "$(grep -c $'\treclassified\t' "$SHDIR/myservice.events" 2>/dev/null || true)" "1"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_not_contains "the emit never says RECOVERED, CAUSE UNKNOWN"       "$emit" "CAUSE UNKNOWN"
+assert_not_contains "…and never uses the RECOVERED vocabulary"           "$emit" "RECOVERED"
+assert_not_contains "…and never prints the recovered arm's close-the-loop advice" "$emit" "close the loop"
+assert_contains     "it says the finding SUPERSEDES the open incident"   "$emit" "SUPERSEDES AN OPEN INCIDENT"
+# The status an emit-only escalation writes is `emit-only`, not `escalated`
+# — verified against the module rather than assumed, which is the whole point
+# of asserting on it: the supersession line must name the REAL prior status.
+assert_contains     "…naming the status it superseded"                   "$emit" "was \`emit-only\` since"
+assert_contains     "…and warning off the outage template by name"       "$emit" "Do NOT file"
+assert_eq "still no svc.sh restart anywhere in the transition" "$(wc -l < "$SVC_CALLS")" "0"
+# CONTROL: a REAL recovery (green, not a finding) still attributes as before.
+reset_state
+set_policy emit-only
+rm -f "$OKFLAG"
+NEXUS_TEST_NOW=1000 _service_health_check_tick
+NEXUS_TEST_NOW=1100 _service_health_check_tick
+touch "$OKFLAG"
+NEXUS_TEST_NOW=1200 _service_health_check_tick
+assert_eq "CONTROL: an actually-green transition still records 'recovered'" \
+    "$(grep -c $'\trecovered\t' "$SHDIR/myservice.events" 2>/dev/null || true)" "1"
+set_policy ""
+
+# ===========================================================================
+echo "## FINDING: mute-until — expires, is owned, breaks on a worse band (#1423)"
+# Four constraints, each from something that bit this repo the same week. An
+# invalid or expired mute is IGNORED LOUDLY, never obeyed quietly: a
+# suppression that fails OPEN hides the thing it was asked to hide for a
+# reason nobody stated.
+mk_finding() {   # <key> <band>
+    { printf 'svc: FINDING: condition present\nfinding-key: %s\nfinding-band: %s\n' "$1" "$2"; } > "$FINDMODE"
+}
+arm_finding_service() {
+    reset_state
+    printf 'myservice\t%s\t./launch.sh\tif [ -f finding ]; then cat finding >&2; exit 100; fi; test -f ok\t%s/serve.log\n' "$WD" "$WD" > "$REGISTRY"
+    touch "$OKFLAG"
+}
+FUTURE=$(date -d '+30 days' +%F 2>/dev/null || echo 2099-01-01)
+PAST=$(date -d '-1 day' +%F 2>/dev/null || echo 2000-01-01)
+
+arm_finding_service; mk_finding k-mute 1
+NEXUS_TEST_NOW=1000 _service_health_check_tick
+printf 'service=myservice\nowner=operator\nreason=accepted, tracked\nuntil=%s\nband=1\n' "$FUTURE" > "$SHDIR/myservice.finding-mute"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null); erc=$?
+assert_empty "a VALID mute (owner + reason + future until: + band) suppresses the emit" "$emit"
+assert_eq    "…and the emit has nothing to surface (rc 1)" "$erc" "1"
+assert_file_exists "…while the sidecar KEEPS TRACKING the condition underneath" "$SHDIR/myservice.finding"
+
+# 1+2: OWNERSHIP. Same #1482 rule as a `none` positive-control row.
+printf 'service=myservice\nowner=operator\nreason=just because\nband=1\n' > "$SHDIR/myservice.finding-mute"
+rm -f "$SHDIR/myservice-finding-surfaced"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "an UNOWNED mute (no until: and no tracker) is REFUSED, loudly" "$emit" "MUTE REFUSED"
+assert_contains "…and the finding is emitted anyway"                            "$emit" "is UP and reports a FINDING"
+printf 'service=myservice\nreason=r\nuntil=%s\nband=1\n' "$FUTURE" > "$SHDIR/myservice.finding-mute"
+rm -f "$SHDIR/myservice-finding-surfaced"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "a mute with no owner= is REFUSED" "$emit" "MUTE REFUSED"
+printf 'service=myservice\nowner=k\nreason=r\ntracker=your-org/nexus-code#1423\nband=1\n' > "$SHDIR/myservice.finding-mute"
+rm -f "$SHDIR/myservice-finding-surfaced"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_empty "CONTROL: a TRACKER ref satisfies ownership just as an until: date does" "$emit"
+
+# 1: EXPIRY.
+printf 'service=myservice\nowner=k\nreason=r\nuntil=%s\nband=1\n' "$PAST" > "$SHDIR/myservice.finding-mute"
+rm -f "$SHDIR/myservice-finding-surfaced"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "an EXPIRED mute stops suppressing and says so" "$emit" "MUTE EXPIRED"
+assert_contains "…and the finding is emitted anyway"            "$emit" "is UP and reports a FINDING"
+
+# 3: THE BAND BREAK. This is the constraint that stops a mute becoming the
+# mechanism by which the incident this tool exists to catch goes unreported.
+printf 'service=myservice\nowner=k\nreason=r\nuntil=%s\nband=1\n' "$FUTURE" > "$SHDIR/myservice.finding-mute"
+rm -f "$SHDIR/myservice-finding-surfaced"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_empty "CONTROL: at the muted band it is still silent" "$emit"
+mk_finding k-mute-worse 3
+NEXUS_TEST_NOW=1200 _service_health_check_tick
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "a WORSE band BREAKS the mute, so 10 pct to 77 pct can never be silent" "$emit" "MUTE BROKEN"
+assert_contains "…naming the bands it crossed"                                     "$emit" "band 1 into band 3"
+assert_contains "…and emitting the finding"                                        "$emit" "is UP and reports a FINDING"
+
+# 4: `muted` AND `cleared` ARE DISTINGUISHABLE IN THE RECORD.
+rm -f "$FINDMODE"
+NEXUS_TEST_NOW=1300 _service_health_check_tick
+assert_no_file "a green check clears the finding sidecar" "$SHDIR/myservice.finding"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains "the CLEARED breadcrumb says it is a real clear, not a mute" "$emit" "not a mute"
+assert_eq "the events history distinguishes them: one finding-cleared, no 'muted' row" \
+    "$(grep -c $'\tfinding-cleared\t' "$SHDIR/myservice.events" 2>/dev/null || true)" "1"
+rm -f "$SHDIR/myservice.finding-mute"
+set_policy ""
+
+# ===========================================================================
 echo "## healthy service ⇒ no incident, no emit"
 reset_state
 touch "$OKFLAG"
@@ -608,6 +829,34 @@ assert_contains     "emit says RECOVERED BY INTERVENTION" "$emit" "RECOVERED BY 
 assert_not_contains "emit never calls a rescued outage a transient blip" "$emit" "Transient blip"
 assert_contains     "emit states action was warranted" "$emit" "NOT a transient blip"
 assert_no_file "restart marker consumed on incident close" "$SHDIR/myservice.restart"
+
+# your-org/nexus-code#1456: a VERSION-RESTART is neither a self-heal nor an
+# operator action. Before this arm existed the marker's `actor=version-restart`
+# fell into the operator arm and the emit read "RESTORED by operator
+# intervention" for a restart no human made — inverting the diagnosis.
+echo
+echo "## a VERSION-RESTART is attributed as source drift — not a self-heal, not an operator"
+reset_incon
+rm -f "$OKFLAG"
+set_policy "emit-only"
+NEXUS_TEST_NOW=4000 _service_health_check_tick        # → grace
+NEXUS_TEST_NOW=4100 _service_health_check_tick        # grace elapsed → emit-only escalation
+# _version_restart.sh restarts it through svc.sh with SVC_RESTART_ACTOR set.
+printf 'actor=version-restart\nat=4150\niso=2026-09-04T14:11:20-07:00\n' > "$SHDIR/myservice.restart"
+touch "$OKFLAG"
+NEXUS_TEST_NOW=4200 _service_health_check_tick        # → recovered
+assert_eq "recovered_by=version-restart (from the marker's actor)" \
+    "$(_sh_field "$SHDIR/myservice.state" recovered_by)" "version-restart"
+via=$(_sh_field "$SHDIR/myservice.state" recovered_via)
+assert_contains     "recovered_via names source drift" "$via" "source drift"
+assert_not_contains "recovered_via never attributes an operator INTERVENTION" "$via" "operator intervention"
+assert_not_contains "recovered_via never says self-heal" "$via" "self-healed"
+emit=$(_service_health_emit_section "$SHDIR" "$ROOT" 2>/dev/null)
+assert_contains     "emit says RESTARTED BY VERSION-RESTART" "$emit" "RESTARTED BY VERSION-RESTART"
+assert_not_contains "emit never calls it an INTERVENTION" "$emit" "INTERVENTION"
+assert_contains     "emit says no operator acted" "$emit" "No operator acted"
+assert_not_contains "emit never calls it a transient blip" "$emit" "Transient blip"
+assert_no_file "restart marker consumed on incident close (version-restart)" "$SHDIR/myservice.restart"
 
 echo
 echo "## a WATCHER auto-restart is still attributed to the watcher"

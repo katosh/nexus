@@ -36,6 +36,19 @@
 
 set -u
 
+# --- RE-ENTRY BOUND (your-org/nexus-code#1033) -------------------------------
+# Backstop for any resolution CYCLE the content check cannot see — including one
+# whose other end is not a copy of this file at all. Forkless; bounded small on
+# purpose, because a large bound turns a loud instant refusal into a silent burn.
+_pw_depth="${NEXUS_PIPWRAP_DEPTH:-0}"
+case "$_pw_depth" in ''|*[!0-9]*) _pw_depth=0 ;; esac
+if [ "$_pw_depth" -ge "${NEXUS_PIPWRAP_DEPTH_MAX:-4}" ]; then
+    printf '%s shim: REFUSING — re-entered %s times without reaching a real binary; that is a resolution CYCLE (your-org/nexus-code#1033), not a slow call.\n' \
+        "pip" "$_pw_depth" >&2
+    exit 127
+fi
+export NEXUS_PIPWRAP_DEPTH=$((_pw_depth + 1))
+
 # --- locate this wrapper's own dir (to exclude from resolution) -----------
 _pw_name=$(basename "$0")
 _pw_arg0="$0"
@@ -61,6 +74,37 @@ _pw_rp() {
     printf '%s/%s\n' "$_pw_rp_d" "$(basename "$1")"
 }
 
+
+# --- IS THIS CANDIDATE A NEXUS WRAPPER? (your-org/nexus-code#1033) -----------
+# The gates below ask "is this candidate the same FILE as me?" — a directory
+# string compare and a realpath compare. Both answer the ALIASING case (#568 A5:
+# one file, two names). Neither answers the INVERSE: two DIFFERENT files that
+# are both copies of this wrapper — a second clone, a worktree, /tmp/devcheck.
+# That passes both gates, so copy A selects copy B as "the real pip" and
+# execs it while B execs A. Measured for the tmux sibling: 7,705 processes, PID
+# space wrapped, one agent dead (#1033). Measured here for THIS wrapper with
+# two distinct copies on PATH: an unbounded exec spin — ONE process, no growth,
+# never returns, invisible to any process-count check.
+#
+# The discriminator is CONTENT, not identity: match the file's own
+# self-identifying path comment, which sits within the first lines of every
+# revision. Deliberately NOT a marker introduced by this fix — a marker is an
+# opt-in that only the ALREADY-FIXED copy carries, and the copy you actually
+# meet during a rollout is the unfixed one. (That exact mistake was made and
+# measured on the tmux sibling before this form replaced it.)
+_pw_is_nexus_wrapper() {
+    IFS= read -r -N 2 _pw_magic < "$1" 2>/dev/null || return 1
+    [ "$_pw_magic" = '#!' ] || return 1         # ELF / not a script at all
+    _pw_scan=0
+    while [ "$_pw_scan" -lt 40 ] && IFS= read -r _pw_line; do
+        case "$_pw_line" in
+            *monitor/pipwrap/pip*) return 0 ;;
+        esac
+        _pw_scan=$((_pw_scan + 1))
+    done < "$1"
+    return 1
+}
+
 _pw_self_rp=""
 [ -n "$_pw_dir" ] && _pw_self_rp=$(_pw_rp "$_pw_dir/$_pw_name" 2>/dev/null || true)
 
@@ -83,6 +127,8 @@ for _pw_d in ${PATH:-}; do
         _pw_cand_rp=$(_pw_rp "$_pw_d/$_pw_name" 2>/dev/null || true)
         [ "$_pw_cand_rp" = "$_pw_self_rp" ] && continue
     fi
+    # Third gate: a candidate that IS a nexus wrapper is never the real pip.
+    _pw_is_nexus_wrapper "$_pw_d/$_pw_name" && continue
     _pw_real="$_pw_d/$_pw_name"
     break
 done

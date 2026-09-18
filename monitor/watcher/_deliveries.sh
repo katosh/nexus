@@ -624,6 +624,23 @@ _process_delivery() {
     if (( is_in_repo == 0 )); then
         local extra=""
         [[ -n "$path" ]] && extra=" path=${path}"
+        # `src=body` declares the ID VOCABULARY of this block, in the same
+        # field and spelling `_mentions.sh` already uses for its body matches:
+        # the mention is in the ISSUE/PR BODY, so its reaction lives on the
+        # issue/PR itself (`repos/{r}/issues/{n}/reactions`) and `id=` is NOT
+        # a comment database id. Without it `kind=pr` is AMBIGUOUS — a PR
+        # OPEN (id = the PR's databaseId) is byte-indistinguishable from a
+        # comment on a PR (id = the comment id) — and the re-emit reaction
+        # classifier then resolves the wrong endpoint, 404s permanently, and
+        # the mention can be evicted by neither a rocket nor eyes
+        # (your-org/nexus-code#1500). `kind=issue_new` is unambiguous on its
+        # own; it is marked too so the vocabulary is uniform and the
+        # classifier's `issue_new` arm can stay purely a back-compat arm for
+        # entries registered before this change.
+        case "$kind" in
+            issue_new) extra="${extra} src=body" ;;
+            pr) [[ "$event" == "pull_request" ]] && extra="${extra} src=body" ;;
+        esac
         printf -v block 'mention=%s kind=%s n=%s id=%s author=%s%s\n  body: %s\n' \
             "$repo" "$kind" "$n" "$id" "$author" "$extra" "$body_preview"
     else

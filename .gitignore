@@ -59,6 +59,27 @@ nexus/
 # at the nexus root. The default venv lives under locals/venvs/ instead.
 /.venv/
 
+# agent-sandbox runtime state, at the nexus root. Generated, never tracked, and
+# it accumulates over a nexus's lifetime — 3,394 untracked files on the operator
+# nexus at the time of your-org/nexus-code#1197. Anchored, matching the
+# convention above: this is nexus-root state, not something a work/<project>
+# repo should inherit a rule about.
+#
+# THIS IS THE FILE-COUNT HALF AND IT IS NOT WHAT RESTORED THE GATE, which is
+# worth writing down because #1197 proposed it as "the one-line fix". Measured
+# untracked bytes on that nexus: artifacts/ 41,741 MB, backups/ 462 MB, data/
+# 361 MB, .sandbox-state/ 89 MB. So this line removes 78% of the untracked FILES
+# and 0.2% of the untracked BYTES, and the probe timeout is driven by bytes —
+# ten .h5ad files alone are 41.5 GB. The cost fix is `grep -I` in
+# monitor/_guard_population.sh:gp_untracked_matching; this line is worth having
+# on its own terms, for the spawn and stat cost and because tracking runtime
+# state is never right, not as the remedy.
+#
+# artifacts/ and backups/ are deliberately NOT ignored here. They may be
+# intentional, and that is each operator's call to make in their own clone
+# rather than this repo's to make for everyone.
+/.sandbox-state/
+
 # Python bytecode caches (e.g. from harness py_compile checks).
 __pycache__/
 *.pyc

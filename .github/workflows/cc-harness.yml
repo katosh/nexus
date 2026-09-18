@@ -35,6 +35,15 @@ on:
       # stack was invisible to changes in that stack.
       - 'monitor/watcher/_idle_probe.sh'
       - 'monitor/watcher/_over_limit.sh'
+      # <your-org>/nexus-code#1465: run-tests.sh now consults repo-root.sh for
+      # the tree line every run-log header carries, so the runner this
+      # workflow executes SOURCES it — PF001 names it the moment it is left out.
+      - 'monitor/repo-root.sh'
+      # <your-org>/nexus-code#1334: test-realmodel-trust-sandboxed-env.sh EXECUTES
+      # the launcher path to pin CLAUDE_CODE_SANDBOXED=1's semantics against the
+      # real binary, so a change to spawn-worker.sh changes what this workflow
+      # proves -- PF001 names it the moment it is left out.
+      - 'monitor/spawn-worker.sh'
       # RETAINED, but D6's stated reason for them was WRONG (<your-org>/nexus-
       # code#765). D6 added these two as "the substrate every scenario runs
       # on". They are not the substrate of THIS workflow's scenarios: the eight
@@ -84,12 +93,22 @@ on:
       - 'monitor/_node-bootstrap.sh'
       - 'monitor/_trash.sh'
       - 'monitor/link-nexus-tools.sh'
+      # <your-org>/nexus-code#1535: `test-realmodel-longjob-wake.sh` runs the
+      # longjob dispatcher against the real binary; PF001 derives the edge.
+      - 'monitor/longjob-watch.sh'
       # Found ONLY by the derivation, by neither #765 nor #568 D6: the
       # scenarios load `pane-state.sh`, which sources `_idle_probe.sh`, which
       # sources `../_submit_evidence.sh` at _idle_probe.sh:1788. Three hops and
       # an inline `$(dirname "${BASH_SOURCE[0]}")` — which is exactly why no
       # one reading the workflow ever wrote it down.
       - 'monitor/_submit_evidence.sh'
+      # <your-org>/nexus-code#1239 (W2-22). Every `test-claude-md-*.sh` suite this
+      # workflow runs now calls `th_claude_md_block_coverage`, which executes
+      # `claude-md-block-coverage.sh` to print the entry's UNCHECKED share — so
+      # that script is in the closure. Caught by PF001 on the MERGED bundle
+      # tree, not on the branch that added it: the branch's own guard run
+      # could not see this workflow's filter.
+      - 'monitor/watcher/claude-md-block-coverage.sh'
       # <your-org>/nexus-code#792. Both kill-guard lints in this workflow now
       # SOURCE `monitor/shell-files.sh` for their file population, so a change
       # to the derivation changes what this workflow proves. Caught by PF001,
@@ -99,6 +118,121 @@ on:
       # same defect shape this PR is about, one level up: a guard whose
       # population silently fails to include the thing it guards.
       - 'monitor/shell-files.sh'
+      # <your-org>/nexus-code#934. `pane-state.sh` — already in this filter —
+      # now SOURCEs `monitor/_tmux-window.sh` (pane-state.sh:2646) for the
+      # shared window-key vocabulary, so the resolver is inside this
+      # workflow's execution closure and a change to it changes what this
+      # workflow proves. Caught by PF001 the same way `shell-files.sh` above
+      # was: the enumerated list did not know about an edge the derivation
+      # did. Recorded rather than quietly appended, because the edge is one
+      # hop through a file already listed, which is the shape that reads as
+      # already-covered to anyone checking the filter by eye.
+      - 'monitor/_tmux-window.sh'
+      # <your-org>/nexus-code#1214 -> this PR. THREE MORE EDGES, and all three
+      # were derived by PF001 rather than noticed — which is the fourth time in
+      # this filter's history that the enumerated list did not know an edge the
+      # derivation did (#765, #792, #934, now this). Stated per-site with the
+      # call site, because "it is in the closure" is not checkable and the
+      # three arrive at DIFFERENT depths and fail in DIFFERENT ways:
+      #
+      #   monitor/_bookkeeping.sh   SOURCED at monitor/watcher/_idle_probe.sh:220
+      #                             (one hop from a file already listed) for the
+      #                             `wk_encode` window-key encoder. GUARDED and
+      #                             LOUD: unreadable -> exit 2, refusing. So a
+      #                             change here cannot fail silently at runtime —
+      #                             but with the filter blind to it the WORKFLOW
+      #                             never runs, and THAT absence is silent.
+      #   monitor/async-run.sh      EXECUTED at monitor/pane-state.sh:2278
+      #                             (`timeout 5 "$ar" --status-line`) to decide
+      #                             the `idle-orphan-async` verdict. Guarded by
+      #                             `[[ -x "$ar" ]] || return 1` — so a broken
+      #                             async-run degrades the verdict rather than
+      #                             erroring, the direction that hides itself.
+      #   monitor/declare-wait.sh   DEPTH TWO: executed at monitor/async-run.sh:351,
+      #                             reached only because `async-run.sh` above is
+      #                             in the closure at all. BEST-EFFORT by design
+      #                             (warns to stderr and continues if missing),
+      #                             so nothing fails and the wait is simply never
+      #                             registered with the watcher.
+      #
+      # THE LINT WAS RE-RUN AFTER ADDING THESE, and it surfaced nothing new —
+      # said plainly because the opposite is the plausible outcome and would be
+      # the interesting one. PF001 computes the FULL TRANSITIVE closure in one
+      # pass, so it named `declare-wait.sh` in the same run that named
+      # `async-run.sh` even though the former is reachable only THROUGH the
+      # latter; the depth-2 edge did not require a second pass here. The re-run
+      # is still the right move rather than ceremony, because nothing in the
+      # rule's contract promises that: 21 passed / 2 failed before, 23 / 0
+      # after, and a second pass is the only thing that can tell a transcribed
+      # list from a converged one.
+      #
+      # AND THE FILTER IS STILL NOT PROVEN COMPLETE. Measured on this tree,
+      # `python3 monitor/lint-workflows.py .github/workflows`:
+      #
+      #     cc-harness.yml   32 file(s) resolved, 23 reference(s) NOT resolved
+      #
+      # The 32 are covered. The 23 are paths built from runtime variables, which
+      # no static pass can follow — so a green PF here means "no hole on the
+      # edges it could follow", never "the filter is complete". That distinction
+      # is the whole of #765: a workflow that does not run on a change to code
+      # it executes produces an ABSENCE, and an absence is indistinguishable
+      # from a pass, so a reviewer doing everything right merges it.
+      - 'monitor/_bookkeeping.sh'
+      - 'monitor/async-run.sh'
+      - 'monitor/declare-wait.sh'
+      # <your-org>/nexus-code#1326 -> `declare-wait.sh` now SOURCES this shared
+      # `(kind, id)` shape floor, so it joined this workflow's closure the
+      # moment the file was created. `test-lint-workflows.sh` PF001 caught it
+      # and `ng guards-for-diff --run` did NOT — that suite declares no
+      # population and is one of the 385 of 412 invisible to the index, which
+      # is exactly why a green there is not coverage.
+      - 'monitor/_wait_id.sh'
+      # <your-org>/nexus-code#1133 -> this PR. `monitor/_tmux_socket.sh` (added by
+      # `50180ea`, the #991/#1001/#1032 footgun batch) is the ONE place the
+      # 108-byte `sun_path` ceiling is measured, and THREE files in this
+      # workflow's closure source it. They fail DIFFERENTLY when it is
+      # unreachable, measured against a pristine `git archive 1b0d91a3` export
+      # with the file deleted — stated per-site because an earlier draft of this
+      # comment asserted "both of the first two refuse outright", which is false
+      # on both halves it named:
+      #
+      #   cc-harness/_lib.sh:352   REFUSES OUTRIGHT, before sourcing (`return 1`
+      #                            + "A check that did not run is not a pass").
+      #                            The only one that does. Reached under
+      #                            `monitor/cc-harness/**`, already in this filter.
+      #   _test_helpers.sh:940     DEFERS by design — guarded source, sets
+      #                            `_th_tmux_socket_lib_missing=1`, quiet at
+      #                            source time, then `exit 78` at first use in
+      #                            `th_require_tmux_socket`.
+      #   run-tests.sh:257         NO readability guard at all: the `.` fails and
+      #                            the next `tmux_socket_len` / `TMUX_SUN_PATH_MAX`
+      #                            dies under `set -uo pipefail` (rc 1). Loud, but
+      #                            a crash rather than a designed refusal.
+      #
+      # What they share is the property this line depends on: none of the three
+      # silently proceeds with the ceiling unmeasured. So a change to
+      # `_tmux_socket.sh` can turn every real-binary scenario here into a refusal
+      # or a crash — and without this line that change produces NO run at all,
+      # which is indistinguishable from a pass (#765).
+      #
+      # Caught by PF001, not by a human, for the third time running and for the
+      # same reason as `shell-files.sh` and `_tmux-window.sh` above: the edge is
+      # ONE HOP through a file already listed, which is precisely the shape that
+      # reads as already-covered to anyone checking this filter by eye. That the
+      # derivation keeps finding what enumeration misses is the argument for
+      # keeping the derivation, not for trusting the list.
+      - 'monitor/_tmux_socket.sh'
+      # <your-org>/nexus-code#1119. `monitor/cc-harness/demo.sh` now SOURCEs
+      # `monitor/watcher/_tmux-fixture.sh` for `nx_real_tmux_bin`, because its
+      # own `type -P tmux` resolved `monitor/tmuxwrap` — the PATH-front wrapper
+      # this workspace installs for every agent process — and wrote a shim that
+      # execs it with no `-L` pin under `--here`. That is the `#1105` shape,
+      # planted by production code rather than a fixture. Sourcing the shared
+      # definition puts the fixture inside this workflow's execution closure, so
+      # a change to `nx_real_tmux_bin` changes what this workflow proves.
+      # Caught by PF001, not by me — the third time the derivation has known
+      # about an edge the enumerated list did not.
+      - 'monitor/watcher/_tmux-fixture.sh'
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/cc-harness.yml'
@@ -182,7 +316,12 @@ jobs:
 
       - name: install runtime deps (jq + tmux)
         run: |
-          sudo apt-get update
+          # <your-org>/nexus-code#1505: drop the runner image's unused third-party apt
+          # source before updating (its index outage fails `apt-get update` at exit 100
+          # for packages this build never installs), then retry a transient index
+          # failure a bounded number of times. NOT `|| true`: that hides a real failure.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          for i in 1 2 3; do sudo apt-get update && break; [ "$i" -lt 3 ] || exit 1; sleep 15; done
           sudo apt-get install -y --no-install-recommends jq tmux
 
       - name: syntax check the harness shell + python

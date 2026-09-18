@@ -132,9 +132,37 @@ assert_contains "…and the correction is stated, not silent" "$OUT" "NOTE:"
 # A ledger left behind would be read by the next process that recycles the pid,
 # manufacturing assertions nobody made — which would be a fresh instance of
 # this file's own subject.
-before=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name '.th-ledger.*' 2>/dev/null | wc -l)
-run_case 'assert_eq "x" 1 1; th_summary_and_exit'
-after=$(find "${TMPDIR:-/tmp}" -maxdepth 1 -name '.th-ledger.*' 2>/dev/null | wc -l)
+# COUNTED IN A PRIVATE TMPDIR, NOT THE SHARED ONE (your-org/nexus-code#1317).
+# This sampled `${TMPDIR:-/tmp}` before and after its own case. That directory is
+# SHARED and globally mutating: under `run-tests.sh --jobs N` the other N-1
+# suites create and remove THEIR ledgers between the two `find` calls, so
+# `after > before` for reasons having nothing to do with this suite. Measured on
+# a quiet box (0 sibling bands, loadavg 37) at `--jobs 4`: this suite is
+# **35 passed / 0 failed SOLO** and FAILS in-band at 2.22s on exactly this
+# assertion — a false red that is green in isolation, which is `#1317`'s claim,
+# measured with a mechanism rather than assumed.
+#
+# The window is not narrow: /tmp held **63,642** `.th-ledger.*` files at the time
+# of measurement (all one uid, oldest 2026-08-27), and the `find` above takes
+# **260 ms** over that population — 260 ms of sibling writes, every run.
+#
+# Giving the case its own TMPDIR preserves the assertion's PURPOSE exactly — does
+# `th_summary_and_exit` remove the ledger it created — while removing the shared
+# -directory confound. `_TH_LEDGER` is `"${TMPDIR:-/tmp}/.th-ledger.$_TH_KEY"`,
+# so the child writes where we point it.
+#
+# NOTE the 63,642 is a SECOND finding and is NOT fixed here: ledgers are leaking
+# corpus-wide. `th_summary_and_exit` removes its own, so the leak is every suite
+# that dies, times out, or never reaches summary. That wants its own issue.
+_lh_tmp=$(mktemp -d) || _lh_tmp=''
+if [[ -n "$_lh_tmp" ]]; then
+    before=$(find "$_lh_tmp" -maxdepth 1 -name '.th-ledger.*' 2>/dev/null | wc -l)
+    OUT=$(TMPDIR="$_lh_tmp" bash -c "set -uo pipefail; . '$HELPERS'; assert_eq \"x\" 1 1; th_summary_and_exit" 2>&1); RC=$?
+    after=$(find "$_lh_tmp" -maxdepth 1 -name '.th-ledger.*' 2>/dev/null | wc -l)
+    rm -rf "$_lh_tmp"
+else
+    before=0; after=1   # mktemp failed: fail the assertion rather than pass vacuously
+fi
 assert_eq "the ledger is removed at summary time (no growth in stale files)" \
     "$([[ "$after" -le "$before" ]] && echo clean || echo leaked)" "clean"
 

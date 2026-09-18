@@ -49,7 +49,8 @@ assert_gt() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if "$REAL_GREP" -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && "$REAL_GREP" -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else printf '  FAIL: %s\n           expected substring: %s\n           in: %s\n' "$label" "$needle" "$hay" >&2; FAIL=$(( FAIL + 1 )); fi
 }
 assert_not_contains() {
@@ -74,6 +75,8 @@ NG="$FAKE_NEXUS/monitor/ng"
 # must provision it too — omitting it makes every report-grep assertion
 # fail at `ng` startup, not on the report-grep contract (your-org/nexus-code#631).
 cp "$_test_dir/../_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
+# your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+cp "$_test_dir/../_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 
 cat > "$FAKE_NEXUS/config/load.sh" <<'STUB'
 #!/usr/bin/env bash

@@ -39,8 +39,26 @@ _TRASH_NEXUS_ROOT=$(cd "$_trash_self_dir/.." && pwd)
 # Default trash root: gitignored monitor/.state/.trash (covered by
 # monitor/.gitignore's `.state/`). Overridable via NEXUS_TRASH_DIR for a
 # site that wants trash elsewhere.
+#
+# THE ROOT RESOLVES LIKE EVERY OTHER STATE SURFACE (your-org/nexus-code#1451):
+# NEXUS_TRASH_DIR -> NEXUS_STATE_DIR/.trash -> NEXUS_ROOT/monitor/.state/.trash
+# -> this file's own BASH_SOURCE location. It used to jump straight from the
+# override to BASH_SOURCE, which is the #1431 class exactly: a suite that pins
+# NEXUS_ROOT (and NEXUS_STATE_DIR) to a fixture for the linker still had the
+# linker's `_trash.sh` write `monitor/.state/.trash/` into the CHECKOUT — the
+# first catch of the band's LEAK-AT-SOURCE arm, on its first CI run. The
+# same-filesystem fallback inside `trash_path` is what keeps this safe when
+# the resolved root is on another device than the target.
 _trash_default_root() {
-    printf '%s' "${NEXUS_TRASH_DIR:-$_TRASH_NEXUS_ROOT/monitor/.state/.trash}"
+    if [ -n "${NEXUS_TRASH_DIR:-}" ]; then
+        printf '%s' "$NEXUS_TRASH_DIR"
+    elif [ -n "${NEXUS_STATE_DIR:-}" ]; then
+        printf '%s' "$NEXUS_STATE_DIR/.trash"
+    elif [ -n "${NEXUS_ROOT:-}" ]; then
+        printf '%s' "$NEXUS_ROOT/monitor/.state/.trash"
+    else
+        printf '%s' "$_TRASH_NEXUS_ROOT/monitor/.state/.trash"
+    fi
 }
 
 # Device id of the nearest EXISTING ancestor of $1 (the dir doesn't have

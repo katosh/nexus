@@ -96,6 +96,28 @@ source "$_VERSION_MODULE_DIR/../_log-mode.sh"
 # Log through the host's `log` when one is defined (the watcher's
 # stderr logger), else fall back to plain stderr so the module stays
 # usable from bootstrap-recover.sh / tests without ceremony.
+# THE NEGATION IS DEFEATED ON A COMPOUND COMMAND, so this predicate is a
+# FUNCTION and callers write `if ! <fn>`. Measured, bash 4.4.20:
+#     : 2>/dev/null < UNREADABLE        rc 1     ! : … < UNREADABLE        rc 0
+#     { : ; } 2>/dev/null < UNREADABLE  rc 1     ! { : ; } … < UNREADABLE  rc 1   <-- ! IGNORED
+#     ( : ) 2>/dev/null < UNREADABLE    rc 1     ! ( : ) … < UNREADABLE    rc 1   <-- ! IGNORED
+# A failed redirection on a COMPOUND command is a redirection ERROR, and the
+# `!` does not invert it; on a SIMPLE command it does. So `! : < f` works,
+# `! { :; } < f` silently never fires, and testing the first and generalising
+# walks you into the second. `cmd … || arm` is unaffected and is what the body
+# below uses. AND ZSH DISAGREES: the same `! { :; } < UNREADABLE` is rc 0 under
+# zsh 5.4.2 — so probing this at an interactive zsh prompt CONFIRMS the broken
+# form. This nexus is zsh-default, which is exactly how it would arrive.
+# A guard that parses, reads correctly, and never fires is the very defect
+# class your-org/nexus-code#1266 is about; it was caught here only because the
+# suite asserts this function's rc directly.
+_version_registry_readable() {
+    local f="$1"
+    [[ -f "$f" ]] || return 1
+    { : ; } 2>/dev/null < "$f" || return 1
+    return 0
+}
+
 _version_log() {
     if declare -F log >/dev/null 2>&1; then
         log "version: $*"
@@ -417,6 +439,71 @@ _version_restart_self() {
     return 0
 }
 
+
+# _version_pull_restart_advisory <nexus_root> <branch>
+#
+# Name the registered services a deploy pull will restart
+# (your-org/nexus-code#1456). Every version-tracked service — a registry row
+# whose launch command resolves to a script file — is restarted by this module
+# when that script's hash drifts, exactly as the watcher restarts itself. So a
+# pull that rewrites a launch script IS a service restart, and the advisory
+# that prescribes the pull must say which ones.
+#
+# TWO ARMS, and the difference between them is stated on the line:
+#   EXACT   — when `origin/<branch>` resolves in the local object store, the
+#             incoming diff `HEAD..origin/<branch>` is intersected with the
+#             launch scripts. This is the diff THE CLONE WILL RECEIVE — not the
+#             promotion diff, which over-predicts (measured: `main...dev` named
+#             three services including one under a do-not-restart constraint;
+#             the pull touched one). It is only as fresh as the last fetch, and
+#             the line says so.
+#   GENERIC — otherwise, the version-tracked services are listed so the
+#             deployer knows the population that CAN restart.
+# Never silent: a readable registry with no trackable service says that too.
+_version_pull_restart_advisory() {
+    local nexus_root="${1:-.}" branch="${2:-dev}"
+    local registry="${NEXUS_SERVICES_REGISTRY:-$nexus_root/monitor/services.registry}"
+    [[ -e "$registry" ]] || return 0
+    _version_registry_readable "$registry" 2>/dev/null || return 0
+    local name workdir launch health logfile script rel
+    local -a tracked=() rels=()
+    while IFS=$'\t' read -r name workdir launch health logfile; do
+        [[ -n "$name" && "$name" != \#* ]] || continue
+        workdir="${workdir/#\~/$HOME}"
+        workdir="${workdir//\$NEXUS_ROOT/$nexus_root}"
+        script=$(_version_service_script "$workdir" "$launch" 2>/dev/null) || continue
+        rel=$(realpath --relative-to="$nexus_root" "$script" 2>/dev/null) || rel="$script"
+        tracked+=("$name"); rels+=("$rel")
+    done < "$registry"
+    if (( ${#tracked[@]} == 0 )); then
+        printf 'A pull restarts no registered service: no registry row has a file-backed launch script to track.\n'
+        return 0
+    fi
+    local origin_sha="" i
+    origin_sha=$(git -C "$nexus_root" rev-parse --verify -q "origin/$branch" 2>/dev/null) || origin_sha=""
+    if [[ -n "$origin_sha" ]]; then
+        local incoming hits=0
+        incoming=$(git -C "$nexus_root" diff --name-only "HEAD..origin/$branch" -- 2>/dev/null || true)
+        printf 'A pull ALSO RESTARTS every version-tracked service whose launch script it rewrites (the same drift restart the watcher applies to itself). Against origin/%s as LAST FETCHED (%.12s — `git fetch` first for the exact set):\n' \
+            "$branch" "$origin_sha"
+        for i in "${!tracked[@]}"; do
+            if grep -qxF -- "${rels[$i]}" <<<"$incoming"; then
+                printf '  WILL RESTART: %s (%s)\n' "${tracked[$i]}" "${rels[$i]}"
+                hits=$(( hits + 1 ))
+            fi
+        done
+        if (( hits == 0 )); then
+            printf '  none — no registered launch script is in that diff; the tracked ones are:'
+            for i in "${!tracked[@]}"; do printf ' %s (%s)' "${tracked[$i]}" "${rels[$i]}"; done
+            printf '\n'
+        fi
+    else
+        printf 'A pull ALSO RESTARTS every version-tracked service whose launch script it rewrites — the incoming diff is not readable locally (origin/%s unresolved; `git fetch` to see it), so the population that CAN restart is:' "$branch"
+        for i in "${!tracked[@]}"; do printf ' %s (%s)' "${tracked[$i]}" "${rels[$i]}"; done
+        printf '\n'
+    fi
+}
+
 # _version_write_drift_record <version_state_dir> <comp> <old> <new> <note> [window]
 #
 # Persist an ask record at drift-<comp> (key=value, cc-update style).
@@ -588,7 +675,7 @@ _version_emit_section() {
                 # your-org/nexus-code#614. `note` is a packed record:
                 #   behind|<commits>|<hours>|<branch>|<why>
                 #   could-not-determine|<reason>|<detail>|<branch>
-                local _cd_kind _cd_a _cd_b _cd_branch _cd_why
+                local _cd_kind _cd_a _cd_b _cd_branch _cd_why _cd_head
                 IFS='|' read -r _cd_kind _cd_a _cd_b _cd_branch _cd_why <<<"$note"
                 if [[ "$_cd_kind" == "could-not-determine" ]]; then
                     # NEVER phrase this as healthy. An undetermined
@@ -607,10 +694,34 @@ _version_emit_section() {
                         "${old:-?}" "$new" "$detected"
                     printf 'Merged code is NOT running code: the watcher, spawner and every `ng` verb execute what is checked out here, not what is on %s.\n' \
                         "${_cd_branch:-dev}"
-                    printf 'Deploy when no worker is mid-flight (this is deliberately a human-timed action — a pull swaps helper libraries under the running watcher and in-flight workers):\n'
+                    # THE COMMAND NAMES THE SAME REF THE DRIFT WAS MEASURED
+                    # AGAINST — the configured integration branch, a
+                    # VARIABLE, never a literal (your-org/nexus-code#1529,
+                    # w241sk F3: a hard-coded `main` was a no-op pull on a
+                    # dev-tracking primary plus a prescribed checkout that
+                    # would have regressed the running watcher). Which branch
+                    # operators deploy from is `monitor.integration_branch`,
+                    # an operator configuration decision; the default is left
+                    # alone here. Nothing here pulls: this is text for a
+                    # human, and it never prescribes a checkout on this clone.
+                    # The variable form is pinned by
+                    # test-cc-update-no-remote-code.sh.
+                    printf 'Deploy when no worker is mid-flight (this is deliberately a human-timed action — a pull swaps helper libraries under the running watcher and in-flight workers). The deployment branch is monitor.integration_branch (%s, the ref measured above); never check out a different branch on this clone to deploy:\n' \
+                        "${_cd_branch:-dev}"
                     printf '  git -C %s pull --ff-only origin %s\n' \
                         "${nexus_root:-.}" "${_cd_branch:-dev}"
+                    _cd_head=$(git -C "${nexus_root:-.}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+                    if [[ -n "$_cd_head" && "$_cd_head" != "HEAD" && "$_cd_head" != "${_cd_branch:-dev}" ]]; then
+                        printf 'NOTE: this clone is checked out on %s, not %s — align monitor.integration_branch with the branch you deploy from before pulling; a pull into a different branch is not a deploy.\n' \
+                            "$_cd_head" "${_cd_branch:-dev}"
+                    fi
                     printf 'The version-aware watcher self-restarts on the resulting source-set drift; no manual restart needed.\n'
+                    # The pull also restarts version-tracked SERVICES whose
+                    # launch script changes, and until your-org/nexus-code#1456
+                    # this advisory never said so — a restart then arrived as a
+                    # surprise health emit rather than as the predicted
+                    # consequence of the action just prescribed.
+                    _version_pull_restart_advisory "${nexus_root:-.}" "${_cd_branch:-dev}"
                 fi
                 printf 'Ack/clear: rm %s\n' "$f"
                 ;;
@@ -750,7 +861,19 @@ _version_check_tick() {
 
     # ---- registered services ------------------------------------------
     local registry="${NEXUS_SERVICES_REGISTRY:-$nexus_root/monitor/services.registry}"
-    [[ -f "$registry" ]] || return 0
+    # your-org/nexus-code#1266. `[[ -f ]]` is TRUE for a file that exists and
+    # cannot be READ, so this guard did not cover the parse below: an
+    # unreadable registry yielded zero rows and every registered service
+    # silently dropped out of drift detection — the launch scripts stopped
+    # being version-checked with no artefact saying so. This module is loaded
+    # into the watcher and does not source bootstrap-recover.sh at load time,
+    # so the predicate is re-derived here; the CONTRACT is the one documented
+    # in bootstrap-recover.sh ("registry READABILITY: three states, not two").
+    [[ -e "$registry" ]] || return 0
+    if ! _version_registry_readable "$registry"; then
+        _version_log "services registry at $registry exists but is NOT READABLE; no service drift check this pass (rc 79)"
+        return 79
+    fi
     # Subshell on purpose: bootstrap-recover.sh sets globals (STATE_DIR,
     # INTERVAL, …) on source; isolating it keeps the watcher's own
     # globals pristine. All version state is on-disk, so nothing needs
@@ -806,11 +929,19 @@ _version_check_tick() {
                         # start, or when this module runs outside the watcher,
                         # e.g. under test — where the plain call is correct).
                         svc_rc=0
+                        # SVC_RESTART_ACTOR names THIS module in the restart
+                        # marker svc.sh stamps (your-org/nexus-code#1456): the
+                        # health monitor reads that marker to attribute the
+                        # recovery, and its default `operator` made a
+                        # source-drift restart read as "RESTORED by operator
+                        # intervention" when no operator acted.
                         if [[ -n "${INSTANCE_LOCK_FD:-}" ]]; then
                             NEXUS_ROOT="$nexus_root" NEXUS_SERVICES_REGISTRY="$registry" \
+                            SVC_RESTART_ACTOR=version-restart \
                                "$svc_bin" restart "$name" >/dev/null 2>&1 {INSTANCE_LOCK_FD}>&- || svc_rc=$?
                         else
                             NEXUS_ROOT="$nexus_root" NEXUS_SERVICES_REGISTRY="$registry" \
+                            SVC_RESTART_ACTOR=version-restart \
                                "$svc_bin" restart "$name" >/dev/null 2>&1 || svc_rc=$?
                         fi
                         if (( svc_rc == 0 )); then

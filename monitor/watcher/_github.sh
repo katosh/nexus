@@ -453,9 +453,18 @@ _watcher_handle_graphql_failure() {
 # `MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS` (default 1800), emit a
 # `watcher_alert=` sentinel that rides compose_report to the
 # orchestrator, re-nagging on the slower
-# `MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS` (default 3600) cadence. A
+# `MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS` (default 900) cadence. A
 # recovery after an escalation announces itself too — an alert that
 # never retracts trains the reader to ignore it.
+#
+# That re-nag is NOT decoration, and it was 3600 until
+# your-org/nexus-code#966's follow-up. An escalation that announces once and
+# then goes quiet for an hour is indistinguishable, from the operator's side,
+# from the surface having recovered — because a recovery is ALSO announced
+# once and then quiet. The restatement is what makes the two legible, so it
+# has to arrive on a human timescale and it has to carry a live `held_s`
+# (recomputed from `first` on every call; the storm's frozen `held_s=2403`
+# was one generation replayed, never the generator repeating itself).
 #
 # State: `graphql-degraded-<surface>` holding `first`/`count`/`announced`.
 _graphql_degraded_path() { printf '%s/graphql-degraded-%s' "${STATE_DIR:-.}" "$1"; }
@@ -492,8 +501,24 @@ _graphql_note_failure() {
 
     local escalate="${MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS:-1800}"
     [[ "$escalate" =~ ^[0-9]+$ ]] || escalate=1800
-    local remind="${MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS:-3600}"
-    [[ "$remind" =~ ^[0-9]+$ ]] || remind=3600
+    # Restatement cadence while the surface is STILL degraded
+    # (your-org/nexus-code#966 follow-up). Was 3600, which is the silent
+    # half of the same outage that produced the emit storm: measured
+    # 2026-08-17, the escalation announced at 10:45:41 and the channel then
+    # went quiet for the rest of the hour while `issue_comments` kept failing
+    # (`count` 5 -> 8 by 11:15:40, zero recoveries). Silence is not neutral
+    # here — a REAL recovery emits `ingest-recovered`, so an operator reading
+    # quiet as resolution is reading the design correctly and being misled.
+    #
+    # 900 is bounded on both sides. Below 600 buys NOTHING: this function is
+    # only ever called from the `github_poll` path, so the effective period is
+    # this window rounded UP to a multiple of the 600s poll — 900 therefore
+    # restates every second poll (~20 min), not every 15. Above ~1800 the
+    # restatement stops reading as a heartbeat and starts reading as a new
+    # incident. Each restatement recomputes `held_s` from `first`, so it
+    # carries a LIVE age rather than the frozen one the storm repeated.
+    local remind="${MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS:-900}"
+    [[ "$remind" =~ ^[0-9]+$ ]] || remind=900
 
     local due=0 held=$(( now - first ))
     if (( held >= escalate )); then

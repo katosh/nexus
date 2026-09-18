@@ -91,6 +91,16 @@
 #   0  CHECKED. Every discovered shim reachable in every enforceable surface,
 #      and the nproc ceiling observed to apply and propagate. Per-item warnings
 #      and the bash `-lic` carve-out live here: the guard looked and judged.
+#      THREE surfaces are examined, not two (your-org/nexus-code#652, #654):
+#      the AMBIENT one — the PATH this guard was handed by its caller — plus
+#      the two spawned probe shells. The ambient one was added because the two
+#      spawned ones cannot see the caller: a session replaying a PATH snapshot
+#      frozen before a PATH fix keeps the pre-fix ordering for its whole life,
+#      while every shell this guard spawns re-derives the fixed ordering. The
+#      guard therefore used to reach a CONFIDENT WRONG ANSWER — exit 0 in a
+#      worker whose own `command -v pip` answered `/app/bin/pip`, the #487
+#      fork-storm binary. All of #612's hardening is on the COULD-NOT-LOOK
+#      axis and none of it helps against looking at the wrong thing.
 #   1  CONFIRMED failure. The launcher must abort the spawn.
 #  79  NOT CHECKED — the guard's own precondition is absent (NEXUS_ROOT unset,
 #      no shim dirs, probe shell missing). Never folded into 0. A CONFIRMED
@@ -100,11 +110,56 @@
 # Overrides (for tests):
 #   NEXUS_SHIMWRAP_GLOB       shim-dir glob (default $NEXUS_ROOT/monitor/*wrap)
 #   NEXUS_ASSERT_GH_SHELL     shell to probe (default $SHELL, then /usr/bin/zsh)
+#   NEXUS_INHERITED_PATH      the PATH THIS PROCESS WAS GIVEN, recorded by
+#                             monitor/shellenv/bash_env.sh before it re-fronts.
+#                             Read (never written) here; it is what the AMBIENT
+#                             surface adjudicates. Absent → falls back to $PATH,
+#                             which is the weaker reading and is documented as
+#                             such at the surface itself.
 #   NEXUS_ASSERT_NPROC_EXPECT expected soft RLIMIT_NPROC (the launcher's
 #                             ceiling). Unset/0 → propagation is still observed,
 #                             but no specific ceiling is required.
 #   NEXUS_ASSERT_SKIP_NPROC=1 skip the nproc observation entirely.
+#   NEXUS_ASSERT_SKIP_SNAPSHOT=1 skip the frozen-snapshot leg entirely.
+#   NEXUS_ASSERT_SNAPSHOT     read THIS snapshot file instead of discovering one.
+#   NEXUS_ASSERT_NO_ANCESTRY=1 disable the ancestry walk, forcing the mtime
+#                             proxy — a test seam, so the two selection routes
+#                             can be exercised independently.
+#   NEXUS_CC_HOME             when set, the ONLY Claude-Code home consulted for
+#                             snapshots. A fixture overriding HOME does not
+#                             necessarily override CLAUDE_CONFIG_DIR, so without
+#                             an exclusive seam this leg reads the REAL host's
+#                             snapshot from inside a synthetic fixture.
+#   NEXUS_SPAWNER_SNAPSHOT    the snapshot the SPAWNING agent's own tool shell
+#                             sources, carried into the launcher by
+#                             spawn-worker.sh (your-org/nexus-code#1477). Ranked
+#                             after this process's own ancestry and BEFORE the
+#                             newest-by-mtime proxies: it is a nexus-launched
+#                             artifact on the same rc chain as the child, which
+#                             is the subject the snapshot leg's header always
+#                             claimed to examine. Scoped by NEXUS_CC_HOME like
+#                             the ancestry route: a path outside that home is
+#                             ignored, not preferred.
 #   NEXUS_ASSERT_SKIP_SHIMS=1 skip the shim-reachability probes entirely.
+#   NEXUS_ASSERT_PROBE_TIMEOUT     seconds a probe shell may run before SIGTERM
+#                             (default 40); NEXUS_ASSERT_PROBE_KILL_GRACE seconds
+#                             after that before SIGKILL (default 5). Probe shells
+#                             run DETACHED from the controlling tty (`setsid`,
+#                             stdin </dev/null) — see `_asw_probe_exec` for the
+#                             measured hang this closes. Test seams for the kill
+#                             path; leave at the defaults in production.
+#
+# Inputs that are NOT overrides — contracts other launchers already pin:
+#   NEXUS_IS_ORCHESTRATOR=1   exported by EVERY orchestrator spawn path
+#                             (monitor/watcher/_respawn.sh's launcher, and
+#                             spawn-fresh-orchestrator.sh through it; asserted
+#                             by test-respawn.sh, test-spawn-fresh-orchestrator.sh
+#                             and test-target-config.sh). It marks the SELF-HEAL
+#                             path: on it the frozen-snapshot leg below WARNS and
+#                             records durably but never refuses
+#                             (your-org/nexus-code#1477 — see that leg for the
+#                             stated error direction). Worker spawns do not set
+#                             it and keep the fail-CLOSED refusal.
 
 set -u
 
@@ -218,6 +273,156 @@ EOF
     return 1
 }
 
+# ---------------------------------------------------------------------------
+# THE AMBIENT SURFACE (your-org/nexus-code#652, #654)
+# ---------------------------------------------------------------------------
+# The two probe surfaces below spawn a FRESH `$SHELL`. This guard's own
+# process does not, and that difference is the whole of #652/#654: an agent's
+# Bash tool call is not a fresh shell, it is
+#
+#     /usr/bin/zsh -c source ~/.claude/.../snapshot-zsh-<id>.sh …
+#
+# replaying a PATH captured ONCE at session start. A session that started
+# before a PATH fix keeps the pre-fix ordering for its whole life, and every
+# freshly spawned probe shell reports the FIXED ordering — so the guard
+# reached a CONFIDENT WRONG ANSWER by measuring the wrong shell. Both halves
+# were measured in one worker seconds apart: `command -v pip` -> /app/bin/pip
+# (the #487 fork-storm binary) while this guard exited 0.
+#
+# MEASURED, this host, 44 snapshots on disk at 2026-09-02T08:40Z (the count
+# GROWS as sessions start — it was 52 an hour later, so it is pinned to its
+# moment rather than quoted bare):
+#
+#   position 13   13 snapshots   2026-08-04 06:34 .. 2026-08-05 07:48
+#   position  2    1 snapshot    2026-08-06 04:32          <- the transition
+#   position  1   30 snapshots   2026-08-08 04:24 onward
+#
+# THE MIDDLE ROW IS STATED BECAUSE AN EARLIER DRAFT OF THIS COMMENT OMITTED IT.
+# It said "every snapshot at or before 2026-08-05 carries position 13, and
+# every snapshot from 2026-08-08 onward carries position 1" — true of 43 of the
+# 44, and the one it dropped is the ONLY sample between the two dates, i.e.
+# precisely the transition the paragraph exists to describe. A clean
+# before/after reads as a sharper finding than a three-state one, which is
+# exactly why the inconvenient sample is the one that goes missing. Caught by
+# the skeptic on this change.
+#
+# So the SYMPTOM is repaired and the gate that certified it clean throughout
+# was never changed. That is what this surface is for.
+#
+# WHAT THIS CAN AND CANNOT SEE, stated because a scope claim needs a
+# direction. This guard runs BEFORE `claude` execs, so the CHILD's future
+# snapshot does not exist yet and cannot be inspected — #654 is right that no
+# amount of tuning reaches it. What this guard CAN see is the PATH of its own
+# process, which is a real agent surface in both of its call shapes, though
+# not equally: in the DIAGNOSTIC path it IS the buried tool shell, which is the
+# case `#654` filed and the case this surface catches. In the SPAWN path it is
+# the immediately preceding bash, whose PATH `bash_env.sh` step (b) has ALREADY
+# re-fronted — because every non-interactive bash both records (a0) and repairs
+# (b), the record the guard reads describes a shell the prelude has already
+# fixed. So the ambient surface is structurally blind to burial inherited from
+# any shell above the last bash in the chain, and the spawn path is covered by
+# the SNAPSHOT surface below, not by this one.
+#
+# Wording supplied verbatim by the skeptic `wpathsk`, which MEASURED it:
+# launcher one hop up holds the buried value, the guard does not; the guard
+# exits 0 with zero ambient refusals where the same guard handed that value
+# directly exits 1 with three. The three ambient suite cases set
+# NEXUS_INHERITED_PATH on the invocation line, so they exercise the CONSUMER
+# and never the producer-to-consumer channel — the one hop where the value is
+# destroyed is the one hop nothing covers. Not a fail-open regression (the
+# snapshot leg catches the spawn case); the defect was the ATTRIBUTION, which
+# is why it read plausibly for as long as it did.
+#
+# WHY THE ENFORCEABLE SIGNAL IS *BURIAL* AND NOT MERE ABSENCE. Refusing
+# whenever a guarded name resolves off-shim in the ambient PATH would refuse
+# in every test fixture, whose shim dirs are temp directories that were never
+# fronted anywhere — and it would do so by discriminating on the FIXTURE
+# rather than on the property, which this file's own suite already forbids
+# (it asserts the verdict must not depend on which override the caller set).
+# So the adjudicated signal is the one #578/#652 actually produce: the shim
+# directory IS on this PATH and something resolves AHEAD of it. That is a
+# front that was applied and then defeated — confirmed-bad, and impossible to
+# reach from a fixture whose shim dir is not on PATH at all.
+#
+# The residual, named rather than hidden: a shim dir ABSENT from the ambient
+# PATH is reported as a scoped WARNING, not a refusal. It errs toward
+# ALLOWING, and the reason it is not a refusal is that this guard is run in
+# contexts (its own suite, CI, an operator shell) where an unfronted ambient
+# PATH is normal and a refusal would halt every spawn on the board.
+# THE AMBIENT PATH IS THE ONE THIS PROCESS INHERITED, NOT ITS LIVE $PATH.
+# monitor/shellenv/bash_env.sh re-fronts PATH at the start of every
+# non-interactive bash — including this guard — so by line 1 the guard's own
+# $PATH has already been repaired and reports clean about a shell that is not
+# the one at risk. bash_env.sh therefore records what it inherited, and that
+# is the value adjudicated here. Falling back to $PATH when the record is
+# absent is deliberate and is the WEAKER reading: it means the guard was
+# invoked without the nexus prelude, so there is no separate caller PATH to
+# recover and $PATH is the best available answer.
+_asw_ambient_path() {
+    printf '%s' "${NEXUS_INHERITED_PATH:-$PATH}"
+}
+
+# Resolve `$1` against an explicit PATH string, the way execvp would. Not
+# `command -v`: that reads the LIVE $PATH, which is the wrong one here.
+# Binaries only — an alias or function cannot be inherited across the exec
+# that separates this guard from its caller, so there is nothing else to find.
+_asw_resolve_in() {
+    _asw_ri_n="${1:-}"; _asw_ri_path="${2:-}"
+    [ -n "$_asw_ri_n" ] || return 1
+    _asw_ri_ifs=$IFS
+    IFS=:
+    for _asw_ri_d in $_asw_ri_path; do
+        [ -n "$_asw_ri_d" ] || continue
+        if [ -x "$_asw_ri_d/$_asw_ri_n" ] && [ ! -d "$_asw_ri_d/$_asw_ri_n" ]; then
+            IFS=$_asw_ri_ifs
+            printf '%s/%s' "$_asw_ri_d" "$_asw_ri_n"
+            return 0
+        fi
+    done
+    IFS=$_asw_ri_ifs
+    return 1
+}
+
+# `_asw_dir_on_path_in <dir> <path-string>` asks about an EXPLICIT PATH; the
+# bare `_asw_dir_on_path <dir>` asks about the ambient one (unchanged callers).
+_asw_dir_on_path() { _asw_dir_on_path_in "${1:-}" "$(_asw_ambient_path)"; }
+_asw_dir_on_path_in() {
+    _asw_dop_d="${1:-}"; _asw_dop_path="${2:-}"
+    [ -n "$_asw_dop_d" ] || return 1
+    _asw_dop_r=$(_asw_rp "$_asw_dop_d" 2>/dev/null || true)
+    _asw_dop_ifs=$IFS
+    IFS=:
+    for _asw_dop_e in $_asw_dop_path; do
+        [ -n "$_asw_dop_e" ] || continue
+        if [ "$_asw_dop_e" = "$_asw_dop_d" ]; then IFS=$_asw_dop_ifs; return 0; fi
+        if [ -n "$_asw_dop_r" ]; then
+            _asw_dop_er=$(_asw_rp "$_asw_dop_e" 2>/dev/null || true)
+            if [ -n "$_asw_dop_er" ] && [ "$_asw_dop_er" = "$_asw_dop_r" ]; then
+                IFS=$_asw_dop_ifs; return 0
+            fi
+        fi
+    done
+    IFS=$_asw_dop_ifs
+    return 1
+}
+
+# Which shim dir ships `$1`, and is that dir on the ambient PATH? Answers
+# through the ENUMERATED dirs, never a literal path, so it inherits the
+# never-hand-maintained property the shim set already has.
+_asw_shimdir_on_path() { _asw_shimdir_on_path_in "${1:-}" "$(_asw_ambient_path)"; }
+_asw_shimdir_on_path_in() {
+    _asw_sdp_n="${1:-}"; _asw_sdp_path="${2:-}"
+    [ -n "$_asw_sdp_n" ] || return 1
+    while IFS= read -r _asw_sdp_d; do
+        [ -n "$_asw_sdp_d" ] || continue
+        [ -x "$_asw_sdp_d/$_asw_sdp_n" ] || continue
+        if _asw_dir_on_path_in "$_asw_sdp_d" "$_asw_sdp_path"; then return 0; fi
+    done <<EOF
+${_asw_dirs}
+EOF
+    return 1
+}
+
 # Why an unwrapped name matters — the operator-facing consequence, per hazard
 # class. An unknown name still gets a correct, generic line.
 _asw_hazard_note() {
@@ -228,6 +433,8 @@ _asw_hazard_note() {
             printf 'FAIL-OPEN: the sandbox-wrapped %s re-execs without bound and has taken this node down (#487) — a bare `%s` here RUNS.' "$1" "$1" ;;
         sandbox-notify)
             printf 'operator notifications would bypass the engagement gate.' ;;
+        tmux)
+            printf 'FAIL-OPEN: a board-lethal kill (kill-server, or the last window of the last session) would run UNCHECKED, and ending the server tears down the whole sandbox with no in-sandbox recovery (#644, #892).' ;;
         *)
             printf 'this PATH-front guard would not apply to `%s`.' "$1" ;;
     esac
@@ -255,6 +462,19 @@ _asw_base=$(basename -- "$_asw_probe_shell" 2>/dev/null || printf '%s' "$_asw_pr
 # zsh-is-not-bash trap).
 _asw_run_probe() {
     _asw_flags="$1"
+    # THE AMBIENT SURFACE SPAWNS NOTHING. Resolving in THIS process is the
+    # entire point: a spawned shell re-derives PATH and would answer the
+    # question that #652/#654 showed was the wrong one.
+    if [ "$_asw_flags" = "--ambient" ]; then
+        _asw_amb=$(_asw_ambient_path)
+        while IFS= read -r _asw_an; do
+            [ -n "$_asw_an" ] || continue
+            printf '%s:%s\n' "$_asw_an" "$(_asw_resolve_in "$_asw_an" "$_asw_amb" 2>/dev/null)"
+        done <<EOF
+${_asw_names}
+EOF
+        return 0
+    fi
     _asw_cmd='printf "%s\n" "$NEXUS_ASSERT_SHIM_NAMES" | tr " " "\n" | while IFS= read -r _n; do
         [ -n "$_n" ] || continue
         printf "SHIMMARK:%s:%s\n" "$_n" "$(command -v -- "$_n" 2>/dev/null)"
@@ -268,14 +488,89 @@ _asw_run_probe() {
     ZSH_COMPDUMP="${TMPDIR:-/tmp}/.nexus-assert-zcompdump.$$"
     NEXUS_ASSERT_SHIM_NAMES=$(printf '%s' "$_asw_names" | tr '\n' ' ')
     export ZSH_COMPDUMP NEXUS_ASSERT_SHIM_NAMES
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 40 "$_asw_probe_shell" $_asw_flags "$_asw_cmd" 2>/dev/null \
-            | sed -n 's/^SHIMMARK://p'
-    else
-        "$_asw_probe_shell" $_asw_flags "$_asw_cmd" 2>/dev/null \
-            | sed -n 's/^SHIMMARK://p'
-    fi
+    _asw_probe_exec "$_asw_probe_shell" $_asw_flags "$_asw_cmd" 2>/dev/null \
+        | sed -n 's/^SHIMMARK://p'
     rm -f "$ZSH_COMPDUMP" 2>/dev/null || true
+}
+
+# _asw_probe_exec <shell> <flags...> <cmd>
+#
+# Run a probe shell with NO controlling tty, stdin from /dev/null, and a
+# timeout that ESCALATES to SIGKILL (your-org/nexus-code#1497).
+#
+# WHY. Every launcher that runs this guard runs it inside a tmux pane, and an
+# INTERACTIVE shell (`-lic`, `-ic`) started there by a plain `timeout 40 …`
+# is in a BACKGROUND process group of the pane's tty (GNU timeout puts its
+# child in its own group so it can kill the group). POSIX job control stops
+# such a shell with SIGTTIN/SIGTTOU the moment it touches the terminal, before
+# it can run the `-c` command. Measured on 2026-09-06/08 (zsh 5.4.2, bash
+# 4.4.20, GNU timeout 8.28, in a pane shaped exactly like
+# `_respawn.sh`'s launcher — 4 of 4 runs): the shell sits in state T; at 40 s
+# the bare `timeout` sends SIGTERM, which an interactive shell IGNORES once
+# its signal setup has run, and then waits forever — no `-k`, nothing
+# stronger to send. The launcher never reaches `exec claude`, and
+# `pane-state.sh` reads `unknown reason=live-descendant` for the window. Two
+# orchestrator boots of one nexus hung this way on 2026-09-06 (the watcher
+# logged `input-ready probe timed out … last state='unknown'` and every emit
+# `FAILED rc=4`). The milder outcome — the stopped shell dies on the TERM,
+# the surface comes back EMPTY after 40 s and the guard "allows" having
+# learned nothing — is the one every other operator has been paying since
+# the probe landed (#578): a 40 s tax per spawn and a blind surface.
+#
+# THE FIX IS THE MORE FAITHFUL MODEL, not a workaround: Claude Code takes the
+# very shell snapshot this probe stands in for from a SUBPROCESS WITH NO TTY.
+# `setsid` gives the probe the same footing (no controlling terminal, so no
+# job-control stop and nothing to read from), `</dev/null` closes the other
+# door, and `-k` makes the bound a bound.
+#
+# ORDER MATTERS: `setsid` OUTSIDE, `timeout` INSIDE. GNU timeout kills its
+# direct child and then its own process group (`kill(0, sig)`), which is
+# where the child's descendants live. Run the other way round (`timeout …
+# setsid …`) the shell lands in a NEW session and only the shell itself is
+# ever signalled: a descendant it spawned before wedging — an rc chain's
+# `tmux`, a `sleep`, anything — survives, keeps the output pipe open, and the
+# guard waits for IT. Measured while writing the test for this: a probe shell
+# that ignored SIGTERM and slept was killed on schedule, yet the guard
+# returned only when its orphaned `sleep` did. With `setsid -w timeout …` the
+# whole detached group goes down at the bound. `setsid -w` execs in place
+# when the caller is not a group leader (the normal case here) and waits for
+# the child when it has to fork, so the exit status and the pipe both stay
+# attached to the probe.
+#
+# The two numbers are knobs so a test can drive the KILL path in seconds:
+#   NEXUS_ASSERT_PROBE_TIMEOUT     seconds before SIGTERM (default 40)
+#   NEXUS_ASSERT_PROBE_KILL_GRACE  seconds after that before SIGKILL (default 5)
+# Non-numeric values fall back to the defaults rather than to an unbounded
+# probe.
+_asw_probe_timeout="${NEXUS_ASSERT_PROBE_TIMEOUT:-40}"
+case "$_asw_probe_timeout" in ''|*[!0-9]*) _asw_probe_timeout=40 ;; esac
+_asw_probe_kill_grace="${NEXUS_ASSERT_PROBE_KILL_GRACE:-5}"
+case "$_asw_probe_kill_grace" in ''|*[!0-9]*) _asw_probe_kill_grace=5 ;; esac
+# WHY A GUARANTEED RETURN IS SAFE HERE — AND WHAT WOULD MAKE IT UNSAFE
+# (your-org/nexus-code#1498 review). `-k` turns the bound into a bound: a probe
+# shell that ignores SIGTERM is KILLED and its surface comes back EMPTY. That
+# is only safe because an EMPTY surface ALLOWS — the two degrade-to-allow arms
+# below, at the `did not resolve at all (empty)` warning and at the `gh`
+# version-floor warning, neither of which sets `_asw_refused`.
+#
+# THE TWO ARE COUPLED AND THE COUPLING IS INVISIBLE FROM EITHER END. Hardening
+# an empty surface into a REFUSAL looks entirely local to the adjudication
+# block; on that day `-k` silently converts a rare hang into a DETERMINISTIC
+# spawn refusal on every host with a controlling tty, because a killed probe
+# always yields an empty surface. If you change what an empty surface does,
+# this function is the other half of that change. Case 13c pins the ALLOW.
+_asw_probe_exec() {
+    if command -v setsid >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then
+            setsid -w timeout -k "$_asw_probe_kill_grace" "$_asw_probe_timeout" "$@" </dev/null
+        else
+            setsid -w "$@" </dev/null
+        fi
+    elif command -v timeout >/dev/null 2>&1; then
+        timeout -k "$_asw_probe_kill_grace" "$_asw_probe_timeout" "$@" </dev/null
+    else
+        "$@" </dev/null
+    fi
 }
 
 _asw_refused=0
@@ -307,7 +602,16 @@ esac
 if [ "${NEXUS_ASSERT_SKIP_SHIMS:-}" = 1 ]; then
     _asw_say "shim-reachability probes skipped by explicit request (NEXUS_ASSERT_SKIP_SHIMS=1)."
 elif [ "$_asw_have_shims" = 1 ] && [ "$_asw_probe_ok" = 1 ]; then
+    # AMBIENT FIRST — it is the surface the caller is actually running in, and
+    # putting it first means a buried caller is named before two spawned
+    # shells report the ordering it does not have.
+    #
+    # Its enforceability token is `burial`, not 0/1: adjudicated as a REFUSAL
+    # when the shim dir is on this PATH and something resolves ahead of it,
+    # and as a scoped WARNING when the shim dir is not on this PATH at all.
+    # See the AMBIENT SURFACE block above for why that is the property line.
     for _asw_spec in \
+        "ambient (the PATH this guard INHERITED):--ambient:burial" \
         "non-interactive (tool -c):-c:1" \
         "login+interactive (snapshot source):-lic:$_asw_lic_enforceable"; do
         _asw_lbl="${_asw_spec%%:*}"
@@ -326,7 +630,11 @@ elif [ "$_asw_have_shims" = 1 ] && [ "$_asw_probe_ok" = 1 ]; then
                         "$_asw_tmp.probe" 2>/dev/null)
 
             if [ -z "$_asw_res" ]; then
-                _asw_say "WARNING: $_asw_base $_asw_lbl: \`$_asw_name\` did not resolve at all (empty). Not a hazard on its own (a missing command fails loudly on use), so allowing — but the shim is not on PATH here."
+                # The ambient surface spawns no shell, so naming one here
+                # would misattribute the observation to a probe that never ran.
+                _asw_who="$_asw_base $_asw_lbl"
+                [ "$_asw_enf" = burial ] && _asw_who="$_asw_lbl"
+                _asw_say "WARNING: $_asw_who: \`$_asw_name\` did not resolve at all (empty). Not a hazard on its own (a missing command fails loudly on use), so allowing — but the shim is not on PATH here."
                 _asw_warned=1
                 continue
             fi
@@ -341,13 +649,63 @@ elif [ "$_asw_have_shims" = 1 ] && [ "$_asw_probe_ok" = 1 ]; then
                 *)
                     # A non-absolute answer means an alias, shell function or
                     # builtin is shadowing a guarded name AHEAD of the shim.
-                    # That is a bypass by another route — a confirmed-bad
+                    # That is USUALLY a bypass by another route — a confirmed-bad
                     # state, not an unknown one.
+                    #
+                    # THE EXCEPTION: A SELF-PREFIXING ALIAS IS TRANSPARENT TO A
+                    # PATH-FRONT SHIM (your-org/nexus-code#892, skeptic F1).
+                    # An alias whose expansion's FIRST WORD is the alias name
+                    # itself — `tmux='tmux -2'`, `ls='ls --color=auto'`, the
+                    # commonest shape in any operator's rc — does not bypass
+                    # anything: zsh will not recursively re-expand the head, so
+                    # the expanded first word resolves through PATH and lands on
+                    # the shim. Only the extra flags are prepended.
+                    #
+                    # Treating it as a bypass is not a harmless over-refusal. It
+                    # is a TOTAL SPAWN WEDGE: every agent launcher runs this gate
+                    # and aborts on non-zero, so one alias in ~/.zshrc halts the
+                    # whole board — and this guard exists precisely to keep the
+                    # board alive. Measured on this host with `alias tmux='tmux
+                    # -2'` live: the aliased kill still reached the shim and was
+                    # REFUSED, i.e. the guard applied and the refusal's premise
+                    # was false.
+                    #
+                    # An alias whose first word DIFFERS
+                    # (`tmux='/usr/bin/tmux -2'`, `gh='hub'`) genuinely does
+                    # bypass the shim, and still refuses.
+                    _asw_alias_head=$(printf '%s' "$_asw_res" \
+                        | sed -n "s/^alias $_asw_name=//p" \
+                        | sed "s/^['\"]//; s/['\"]$//" \
+                        | awk '{print $1}')
+                    if [ -n "$_asw_alias_head" ] && [ "$_asw_alias_head" = "$_asw_name" ]; then
+                        _asw_say "NOTE: $_asw_base $_asw_lbl: \`$_asw_name\` is aliased SELF-PREFIXING ('$_asw_res'). The expansion's head is \`$_asw_name\` itself, which zsh does not re-expand, so it still resolves through PATH to the shim. Not a bypass; allowing."
+                        continue
+                    fi
                     _asw_msg="\`$_asw_name\` is SHADOWED by a shell alias/function ('$_asw_res') ahead of the shim. $(_asw_hazard_note "$_asw_name")"
                     ;;
             esac
 
-            if [ "$_asw_enf" = 1 ]; then
+            if [ "$_asw_enf" = burial ]; then
+                # BURIED: the front was applied here and then defeated. This is
+                # the #578/#652 signature and it is confirmed-bad.
+                if _asw_shimdir_on_path "$_asw_name"; then
+                    _asw_refused=1; _asw_shim_refused=1
+                    _asw_say "REFUSING SPAWN: $_asw_lbl: $_asw_msg"
+                    _asw_say "  The shim directory IS on the INHERITED PATH and \`$_asw_name\` resolves AHEAD of it."
+                    _asw_say "  That is a front that was applied and then BURIED — the #578 signature, in the"
+                    _asw_say "  surface the caller is actually running in. A freshly spawned probe shell"
+                    _asw_say "  re-derives PATH and would report this clean (your-org/nexus-code#652, #654)."
+                else
+                    # NOT ADJUDICABLE, and said so rather than folded into the
+                    # pass. This is the guard looking and judging an individual
+                    # item, so it is a warning and not the 79 outcome.
+                    _asw_warned=1
+                    _asw_say "WARNING: $_asw_lbl: $_asw_msg"
+                    _asw_say "  The shim directory is NOT on the INHERITED PATH at all, so this is not the"
+                    _asw_say "  buried-front signature and is not adjudicated as a failure. What is NOT"
+                    _asw_say "  established: that a bare \`$_asw_name\` from THIS shell reaches the shim. It does not."
+                fi
+            elif [ "$_asw_enf" = 1 ]; then
                 _asw_refused=1; _asw_shim_refused=1
                 _asw_say "REFUSING SPAWN: $_asw_base $_asw_lbl: $_asw_msg"
             else
@@ -360,6 +718,41 @@ elif [ "$_asw_have_shims" = 1 ] && [ "$_asw_probe_ok" = 1 ]; then
 ${_asw_names}
 EOF
     done
+
+    # ONE HOP ABOVE THE CALLER (your-org/nexus-code#1383). The ambient surface
+    # adjudicates the PATH this process INHERITED — and in the SPAWN path that
+    # caller is a bash launcher whose own prelude had ALREADY re-fronted before
+    # exporting PATH to us, so the reading above describes a repaired shell and
+    # a silent clean there was a question the surface could not answer. The
+    # prelude now carries the caller's OWN inherited PATH forward, one hop,
+    # keyed on pid identity (bash_env.sh a0). When it is present, that value
+    # is adjudicated here for the same burial signature — as a WARNING, never
+    # a refusal: a refusal on this surface reaches `_respawn.sh` at exit 78
+    # and the board cannot self-heal (#670). An earlier version of this
+    # comment added "and the SNAPSHOT surface below already covers the spawn
+    # case with a mutation-proven refusal" — which named the hazard on THIS
+    # leg and delegated to the leg that carried it: the snapshot leg's refusal
+    # reached `_respawn.sh` identically, and on 2026-09-06 it did, for 18 h
+    # (your-org/nexus-code#1477, D1). The snapshot leg now applies the same
+    # rule on the orchestrator path (`NEXUS_IS_ORCHESTRATOR=1`) and keeps its
+    # refusal for WORKER spawns only; see that leg for the error direction.
+    if [ -n "${NEXUS_INHERITED_PATH_UPSTREAM:-}" ]; then
+        _asw_say "NOTE: ambient: the caller (pid ${NEXUS_INHERITED_PATH_UPSTREAM_PID:-?}) had already run the nexus prelude and re-fronted before exporting PATH to this guard, so the ambient reading above describes a REPAIRED shell. Adjudicating the PATH that caller itself inherited (one hop up; your-org/nexus-code#1383):"
+        while IFS= read -r _asw_up_name; do
+            [ -n "$_asw_up_name" ] || continue
+            _asw_up_res=$(_asw_resolve_in "$_asw_up_name" "$NEXUS_INHERITED_PATH_UPSTREAM" 2>/dev/null) || _asw_up_res=""
+            [ -n "$_asw_up_res" ] || continue
+            if _asw_under_shim "$_asw_up_res"; then continue; fi
+            if _asw_shimdir_on_path_in "$_asw_up_name" "$NEXUS_INHERITED_PATH_UPSTREAM"; then
+                _asw_warned=1
+                _asw_say "WARNING: ambient (one hop above the caller): \`$_asw_up_name\` resolves to '$_asw_up_res' AHEAD of the shim dir in the PATH the caller inherited. $(_asw_hazard_note "$_asw_up_name")"
+                _asw_say "  A front applied and then BURIED in the shell above the last bash in the chain (the #652/#654 signature)."
+                _asw_say "  NOT adjudicated as a refusal: the snapshot surface covers the spawn, and a refusal here would reach _respawn.sh (#670)."
+            fi
+        done <<EOF
+${_asw_names}
+EOF
+    fi
 elif [ "$_asw_have_shims" != 1 ]; then
     # "Nothing to enforce" is NOT "enforced and clean" (your-org/nexus-code#612).
     # This is the branch a fork, an older checkout, or a NEXUS_ROOT re-rooted
@@ -435,11 +828,8 @@ else
     # A bare `gh --version` in the agent's own shell. Marker-delimited for the
     # same reason the shim probe uses one: an interactive rc may print a banner.
     _asw_ghv_raw=$(
-        if command -v timeout >/dev/null 2>&1; then
-            timeout 40 "$_asw_probe_shell" -c 'printf "GHVERMARK:%s\n" "$(gh --version 2>/dev/null | head -1)"' 2>/dev/null
-        else
-            "$_asw_probe_shell" -c 'printf "GHVERMARK:%s\n" "$(gh --version 2>/dev/null | head -1)"' 2>/dev/null
-        fi | sed -n 's/^GHVERMARK://p' | head -1
+        _asw_probe_exec "$_asw_probe_shell" -c 'printf "GHVERMARK:%s\n" "$(gh --version 2>/dev/null | head -1)"' 2>/dev/null \
+            | sed -n 's/^GHVERMARK://p' | head -1
     )
     _asw_ghv=$(printf '%s' "$_asw_ghv_raw" | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^v?[0-9]+\.[0-9]+/) { print $i; exit } }')
     _asw_ghv="${_asw_ghv#v}"
@@ -491,6 +881,448 @@ else
                     "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" \
                     >> "$_asw_root/monitor/.state/gh-below-floor.log" 2>/dev/null || true
             fi
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# PORTED FROM your-org/nexus-code#670 (closed in favour of this) — the
+# FROZEN-SNAPSHOT surface, verbatim apart from this header.
+#
+# WHY BOTH SURFACES EXIST, because a reader will ask why one file probes the
+# same hazard twice. They answer DIFFERENT QUESTIONS and each catches a case
+# the other misses — measured, not argued, by running each against the other's
+# fixture:
+#
+#   caller's PATH BURIED, snapshot CLEAN -> ambient REFUSES,  snapshot passes
+#   caller's PATH CLEAN,  snapshot BURIED -> ambient passes,  snapshot REFUSES
+#
+# The AMBIENT surface measures the PATH that WILL BE USED by this process's
+# caller. The SNAPSHOT surface measures the RECORDING that produces it — which
+# is what every FUTURE tool call in an already-running session will replay. A
+# session started before a PATH repair stays frozen on the bad recording for
+# its whole life while every freshly spawned probe reports the fixed ordering,
+# and that is the case #652 was filed from.
+#
+# #670 was a month stale (merge base 1,075 commits back) and CONFLICTING, and
+# its base predates the SELF-PREFIXING-alias carve-out below (`#892` F1), so
+# running it on this host refused UNCONDITIONALLY — a total spawn wedge, since
+# every launcher aborts on non-zero. Measured with a CLEAN caller and a CLEAN
+# snapshot: still rc 1, on `alias tmux='tmux -2'`. That is why this is a PORT
+# onto current `dev` rather than a rebase, and why the carve-out is kept.
+#
+# NEAR-MISS WORTH RECORDING, because it nearly went into the disposition: the
+# first cross-test read rc 1 from #670 on the caller-buried case and was about
+# to credit it with catching that case. The refusal was real and about the
+# alias. What separated them was a CONTROL — the same fixture with a clean
+# caller — which refused too. A REFUSAL IS NOT EVIDENCE ABOUT THE VARIABLE YOU
+# VARIED UNLESS THE CONTROL REFUSES TO REFUSE.
+# THE FROZEN-SNAPSHOT SURFACE — your-org/nexus-code#652 / #654 / #1477
+# ---------------------------------------------------------------------------
+# Everything above probes a FRESHLY SPAWNED shell. That surface repairs
+# itself: front-path.zsh runs last there and wins, so the probe passes —
+# honestly. It is not lying about the shell it examined.
+#
+# The agent's Bash tool call is NOT a fresh shell. It is
+#     /usr/bin/zsh -c source <cc-home>/shell-snapshots/snapshot-zsh-<id>.sh …
+# a FROZEN ARTIFACT recorded once at Claude Code startup. A guard that
+# re-derives a surface cannot see a defect baked into a recording of a
+# different one — which is why this guard exited 0 while three separate
+# workers resolved `gh` to linuxbrew and `pip` to /app/bin/pip.
+#
+# And the snapshot does NOT lack the shim dirs. Measured 2026-08-02, the
+# snapshot's single `export PATH=` carried monitor/ghwrap at POSITION 13,
+# behind /home/operator/Projects/utilities and the linuxbrew dirs: the
+# front-path prepend ran, then ~/.zshrc's re-prepend won the #578 race,
+# and the snapshot froze THAT ordering permanently. So the question is
+# not presence, it is ORDER — exactly the question the live probe asks,
+# asked of the recording.
+#
+# WHOSE SNAPSHOT. At SPAWN time the child's snapshot does not exist yet
+# (Claude Code writes it at startup), so this leg necessarily adjudicates
+# ANOTHER session's artifact and infers about the child. Which session's
+# is the whole question, and the answer is ranked (see the selection
+# block below): this process's own tool shell (ancestry), then the
+# SPAWNING agent's (carried by the launcher, #1477), then — as a proxy
+# that is REPORTED as one — the newest file in the CC home by mtime.
+#
+# THE ERROR DIRECTION, DECIDED HERE AND NOT ONE LEG OVER (your-org/nexus-code
+# #1477). This leg used to be a hard refusal on EVERY spawn path, and the
+# ambient leg above justified its own warn-only rule by pointing at it:
+# "the SNAPSHOT surface already covers the spawn case". On 2026-09-06 the
+# newest-by-mtime snapshot belonged to a `claude` launched OUTSIDE the nexus
+# launcher — no ZDOTDIR, so no shim dir anywhere in its PATH — and this leg
+# refused every spawn for 18 h, INCLUDING `_respawn.sh`: 1,104 failed
+# respawns, 75 emits archived undelivered, and no self-heal, because the
+# only thing that writes a nexus-provenance snapshot is a nexus-launched
+# agent, which this leg was refusing to launch. Retrying could not clear
+# it. Two rules follow, each with its direction stated:
+#
+#   FOREIGN vs BURIAL. The two signatures differ and only one is #652.
+#     * shim dirs PRESENT in the snapshot's PATH but a guarded name
+#       resolves AHEAD of them → BURIAL, the #578/#652/#654 race frozen
+#       into a recording. Confirmed-bad about SOME nexus-launched shell.
+#     * NO shim dir in that PATH AT ALL, while the live probes above just
+#       found THIS spawn's own env correctly fronted → the recording is of
+#       a shell that never had the nexus env: a FOREIGN artifact. It says
+#       nothing about the child, which writes its own snapshot from the env
+#       verified live. WARN loudly; never refuse. Errs toward ALLOWING a
+#       spawn whose only evidence against it is somebody else's shell.
+#       When the live probes did NOT run (no probe shell, NOT CHECKED),
+#       a foreign snapshot is NOT CHECKED too — "could not look" must not
+#       become a refusal on evidence about a different session.
+#
+#   THE SELF-HEAL PATH NEVER REFUSES HERE. `NEXUS_IS_ORCHESTRATOR=1` is
+#     exported by every orchestrator spawn path (_respawn.sh's launcher;
+#     spawn-fresh-orchestrator.sh through it). On that path a BURIAL is
+#     a WARNING plus a durable row in monitor/.state/guard-unverified.log
+#     plus a sandbox-notify — the same rule the ambient one-hop leg and
+#     the `gh` floor leg already apply for the same reason. Errs toward
+#     STARTING a possibly-buried orchestrator, deliberately: the measured
+#     alternative is NO orchestrator, an unreachable board for every
+#     remote user, and a latch nothing can clear — while a started
+#     orchestrator writes a fresh nexus-provenance snapshot that clears
+#     the latch for every worker spawn after it, and can repair the
+#     shell-init itself. WORKER spawns keep the fail-CLOSED refusal on
+#     burial: a refused worker is one window, not the board.
+#
+#   WHAT STILL CAN refuse an orchestrator respawn: the live probe legs
+#     (this spawn's own `-c`/`-lic` shells miss a shim) and the nproc leg.
+#     Those adjudicate THIS spawn's deterministic env, not a peer's
+#     artifact, and they are not self-latching — a shellenv repair clears
+#     them on the next attempt. Named here as the residual, not hidden.
+# The LAST `export PATH=` of a snapshot file (the tool shell replays it top to
+# bottom, so the final assignment wins), one layer of quotes stripped.
+_asw_snap_path_of() {
+    _asw_spo=$(sed -n 's/^[[:space:]]*export PATH=//p' "$1" 2>/dev/null | tail -1)
+    case "$_asw_spo" in
+        \"*\") _asw_spo=$(printf '%s' "$_asw_spo" | sed 's/^"//; s/"$//') ;;
+        \'*\') _asw_spo=$(printf '%s' "$_asw_spo" | sed "s/^'//; s/'$//") ;;
+    esac
+    printf '%s' "$_asw_spo"
+}
+# Does ANY enumerated shim dir appear on this PATH string? Presence at any
+# position means a nexus-fronted shell wrote it (ORDER is adjudicated per name
+# later); absence at every position means the writer never had the nexus env.
+_asw_path_has_shimdir() {
+    while IFS= read -r _asw_phs_d; do
+        [ -n "$_asw_phs_d" ] || continue
+        if _asw_dir_on_path_in "$_asw_phs_d" "$1"; then return 0; fi
+    done <<EOF
+${_asw_dirs}
+EOF
+    return 1
+}
+# _asw_pick_snapshot <cc-home> — the mtime route, made PROVENANCE-AWARE
+# (your-org/nexus-code#1477, skeptic F1). `ls -t | head -1` handed the leg ONE
+# file, and a single FOREIGN file newer than a BURIED nexus one masked the
+# burial entirely: rc 0 + "READ AS FOREIGN" with nothing said about the buried
+# file beneath it — on the worker path that is #652 re-opened by one stray
+# `claude`, and this host sat in exactly that mixed state for 43 minutes on
+# 2026-09-06. So walk the listing newest-first and adjudicate the newest file
+# that HAS nexus provenance; report FOREIGN only when no such file exists.
+# Prints `<path>|<n-foreign-passed-over>` or nothing. Every candidate must sit
+# under <cc-home>/shell-snapshots/ (the nullglob post-condition: an unmatched
+# glob would make `ls -t` list the CWD and hand back RELATIVE names).
+_asw_pick_snapshot() {
+    _asw_ps_home="$1"; _asw_ps_first=""; _asw_ps_skipped=0
+    _asw_ps_list=$(ls -t "$_asw_ps_home"/shell-snapshots/snapshot-*.sh 2>/dev/null)
+    while IFS= read -r _asw_ps_f; do
+        [ -n "$_asw_ps_f" ] || continue
+        case "$_asw_ps_f" in "$_asw_ps_home"/shell-snapshots/*) : ;; *) continue ;; esac
+        [ -r "$_asw_ps_f" ] || continue
+        [ -n "$_asw_ps_first" ] || _asw_ps_first="$_asw_ps_f"
+        if _asw_path_has_shimdir "$(_asw_snap_path_of "$_asw_ps_f")"; then
+            printf '%s|%s' "$_asw_ps_f" "$_asw_ps_skipped"; return 0
+        fi
+        _asw_ps_skipped=$(( _asw_ps_skipped + 1 ))
+    done <<EOF
+${_asw_ps_list}
+EOF
+    [ -n "$_asw_ps_first" ] && printf '%s|-1' "$_asw_ps_first"
+    return 0
+}
+
+if [ "${NEXUS_ASSERT_SKIP_SNAPSHOT:-}" != 1 ]; then
+    _asw_snap="${NEXUS_ASSERT_SNAPSHOT:-}"
+    _asw_snap_src=""
+
+    # Did the LIVE probes above RUN and find THIS spawn's own env clean?
+    # Three-valued on purpose: 1 = ran and clean, 0 = ran and refused,
+    # "" = did not run (skipped, no shim dirs, no probe shell). A first
+    # draft derived "clean" from `_asw_shim_refused = 0` alone, which reads
+    # NOT-REFUSED as OBSERVED-CLEAN — the not-checked-equals-pass collapse
+    # this file's exit-79 contract exists to forbid (#612). Recorded before
+    # the snapshot leg runs, because the FOREIGN branch below turns on it.
+    _asw_live_clean=""
+    if [ "${NEXUS_ASSERT_SKIP_SHIMS:-}" != 1 ] && [ "$_asw_have_shims" = 1 ] && [ "$_asw_probe_ok" = 1 ]; then
+        if [ "$_asw_shim_refused" = 0 ]; then _asw_live_clean=1; else _asw_live_clean=0; fi
+    fi
+
+    # The self-heal path (see the header above for the contract and the
+    # tests that pin it). Only the literal "1" enables, matching every
+    # other reader of this marker (hooks/orchestrator-session-pin.sh).
+    _asw_selfheal=0
+    [ "${NEXUS_IS_ORCHESTRATOR:-0}" = 1 ] && _asw_selfheal=1
+
+    # Durable row for an announce-and-proceed outcome on this leg. The same
+    # sink guard-block.sh.in's `_nx_note` writes — one file to read after
+    # the fact to learn that an agent started with a known-defective
+    # surface. Same mode discipline (0640 via _log-mode.sh or umask 0027,
+    # your-org/nexus-code#484); failing to record is itself announced.
+    _asw_record_unverified() {
+        [ -n "$_asw_root" ] || { _asw_say "  (NEXUS_ROOT unset — the above is NOT durably recorded)"; return 0; }
+        _asw_ulog="$_asw_root/monitor/.state/guard-unverified.log"
+        mkdir -p "$_asw_root/monitor/.state" 2>/dev/null || true
+        if [ -r "$_asw_root/monitor/_log-mode.sh" ]; then
+            # shellcheck disable=SC1090
+            . "$_asw_root/monitor/_log-mode.sh" 2>/dev/null && _ensure_service_log "$_asw_ulog"
+        elif [ ! -e "$_asw_ulog" ]; then
+            ( umask 0027; : >> "$_asw_ulog" ) 2>/dev/null || true
+        fi
+        if ! printf '%s\t%s\t%s\t%s\n' \
+                "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown-ts)" \
+                "assert-shims-wrapped" \
+                "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" \
+                "$1" >> "$_asw_ulog" 2>/dev/null; then
+            _asw_say "  could NOT record the above to $_asw_ulog — this spawn leaves no durable evidence of it."
+        fi
+    }
+
+    # ANCESTRY FIRST — your-org/nexus-code#670 review, finding 1.
+    #
+    # Selecting `ls -t … | head -1` picks the newest snapshot written by
+    # ANY Claude Code process. With ~15 concurrent agents and 46 snapshots
+    # in one home, that is a PROXY for this spawn's artifact, not the
+    # artifact — and the guard's own comment used to claim it "necessarily
+    # examines the SPAWNING agent's". It did not. Verified on this host:
+    # `ls -t` selected snapshot-…-0rkx7w.sh while this process's own tool
+    # shell sources snapshot-…-ed2ccb.sh.
+    #
+    # It fails OPEN in the direction that matters most. After the
+    # shell-init repair lands, the natural check is "does the guard pass
+    # now?" — and ONE fresh good snapshot makes it pass while every
+    # already-running agent stays frozen on a bad recording. That is a
+    # green light for a repair which has not reached the population, i.e.
+    # this guard's own defect class turned on its own verification loop.
+    # And it fails CLOSED in the direction that took the board down: one
+    # snapshot from a session that was never nexus-launched refuses every
+    # spawn on the host (#1477).
+    #
+    # The linkage is exact and free: this guard runs as a descendant of
+    # the Bash tool call, whose frame is literally
+    #     zsh -c source <cc-home>/shell-snapshots/snapshot-<id>.sh …
+    # so the path is in our own ancestry, verbatim. Walk up and read it.
+    # `ls -t` remains as a fallback (a launcher may invoke us outside a
+    # tool call), but which source was used is REPORTED, so a reader can
+    # tell a measurement from an inference.
+    if [ -z "$_asw_snap" ] && [ "${NEXUS_ASSERT_NO_ANCESTRY:-}" != 1 ]; then
+        _asw_pid=$$
+        _asw_hop=0
+        while [ "$_asw_hop" -lt 8 ]; do
+            _asw_line=$(ps -o ppid=,args= -p "$_asw_pid" 2>/dev/null | head -1) || break
+            [ -n "$_asw_line" ] || break
+            # `ps` right-pads the ppid column, so the line STARTS with
+            # spaces and a bare `${line%% *}` yields the empty string —
+            # which then fails the numeric test and breaks the walk on its
+            # first hop, silently falling back to the mtime proxy this
+            # whole block exists to replace. Strip leading blanks first.
+            _asw_line=${_asw_line#"${_asw_line%%[![:space:]]*}"}
+            _asw_ppid=${_asw_line%% *}
+            case "$_asw_ppid" in ''|*[!0-9]*) break ;; esac
+            # Take the LAST snapshot-looking token on the frame, so an
+            # unrelated earlier path on the same command line cannot win.
+            _asw_cand=$(printf '%s' "$_asw_line" \
+                | tr ' ' '\n' \
+                | grep -E '/shell-snapshots/snapshot-[^/]*\.sh$' \
+                | tail -1)
+            # NEXUS_CC_HOME, when set, is documented as the ONLY root
+            # consulted — so an ancestry path OUTSIDE it must be ignored,
+            # not preferred. Ancestry is ambient: without this, a hermetic
+            # fixture that declares its own CC home still picks up the REAL
+            # host's snapshot, which is the same leak the seam was added to
+            # close, re-entering through a new door.
+            if [ -n "$_asw_cand" ] && [ -n "${NEXUS_CC_HOME:-}" ]; then
+                case "$_asw_cand" in
+                    "$NEXUS_CC_HOME"/*) : ;;
+                    *) _asw_cand="" ;;
+                esac
+            fi
+            if [ -n "$_asw_cand" ] && [ -r "$_asw_cand" ]; then
+                _asw_snap="$_asw_cand"
+                _asw_snap_src="ancestry (frame $_asw_hop — the snapshot THIS process's tool shell sources)"
+                break
+            fi
+            _asw_pid="$_asw_ppid"
+            _asw_hop=$(( _asw_hop + 1 ))
+        done
+    fi
+    # THE SPAWNER'S SNAPSHOT, carried by the launcher (your-org/nexus-code
+    # #1477, D2). In the spawn path there is no `claude` ancestor — the
+    # launcher is tmux's child, not the orchestrator's — so the walk above
+    # always misses and used to fall straight through to the mtime proxy.
+    # spawn-worker.sh runs INSIDE the spawning agent's tool shell, where the
+    # walk does succeed, and exports what it found. That artifact is the one
+    # this leg's header always said it examined: the spawning agent's, same
+    # rc chain, a nexus-launched shell by construction — and if IT is
+    # buried, so was the shell that decided to spawn. Scoped by NEXUS_CC_HOME
+    # exactly like ancestry, for the same hermetic-fixture reason.
+    if [ -z "$_asw_snap" ] && [ -n "${NEXUS_SPAWNER_SNAPSHOT:-}" ]; then
+        _asw_cand="$NEXUS_SPAWNER_SNAPSHOT"
+        if [ -n "${NEXUS_CC_HOME:-}" ]; then
+            case "$_asw_cand" in
+                "$NEXUS_CC_HOME"/*) : ;;
+                *) _asw_say "NOTE: snapshot leg: NEXUS_SPAWNER_SNAPSHOT lies outside NEXUS_CC_HOME — ignored under the exclusive seam, not preferred."; _asw_cand="" ;;
+            esac
+        fi
+        if [ -n "$_asw_cand" ] && [ -r "$_asw_cand" ]; then
+            _asw_snap="$_asw_cand"
+            _asw_snap_src="the SPAWNING agent's own tool shell, carried by the launcher (NEXUS_SPAWNER_SNAPSHOT; same rc chain as the child — #1477)"
+        elif [ -n "$_asw_cand" ]; then
+            _asw_say "NOTE: snapshot leg: NEXUS_SPAWNER_SNAPSHOT='$_asw_cand' is not readable — falling back to the mtime proxy."
+        fi
+    fi
+    # NEXUS_CC_HOME, when set, is the ONLY root consulted — the same
+    # hermetic-test seam _submit_evidence.sh uses, and it is load-bearing
+    # here for a reason worth stating: a fixture that overrides HOME does
+    # NOT necessarily override CLAUDE_CONFIG_DIR, so without an exclusive
+    # seam this leg reads the REAL host's snapshot from inside a synthetic
+    # fixture and reports on a surface the test never built.
+    # The mtime route — PROVENANCE-AWARE (see _asw_pick_snapshot): the newest
+    # file that has nexus provenance is adjudicated; foreign files newer than
+    # it are counted and named in the route, never allowed to mask it.
+    _asw_route_from_pick() {   # <pick-output> <home-label> -> sets _asw_snap/_asw_snap_src
+        _asw_rfp="$1"; _asw_rfp_home="$2"
+        [ -n "$_asw_rfp" ] || return 1
+        _asw_snap="${_asw_rfp%|*}"; _asw_rfp_n="${_asw_rfp##*|}"
+        if [ "$_asw_rfp_n" = -1 ]; then
+            _asw_snap_src="newest in $_asw_rfp_home (mtime PROXY — not linked to this process; #670 finding 1); NO nexus-provenance snapshot exists there"
+        elif [ "$_asw_rfp_n" = 0 ]; then
+            _asw_snap_src="newest in $_asw_rfp_home (mtime PROXY — not linked to this process; #670 finding 1)"
+        else
+            _asw_snap_src="newest NEXUS-PROVENANCE snapshot in $_asw_rfp_home (mtime proxy; $_asw_rfp_n newer FOREIGN file(s) passed over rather than allowed to mask it — #1477 F1)"
+        fi
+        return 0
+    }
+    if [ -z "$_asw_snap" ] && [ -n "${NEXUS_CC_HOME:-}" ]; then
+        _asw_route_from_pick "$(_asw_pick_snapshot "$NEXUS_CC_HOME")" "NEXUS_CC_HOME" || _asw_snap=''
+        _asw_cc_scoped=1
+    fi
+    if [ -z "$_asw_snap" ] && [ -z "${_asw_cc_scoped:-}" ]; then
+        for _asw_cch in ${CLAUDE_CONFIG_DIR:+"$CLAUDE_CONFIG_DIR"} "$HOME/.claude"; do
+            [ -d "$_asw_cch/shell-snapshots" ] || continue
+            if _asw_route_from_pick "$(_asw_pick_snapshot "$_asw_cch")" "$_asw_cch"; then break; fi
+        done
+    fi
+
+    if [ -z "$_asw_snap" ] || [ ! -r "$_asw_snap" ]; then
+        _asw_not_checked "no readable Claude Code shell snapshot found — the surface the agent's tool calls actually source was not examined (#652). A fresh-shell pass says nothing about it."
+    else
+        # LAST `export PATH=` wins: the snapshot is replayed top to bottom,
+        # so the final assignment is what the tool shell ends up with.
+        _asw_snap_path=$(_asw_snap_path_of "$_asw_snap")
+
+        if [ -z "$_asw_snap_path" ]; then
+            _asw_not_checked "snapshot $_asw_snap defines no \`export PATH=\` — cannot determine the tool shell's resolution order (#652)."
+        else
+            # PROVENANCE: does ANY shim dir appear anywhere in the recorded
+            # PATH? Presence at any position means a nexus-fronted shell
+            # wrote it (order is adjudicated per name below); absence at
+            # every position means the writer never had the nexus env.
+            _asw_snap_has_shimdir=0
+            _asw_path_has_shimdir "$_asw_snap_path" && _asw_snap_has_shimdir=1
+            _asw_snap_prov="nexus-fronted (a shim dir is in its PATH)"
+            [ "$_asw_snap_has_shimdir" = 1 ] || _asw_snap_prov="FOREIGN (no shim dir anywhere in its PATH)"
+            # Always said, pass or not: the selection route and the
+            # provenance are the two facts a reader needs after the fact,
+            # and the outage's diagnostic said them only inside a refusal.
+            _asw_say "NOTE: snapshot leg examined $_asw_snap — selected via: ${_asw_snap_src:-explicit NEXUS_ASSERT_SNAPSHOT}; provenance: $_asw_snap_prov."
+
+            _asw_snap_foreign_said=0
+            while IFS= read -r _asw_name; do
+                [ -n "$_asw_name" ] || continue
+                # First PATH entry holding an executable of this name IS what
+                # the tool shell resolves — the same rule `command -v` applies.
+                _asw_first=""
+                _asw_oldifs=$IFS; IFS=:
+                for _asw_d in $_asw_snap_path; do
+                    [ -n "$_asw_d" ] || continue
+                    if [ -x "$_asw_d/$_asw_name" ]; then _asw_first="$_asw_d/$_asw_name"; break; fi
+                done
+                IFS=$_asw_oldifs
+
+                [ -n "$_asw_first" ] || continue   # not installed at all: not a bypass
+                _asw_under_shim "$_asw_first" && continue
+
+                if [ "$_asw_snap_has_shimdir" != 1 ]; then
+                    # FOREIGN. Said once, with every name it affects listed
+                    # by the per-name lines that follow.
+                    if [ "$_asw_snap_foreign_said" = 0 ]; then
+                        _asw_snap_foreign_said=1
+                        case "$_asw_live_clean" in
+                            1)
+                                _asw_warned=1
+                                _asw_say "WARNING: the frozen tool-shell snapshot selected above carries NO shim dir AT ALL, while this spawn's own shells resolve every guarded name correctly."
+                                _asw_say "  READ AS FOREIGN, not as burial: a \`claude\` launched outside the nexus launcher (no ZDOTDIR) wrote it. It describes THAT session; the child writes its OWN snapshot from the env verified live above (your-org/nexus-code#1477)."
+                                _asw_say "  NOT adjudicated as a refusal: a refusal would reach _respawn.sh and the board could not self-heal (#670/#1477) — the same rule the ambient leg applies. Errs toward ALLOWING." ;;
+                            0)
+                                _asw_say "NOTE: the frozen tool-shell snapshot selected above carries NO shim dir at all (FOREIGN); this spawn's OWN live probes already refused, so that refusal stands and this leg adds nothing to it." ;;
+                            *)
+                                _asw_not_checked "the frozen tool-shell snapshot selected above carries NO shim dir at all (FOREIGN — written by a session that never had the nexus env) AND this spawn's live probes did not run, so nothing here speaks for the child's shell (your-org/nexus-code#1477). Not a refusal on a peer's artifact; not a pass." ;;
+                        esac
+                    fi
+                    case "$_asw_live_clean" in
+                        1) _asw_say "  foreign snapshot resolves \`$_asw_name\` to '$_asw_first' — $(_asw_hazard_note "$_asw_name")" ;;
+                    esac
+                    continue
+                fi
+
+                # SHIM-SET DRIFT is not BURIAL (your-org/nexus-code#1477, skeptic
+                # F2). The snapshot carries SOME shim dirs but not the one that
+                # ships THIS name: it was recorded before that shim dir existed
+                # (the orchestrator started before `monitor/newwrap` was added),
+                # and the name resolves where it always did. The child's launcher
+                # fronts the new dir, so nothing about the child is at risk — and
+                # because the spawner's snapshot is now CARRIED into every worker
+                # spawn, calling this burial would latch every spawn until the
+                # orchestrator restarts. Per name: own shim dir ABSENT -> drift,
+                # warn; PRESENT but behind -> burial, below.
+                if ! _asw_shimdir_on_path_in "$_asw_name" "$_asw_snap_path"; then
+                    _asw_warned=1
+                    _asw_say "WARNING: frozen tool-shell snapshot resolves \`$_asw_name\` to '$_asw_first' and its OWN shim dir is ABSENT from that PATH while other shim dirs are present — SHIM-SET DRIFT: the snapshot predates that shim dir; not a burial. The child's launcher fronts it. (#1477 F2)"
+                    continue
+                fi
+
+                # BURIAL: shim dirs ARE in the recorded PATH and this name
+                # resolves ahead of them — the #578/#652/#654 signature.
+                if [ "$_asw_selfheal" = 1 ]; then
+                    _asw_warned=1
+                    _asw_say "WARNING (self-heal path, NOT refusing): frozen tool-shell snapshot resolves \`$_asw_name\` to '$_asw_first', AHEAD of the shim dirs that ARE in its PATH — the BURIAL signature (#652/#654). $(_asw_hazard_note "$_asw_name")"
+                    _asw_say "  snapshot: $_asw_snap"
+                    _asw_say "  selected via: ${_asw_snap_src:-explicit NEXUS_ASSERT_SNAPSHOT}"
+                    _asw_say "  NEXUS_IS_ORCHESTRATOR=1: a refusal here reaches _respawn.sh and the board cannot self-heal — measured 2026-09-06 as 1,104 failed respawns over 18 h with no path out (your-org/nexus-code#1477). Starting the orchestrator so it can repair the shell-init and write a fresh snapshot; worker spawns still refuse on this signature."
+                    # One durable row per spawn, naming the first buried name;
+                    # the per-name warnings above carry the rest.
+                    if [ "${_asw_selfheal_recorded:-0}" = 0 ]; then
+                        _asw_selfheal_recorded=1
+                        _asw_record_unverified "frozen-snapshot leg: BURIAL signature (\`$_asw_name\` -> $_asw_first) in $_asw_snap [${_asw_snap_src:-explicit}] — orchestrator started ANYWAY on the self-heal path (#1477); repair shell-init and re-verify with monitor/assert-shims-wrapped.sh"
+                        # The operator's tmux, not only a pane's stderr and a
+                        # log row (the header promised this; skeptic F3 found
+                        # it missing).
+                        command -v sandbox-notify >/dev/null 2>&1 \
+                            && sandbox-notify "orchestrator started BURIED (assert-shims-wrapped self-heal path, #1477): \`$_asw_name\` resolves off-shim in its tool shell — repair shell-init" >/dev/null 2>&1 || true
+                    fi
+                    continue
+                fi
+                _asw_refused=1; _asw_shim_refused=1
+                _asw_say "REFUSING SPAWN: frozen tool-shell snapshot resolves \`$_asw_name\` to '$_asw_first', NOT under a shim dir. $(_asw_hazard_note "$_asw_name")"
+                _asw_say "  snapshot: $_asw_snap"
+                _asw_say "  selected via: ${_asw_snap_src:-explicit NEXUS_ASSERT_SNAPSHOT}"
+                _asw_say "  shim dirs ARE present in that snapshot's PATH but \`$_asw_name\` resolves ahead of them — the BURIAL signature (#652/#654), not a foreign artifact (#1477)."
+                _asw_say "  this is the surface the agent's Bash tool SOURCES; a fresh-shell probe repairs itself and cannot see it (#652/#654)."
+            done <<EOF
+${_asw_names}
+EOF
         fi
     fi
 fi

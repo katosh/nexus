@@ -243,6 +243,16 @@ while IFS= read -r f; do
     fi
     found=$(scan_file "$f" "$_src")
     [[ -n "$found" ]] && hits+="$found"$'\n'
+# THE WIDE PATHSPEC HERE IS DELIBERATE (your-org/nexus-code#1111). git matches
+# pathspecs with `fnmatch` WITHOUT `FNM_PATHNAME`, so this `*` CROSSES `/` and
+# the enumeration also picks up `monitor/watcher/test-integration/_harness.sh`
+# and `.../stub-claude.sh`, which are a shared library and a `claude` shim
+# rather than suites. `#1111` narrowed the SUITE-COUNT sites to
+# `:(glob)**/test-*.sh` because their label says "tracked test suites" and
+# their number is quoted as a measurement. This site is NOT one of those: it
+# enumerates a corpus TO LINT, and `_harness.sh` is 510 lines carrying exactly
+# the constructs scanned for here. Narrowing it would DELETE COVERAGE from the
+# one file most worth scanning, dressed up as a consistency fix. Leave it wide.
 done < <(git ls-files -- '*test-*.sh')
 
 # A population this scan could not have enumerated makes every result below
@@ -254,7 +264,11 @@ done < <(git ls-files -- '*test-*.sh')
 # to a clean sweep.
 assert_eq "the scanner's own file is inside the scanned corpus" \
     "$(git ls-files -- '*test-*.sh' | grep -cxF 'monitor/watcher/test-diagnostics-outlive-their-paths.sh')" "1"
-assert_eq "the corpus was actually enumerated (>=200 test files)" \
+# "paths matching *test-*.sh", not "test files": git's pathspec `*` crosses `/`
+# so this corpus also holds test-integration/_harness.sh and stub-claude.sh.
+# Scanning them is correct (see the note at the enumeration below); the label is
+# the half that was over-claiming. your-org/nexus-code#1111.
+assert_eq "the corpus was actually enumerated (>=200 paths matching *test-*.sh)" \
     "$([[ "$n_files" -ge 200 ]] && echo yes || echo "no ($n_files)")" "yes"
 assert_eq "…and files with a trap-doomed mktemp dir were found (>=150)" \
     "$([[ "$n_doomed" -ge 150 ]] && echo yes || echo "no ($n_doomed)")" "yes"

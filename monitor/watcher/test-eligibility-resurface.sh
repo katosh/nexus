@@ -33,7 +33,8 @@ FAIL=0
 
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s\n' "$label" >&2
@@ -276,12 +277,22 @@ ISSUE_FIXTURE='{
     }
   }
 }'
-(
+# The env scoping stays in a subshell; the ASSERTION does not.
+# your-org/nexus-code#922/#805 variant 2: `assert_not_contains` does
+# `printf '  PASS:'; PASS=$(( PASS + 1 ))`, so called inside `( … )` the line
+# reaches stdout and the increment dies with the subshell. This suite defines
+# its own vocabulary and does not source _test_helpers.sh, so it has no
+# _TH_LEDGER and nothing reconciles the loss back. Measured before this fix:
+# 8 PASS: lines against a footer of `7 passed, 0 failed`, reproduced on a
+# dedicated CI runner and locally solo. Benign here (an undercount on a
+# passing suite) and NOT benign in general -- the same shape on a FAILING
+# assertion leaves FAIL=0 and the suite exits 0 with a red assertion (#783).
+out=$(
     USER_LOGIN=""
     export USER_LOGIN
-    out=$(snapshot_github)
-    assert_not_contains "empty USER_LOGIN: ROCKET still excludes" "$out" "id=4558999004"
+    snapshot_github
 )
+assert_not_contains "empty USER_LOGIN: ROCKET still excludes" "$out" "id=4558999004"
 
 # ---- 6. dedup with EMPTY processed file: reactions filter still wins -
 # Regression guard for hypothesis 1. The reactions filter must exclude

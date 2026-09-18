@@ -134,16 +134,34 @@
 #     Errs toward NOT flagging. **This bullet is no longer load-bearing**: the
 #     residue is enumerated into `aso-unresolved-sources.manifest` and P3 fails
 #     when it changes, so a wrong sentence here now reds a test instead of
-#     misinforming a reader. Measured 2026-08-07: 19 tokens of 577.
+#     misinforming a reader.
 #
-#     SEVENTEEN of the nineteen genuinely need the shell — `$init` (loop
-#     variable over a glob), `${NEXUS_PREV_BASH_ENV}` (inherited env),
-#     `<(sed …)` (a process substitution, not a variable at all), and
-#     `$1`/`$0`/`$2` (positional parameters, in helpers that source whatever
-#     path the caller passes). The other two are named rather than folded in,
-#     because "every one of them genuinely needs the shell" is what I wrote
-#     first and it was false — F1's shape a fourth time, caught by `#799`'s
-#     skeptic (F-2):
+#     NO COUNT IS QUOTED HERE ANY MORE, and its removal is the fix rather than
+#     a refresh (your-org/nexus-code#1041 item 8). This used to read "Measured
+#     2026-08-07: 19 tokens of 577", followed by a partition — "SEVENTEEN of
+#     the nineteen genuinely need the shell" — and "a systematic sweep of all
+#     nineteen found these are the only two". The manifest holds THIRTY rows at
+#     7c4ddbb:
+#
+#       git show "<ref>:monitor/watcher/aso-unresolved-sources.manifest" | grep -c ''
+#
+#     so the partition was drawn over a set that has since grown by eleven.
+#     Refreshing the numerator to 30 would NOT fix it: "seventeen of the
+#     nineteen" is a PARTITION, and updating the total without re-classifying
+#     the eleven new rows reproduces the defect one commit later, which is
+#     precisely how this sentence got here. The two individually-argued
+#     exceptions below are kept, because each carries its own reasoning and
+#     stands on it; the arithmetic around them does not.
+#
+#     The manifest is the authority — it is machine-checked, P3 reds when it
+#     moves, and this bullet says so two paragraphs up. Prose that RESTATES a
+#     machine-checked number is the generator of this whole defect class: the
+#     restatement cannot be checked and will always outlive the thing it
+#     restates. So it is deleted, not maintained.
+#
+#     The two exceptions, named rather than folded in, because "every one of
+#     them genuinely needs the shell" is what I wrote first and it was false —
+#     F1's shape a fourth time, caught by `#799`'s skeptic (F-2):
 #
 #       * `watcher/_service_health.sh  $SERVICE_HEALTH_LABSH_EVIDENCE` is
 #         STATICALLY RESOLVABLE and is not resolved. The default is supplied by
@@ -160,8 +178,11 @@
 #         shell code — DATA, not a source statement. Errs toward flagging, the
 #         declared safe direction.
 #
-#     A systematic sweep of all nineteen found these are the only two; the
-#     other `${…:-}` occurrences are emptiness tests, not path defaults.
+#     A sweep at the time these were written found they were the only two of
+#     that shape; the other `${…:-}` occurrences were emptiness tests, not path
+#     defaults. Scoped to when it was measured rather than asserted of the
+#     manifest as it stands now — the manifest has grown since, and this
+#     sentence has no way to know it.
 #
 #     THE MANIFEST'S OWN BOUND, which went unstated until your-org/nexus-code#793
 #     and is the reason that issue exists. The residue is a residue OF TOKENS.

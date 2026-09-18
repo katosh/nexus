@@ -41,6 +41,13 @@ export NEXUS_ROOT
 
 # shellcheck source=_remote_lib.sh
 source "$_script_dir/_remote_lib.sh"
+# Containment invariant for a supervised-service ACTIVATION helper: this
+# launcher must live inside the NEXUS_ROOT it registers under, and neither may
+# be ephemeral (your-org/nexus-code#1034 rec. 3, applying #577 to the service
+# registry). Consulted by cmd_up ONLY — see the call site for why the
+# read-only verbs and --down are deliberately not gated.
+# shellcheck source=_service_root.sh
+source "$_script_dir/_service_root.sh"
 # Recovery primitives (recover_service, _recover_pidfile,
 # _recover_service_running, SERVICES_REGISTRY) — same decision path as
 # bootstrap-recover, so activation and recovery never drift.
@@ -78,7 +85,27 @@ ensure_registry_row() {
     [[ -f "$SERVICES_REGISTRY" ]] || : > "$SERVICES_REGISTRY"
     _rewrite() {
         local tmp; tmp=$(mktemp "$SERVICES_REGISTRY.XXXXXX") || die "mktemp failed"
-        awk -F'\t' -v n="$SERVICE_NAME" '$1 != n' "$SERVICES_REGISTRY" > "$tmp"
+    # your-org/nexus-code#1266 (rewrite half). `awk … "$REG" > "$tmp"` FAILS
+    # OPEN on an unreadable registry — rc 2, `$tmp` EMPTY — and the `mv` two
+    # lines down then COMMITS that empty file over the operator's registry.
+    # Nothing tests awk's rc (this script is `set -uo pipefail`, no `-e`), so
+    # the function prints its success line and returns 0. Measured against an
+    # 11-row registry at 85458bf8: `ensure` left 1 row, `remove` left 0, both
+    # at rc 0 announcing success. That is strictly worse than the READ half of
+    # this issue — it is permanent DATA DESTRUCTION, and afterwards every
+    # reader legitimately reports "no services" because there genuinely are
+    # none, so the manufactured success becomes self-consistent.
+    #
+    # The realistic driver is not chmod but a transient ESTALE/EIO on the
+    # NFS-backed tree, where the DIRECTORY stays writable while the file read
+    # fails — exactly the state in which `mv` succeeds.
+    #
+    # Read-then-write is not atomic here, so the rc of the READ is the only
+    # thing standing between a transient fault and a destroyed registry.
+        if ! awk -F'\t' -v n="$SERVICE_NAME" '$1 != n' "$SERVICES_REGISTRY" > "$tmp"; then
+            rm -f "$tmp"
+            die "registry at $SERVICES_REGISTRY exists and could not be READ (awk rc!=0) — REFUSING to rewrite it. Rewriting now would replace every existing row with just '$SERVICE_NAME'."
+        fi
         printf '%s\n' "$row" >> "$tmp"
         mv "$tmp" "$SERVICES_REGISTRY"
     }
@@ -94,7 +121,27 @@ ensure_registry_row() {
 remove_registry_row() {
     [[ -f "$SERVICES_REGISTRY" ]] || return 0
     local tmp; tmp=$(mktemp "$SERVICES_REGISTRY.XXXXXX") || die "mktemp failed"
-    awk -F'\t' -v n="$SERVICE_NAME" '$1 != n' "$SERVICES_REGISTRY" > "$tmp"
+    # your-org/nexus-code#1266 (rewrite half). `awk … "$REG" > "$tmp"` FAILS
+    # OPEN on an unreadable registry — rc 2, `$tmp` EMPTY — and the `mv` two
+    # lines down then COMMITS that empty file over the operator's registry.
+    # Nothing tests awk's rc (this script is `set -uo pipefail`, no `-e`), so
+    # the function prints its success line and returns 0. Measured against an
+    # 11-row registry at 85458bf8: `ensure` left 1 row, `remove` left 0, both
+    # at rc 0 announcing success. That is strictly worse than the READ half of
+    # this issue — it is permanent DATA DESTRUCTION, and afterwards every
+    # reader legitimately reports "no services" because there genuinely are
+    # none, so the manufactured success becomes self-consistent.
+    #
+    # The realistic driver is not chmod but a transient ESTALE/EIO on the
+    # NFS-backed tree, where the DIRECTORY stays writable while the file read
+    # fails — exactly the state in which `mv` succeeds.
+    #
+    # Read-then-write is not atomic here, so the rc of the READ is the only
+    # thing standing between a transient fault and a destroyed registry.
+    if ! awk -F'\t' -v n="$SERVICE_NAME" '$1 != n' "$SERVICES_REGISTRY" > "$tmp"; then
+        rm -f "$tmp"
+        die "registry at $SERVICES_REGISTRY exists and could not be READ (awk rc!=0) — REFUSING to rewrite it. Rewriting now would TRUNCATE it to zero rows."
+    fi
     mv "$tmp" "$SERVICES_REGISTRY"
     say "registry: removed row '$SERVICE_NAME'"
 }
@@ -189,7 +236,17 @@ port_is_held() {
         0) return 1 ;;   # bound it ourselves — free
         1) return 0 ;;   # EADDRINUSE — held
     esac
-    ( exec 3<>"/dev/tcp/$host/$port" ) 2>/dev/null && return 0
+    # your-org/nexus-code#1028 — BOUNDED, via the one helper in _remote_lib.sh.
+    # This is a near-duplicate of `_remote_port_is_held` and carried the same
+    # unbounded connect; fixing only the lib copy would have left the hang on
+    # the path an operator actually reaches (`remote-up.sh` blew a 90s and a
+    # 150s cap on exactly this line).
+    _remote_tcp_probe "$host" "$port"
+    case $? in
+        0) return 0 ;;
+        2) printf 'remote-up: WARNING — TCP probe of %s:%s TIMED OUT; occupancy is UNKNOWN, not free (your-org/nexus-code#1028)\n' \
+               "$host" "$port" >&2 ;;
+    esac
     if command -v nc >/dev/null 2>&1; then
         printf '' | nc -w 2 "$host" "$port" >/dev/null 2>&1 && return 0
     fi
@@ -441,6 +498,22 @@ alert_port_change() {
 }
 
 cmd_up() {
+    # FIRST gate, before every other one: may THIS launcher enable a service at
+    # all? Everything below writes a registry row naming `$LAUNCH_BIN` — which
+    # is `$_script_dir/remote-sshd-supervised.sh`, i.e. THIS tree's supervisor,
+    # NOT `$NEXUS_ROOT`'s. So a clone's copy of this script registers a clone
+    # path, and it does so whether NEXUS_ROOT was inherited (the row lands in
+    # the PRIMARY registry pointing at a launcher the primary does not contain)
+    # or not (the whole activation forks into the clone — your-org/nexus-code#1034).
+    # Neither is recoverable by the primary once the clone is gone. Refuse here,
+    # where nothing has been created yet.
+    #
+    # Only `up` is gated. `--status` and `--port` create nothing, and `--down`
+    # is the RETIREMENT path: gating it would strand exactly the state this
+    # guard exists to prevent.
+    SVCROOT_TAG=remote-up SVCROOT_VERB=remote-up.sh \
+        svcroot_guard "$_script_dir" "$NEXUS_ROOT" \
+        || die "refusing to enable '$SERVICE_NAME' from this tree (see above) — nothing was registered, started or changed"
     # Registration IS enabling — running this command turns the channel on
     # (no separate config flag). Off by default = this was never run / was
     # --down'd. Registering the row before launch makes the supervisor +
@@ -456,6 +529,29 @@ cmd_up() {
     # bricking; the LOCATION rule is never auto-"fixed".
     _remote_principals_harden
     _remote_principals_guard || die "unsafe credential storage — fix principals_dir and re-run (nothing was enabled)"
+    # WHAT YOUR PIN ACTUALLY MEANS — printed every bring-up, never conditional on
+    # something looking wrong. `from_cidr` constrains the source address of the
+    # LAST HOP, not the client: behind a bastion / jump host / VPN concentrator /
+    # NAT it authenticates shared infrastructure and says nothing about WHICH
+    # client. A correctly-written `from=` line is not evidence of a client
+    # restriction, and the weak case has to be REPORTABLE rather than silent —
+    # it survives every check the absence-focused guards perform.
+    say "from_cidr meaning: $(_remote_pin_meaning)"
+    # SEQUENCE the posture change: refuse to APPLY a ROUTABLE move while any
+    # enrolled principal has not yet RE-ENROLLED onto the pin the new posture
+    # requires. An invitation merely being outstanding is NOT enough and does
+    # not release this — the client has to redeem it, which it can only do while
+    # the current posture is still serving, which is why this refuses. A
+    # locked-out client cannot ask this channel why it is locked out.
+    # Runs BEFORE anything is registered or started, so a refusal leaves the
+    # current posture serving. Exact width of the guarantee, including what it
+    # deliberately does NOT gate: see the header block in _remote_lib.sh.
+    # The die text must name the condition that ACTUALLY refused. It used to say
+    # "issue the invitation(s) … then re-run", which is the pre-S2 release rule:
+    # issuance no longer opens this gate, redemption does. The message an
+    # operator reads under a refusal is the one they act on, so a stale one
+    # sends them round a loop that cannot terminate.
+    _remote_posture_change_guard || die "posture change refused — the principal(s) named above have not RE-ENROLLED yet. Issuing an invitation is step 1 of 3; the client must redeem it over the current posture, then re-run (nothing was changed)"
     # Choose + RECORD an open port BEFORE the collision gate (#637 item 1). This
     # runs after the credential guards (it writes the recorded-port file into the
     # now-validated principals_dir) and before check_port_collision (which reads
@@ -497,6 +593,11 @@ cmd_up() {
     say "command policy: $(_remote_command_policy) (set monitor.remote.command_policy=unfiltered for a sandbox-confined shell)"
     ensure_registry_row
     ensure_host_key
+    # NOTE: the posture is recorded only AFTER the endpoint is confirmed
+    # serving — see the commit step below the health wait. Recording it here
+    # (which is what this did) is the ordering bug the guard exists to prevent,
+    # one level up: an ABORTED bring-up would leave behind a record of a posture
+    # that never served, permanently disarming the guard for that transition.
 
     # A running supervisor captured the OLD port at its launch (remote-sshd-
     # supervised.sh reads _remote_port ONCE, before its loop). recover_service is
@@ -541,6 +642,27 @@ cmd_up() {
         sleep 2; waited=$(( waited + 2 ))
     done
 
+    # ── COMMIT THE POSTURE, through the tested seam ──────────────────────
+    # The decision lives in _remote_commit_posture (see _remote_lib.sh), NOT
+    # here, and deliberately so: inline, the invariant "recorded iff serving"
+    # had no seam at which any test could observe it, and every textual
+    # assertion written over this file's shape was defeatable. This call site
+    # must stay a pure delegation — putting a branch back here re-creates the
+    # untestable shape.
+    # ⚠ THIS CALL'S PLACEMENT IS NOT GUARDED BY ANY TEST. The suite closes the
+    # CENSUS axis (how many call sites) but cannot close the PLACEMENT axis
+    # (whether the one call sits inside this health-gated block). Move it onto
+    # another branch and every assertion stays green while the endpoint records
+    # a posture for an endpoint that never served. See the box above
+    # `_remote_commit_posture` in _remote_lib.sh before touching this.
+    _remote_commit_posture "$HEALTH_BIN"
+    case $? in
+        0) ;;   # serving and recorded — the silent, normal path
+        1) say "WARNING: could not record the applied posture at $(_remote_posture_file) — the next run will treat this posture as a change (the guarded direction)" ;;
+        2) say "posture NOT recorded: the endpoint is not serving, so this posture was not applied."
+           say "  The posture-change guard stays ARMED for this transition — as it should." ;;
+    esac
+
     cat >&2 <<EOF
 
   nexus-remote-ssh service is registered$( "$HEALTH_BIN" >/dev/null 2>&1 && echo " and HEALTHY" || echo " (listener not yet up)" ).
@@ -550,9 +672,36 @@ $( (( PORT_CHANGED )) && printf '\n  *** PORT CHANGED %s -> %s — re-inform the
   Command policy:  $(_remote_command_policy)$( _remote_unfiltered && echo "  (clients get a sandbox-confined SHELL)" || echo "  (request-only channel)" )
   Read-only attach:$(_remote_allow_attach && echo " enabled" || echo " disabled")
   Host key:        $(_remote_principals_dir)/ssh_host_ed25519_key
-  Host fingerprint (give to the operator to PIN; NON-secret):
+  Host fingerprint (cross-check; NON-secret):
 EOF
     print_fingerprint >&2
+    # THE PINNABLE LINE, not just a fingerprint. A client handed only SHA256:…
+    # cannot populate known_hosts without connecting once and accepting what
+    # arrives — TOFU against a port this very script warns may be held by a
+    # co-tenant. `ssh-keyscan` is not a substitute: it reports the key a server
+    # CLAIMS without verifying a signature, and this public key is not secret,
+    # so anyone can replay it. Keyed on an ALIAS, because 127.0.0.1 is not an
+    # identity on a shared network namespace and an address-keyed pin breaks on
+    # every posture move.
+    _remote_endpoint_params
+    if [[ -n "$_REMOTE_EP_KNOWN_HOSTS_LINE" ]]; then
+        cat >&2 <<EOF
+
+  Host key LINE to give the client — this is what it PINS (NON-secret).
+  It appends this verbatim to ~/.ssh/known_hosts.nexus:
+
+    $_REMOTE_EP_KNOWN_HOSTS_LINE
+
+  and connects with:
+    $_REMOTE_EP_CONNECT policy
+
+  Jump hops: $_REMOTE_EP_JUMP_NOTE
+  Verify that form against a FRESH client (ignores your own ssh_config):
+    $_REMOTE_EP_VERIFY_LINE
+EOF
+    else
+        say "WARNING: no host public key on disk — cannot print a pinnable line yet"
+    fi
     cat >&2 <<EOF
 
   Enroll a client (secret token delivered OUT-OF-BAND, never on GitHub):
@@ -597,7 +746,14 @@ cmd_status() {
         _remote_identity_probe "$host" "$port" 5
         id="$_REMOTE_ID_VERDICT"
     fi
-    echo "$SERVICE_NAME  registered:$(_remote_registered && echo yes || echo no)  policy:$(_remote_command_policy)  $health  endpoint:$id  supervisor:$sup  bind:$(_remote_bind_address):$port"
+    echo "$SERVICE_NAME  registered:$(_remote_registered && echo yes || echo no)  policy:$(_remote_command_policy)  $health  endpoint:$id  supervisor:$sup  bind:$(_remote_bind_address):$port  pin:$(_remote_pin_class)"
+    # WHAT THE PIN ACTUALLY MEANS, on the surface an operator reads most often.
+    # `--status` is where someone checks "is my channel fine?", and a from_cidr
+    # that authenticates a shared bastion — or one that is malformed and
+    # therefore restricts nothing — looks identical to a real client pin from
+    # the one-line summary. bring-up already prints this; status did not, so the
+    # value was stated once at enable time and never again.
+    echo "  pin meaning: $(_remote_pin_meaning)" >&2
     [[ "$id" == foreign ]] && echo "  ^ $_REMOTE_ID_REASON" >&2
     # Surface the port PROVENANCE (#637): a recorded port that diverges from the
     # configured preference means setup had to move — a client pinned to the

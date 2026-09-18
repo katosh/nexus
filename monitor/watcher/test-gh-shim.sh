@@ -59,6 +59,13 @@ chmod +x "$MINT_FAIL"
 
 export NEXUS_ROOT="$WORK/nexus"
 mkdir -p "$NEXUS_ROOT/monitor/.state"
+# HERMETIC (your-org/nexus-code#1453 / #1336): the arms below that point
+# NEXUS_ROOT at the REAL repo root (the zsh path-front checks) run the real
+# wrapper, whose capability cache resolves NEXUS_STATE_DIR before NEXUS_ROOT;
+# without this pin the decoy probe reads LEAK-AT-SOURCE — gh-capable.d written
+# into the source checkout. Pinned to the dir this suite already treats as its
+# state dir, so every arm's writes land in $WORK.
+export NEXUS_STATE_DIR="$NEXUS_ROOT/monitor/.state"
 export PATH="$FAKEBIN:$PATH"
 
 # Run a gh invocation in a clean subshell with the shim sourced. Each case

@@ -25,7 +25,8 @@ FAIL=0
 
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s\n' "$label" >&2
@@ -244,14 +245,19 @@ echo '=== second run: cursor short-circuits everything ==='
 out=$(snapshot_bot_mentions 2>/dev/null)
 assert_eq "empty output on second run" "$out" ""
 
-# ---- processed-comments dedup (botmention: prefix) ----
+# ---- processed-comments.txt is NOT a dedup source for this path (#1509) ----
+#
+# The `botmention:` prefix this case used to certify had no writer, exactly
+# like the user path's `mention:` prefix (your-org/nexus-code#1509). A stale
+# key in the cache must NOT hide an emit; the reaction filter is the dedup.
+# Inverse of the case it replaces; RED on the tree that consulted the cache.
 
-echo '=== processed-comments dedup hides the comment / body emit ==='
+echo '=== a botmention:-prefixed cache key does NOT hide the comment / body emit (#1509) ==='
 rm -f "$STATE_DIR/last-bot-mention-cursor.txt"
 printf 'botmention:4780061875\nbotmention:issue:99\n' > "$STATE_DIR/processed-comments.txt"
 out=$(snapshot_bot_mentions 2>/dev/null)
-assert_not_contains "comment hidden by botmention: dedup"      "$out" "id=4780061875"
-assert_not_contains "issue body hidden by botmention:issue: dedup" "$out" "n=99 id=4780065000"
+assert_contains "comment is emitted despite a botmention: cache key (no writer exists for it)" "$out" "id=4780061875"
+assert_contains "issue body is emitted despite a botmention:issue: cache key" "$out" "n=99 id=4780065000"
 rm -f "$STATE_DIR/processed-comments.txt"
 
 # ---- eligibility: ROCKET / non-self EYES suppress ----

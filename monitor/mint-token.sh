@@ -6,6 +6,7 @@
 # Usage:
 #   GH_TOKEN=$(monitor/mint-token.sh) gh issue list ...
 #   monitor/mint-token.sh --jwt-only            # App-level JWT only
+#   monitor/mint-token.sh --check-key           # report the key's exposure; mint nothing
 #
 # The default (no flag) prints an installation access token suitable for
 # `GH_TOKEN=...` with `gh`. With `--jwt-only`, the script prints just the
@@ -54,6 +55,11 @@
 #   2  bot config unreachable (no nexus.yml found, required key empty,
 #      or private key file missing/unreadable)
 #   3  token mint failed (response on stderr)
+#   4  private key REFUSED: it is world-accessible AND every ancestor
+#      directory is world-traversable, so other local users can read it.
+#      `chmod 600` the key. Distinct from 2 so a caller can tell a
+#      credential-hygiene refusal from a missing/broken config.
+#      `--check-key` reports the same analysis without minting.
 #
 # Note: callers must check the exit code. `GH_TOKEN=$(...)` discards
 # it; use `tok=$(./monitor/mint-token.sh) || die ...; GH_TOKEN=$tok gh
@@ -61,14 +67,34 @@
 
 set -euo pipefail
 
+# ARGUMENT-LOOP PROGRESS GUARD (your-org/nexus-code#924). Each argument loop
+# below asserts that every iteration consumes at least one argument. Without it
+# a value-taking flag given LAST spins forever — `shift 2` with `$#` == 1 is
+# refused, so the arm re-matches — and a hang here is worse than an error
+# because nothing on this board surfaces it. Full rationale: monitor/ng.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
+
 die() { printf 'mint-token.sh: %s\n' "$*" >&2; exit "${MINT_DIE_RC:-2}"; }
 
 JWT_ONLY=0
-while (( $# > 0 )); do
+CHECK_KEY=0
+_argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
     case "$1" in
         --jwt-only) JWT_ONLY=1; shift ;;
+        --check-key) CHECK_KEY=1; shift ;;
         -h|--help)
-            sed -n '2,49p' "$0" >&2
+            # 2,66 — the whole header comment, INCLUDING the exit codes.
+            # It was 2,49 and stopped short of them, so `--help` documented
+            # every flag and none of the statuses a caller must branch on
+            # (your-org/nexus-code#1501 added a fourth). The range ends one
+            # line above `set -euo pipefail`; a header that grows past it
+            # truncates silently, which is why the last documented line is
+            # named here rather than left to be inferred.
+            sed -n '2,66p' "$0" >&2
             exit 0 ;;
         *)
             echo "mint-token.sh: unknown flag: $1" >&2
@@ -152,7 +178,10 @@ SAFETY_S=300   # mint a fresh token if cached one expires within 5 min
 # it even tried the network, with a valid credential one `curl` away.
 _cache_warn() { printf 'mint-token.sh: %s\n' "$*" >&2; }
 
-if (( JWT_ONLY == 0 )); then
+# `CHECK_KEY` joins the guard: the cache arm EXITS 0 with a token, so a
+# `--check-key` run that happened to find a warm cache would print a
+# credential and never reach its own report (your-org/nexus-code#1501).
+if (( JWT_ONLY == 0 && CHECK_KEY == 0 )); then
     # Advisory: a missing cache dir on a read-only/full $HOME must not stop
     # us from minting a fresh token over a perfectly healthy network.
     if ! mkdir -p "$(dirname "$CACHE")" 2>/dev/null; then
@@ -176,6 +205,143 @@ fi
 
 [[ -f "$KEY_PATH" ]] || die "private key not found at $KEY_PATH (github.bot_pem_path)"
 [[ -r "$KEY_PATH" ]] || die "private key not readable at $KEY_PATH (check perms; should be 600)"
+
+# ---------------------------------------------------------------------------
+# KEY EXPOSURE GATE (your-org/nexus-code#1501)
+# ---------------------------------------------------------------------------
+#
+# The two checks above are `-f` and `-r`. For a long time the words
+# "should be 600" sat in the SECOND one's failure message and enforced
+# nothing, while two documents asserted this script rejects a loose key
+# mode. A mode-644 key passed both tests in silence. That is a documented
+# guarantee with no enforcing branch, which is worse than a documented gap:
+# a gap invites scrutiny, a false guarantee deflects it.
+#
+# WHAT IS ENFORCED HERE, AND WHY IT IS NOT `mode == 600`.
+#
+# A file mode is the LAST gate, not the only one. `#1501` was filed as an
+# exposure on the strength of `stat` ON THE FILE ALONE — mode 644 — and
+# withdrawn when the ancestors were read: `~/.claude` is 700, so
+# other-execute is 0 and no other user can TRAVERSE to the path. The file's
+# own 644 was inert. `stat` on a file answers "what are this inode's bits",
+# never "who can read this file".
+#
+# So a naive `case $mode in 600|400) ;; *) die` would REFUSE a setup that is
+# in fact airtight, on every mint, on the path every GitHub write in this
+# nexus takes — a self-inflicted outage in answer to a non-problem. The gate
+# refuses only on a POSITIVELY ESTABLISHED exposure: world bits on the key
+# AND an unbroken world-traversable path to it. Anything it cannot establish
+# it does not assert; see `_key_reachable_by_others`, which is three-valued
+# for that reason.
+#
+# GROUP is deliberately NOT a refusal. Who is in a group is not derivable
+# here, and a bot-uid group is a legitimate administered setup (the same
+# doc sanctions `0660` for the webhook secret). `--check-key` reports it;
+# this gate does not act on it.
+#
+# The remedy the refusal names is `chmod 600`, which is one command, always
+# available, and cannot break anything — which is what makes refusing (as
+# opposed to warning) the right severity.
+
+# _key_mode <path> — the octal mode, or empty when it cannot be read.
+_key_mode() {
+    local m
+    m=$(stat -c '%a' -- "$1" 2>/dev/null) || return 1
+    [[ "$m" =~ ^[0-7]{3,4}$ ]] || return 1
+    printf '%s\n' "$m"
+}
+
+# _key_reachable_by_others <path>
+#   0  every ancestor directory grants other-execute — another local user can
+#      traverse to this path
+#   1  some ancestor denies it — containment, positively established
+#   3  UNKNOWN — an ancestor could not be stat'd. NEITHER of the above; the
+#      caller must not read it as either (this repo's three-valued doctrine:
+#      "I could not tell" is not silently "no").
+_key_reachable_by_others() {
+    local d m up
+    d=$(dirname -- "$1")
+    # Resolve symlinks when we can: the mode that matters belongs to the
+    # directories actually walked, not to the ones spelled in the config.
+    if command -v readlink >/dev/null 2>&1; then
+        local real; real=$(readlink -f -- "$d" 2>/dev/null) && [[ -n "$real" ]] && d="$real"
+    fi
+    while :; do
+        m=$(stat -c '%a' -- "$d" 2>/dev/null) || return 3
+        [[ "$m" =~ ^[0-7]{3,4}$ ]] || return 3
+        (( (8#$m & 8#1) != 0 )) || return 1
+        [[ "$d" == "/" ]] && break
+        up=$(dirname -- "$d")
+        [[ "$up" == "$d" ]] && break
+        d="$up"
+    done
+    return 0
+}
+
+# _key_exposure_report <path> — prints `verdict=<exposed|contained|group-visible|ok|unknown> mode=<m> reason=<...>`
+# on stdout. Never exits; the decision belongs to the caller.
+_key_exposure_report() {
+    local kp="$1" mode reach
+    mode=$(_key_mode "$kp") || {
+        printf 'verdict=unknown mode=? reason=stat could not read the mode of %s\n' "$kp"
+        return 0
+    }
+    local world=$(( 8#$mode & 8#7 )) group=$(( 8#$mode & 8#70 ))
+    if (( world == 0 && group == 0 )); then
+        printf 'verdict=ok mode=%s reason=no group or other bits; only the owner can read or replace the key\n' "$mode"
+        return 0
+    fi
+    if (( world != 0 )); then
+        # `set -e` is on: a three-valued probe returning 1 or 3 as a SIMPLE
+        # command would abort the script. Read the status into a variable on
+        # the very next line, with the `||` that makes the non-zero legal.
+        reach=0; _key_reachable_by_others "$kp" || reach=$?
+        case "$reach" in
+            0) printf 'verdict=exposed mode=%s reason=the key carries other-bits AND every ancestor directory grants other-execute, so any local user can reach it\n' "$mode" ;;
+            1) printf 'verdict=contained mode=%s reason=the key carries other-bits but an ancestor directory denies other-execute, so the file mode is inert; still worth tightening\n' "$mode" ;;
+            *) printf 'verdict=unknown mode=%s reason=the key carries other-bits and an ancestor directory could not be stat'"'"'d, so reachability is UNDETERMINED — neither established nor ruled out\n' "$mode" ;;
+        esac
+        return 0
+    fi
+    printf 'verdict=group-visible mode=%s reason=the key is group-accessible; who is in that group is not derivable here, so this is reported and not acted on\n' "$mode"
+}
+
+# `--check-key` REPORTS rather than dies, so the gate is skipped for it — a
+# diagnostic verb that exits through the refusal it exists to explain would
+# print the refusal and never reach its own report.
+if [[ "${NEXUS_SKIP_KEY_EXPOSURE_GATE:-0}" != 1 ]] && (( CHECK_KEY == 0 )); then
+    _kx=$(_key_exposure_report "$KEY_PATH")
+    case "$_kx" in
+        verdict=exposed*)
+            printf 'mint-token.sh: REFUSING to sign with %s\n' "$KEY_PATH" >&2
+            printf '  %s\n' "$_kx" >&2
+            printf '  This is not a mode preference: the ancestors were walked and every one\n' >&2
+            printf '  of them grants other-execute, so the bits on the key are the whole of\n' >&2
+            printf '  the protection and they are open.\n' >&2
+            printf '  Fix:  chmod 600 %q\n' "$KEY_PATH" >&2
+            printf '  Then consider ROTATING the key — a mode change does not un-expose a\n' >&2
+            printf '  key that was readable (docs/admin/github-app.md, "Rotating the private key").\n' >&2
+            MINT_DIE_RC=4 die "private key at $KEY_PATH is reachable and readable by other local users"
+            ;;
+    esac
+    unset _kx
+fi
+
+# `--check-key` REPORTS and exits. It is the surface the docs point at for the
+# three verdicts the gate deliberately does not act on — `contained`,
+# `group-visible` and `unknown` — so that "the gate did not refuse" never has
+# to be read as "the mode is fine". Exit 0 = `ok`, 4 = `exposed` (the same code
+# the gate dies with), 5 = anything the gate tolerates but a reader should see.
+if (( CHECK_KEY == 1 )); then
+    _kx=$(_key_exposure_report "$KEY_PATH")
+    printf 'key: %s\n' "$KEY_PATH"
+    printf '%s\n' "$_kx"
+    case "$_kx" in
+        verdict=ok*)       exit 0 ;;
+        verdict=exposed*)  exit 4 ;;
+        *)                 exit 5 ;;
+    esac
+fi
 
 b64url() { base64 -w 0 | tr -d '=' | tr '+/' '-_'; }
 

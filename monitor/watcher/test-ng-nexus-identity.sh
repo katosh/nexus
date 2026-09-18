@@ -33,6 +33,13 @@ NG="$FAKE_NEXUS/monitor/ng"
 STUB_DIR="$WORK/bin"
 CAPTURE="$WORK/gh-calls.txt"
 BODY_CAPTURE="$WORK/gh-body.txt"
+# The forge's STORE — what a GET returns after a PATCH updated it (#1118).
+STORE="$WORK/gh-store.txt"
+# The last PATCH's REQUEST body, where a later call cannot clear it.
+# `make_gh_stub` truncates the body capture on any call sending no `--input`
+# (#921), and `_patch_issue_body` now issues an independent GET AFTER the
+# PATCH (#1118 guard 3), so the request capture is wiped before a test reads it.
+PATCH_BODY="$WORK/gh-patch-body.txt"
 
 # `gh` stub: a single overview issue (#1) with a canned body; PATCH
 # echoes an html_url and the piped JSON body is captured for inspection.
@@ -43,7 +50,30 @@ make_gh_stub "$STUB_DIR/gh" "$CAPTURE" --with-body-capture "$BODY_CAPTURE" <<'CA
         ;;
     */issues/[0-9]*)
         if [[ "$method" == "PATCH" ]]; then
-            printf '%s' '{"html_url":"https://mock.example/issues/1"}'
+            # your-org/nexus-code#1118 — the response must carry the body:
+            # `nexus-identity --upsert-overview` now VERIFIES its write by
+            # reading it back rather than trusting the 200, so a body-less
+            # response is `rc 4 UNVERIFIED` by design. Echo the request
+            # faithfully; the captured payload is the `{"body": "..."}`
+            # envelope, so `.body` unwraps it.
+            if [[ -n "${MOCK_BODY_CAPTURE_PATH:-}" && -s "${MOCK_BODY_CAPTURE_PATH:-}" ]]; then
+                if [[ -n "${MOCK_PATCH_BODY_PATH:-}" ]]; then
+                    cat "$MOCK_BODY_CAPTURE_PATH" > "$MOCK_PATCH_BODY_PATH" 2>/dev/null || true
+                fi
+                if [[ -n "${MOCK_STORE_PATH:-}" ]]; then
+                    jq -j '.body' < "$MOCK_BODY_CAPTURE_PATH" > "$MOCK_STORE_PATH" 2>/dev/null || true
+                fi
+                jq -c --arg u "https://mock.example/issues/1" \
+                   '{html_url:$u, body:.body}' < "$MOCK_BODY_CAPTURE_PATH"
+            else
+                printf '%s' '{"html_url":"https://mock.example/issues/1"}'
+            fi
+            return 0 2>/dev/null || exit 0
+        fi
+        # GET: the STORE if a PATCH has updated it, else the fixture — so an
+        # independent read-back (your-org/nexus-code#1118 guard 3) is meaningful.
+        if [[ -n "${MOCK_STORE_PATH:-}" && -s "${MOCK_STORE_PATH:-}" ]]; then
+            jq -Rs --arg u "https://mock.example/issues/1" '{html_url:$u, body:.}' < "$MOCK_STORE_PATH"
             return 0 2>/dev/null || exit 0
         fi
         if [[ -n "${MOCK_BODY_FILE:-}" && -f "${MOCK_BODY_FILE:-}" ]]; then
@@ -64,12 +94,15 @@ run_ng() {
     local _out_var="$1" _err_var="$2" _rc_var="$3"; shift 3
     local _stdout _stderr _rc _out_tmp _err_tmp
     _out_tmp=$(mktemp); _err_tmp=$(mktemp)
-    : > "$CAPTURE"; : > "$BODY_CAPTURE"
+    : > "$CAPTURE"; : > "$BODY_CAPTURE"; : > "$STORE"; : > "$PATCH_BODY"
     ( cd "$NEUTRAL_CWD" && run_hermetic \
         NEXUS_ROOT="$FAKE_NEXUS" \
         NEXUS_STATE_DIR="$WORK/state" \
         PATH="$STUB_DIR:$PATH" \
         MOCK_BODY_FILE="${MOCK_BODY_FILE:-}" \
+        MOCK_BODY_CAPTURE_PATH="$BODY_CAPTURE" \
+        MOCK_STORE_PATH="$STORE" \
+        MOCK_PATCH_BODY_PATH="$PATCH_BODY" \
         -- "$NG" "$@" ) >"$_out_tmp" 2>"$_err_tmp"
     _rc=$?
     _stdout=$(<"$_out_tmp"); _stderr=$(<"$_err_tmp")
@@ -127,7 +160,7 @@ run_ng out err rc nexus-identity --upsert-overview
 assert_eq        "exit 0"                            "$rc" "0"
 calls=$(<"$CAPTURE")
 assert_contains  "PATCH issued"                      "$calls" "-X PATCH"
-patched=$(<"$BODY_CAPTURE")
+patched=$(<"$PATCH_BODY")
 assert_contains  "patched body has start delimiter"  "$patched" "nexus-identity:start"
 assert_contains  "patched body has end delimiter"    "$patched" "nexus-identity:end"
 assert_contains  "patched body preserves prose"      "$patched" "body prose"
@@ -139,7 +172,7 @@ seeded="$WORK/seeded-body.md"
 printf '## Nexus overview\n\n<!-- nexus-identity:start -->\nSTALE IDENTITY\n<!-- nexus-identity:end -->\n\ntrailing prose\n' > "$seeded"
 MOCK_BODY_FILE="$seeded" run_ng out err rc nexus-identity --upsert-overview
 assert_eq        "exit 0"                            "$rc" "0"
-patched=$(<"$BODY_CAPTURE")
+patched=$(<"$PATCH_BODY")
 assert_not_contains "stale block removed"            "$patched" "STALE IDENTITY"
 assert_contains     "trailing prose preserved"       "$patched" "trailing prose"
 # Exactly one start delimiter survives (no duplicate block).

@@ -8,12 +8,26 @@
 # no $HOME writes — every fixture lives under a mktemp -d sandbox that is a
 # stand-in NEXUS_ROOT).
 
+# HERMETIC on the #1431 axis since your-org/nexus-code#1451: `_trash.sh` now
+# resolves its trash root through NEXUS_STATE_DIR / NEXUS_ROOT before its own
+# BASH_SOURCE location, so the linker's trash lands under the sandbox this
+# suite pins rather than in the checkout. The `allow-source-leak` marker that
+# stood here while #1451 was open is gone on purpose — a suite that probes
+# hermetic needs no exemption, and an exemption that outlives its reason is a
+# leak nobody is watching.
 set -uo pipefail
 
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 _repo_root=$(cd "$_test_dir/../.." && pwd)
 LINKER="$_repo_root/monitor/link-nexus-tools.sh"
 TRASH="$_repo_root/monitor/_trash.sh"
+# Every state write this suite provokes — the linker's trash AND the direct
+# `$TRASH trash …` call below — resolves through NEXUS_STATE_DIR first (#1451),
+# so ONE pin covers both. Without it the direct call resolves the INHERITED
+# NEXUS_ROOT and lands `monitor/.state/.trash/` in whatever tree an agent's
+# shell names (measured LEAK under `nexus-root-sensitivity.sh probe`).
+_lnt_state=$(mktemp -d); trap 'rm -rf "$_lnt_state"' EXIT
+export NEXUS_STATE_DIR="$_lnt_state/state"; mkdir -p "$NEXUS_STATE_DIR"
 
 PASS=0
 FAIL=0

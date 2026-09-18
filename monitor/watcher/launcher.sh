@@ -235,7 +235,8 @@ _launch_caller() {
     if [[ -n "${WATCHER_LAUNCH_CALLER:-}" ]]; then
         printf '%s' "$WATCHER_LAUNCH_CALLER"
     else
-        tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null | head -c 120 || printf 'ppid=%s' "$PPID"
+        # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+        { tr '\0' ' ' < "/proc/$PPID/cmdline"; } 2>/dev/null | head -c 120 || printf 'ppid=%s' "$PPID"
     fi
 }
 _launch_audit() {

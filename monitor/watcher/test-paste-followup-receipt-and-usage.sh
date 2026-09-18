@@ -78,6 +78,17 @@ if [[ "$cmd" == "list-windows" ]]; then
         *window_id*)
             d="${fmt#*'#{window_id}'}"; d="${d%%'#{window_name}'*}"
             for w in ${MOCK_TMUX_WINDOWS:-}; do printf '@3%s%s\n' "$d" "$w"; done ;;
+        *window_index*)
+            # The INDEX shape (your-org/nexus-code#905): resolve_window_key /
+            # resolve_window_index ask for `#{window_index}<delim>#{window_name}`,
+            # which carries no `window_id`. Without this arm it fell to the
+            # default below and came back a BARE, unsplittable name. Delimiter
+            # EXTRACTED from the requested format, never assumed.
+            d="${fmt#*'#{window_index}'}"; d="${d%%'#{window_name}'*}"
+            i=0
+            for w in ${MOCK_TMUX_WINDOWS:-}; do
+                printf '%s%s%s\n' "$i" "$d" "$w"; i=$(( i + 1 ))
+            done ;;
         *) printf '%s\n' "${MOCK_TMUX_WINDOWS:-}" ;;
     esac
     exit 0
@@ -316,6 +327,63 @@ assert_contains "B6 …and cites the issue"             "$MUT_OUT" '#883'
 assert_not_contains "B6 …and does NOT print a truncated usage line" \
     "$MUT_OUT" 'usage: paste-followup.sh <window>'
 
+# B7. THE DEGRADATION THAT WAS SILENT (your-org/nexus-code#906 B).
+#
+# B6 covers the TOTAL failure — zero arms found. It said nothing about a
+# PARTIAL read, and that was the gap: arity came from `shift 2` on the arm's
+# pattern line, so an arm written across several lines printed as a switch
+# while the parser went on eating a value. `[--src]` instead of
+# `[--src <label>]`, no error. A caller following it writes `--src
+# --no-enter` and loses `--no-enter` into SRC.
+#
+# The multi-line style is native to this file — its own `--help` arm was
+# written that way until #900 collapsed it — so this is a live shape, not a
+# hypothetical. The fix keeps the derivation and makes its degradation loud;
+# these assertions are what hold it to that.
+b7_mutate() {   # <label> <old> <new>  → runs a mutant, leaves $B7_OUT/$B7_RC
+    local f="$WORK/b7-$1.sh"
+    python3 - "$SCRIPT" "$f" "$2" "$3" <<'PY'
+import sys
+src, dst, a, b = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+d = open(src, 'rb').read()
+assert d.count(a.encode()) == 1, "b7 anchor not unique/found"
+open(dst, 'wb').write(d.replace(a.encode(), b.encode()))
+PY
+    B7_OUT=$(bash "$f" 2>&1); B7_RC=$?
+}
+
+b7_mutate multiline \
+    '        --src)      SRC="${2:-}";      shift 2 || die "--src needs a label" ;; #= <label>' \
+    '        --src)
+            SRC="${2:-}"
+            shift 2 || die "--src needs a label"
+            ;; #= <label>'
+assert_eq       "B7 a multi-line value-taking arm is REFUSED (was: printed as a switch)" "$B7_RC" "1"
+assert_contains "B7 …the diagnostic names the arm"        "$B7_OUT" '--src'
+assert_contains "B7 …and says the pattern line is silent" "$B7_OUT" "body has 'shift 2'"
+assert_contains "B7 …and cites the issue"                 "$B7_OUT" '#906'
+assert_not_contains "B7 …and prints NO synopsis at all"   "$B7_OUT" 'usage: paste-followup.sh <window>'
+# The specific wrong answer it used to publish must be gone.
+assert_not_contains "B7 …least of all the wrong-arity one" "$B7_OUT" '[--src]'
+
+b7_mutate noshift \
+    '        --no-enter) SEND_ENTER=0;      shift ;;' \
+    '        --no-enter) SEND_ENTER=0; ;;'
+assert_eq       "B7 an arm that neither shifts nor is marked is REFUSED" "$B7_RC" "1"
+assert_contains "B7 …naming the missing marker" "$B7_OUT" "no 'shift'/'shift 2' and no '#= none' marker"
+
+# B7 POSITIVE CONTROL. A guard that refuses everything would pass every
+# assertion above. A non-shifting arm EXPLICITLY marked `#= none` — the
+# escape hatch the diagnostic tells you to use — must still render.
+b7_mutate marked \
+    '        --no-enter) SEND_ENTER=0;      shift ;;' \
+    '        --no-enter) SEND_ENTER=0; ;; #= none'
+assert_eq       "B7 CONTROL an explicitly-marked non-shifting arm is accepted" "$B7_RC" "1"
+assert_contains "B7 CONTROL …and still appears in the synopsis" "$B7_OUT" '[--no-enter]'
+assert_contains "B7 CONTROL …which is a real synopsis, not a refusal" \
+    "$B7_OUT" 'usage: paste-followup.sh <window>'
+assert_not_contains "B7 CONTROL …with no arity complaint" "$B7_OUT" 'cannot determine the arity'
+
 # ---------------------------------------------------------------------------
 # EXPECTED-COUNT GUARD (required by test-summary-honesty-manifest.sh at the
 # `ledger=yes` protection level). An assert_* block that never executes
@@ -327,9 +395,10 @@ assert_not_contains "B6 …and does NOT print a truncated usage line" \
 # +  8  PART B fixtures — B0 floor + 3 anchors, B1 rc/help-rc/help-identity/
 #        header-non-vacuity
 # +  3  B5 — the two flags the issue names, plus the alias
-# +  5  B6 — the fail-loud derivation
+# +  5  B6 — the fail-loud derivation (zero arms)
+# + 12  B7 — the fail-loud derivation (a half-read arm) + its positive control
 # +  3  per accepted flag: B2 accepted, B3 usage names it, B4 header documents it
-EXPECTED=$(( 16 + 8 + 3 + 5 + 3 * ${#FLAGS[@]} ))
+EXPECTED=$(( 16 + 8 + 3 + 5 + 12 + 3 * ${#FLAGS[@]} ))
 if (( PASS + FAIL != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. An assertion did not execute.\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" >&2

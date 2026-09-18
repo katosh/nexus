@@ -64,7 +64,7 @@ stateDiagram-v2
     IdleNoWrap --> IdleTooLong: idle >= 24 h
     Wrapped --> IdleTooLong: idle >= 24 h
     Busy --> PaneAbsent: claude process gone / renderer blocked
-    Busy --> OverLimit: weekly limit hit (watcher owns the wake-loop)
+    Busy --> OverLimit: usage limit hit, tier read from the pane (watcher owns the wake-loop)
     OverLimit --> Busy: suspension cleared, resume brief pasted
     IdleNoWrap --> OrphanAsync: declared external waits, no resume mechanism
 
@@ -170,7 +170,10 @@ marker → real classifier → real resume that completes once the mock recovers
 | Paste confirm grace | 180 s | `MONITOR_PASTE_CONFIRM_GRACE_SECONDS` / `monitor.paste_confirm_grace_seconds` | How long after a guaranteed-submit paste the watcher waits for the `UserPromptSubmit` before flagging `paste-unconfirmed`. |
 | Retain TTL | 86400 s (24 h) | `MONITOR_RETAIN_TTL_SECONDS` / `monitor.retain_ttl_seconds` | Lifetime of a `window-retain` suppression; consumed early by any engagement after `retain.ts`. |
 | Idle close threshold | 24 h | `MONITOR_IDLE_CLOSE_HOURS` / `monitor.idle_close_hours` | `idle-too-long` — strong default-to-close; inviolable. |
-| Over-limit backoff | 60 s → 300 s cap, ≤ 10 attempts | `monitor.over_limit.initial_backoff_seconds` / `monitor.over_limit.max_attempts` | Watcher-owned resume loop for `over-limit` windows. |
+| Over-limit backoff | 60 s → 300 s cap, ≤ 4 attempts | `monitor.over_limit.initial_backoff_seconds` / `monitor.over_limit.max_backoff_seconds` / `monitor.over_limit.max_attempts` | Watcher-owned resume loop for `over-limit` windows. |
+| Over-limit observation staleness | 600 s | `MONITOR_OVER_LIMIT_OBSERVATION_STALENESS_SECONDS` / `monitor.over_limit.observation_staleness_seconds` | How long an OBSERVED over-limit sighting keeps the orchestrator emit gate closed. Stale ⇒ the gate OPENS — absent evidence of suspension, emit. |
+| Over-limit suppression alert | 900 s | `MONITOR_OVER_LIMIT_SUPPRESSION_ALERT_SECONDS` / `monitor.over_limit.suppression_alert_seconds` | How long a hold must last before the FIRST out-of-band announcement that the operator channel is being withheld. |
+| Over-limit suppression reminder | 3600 s | `MONITOR_OVER_LIMIT_SUPPRESSION_REMINDER_SECONDS` / `monitor.over_limit.suppression_reminder_seconds` | Cadence of reminders after that first announcement — deliberately slower, so a legitimate 5 h hold does not fire 20 critical-class bells. |
 | Turn-failure marker freshness | 1800 s | `MONITOR_TURN_FAILURE_STALENESS_SECONDS` | Max age of a `turn-failure` marker still treated as live for `interrupted`; an older marker (missed Stop-clear) is ignored. |
 | Watcher cycle | 60 s | `POLL_SECONDS` | The probe's sampling cadence — all of the above are evaluated once per cycle. |
 

@@ -39,8 +39,12 @@ The orchestrator fills these placeholders — `<ONE-TIME-TOKEN>` + `<ENROLL-PRIV
 (both from `enroll-invite`; BOTH secret), `<HOST-FINGERPRINT>`, `<PRINCIPAL>`,
 `<SSH-USER>` (the in-sandbox login user), `<ENDPOINT>` (**the host's LAN IP** for
 direct off-host access [Posture 1], or `localhost` when reaching a loopback bind via
-a tunnel/carrier [Posture 2]), `<PORT>` (`monitor.remote.port`), and `[-J <jump-host>]`
-only if the SSH path crosses a bastion — and hands the operator the result to paste
+a tunnel/carrier [Posture 2]), `<PORT>` (the port IN FORCE —
+`monitor/remote-up.sh --port`; the configured `monitor.remote.port` is only a
+preference and may have been moved at setup), `<HOST-KEY-LINE>` +
+`<ALIAS>` (from `monitor/remote-up.sh`, which prints the pinnable line — **a
+fingerprint alone is not pinnable**), and `<JUMP-CHAIN>` (`monitor.remote.jump_hosts`,
+comma-separated) only if the SSH path crosses one or more bastions — and hands the operator the result to paste
 **verbatim** into their client agent. The client self-generates its OWN permanent
 key, saves the enroll key, self-enrolls over SSH with the enroll key, reconnects as
 the CONTROLLER of the channel, then runs `policy`/`help` for the rest. **Net operator
@@ -70,14 +74,23 @@ step — see the note below).
 >    ```
 >    <ENROLL-PRIVATE-KEY>
 >    ```
-> 3. **Pin host fingerprint** — verify the server's key equals this EXACTLY; on
->    any mismatch, STOP: `<HOST-FINGERPRINT>`
->    (seed: `ssh-keyscan -p <PORT> <ENDPOINT>` → confirm via `ssh-keygen -lf -` → append to `~/.ssh/known_hosts`.)
+> 3. **Pin the host key — write the LINE, never seed it by connecting.** Append
+>    this verbatim to a dedicated known_hosts, keyed on the ALIAS (not an address):
+>    ```
+>    <HOST-KEY-LINE>
+>    ```
+>    `mkdir -p ~/.ssh && cat >> ~/.ssh/known_hosts.nexus` then `chmod 600 ~/.ssh/known_hosts.nexus`.
+>    Cross-check the fingerprint: `<HOST-FINGERPRINT>`. On any mismatch, STOP.
 > 4. **Self-enroll with the ENROLL key** (one-time; token single-use, consumed here) —
 >    pipe the token + YOUR OWN public key to the enroll session:
->    `printf '%s\n%s\n' '<ONE-TIME-TOKEN>' "$(cat ~/.ssh/nexus-remote.pub)" | ssh -T -i ~/.ssh/nexus-enroll -p <PORT> [-J <jump-host>] <SSH-USER>@<ENDPOINT>`
+>    `printf '%s\n%s\n' '<ONE-TIME-TOKEN>' "$(cat ~/.ssh/nexus-remote.pub)" | ssh -T -i ~/.ssh/nexus-enroll -p <PORT> <JUMP-CHAIN> <PIN-OPTS> <SSH-USER>@<ENDPOINT>`
 > 5. **Reconnect with YOUR OWN key** (the enroll key is now spent — you may `rm ~/.ssh/nexus-enroll`):
->    `ssh -i ~/.ssh/nexus-remote -p <PORT> [-J <jump-host>] <SSH-USER>@<ENDPOINT> policy`
+>    `ssh -i ~/.ssh/nexus-remote -p <PORT> <JUMP-CHAIN> <PIN-OPTS> <SSH-USER>@<ENDPOINT> policy`
+>
+>    `<PIN-OPTS>` = `-o HostKeyAlias=<ALIAS> -o UserKnownHostsFile=~/.ssh/known_hosts.nexus -o StrictHostKeyChecking=yes`
+>    `<JUMP-CHAIN>` = `-J hop1,hop2` if your network needs bastions (comma-separated,
+>    in order), otherwise omit. Carrying the pin as explicit `-o` options is
+>    deliberate — see "Why the connect line carries its own options" below.
 >
 > Once connected, run `policy` (or `help`) for full usage (`request
 > file`/`await`/`fetch`, plus the non-blocking background reply-watcher so you
@@ -90,7 +103,7 @@ step — see the note below).
 > **reply-watcher** setup (how you learn a reply has landed) once your channel is
 > up. The completion steps are obtained BY ASKING, so this stays correct as the
 > flow evolves:
-> `ssh -i ~/.ssh/nexus-remote -p <PORT> [-J <jump-host>] <SSH-USER>@<ENDPOINT> request file --kind question --slug complete-setup --message "What are the remaining steps to complete my setup? Include the reply-watcher setup."`
+> `ssh -i ~/.ssh/nexus-remote -p <PORT> <JUMP-CHAIN> <PIN-OPTS> <SSH-USER>@<ENDPOINT> request file --kind question --slug complete-setup --message "What are the remaining steps to complete my setup? Include the client helper set and how to run it."`
 >
 > Need broader access? The channel can't grant it — ask your own operator.
 > ---
@@ -161,7 +174,11 @@ learns the state via `request fetch <id> status` — a **read-only, ownership-
 checked sub-mode of the already-allowed `fetch` verb** (no new top-level verb;
 it returns only the client's OWN request's state word). Each poll cycle it does
 a short `fetch status` pre-check, then a single long blocking `await` — one
-session at a time, never concurrent, so within `MaxSessions=4`. On `claimed`
+connection at a time, never concurrent. **That seriality is the tool's own
+discipline, not something sshd enforces:** `MaxSessions=4` caps multiplexed
+sessions WITHIN one connection and `MaxStartups=3:50:10` throttles concurrent
+UNAUTHENTICATED connections, so neither bounds a serial authenticated client
+(see the header of `monitor/client/nexus-request`). On `claimed`
 (the orchestrator is actively processing) it emits a `state=processing`
 progress event **once** and **extends the patience window** (a fresh lifetime
 window from when processing began, capped at the 7-day hard ceiling) — active
@@ -189,7 +206,9 @@ nexus-request: state=timeout id=<id> reason=budget_exhausted waited_s=<s> ts=<ut
 ```
 `reason ∈ { file_failed | terminal_failed | not_found | confinement_reject |
 channel_unavailable | enroll_auth_lost | refused }`. Exit codes: **0** replied
-or acked, **2** failed, **3** timeout, **64** usage.
+or acked, **2** failed, **3** timeout, **4** already-emitted (this id's terminal
+event was delivered by an earlier run — a RESULT, not a silence), **64** usage,
+**143** stopped by SIGINT/SIGTERM (no emit).
 
 **How a client AGENT backgrounds + consumes it** (one submit+wait per call):
 ```bash
@@ -247,6 +266,7 @@ has: **no new capability, no new server verb, nothing widened.**
 
 ```
 nexus-reply-watch <id> [--poll S] [--timeout S] [--out FILE] [--stop-file FILE]
+                       [--ssh-host ALIAS] [--envelope] [--re-emit]
 ```
 
 **Mechanism (self-limiting long-poll, robust to outage + suspend).** It loops
@@ -258,8 +278,12 @@ half-open socket — the classic wake-from-suspend hazard — into a prompt
 reconnect rather than a multi-minute hang. The lifetime budget is **wall-clock**
 (not an attempt count), so minutes-to-hours of laptop standby simply consume
 wall time and resolve to one clean terminal decision on wake. It holds **one**
-connection at a time, so it stays within the sshd `MaxSessions=4` /
-`MaxStartups=3:50:10` limits; keep concurrent watchers **≤ 4**.
+connection at a time — by this loop's own design, not because sshd forces it:
+`MaxSessions=4` caps multiplexed sessions WITHIN a connection and
+`MaxStartups=3:50:10` throttles concurrent UNAUTHENTICATED connections, so
+neither limits how many serial authenticated clients may connect. Many watchers
+starting at once still contend for `MaxStartups`' three unauthenticated slots,
+so keep concurrent watchers to a handful.
 
 **Emit grammar (stdout is the event; stderr is backoff noise).** Exactly one
 terminal emit, then exit:
@@ -280,10 +304,11 @@ enroll_auth_lost | refused }`. The body is **length-framed** (`reply_bytes=N`):
 the consumer reads exactly N bytes and never line-scans, so a reply body that
 itself contains a `state=…` line can never masquerade as the status line.
 Exit codes mirror the state: **0** replied (or `acked`, a terminal ack with no
-body), **2** failed, **3** timeout, **64** usage. So the agent is **never left
-hanging** — it always gets a terminal `state=` and a matching exit code, and
-distinguishes "reply arrived" from "gave up / errored" to decide whether to
-re-file, re-enroll, or alert its operator.
+body), **2** failed, **3** timeout, **4** already-emitted, **64** usage, **143**
+stopped by signal. So the agent is **never left hanging** — it always gets a
+terminal `state=` and a matching exit code, and distinguishes "reply arrived"
+from "gave up / errored" to decide whether to re-file, re-enroll, or alert its
+operator.
 
 **How a client AGENT backgrounds + consumes it.** Mirror the harness Monitor
 model (one event, process exits when done):
@@ -321,13 +346,163 @@ client completes with its operator — never auto-run. The post-connect
 onboarding notice (`policy`/`help`) already carries this framing + a short
 pointer to the watcher.
 
-**Delivering the script (out-of-band, like the key).** The one small POSIX-sh
-script (`monitor/client/nexus-reply-watch`) is client-side tooling, handed over
-the same way as the key + token — NOT delivered as channel data (runnable bytes
-over a pull-only, emit-not-execute channel is exactly the posture the channel
-avoids). The client saves it next to its key and adds a one-time `~/.ssh/config`
-alias so the invocation stays short (the watcher applies the keepalive `-o`
-hardening itself regardless):
+## Why the connect line carries its own options
+
+**A printed connect line that leans on the client's ssh_config does not work on
+the clients most likely to use it.** Two independent faults, both measured with
+`ssh -G` on a real client:
+
+**Wildcard collision.** Site configs commonly carry a stanza like
+
+```sshconfig
+Host <prefix>* <other-prefix>*
+    HostName %h.<domain>
+```
+
+A **fully-qualified** hostname still matches that wildcard, so `%h` re-qualifies
+it. Measured, same client, same config:
+
+| invocation | `host` | `hostname` (what is actually resolved) |
+|---|---|---|
+| `ssh -G <host>.<domain>` | `<host>.<domain>` | **`<host>.<domain>.<domain>`** ← doubled |
+| `ssh -G <host>` | `<host>` | `<host>.<domain>` ✓ |
+
+Note the asymmetry: `host` echoes the name **as given**, while `hostname` shows
+the **post-expansion** target. The doubled suffix appears **only** in
+`hostname` — which is exactly why the failure surfaces as a DNS error rather
+than a config error, and why it survives review. Telling a client to use the
+FQDN, which looks like the safe and explicit choice, is what triggers it.
+
+**Missing hops.** A single `-J` assumes the endpoint host is directly reachable
+from that hop. Off-site it usually is not — a bastion comes first. `-J` takes a
+**comma-separated chain** applied in order, which is what
+`monitor.remote.jump_hosts` renders.
+
+**So the rendered line is self-contained**: explicit `-o` pin options, an
+explicit jump chain, no dependence on any client-side `Host` alias.
+
+**Verify a form against a FRESH client, not against your own config.**
+`-F /dev/null` ignores the invoking user's `ssh_config`, so this shows what the
+form does for someone else:
+
+```bash
+ssh -G -F /dev/null -p <PORT> <JUMP-CHAIN> <SSH-USER>@<ENDPOINT> \
+  | egrep '^(host|hostname|port|proxyjump|user) '
+```
+
+Diff that against the same command **without** `-F /dev/null`. If `hostname`
+differs between them, the client's config is rewriting your target — and the
+line you were about to hand over is the one that will fail.
+
+## Delivering the helper set (out-of-band, like the key)
+
+**It is a SET of three files, not one script.** `nexus-request` and
+`nexus-reply-watch` both `.`-source `_nexus_watch_lib.sh` from beside
+themselves — they converged on one watch-loop core — so all three install into
+**one** directory. Either script delivered alone is not a degraded helper, it
+is a helper that cannot run: it exits **64** with `cannot load
+_nexus_watch_lib.sh (expected next to this script)`, naming the path it looked
+for and telling you to re-request the set.
+
+Hand them over the same way as the key + token — **never as channel data**
+(runnable bytes over a pull-only, emit-not-execute channel is exactly the
+posture the channel avoids). Produce the delivery with the verb, which emits a
+one-paste installer for the whole set:
+
+```bash
+monitor/ng remote client-helper --base64      # installer + manifest
+monitor/ng remote client-helper               # manifest only
+monitor/ng remote client-helper --verify DIR  # check an install against this checkout
+```
+
+**Never transcribe a digest.** The verb hashes the files as they exist at call
+time, so its digests cannot be stale. A sha256 pasted into a document or
+recalled from memory is correct when written and wrong from the next commit
+onward — and because the client verifies against the value the orchestrator
+supplied, **both sides agree and nothing errors**. That has already happened:
+a client was given a digest four revisions behind the shipped helper, verified
+successfully against it, and installed the stale copy.
+
+### What the digest establishes — and what it does not
+
+**A digest supplied alongside the artifact by the same party proves transit
+integrity only. It authenticates nothing.** It is not a signature; it says
+nothing about provenance and nothing about whether the code is benign. A client
+that matches the digest has ruled out a mangled copy and nothing else.
+
+**So source review is the client's job, and a matching hash does not discharge
+it.** State this when you hand the set over, and expect a client to do it —
+these are short POSIX-sh scripts, meant to be read. The expected procedure,
+before the client's operator authorises the install:
+
+- confirm the only `.` sources the companion library at a fixed path beside the
+  script, and never reply bytes;
+- check the frontmatter parser's key allowlist;
+- count the outbound call sites and confirm they are the pinned `ssh`
+  invocation;
+- confirm no `eval`, no pipe-to-shell, no persistence, no phone-home;
+- `sh -n` each file.
+
+A client that reports **what** it checked has reviewed the code; one that
+reports "hash matched" has checked the postman.
+
+### Installing is not setting up
+
+Copying the three files, `chmod +x` on the two scripts, and checking hashes is
+**installation**. It is a prerequisite, not the thing. An agent actually wiring
+the watcher into how it works needs four more facts, and none of them are
+discoverable from the file list — say them explicitly when you deliver the set:
+
+**1. The background-launch pattern.** The watcher is meant to be launched and
+left; the agent keeps working and consumes the result later.
+
+```bash
+nexus-reply-watch "$id" --poll 300 --timeout 86400 > reply.txt 2>watch.log &
+watch_pid=$!
+# … keep working …
+wait "$watch_pid"; rc=$?      # rc IS the outcome; reply.txt IS the payload
+```
+
+**2. Process exit is the event edge; stdout is the payload.** There is exactly
+one terminal emit, then the process ends — so an agent waits on the PROCESS,
+never on a log line. Read the exit code first, then stdout:
+**0** replied/acked · **2** failed · **3** timeout (gave up, still pending) ·
+**4** already-emitted (see below) · **64** usage · **143** stopped by signal.
+Stderr is backoff noise and carries no outcome.
+
+**3. `--envelope` changes WHAT is in the payload, not how it arrives.** Default
+is the **raw reply bytes**, byte-exact, framed by `reply_bytes=N` — read exactly
+N bytes and never line-scan, so a body containing its own `state=` line cannot
+spoof the status line. `--envelope` instead emits the full `.replied.md`
+envelope (frontmatter + `## Reply`) — use it when you want the request's
+metadata, not just the answer.
+
+**4. Where state and sentinels live, and the one result that looks like
+nothing.** Each consumed id leaves a marker at
+`${NEXUS_REPLY_WATCH_STATE:-${XDG_STATE_HOME:-~/.local/state}/nexus-reply-watch}/<id>.emitted`
+— deliberately not under `/tmp`, so it survives a reboot and a crashed run
+never double-emits.
+
+> **Re-watching an already-consumed id is a RESULT, not a silence.** It emits
+> `state=already-emitted` on stdout and exits **4**, and the line names the
+> sentinel path. This previously exited **0 with empty stdout** — which is
+> byte-identical to what a lost reply looks like, so an agent retrying a watch
+> would conclude the reply had vanished. To deliberately re-deliver, pass
+> `--re-emit` (it re-reads the reply already on the server; it never re-files
+> the request), or remove the named sentinel.
+
+`nexus-request` is the same machinery with the file step in front: one call that
+submits, waits, and emits — use it for "ask and wait", and `nexus-reply-watch`
+when you already have an id (resuming after a restart, or watching a request
+another process filed).
+
+### The ssh-config alias (optional, and never load-bearing)
+
+The client saves the set next to its key and may add a one-time `~/.ssh/config`
+alias so the invocation stays short. Pin under the **alias**, not the address —
+`127.0.0.1` is not an identity on a host with a shared network namespace, and an
+alias-keyed pin survives a posture or port change unchanged (the watcher applies
+the keepalive `-o` hardening itself regardless):
 
 ```sshconfig
 # ~/.ssh/config — written once at setup (Posture 1 LAN-direct shown;
@@ -337,10 +512,29 @@ Host nexus-remote
     Port <PORT>
     User <SSH-USER>
     IdentityFile ~/.ssh/nexus-remote
-    # ProxyJump <jump-host>   # OPTIONAL + site-specific — most clients connect
-    #                         # directly and OMIT this; add only if your network
-    #                         # requires a bastion (use your own host, not an example)
+    # THE PIN, decoupled from the route. HostKeyAlias keys the known_hosts entry
+    # on a stable name instead of <ENDPOINT>:<PORT>, both of which move when the
+    # posture changes — and 127.0.0.1 is not an identity anyway: every co-tenant
+    # sandbox on that host is also 127.0.0.1, so address-keyed entries collide
+    # across different daemons. A dedicated UserKnownHostsFile keeps this pin
+    # out of your main file. Measured: a client pinned this way needed NO change
+    # at all across a real endpoint migration, while still refusing a co-tenant
+    # on the old address.
+    HostKeyAlias <ALIAS>
+    UserKnownHostsFile ~/.ssh/known_hosts.nexus
+    StrictHostKeyChecking yes
+    # ProxyJump <hop1>,<hop2>  # OPTIONAL + site-specific — most clients connect
+    #                          # directly and OMIT this. If your network needs
+    #                          # bastions, CHAIN them comma-separated in order;
+    #                          # a single hop assumes the endpoint host is
+    #                          # directly reachable from it, which off-site it
+    #                          # often is not. Use your own hosts, not examples.
 ```
+
+**The alias is a convenience; the `-o` form is the contract.** Every line this
+skill and the server render carries the pin as explicit `-o` options precisely
+so it does not depend on this stanza — see "Why the connect line carries its own
+options" above for the wildcard-collision measurement that motivates it.
 
 Then `nexus-reply-watch <id>` "just works". Override the endpoint without a
 config block via `NEXUS_REMOTE_SSH_HOST` / `_PORT` / `_USER` / `_KEY`; override

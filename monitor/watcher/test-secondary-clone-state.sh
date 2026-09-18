@@ -50,7 +50,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    grep -qF -- "$needle" <<<"$hay" && ok "$label" || bad "$label" "missing $(printf %q "$needle")"
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay" && ok "$label" || bad "$label" "missing $(printf %q "$needle")"
 }
 assert_not_contains() {
     local label="$1" hay="$2" needle="$3"
@@ -88,6 +89,8 @@ make_nexus() {
     # (your-org/nexus-code#601/#605: degrading to the silent-coercion
     # behaviour it replaces is worse than refusing).
     cp "$MON/_bookkeeping.sh"   "$root/monitor/_bookkeeping.sh"
+    # your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+    cp "$MON/_nexus-root.sh"   "$root/monitor/_nexus-root.sh"
     chmod +x "$root/monitor/spawn-worker.sh" "$root/monitor/ng" \
              "$root/monitor/skeptic-channel.sh"
     printf '#!/bin/bash\necho "stub-claude: $*"\n' > "$root/node_modules/.bin/claude"

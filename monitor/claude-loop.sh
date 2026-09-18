@@ -31,6 +31,7 @@
 #       --prompt-file <path> \
 #       [--settings <path>] \
 #       [--model <model-id>] \
+#       [--plugin-dir <dir>] \
 #       [--max-restarts N] \
 #       [--retain-ttl-seconds SEC] \
 #       [--state-dir <dir>] \
@@ -57,6 +58,7 @@ WINDOW=
 PROMPT_FILE=
 SETTINGS_PATH=
 MODEL=
+PLUGIN_DIR=
 MAX_RESTARTS=10
 RETAIN_TTL=
 STATE_DIR=
@@ -68,6 +70,7 @@ while (( $# )); do
         --prompt-file)         PROMPT_FILE="${2:-}"; shift 2 ;;
         --settings)            SETTINGS_PATH="${2:-}"; shift 2 ;;
         --model)               MODEL="${2:-}"; shift 2 ;;
+        --plugin-dir)          PLUGIN_DIR="${2:-}"; shift 2 ;;
         --max-restarts)        MAX_RESTARTS="${2:-}"; shift 2 ;;
         --retain-ttl-seconds)  RETAIN_TTL="${2:-}"; shift 2 ;;
         --state-dir)           STATE_DIR="${2:-}"; shift 2 ;;
@@ -168,11 +171,40 @@ _consume_sentinel() { [[ -e "$SENTINEL_FILE" ]] && rm -f "$SENTINEL_FILE"; }
 _run_claude() {
     local first="$1"
     local -a args=( --dangerously-skip-permissions )
+    # Session messaging name = this worker's tmux window name
+    # (your-org/nexus-code#1047). `-n/--name` is a stock documented CLI flag
+    # (claude 2.1.246: "Set a display name for this session"); without it the
+    # session self-names from basename($PWD) plus two hex chars, so two workers
+    # in one clone land two characters apart (measured: nexus-code-skagentmsg-9b
+    # beside -e0) and no orchestrator can predict either from the window it sees.
+    #
+    # SCOPE — this makes a LIVE agent addressable by the window name an
+    # orchestrator can see; it does NOT identify a task across time, because
+    # windows get reused and renamed and the session name does NOT follow a
+    # later `tmux rename-window` (measured: window renamed, session name
+    # unchanged). A stale name still resolves, so never treat it as a task key.
+    #
+    # Repeated on every --continue respawn below, not just the first call: a
+    # respawned claude re-registers from scratch and would otherwise fall back
+    # to the derived name mid-loop.
+    #
+    # Gated on a capability probe: an unsupported --name is FATAL (rc 1,
+    # "error: unknown option"), so an unconditional flag would turn every
+    # respawn on an older Claude Code pin into a dead worker.
+    if [[ -n "$WINDOW" ]] && claude_supports_name_flag; then
+        args+=( --name "$WINDOW" )
+    fi
     [[ -n "$SETTINGS_PATH" ]] && args+=( --settings "$SETTINGS_PATH" )
     # Per-worker model pin (issue #433). Appended on the first call
     # AND every --continue respawn so the pin survives restarts.
     # Empty MODEL = inherit the ambient default, args unchanged.
     [[ -n "$MODEL" ]] && args+=( --model "$MODEL" )
+    # longjob-watch dispatcher (your-org/nexus-code#1535): the plugin dir the
+    # spawner already validated. Repeated on every --continue respawn, because
+    # a plugin monitor is session-scoped and is re-armed only at session start
+    # — a respawn WITHOUT it is a session that can never be woken by its own
+    # spool. Empty = the spawner decided not to arm; nothing is added.
+    [[ -n "$PLUGIN_DIR" ]] && args+=( --plugin-dir "$PLUGIN_DIR" )
     if (( first )); then
         args+=( "$PROMPT_BODY" )
     else

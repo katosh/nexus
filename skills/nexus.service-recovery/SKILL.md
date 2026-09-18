@@ -129,40 +129,6 @@ recovery procedure everywhere. **Leave that opening in** when you
 file — it is the audience-first lead, deliberately ahead of the
 machine facts.
 
-## The project filesystem went read-only
-
-First: run `monitor/svc.sh status` and read the **top** row. `fs
-READ-ONLY` (exit 1) means the project tree cannot be written and
-**every row below it is stale** — services report `UP` from
-pidfiles nobody can update. Do not chase them.
-
-There is **nothing to fix from inside**. The sandbox mount
-namespace is kernel-enforced; the remedy is a restart from
-OUTSIDE (detach the inner tmux with `Ctrl-a` `d`, then
-`agent-sandbox tmux new-session ./watcher --continue`). **Never**
-remount, re-bind, or `unshare` around it, and never advise an
-operator to.
-
-It is **not** a storage outage. The signature is a mount that is
-`ro` while its superblock is still `rw`, with the project's
-read-write bind missing from `/proc/self/mountinfo`. The filer is
-healthy and has free space — check before anyone pages storage-support.
-
-The watcher does not die on this any more (<your-org>/nexus-code#473).
-It enters read-only **degraded mode**: it suspends project-tree
-writes, keeps its loop alive, refuses to self-restart (a
-`--replace` would kill the one working watcher — its successor
-cannot even open its own log), and escalates **once** via
-`sandbox-notify` + a `cc-incident:` GitHub issue. On recovery it
-appends the incident to `monitor/.state/fs-incidents.jsonl` and
-comments the resolution on that issue. If you are diagnosing a
-past outage, read that file first.
-
-Two incidents so far, 2026-06-29 and 2026-07-09, both opening
-seconds after a `launcher.sh --replace` self-restart. The
-association is strong; the **root cause is not established**. Do
-not present it as one.
-
 Below the human lead it carries the five required sections —
 **Failure report** (what went down, when, the failing
 healthcheck, user-facing impact), **Immediate response** (the
@@ -214,6 +180,40 @@ confirmed. A `flapping` incident is not done until the service has
 been healthy long enough that the watcher closed its incident
 state (the emit stops re-surfacing).
 
+## The project filesystem went read-only
+
+First: run `monitor/svc.sh status` and read the **top** row. `fs
+READ-ONLY` (exit 1) means the project tree cannot be written and
+**every row below it is stale** — services report `UP` from
+pidfiles nobody can update. Do not chase them.
+
+There is **nothing to fix from inside**. The sandbox mount
+namespace is kernel-enforced; the remedy is a restart from
+OUTSIDE (detach the inner tmux with `Ctrl-a` `d`, then
+`agent-sandbox tmux new-session ./watcher --continue`). **Never**
+remount, re-bind, or `unshare` around it, and never advise an
+operator to.
+
+It is **not** a storage outage. The signature is a mount that is
+`ro` while its superblock is still `rw`, with the project's
+read-write bind missing from `/proc/self/mountinfo`. The filer is
+healthy and has free space — check before anyone pages storage-support.
+
+The watcher does not die on this any more (<your-org>/nexus-code#473).
+It enters read-only **degraded mode**: it suspends project-tree
+writes, keeps its loop alive, refuses to self-restart (a
+`--replace` would kill the one working watcher — its successor
+cannot even open its own log), and escalates **once** via
+`sandbox-notify` + a `cc-incident:` GitHub issue. On recovery it
+appends the incident to `monitor/.state/fs-incidents.jsonl` and
+comments the resolution on that issue. If you are diagnosing a
+past outage, read that file first.
+
+Two incidents so far, 2026-06-29 and 2026-07-09, both opening
+seconds after a `launcher.sh --replace` self-restart. The
+association is strong; the **root cause is not established**. Do
+not present it as one.
+
 ## Tuning knobs (surface, don't silently retune)
 
 The watcher defaults are sensible; if an incident reveals they are
@@ -249,6 +249,15 @@ went stale — e.g. you were just (re)started):
 ```
 Monitor({command: 'until ! <NEXUS_ROOT>/monitor/watcher-supervise-tick.sh; do sleep 15; done'})
 ```
+
+This loop's condition is a **script's exit status**, which is why it is safe
+to copy. The shape it teaches is not: `until ! pgrep -f <name>` can never
+become true, because the waiting shell's own argv contains the pattern, so the
+match finds the waiter and the loop hangs SILENTLY while reading as healthy
+background work (<your-org>/nexus-code#927 — 5h20m, 191 CPU-seconds, and the
+window it belonged to could not be retired). In a `Monitor` or a backgrounded
+`Bash` wait-loop, the condition must be a **sentinel file, an exit status, or
+a recorded pid** (`job & pid=$!`), never a process NAME.
 
 Each tick touches the supervisor heartbeat (clearing the watcher's
 reminder) and reports watcher liveness — the UP/BUSY/WEDGED/DOWN

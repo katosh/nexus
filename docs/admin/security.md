@@ -39,9 +39,20 @@ below or the repo-root [`SECURITY.md`](https://github.com/<your-org>/nexus-code/
   for external public repos.
 - **Sandbox-bounded execution.** Every Claude Code session runs
   inside agent-sandbox, with writable paths limited to the project
-  directory and `~/.claude/`. Workers cannot mutate the watcher,
-  the orchestrator's process, or anything outside their sandbox
-  directory.
+  directory and `~/.claude/`. A worker cannot touch anything outside
+  that boundary.
+
+    !!! warning "The boundary is the nexus, not the worker's checkout"
+        The nexus root *is* the sandbox project directory, and every
+        agent shares it. A worker's writable set therefore includes
+        `monitor/` — the watcher's own source, `ng`, the skills, and
+        the state dir. Nexus does **not** isolate agents from each
+        other or from the control plane; it relies on convention
+        (`skills/nexus.worker-defaults`, separate clones for parallel
+        work) and on the audit trail, not on a kernel boundary. This
+        is why `CLAUDE.md` forbids `git checkout` on the main clone
+        while the watcher is running: a worker really can rewrite the
+        code the running watcher sourced.
 
 ### What nexus does NOT enforce
 
@@ -290,8 +301,31 @@ host hygiene:
 - The watcher host should be a host you control end-to-end. Shared
   development boxes where other users have shell access are a poor
   fit — anyone with the same UID can read `~/.claude/`.
-- `~/.claude/<bot-slug>.pem` must be `chmod 600`. Anything looser is
-  rejected by `monitor/mint-token.sh` with `"private key not found"`.
+- `~/.claude/<bot-slug>.pem` must be `chmod 600`. `monitor/mint-token.sh`
+  **refuses to sign (exit 4)** when the key is world-accessible *and*
+  every ancestor directory grants other-execute — i.e. when another
+  local user can actually reach it (<your-org>/nexus-code#1501). Read the
+  boundary precisely, because it is narrower than "the mode must be 600"
+  and deliberately so:
+  - **A file mode is the last gate, not the only one.** A mode-644 key
+    under a mode-700 `~/.claude` is *inert* — other-execute is 0 on the
+    directory, so traversal is denied and the file's own bits never come
+    into play. The gate does **not** refuse that setup, and it must not:
+    `mint-token.sh` is on the path of every GitHub write here, so a
+    false refusal is a self-inflicted outage in answer to a non-problem.
+  - **Group access is reported, never refused.** Who is in a group is
+    not derivable from the host, and a bot-uid group is a legitimate
+    administered setup.
+  - **What it cannot establish, it does not assert.** An ancestor it
+    cannot `stat` yields `unknown`, which is neither "exposed" nor
+    "safe"; the mint proceeds and `--check-key` says so.
+  Run `monitor/mint-token.sh --check-key` for the full verdict without
+  minting: exit 0 `ok`, 4 `exposed`, 5 anything the gate tolerates but a
+  reader should see (`contained`, `group-visible`, `unknown`).
+  `NEXUS_SKIP_KEY_EXPOSURE_GATE=1` is the documented override.
+  Note that `chmod 600` does not *un*-expose a key that was readable —
+  if the gate fires, rotate as well (see
+  [github-app.md](github-app.md), "Rotating the private key").
 - `config/nexus.yml` is `chmod 600`. The file isn't strictly secret
   (no auth material), but the perm keeps it consistent with the pem
   and token cache.

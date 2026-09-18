@@ -25,6 +25,22 @@
 #   monitor/hooks/bash-footgun-guard.sh
 #       same two fields, plus hookSpecificOutput/additionalContext
 #
+# DECLARED COVERAGE BOUNDARY (your-org/nexus-code#927): this scenario drives
+# the `Bash` tool only. The footgun guard is now registered `Bash|Monitor`,
+# because `Monitor` carries `.tool_input.command` into the same shell and was
+# an unguarded path to every rule in the conf. That the `Monitor` arm is
+# REACHABLE — PreToolUse fires with tool_name=Monitor and the command in the
+# same field — was verified against the real binary out-of-band:
+#
+#   claude --dangerously-skip-permissions --settings <s> -p '<force a Monitor call>'
+#   with  {"hooks":{"PreToolUse":[{"matcher":"Monitor",...}]}}
+#   → observed: PRE-Monitor tool=Monitor cmd=<the command>
+#
+# That is a one-off measurement, NOT a standing assertion: no suite re-runs it,
+# so a payload reshape on the Monitor path would go unnoticed here exactly as
+# it would have on the Bash path before this file existed. Adding an ARM C that
+# drives a Monitor tool call is the obvious follow-up.
+#
 # A rename of the event, a reshaped payload, or a dropped `tool_input`
 # silently disables BOTH guards — the class of breakage that shows up in
 # production as "the footgun guard stopped firing" with no error anywhere.

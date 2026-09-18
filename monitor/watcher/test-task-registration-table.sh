@@ -55,17 +55,21 @@ actual=$(
 # defaults for those are pinned separately below, so a knob whose default moves
 # is caught even though the registration line does not change.
 read -r -d '' golden <<'GOLDEN'
+_schedule_task auth_hold 5 _v2_task_auth_hold --class cheap
 _schedule_task over_limit_wakes 5 _v2_task_over_limit_wakes --class cheap
+_schedule_task orphan_async_wakes 15 _v2_task_orphan_async_wakes --class cheap
 _schedule_task target_window 2 _v2_task_target_window_probe --class cheap
 _schedule_task orchestrator_liveness 5 _v2_task_orchestrator_liveness --class cheap
 _schedule_task pending_decisions 10 _v2_task_pending_decisions --class cheap
 _schedule_task requests_poll 10 _v2_task_requests_poll --class cheap
 _schedule_task bell_windows 30 _v2_task_bell_windows --class cheap
+_schedule_task selection_snapshot 10 _v2_task_selection_snapshot --class cheap
 _schedule_task prune_archive 600 _v2_task_prune_archive --class cheap
 _schedule_task detect_unstick 10 _v2_task_detect_unstick --class medium --async
 _schedule_task snapshot_local 30 _v2_task_snapshot_local --class medium --async
 _schedule_task idle_section 30 _v2_task_idle_section --class expensive --async
 _schedule_task over_limit_scan 60 _v2_task_over_limit_scan --class expensive --async
+_schedule_task orphan_async_scan 60 _v2_task_orphan_async_scan --class expensive --async
 _schedule_task deliveries_poll 15 _v2_task_deliveries_poll --class medium --async
 _schedule_task github_poll 600 _v2_task_github_poll --class expensive --async
 _schedule_task full_state_snap 600 _v2_task_full_state_snap --class expensive --async
@@ -101,7 +105,24 @@ fi
 # `MONITOR_CLONE_DRIFT_INTERVAL_SECONDS` — the condition it catches is measured
 # in days, so a tighter cadence would buy nothing and spend rate limit.
 n_tasks=$(grep -c . <<<"$actual")
-[[ "$n_tasks" == 23 ]] && ok "23 tasks registered" || bad "task count" "got $n_tasks, want 23"
+# 23 -> 25: `orphan_async_wakes` and `orphan_async_scan`, added by
+# your-org/nexus-code#1071 (abac969) to close the idle-orphan-async loop — a
+# worker that goes idle with an async job still in flight. They landed without
+# the golden-table update this suite exists to prompt for, which is why `dev`
+# has been red here; the pairing mirrors `over_limit_wakes`/`over_limit_scan`
+# exactly, and the classes follow the same rule: the WAKES half is cheap and
+# synchronous (it only reads due wakes), the SCAN half is expensive --async
+# because it probes every worker pane (one pane-state call per window) and
+# must never hold the synchronous slot. Verified against the source rather
+# than inferred: main.sh:4791/4804 carry those exact classes, and the two
+# bodies are one-liners onto _orphan_async_process_wakes and
+# _orphan_async_scan_panes respectively.
+# 26 since #1518 (w237, bundled by w239): `auth_hold` is the login-hold observer
+# — the third arm beside over_limit in the emit ladder, scheduled cheap every 5.
+# 27 since your-org/nexus-code#1528 (w240): `selection_snapshot` is the rolling
+# last-seen window-selection writer the respawn's rule-4 arm reads (10 s, cheap,
+# sync — one `list-windows -a` and one small atomic write per fire).
+[[ "$n_tasks" == 27 ]] && ok "27 tasks registered" || bad "task count" "got $n_tasks, want 27"
 
 # Every task must declare a cost class — the scheduler's whole priority model
 # reads it, and an unclassified task silently lands in the default bucket.

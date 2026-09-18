@@ -103,6 +103,7 @@ _emit_volatile_strip() {
         s/interrupted [0-9]+h[0-9]+m/interrupted/g
         s/interrupted [0-9]+s/interrupted/g
         s/[0-9]+ awaiting-input/awaiting-input/g
+        s/taken [0-9]+s ago/taken ago/g
         /^--- nexus-emit-sig /d
     ' | awk '
         # your-org/nexus-code#658 — fold the CLOCK-DRIVEN half of the

@@ -21,6 +21,14 @@
 #
 #   gh run view --job <id> --log   rc=0, ZERO lines      (2.89.0: 622 lines)
 #   gh run view <run> --log        rc=0, 2 of 10 JOBS    (2.89.0: all 10)
+#
+# AND A CAPABLE CLIENT IS NOT ENOUGH FOR THAT FIRST FORM (your-org/nexus-code#1408):
+# on 2.89.0, `gh run view --job <id> --log` IGNORES the job id and serves the
+# run's LATEST attempt — a failing attempt-1 job read `0 failed`, byte-identical
+# to attempt 2. This floor buys correct `pr checks` and complete `run view
+# <run> --log`; per-job, per-attempt log bodies come ONLY from
+# `gh api repos/O/R/actions/jobs/<id>/logs`. A log byte count is
+# method-dependent (`run view` prefixes job/step names, ~80% larger) — tag it.
 #   gh pr checks                   prints `pass` for a check whose REST
 #                                  conclusion is `skipped`
 #
@@ -127,7 +135,8 @@
 #   NEXUS_GH_MIN_VERSION      floor, "M.m.p" (default 2.86.0 — see the
 #                             coverage-boundary section above before lowering it)
 #   NEXUS_GH_CAPABLE_NOCACHE  =1 to bypass the version cache (tests)
-#   NEXUS_GH_CAPABLE_CACHE    cache dir (default $NEXUS_ROOT/monitor/.state/gh-capable.d)
+#   NEXUS_GH_CAPABLE_CACHE    cache dir (default $NEXUS_STATE_DIR/gh-capable.d, else
+#                             $NEXUS_ROOT/monitor/.state/gh-capable.d — #1453)
 
 _ghc_floor() { printf '%s' "${NEXUS_GH_MIN_VERSION:-2.86.0}"; }
 
@@ -146,8 +155,21 @@ _ghc_rp() {
 # agents probe concurrently. Keyed on size AND mtime so an in-place upgrade
 # (brew relinking gh) invalidates instead of serving a stale answer — the cache
 # must never become its own version of the bug this file fixes.
+# THE CACHE IS STATE, AND IT RESOLVES LIKE STATE (your-org/nexus-code#1453):
+# NEXUS_GH_CAPABLE_CACHE -> NEXUS_STATE_DIR -> NEXUS_ROOT/monitor/.state — the
+# same arm order as `ng`'s `_resolve_state_dir`, minus the config arm (this
+# file must stay dependency-free; a wrong cache dir here costs one re-probe,
+# not a lost write). It used to consult only NEXUS_ROOT, so a suite that had
+# pinned NEXUS_STATE_DIR to its own scratch — the prescribed hermeticity
+# spelling — still wrote `gh-capable.d/` into the INHERITED root the moment any
+# child reached `gh` through the PATH-front wrapper. Measured on two suites
+# under `nexus-root-sensitivity.sh probe`: LEAK rc=0 on an operator's host,
+# hermetic on CI, because CI has no BASH_ENV force-fronting the wrapper ahead
+# of the suite's stub. An instrument that answers differently on two hosts
+# has an unenumerated input; this arm is that input, enumerated.
 _ghc_cache_dir() {
     if [ -n "${NEXUS_GH_CAPABLE_CACHE:-}" ]; then printf '%s' "$NEXUS_GH_CAPABLE_CACHE"; return 0; fi
+    if [ -n "${NEXUS_STATE_DIR:-}" ]; then printf '%s' "$NEXUS_STATE_DIR/gh-capable.d"; return 0; fi
     [ -n "${NEXUS_ROOT:-}" ] || return 1
     printf '%s' "$NEXUS_ROOT/monitor/.state/gh-capable.d"
 }
@@ -265,6 +287,24 @@ _ghc_meets() {
 # `--version` would exec a whole second wrapper — terminating, but it would
 # attribute the WRONG version (the sibling's resolution, not ours) to a
 # candidate slot. Skip anything living in a `*/ghwrap/` directory.
+#
+# THE PATH-SHAPE TEST IS NOT SUFFICIENT ON ITS OWN, AND THAT WAS MEASURED
+# (your-org/nexus-code#1033). Both arms below key on the literal directory name
+# `ghwrap`, which is IDENTITY BY LOCATION — the same substitution `#755` names,
+# one level up. A copy of the wrapper in a directory called anything else passes
+# both arms, and the capability floor does NOT catch it: a wrapper copy probed
+# with `--version` DELEGATES to its own real gh and reports that version, so it
+# reads as fully capable. Measured with two copies in dirs named `ghshim`:
+# unbounded FORK growth, 43 processes in 5 seconds.
+#
+# So ask what the candidate IS. A real `gh` is an ELF binary; every copy of the
+# wrapper is a shell script carrying its own self-identifying path comment in
+# the first lines — present in every revision, so it needs no cooperation from
+# the copy being examined (a marker introduced by a fix is an opt-in that only
+# the ALREADY-FIXED copy carries, which is useless during a rollout).
+#
+# Forkless: `read` is a builtin and a redirect on a builtin does not fork. A
+# real gh is not `#!`, so it costs one 2-byte read and never the line scan.
 _ghc_is_ghwrap() {
     case "$1" in
         */ghwrap/gh) return 0 ;;
@@ -273,6 +313,16 @@ _ghc_is_ghwrap() {
     case "$_ghc_wr" in
         */ghwrap/gh) return 0 ;;
     esac
+    # Content gate — independent of where the file happens to live.
+    IFS= read -r -N 2 _ghc_magic < "$1" 2>/dev/null || return 1
+    [ "$_ghc_magic" = '#!' ] || return 1
+    _ghc_scan=0
+    while [ "$_ghc_scan" -lt 40 ] && IFS= read -r _ghc_line; do
+        case "$_ghc_line" in
+            *monitor/ghwrap/gh*) return 0 ;;
+        esac
+        _ghc_scan=$((_ghc_scan + 1))
+    done < "$1"
     return 1
 }
 

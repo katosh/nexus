@@ -60,6 +60,10 @@ fi
 
 WORK=$(mktemp -d -t nexus-twp-live-XXXXXX)
 SOCK="nexus-twp-live-$$"
+# your-org/nexus-code#991: measure the socket path BEFORE tmux is asked to
+# bind it. A too-long TMUX_TMPDIR is an ENVIRONMENT fault, not a defect in
+# the code under test, and without this it presents as one.
+th_require_tmux_socket "$SOCK"
 th_tmux_fixture_conf "$WORK/tmux.conf"
 
 # `$TMUX` OUTRANKS `TMUX_TMPDIR` (your-org/nexus-code#644): every agent
@@ -83,9 +87,21 @@ trap cleanup EXIT
 # fixture socket with a PATH-front wrapper — the same device the
 # respawn integration test uses.
 mkdir -p "$WORK/bin"
+# BELT (your-org/nexus-code#1105, #1115 skeptic F1). `$(command -v tmux)`
+# expands AT WRITE TIME to monitor/tmuxwrap/tmux under an agent, so this shim
+# NAMED the wrapper and tmuxwrap's gate-3 skipped it — resolving the real tmux
+# with NO -L. Bounded today only by accident (this suite spawns no fresh shell,
+# and its own calls carry -L in argv), so the day anyone adds a `bash -c` leg
+# its queries move silently to the operator's board. Resolve the real BINARY.
+. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_tmux-fixture.sh"
+_TWL_REALBIN=$(nx_real_tmux_bin) || {
+    echo "SKIP: no real tmux BINARY on PATH (only wrappers) — cannot isolate this fixture" >&2
+    exit 77
+}
+mkdir -p "$WORK/bin"
 cat > "$WORK/bin/tmux" <<WRAP
 #!/usr/bin/env bash
-exec env -u TMUX $(command -v tmux) -L "$SOCK" -f "$WORK/tmux.conf" "\$@"
+exec env -u TMUX "$_TWL_REALBIN" -L "$SOCK" -f "$WORK/tmux.conf" "\$@"
 WRAP
 chmod +x "$WORK/bin/tmux"
 PATH="$WORK/bin:$PATH"; export PATH

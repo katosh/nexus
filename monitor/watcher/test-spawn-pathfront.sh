@@ -227,11 +227,12 @@ _source_path() {   # $1=shell  $2=initial PATH
 GHW="$REPO_ROOT/monitor/ghwrap"
 NTW="$REPO_ROOT/monitor/notifywrap"
 PPW="$REPO_ROOT/monitor/pipwrap"
+TMW="$REPO_ROOT/monitor/tmuxwrap"
 LBIN="$FAKE_LOCALS/bin"
 # The exact shape of the live failure: every nexus dir present but BURIED
 # behind a competing entry, as ~/.zshrc's linuxbrew re-prepend leaves it.
 # /usr/bin:/bin keep the spawned shell's own rc (Lmod's modules.sh) quiet.
-BURIED="$DECOY:$GHW:$NTW:$PPW:$LBIN:/usr/bin:/bin"
+BURIED="$DECOY:$GHW:$NTW:$PPW:$TMW:$LBIN:/usr/bin:/bin"
 
 # TEETH: the fixture must genuinely start buried, or the test proves nothing.
 if [[ "$(_pos "$GHW" "$BURIED")" == "1" ]]; then
@@ -245,10 +246,13 @@ for sh_bin in /bin/bash "$(command -v zsh 2>/dev/null)"; do
     sh_name=$(basename "$sh_bin")
 
     got=$(_source_path "$sh_bin" "$BURIED")
-    # ghwrap leads, then notifywrap, pipwrap, locals/bin — the established
-    # invariant, now reached from a buried start rather than an absent one.
+    # ghwrap leads, then notifywrap, pipwrap, tmuxwrap, locals/bin — the
+    # established invariant, now reached from a buried start rather than an
+    # absent one. tmuxwrap (your-org/nexus-code#892) joins BEHIND the three
+    # incumbents precisely so ghwrap keeps the very-front slot.
     if [[ "$(_pos "$GHW" "$got")" == "1" && "$(_pos "$NTW" "$got")" == "2" \
-       && "$(_pos "$PPW" "$got")" == "3" && "$(_pos "$LBIN" "$got")" == "4" ]]; then
+       && "$(_pos "$PPW" "$got")" == "3" && "$(_pos "$TMW" "$got")" == "4" \
+       && "$(_pos "$LBIN" "$got")" == "5" ]]; then
         ok "$sh_name: buried nexus dirs moved to front in order"
     else
         bad "$sh_name: buried nexus dirs moved to front in order" "got: $got"

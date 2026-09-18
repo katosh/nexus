@@ -121,6 +121,16 @@
 #            REFUSED on a reply:required id — use `reply` so the demanded answer isn't dropped)
 #     reply  <id> [--file f|--message t|-] [--status S] [--worker w] [--dir p]
 #            [--issue owner/repo#N] [--no-publish] [--progress p] [--results p]  # .claimed → .replied
+#            --status is a CLOSED vocabulary (unknown values are refused, #1293):
+#              spawned   a reviewer is coming; ITS verdict discharges the gate
+#                        (on a spawn-skeptic request, --worker is REQUIRED)
+#              declined  no review — on a spawn-skeptic request this verb
+#                        resolves the skeptic gate BEFORE replying, so the
+#                        decision and its record are one act
+#              deferred  not now; the gate deliberately STAYS armed
+#              answered  an ordinary answer (REFUSED on spawn-skeptic: ambiguous)
+#            [--skeptic-resolved]  assert the gate is already discharged; skip
+#                        the resolve. Says so on stderr; never silent.
 #     fail   <id> --reason "<why>"                                # → .failed
 #
 # ── Exit codes ────────────────────────────────────────────────────────
@@ -139,9 +149,69 @@
 
 set -uo pipefail
 
+# ARGUMENT-LOOP PROGRESS GUARD (your-org/nexus-code#924). Each argument loop
+# below asserts that every iteration consumes at least one argument. Without it
+# a value-taking flag given LAST spins forever — `shift 2` with `$#` == 1 is
+# refused, so the arm re-matches — and a hang here is worse than an error
+# because nothing on this board surfaces it. Full rationale: monitor/ng.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
+
 _script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 die()  { printf 'request-channel: %s\n' "$*" >&2; exit 1; }
+
+# ---- your-org/nexus-code#906 R1 (diagnostic axis) -------------------------
+#
+# A bare token that does not start with `-` is NOT an unknown flag — it is an
+# unexpected POSITIONAL, and saying "unknown flag" sends the reader hunting a
+# flag name that was never the problem, at the exact moment they got the call
+# shape wrong and most needed to be told what was actually wrong.
+#
+# It must also not ECHO THE WHOLE TOKEN. Measured in ordinary orchestration:
+# `ng request reply <id> "<900-char message>"` printed the entire message back
+# as a flag name. Same family as #858 C, where a multi-line body embedded in a
+# diagnostic survived a `| tail -1` and read as a plausible value.
+_arg_excerpt() {   # <token> → first line, excerpted, dropped-line count named
+    local v="${1-}" first nl bytes
+    first="${v%%$'\n'*}"
+    # BYTE-capped, trimmed on a CHARACTER boundary (your-org/nexus-code#906).
+    # Three axes, and only the third is the property:
+    #   #858 C capped LINES   → a 900-char SINGLE-line token walked through
+    #   the first #906 cut capped CHARACTERS → still a proxy; 72 multi-byte
+    #                                          characters is 219 bytes
+    #   this caps BYTES       → what "do not swamp the diagnostic" means
+    # Character-boundary trimming is why the char cap comes first: slicing at
+    # a byte offset would split a multi-byte character into mojibake, so the
+    # loop removes whole characters until the byte budget is met.
+    (( ${#first} > 72 )) && first="${first:0:72}"
+    while (( ${#first} > 1 )); do
+        bytes=$(LC_ALL=C printf '%s' "$first" | wc -c)
+        (( bytes <= 96 )) && break
+        first="${first:0:$(( ${#first} - 4 ))}"
+    done
+    # Ellipsis iff the excerpt is shorter than the line it came from. One
+    # condition, because the two-clause version this replaced could in
+    # principle append twice and only testing showed it did not.
+    [[ "$first" != "${v%%$'\n'*}" ]] && first="${first}…"
+    nl="${v//[^$'\n']/}"
+    if (( ${#nl} > 0 )); then
+        printf "'%s' (+%d more line(s))" "$first" "${#nl}"
+    else
+        printf "'%s'" "$first"
+    fi
+}
+
+# <verb> <token> [<what they probably wanted>]
+_die_positional() {
+    local verb="$1" tok="$2" hint="${3:-}"
+    local msg="$verb: unexpected POSITIONAL argument $(_arg_excerpt "$tok")"
+    if [[ -n "$hint" ]]; then msg+=" — did you mean $hint?"; else msg+="."; fi
+    die "$msg Flags must start with --; positionals are matched in order."
+}
 warn() { printf 'request-channel: %s\n' "$*" >&2; }
 
 # shellcheck source=_channel_lib.sh
@@ -251,7 +321,7 @@ _resolve_read_owned() {
     for try in 0 1; do
         if ! sf=$(_state_file_for_id "$id"); then
             if [[ -n "$principal" ]]; then
-                printf 'request-channel: no request for id %s — cannot verify ownership\n' "$id" >&2
+                printf 'request-channel: no request for id %s — cannot verify ownership\n' "$(_arg_excerpt "$id")" >&2
                 exit 5
             fi
             return 1
@@ -295,11 +365,51 @@ _build_request_file() {
         printf -- '---\n'
         printf 'request: %s\n' "$id"
         printf 'origin: %s\n' "$origin"
+        # PROCESS-DERIVED provenance beside the argv-supplied origin
+        # (your-org/nexus-code#1341): eight requests landed in the operator's
+        # inbox in 84 s and nothing in the record said WHO filed them — the one
+        # field that read as provenance identified the ng BINARY. These facts
+        # are taken from the filing process, not from its arguments, so a
+        # mis-set --origin is still attributable.
+        printf 'filed-by: uid=%s pid=%s ppid=%s window=%s pane=%s session=%s host=%s\n' \
+            "$(id -un 2>/dev/null || echo '?')" "$$" "$PPID" \
+            "${NEXUS_WORKER_WINDOW:-<unset>}" "${TMUX_PANE:-<unset>}" \
+            "${CLAUDE_SESSION_ID:-${NEXUS_SESSION_ID:-<unset>}}" "$(hostname -s 2>/dev/null || echo '?')"
         printf 'kind: %s\n' "$kind"
         [[ -n "$reply" ]] && printf 'reply: %s\n' "$reply"
         printf 'created: %s\n' "$(_chan_now_iso)"
         printf 'priority: %s\n' "$priority"
         printf 'publish: %s\n' "$publish"
+        # `state:` IS A CONTENT-TRANSITION COMPLETION MARKER, NOT THE REQUEST'S
+        # STATE (your-org/nexus-code#1358). THE FILENAME SUFFIX IS THE STATE OF
+        # RECORD — the header at the top of this file says so, and this write
+        # site did not, which is where the field acquires its false authority.
+        #
+        # Only a CONTENT builder rewrites it: `_build_reply_content` and
+        # `_build_amend_content` write `state: replied`, `_build_fail_content`
+        # writes `state: failed`. `ack` is a PURE RENAME (`_chan_transition`
+        # with builder `-`), by design and for the crash-safety reason the
+        # header gives, so it never touches the body. A `.done.md` therefore
+        # keeps whatever this line wrote — measured on the live request store
+        # 2026-09-02: 99/99 `.replied.md` carry `state: replied` and 0/79
+        # `.done.md` carry `state: done`; ALL 79 still say `state: new`.
+        #
+        # THE FIELD IS NOT DECORATIVE, WHICH IS WHY IT IS NOT SIMPLY DROPPED.
+        # `watcher/_requests.sh` keys crash recovery on it: a `.replying` is
+        # COMPLETE iff its frontmatter says `state: replied` (the builder writes
+        # it BEFORE the content mv), and that test is deliberately unforgeable
+        # by body text. Dropping the field would also break the remote client,
+        # which reads it off a terminal `.replied.md` to tell a reply from an
+        # ack (`client/nexus-reply-watch`).
+        #
+        # SO: DO NOT WRITE A PREDICATE ON THE VALUES THIS FIELD GETS WRONG.
+        # Both readers today ask `== replied` — the one value a builder always
+        # maintains — so the field is right about the only question anyone asks
+        # of it. `== done`, `!= new` and `== new` are the tempting next
+        # predicates and every one of them is wrong on every terminal-by-ack
+        # request. Ask the FILENAME SUFFIX instead (`list --state done`, or
+        # `_state_file_for_id`, which returns it). `test-request-state-field.sh`
+        # asserts the reader polarity so this cannot regress silently.
         printf 'state: new\n'
         printf -- '---\n\n'
         printf '## Request\n\n'
@@ -320,7 +430,7 @@ _build_request_file() {
 cmd_file() {
     local origin="" kind="question" priority="normal" reply="" publish="true" slug=""
     local -a body_args=()
-    while (( $# > 0 )); do
+    _argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
         case "$1" in
             --origin)   origin="${2:-}";   shift 2 || die "--origin needs a value" ;;
             --kind)     kind="${2:-}";     shift 2 || die "--kind needs a value" ;;
@@ -330,7 +440,7 @@ cmd_file() {
             --no-publish) publish="false"; shift ;;
             --file|--message) body_args+=("$1" "${2:-}"); shift 2 || die "$1 needs a value" ;;
             -)          body_args+=("-");   shift ;;
-            *) die "file: unknown flag: $1" ;;
+            *) die "file: unknown flag: $(_arg_excerpt "$1")" ;;
         esac
     done
     [[ -n "$origin" ]] || die "file: --origin <window-or-principal> is required"
@@ -339,7 +449,7 @@ cmd_file() {
     # filename-safe and un-spoofable. Reject (don't silently mangle) so the
     # printed id matches the caller's expectation. The remote forced-command
     # path forces a `remote-<principal>` origin already in this charset.
-    [[ "$origin" =~ ^[A-Za-z0-9_-]+$ ]] || die "file: --origin must be [A-Za-z0-9_-]: $origin"
+    [[ "$origin" =~ ^[A-Za-z0-9_-]+$ ]] || die "file: --origin must be [A-Za-z0-9_-]: $(_arg_excerpt "$origin")"
     case "$priority" in normal|high) ;; *) die "file: --priority must be normal|high" ;; esac
     # --reply gates whether the request DEMANDS a reply. The only value that
     # changes behaviour is `required`; `optional`/`none` (and empty) are the
@@ -350,10 +460,10 @@ cmd_file() {
         required) ;;
         *) die "file: --reply accepts 'required', 'optional', or 'none'" ;;
     esac
-    [[ "$kind" =~ ^[a-z][a-z0-9-]*$ ]] || die "file: --kind must be a kebab token: $kind"
+    [[ "$kind" =~ ^[a-z][a-z0-9-]*$ ]] || die "file: --kind must be a kebab token: $(_arg_excerpt "$kind")"
 
     local safe_slug; safe_slug=$(_chan_safe "$slug")
-    [[ -n "$safe_slug" ]] || die "file: --slug sanitizes to empty: $slug"
+    [[ -n "$safe_slug" ]] || die "file: --slug sanitizes to empty: $(_arg_excerpt "$slug")"
 
     mkdir -p "$REQ_DIR" "$IDS_DIR" "$REPLIES_DIR" 2>/dev/null \
         || die "file: cannot create inbox dirs under $REQ_DIR"
@@ -364,7 +474,7 @@ cmd_file() {
     local stem="$base" n=0
     while ! mkdir "$IDS_DIR/$stem" 2>/dev/null; do
         n=$((n + 1))
-        (( n > 999 )) && die "file: could not allocate a free id for $base after 999 tries"
+        (( n > 999 )) && die "file: could not allocate a free id for $(_arg_excerpt "$base") after 999 tries"
         stem=$(printf '%s-%02d' "$base" "$n")
     done
 
@@ -396,18 +506,21 @@ cmd_file() {
 
 # ── await ─────────────────────────────────────────────────────────────
 cmd_await() {
-    local id="${1:-}"; [[ -n "$id" ]] || die "usage: await <id> [--timeout S] [--interval S] [--principal P]"
-    shift
-    _validate_id "$id"
+    local id=""
     local timeout=1800 interval=5 principal="${NEXUS_REQUEST_PRINCIPAL:-}"
-    while (( $# > 0 )); do
+    _argloop_prev_2=-1; while (( $# > 0 )); do (( $# != _argloop_prev_2 )) || _argloop_stuck "$1"; _argloop_prev_2=$#
         case "$1" in
             --timeout)   timeout="${2:-}";   shift 2 || die "--timeout needs seconds" ;;
             --interval)  interval="${2:-}";  shift 2 || die "--interval needs seconds" ;;
             --principal) principal="${2:-}"; shift 2 || die "--principal needs a value" ;;
-            *) die "await: unknown flag: $1" ;;
+            --*) die "await: unknown flag: $(_arg_excerpt "$1")" ;;
+            *)  if [[ -z "$id" ]]; then id="$1"
+                else _die_positional "await" "$1"; fi
+                shift ;;
         esac
     done
+    [[ -n "$id" ]] || die "usage: await <id> [--timeout S] [--interval S] [--principal P]"
+    _validate_id "$id"
     [[ "$timeout"  =~ ^[0-9]+$ ]] || die "--timeout must be an integer"
     [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || die "--interval must be a positive integer"
     local waited=0 sf path state
@@ -435,23 +548,27 @@ cmd_await() {
         waited=$((waited + interval))
     done
     printf 'request-channel: await timed out after %ds; id %s still pending (not yet replied/done)\n' \
-        "$timeout" "$id" >&2
+        "$timeout" "$(_arg_excerpt "$id")" >&2
     return 4
 }
 
 # ── fetch (no-publish branch; path-confined BY CONSTRUCTION) ───────────
 cmd_fetch() {
-    local id="${1:-}" selector="${2:-}"
-    [[ -n "$id" && -n "$selector" ]] || die "usage: fetch <id> progress|results|status [--principal P]"
-    shift 2
-    _validate_id "$id"
+    local id=""
+    local selector=""
     local principal="${NEXUS_REQUEST_PRINCIPAL:-}"
-    while (( $# > 0 )); do
+    _argloop_prev_3=-1; while (( $# > 0 )); do (( $# != _argloop_prev_3 )) || _argloop_stuck "$1"; _argloop_prev_3=$#
         case "$1" in
             --principal) principal="${2:-}"; shift 2 || die "--principal needs a value" ;;
-            *) die "fetch: unknown flag: $1" ;;
+            --*) die "fetch: unknown flag: $(_arg_excerpt "$1")" ;;
+            *)  if [[ -z "$id" ]]; then id="$1"
+                elif [[ -z "$selector" ]]; then selector="$1"
+                else _die_positional "fetch" "$1"; fi
+                shift ;;
         esac
     done
+    [[ -n "$id" && -n "$selector" ]] || die "usage: fetch <id> progress|results|status [--principal P]"
+    _validate_id "$id"
     # The selector is a FIXED enum, never a path. Target is computed from
     # <id> + selector ALONE — the reply frontmatter's advisory *_path
     # fields are IGNORED (RFC §D.6): nothing the client supplies can widen
@@ -479,7 +596,7 @@ cmd_fetch() {
     # caller falls through here) report not-found → rc 2.
     if [[ "$selector" == status ]]; then
         if [[ -z "$state" ]]; then
-            printf 'request-channel: no request for id %s\n' "$id" >&2
+            printf 'request-channel: no request for id %s\n' "$(_arg_excerpt "$id")" >&2
             exit 2
         fi
         # A CONTENT-TRANSITION intermediate (replying/failing) is pending, not a
@@ -562,7 +679,7 @@ cmd_show() {
     local id="${1:-}"; [[ -n "$id" ]] || die "usage: show <id>"
     _validate_id "$id"
     local sf path
-    sf=$(_state_file_for_id "$id") || { printf 'request-channel: no request for id %s\n' "$id" >&2; exit 2; }
+    sf=$(_state_file_for_id "$id") || { printf 'request-channel: no request for id %s\n' "$(_arg_excerpt "$id")" >&2; exit 2; }
     path="${sf%$'\t'*}"
     cat -- "$path"
 }
@@ -571,7 +688,7 @@ cmd_reqfile() {
     local id="${1:-}"; [[ -n "$id" ]] || die "usage: reqfile <id>"
     _validate_id "$id"
     local sf
-    sf=$(_state_file_for_id "$id") || { printf 'request-channel: no request for id %s\n' "$id" >&2; exit 2; }
+    sf=$(_state_file_for_id "$id") || { printf 'request-channel: no request for id %s\n' "$(_arg_excerpt "$id")" >&2; exit 2; }
     printf '%s\n' "${sf%$'\t'*}"
 }
 
@@ -579,10 +696,10 @@ cmd_dir() { printf '%s\n' "$REQ_DIR"; }
 
 cmd_list() {
     local state=all
-    while (( $# > 0 )); do
+    _argloop_prev_4=-1; while (( $# > 0 )); do (( $# != _argloop_prev_4 )) || _argloop_stuck "$1"; _argloop_prev_4=$#
         case "$1" in
             --state) state="${2:-}"; shift 2 || die "--state needs a value" ;;
-            *) die "list: unknown flag: $1" ;;
+            *) die "list: unknown flag: $(_arg_excerpt "$1")" ;;
         esac
     done
     [[ -d "$REQ_DIR" ]] || return 0
@@ -718,14 +835,105 @@ _build_fail_content() {
     printf '%s\n' "$reason" >> "$tmp" || return 1
 }
 
+# _reply_refuse <rc> — every `cmd_reply` exit AFTER `_validate_id` and BEFORE
+# the payload is opened routes through here, so no such refusal can forget to
+# say what became of the payload (your-org/nexus-code#1358).
+#
+# THE SCOPE LINE IS LOAD-BEARING, AND IT HAS BEEN WRONG TWICE — READ IT BEFORE
+# YOU TRUST IT. Version 1 said "every" while the code covered only the eight
+# STATE refusals; three exits before the capture did not route through it (`no
+# request for id` at exit 2, and the two `die`s for a corrupt `body_bytes` and
+# an unrecognised state). Those three were then wired up — and the sentence was
+# rewritten to the UNBOUNDED "EVERY `cmd_reply` exit that fires BEFORE the
+# payload is opened … all eleven", which is a SECOND universal over a subset,
+# committed in the act of correcting the first. Measured at `dc00d87f`, five
+# exits fire before the payload is opened and print no payload note:
+#
+#     malformed id (`_validate_id`)                          rc 1
+#     no id at all (the usage `die`)                         rc 1
+#     unknown flag (`--*) die`)                              rc 1
+#     stray positional (`_die_positional`)                   rc 1
+#     dangling `--file`/`--message` with no value            rc 1
+#
+# The last is the sharpest: the arg loop appends the pair to `body_args` and
+# THEN dies on the failed `shift 2`, so the text is in the array and still
+# unreported. The CODE is defensible — these are argument-parse errors, before
+# an id has been established — so the fix is this narrowed sentence, not eleven
+# more call sites. What is not defensible is a universal quantifier nobody
+# re-derives: version 1's failure was an unchecked "every", and so was version
+# 2's. If you widen the routing, widen this line; if you widen this line, count
+# the arms first.
+#
+# Reads the caller's `body_args` by dynamic scope, deliberately and documented:
+# `cmd_reply` is the only caller and the array is its local. Threading it
+# through every call site is the thing that eventually gets one of them wrong
+# — which is precisely what happened when there were eight. The
+# `${body_args[@]+…}` guard degrades a future caller lacking the array to a
+# silent refusal rather than an unbound-variable failure INSIDE a refusal that
+# is already in progress.
+_reply_refuse() {
+    _reply_payload_note ${body_args[@]+"${body_args[@]}"} >&2
+    exit "${1:-6}"
+}
+_reply_refuse_6() { _reply_refuse 6; }
+
+# _reply_payload_note <body_args...>
+# Say what became of a reply payload the refusal path never read
+# (your-org/nexus-code#1358). Prints one or more stderr-ready lines; prints
+# NOTHING when no payload was supplied.
+#
+# WHY THIS EXISTS. `cmd_reply` parses `--file`/`--message` into `body_args` and
+# does not open them until AFTER every state refusal has exited. So a refused
+# reply loses no bytes — and says nothing about that either, which is the same
+# silence the channel exists to prevent. The two cases differ and the
+# difference is the whole point:
+#
+#   --file <p>   the bytes were NEVER OPENED and are unchanged at <p>. Nothing
+#                to recover; the caller just has to be told where they still are.
+#   --message t  the text lived only in argv and dies with the process, so it is
+#                spilled to a temp file HERE and the path is named.
+#   -            stdin. Deliberately NOT drained: this runs on a refusal path
+#                whose stdin is whatever the caller had, and reading an
+#                inherited terminal stdin BLOCKS. Say it was not read.
+#
+# Best-effort throughout: a spill that cannot be written degrades to naming the
+# loss, never to failing the refusal that is already in progress.
+_reply_payload_note() {
+    local i=0 n=$# a v spill
+    local -a args=("$@")
+    while (( i < n )); do
+        a="${args[i]}"; v="${args[i+1]:-}"
+        case "$a" in
+            --file)
+                printf '  Your `--file %s` was NOT read — this verb opens the payload only after\n' "$v"
+                printf '  the state check above, so its bytes are unchanged at that path.\n'
+                i=$(( i + 2 )) ;;
+            --message)
+                spill=$(mktemp "${TMPDIR:-/tmp}/reqreply-refused.XXXXXX" 2>/dev/null) || spill=""
+                if [[ -n "$spill" ]] && printf '%s\n' "$v" > "$spill" 2>/dev/null; then
+                    printf '  Your `--message` text was NOT recorded on the request. It lived only in\n'
+                    printf '  argv, so it has been spilled to: %s\n' "$spill"
+                else
+                    printf '  Your `--message` text was NOT recorded and could not be spilled to a temp\n'
+                    printf '  file — it exists nowhere but your own scrollback. Copy it before retrying.\n'
+                fi
+                i=$(( i + 2 )) ;;
+            -)
+                printf '  A stdin payload (`-`) was NOT read. It is deliberately not drained here:\n'
+                printf '  this is a refusal path and reading an inherited stdin would block.\n'
+                i=$(( i + 1 )) ;;
+            *)  i=$(( i + 1 )) ;;
+        esac
+    done
+}
+
 # ── reply (orchestrator → client; .claimed → .replied; --amend: replied→replied)
 cmd_reply() {
-    local id="${1:-}"; [[ -n "$id" ]] || die "usage: reply <id> [--message t|--file f] [--status S] [--worker w] [--dir p] [--issue o/r#N] [--no-publish] [--amend] [--progress p] [--results p]"
-    shift
-    _validate_id "$id"
+    local id=""
     local status="" worker="" wdir="" issue="" publish="" progress="" results="" amend=0
+    local skeptic_resolved=0
     local -a body_args=()
-    while (( $# > 0 )); do
+    _argloop_prev_5=-1; while (( $# > 0 )); do (( $# != _argloop_prev_5 )) || _argloop_stuck "$1"; _argloop_prev_5=$#
         case "$1" in
             --status)   status="${2:-}";   shift 2 || die "--status needs a value" ;;
             --worker)   worker="${2:-}";   shift 2 || die "--worker needs a value" ;;
@@ -733,26 +941,32 @@ cmd_reply() {
             --issue)    issue="${2:-}";    shift 2 || die "--issue needs owner/repo#N" ;;
             --no-publish) publish="false"; shift ;;
             --amend)    amend=1;           shift ;;
+            --skeptic-resolved) skeptic_resolved=1; shift ;;
             --progress) progress="${2:-}"; shift 2 || die "--progress needs a path" ;;
             --results)  results="${2:-}";  shift 2 || die "--results needs a path" ;;
             --file|--message) body_args+=("$1" "${2:-}"); shift 2 || die "$1 needs a value" ;;
             -)          body_args+=("-");   shift ;;
-            *) die "reply: unknown flag: $1" ;;
+            --*) die "reply: unknown flag: $(_arg_excerpt "$1")" ;;
+            *)  if [[ -z "$id" ]]; then id="$1"
+                else _die_positional "reply" "$1" "--message/--file"; fi
+                shift ;;
         esac
     done
+    [[ -n "$id" ]] || die "usage: reply <id> [--message t|--file f] [--status spawned|answered|declined|deferred] [--worker w] [--dir p] [--issue o/r#N] [--no-publish] [--amend] [--skeptic-resolved] [--progress p] [--results p]"
+    _validate_id "$id"
 
     # Pre-check for a precise voice on a STABLE state. The transition engine
     # re-validates independently (its resolve is the authority under a race);
     # this block only chooses the user-facing message + gates --amend.
     local sf path state
-    sf=$(_state_file_for_id "$id") || { printf 'request-channel: no request for id %s\n' "$id" >&2; exit 2; }
+    sf=$(_state_file_for_id "$id") || { printf 'request-channel: no request for id %s\n' "$(_arg_excerpt "$id")" >&2; _reply_refuse 2; }
     path="${sf%$'\t'*}"; state="${sf##*$'\t'}"
     local amend_n_old=""
     if (( amend )); then
         case "$state" in
             replied) ;;
-            replying|failing) printf 'request-channel: id %s has an in-flight/crashed transition (%s); the watcher reaper recovers it — retry --amend after\n' "$id" "$state" >&2; exit 6 ;;
-            *) printf 'request-channel: reply --amend requires a replied request; id %s is %s\n' "$id" "$state" >&2; exit 6 ;;
+            replying|failing) printf 'request-channel: id %s has an in-flight/crashed transition (%s); the watcher reaper recovers it — retry --amend after\n' "$id" "$state" >&2; _reply_refuse_6 ;;
+            *) printf 'request-channel: reply --amend requires a replied request; id %s is %s\n' "$id" "$state" >&2; _reply_refuse_6 ;;
         esac
         # UNFORGEABLE amend boundary: the reply body is the last body_bytes bytes.
         # A legacy .replied written before the marker existed cannot be amended
@@ -763,14 +977,15 @@ cmd_reply() {
         amend_n_old=$(_reply_body_bytes "$path")
         if [[ -z "$amend_n_old" ]]; then
             printf 'request-channel: id %s is a legacy reply without a body_bytes marker; --amend cannot locate the reply body safely — re-reply manually (fail + fresh reply) instead\n' "$id" >&2
-            exit 6
+            _reply_refuse_6
         fi
-        [[ "$amend_n_old" =~ ^[0-9]+$ ]] || die "reply --amend: corrupt body_bytes ($amend_n_old) for id $id"
+        [[ "$amend_n_old" =~ ^[0-9]+$ ]] || { _reply_payload_note ${body_args[@]+"${body_args[@]}"} >&2
+            die "reply --amend: corrupt body_bytes ($amend_n_old) for id $id"; }
         local _results="$REPLIES_DIR/$id/results.md"
         if [[ -f "$_results" ]]; then
             if ! tail -c "$amend_n_old" -- "$path" | cmp -s - "$_results"; then
                 printf 'request-channel: id %s reply body (last %s bytes) does not match results.md — refusing to amend a tampered/corrupt reply\n' "$id" "$amend_n_old" >&2
-                exit 6
+                _reply_refuse_6
             fi
         fi
         # (results.md absent — e.g. a crash-recovered reply — leaves body_bytes,
@@ -778,11 +993,12 @@ cmd_reply() {
     else
         case "$state" in
             claimed) ;;
-            replied) printf 'request-channel: id %s is already replied (one reply per request; use --amend to update)\n' "$id" >&2; exit 6 ;;
-            done|failed) printf 'request-channel: id %s is terminal (%s); cannot reply\n' "$id" "$state" >&2; exit 6 ;;
-            replying|failing) printf 'request-channel: id %s has an in-flight/crashed transition (%s); the watcher reaper recovers it — retry after\n' "$id" "$state" >&2; exit 6 ;;
-            new) printf 'request-channel: id %s is unclaimed (.new); the watcher claims before reply\n' "$id" >&2; exit 6 ;;
-            *) die "reply: unexpected state for id $id: $state" ;;
+            replied) printf 'request-channel: id %s is already replied (one reply per request; use --amend to update)\n' "$id" >&2; _reply_refuse_6 ;;
+            done|failed) printf 'request-channel: id %s is terminal (%s); cannot reply\n' "$id" "$state" >&2; _reply_refuse_6 ;;
+            replying|failing) printf 'request-channel: id %s has an in-flight/crashed transition (%s); the watcher reaper recovers it — retry after\n' "$id" "$state" >&2; _reply_refuse_6 ;;
+            new) printf 'request-channel: id %s is unclaimed (.new); the watcher claims before reply\n' "$id" >&2; _reply_refuse_6 ;;
+            *) _reply_payload_note ${body_args[@]+"${body_args[@]}"} >&2
+               die "reply: unexpected state for id $id: $state" ;;
         esac
     fi
 
@@ -822,6 +1038,124 @@ cmd_reply() {
     # status default: spawned if a worker is named, else answered.
     if [[ -z "$status" ]]; then
         if [[ -n "$worker" ]]; then status="spawned"; else status="answered"; fi
+    fi
+
+    # ---- A REPLY'S STATUS IS A SELECTOR, SO IT IS NOT A FREE LABEL ---------
+    #
+    # `status` used to accept any string and nothing read it. It is now the
+    # field that decides whether answering a `spawn-skeptic` request DISCHARGES
+    # the skeptic gate the request was filed against, so an unrecognised value
+    # must be a REFUSAL and not a silent accept: the moment a value SELECTS,
+    # adding a member is a behavioural change that has to teach the matcher in
+    # the same commit (your-org/nexus-code#1050). Allowlist, default-DENY. The
+    # arms are literal equality over disjoint values, so no arm can shadow
+    # another (#1121).
+    #
+    #   spawned   a reviewer was spawned; ITS verdict discharges the gate later
+    #   declined  the orchestrator declined the review; the gate must be
+    #             discharged HERE, because nothing else will
+    #   deferred  not now, ask again — deliberately does NOT discharge the gate
+    #   answered  an ordinary answer to a non-gating request
+    case "$status" in
+        spawned|answered|declined|deferred) ;;
+        *) printf 'request-channel: reply --status %s is not a recognised status.\n' "$(_arg_excerpt "$status")" >&2
+           printf '  Known: spawned | answered | declined | deferred\n' >&2
+           printf '  This field SELECTS (a spawn-skeptic decline discharges the skeptic gate),\n' >&2
+           printf '  so an unknown value is refused rather than recorded as a label.\n' >&2
+           exit 2 ;;
+    esac
+
+    # ---- ACTING ON A DECISION MUST RECORD IT ------------------------------
+    #
+    # Answering a `spawn-skeptic` request — including DECLINING it — used to
+    # write nothing to the skeptic ledger. The request moved to `.replied.md`,
+    # this verb returned 0, the requesting agent read the decline and
+    # reasonably reported it as recorded, and `retire-window` later refused
+    # with "a cleared marker is not clearance" because from the ledger's side
+    # no verdict and no resolution existed. Measured three times in one
+    # session (`olayship`, `ctxdiff`, `integ`); each was fixed by re-issuing
+    # the SAME decision through `ng skeptic resolve`, so the decision was never
+    # in doubt — only its record. It also produced re-filing loops: three
+    # windows filed the same request twice and one filed it four times,
+    # because a reply resolves the REQUEST without changing anything the
+    # requester's wrap-up path reads. Answering harder does not help.
+    # (your-org/nexus-code#1293; the ambiguity is #961 / #1199.)
+    #
+    # A DECLINE THAT IS NOT RECORDED IS INDISTINGUISHABLE FROM A REVIEW THAT
+    # NEVER HAPPENED. So on a spawn-skeptic request this verb refuses to leave
+    # the answer's MEANING unstated, and on a decline it makes the decision and
+    # its durable record ONE act.
+    local req_kind req_origin
+    req_kind=$(_chan_frontmatter_field "$path" kind)
+    req_origin=$(_chan_frontmatter_field "$path" origin)
+    if [[ "$req_kind" == "spawn-skeptic" ]] && (( amend == 0 )); then
+        case "$status" in
+            spawned)
+                # A spawn is discharged later by the reviewer's own verdict —
+                # but only if a reviewer actually exists. Naming it is the
+                # whole content of the claim.
+                if [[ -z "$worker" ]]; then
+                    printf 'request-channel: --status spawned on a spawn-skeptic request must name the reviewer (--worker <window>).\n' >&2
+                    printf '  The gate is discharged by THAT window'"'"'s verdict; an unnamed spawn discharges nothing.\n' >&2
+                    exit 6
+                fi
+                ;;
+            answered)
+                # The ambiguous case that caused all three incidents. `answered`
+                # cannot say whether a reviewer is coming, so nothing downstream
+                # can tell a decline from a spawn — which is exactly why the
+                # population on disk is unclassifiable after the fact.
+                printf 'request-channel: --status answered is ambiguous on a spawn-skeptic request.\n' >&2
+                printf '  Say which answer this is, so the ledger and the request agree:\n' >&2
+                printf '    --status spawned --worker <window>   a reviewer is coming; ITS verdict discharges the gate\n' >&2
+                printf '    --status declined                    no review; this verb discharges the gate now\n' >&2
+                printf '    --status deferred                    not now — the gate STAYS armed on purpose\n' >&2
+                exit 6 ;;
+            declined)
+                if (( skeptic_resolved )); then
+                    printf 'request-channel: NOTE — --skeptic-resolved given; not resolving %s again. You are asserting the gate is already discharged.\n' \
+                        "${req_origin:-<unknown-origin>}" >&2
+                else
+                    [[ -n "$req_origin" ]] || { printf 'request-channel: spawn-skeptic decline for id %s has no `origin` in its frontmatter; cannot resolve a gate without a window\n' "$id" >&2; exit 6; }
+                    # The rationale is written to the audit trail beside the
+                    # marker and `resolve` requires it to be substantive. Refuse
+                    # a too-short body rather than PADDING one: a manufactured
+                    # rationale is worse than no verb at all.
+                    local _sk_reason; _sk_reason=$(tr '\n' ' ' < "$bodyfile" | sed 's/  */ /g; s/^ //; s/ $//')
+                    if (( ${#_sk_reason} < 20 )); then
+                        rm -f "$bodyfile"
+                        printf 'request-channel: a spawn-skeptic DECLINE discharges %s'"'"'s skeptic gate, and that goes on the audit trail.\n' "$req_origin" >&2
+                        printf '  Give a substantive --message (>=20 chars) saying WHY the review is declined.\n' >&2
+                        exit 6
+                    fi
+                    # ORDER IS THE GUARANTEE (your-org/nexus-code#665): resolve
+                    # BEFORE the request transitions. resolve-then-reply fails
+                    # LOUD — the caller sees a non-zero reply and nothing was
+                    # consumed. reply-then-resolve fails SILENT: the request is
+                    # already `.replied`, the caller believes the decision
+                    # landed, and that IS this bug.
+                    local _sk_bin="$_script_dir/skeptic-channel.sh" _sk_out _sk_rc
+                    if [[ ! -x "$_sk_bin" ]]; then
+                        rm -f "$bodyfile"
+                        printf 'request-channel: cannot resolve %s'"'"'s skeptic gate — %s is missing or not executable. REFUSING the reply rather than recording a decline nothing will see.\n' "$req_origin" "$_sk_bin" >&2
+                        exit 6
+                    fi
+                    _sk_out=$("$_sk_bin" resolve "$req_origin" --reason "spawn-skeptic request $id DECLINED by the orchestrator: $_sk_reason" 2>&1); _sk_rc=$?
+                    if (( _sk_rc != 0 )); then
+                        rm -f "$bodyfile"
+                        printf 'request-channel: the skeptic gate for %s was NOT resolved (rc %s) — REFUSING to record the decline.\n' "$req_origin" "$_sk_rc" >&2
+                        printf '%s\n' "$_sk_out" | sed 's/^/  /' >&2
+                        printf '  Nothing was written. If the gate is already discharged, re-run with --skeptic-resolved.\n' >&2
+                        exit 6
+                    fi
+                    printf 'request-channel: resolved %s'"'"'s skeptic gate on the record before replying (your-org/nexus-code#1293).\n' "$req_origin" >&2
+                fi
+                ;;
+            deferred)
+                printf 'request-channel: NOTE — --status deferred leaves %s'"'"'s skeptic gate ARMED on purpose; retirement will still require a verdict or a resolution.\n' \
+                    "${req_origin:-<unknown-origin>}" >&2
+                ;;
+        esac
     fi
     # session_id best-effort from the worker's window record (liveness hint).
     local session_id=""
@@ -887,7 +1221,7 @@ cmd_reply() {
            printf 'request-channel: reply lost the race for id %s (now %s) — the request was concurrently transitioned (reaper/ack); terminal file left intact, no reply written\n' \
                "$id" "$now_state" >&2
            exit 6 ;;
-        2) rm -f "$bodyfile"; printf 'request-channel: no request for id %s\n' "$id" >&2; exit 2 ;;
+        2) rm -f "$bodyfile"; printf 'request-channel: no request for id %s\n' "$(_arg_excerpt "$id")" >&2; exit 2 ;;
         7) rm -f "$bodyfile"; die "reply: id $id kept being renamed under a concurrent writer; retry" ;;
         *) rm -f "$bodyfile"; die "reply: transition failed for $id (rc $rc)" ;;
     esac
@@ -946,7 +1280,26 @@ cmd_ack() {
     local out rc
     out=$(_chan_transition die _state_file_for_id "$id" done - "new claimed" -); rc=$?
     case "$rc" in
-        0) printf '%s\n' "$out"; return 0 ;;
+        0) # RESTAMP: `rename(2)` PRESERVES mtime, and the GC reads mtime
+           # (your-org/nexus-code#1358). `ack` is a pure rename, so without this
+           # a `.done.md` carries the mtime it had as `.new.md` — its FILING
+           # time — and `watcher/_requests.sh`'s retention sweep ages it from
+           # when it was asked rather than from when it was answered. Measured
+           # on the live store 2026-09-02: 79/79 `.done.md` mtimes match their
+           # own `created:` to the second (max delta 0s), while 0/99
+           # `.replied.md` do (max delta 6174s) — because a reply is a content
+           # transition and lands a fresh file.
+           #
+           # THE TAIL IS THE PART THAT BITES: retention and max-age are the SAME
+           # default (259200s / 72h), so a request that dwells near the max-age
+           # cap and is then acked is GC'd almost immediately instead of 72h
+           # later. Bounded, but the bound is total loss of retention.
+           #
+           # Best-effort: a `touch` that fails leaves exactly the pre-fix
+           # behaviour, which is a shortened retention and never a lost request,
+           # so it must not fail an otherwise-successful ack.
+           [[ -n "$out" ]] && touch -- "$out" 2>/dev/null || true
+           printf '%s\n' "$out"; return 0 ;;
         2) # No live file: GC'd or never existed. Idempotent no-op.
            printf 'request-channel: id %s not present (already acked/GC'"'"'d?) — no-op\n' "$id" >&2
            return 0 ;;
@@ -962,22 +1315,25 @@ cmd_ack() {
 
 # ── fail (orchestrator/watcher; new|claimed → failed) ──────────────────
 cmd_fail() {
-    local id="${1:-}"; [[ -n "$id" ]] || die "usage: fail <id> --reason \"<why>\""
-    shift
-    _validate_id "$id"
+    local id=""
     local reason=""
-    while (( $# > 0 )); do
+    _argloop_prev_6=-1; while (( $# > 0 )); do (( $# != _argloop_prev_6 )) || _argloop_stuck "$1"; _argloop_prev_6=$#
         case "$1" in
             --reason) reason="${2:-}"; shift 2 || die "--reason needs text" ;;
-            *) die "fail: unknown flag: $1" ;;
+            --*) die "fail: unknown flag: $(_arg_excerpt "$1")" ;;
+            *)  if [[ -z "$id" ]]; then id="$1"
+                else _die_positional "fail" "$1" "--reason"; fi
+                shift ;;
         esac
     done
+    [[ -n "$id" ]] || die "usage: fail <id> --reason \"<why>\""
+    _validate_id "$id"
     [[ -n "$reason" ]] || die "fail: --reason is required"
     local out rc
     out=$(_chan_transition die _state_file_for_id "$id" failed failing "new claimed" _build_fail_content "$reason"); rc=$?
     case "$rc" in
         0) printf '%s\n' "$out"; return 0 ;;   # transitioned OR idempotent (already .failed)
-        2) printf 'request-channel: no request for id %s\n' "$id" >&2; exit 2 ;;
+        2) printf 'request-channel: no request for id %s\n' "$(_arg_excerpt "$id")" >&2; exit 2 ;;
         6) # Not in a failable state (done/replied terminal, or an in-flight
            # replying/failing intermediate) — refuse.
            local nsf st="?"; nsf=$(_state_file_for_id "$id") && st="${nsf##*$'\t'}"
@@ -1005,7 +1361,7 @@ main() {
             awk '/^$/{exit} NR>1' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
             [[ -z "$sub" ]] && exit 1 || exit 0
             ;;
-        *) die "unknown subcommand: $sub (run with --help)" ;;
+        *) die "unknown subcommand: $(_arg_excerpt "$sub") (run with --help)" ;;
     esac
 }
 

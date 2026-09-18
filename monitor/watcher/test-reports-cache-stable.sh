@@ -35,7 +35,7 @@ FAIL=0
 pass() { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }
 fail() { printf '  FAIL: %s\n' "$1" >&2; FAIL=$(( FAIL + 1 )); }
 assert_eq()           { [[ "$2" == "$3" ]] && pass "$1" || fail "$1: got '${2:0:200}' want '${3:0:200}'"; }
-assert_contains()     { [[ "$2" == *"$3"* ]] && pass "$1" || fail "$1: missing '$3'"; }
+assert_contains()     { [[ -n "$3" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2; [[ -n "$3" && "$2" == *"$3"* ]] && pass "$1" || fail "$1: missing '$3'"; }
 assert_not_contains() { [[ "$2" != *"$3"* ]] && pass "$1" || fail "$1: should NOT contain '$3'"; }
 
 _extract_fn() { sed -n "/^$2() {/,/^}/p" "$1"; }

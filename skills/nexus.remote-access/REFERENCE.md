@@ -84,7 +84,9 @@ becomes fail-open.
 - An **expired** token is refused fail-closed at redeem, and `prune-enroll`
   drops its `authorized_keys` enroll line — so an expired token grants nothing
   by two independent mechanisms.
-- `ng remote gc-tokens` (supervisor loop + `remote-up.sh`) then deletes the
+- `ng remote gc-tokens` (called from the supervisor loop —
+  `remote-sshd-supervised.sh`, at start-up and once per loop pass; **not** from
+  `remote-up.sh`, which calls neither `gc-tokens` nor `prune-enroll`) then deletes the
   inert **records**: expired, corrupt, and stranded `*.token.consumed.*` claim
   files older than one TTL. This is *hygiene*, not access control — but a file
   that can never grant access should not outlive its purpose. Before this

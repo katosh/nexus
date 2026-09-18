@@ -126,7 +126,7 @@ _coldbuild_guard jupyterlab "$wd" /x/labsh-supervised.sh >/dev/null 2>&1
 check "--force / SVC_FORCE=1 overrides the guard" "$?" "0"
 
 SVC_FORCE=0
-_coldbuild_guard dolimap-serve "$wd" ./serve-supervised.sh >/dev/null 2>&1
+_coldbuild_guard mysite-serve "$wd" ./serve-supervised.sh >/dev/null 2>&1
 check "a non-labsh service is never guarded" "$?" "0"
 
 echo "=== BOUNDS: the guard must never refuse a WEDGED build (your-org/your-nexus#273 round 2) ==="
@@ -227,10 +227,39 @@ for fn in cmd_stop cmd_restart; do
     body=$(declare -f "$fn")
     w=$(printf '%s\n' "$body" | grep -n 'watcher)'        | head -1 | cut -d: -f1)
     g=$(printf '%s\n' "$body" | grep -n '_coldbuild_guard' | head -1 | cut -d: -f1)
-    if [[ -n "$w" && -n "$g" ]] && (( w < g )); then
-        ok "$fn dispatches watcher) before _coldbuild_guard (guard unreachable for the watcher)"
+    # `^[0-9]+$`, not `[[ -n ]]` (your-org/nexus-code#1016): an empty capture
+    # cannot arithmetic-evaluate, so `(( "" < "" ))` is a SILENT PASS — the
+    # structural check would certify an ordering it never measured. Structural
+    # by necessity here (running cmd_stop watcher would stop the LIVE watcher),
+    # and it pins ORDER only, never that the guard is unreachable at runtime.
+    if [[ "$w" =~ ^[0-9]+$ && "$g" =~ ^[0-9]+$ ]] && (( w < g )); then
+        ok "$fn dispatches watcher) before _coldbuild_guard (ORDER only — see the arm check below)"
     else
         bad "$fn: watcher dispatch (line ${w:-none}) does not precede the guard (line ${g:-none})"
+    fi
+    # ORDER IS NOT REACHABILITY, and the position check above cannot tell the
+    # difference (your-org/nexus-code#1016). Deleting one token — the `; return`
+    # in `watcher) _stop_watcher; return ;;` at monitor/svc.sh:1676 — leaves the
+    # `watcher)` token exactly where it was, so `(( w < g ))` still holds and the
+    # assertion above stays GREEN. But the case now FALLS OUT into `svc_require`
+    # + `_coldbuild_guard`, so the guard becomes REACHABLE for the watcher: the
+    # precise negation of the claim. Measured: position GREEN, this check RED,
+    # for both functions.
+    #
+    # `return` is what makes the dispatch a control-flow claim. This is a
+    # CONTAINMENT census over the arm's own region — the one question a text
+    # assertion can honestly answer here — because `declare -f` re-renders the
+    # arm across several lines, so a single-line match false-alarms on the
+    # shipped tree. It still does NOT prove unreachability at runtime; that
+    # would need to call cmd_stop watcher, which would stop the LIVE watcher.
+    if printf '%s\n' "$body" | awk '
+            /^[[:space:]]*watcher\)/            { inarm=1; next }
+            inarm && /^[[:space:]]*;;/           { inarm=0 }
+            inarm && /^[[:space:]]*return([[:space:]]|;|$)/ { found=1 }
+            END { exit(found?0:1) }'; then
+        ok "$fn's watcher) arm SHORT-CIRCUITS (carries return) — the guard is unreachable for it"
+    else
+        bad "$fn's watcher) arm does not return: the case falls out into _coldbuild_guard, which is reachable for the watcher"
     fi
 done
 

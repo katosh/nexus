@@ -7,6 +7,8 @@ Two rule families, one failure mode: a red that reaches nobody.
       verdict (your-org/nexus-code#628, re-found as #736)
   SR  a scheduled workflow must be reachable from the branch it is authored on,
       or it is not coverage — it is a file (#737)
+  AU  `apt-get update` must be narrowed to the sources the build consumes and
+      never masked (#1505) — documented on `_check_apt_update`
 
 MC is documented immediately below; SR's rationale, boundary and measurement
 live on `_check_reachability`.
@@ -96,8 +98,16 @@ would break it.
 =============================== RULE FAMILY TD ===============================
 
   TD001  a step that invokes `monitor/watcher/run-tests.sh` without engaging
-         `th_deadline`'s scaling — neither `NEXUS_TEST_DEADLINE_SCALE` set
-         explicitly nor `--jobs N` with N GREATER THAN the runner's vCPU count.
+         `th_deadline`'s scaling — neither `NEXUS_TEST_DEADLINE_SCALE` set to
+         an EFFECTIVE value nor `--jobs N` with N GREATER THAN the runner's
+         vCPU count.
+         "Effective", not "present": the pin is RESOLVED the way the runtime
+         resolves it (innermost scope first — inline `VAR=val` prefix, then
+         step/job/workflow `env:`) and a value below 2, a non-numeric value or
+         an unevaluatable `${{ }}` expression is a finding. Exempting on mere
+         presence let `NEXUS_TEST_DEADLINE_SCALE: 1` through, which th_deadline
+         honours as a valid override and which is strictly worse than omitting
+         the pin (your-org/nexus-code#1300 R3).
          Rationale, the measurement behind it and its coverage boundary: see
          `_check_deadline_scale` below.
 
@@ -304,14 +314,15 @@ def lint_file(path):
     td_findings, td_note = _check_deadline_scale(doc, path, name)
     pf_findings, pf_note = _check_path_filter(doc, path, name)
     eb_findings, eb_note = _check_errexit_branch(doc, path, name)
+    au_findings, au_note = _check_apt_update(doc, path, name)
     findings = (mc_findings + sr_findings + td_findings + pf_findings
-                + eb_findings)
+                + eb_findings + au_findings)
     # A file is reported "exempt" only when EVERY family excused it; if one
     # family checked it, the file was checked. Collapsing the notes into one
     # line keeps the exempt list readable without hiding which family spoke.
-    if mc_note and sr_note and td_note and pf_note and eb_note:
-        return findings, "%s; %s; %s; %s; %s" % (mc_note, sr_note, td_note,
-                                                 pf_note, eb_note)
+    if mc_note and sr_note and td_note and pf_note and eb_note and au_note:
+        return findings, "%s; %s; %s; %s; %s; %s" % (mc_note, sr_note, td_note,
+                                                     pf_note, eb_note, au_note)
     return findings, None
 
 
@@ -475,6 +486,70 @@ RUN_TESTS_TOKEN = "monitor/watcher/run-tests.sh"
 DEADLINE_SCALE_VAR = "NEXUS_TEST_DEADLINE_SCALE"
 
 
+def _resolve_deadline_scale(body, step_env, job_env, wf_env):
+    """Resolve NEXUS_TEST_DEADLINE_SCALE as the RUNTIME sees it, not as text.
+
+    Returns (value, scope-label) or (None, None). Precedence is INNERMOST
+    FIRST, which is what GitHub does and what a text scan gets wrong:
+
+        inline `VAR=val cmd` prefix   >   step `env:`   >   job `env:`   >   workflow `env:`
+
+    The inline form is not exotic — tests-slow-integration.yml's SLOW band
+    sets the scale exactly that way (`SLOW_TESTS=1 NEXUS_TEST_DEADLINE_SCALE=2
+    env -u ... bash run-tests.sh`), so a resolver that only walked the three
+    YAML scopes would report that band UNPINNED and be confidently wrong about
+    the one band #749 was filed against (your-org/nexus-code#1300 R3).
+
+    COVERAGE BOUNDARY — read this before trusting a green
+    (your-org/nexus-code#1300 R4). This function is HALF semantic and half
+    textual, and the halves have different strength:
+
+      * RESOLVED SEMANTICALLY: workflow-, job- and step-scoped `env:`, read
+        from the `yaml.safe_load`ed document. Scope precedence here is real.
+      * MATCHED BY REGEX: the INLINE scope. It takes the FIRST match in the
+        step body where the shell takes the one on the line that actually
+        runs, and it applies a `.strip()` the runtime does NOT perform.
+
+    Two measured consequences, stated at the strength each was measured:
+
+      * FALSE GREEN, verified: a decoy earlier in the body — e.g. an
+        `echo "NEXUS_TEST_DEADLINE_SCALE=2"` line above a real
+        `NEXUS_TEST_DEADLINE_SCALE=1 ... run-tests.sh` — resolves to the
+        DECOY and the lint returns rc 0 on a genuinely inert band.
+      * MISSTATED REASON, not a false green: a padded value such as `" 1"` is
+        flagged, but the finding says the value is `1` and blames
+        th_deadline for "honouring a valid override". Measured, th_deadline
+        matches `^[0-9]+$`, REJECTS `" 1"`, and falls back to
+        ceil(jobs/nproc) — so the direction is safe (it flags) while the
+        mechanism named is wrong.
+
+    A trailing `#` does NOT defeat it — measured, `SCALE=1#x` is caught by the
+    non-numeric arm. Recorded because it was reported as a defeat and is not
+    one here; do not carry that claim forward without re-measuring.
+
+    LIVE COUNT: **0 inert pins across 9 run-tests steps and 6 resolved pins**,
+    at e4635e84, clean tree. So this is a RATCHET AGAINST ACCIDENTAL
+    REGRESSION, not a proof against a determined edit.
+
+    The cheap improvement, deliberately NOT taken here: switching the regex to
+    the LAST match would close the decoy case. It is left undone because the
+    fixtures and mutants that vouch for this function were verified against
+    THIS implementation, and because last-match is still not semantic — a
+    decoy AFTER the real invocation would defeat it in turn. Resolving the
+    inline scope properly means parsing the step body as shell, which is a
+    different piece of work than a lint rule.
+    """
+    m = re.search(re.escape(DEADLINE_SCALE_VAR) + r"=([^\s;&|]+)", body or "")
+    if m:
+        return m.group(1), "inline on the command"
+    for scope, label in ((step_env, "step `env:`"),
+                         (job_env, "job `env:`"),
+                         (wf_env, "workflow `env:`")):
+        if isinstance(scope, dict) and DEADLINE_SCALE_VAR in scope:
+            return scope[DEADLINE_SCALE_VAR], label
+    return None, None
+
+
 def _strip_shell_comments(text):
     """Drop whole-line `#` comments from a run: block.
 
@@ -561,8 +636,12 @@ def _check_deadline_scale(doc, path, name):
 
     WHY `N > nproc` AND NOT `N >= 1`. ceil is not strictly increasing here:
     `--jobs 2` on a 2-vCPU runner is ceil(2/2) = 1, identical to passing
-    nothing. Requiring merely "some --jobs" would bless the inert case. This is
-    not hypothetical — it is tests.yml's `jobs: 2` matrix cell today.
+    nothing. Requiring merely "some --jobs" would bless the inert case. This
+    was tests.yml's `jobs: 2` matrix cell until your-org/nexus-code#1300 dropped
+    it for cost; the shape is still live in this rule's own selftest fixtures
+    (`td-jobs-equal-nproc`, `td-matrix-has-inert-cell`), which is where the
+    negative control belongs — a rule whose only witness is production config
+    stops being tested the day that config changes (#1300 F1).
 
     WHY THIS IS ENFORCEMENT AND #749 WAS NOT. #749 made the EFFECTIVE scale
     visible in run-tests.sh's own header (`deadline-scale=1`). Visibility
@@ -625,9 +704,55 @@ def _check_deadline_scale(doc, path, name):
 
             # Scale set explicitly anywhere that reaches the process: workflow
             # env, job env, step env, or inline on the command itself.
-            if (DEADLINE_SCALE_VAR in wf_env or DEADLINE_SCALE_VAR in job_env
-                    or DEADLINE_SCALE_VAR in step_env
-                    or DEADLINE_SCALE_VAR in body):
+            #
+            # RESOLVE THE VALUE — DO NOT EXEMPT ON PRESENCE
+            # (your-org/nexus-code#1300 R3). This arm used to `continue` the
+            # moment the variable was MENTIONED in any scope, which made the
+            # rule blind to the one edit that actually degrades CI:
+            # `NEXUS_TEST_DEADLINE_SCALE: 1`. th_deadline honours that as a
+            # VALID override (measured: `th_deadline 10` is 10 at 1 and 20 at
+            # 2), so every polled deadline reverts to its bare literal — the
+            # #749 state, reached from inside the remedy for #749, by one
+            # character. It is STRICTLY WORSE than deleting the pin, which at
+            # least falls back to ceil(jobs/nproc).
+            #
+            # Presence was a PROXY; the property is the resolved VALUE. And it
+            # must be resolved the way the RUNTIME resolves it, innermost
+            # scope first — a text scan that takes the FIRST match disagrees
+            # with GitHub, which takes the LAST enclosing scope, and the
+            # disagreement silently favours whichever value makes the check
+            # pass.
+            scale_raw, scale_scope = _resolve_deadline_scale(
+                body, step_env, job_env, wf_env)
+            if scale_raw is not None:
+                sval = str(scale_raw).strip()
+                if "${{" in sval:
+                    findings.append((
+                        "TD001",
+                        "%s sets %s to the expression `%s` (%s).\n"
+                        "    Its runtime value cannot be evaluated here, so whether the\n"
+                        "    band is scaled is UNKNOWN — reported rather than assumed\n"
+                        "    away (fail-closed).\n"
+                        % (where, DEADLINE_SCALE_VAR, sval, scale_scope)))
+                elif not sval.isdigit():
+                    findings.append((
+                        "TD001",
+                        "%s sets %s to the NON-NUMERIC value `%s` (%s).\n"
+                        "    th_deadline matches `^[0-9]+$` and SILENTLY falls back to\n"
+                        "    ceil(jobs/nproc), so the pin does not mean what it says and\n"
+                        "    nothing reports the discrepancy.\n"
+                        % (where, DEADLINE_SCALE_VAR, sval, scale_scope)))
+                elif int(sval) < 2:
+                    findings.append((
+                        "TD001",
+                        "%s sets %s=%s (%s).\n"
+                        "    th_deadline honours that as a VALID override, so every polled\n"
+                        "    deadline is its bare literal — NO scaling at all. This is the\n"
+                        "    #749 configuration, and it is WORSE than omitting the pin,\n"
+                        "    which would at least fall back to ceil(jobs/nproc).\n"
+                        "    Remedy: set %s to 2 or more.\n"
+                        % (where, DEADLINE_SCALE_VAR, sval, scale_scope,
+                           DEADLINE_SCALE_VAR)))
                 continue
 
             if not isinstance(runs_on, str):
@@ -692,6 +817,115 @@ def _check_deadline_scale(doc, path, name):
     if exempt_reasons:
         return [], "; ".join(exempt_reasons)
     return [], None
+
+
+
+# --------------------------------------------------------------------------
+# RULE FAMILY AU — `apt-get update` must not fail on a source the build never
+# installs from, and must not be masked either
+# --------------------------------------------------------------------------
+#
+# THE DEFECT (your-org/nexus-code#1505). Every job that installs packages
+# died in SETUP at 10-16 s — 9 of 10, twice, with the survivor being the one
+# job that installs nothing — because `apt-get update` exits 100 when ANY
+# configured source fails its index fetch, and the source that failed was
+# Google Chrome's, preinstalled on the runner image and never installed from
+# by this repo. Its own message said the failure was survivable ("They have
+# been ignored, or old ones used instead"); the exit status said otherwise, and
+# a single third-party index outage took the whole battery down for every PR
+# and for `dev`. Six bare sites in tests.yml, two in tests-slow-integration.yml,
+# one in cc-harness.yml, zero mitigations — and `google.*chrome` returns 0 over
+# our YAML, so a grep for the offending source reads as "not our problem".
+# The exposure is the BARE invocation, which is why this is a lint over the
+# construct and not a note about a hostname.
+#
+#   AU001  a `run:` body invokes `apt-get update` with NO earlier line in the
+#          SAME body narrowing /etc/apt/sources.list.d/. The order is the rule:
+#          a narrowing AFTER the update protects nothing.
+#   AU002  the invocation is masked — `|| true` / `|| :` on the update line.
+#          The tempting one-liner and the wrong fix: it converts a genuine
+#          failure of the Ubuntu indexes this build DOES need into a
+#          mysterious missing-package failure a step later. Reported even
+#          when AU001 is satisfied, because masking is wrong on its own.
+#
+# WHAT IS NOT CHECKED, stated: a retry loop. The shipped remedy retries a
+# transient index failure a bounded number of times and then fails loudly,
+# but a retry is a courtesy to the transient case, not the property — the
+# property is that the source list is narrowed to what the build consumes.
+# A step that narrows and does not retry is clean here.
+
+_AU_UPDATE = re.compile(r"\bapt-get\b(?:\s+-{1,2}[\w-]+(?:=\S+)?)*\s+update\b")
+_AU_NARROW = re.compile(r"\brm\b.*\s/etc/apt/sources\.list\.d/")
+_AU_MASK = re.compile(r"\|\|\s*(?:true|:)(?:\s|;|$)")
+
+
+def _au_strip_comment(line):
+    """Drop a trailing `# …` (at start or after whitespace); quotes are not
+    modelled — none of the shapes this family reads carry a quoted `#`."""
+    return re.sub(r"(^|\s)#.*$", "", line)
+
+
+def au_scan(body):
+    """Yield (lineno, statement, rule) for every apt-get update in BODY."""
+    narrowed = False
+    for lineno, raw in enumerate(body.splitlines(), 1):
+        line = _au_strip_comment(raw)
+        if _AU_NARROW.search(line):
+            narrowed = True
+        if not _AU_UPDATE.search(line):
+            continue
+        if _AU_MASK.search(line):
+            yield lineno, raw, "AU002"
+        if not narrowed:
+            yield lineno, raw, "AU001"
+
+
+def _check_apt_update(doc, path, name):
+    """Rule family AU — apt-get update narrowed before, never masked."""
+    jobs = doc.get("jobs")
+    if jobs is None:
+        return [], "%s: no `jobs:` block — no `run:` body to analyse" % name
+    if not isinstance(jobs, dict):
+        raise Refusal("%s: `jobs:` is not a mapping" % path)
+    findings, scanned = [], 0
+    for jobname, job in sorted(jobs.items()):
+        if not isinstance(job, dict):
+            raise Refusal("%s: job %s is not a mapping" % (path, jobname))
+        steps = job.get("steps")
+        if not isinstance(steps, list):
+            continue
+        for step in steps:
+            if not isinstance(step, dict) or not isinstance(step.get("run"), str):
+                continue
+            label = step.get("name") or "(unnamed step)"
+            for lineno, stmt, rule in au_scan(step["run"]):
+                scanned += 1
+                if rule == "AU001":
+                    why = ("bare `apt-get update`: it exits 100 when ANY "
+                           "configured source fails its index, including the "
+                           "runner image's third-party sources this build never "
+                           "installs from. Narrow /etc/apt/sources.list.d/ "
+                           "BEFORE it in the same body")
+                else:
+                    why = ("`apt-get update` is MASKED: `|| true` hides a real "
+                           "failure of the Ubuntu indexes this build needs and "
+                           "moves the red to a missing package a step later. "
+                           "Narrow the source list instead of widening the "
+                           "tolerance")
+                findings.append((
+                    rule,
+                    "job `%s`, step %r, line %d of its `run:` body:\n"
+                    "        %s\n"
+                    "    %s (your-org/nexus-code#1505)."
+                    % (jobname, label, lineno, stmt.strip()[:100], why)))
+            # A clean site still counts as scanned — the note below must not
+            # read a narrowed corpus as "nothing to analyse".
+            if _AU_UPDATE.search(step["run"]):
+                scanned += 1
+    if not scanned:
+        return [], ("%s: no `run:` body invokes apt-get update — nothing to "
+                    "narrow" % name)
+    return findings, None
 
 
 def lint_dir(workflows_dir):
@@ -1722,6 +1956,57 @@ jobs:
         run: bash monitor/watcher/run-tests.sh --state ledger.tsv
 """, [], "the scale is stated outright, so no --jobs is needed"),
 
+    # The VALUE arms (your-org/nexus-code#1300 R3). The positive control for
+    # `td-scale-explicit-job-env` above proves an explicit scale EXEMPTS the
+    # step; these three prove the exemption is conditional on the value being
+    # effective, which is what "presence is a proxy" cost three rounds to see.
+    ("td-scale-inert-value-one", """
+on:
+  push:
+    branches: [dev]
+jobs:
+  band:
+    runs-on: ubuntu-latest
+    env:
+      NEXUS_TEST_DEADLINE_SCALE: 1
+    steps:
+      - name: run the band
+        run: bash monitor/watcher/run-tests.sh --state ledger.tsv
+""", ["TD001"], "scale 1 is a VALID override th_deadline honours — every "
+     "deadline reverts to its bare literal, worse than omitting the pin"),
+
+    ("td-scale-step-overrides-job", """
+on:
+  push:
+    branches: [dev]
+jobs:
+  band:
+    runs-on: ubuntu-latest
+    env:
+      NEXUS_TEST_DEADLINE_SCALE: 2
+    steps:
+      - name: run the band
+        env:
+          NEXUS_TEST_DEADLINE_SCALE: 1
+        run: bash monitor/watcher/run-tests.sh --state ledger.tsv
+""", ["TD001"], "GitHub resolves the INNERMOST scope, so the effective value "
+     "is 1 while the job env still reads 2 — a first-match text scan reports OK"),
+
+    ("td-scale-non-numeric", """
+on:
+  push:
+    branches: [dev]
+jobs:
+  band:
+    runs-on: ubuntu-latest
+    env:
+      NEXUS_TEST_DEADLINE_SCALE: two
+    steps:
+      - name: run the band
+        run: bash monitor/watcher/run-tests.sh --state ledger.tsv
+""", ["TD001"], "th_deadline matches ^[0-9]+$ and silently falls back to "
+     "ceil(jobs/nproc) — the pin does not mean what it says"),
+
     ("td-list-only", """
 on:
   push:
@@ -1881,6 +2166,97 @@ jobs:
           import subprocess
           rc = subprocess.call(["true"])
 """, [], "`shell: python` has no errexit to lose a branch to"),
+    # --- AU: apt-get update narrowed before, never masked (#1505) ---------
+    ("au-bare", """
+on:
+  pull_request:
+    branches: [dev]
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq
+""", ["AU001"], "the #1505 head: a bare apt-get update, nine of them shipped"),
+
+    ("au-narrowed", """
+on:
+  pull_request:
+    branches: [dev]
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          for i in 1 2 3; do sudo apt-get update && break; [ "$i" -lt 3 ] || exit 1; sleep 15; done
+          sudo apt-get install -y --no-install-recommends jq
+""", [], "the shipped remedy is clean — else AU001 fires on everything"),
+
+    ("au-narrowed-after", """
+on:
+  pull_request:
+    branches: [dev]
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          sudo apt-get update
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+""", ["AU001"], "ORDER is the rule: a narrowing after the update protects nothing"),
+
+    ("au-masked", """
+on:
+  pull_request:
+    branches: [dev]
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          sudo apt-get update || true
+          sudo apt-get install -y jq
+""", ["AU002"], "narrowed AND masked: the wrong fix is reported on its own"),
+
+    ("au-masked-bare", """
+on:
+  pull_request:
+    branches: [dev]
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get update || true
+""", ["AU001", "AU002"], "the tempting one-liner earns both rules"),
+
+    ("au-other-step-narrowed", """
+on:
+  pull_request:
+    branches: [dev]
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo rm -f /etc/apt/sources.list.d/google-chrome*
+      - run: sudo apt-get update
+""", ["AU001"], "SAME BODY is the rule: a narrowing in another step is not seen"),
+
+    ("au-comment-only", """
+on:
+  pull_request:
+    branches: [dev]
+jobs:
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          # we used to run apt-get update here
+          echo nothing
+""", [], "a mention in a comment is not an invocation"),
+
 ]
 
 REFUSAL_FIXTURES = [
@@ -2094,8 +2470,8 @@ def main():
 
     print("=== workflow lint: MC (meta-edit eviction) + SR (schedule reachability)"
           " + TD (deadline scaling engaged) + PF (paths filter covers what the "
-          "workflow runs) + EB (status branch reachable under errexit) over %d "
-          "file(s) ===" % len(names))
+          "workflow runs) + EB (status branch reachable under errexit) + AU "
+          "(apt-get update narrowed, never masked) over %d file(s) ===" % len(names))
     for n in notes:
         print(n)
     # State the CHECKED set out loud. "Everything was exempt" is a legitimate
@@ -2114,8 +2490,9 @@ def main():
               "that carries its head's verdict; every scheduled workflow is "
               "reachable; every run-tests.sh invocation engages deadline "
               "scaling; no `paths:` filter omits a file its own workflow "
-              "executes; and no `run:` body branches on a status errexit "
-              "already aborted on.")
+              "executes; no `run:` body branches on a status errexit "
+              "already aborted on; and every `apt-get update` is narrowed to "
+              "the sources the build consumes and never masked.")
         # The PF half is a LOWER BOUND and the clean line must not be read as
         # more than it is. Same rule as everywhere else here: the boundary is
         # declared where the reader forms the belief, not in a docstring.
@@ -2159,6 +2536,12 @@ def main():
               "green path is unaffected, so review cannot see it. Fix with "
               "`rc=0` + `|| rc=$?` on the command, not with `set +e`: the "
               "explicit form survives a later edit moving a line.")
+    if any(k.startswith("AU") for k in kinds):
+        print("AU: a bare `apt-get update` fails the whole battery on an index "
+              "outage of a source this build never installs from, and a masked "
+              "one hides the outage of a source it does. Narrow "
+              "/etc/apt/sources.list.d/ before the update, in the same body; "
+              "retry if you like; never `|| true`.")
     if any(k.startswith("PF") for k in kinds):
         print("PF: a workflow that does not run on a change to the code it "
               "executes provides no evidence about that change — and the "

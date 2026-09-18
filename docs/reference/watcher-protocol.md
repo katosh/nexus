@@ -42,31 +42,43 @@ override. Per-task back-pressure: a task that returns rc=75
 
 ### Registered tasks and cadences
 
-Intervals as registered in `main.sh` (`_schedule_task` calls). The
-last four rows register only when their feature is enabled and the
-interval is `> 0`.
+Intervals as registered in `main.sh` (`_schedule_task` calls). Rows
+marked **conditional** register only when their feature is enabled
+and their interval is `> 0`; the rest register unconditionally.
+
+**There is no `heartbeat` scheduler task, deliberately.** The liveness
+heartbeat is a background `setsid` ticker whose cadence cannot depend
+on this scheduler (see [Liveness signals](#liveness-signals)); a task
+here would make liveness a function of loop workload, which is the
+failure `#491` removed.
 
 | Task | Cadence | Class | Role |
 |---|---|---|---|
 | `target_window` | 2 s | cheap | `_target_window_present`; orchestrator-absence detection + respawn trigger. Force-fires `compose_emit` on rc=2. Presence means a LIVE pane, not a listed name — a `remain-on-exit` corpse is rc=2 (`#741`). |
-| `heartbeat` | 5 s | cheap | Bump `monitor/.state/watcher-heartbeat` (pid + ISO ts). |
 | `orchestrator_liveness` | 5 s | cheap | `_orchestrator_liveness_step`: pid / pin / last-paste wedge detection. |
 | `over_limit_wakes` | 5 s | cheap | `_over_limit_process_wakes`: act on due over-limit wake epochs. |
 | `pending_decisions` | 10 s | cheap | Scan `monitor/.state/decisions/*.json`. |
+| `requests_poll` | 10 s | cheap | `requests_poll_emit` (`_requests.sh`): claim + re-emit the request inbox. |
 | `detect_unstick` | 10 s | medium | `detect_and_unstick`: per-pane wedge fingerprinting (see [Auto-unstick](#auto-unstick)). |
 | `deliveries_poll` | 15 s | medium | `_snapshot_deliveries_raw`: **primary** real-time event source (webhook deliveries, App-JWT bucket). |
+| `orphan_async_wakes` | 15 s | cheap | Act on due orphan-async wake epochs. |
 | `bell_windows` | 30 s | cheap | List standing bells on non-orchestrator/non-monitor windows. |
 | `snapshot_local` | 30 s | medium | `snapshot_local`: `--- reports --- / --- tmux --- / --- git ---`. |
 | `idle_section` | 30 s | expensive | `render_idle_section`: idle-worker transitions (see [Idle classifier](#idle-classifier)). |
 | `over_limit_scan` | 60 s | expensive | `_over_limit_scan_panes`: probe every pane for the usage-limit footer. |
+| `orphan_async_scan` | 60 s | expensive | Scan panes for declared-but-unresumed async work. |
 | `compose_emit` | `monitor.interval_seconds` (default 60 s) | medium | Compose + paste the report if any task staged a signal. |
-| `prune_archive` | 600 s | cheap | Delete archived emits older than `monitor.diff_retention_days` (default 7). |
+| `prune_archive` | 600 s | cheap | Delete archived emits older than `monitor.diff_retention_days` (default 7); rotate the oversized state logs. |
 | `github_poll` | 600 s | expensive | `_snapshot_github_raw`: GraphQL **backstop** (bucket-floor gated). |
 | `full_state_snap` | 600 s | expensive | `render_full_state_snapshot`: periodic cumulative snapshot. |
 | `functional_check` | 600 s | expensive | Bot-reaction wedge detector (see [Functional check](#functional-check)). |
-| `cc_version_check` | `monitor.cc_update.interval_seconds` (default 86400 s) | expensive | Detect a newer Claude Code release than the local pin. |
-| `version_check` | `monitor.version_restart.interval_seconds` (default 60 s) | medium | Component-drift / restart detection (issue `#186`). |
-| `service_health` | `monitor.service_health.interval_seconds` (default 120 s) | medium | Registry-healthcheck watch (see [`--- service health ---`](#startup-sweep)). |
+| `comment_surface` | `monitor.comment_surface.interval_seconds` (default 15 s) | medium | **conditional** (interval `> 0`). Sweep-independent operator-comment surfacing (`#562`); its own fast-path emit, logged `reason=comments`. `0` hands surfacing back to `compose_emit`'s backstop. |
+| `reports_roll` | `monitor.reports_roll.interval_seconds` (default 3600 s) | medium | **conditional** (`monitor.reports_roll.enabled`). Monthly `reports/YYYY-MM/` archive roll; a day-stamp gate makes every tick but the first-of-day a no-op. |
+| `cc_version_check` | `monitor.cc_update.interval_seconds` (default 86400 s) | expensive | **conditional** (interval `> 0`). Detect a newer Claude Code release than the local pin. |
+| `cc_auto_update` | `monitor.cc_auto_update.check_interval_seconds` (default 300 s) | expensive | **conditional** (`monitor.cc_auto_update.enabled` — code default off, shipped template on: `_config.sh` falls back to `false` when an existing `nexus.yml` lacks the key, while a tree with no `nexus.yml` reads `nexus.example.yml`'s `true`; <your-org>/nexus-code#1476). Autonomous daily cc-update routine. Registration is resolved ONCE at startup — toggling the config on a running watcher is inert. |
+| `version_check` | `monitor.version_restart.interval_seconds` (default 60 s) | medium | **conditional** (`monitor.version_restart.enabled`). Component-drift / restart detection (issue `#186`). |
+| `clone_drift` | `monitor.clone_drift.interval_seconds` (default 3600 s) | expensive | **conditional** (`monitor.clone_drift.enabled`). Primary-clone deployment-drift detection (`#614`) — registered independently of `version_check`, because they answer different questions. |
+| `service_health` | `monitor.service_health.interval_seconds` (default 120 s) | medium | **conditional** (`monitor.service_health.enabled`). Registry-healthcheck watch (see [`--- service health ---`](#startup-sweep)). |
 
 `compose_emit` registers at `monitor.interval_seconds` so the
 **steady-state emit cadence** remains the one operator-tunable knob;
@@ -86,6 +98,39 @@ into the target with content-level verification (see
 actual local change to absorb — comment-only resurfaces leave the
 baseline alone so a fresh local change can't be masked (see
 [Resurface and the baseline asymmetry](#resurface-and-the-baseline-asymmetry)).
+
+## Liveness signals
+
+Three separate files, three different questions (`#491`). They used
+to be one — the heartbeat was bumped only at the end of a complete
+compose cycle, which made it a **workload** signal: cycle duration
+scales with worker count while every liveness threshold is a
+constant, so at ≥ 12 workers a healthy watcher was *guaranteed* to
+read DOWN, and every remedy keyed on that verdict killed it
+mid-loop.
+
+| File | Question | Writer |
+|---|---|---|
+| `watcher-heartbeat` | **Liveness** — does the process exist and get scheduled? | A background `setsid` ticker inside the watcher process, at `monitor.watcher.heartbeat_tick_seconds` (default 20 s) — workload-independent *by construction*. Started once the instance lock is held and re-checked every loop iteration, so a crashed ticker self-heals within one tick. Fields: `pid`, `ts`, `target`. |
+| `watcher-progress` | **Forward progress** — is the loop moving? | The main scheduler loop, every iteration and at startup-sweep / compose stage boundaries (`_progress_bump`). |
+| `watcher-cycle` | **Functional proof** — did a full compose cycle complete? | `_cycle_bump` at each correct compose-cycle end (the pre-`#491` heartbeat semantics), carrying the measured loop period (`period_s`, `ema_s`). |
+
+`_watcher_alive <state_dir> <interval> [<dead_cutoff>]` in `_lib.sh`
+folds them into one bucket, and `_watcher_liveness_verdict` renders
+the operator-facing trichotomy on top. **The exit code is the
+answer** — nothing is printed by `_watcher_alive`:
+
+| rc | Verdict | Meaning |
+|---|---|---|
+| 0 | `UP` | heartbeat age ≤ `2 × interval + 15 s`, pid alive, cycle cadence nominal |
+| 1 | `BUSY` | heartbeat aging (≤ `5 × interval`, inclusive at the top) or the measured period exceeds `2 × interval` — **healthy under load; do not restart** |
+| 4 | `WEDGED` | alive, but progress/cycle stalled past the measured-period cutoff |
+| 2 | `DOWN` | heartbeat dead-stale, or its pid is no longer a live watcher **and** the instance flock is free |
+| 3 | (no heartbeat) | the file does not exist |
+
+`dead_cutoff` only ever *raises* the DOWN threshold — the
+supervise-tick passes one above the watcher's own async hang-watchdog
+floor so it cannot race a self-healing cycle.
 
 ## Event surfaces
 
@@ -176,7 +221,8 @@ an unhealthy bucket.
 
 Surfaces cross-repo activity that mentions `github.user_login` in
 repos where the App is NOT installed — the gap deliveries can't
-reach. Enabled by `monitor.mentions_enabled: true`.
+reach. **Off by default** (`monitor.mentions_enabled`, default
+`false`); set it to `true` to opt in.
 
 Uses GraphQL `search` with the `mentions:<user_login>` qualifier
 (`mentions:<bot_login>` does not index `[bot]` accounts — confirmed
@@ -266,22 +312,29 @@ infrastructure health the operator must not miss.
 | `--- watcher hosting migration ---` | watcher started legacy window-hosted | Startup sweep only; at most once per watcher lifecycle. |
 | `--- component drift (restart needed) ---` | a nexus-code component changed on disk and its restart needs the orchestrator | Every cycle; only the *asks* surface (automated restarts don't). Re-nag-guarded per candidate hash. |
 | `--- service health ---` | a registered infra service failed its healthcheck | Every cycle; full state always reported. See [Startup sweep](#startup-sweep). |
-| `--- claude code update available ---` | a newer release than the local pin | GATED advisory; surfaced once per candidate. |
-| `<local diff>` | a signal local-state diff | Unified diff, ≤ 120 lines. |
+| `--- claude code update available ---` | a newer release than the local pin | GATED advisory; surfaced once per candidate. **Emit is OFF by default** — `monitor.cc_update.emit_enabled` defaults to `false`, so `_cc_update_emit_section` returns early and the section never renders. Detection still runs and maintains `monitor/.state/cc-update-available`; the autonomous `cc_auto_update` routine closes the loop without the nag. Set it to `true` to restore the manual gate. |
+| `--- reports archived ---` | the auto-roll moved aged reports into `reports/YYYY-MM/` | One-shot audit breadcrumb, written only on a run that moved ≥ 1 file, then consumed. Informational. |
+| `--- local state changes ---` | a signal local-state diff | Unified diff, `head -120` at the source. **The only truncatable-by-default section** — `_cap_emit_sections` caps it at `MONITOR_EMIT_SECTION_MAX_LINES` (default 50) content lines and replaces the overflow with one `[+N more lines omitted]` marker. Every other section in this table is on the exempt allowlist and is never truncated. |
 | `--- eligible github comments ---` | non-empty eligible-comment list | Per-cycle; resurfaces while non-empty. |
 | `--- standing bells ---` | non-empty bell list | Per-cycle; cleared after emit. |
-| `--- pending decisions ---` | a worker/relay wrote a decision record **and its pane is not already being driven forward** | Structured per-decision channel (issue `#129`), sourced from `monitor/.state/decisions/*.json`. Ack = **`ng decision-ack <window> <fp>`**, cited on the row itself; `rm`ing the file does NOT stick (`#790`). Rows are gated on live `pane-state.sh` classification: `busy` / `working-background` / `working-self-paced` / `user-typing` / any `queued=1` pane withholds, everything else — including `blocked`, `idle`, `absent` and every indeterminate reading — emits. Also the relay sink for Case W (see [Auto-unstick](#auto-unstick)). |
+| `--- pending decisions ---` | a worker/relay wrote a decision record **and its pane is not already being driven forward** | Structured per-decision channel (issue `#129`), sourced from `monitor/.state/decisions/*.json`. Ack = **`ng decision-ack <window> <fp>`**, cited on the row itself; `rm`ing the file does NOT stick (`#790`). Rows are gated on live `pane-state.sh` classification: `busy` / `working-background` / `working-self-paced` / `user-typing` / any `queued=1` pane withholds, everything else — including `blocked`, `idle`, `absent` and every indeterminate reading — emits (`bk_decision_row_actionable`, `monitor/_bookkeeping.sh`). Also the relay sink for Case W (see [Auto-unstick](#auto-unstick)). |
+| `--- requests ---` | a claimed request in the watcher-mediated inbox | Sourced from `monitor/.state/requests/*.claimed.md` (`_requests.sh`), re-emitted with cooldown / cap / origin fairness. Each row carries its own `handling:` line saying how THAT request closes — `ng request reply <id>` or `ng request ack <id>`; a `reply:required` request refuses a bare ack. |
 | `--- idle workers ---` | non-empty idle-transition list | Per-cycle; emitted on transitions only. |
 | `--- workspace snapshot ---` | periodic full-state cadence | Cumulative view between transition emits. |
-| `--- dashboard ---` | always | Footer; "stale" advisory only at age ≥ 2 h. |
+| `--- dashboard ---` | always | Footer. Prints `last put: <ts> (local stamp — when \`ng dashboard put\` last ran here)` from `monitor/.state/dashboard-updated.ts`. **It is deliberately NOT a staleness check** (`#1010`): nothing here reads the issue body, so past 2 h it says so in those words and points at `ng dashboard get` rather than nudging a `put`. |
 
 The **idle-workers** section names a state about other tmux windows
 and deserves its own classifier vocabulary.
 
 ### Idle classifier
 
-`_idle_probe.sh` enumerates worker windows (everything except
-`watcher`, `claude`, `orchestrator`, `monitor`) and classifies each
+`_idle_probe.sh` enumerates worker windows — everything except the
+configured target window (`$TARGET`, whatever `monitor.target_window`
+names it), the cockpit window (`$SERVICES_WINDOW`, default
+`services`), the reserved names `watcher` / `claude` /
+`orchestrator` / `monitor`, every window named in
+`monitor/services.registry` (field 1), and the transient `•`-prefixed
+`sandbox-notify` bell windows — and classifies each
 whose **engagement-anchored** idle age has crossed
 `monitor.idle_threshold_seconds` (default 60) AND whose
 `monitor/pane-state.sh` reports an idle-shaped state
@@ -580,10 +633,35 @@ through `_watcher_handle_graphql_failure`:
   noise); one log line per surface per 10 min to
   `monitor/.state/watcher-alerts.log`.
 
+A backoff cannot outlive `MONITOR_GRAPHQL_BACKOFF_MAX_SECONDS`
+(default 900): past that ceiling it reconciles regardless of what the
+API-supplied reset epoch said, logging `graphql_backoff_reconciled
+reason=<...>`. **Because a suppression of the operator channel must
+not be reportable only through the channel it mutes**, a long-held
+backoff also raises its own sentinel.
+
+The sentinel vocabulary on the emit path, all sharing the
+`watcher_alert=<kind>` header shape and a `  body:` line:
+
+| Sentinel | Raised when |
+|---|---|
+| `watcher_alert=rate-limit surface=<s> reset=<epoch>` | the bucket exhausted and a backoff was armed |
+| `watcher_alert=graphql-backoff surface=<s> held_s=<n> ceiling_s=<n>` | a backoff has been holding long enough that comments on that surface are demonstrably not reaching the emit |
+| `watcher_alert=ingest-degraded surface=<s> kind=<partial\|truncated\|total> …` | the fetch is discarding pages, stopping early, or failing outright on every attempt |
+| `watcher_alert=ingest-recovered surface=<s>` | the fetch is succeeding again; anything withheld surfaces this cycle |
+
 To inspect after a suspected silence, `tail
-monitor/.state/watcher-alerts.log` for `WARN <surface>
-graphql_rate_limit reset=...` (rate-limit fires) or
-`graphql_failure ...` (other failure classes).
+monitor/.state/watcher-alerts.log`. Most lines are
+`[<iso>] WARN <surface> <key> <detail>` — `graphql_rate_limit
+reset=<epoch> reset_iso=<iso>` (rate-limit fires), `graphql_failure
+<detail>` (other failure classes), `graphql_backoff_clamped`,
+`graphql_backoff_suppressing`, `graphql_backoff_reconciled` (arm,
+announce, ceiling reconciliation), `graphql_partial_walk` and
+`graphql_degraded_escalated`. **Two carry no `<surface>` field**, so
+do not parse the log positionally: `[<iso>] WARN graphql_gate <kind>
+<detail>` (bucket-floor probe failures, throttled to one line per
+class per 10 min) and `[<iso>] WARN mint-token …`. The set is not
+closed — `grep 'WARN'` rather than an enumerated key list.
 
 ### Anthropic API rate limit (cascade)
 
@@ -650,16 +728,48 @@ cockpit under `bwrap --unshare-pid` — separate pid namespaces and
 `_watcher_pid_is_live_watcher`, the tmux cockpit-peer scan) go blind
 across two sandboxes sharing one bind-mounted `monitor/.state/` and
 would clobber a live peer. flock keys on the inode, not the pid, so it
-crosses the pid-namespace boundary; on the NFSv3 state mount
-(`local_lock=none`) lock requests are forwarded to the server's NLM, so
-it crosses the host boundary too. A same-host flock auto-releases on
-holder death (even SIGKILL), so the only stale class is a *cross-host*
-NFS lock whose holding client died without the server's lock manager
-reclaiming it, or a same-host lock whose machine *rebooted* since
-(detected by a `boot_id` mismatch). Because the blessed self-replace
-paths (`launcher.sh --replace`, version-restart self-restart,
-`bootstrap-recover`) terminate the prior watcher before the successor
-starts, the guard blocks coexistence, never succession.
+crosses the pid-namespace boundary. A same-host flock auto-releases on
+holder death (even SIGKILL), so same-host decisions need no staleness
+logic at all — except after a *reboot*, detected by a `boot_id`
+mismatch against the recorded holder.
+
+**flock does NOT reliably arbitrate across HOSTS, and the code does
+not assume it does.** `flock(2)` over NFS is implementation-dependent,
+and empirically it did not block a second cockpit on another host
+sharing this NFS state dir — a remote starter can see the lock as
+free. The cross-host layer is a **separate heartbeat beacon**,
+`monitor/.state/nexus-instance.heartbeat`, that the live watcher
+rewrites atomically (tmp + rename, so a reader never sees a torn file,
+and a distinct inode from the flock target so a refresh never renames
+the locked one) on every loop iteration. It records `host`, `boot_id`,
+`pid_ns`, `pid`, `tmux`, `nexus_root`, an integer `epoch`, a human
+`ts`, and a per-instance `nonce` generated once at startup.
+
+`_nexus_instance_remote_verdict` classifies a beacon from the vantage
+of a caller whose same-host flock probe already came back free —
+`none` / `same-host` / `stale-remote` are all *free*; only
+`live-remote` (another host, `epoch` age ≤
+`monitor.instance_heartbeat_staleness_seconds`, default 600 s, or
+future-dated by clock skew) refuses, at **exit `4`**, naming the
+holding host. `corrupt` is decided asymmetrically **on purpose**: the
+starter preflight fails closed on it, while `acquire_instance_lock`
+proceeds — a watcher restart path must never self-block, and the flock
+is its same-host backstop. A dead remote holder needs no intervention:
+the beacon ages out of the window and the next start takes over.
+
+The running watcher additionally **self-fences**
+(`_nexus_instance_fence_decision`): before each per-loop refresh it
+classifies the beacon on disk and stands down rather than overwriting
+a *different* instance's fresh beacon — the case where this loop
+wedged past the staleness window, a peer legitimately took over, and
+this loop then un-wedged. Identity is the `nonce` when both sides
+carry one (so even a **same-host** second instance fences), falling
+back to `host` for a beacon written by a watcher predating the field.
+
+Because the blessed self-replace paths (`launcher.sh --replace`,
+version-restart self-restart, `bootstrap-recover`) terminate the prior
+watcher before the successor starts, the guard blocks coexistence,
+never succession.
 
 The lock file's body is advisory diagnostics for the refusal message;
 liveness is the flock itself, never the text. Recorded at acquire time
@@ -688,17 +798,25 @@ that was idle pre-restart and is still idle now produces no
 transition (no emit) on startup; only a worker whose state changed
 between the previous live cycle and now is surfaced.
 
-Three advisory sections ride only the startup sweep, each surfaced
-at most once: `--- install failure ---` (the launcher's project-local
-Claude Code install failed; flag files consumed on first emit),
-`--- claude code update available ---` (a newer release than the
-local pin; re-nag-guarded per candidate), and `--- watcher hosting
-migration ---` (this watcher started legacy window-hosted instead of
-as the headless service; once per watcher start — see
-[Operating → Upgrading](../operating/upgrading.md)).
+Three sections ride **only** the startup sweep, because the poll path
+passes them empty: `--- install failure ---` (the launcher's
+project-local Claude Code install failed; flag files consumed on first
+emit), `--- watcher hosting migration ---` (this watcher started
+legacy window-hosted instead of as the headless service; once per
+watcher start — see
+[Operating → Upgrading](../operating/upgrading.md)), and
+`--- watcher revived (was down) ---` (the supervisor's revival marker,
+surfaced by the revived watcher's first emit and then cleared).
 
-A fourth advisory section, `--- component drift (restart needed)
----`, rides **every** cycle (not just the startup sweep): when a
+`--- claude code update available ---` is **not** one of them: it
+rides every cycle (there is a dedicated `poll-cc-update` emit reason),
+re-nag-guarded per candidate — but its emit gate,
+`monitor.cc_update.emit_enabled`, defaults to `false`, so on a stock
+config the section never renders at all.
+
+A further advisory section, `--- component drift (restart needed)
+---`, likewise rides **every** cycle (not just the startup sweep):
+when a
 nexus-code component changed on disk and its restart needs the
 orchestrator — a cockpit ask (the TUI is orchestrator-owned, so the
 watcher never kills it), a tripped self-restart loop guard, or a
@@ -711,7 +829,7 @@ candidate hash. See
 [`monitor/watcher/_version_restart.sh`](https://github.com/<your-org>/nexus-code/blob/main/monitor/watcher/_version_restart.sh)
 and [Operating → Upgrading](../operating/upgrading.md).
 
-A fifth section, `--- service health ---`, also rides **every**
+`--- service health ---` also rides **every**
 cycle: the `service_health` task (cadence
 `monitor.service_health.interval_seconds`, default 120 s) runs every
 registered infra service's registry healthcheck. On an unhealthy one
@@ -759,8 +877,11 @@ The full body of a typical emit, in section order:
 ```text
 === nexus state changed at 2026-05-11T13:42:01-07:00 (poll) ===
 *If unsure how to proceed: see CLAUDE.md.*
+workspace: 4 busy | 2 idle | 0 retained | …      # always; PARTIAL/STALE/UNAVAILABLE when the render degrades
 
-<unified local diff, ≤ 120 lines>      # only when local_diff non-empty
+--- local state changes ---            # only when local_diff non-empty
+<unified diff; capped at MONITOR_EMIT_SECTION_MAX_LINES (default 50)>
+  [+37 more lines omitted]
 
 --- eligible github comments ---       # only when non-empty
 issue=42 id=4567890 author=user_login
@@ -777,22 +898,25 @@ issue=42 id=4567890 author=user_login
 (emitted on transitions only; see skills/nexus.window-cleanup)
 
 --- service health ---                  # only when a registry service is unhealthy
-service 'dolimap-serve' DOWN and NOT auto-recovering (FLAPPING): unhealthy since 2026-05-11T13:30:00-07:00; 3 restart attempt(s) did not hold.
+service 'mysite-serve' DOWN and NOT auto-recovering (FLAPPING): unhealthy since 2026-05-11T13:30:00-07:00; 3 restart attempt(s) did not hold.
   failing healthcheck: curl -fsS -o /dev/null --max-time 3 http://localhost:8765/
   ACTION (skills/nexus.service-recovery): restore first, then dispatch a root-cause worker + open an operator incident issue.
-    incident issue: monitor/ng service-incident dolimap-serve
+    incident issue: monitor/ng service-incident mysite-serve
 
 --- dashboard ---
-last updated: 2026-05-11T11:10:00-07:00
-(> 2h old; refresh via `monitor/ng dashboard put`)
+last put: 2026-05-11T11:10:00-07:00 (local stamp — when `ng dashboard put` last ran here)
+(no put in > 2h. NOT a staleness check: nothing here reads the issue
+ body, so the dashboard may be current, or stale, or edited elsewhere.
+ To KNOW, read it: `monitor/ng dashboard get`.)
 
 --- nexus-emit-sig 2026-05-11T13:42:01-07:00 a1b2c3 ---
 ```
 
 The CLAUDE.md cue line sits directly under the header — a
 pre-attentional reminder for when an emit isn't self-explanatory.
-The dashboard footer's "stale" advisory fires only at age ≥ 2 h, so
-fresh dashboards don't generate noise. The trailer signature is
+The dashboard footer's advisory fires only at age ≥ 2 h, so a recent
+`put` generates no noise — and it is a claim about a **local stamp**,
+never about the issue body (`#1010`). The trailer signature is
 unique per emit and lives near the bottom of the rendered message
 so it rarely scrolls out of the capture-pane window even for long
 bodies.

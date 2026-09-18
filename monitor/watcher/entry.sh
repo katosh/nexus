@@ -188,7 +188,38 @@ fi
 
 # --- resume-intent reconciliation -----------------------------------------
 
-TARGET="$("$_cfg" monitor.target_window orchestrator)"
+TARGET="$("$_cfg" monitor.target_window orchestrator)"; _target_rc=$?
+# CONSULT THE rc, AND REFUSE AN EMPTY VALUE (your-org/nexus-code#1093).
+# `$TARGET` is the needle of the boot-detection test at the `grep -qxF` below,
+# and an empty needle there fails OPEN in a way `-x` normally prevents:
+# `grep -qxF ""` does NOT match `orchestrator\nemptyneedle`, but a HERE-STRING
+# on an EMPTY command substitution supplies ONE EMPTY LINE — so when tmux fails
+# or the server is absent, the empty needle matches that manufactured line and
+# `orch_present=1`. "Is the orchestrator here?" is then answered PRESENT on no
+# evidence, and a broken environment is exactly when entry.sh runs.
+#
+# Both routes to an empty TARGET are MEASURED, not hypothesised, and the first
+# is the one an unconsulted rc cannot even see:
+#   * `monitor: {target_window: ""}` in config/nexus.yml -> rc 0, empty stdout.
+#     A key present-but-empty is a config typo, and load.sh's default only
+#     covers a MISSING key, so nothing downstream is loud.
+#   * no config found at all -> rc 1, empty stdout, diagnostic on stderr.
+# Before this, `$?` was discarded on the same line it was produced — CLAUDE.md's
+# `fromisoformat` mode 2: the error is not lost, it is merely off the path that
+# produces the answer.
+#
+# REFUSING (rather than falling back to `orchestrator`) is this repo's settled
+# policy for this exact value: launcher.sh:113 already exits 2 on `--target ""`
+# rather than substituting its default, and test-launcher-empty-target.sh pins
+# that. A watcher that guesses its own cockpit's name is worse than one that
+# stops.
+if (( _target_rc != 0 )) || [[ -z "$TARGET" ]]; then
+    echo "watcher: monitor.target_window resolved EMPTY (config read rc=$_target_rc) —" \
+         "refusing to boot rather than guess. An empty window name makes the" \
+         "orchestrator-present test below match a here-string's manufactured empty" \
+         "line and report PRESENT on no evidence (your-org/nexus-code#1093)." >&2
+    exit 2
+fi
 # Cockpit window name — config-resolved so the rename here, the idle-probe
 # exemption, svc.sh, and bootstrap-recover all track one value
 # (your-org/your-nexus#204). Env override: MONITOR_SERVICES_WINDOW.

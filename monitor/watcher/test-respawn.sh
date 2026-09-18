@@ -47,7 +47,8 @@ assert_eq() {
 
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         pass "$label"
     else
         fail "$label — missing literal: $needle"
@@ -96,6 +97,11 @@ TMUX_STUB_BIN="$WORK/stub-bin"
 mkdir -p "$TMUX_STUB_BIN"
 TMUX_LOG="$WORK/tmux-calls.log"
 : > "$TMUX_LOG"
+# Declared here (not beside its stub, further down) so the pane-state stub
+# below can bake in BOTH log paths: an arm driven by the capture stub logs
+# its Enter to THIS file, and the pane must go busy for that arm too.
+TMUX_CAP_LOG="$WORK/tmux-calls-cap.log"
+: > "$TMUX_CAP_LOG"
 
 cat > "$TMUX_STUB_BIN/tmux" <<STUB
 #!/bin/bash
@@ -103,7 +109,7 @@ printf '%s\n' "tmux \$*" >> "$TMUX_LOG"
 case "\$1" in
     list-windows)
         fmt="\$3"
-        if [[ -f "$WORK/tmux-target-absent" ]]; then
+        if [[ -f "$WORK/tmux-target-absent" ]] && ! grep -q 'new-window' "$TMUX_LOG"; then
             names=("watcher")
         else
             names=("watcher" "orchestrator")
@@ -119,19 +125,84 @@ case "\$1" in
             idx=\$(( idx + 1 ))
         done
         ;;
+    new-window)
+        # -P -F '#{window_id}' makes tmux print the id of the window it just
+        # created, and _respawn_spawn_window keys its rc=3 contract on that
+        # handle rather than on a presence-by-NAME probe (your-org/nexus-code
+        # #1327). A stub answering with ZERO BYTES models "created nothing",
+        # so the arm has to speak the handle or every spawn reads as a
+        # failure. Most stubs in this corpus already do -- spawn-worker.sh
+        # has used the same discriminator since #323; the respawn family
+        # was the outlier, in the code and in its fixtures alike.
+        #
+        # NO BACKTICKS IN THIS HEREDOC. It is UNQUOTED (<<STUB), so a
+        # backticked word in a COMMENT is command-substituted when the
+        # fixture is written -- measured at HEAD: six `command not found`
+        # lines per run, from this very comment (your-org/nexus-code#1157).
+        printf '@7\n'
+        exit 0
+        ;;
     *) exit 0 ;;
 esac
 STUB
 chmod +x "$TMUX_STUB_BIN/tmux"
 
-# Stub pane-state.sh — always answers state=idle so the readiness
-# probe passes instantly (these tests focus on the launcher
-# composition, not the paste-pipeline race conditions covered by
-# test-spawn-fresh-orchestrator.sh).
+# Stub pane-state.sh. STATEFUL BY NECESSITY (your-org/nexus-code#1470).
+#
+# The respawn path asks pane-state TWO questions whose accepted answers are
+# DISJOINT: readiness accepts `empty|idle`, post-paste submit-evidence accepts
+# `busy` (it accepted `busy|user-typing` until the typed-retry arms below
+# showed `user-typing` is the signature of an UNSUBMITTED brief). A static
+# stub can satisfy at most one of them, and the
+# static `idle` this used to print satisfied readiness while making
+# submit-evidence UNREACHABLE. Worse, the tmux stub kept the target window
+# ABSENT for the whole call, so `_respawn_probe_state` could never resolve an
+# index and pane-state was NEVER INVOKED AT ALL -- measured: zero calls across
+# the entire suite. Every arm therefore drove the exhausted-retry path and
+# asserted rc 0 on it, which is the #1470 defect pinned as expected behaviour
+# by its own regression suite. Six arms went red the moment the helper began
+# reporting an undelivered brief honestly.
+#
+# So presence and busy-ness are both CAUSED, not scripted: the tmux stubs
+# reveal the window once `new-window` appears in their log, and this stub
+# reports `busy` once an `Enter` appears there. Both derive from a log the
+# arms already truncate between scenarios, so nothing leaks between arms and
+# no new bookkeeping is added. `PSTUB_SUBMIT_EVIDENCE=0` pins it to `idle`
+# forever: that is the FAILURE arm -- the paste landed and no turn began.
 PANE_STATE_STUB="$FAKE_NEXUS/monitor/pane-state.sh"
-cat > "$PANE_STATE_STUB" <<'PSTUB'
+cat > "$PANE_STATE_STUB" <<PSTUB
 #!/bin/bash
-printf 'state=idle active=1 window=%s name=orchestrator\n' "$1"
+# PSTUB_TYPING_ENTERS=N: the brief LANDS but does not submit until the Enter
+# count exceeds N. Before any Enter the pane is idle (readiness); after 1..N
+# Enters it reads user-typing with typed input -- the brief sitting in the box,
+# measured 2026-09-11 -- and only after Enter N+1 does it go busy. Caused by
+# the tmux logs, like the arm below, so it self-resets with them.
+if [ -n "\${PSTUB_TYPING_ENTERS:-}" ]; then
+    n=\$(cat "$TMUX_LOG" "$TMUX_CAP_LOG" 2>/dev/null | grep -c 'send-keys .* Enter')
+    if [ "\$n" -eq 0 ]; then
+        printf 'state=idle active=1 window=%s name=orchestrator\\n' "\$1"
+    elif [ "\$n" -le "\$PSTUB_TYPING_ENTERS" ]; then
+        # PSTUB_TYPING_INPUT picks the input= value (default typed); `none`
+        # drops the field entirely.
+        case "\${PSTUB_TYPING_INPUT:-typed}" in
+            none) printf 'state=user-typing active=1 window=%s name=orchestrator\\n' "\$1" ;;
+            *)    printf 'state=user-typing active=1 window=%s name=orchestrator input=%s\\n' "\$1" "\${PSTUB_TYPING_INPUT:-typed}" ;;
+        esac
+    else
+        printf 'state=busy active=1 window=%s name=orchestrator\\n' "\$1"
+    fi
+    exit 0
+fi
+# The pane reports \`busy\` only AFTER an Enter has been sent -- read off the
+# tmux stubs' own logs, so the answer is CAUSED by the paste rather than by a
+# call count, and self-resets with the log truncation every arm already does.
+# Both logs are consulted: an arm may be driven by either stub.
+if [ "\${PSTUB_SUBMIT_EVIDENCE:-1}" = "1" ] \\
+   && grep -qs 'send-keys .* Enter' "$TMUX_LOG" "$TMUX_CAP_LOG"; then
+    printf 'state=busy active=1 window=%s name=orchestrator\\n' "\$1"
+else
+    printf 'state=idle active=1 window=%s name=orchestrator\\n' "\$1"
+fi
 PSTUB
 chmod +x "$PANE_STATE_STUB"
 
@@ -296,9 +367,213 @@ tmux_log=$(cat "$TMUX_LOG")
 assert_contains "load-buffer received the prompt file" \
                 "$tmux_log" "load-buffer -b nexus-respawn"
 assert_contains "paste-buffer targeted the new window" \
-                "$tmux_log" "paste-buffer -b nexus-respawn"
+                "$tmux_log" "paste-buffer -p -b nexus-respawn"
 assert_contains "send-keys submitted Enter after paste" \
                 "$tmux_log" "send-keys -t orchestrator Enter"
+
+# --- Test 3b: the post-paste verification DECIDES the rc (#1470) --------
+#
+# A PAIR, varying exactly ONE thing: whether the pane ever reports a
+# submitted turn. Everything else -- the spawn, the paste, the Enter -- is
+# byte-identical between the arms, which is what makes the failing arm
+# evidence about the VERIFICATION rather than about the transport.
+#
+# Before #1470 both arms returned 0: `paste_rc` was set only when `tmux
+# send-keys` itself failed, so the function reported the TRANSPORT's success
+# and never the OUTCOME's. Test 3 above is the positive half of this pair --
+# it now genuinely reaches `state=busy` -- and this is the negative half.
+
+echo '=== #1470: submit-evidence PRESENT vs ABSENT decides the return code ==='
+: > "$TMUX_LOG"
+touch "$WORK/tmux-target-absent"
+: > "$WORK/respawn-1470.log"
+
+(
+    NEXUS_ROOT="$FAKE_NEXUS"
+    export NEXUS_ROOT
+    PATH="$TMUX_STUB_BIN:$PATH"
+    export PATH
+    PANE_STATE_BIN="$PANE_STATE_STUB"
+    export PANE_STATE_BIN
+    FRESH_SPAWN_READINESS_BUDGET_SECONDS=2
+    export FRESH_SPAWN_READINESS_BUDGET_SECONDS
+    FRESH_SPAWN_READINESS_POLL_SECONDS=0
+    export FRESH_SPAWN_READINESS_POLL_SECONDS
+    FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1
+    export FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS
+    # THE ONE VARIABLE: the pane never leaves `idle`, so the Enter never
+    # produces a turn. This is the production signature -- both recorded
+    # incidents read `last state='unknown'`, the state that means "could not
+    # look at all", and resolving THAT as delivered is the permissive-default
+    # arm CLAUDE.md singles out for kill decisions, applied to a delivery.
+    PSTUB_SUBMIT_EVIDENCE=0
+    export PSTUB_SUBMIT_EVIDENCE
+
+    # shellcheck source=_respawn.sh
+    . "$_test_dir/_respawn.sh"
+    log() { printf '%s\n' "$1" >> "$WORK/respawn-1470.log"; }
+
+    _respawn_orchestrator orchestrator --prompt-file "$PROMPT" --log-fn log
+) 2>"$WORK/stderr-3b.log"
+rc=$?
+rm -f "$WORK/tmux-target-absent"
+
+assert_eq "rc 4 when the pane NEVER reports a submitted turn" "$rc" "4"
+
+tmux_log_3b=$(cat "$TMUX_LOG")
+respawn_log_3b=$(cat "$WORK/respawn-1470.log")
+
+# THE DISCRIMINATOR: the transport succeeded end to end. Without these two the
+# rc 4 above would be satisfied by a fixture in which the paste simply never
+# happened, and the arm would prove nothing about verification.
+assert_contains "…and the paste-buffer still landed (the transport SUCCEEDED)" \
+                "$tmux_log_3b" "paste-buffer -p -b nexus-respawn"
+assert_contains "…and Enter was still sent" \
+                "$tmux_log_3b" "send-keys -t orchestrator Enter"
+
+assert_contains "…the retry fired first (the fix is not fewer retries)" \
+                "$respawn_log_3b" "retrying Enter once"
+assert_contains "…and exhausting it is REPORTED, not passed through" \
+                "$respawn_log_3b" "reporting UNDELIVERED (rc 4)"
+
+# --- Test 3c: `user-typing` is NOT submit evidence; typed input gets Enter ---
+#
+# Measured 2026-09-11: watcher.log 04:28:06 logged "post-paste verify (after
+# retry): state=user-typing — turn submitted" while the recovery brief sat in
+# the orchestrator's input box (`state=user-typing input=typed`) for ~5.5 min,
+# until one hand-sent Enter submitted it. The old predicate accepted
+# `busy|user-typing`, so #1470's UNDELIVERED arm could not fire for this shape.
+#
+# Every arm below differs from the others only in the pane's answer; the paste
+# and the Enter transport are identical. THE ENTER COUNT is the discriminator
+# the rc alone cannot give: pre-fix, A2 also returns 0 — after ONE Enter,
+# having mistaken the typed box for a submitted turn.
+ARM_RC=0
+ARM_ENTERS=0
+run_typed_arm() {   # run_typed_arm <logfile> [NAME=value…]
+    ARM_LOG="$1"; shift
+    : > "$TMUX_LOG"
+    : > "$ARM_LOG"
+    touch "$WORK/tmux-target-absent"
+    (
+        export NEXUS_ROOT="$FAKE_NEXUS" PATH="$TMUX_STUB_BIN:$PATH" PANE_STATE_BIN="$PANE_STATE_STUB"
+        export FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 FRESH_SPAWN_READINESS_POLL_SECONDS=0
+        export FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1
+        export FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS=4 FRESH_SPAWN_SUBMIT_TYPED_RETRY_INTERVAL_SECONDS=1
+        for kv in "$@"; do export "$kv"; done
+        # shellcheck source=_respawn.sh
+        . "$_test_dir/_respawn.sh"
+        log() { printf '%s\n' "$1" >> "$ARM_LOG"; }
+        _respawn_orchestrator orchestrator --prompt-file "$PROMPT" --log-fn log
+    ) 2>"$ARM_LOG.stderr"
+    ARM_RC=$?
+    rm -f "$WORK/tmux-target-absent"
+    ARM_ENTERS=$(grep -c 'send-keys -t orchestrator Enter' "$TMUX_LOG")
+}
+
+echo '=== 3c A1: the brief sits typed in the box and never submits → rc 4, not "submitted" ==='
+run_typed_arm "$WORK/typed-a1.log" PSTUB_TYPING_ENTERS=999
+assert_eq "A1 rc 4 — a typed, unsubmitted brief is UNDELIVERED" "$ARM_RC" "4"
+assert_not_contains "A1 never logs 'turn submitted'" "$(cat "$WORK/typed-a1.log")" "turn submitted"
+assert_contains "A1 the typed-retry fired" "$(cat "$WORK/typed-a1.log")" "typed-retry 1"
+assert_contains "A1 exhaustion is REPORTED" "$(cat "$WORK/typed-a1.log")" "reporting UNDELIVERED (rc 4)"
+if (( ARM_ENTERS >= 3 )); then
+    pass "A1 Enter re-sent while the box held typed text (${ARM_ENTERS} Enters)"
+else
+    fail "A1 expected >= 3 Enters (paste + retry + typed-retry), got ${ARM_ENTERS}"
+fi
+
+echo '=== 3c A2: Enter is ignored twice more, then takes → rc 0 after typed-retries ==='
+run_typed_arm "$WORK/typed-a2.log" PSTUB_TYPING_ENTERS=3
+assert_eq "A2 rc 0 once a later Enter actually submits" "$ARM_RC" "0"
+assert_eq "A2 exactly 4 Enters: paste, retry, two typed-retries" "$ARM_ENTERS" "4"
+assert_contains "A2 logs the typed-retry submission" "$(cat "$WORK/typed-a2.log")" "typed-retries): state=busy — turn submitted"
+
+echo '=== 3c A3: a normal submit is untouched — ONE Enter, no typed-retry ==='
+run_typed_arm "$WORK/typed-a3.log"
+assert_eq "A3 rc 0" "$ARM_RC" "0"
+assert_eq "A3 exactly 1 Enter" "$ARM_ENTERS" "1"
+assert_not_contains "A3 no typed-retry" "$(cat "$WORK/typed-a3.log")" "typed-retry"
+
+echo '=== 3c A4: an IDLE pane gets the single #1470 retry and no typed-retry ==='
+run_typed_arm "$WORK/typed-a4.log" PSTUB_SUBMIT_EVIDENCE=0
+assert_eq "A4 rc 4" "$ARM_RC" "4"
+assert_eq "A4 exactly 2 Enters (no hammering a pane with nothing in its box)" "$ARM_ENTERS" "2"
+assert_not_contains "A4 no typed-retry" "$(cat "$WORK/typed-a4.log")" "typed-retry"
+
+echo '=== 3c A5: budget 0 disables the typed-retry, and typed is STILL not submitted ==='
+run_typed_arm "$WORK/typed-a5.log" PSTUB_TYPING_ENTERS=999 FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS=0
+assert_eq "A5 rc 4" "$ARM_RC" "4"
+assert_eq "A5 exactly 2 Enters" "$ARM_ENTERS" "2"
+
+# A6/A7 (w234sk F8): the typed-retry is an ALLOWLIST. Enter is pressed only on
+# a positive `input=typed`. `input=?` is undecidable, and CLAUDE.md says to read
+# it as a draft; a line with no `input=` field has said nothing about the box.
+# Both must get the single #1470 retry and no typed-retry.
+echo '=== 3c A6: user-typing with input=? → NO typed-retry (an undecidable box is a draft) ==='
+run_typed_arm "$WORK/typed-a6.log" PSTUB_TYPING_ENTERS=999 'PSTUB_TYPING_INPUT=?'
+assert_eq "A6 rc 4" "$ARM_RC" "4"
+assert_eq "A6 exactly 2 Enters (paste + the single retry)" "$ARM_ENTERS" "2"
+assert_not_contains "A6 no typed-retry" "$(cat "$WORK/typed-a6.log")" "typed-retry"
+
+echo '=== 3c A7: user-typing with NO input= field → NO typed-retry ==='
+run_typed_arm "$WORK/typed-a7.log" PSTUB_TYPING_ENTERS=999 PSTUB_TYPING_INPUT=none
+assert_eq "A7 rc 4" "$ARM_RC" "4"
+assert_eq "A7 exactly 2 Enters" "$ARM_ENTERS" "2"
+assert_not_contains "A7 no typed-retry" "$(cat "$WORK/typed-a7.log")" "typed-retry"
+
+# --- Test 3d: the FORKED fresh-spawn path re-arms requests on rc 4 too ------
+#
+# w234sk F5. spawn-fresh-orchestrator.sh exits 4 when the window was replaced
+# but the brief never became a turn. #1470 taught respawn_agent to re-arm
+# claimed requests on that code; the forked path the orchestrator-liveness state
+# machine launches reset them only on 0. The typed-retry above now turns a
+# typed-but-unsubmitted brief into rc 4 instead of a false 0, so that path would
+# strand still-claimed requests. The body is a top-level function so a stub
+# exiting a chosen code can drive it.
+echo '=== w234sk F5: _orch_fresh_spawn_forked resets delivery state on rc 0 AND rc 4, not on 3 ==='
+FORK_DIR="$WORK/fork-scripts"
+mkdir -p "$FORK_DIR"
+cat > "$FORK_DIR/spawn-fresh-orchestrator.sh" <<'FSO'
+#!/bin/bash
+exit "${FORK_STUB_RC:-0}"
+FSO
+chmod +x "$FORK_DIR/spawn-fresh-orchestrator.sh"
+fork_body=$(awk '/^_orch_fresh_spawn_forked\(\) \{$/ {c=1} c {print} c && /^\}$/ {exit}' "$_test_dir/main.sh")
+if [[ -n "$fork_body" ]]; then
+    pass "extracted _orch_fresh_spawn_forked from main.sh (the rc cases below exercise the real body)"
+else
+    fail "could not extract _orch_fresh_spawn_forked from main.sh; the rc cases below would prove nothing"
+fi
+FORK_RESET=0
+FORK_LOG=""
+fork_case() {   # fork_case <stub-rc> → sets FORK_RESET=0|1 and FORK_LOG
+    rm -f "$WORK/fork-reset" "$WORK/fork.log"
+    (
+        _script_dir="$FORK_DIR"
+        TARGET=orchestrator
+        NEXUS_ROOT="$FAKE_NEXUS"
+        STATE_DIR="$FAKE_NEXUS/monitor/.state"
+        LOGFILE="$WORK/fork-child.log"
+        export FORK_STUB_RC="$1"
+        _close_inherited_locks() { :; }
+        log() { printf '%s\n' "$*" >> "$WORK/fork.log"; }
+        requests_reset_delivery_state() { : > "$WORK/fork-reset"; }
+        sandbox-notify() { :; }
+        eval "$fork_body"
+        _orch_fresh_spawn_forked "prev-sid" "respawn-test"
+    ) 2>>"$WORK/fork-stderr.log"
+    if [[ -f "$WORK/fork-reset" ]]; then FORK_RESET=1; else FORK_RESET=0; fi
+    FORK_LOG=$(cat "$WORK/fork.log" 2>/dev/null)
+}
+fork_case 0
+assert_eq "F5 rc 0: delivery state reset (unchanged)" "$FORK_RESET" "1"
+assert_contains "F5 rc 0: logged as success (unchanged)" "$FORK_LOG" "orchestrator fresh-spawn (forked) succeeded"
+fork_case 4
+assert_eq "F5 rc 4: delivery state reset, because the window WAS replaced (#1470's rule, now on the fork path)" "$FORK_RESET" "1"
+assert_contains "F5 rc 4: logged as undelivered, not as success" "$FORK_LOG" "NOT delivered (rc 4)"
+fork_case 3
+assert_eq "F5 rc 3: no reset, since nothing was replaced" "$FORK_RESET" "0"
 
 # --- Test 4: settings absent → launcher omits --settings ---------------
 
@@ -431,6 +706,107 @@ fi
 # re-onboard. (respawn_agent uses a capturing tmux stub only in
 # Test 11; here we assert the launcher contract. The prompt-body
 # contract for the cold path is asserted in Test 12 below.)
+
+# --- Test 5b: rc 4 through main.sh is SAFE as well as loud (#1470) ------
+#
+# Making an exhausted submit verification report honestly (commit above)
+# makes rc 4 reachable for the first time in normal operation. Until then it
+# fired only when `tmux send-keys` itself failed or the prompt-file was
+# missing, and `respawn_agent` handled it in the `*)` arm -- which returns
+# BEFORE `requests_reset_delivery_state`. So the window would be replaced,
+# every still-claimed request would stay claimed by a session that no longer
+# exists, and nothing would be left to re-arm them.
+#
+# That is the same defect class one step downstream: a manufactured success
+# traded for a silent stranding. This arm exists because nothing else
+# observes the new code path -- an unexercised recovery arm is exactly how
+# the #1470 stranding survived in the first place.
+
+echo '=== #1470: rc 4 through respawn_agent re-arms requests AND reports failure ==='
+: > "$TMUX_LOG"
+touch "$WORK/tmux-target-absent"
+rm -f "$WORK/reset-called" "$WORK/ng-calls.log" "$WORK/respawn-agent-1470.log"
+
+# `ng` stub: respawn_agent action-logs through "$_monitor_dir/ng", guarded by
+# a `-x` test, so without this the action-log half is silently skipped and the
+# assertion below would pass vacuously.
+cat > "$FAKE_NEXUS/monitor/ng" <<NGSTUB
+#!/bin/bash
+printf '%s\n' "ng \$*" >> "$WORK/ng-calls.log"
+exit 0
+NGSTUB
+chmod +x "$FAKE_NEXUS/monitor/ng"
+
+(
+    NEXUS_ROOT="$FAKE_NEXUS"
+    export NEXUS_ROOT
+    PATH="$TMUX_STUB_BIN:$PATH"
+    export PATH
+    PANE_STATE_BIN="$PANE_STATE_STUB"
+    export PANE_STATE_BIN
+    FRESH_SPAWN_READINESS_BUDGET_SECONDS=2
+    export FRESH_SPAWN_READINESS_BUDGET_SECONDS
+    FRESH_SPAWN_READINESS_POLL_SECONDS=0
+    export FRESH_SPAWN_READINESS_POLL_SECONDS
+    FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1
+    export FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS
+    PSTUB_SUBMIT_EVIDENCE=0          # the pane never reports a submitted turn
+    export PSTUB_SUBMIT_EVIDENCE
+
+    RESPAWN_CONSEC_COUNTER="$WORK/consec-counter-1470.txt"
+    _monitor_dir="$FAKE_NEXUS/monitor"
+    STATE_DIR="$FAKE_NEXUS/monitor/.state"
+
+    # shellcheck source=_lib.sh
+    . "$_test_dir/_lib.sh"
+    # shellcheck source=_respawn.sh
+    . "$_test_dir/_respawn.sh"
+    # shellcheck source=_respawn_prompts.sh
+    . "$_test_dir/_respawn_prompts.sh"
+
+    log() { printf '%s\n' "$*" >> "$WORK/respawn-agent-1470.log"; }
+    # The observable stand-in for the real reset. main.sh defines it far from
+    # respawn_agent, so the body extracted below would otherwise call nothing.
+    requests_reset_delivery_state() { : > "$WORK/reset-called"; }
+
+    respawn_agent_body=$(awk '
+        /^respawn_agent\(\) \{$/ { capture = 1 }
+        capture { print }
+        capture && /^\}$/ { capture = 0 }
+    ' "$_test_dir/main.sh")
+    eval "$respawn_agent_body"
+
+    respawn_agent orchestrator
+) 2>"$WORK/stderr-5b.log"
+rc=$?
+rm -f "$WORK/tmux-target-absent"
+rm -f "$FAKE_NEXUS/monitor/ng"
+
+agent_log=$(cat "$WORK/respawn-agent-1470.log" 2>/dev/null || true)
+
+assert_eq "respawn_agent reports FAILURE when the brief was not delivered" "$rc" "1"
+# This suite defines its own primitives (pass/fail/assert_eq/assert_contains)
+# and does NOT source _test_helpers.sh, so `assert_file_exists` is not in
+# scope here. Written with the local ones on purpose: the first draft used
+# `assert_file_exists`, which exited `command not found` WITHOUT counting --
+# so the assertion silently did not run while the suite total was unchanged
+# at 140 either way. Totals agreeing is not evidence that the same
+# assertions ran (#1150).
+if [[ -f "$WORK/reset-called" ]]; then
+    pass "…and the delivery stamps were RE-ARMED anyway (the window WAS replaced)"
+else
+    fail "…and the delivery stamps were RE-ARMED anyway (the window WAS replaced)"
+fi
+assert_contains "…and the respawn was action-logged" \
+                "$(cat "$WORK/ng-calls.log" 2>/dev/null || true)" "watcher-respawn-agent"
+assert_contains "…the rc-4 arm names the undelivered brief rather than a bare rc" \
+                "$agent_log" "was NOT delivered (helper rc=4)"
+assert_contains "…and the tail says the next poll must re-deliver" \
+                "$agent_log" "brief UNDELIVERED"
+# NOT the `*)` arm: that one prints only "helper returned rc=N" and returns
+# before the reset. If rc 4 ever falls back into it, this fires.
+assert_not_contains "…rc 4 does NOT fall through to the generic arm" \
+                    "$agent_log" "helper returned rc=4"
 
 # --- Test 6: issue #176 — pin → --resume <sid> via auto-detect ----------
 #
@@ -706,7 +1082,6 @@ mkdir -p "$RESPAWN_TMPDIR_PROMPT"
 # original.
 TMUX_STUB_CAP_BIN="$WORK/stub-bin-cap"
 mkdir -p "$TMUX_STUB_CAP_BIN"
-TMUX_CAP_LOG="$WORK/tmux-calls-cap.log"
 : > "$TMUX_CAP_LOG"
 
 cat > "$TMUX_STUB_CAP_BIN/tmux" <<STUB
@@ -715,7 +1090,11 @@ printf '%s\n' "tmux \$*" >> "$TMUX_CAP_LOG"
 case "\$1" in
     list-windows)
         fmt="\$3"
-        names=("watcher")
+        if grep -q 'new-window' "$TMUX_CAP_LOG"; then
+            names=("watcher" "orchestrator")
+        else
+            names=("watcher")
+        fi
         idx=0
         for n in "\${names[@]}"; do
             case "\$fmt" in
@@ -726,6 +1105,23 @@ case "\$1" in
             esac
             idx=\$(( idx + 1 ))
         done
+        ;;
+    new-window)
+        # -P -F '#{window_id}' makes tmux print the id of the window it just
+        # created, and _respawn_spawn_window keys its rc=3 contract on that
+        # handle rather than on a presence-by-NAME probe (your-org/nexus-code
+        # #1327). A stub answering with ZERO BYTES models "created nothing",
+        # so the arm has to speak the handle or every spawn reads as a
+        # failure. Most stubs in this corpus already do -- spawn-worker.sh
+        # has used the same discriminator since #323; the respawn family
+        # was the outlier, in the code and in its fixtures alike.
+        #
+        # NO BACKTICKS IN THIS HEREDOC. It is UNQUOTED (<<STUB), so a
+        # backticked word in a COMMENT is command-substituted when the
+        # fixture is written -- measured at HEAD: six `command not found`
+        # lines per run, from this very comment (your-org/nexus-code#1157).
+        printf '@7\n'
+        exit 0
         ;;
     load-buffer)
         # Args: load-buffer -b <buf> <file>

@@ -310,6 +310,116 @@ ENGAGED_WINDOWS=" "
 
 log() { echo "[recover] $*" >&2; }
 
+# --- registry READABILITY: three states, not two --------------------------
+#
+# your-org/nexus-code#1266. `[[ -f "$file" ]]` is TRUE for a file that exists
+# and cannot be READ, so it does not cover the `done < "$file"` redirection
+# one line below. An I/O fault (mode, ACL, ESTALE/EIO on the NFS-backed
+# tree this nexus lives on) therefore produced the SAME observable as an
+# absent registry — zero rows — and `verify-stack.sh` turned that into
+# "stack converged: watcher fresh, services healthy" at exit 0. Measured at
+# 85458bf8 with the registry BYTES held constant (md5 identical) and the
+# file MODE the only variable: mode 0644 -> EXIT=1 naming the unhealthy
+# service, mode 0000 -> EXIT=0 "services healthy". A genuinely unhealthy
+# service read as a healthy stack. That is MANUFACTURED SUCCESS, not a
+# masked failure: every visible artefact says the work was done and the
+# only evidence is an absence.
+#
+# The three states, and the axis that separates them — the same axis
+# monitor/assert-shims-wrapped.sh draws its exit-79 bound on, which is
+# **could the reader examine its subject at all**:
+#
+#   ABSENT      no registry -> "there are no services" IS the answer. rc 0,
+#               no rows. An ADJUDICATION; it stays rc 0.
+#   READABLE    rc 0 and the rows are the answer, zero rows included: an
+#               empty or all-comment registry genuinely declares nothing.
+#   UNREADABLE  the path EXISTS and could not be read. NO statement about
+#               its contents is available. rc 79, NEVER folded into 0.
+#
+# 79 is NOT-CHECKED, exactly as in assert-shims-wrapped.sh: it does not
+# assert a fault in the registry's CONTENT, only that this reader could not
+# look. A CONFIRMED failure outranks it — a consumer that has already found
+# a real fault reports the fault, not 79.
+#
+# Why every ordinary shape must stay rc 0, and why that makes 79 precise:
+# measured at 85458bf8 across 13 registry shapes (absent, empty, row-last
+# with and without a trailing newline, comment-last, blank-last, trailing
+# whitespace, malformed 2-field, 5-field, 6-field policy, CRLF, comments
+# only) EVERY one returns rc 0. Only the unreadable one returns non-zero.
+# So a non-zero rc here means an I/O fault SPECIFICALLY, and `|| return 0`
+# at a call site discards exactly and only that signal.
+#
+# THE PROBE IS NOT `[[ -r ]]`. `-r` reads permission BITS; it does not
+# attempt an open, so it passes for a path that will fail with ESTALE/EIO
+# — the realistic driver on this filesystem. The probe opens the file. It
+# also requires a REGULAR file first, because opening a FIFO BLOCKS, and a
+# reader that hangs is worse than one that lies.
+#
+# THE REPLICA CENSUS, and it is TWO FAMILIES rather than one. The predicate is
+# REPLICATED (not sourced) for the same reason `_recover_service_healthy` is:
+# the watcher must not source this script.
+#
+# THE TWO NUMBERS, stated together because they are the same fact on different
+# denominators and quoting one alone has already caused a reader to reconcile
+# against the other: there are **SEVEN PREDICATES** — this one, plus **SIX
+# REPLICAS** in six other files. The sentence this replaced claimed replication
+# into THREE files, so the replica undercount is 3 -> 6. Whichever number you
+# carry, say which you mean; the suite asserts the SEVEN (predicates), because
+# that is the one countable from the tree without deciding what "original"
+# means.
+#
+# They do NOT all share the ABSENT-case behaviour documented above — so "keep in
+# step" means keep in step with the family you are in, and a reader who copies
+# the nearest one gets the wrong contract half the time:
+#
+#   FAMILY A — `[[ -e ]] || return 0`, i.e. ABSENT is an ANSWER (rc 0).
+#     _recover_registry_readable  (here)
+#     _sh_registry_readable       (watcher/_service_health.sh)
+#     svc_registry_readable       (svc.sh)
+#   These are the ones the contract above describes literally: they are called
+#   by PARSERS, whose job is to emit rows, and "no registry" legitimately means
+#   "no rows".
+#
+#   FAMILY B — `[[ -f ]] || return 1`, i.e. ABSENT reports NOT-READABLE.
+#     _version_registry_readable  (watcher/_version_restart.sh)
+#     _idle_registry_readable     (watcher/_idle_probe.sh)
+#     _remote_reg_open_ok         (_remote_lib.sh)
+#     _requests_reg_open_ok       (watcher/_requests.sh)
+#   These are BARE OPEN TESTS, not adjudicators. Each is SAFE only because its
+#   single call site gates it behind `[[ -e "$reg" ]]` FIRST, which supplies the
+#   absent case before the predicate is ever asked. Measured: all four return 1
+#   for an absent path. THE HAZARD IS THE NEXT CALL SITE, not the current one —
+#   call one of these unguarded and an absent registry reports as unreadable,
+#   which for `_remote_reg_open_ok` would turn a fresh clone's documented
+#   off-by-default state into "the machinery failed".
+#
+# An earlier version of this block said "three" and named only family A. That
+# undercount is this file's own documented hazard — a comment describing the
+# matcher its author cared about — sitting in the block that defines the
+# contract. `monitor/watcher/test-registry-unreadable-refusal.sh` now asserts
+# the census in both directions so it cannot drift again by care alone.
+#
+# There is deliberately NO shared `NEXUS_REGISTRY_NOT_READABLE` constant. One
+# existed here and had ZERO readers while its own comment claimed call sites
+# used it; a constant that cannot be shared (the watcher modules do not source
+# this file) is dead code wearing a mechanism's clothes.
+
+# _recover_registry_readable <file>
+#   0  readable, or genuinely ABSENT (both are adjudications)
+#  79  exists and could not be read — no statement about contents available
+_recover_registry_readable() {
+    local file="$1"
+    [[ -e "$file" ]] || return 0
+    [[ -f "$file" ]] || return 79
+    # `2>/dev/null` FIRST. Redirections are applied left to right, so
+    # `{ :; } < "$file" 2>/dev/null` attempts the open BEFORE stderr is
+    # silenced and leaks a bare "Permission denied" naming THIS line — a
+    # diagnostic that points at the probe rather than at the registry.
+    # Measured on bash 4.4.20: order A prints, order B is silent, both rc 1.
+    { : ; } 2>/dev/null < "$file" || return 79
+    return 0
+}
+
 # --- registry parsing -----------------------------------------------------
 #
 # Emit one validated `name<TAB>workdir<TAB>launch<TAB>health<TAB>logfile`
@@ -327,7 +437,17 @@ log() { echo "[recover] $*" >&2; }
 # falls back to `<workdir>/serve.log`.
 _recover_parse_registry() {
     local file="$1"
-    [[ -f "$file" ]] || return 0
+    # Three states, not two — see "registry READABILITY" above. ABSENT is an
+    # answer (rc 0, no rows); UNREADABLE is not (rc 79).
+    if ! _recover_registry_readable "$file"; then
+        # ONE honest diagnostic, naming the file and the verdict. The bare
+        # bash redirection error this replaces named a line number inside
+        # this function, which reads as a bug in the parser rather than as
+        # an unreadable registry.
+        log "registry: NOT READABLE at $file — refusing to report its contents (rc 79)"
+        return 79
+    fi
+    [[ -e "$file" ]] || return 0
     # `policy` is the OPTIONAL 6th column consumed only by the watcher's
     # service-health task (monitor/watcher/_service_health.sh). bootstrap-
     # recover does not use it, but it MUST read it into its own variable so
@@ -350,17 +470,66 @@ _recover_parse_registry() {
         logfile="${logfile/#\~/$HOME}"
         logfile="${logfile//\$NEXUS_ROOT/$NEXUS_ROOT}"
         printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$workdir" "$launch" "$health" "$logfile"
-    done < "$file"
+    # The probe above and this redirection are two separate opens, so a fault
+    # arriving between them (ESTALE on a re-exported mount) would otherwise
+    # slip through as a SHORT read — plausible, non-empty, and worse than a
+    # zero because nothing looks wrong. The redirection's own rc is the only
+    # thing that sees it.
+    done < "$file" || return 79
 }
 
 # --- per-service primitives ----------------------------------------------
 
 # Run a healthcheck command in the service's workdir. Exit 0 = healthy.
 # The healthcheck is arbitrary shell (curl, pgrep, test -f …); we run it
-# under `bash -c` so the registry author writes it naturally.
+# from a PIPE rather than from argv so the registry author writes it naturally
+# AND the health string never becomes process-table content.
+#
+# WHY NOT `bash -c "$health"` (your-org/nexus-code#891). That form puts the
+# ENTIRE health string — pattern included — into a process's argv. Whether that
+# process survives long enough to be scanned depends on whether bash EXECs, and
+# the safe set is far narrower than "simple commands":
+#
+#     bash 4.4.20, nothing matching the marker running, rc=1 is correct
+#       pgrep -f M                 rc=1  exec'd, safe
+#       pgrep -f M >/dev/null      rc=0  FALSE HEALTHY   <- a redirection defeats exec
+#       pgrep -f M 2>/dev/null     rc=0  FALSE HEALTHY
+#       pgrep -f M && true         rc=0  FALSE HEALTHY
+#       ( pgrep -f M )             rc=0  FALSE HEALTHY
+#       exec pgrep -f M            rc=1  safe
+#
+# A redirection is idiomatic in a healthcheck, so "keep it a simple command" is
+# not a usable rule. The failure direction is what makes this worse than its
+# siblings: it is a BOOLEAN THAT IS ALWAYS TRUE. The service reads `healthy`
+# forever, the supervisor never restarts it, and nothing anywhere logs a fault.
+# #869 (kill-side ownership) and #871 (the wait-side hook guard) both miss it
+# because it is neither a kill nor a wait.
+#
+# Process substitution passes the script over /dev/fd, so this process's argv is
+# `bash /dev/fd/N` and carries no pattern under ANY health-string shape. It
+# writes nothing to disk, which matters: a temp-file variant fails closed under
+# the read-only-filesystem degraded mode (#473) and would spuriously report
+# UNHEALTHY — restarting working services — exactly when the tree is least able
+# to cope.
+#
+# NOT fixed by this, and not a defect of it: a health string whose LAST stage
+# masks the status (`pgrep -f X | head -1` returns head's 0) still lies. That is
+# ordinary pipeline semantics, owned by the registry author, and measured as
+# such — `false | head -1` is rc 0 with no process predicate anywhere. Under
+# `set -o pipefail` the same string reports correctly.
+#
+# A SECOND, IDENTICAL SITE exists at monitor/watcher/_service_health.sh
+# (`_sh_service_healthy`), deliberately replicated there to avoid sourcing this
+# script into the watcher. Both were fixed together; keep them in step.
 _recover_service_healthy() {
-    local workdir="$1" health="$2"
-    ( cd "$workdir" 2>/dev/null && bash -c "$health" ) >/dev/null 2>&1
+    local workdir="$1" health="$2" rc=0
+    ( cd "$workdir" 2>/dev/null && bash <(printf '%s' "$health") ) >/dev/null 2>&1 || rc=$?
+    # exit 100 == alive, reporting a FINDING about its environment
+    # (your-org/nexus-code#1423; the watcher's _service_health.sh owns the
+    # vocabulary). Not down: relaunching a monitor for saying what it was
+    # registered to say would be the restart-that-changes-nothing this
+    # code was sent to by the DOWN wording.
+    (( rc == 0 || rc == 100 ))
 }
 
 _recover_window_exists() {
@@ -495,6 +664,48 @@ _recover_service_running() {
 # The inner shell records its OWN pid into the pidfile and then `exec`s
 # the wrapper, so the recorded PID is the wrapper's regardless of whether
 # setsid forks or execs. Returns nonzero if setsid is unavailable.
+# How long `_recover_launch_service` waits for the supervisor's own pidfile to
+# appear before declaring the launch failed. Bounded and LOUD by construction —
+# see the function for why neither a sleep nor an unbounded wait is acceptable.
+: "${NEXUS_RECOVER_PIDFILE_TIMEOUT:=10}"
+
+# Wait for a COMPLETE supervisor record at $1, or fail.
+#
+# WHY A POLL AND NOT A SLEEP (your-org/nexus-code#918). A `sleep` is not a
+# synchronisation primitive: it is a guess that is simultaneously too long on an
+# idle box and too short under the load that produces the race in the first
+# place. A bounded poll returns as soon as the record is readable and still has
+# a hard ceiling.
+#
+# WHY BOUNDED AND NOT "UNTIL IT APPEARS". An unbounded wait converts a flake
+# into a HANG, and this is the SERVICE RECOVERY path — the code that runs when
+# something is already wrong. A recovery that never returns is worse than the
+# bug it was fixing.
+#
+# WHAT HAPPENS WHEN THE CHILD NEVER WRITES: this returns non-zero, the caller
+# logs `launch FAILED` and emits `launch-failed`. Never a silent `absent` — an
+# absent record and a supervisor that failed to start are the same observable,
+# and conflating them is exactly the defect being fixed here.
+_recover_wait_pidfile() {
+    local pf="$1"
+    local timeout="${2:-$NEXUS_RECOVER_PIDFILE_TIMEOUT}"
+    # Centiseconds, integer: bash cannot compare floats, and `[[ 0.5 -lt 1 ]]`
+    # is a syntax error rather than a false — a silent-zero shape.
+    local waited=0 step_cs=5 max_cs=$(( timeout * 100 )) line=''
+    while (( waited < max_cs )); do
+        if [[ -f "$pf" ]]; then
+            read -r line < "$pf" 2>/dev/null || line=''
+            # `mv` makes the record appear whole, so a readable first line means
+            # the whole record landed. Checked anyway: a legacy or hand-written
+            # file could pre-date the atomic writer.
+            [[ "$line" =~ ^[0-9]+$ ]] && return 0
+        fi
+        sleep 0.05
+        waited=$(( waited + step_cs ))
+    done
+    return 1
+}
+
 _recover_launch_service() {
     local name="$1" workdir="$2" launch="$3" logfile="$4"
     command -v setsid >/dev/null 2>&1 || { log "setsid unavailable; cannot launch $name headless"; return 1; }
@@ -519,7 +730,14 @@ _recover_launch_service() {
     local idrec='_ns=$(readlink /proc/$$/ns/pid 2>/dev/null || printf unknown);'
     idrec+=' _sr=$(cat /proc/$$/stat 2>/dev/null); _sr=${_sr#*") "}; set -- $_sr;'
     idrec+=' printf "%s\nns=%s\nstart=%s\n" "$$" "${_ns:-unknown}" "${20:-unknown}"'
-    printf -v inner 'ulimit -Su "$(ulimit -Hu)" 2>/dev/null || true; { %s; } > %q; cd %q && exec %s' "$idrec" "$pf" "$workdir" "$launch"
+    # ATOMIC WRITE (your-org/nexus-code#918). The record is written to a temp
+    # file in the SAME directory and then `mv`'d into place; rename(2) is atomic
+    # on POSIX, so a reader sees either the old record or the whole new one,
+    # never a half-written one. Before this, `> "$pf"` truncated on open and the
+    # `printf` landed later, so a reader between the two got an EMPTY file and
+    # reported `malformed-record`. `$$` inside the inner string is the CHILD's
+    # pid, so the temp name cannot collide between concurrent launches.
+    printf -v inner 'ulimit -Su "$(ulimit -Hu)" 2>/dev/null || true; _tf=%q.tmp.$$; { %s; } > "$_tf" && mv -f "$_tf" %q; cd %q && exec %s' "$pf" "$idrec" "$pf" "$workdir" "$launch"
     # Create the log with an explicit mode BEFORE the redirect opens it.
     # A bare `>>` would create it under the ambient umask (007 here) —
     # 0660, group-writable, in a group-shared tree — and a group-writable
@@ -528,6 +746,26 @@ _recover_launch_service() {
     # call covers the whole fleet. Best-effort by contract: it never fails
     # a launch, and never touches a log owned by another uid (nginx, labsh).
     _ensure_service_log "$lf"
+    # MOVE THE OLD RECORD ASIDE FIRST, and this is not tidiness — without it the
+    # wait below is a no-op. A relaunch happens precisely when a STALE pidfile
+    # exists, so the parent would find that stale file instantly, conclude the
+    # child had written, and return before the new record landed: the original
+    # race, reintroduced by its own fix. Clearing it makes the wait observe the
+    # NEW record or nothing.
+    #
+    # RENAMED, NOT DELETED (your-org/nexus-code#918, sk890). This step is
+    # UNCONDITIONAL and runs BEFORE the launch, so with `rm -f` any launch that
+    # then failed to produce a record destroyed the prior one — on exactly the
+    # path where an operator most wants it. A failed relaunch is when that file
+    # is the only remaining trace of which supervisor died, and the failure log
+    # says `Check $lf`, which is useless if the evidence went with it. `#606`
+    # built a deliberate culture around `Pid record PRESERVED (evidence)`; this
+    # keeps it. The wait still sees no CURRENT record, so the synchronisation
+    # property is unchanged — the rename buys the evidence for free.
+    #
+    # `$pf.superseded` deliberately does not end in `.pid`, so the `services/*.pid`
+    # globs elsewhere do not pick it up as a live record.
+    mv -f "$pf" "$pf.superseded" 2>/dev/null || true
     setsid bash -c "$inner" </dev/null >>"$lf" 2>&1 &
     # Stamp the launch script's source hash as this service's running
     # version (issue #186) — the comparison anchor for the watcher's
@@ -536,6 +774,14 @@ _recover_launch_service() {
     # version-managed.
     _version_record_service_running "$STATE_DIR/version" "$name" "$workdir" "$launch" \
         2>/dev/null || true
+    # SYNCHRONISE before returning. The pidfile is written by the CHILD; every
+    # caller (svc.sh's reconcile, jupyter-up, remote-up) reads it immediately
+    # after this returns. Returning without waiting is what made a successful
+    # restart report `CANNOT RECONCILE` (your-org/nexus-code#918).
+    if ! _recover_wait_pidfile "$pf"; then
+        log "service '$name': supervisor did not write its pid record within ${NEXUS_RECOVER_PIDFILE_TIMEOUT}s (pidfile $pf) — treating the launch as FAILED. Check $lf."
+        return 1
+    fi
     return 0
 }
 
@@ -811,6 +1057,20 @@ _recover_snapshot_workers() {
     fi
     # Registry service names (legacy windowed services keep their
     # window name): one exclusion set alongside the fixed infra names.
+    # your-org/nexus-code#1266. This set is an EXCLUSION, so an empty one is
+    # PERMISSIVE: every registered service window would fall through to the
+    # worker arms below and be treated as a dead worker to respawn or close.
+    # `while … done < <(cmd)` DISCARDS cmd's rc, so the parser's 79 cannot be
+    # seen at the loop — ask the predicate BEFORE it. Refusing the whole
+    # worker step is the fail-CLOSED direction: not respawning workers for one
+    # recovery pass is recoverable; mistaking eleven live services for dead
+    # workers is not.
+    if ! _recover_registry_readable "$SERVICES_REGISTRY"; then
+        log "workers: REFUSED — registry at $SERVICES_REGISTRY exists and could not be READ."
+        log "workers:   The service-name exclusion set would be EMPTY, so every registered"
+        log "workers:   service window would classify as a dead worker. Not respawning anything."
+        return 0
+    fi
     local registry_names=" "
     local rn _rest
     while IFS=$'\t' read -r rn _rest; do
@@ -957,12 +1217,25 @@ _recover_read_boot_intent() {
 }
 
 # Most recent report filed for a window, relative to $NEXUS_ROOT, or empty.
-# Same maxdepth-1 name-match the fresh-orchestrator situation report uses.
+#
+# KEYED ON THE FRONTMATTER `window:` FIELD, NOT ON THE FILENAME
+# (your-org/nexus-code#1195). An agent has TWO names: the report's filename
+# carries a cwd-derived PROJECT SLUG (the first segment after the last
+# `/work/` in `$PWD`), while `window:` is resolved from live tmux. On this
+# corpus they disagree for 136 of 709 reports, and 21 windows are indexed
+# under two or more slugs — so `-name "*${window}*.md"` was a SILENT ZERO on
+# the cold-boot resumption surface, printing "(none found under reports/)"
+# about a worker that had filed one. It errs the other way too: for one live
+# window the name match returns 6 where the frontmatter says 3.
+#
+# rc 2 (COULD NOT LOOK) is propagated rather than folded into "none" — the
+# caller has a third arm for it.
 _recover_worker_last_report() {
-    local window="$1" reports_dir="$NEXUS_ROOT/reports"
-    [[ -d "$reports_dir" ]] || return 0
-    find "$reports_dir" -maxdepth 1 -type f -name "*${window}*.md" \
-        -printf '%T@\treports/%f\n' 2>/dev/null | sort -nr | head -1 | cut -f2-
+    local window="$1" ng="$NEXUS_ROOT/monitor/ng" out rc=0
+    [[ -x "$ng" ]] || return 2
+    out=$("$ng" reports-for-window "$window" --reports-dir "$NEXUS_ROOT/reports" 2>/dev/null) || rc=$?
+    (( rc == 0 )) || return "$rc"
+    printf 'reports/%s\n' "$(basename -- "$(printf '%s\n' "$out" | head -1)")"
 }
 
 # One manifest entry for one dropped worker. Session-id and workdir come
@@ -988,7 +1261,8 @@ _recover_manifest_entry() {
         printf -- '- session-id: **UNRESOLVED** (spawn-worker --dry-run exit %d)\n' "$rc"
         printf -- '- resolver said: `%s`\n' "$(tr '\n' ' ' <<<"$out" | cut -c1-300)"
     fi
-    report=$(_recover_worker_last_report "$window")
+    local report_rc=0
+    report=$(_recover_worker_last_report "$window") || report_rc=$?
     # Deliberately an `if`, not `"${report:+…}${report:-…}"`. `${var:-alt}`
     # expands to the VALUE when the variable is set, so that pair fires BOTH
     # arms on a non-empty report and emits the path twice (your-org/nexus-code#651
@@ -997,6 +1271,11 @@ _recover_manifest_entry() {
     # finished, and a doubled path is a path an agent can mis-copy.
     if [[ -n "$report" ]]; then
         printf -- '- last report: `%s`\n' "$report"
+    elif (( ${report_rc:-1} == 2 )); then
+        # "I could not look" is not "there is none" (#1195, and #813/#618
+        # before it). On the resumption surface the difference decides
+        # whether an orchestrator re-spawns a worker that had already finished.
+        printf -- '- last report: COULD NOT LOOK — the reports corpus was not enumerable\n'
     else
         printf -- '- last report: (none found under reports/)\n'
     fi
@@ -1244,7 +1523,16 @@ _recover_main() {
     fi
 
     if (( LIST_ONLY == 1 )); then
-        if [[ -f "$SERVICES_REGISTRY" ]]; then
+        if ! _recover_registry_readable "$SERVICES_REGISTRY"; then
+            # An empty listing at rc 0 is indistinguishable from "nothing is
+            # registered" (your-org/nexus-code#1266). Say which, and exit
+            # non-zero so a caller that tests the rc is not told "none".
+            log "REFUSED: registry at $SERVICES_REGISTRY exists and could not be READ."
+            log "  This listing is EMPTY because it could not be read, NOT because"
+            log "  nothing is registered."
+            return 79
+        fi
+        if [[ -e "$SERVICES_REGISTRY" ]]; then
             _recover_parse_registry "$SERVICES_REGISTRY"
         else
             log "no registry at $SERVICES_REGISTRY"
@@ -1309,7 +1597,15 @@ _recover_main() {
     if (( DO_SERVICES == 0 )); then
         log "services: skipped (--no-services / --watcher-only — nexus core only)"
     else
-        if [[ ! -f "$SERVICES_REGISTRY" ]]; then
+        if ! _recover_registry_readable "$SERVICES_REGISTRY"; then
+            # Without this, the loop below saw zero rows and the summary line
+            # printed "services: 0 registered — 0 healthy, 0 relaunched" — a
+            # sentence that reads as a clean bill of health for a stack whose
+            # registry could not be opened (your-org/nexus-code#1266).
+            log "services: REFUSED — registry at $SERVICES_REGISTRY exists and could not be READ."
+            log "services:   NOT recovering anything, and NOT reporting '0 registered':"
+            log "services:   this is 'could not look', not 'nothing to do'."
+        elif [[ ! -e "$SERVICES_REGISTRY" ]]; then
             log "no service registry at $SERVICES_REGISTRY — watcher-only recovery"
             log "  (copy monitor/services.registry.example to enable service recovery)"
         else

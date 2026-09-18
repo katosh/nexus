@@ -208,6 +208,73 @@
 # $NEXUS_SERVICES_REGISTRY override, else $NEXUS_ROOT/monitor/
 # services.registry, else this file's sibling monitor dir (mirrors
 # the pane-state.sh / ng resolution elsewhere in this module).
+
+# your-org/nexus-code#941 — the window-key encoder lives in ONE place
+# (monitor/_bookkeeping.sh). Sourced only if not already present, because the
+# usual caller has loaded it long before this file. NO fallback to the lossy
+# `${w//[^a-zA-Z0-9_-]/_}` form: a writer and a reader disagreeing about the
+# key is the very defect this closes, and a silent fallback would recreate it
+# exactly when nobody is watching.
+
+# STATE_DIR UNSET IS NOT "the current directory" (your-org/nexus-code#1478).
+# Every state path in this module used to fall back to `.`, so a caller that
+# sourced it without STATE_DIR — 22 production scripts source this file, from
+# hooks to spawn-worker.sh — wrote `last-prelude.ts`, `engagement-log.tsv`,
+# `idle-probe-previous-windows.txt` and `pane-change/` into its CWD. Measured
+# 2026-09-06: all four sat at the operator's REPO ROOT with one mtime
+# (2026-08-26 18:44), i.e. one invocation, cwd = the checkout. Untracked, so
+# nothing shipped; but the default WAS the mechanism, and `.` is the
+# permissive default arm of a state-dir resolver (#1451/#1452 family).
+# Fail closed toward the checkout: the fallback is a per-user scratch dir,
+# announced ONCE on stderr, never the cwd. Returning EMPTY would be worse —
+# `${STATE_DIR}/last-prelude.ts` would then be `/last-prelude.ts`.
+_ip_nostate_dir() {
+    local d="${TMPDIR:-/tmp}/nexus-idle-probe-NOSTATE-$(id -u 2>/dev/null || echo u)"
+    mkdir -p "$d" 2>/dev/null || true
+    # Once per PROCESS. This runs inside `$(…)` at every call site, so a shell
+    # variable set here dies with the subshell — the marker is a file keyed on
+    # the parent's pid instead.
+    if [[ ! -e "$d/.warned-$$" ]]; then
+        : > "$d/.warned-$$" 2>/dev/null || true
+        printf '_idle_probe.sh: WARNING: STATE_DIR is unset — state falls back to %s, NOT the current directory (your-org/nexus-code#1478). Set STATE_DIR.\n' "$d" >&2
+    fi
+    printf '%s' "$d"
+}
+
+if ! declare -F wk_encode >/dev/null 2>&1; then
+    _wk_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_bookkeeping.sh"
+    if [[ -r "$_wk_lib" ]]; then
+        # shellcheck source=monitor/_bookkeeping.sh
+        source "$_wk_lib"
+    else
+        printf '%s: cannot load the window-key encoder from %s — refusing\n' \
+            "${BASH_SOURCE[0]##*/}" "$_wk_lib" >&2
+        return 2 2>/dev/null || exit 2
+    fi
+fi
+
+# THE NEGATION IS DEFEATED ON A COMPOUND COMMAND, so this predicate is a
+# FUNCTION and callers write `if ! <fn>`. Measured, bash 4.4.20:
+#     : 2>/dev/null < UNREADABLE        rc 1     ! : … < UNREADABLE        rc 0
+#     { : ; } 2>/dev/null < UNREADABLE  rc 1     ! { : ; } … < UNREADABLE  rc 1   <-- ! IGNORED
+#     ( : ) 2>/dev/null < UNREADABLE    rc 1     ! ( : ) … < UNREADABLE    rc 1   <-- ! IGNORED
+# A failed redirection on a COMPOUND command is a redirection ERROR, and the
+# `!` does not invert it; on a SIMPLE command it does. So `! : < f` works,
+# `! { :; } < f` silently never fires, and testing the first and generalising
+# walks you into the second. `cmd … || arm` is unaffected and is what the body
+# below uses. AND ZSH DISAGREES: the same `! { :; } < UNREADABLE` is rc 0 under
+# zsh 5.4.2 — so probing this at an interactive zsh prompt CONFIRMS the broken
+# form. This nexus is zsh-default, which is exactly how it would arrive.
+# A guard that parses, reads correctly, and never fires is the very defect
+# class your-org/nexus-code#1266 is about; it was caught here only because the
+# suite asserts this function's rc directly.
+_idle_registry_readable() {
+    local f="$1"
+    [[ -f "$f" ]] || return 1
+    { : ; } 2>/dev/null < "$f" || return 1
+    return 0
+}
+
 _idle_registry_service_names() {
     local registry="${NEXUS_SERVICES_REGISTRY:-}"
     if [[ -z "$registry" ]]; then
@@ -217,7 +284,25 @@ _idle_registry_service_names() {
             registry="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/services.registry"
         fi
     fi
-    [[ -n "$registry" && -f "$registry" ]] || return 0
+    # your-org/nexus-code#1266. `[[ -f ]]` is TRUE for a file that exists and
+    # cannot be READ, so this guard did not cover the `done < "$registry"`
+    # below. The direction here is the SAFE one and the treatment is
+    # deliberately different from the other readers: this list is an
+    # EXEMPTION set, so losing it makes the sweep see MORE windows, never
+    # fewer — it over-reports rather than going silent. Refusing to produce a
+    # list would instead disable the worker sweep, which is a real
+    # degradation for a fault that costs noise.
+    #
+    # So: keep the behaviour, remove the SILENCE. rc 79 states "this exemption
+    # set is INCOMPLETE, not empty" for any caller that cares, and the log
+    # line is the artefact that was missing. The one existing caller captures
+    # with $( ), so it CAN see the rc — see _idle_list_worker_windows.
+    [[ -n "$registry" && -e "$registry" ]] || return 0
+    if ! _idle_registry_readable "$registry"; then
+        printf 'idle-probe: services registry at %s exists but is NOT READABLE; the infra-window exemption set is INCOMPLETE, so registered service windows may classify as workers (rc 79)\n' \
+            "$registry" >&2
+        return 79
+    fi
     local line name workdir launch health
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -255,6 +340,16 @@ _idle_list_worker_windows() {
     command -v tmux >/dev/null 2>&1 || return 0
     local svc_names
     svc_names=$(_idle_registry_service_names)
+    # NO status flag is set here, deliberately. An earlier version of this
+    # function set IDLE_SVC_EXEMPTIONS_INCOMPLETE on rc 79. It had ZERO readers,
+    # and it could not have worked if it had one: every caller of
+    # _idle_list_worker_windows invokes it inside `$( )` (main.sh) or
+    # `< <( )` (_over_limit.sh), so an assignment in this scope cannot escape
+    # to any of them. That is a flag that LOOKS like a guard and is incapable of
+    # being one — the same unobservable-verdict class this file's #1266 work is
+    # about, so it is removed rather than left to reassure a future reader.
+    # The artefact for the incomplete-exemption case is the LOG LINE emitted by
+    # _idle_registry_service_names, which does survive a subshell.
     tmux list-windows -F '#{window_name}|#{window_activity}|#{window_index}' 2>/dev/null \
         | awk -F'|' -v target="${TARGET:-orchestrator}" \
               -v cockpit="${SERVICES_WINDOW:-services}" -v svc_list="$svc_names" '
@@ -367,12 +462,63 @@ _idle_window_wrap_up_entry() {
         spawn_epoch=$(_idle_iso_to_epoch "$spawn_ts")
         [[ -n "$spawn_epoch" ]] || spawn_epoch=0
     fi
-    local entry_window entry_report entry_ts entry_epoch
+    local entry_window entry_report entry_ts entry_epoch entry_comment
     if command -v jq >/dev/null 2>&1; then
         # `// "_NULL_"` keeps the tab-separated output three-column
         # even when an entry has no `window` field (pre-#109 entries).
-        while IFS=$'\t' read -r entry_window entry_report entry_ts; do
+        while IFS=$'\t' read -r entry_window entry_report entry_ts entry_comment; do
             [[ -n "$entry_report" ]] || continue
+            # CANDIDACY FIRST, LIFECYCLE SCOPE SECOND (your-org/nexus-code#1063).
+            # The two predicates are pure and independent, so swapping them
+            # cannot change which entry is returned — but the scope check forks
+            # `date -d` once per entry (_idle_iso_to_epoch) while the candidacy
+            # check is pure bash. With scope first, an entry belonging to some
+            # OTHER window still cost a fork before being discarded, making the
+            # walk O(windows x ALL historical wrap-ups) — a cost that grows
+            # monotonically with the action log and never falls.
+            #
+            # Measured on the live log 2026-08-26 (3,853,593 bytes, 2,599
+            # `"event":"wrap-up"` entries, 5 worker windows): 7,805 of 7,815
+            # `date -d` forks per `list_really_idle_workers` came from this one
+            # loop — ~11 s per window, 33 s for the sweep, 44 s per
+            # `render_idle_prelude`. That is past compose_report's 20 s bound, so
+            # `_run_bounded` returned 124 and every emit carried
+            # `workspace: UNAVAILABLE`. Not load: retiring a window did not help,
+            # because the term that grew was the log, not the window count.
+            #
+            # #1063 REMOVED THE PER-ENTRY FORK AND LEFT THE PER-ENTRY WALK
+            # (your-org/nexus-code#1329). Candidacy-first made each discarded entry
+            # cheap; it did not stop the entry being DELIVERED to this loop. bash
+            # `read` from a pipe consumes a byte at a time, so the surviving term is
+            # O(windows x ALL historical wrap-ups) in read(2) syscalls, and it grows
+            # with the log exactly as the fork term did.
+            #
+            # Measured at 0b82ffb2 against the live action log (7,746,636 bytes,
+            # 3,309 `"event":"wrap-up"` entries, 14 worker windows):
+            #
+            #   _idle_window_spawn_ts        60- 83 ms   filters IN JQ
+            #   _idle_window_retain_event  1510-1714 ms  filtered in BASH (3,278 rows)
+            #   _idle_window_wrap_up_entry 2490-2930 ms  filtered in BASH (3,309 rows)
+            #
+            # Same file, same grep, same tac, same jq, same order of magnitude of
+            # rows. The ONLY difference is WHERE the window predicate runs — and
+            # `_idle_window_spawn_ts`, defined above, is the positive control that
+            # was already doing it right.
+            #
+            # So the SAME candidacy predicate now also runs in the jq producer
+            # below. It is a PREFILTER, not a new rule: candidacy is the FIRST test
+            # in this loop (that is #1063's ordering, deliberately preserved), so an
+            # entry jq drops is an entry this loop would have `continue`d before
+            # running any other predicate. The bash arms below are kept verbatim —
+            # the non-jq fallback still needs them, and they re-test for free.
+            if [[ "$entry_window" != "_NULL_" ]]; then
+                # Post-#109: authoritative window field present.
+                # Match only on exact equality; skip otherwise.
+                [[ "$entry_window" == "$window" ]] || continue
+            else
+                # Pre-#109: no window field → fall back to basename heuristic.
+                _idle_basename_matches "$entry_report" "$window" || continue
+            fi
             # Lifecycle scope: skip wrap-ups recorded before the
             # current spawn. Only enforced when we have a spawn
             # anchor (epoch > 0); otherwise we operate as before.
@@ -383,23 +529,59 @@ _idle_window_wrap_up_entry() {
                     continue
                 fi
             fi
-            if [[ "$entry_window" != "_NULL_" ]]; then
-                # Post-#109: authoritative window field present.
-                # Match only on exact equality; skip otherwise.
-                if [[ "$entry_window" == "$window" ]]; then
-                    printf '%s\t%s' "$entry_report" "$entry_ts"
-                    return 0
-                fi
-                continue
-            fi
-            # Pre-#109: no window field → fall back to basename heuristic.
-            if _idle_basename_matches "$entry_report" "$window"; then
-                printf '%s\t%s' "$entry_report" "$entry_ts"
-                return 0
-            fi
+            # your-org/nexus-code#1116 review, F1 — A WRAP-UP THAT PUBLISHED
+            # NOTHING IS NOT A WRAP-UP. `ng wrap-up` records its event
+            # unconditionally, INCLUDING on the two paths that deliberately
+            # publish nothing and exit 3 (`#1114` degenerate-teaser, `#862`
+            # nothing-published). This reader used to accept any wrap-up event,
+            # so the watcher classified such a window `wrapped` and the cleanup
+            # table sent the orchestrator to retire a worker whose answer never
+            # reached the thread — the marker of a delivery without the
+            # delivery, one layer up from where `#1114` fixed it.
+            #
+            # SKIP AND KEEP LOOKING, rather than return not-found. An honest
+            # idempotent RE-RUN is the normal shape (`#862`: the asset link
+            # moved, the body did not), and its newest event is
+            # `nothing-published` while an EARLIER event in the same lifecycle
+            # did publish. Returning not-found on the newest entry would
+            # un-wrap a window that genuinely handed off. So an unpublished
+            # entry is passed over and the walk continues; only a lifecycle
+            # containing no published wrap-up at all yields not-found.
+            #
+            # An ABSENT `.comment` is not unpublished — events predating the
+            # field carry none, and the newest-first walk must not reject the
+            # entire history on a field that did not exist.
+            case "$entry_comment" in
+                degenerate-teaser|nothing-published) continue ;;
+            esac
+            printf '%s\t%s' "$entry_report" "$entry_ts"
+            return 0
         done < <(grep '"event":"wrap-up"' "$log_file" \
                     | tac \
-                    | jq -r '[(.window // "_NULL_"), (.report // ""), (.ts // "_NULL_")] | @tsv' 2>/dev/null)
+                    | jq -r --arg w "$window" '
+                          (.window // "_NULL_") as $ew
+                          | (.report // "") as $r
+                          | select($ew == $w
+                                   or ($ew == "_NULL_"
+                                       and ($r | (startswith($w + "_")
+                                                  or contains("_" + $w)
+                                                  or contains("-" + $w)
+                                                  or contains("_" + $w + ".")))))
+                          | [$ew, $r, (.ts // "_NULL_"), (.comment // "")] | @tsv' 2>/dev/null)
+        # THE PRE-#109 ARM IS PREFILTERED TOO (your-org/nexus-code#1406). The
+        # producer above used to pass EVERY no-window row through — `$ew ==
+        # "_NULL_"` was a blanket accept, and the basename test ran in bash,
+        # per row, per window. Profiled against the live log (31,957 rows, 8
+        # synthetic windows): `_idle_window_wrap_up_entry` + `_idle_basename_matches`
+        # were 3,728 + 3,000 traced lines at the full log against 128 + 0 at a
+        # 1% tail — the ENTIRE log-size term of `render_idle_prelude`, and the
+        # residual `#1063` left behind (it removed the per-row FORK, `#1329`
+        # moved the window predicate into jq for rows that HAVE a window; the
+        # rows that do not still reached bash one at a time). The four
+        # disjuncts are `_idle_basename_matches` verbatim, so the bash arm
+        # below re-tests for free and nothing that matched before stops
+        # matching now; what changes is that a legacy row belonging to some
+        # OTHER window is dropped in jq instead of in a bash `continue`.
     else
         local line
         while IFS= read -r line; do
@@ -410,6 +592,14 @@ _idle_window_wrap_up_entry() {
             entry_ts=$(printf '%s' "$line" \
                 | sed -n 's/.*"ts":"\([^"]*\)".*/\1/p')
             [[ -n "$entry_report" ]] || continue
+            # Candidacy first, lifecycle scope second — same reordering, same
+            # reason, as the jq branch above (your-org/nexus-code#1063). This
+            # arm forks `date -d` too, so it carried the same growth term.
+            if [[ -n "$entry_window" ]]; then
+                [[ "$entry_window" == "$window" ]] || continue
+            else
+                _idle_basename_matches "$entry_report" "$window" || continue
+            fi
             if (( spawn_epoch > 0 )) && [[ -n "$entry_ts" ]]; then
                 entry_epoch=$(_idle_iso_to_epoch "$entry_ts")
                 if [[ "$entry_epoch" =~ ^[0-9]+$ ]] \
@@ -417,17 +607,16 @@ _idle_window_wrap_up_entry() {
                     continue
                 fi
             fi
-            if [[ -n "$entry_window" ]]; then
-                if [[ "$entry_window" == "$window" ]]; then
-                    printf '%s\t%s' "$entry_report" "$entry_ts"
-                    return 0
-                fi
-                continue
-            fi
-            if _idle_basename_matches "$entry_report" "$window"; then
-                printf '%s\t%s' "$entry_report" "$entry_ts"
-                return 0
-            fi
+            # Same rule as the jq arm above (your-org/nexus-code#1116 F1);
+            # the two arms must agree or the classification depends on
+            # whether jq happens to be installed.
+            entry_comment=$(printf '%s' "$line" \
+                | sed -n 's/.*"comment":"\([^"]*\)".*/\1/p')
+            case "$entry_comment" in
+                degenerate-teaser|nothing-published) continue ;;
+            esac
+            printf '%s\t%s' "$entry_report" "$entry_ts"
+            return 0
         done < <(grep '"event":"wrap-up"' "$log_file" | tac)
     fi
     return 1
@@ -463,6 +652,25 @@ _idle_window_retain_event() {
     [[ -f "$log_file" ]] || return 1
     [[ -n "$window" ]]   || return 1
     local entry_window entry_ts entry_reason
+    # The window predicate runs in the jq producer, not here — same reason, same
+    # measurement, as the wrap-up walk above (your-org/nexus-code#1329). This walk
+    # is the SECOND-largest term in `list_really_idle_workers`: 1510-1714 ms per
+    # call at 0b82ffb2 against 3,278 `window-retain` entries, purely because 3,277
+    # of them reached bash's `read` before being discarded on one string compare.
+    # PREMISE CORRECTED (your-org/nexus-code#1329, skeptic item 6b). An earlier
+    # version of this comment said `window-retain` REQUIRES an explicit `window`
+    # extra, so there was "no absent-field arm to preserve". That is FALSE:
+    # measured on the live action log 2026-09-03, **31 of 3,346** `window-retain`
+    # entries carry `"window":null` (the wrap-up walk's figure, for contrast, is
+    # 75 of 3,377).
+    #
+    # The CODE was never wrong — only the reason given for it. There IS an
+    # absent-field arm, `(.window // "")`, and it DISCARDS rather than preserves:
+    # a null window becomes `""`, which cannot equal a real `$window`. That is
+    # exactly what the bash test it replaced did, because the `sed` extractor
+    # below does not match `"window":null` either and leaves `entry_window`
+    # empty. So the jq `select` is still the bash test verbatim — for a different
+    # and measurable reason than the one first written down here.
     if command -v jq >/dev/null 2>&1; then
         while IFS=$'\t' read -r entry_window entry_ts entry_reason; do
             [[ "$entry_window" == "$window" ]] || continue
@@ -470,7 +678,8 @@ _idle_window_retain_event() {
             return 0
         done < <(grep '"event":"window-retain"' "$log_file" \
                     | tac \
-                    | jq -r '[(.window // ""), (.ts // ""), (.reason // "")] | @tsv' 2>/dev/null)
+                    | jq -r --arg w "$window" 'select((.window // "") == $w)
+                          | [(.window // ""), (.ts // ""), (.reason // "")] | @tsv' 2>/dev/null)
     else
         local line
         while IFS= read -r line; do
@@ -604,14 +813,99 @@ _idle_pane_state_line() {
         && [[ "$MONITOR_HEARTBEAT_STALENESS_SECONDS" =~ ^[0-9]+$ ]]; then
         hb_args+=(--heartbeat-staleness "$MONITOR_HEARTBEAT_STALENESS_SECONDS")
     fi
-    local _ps_line
-    _ps_line=$("$pane_state_script" "${hb_args[@]}" "$window_index" 2>/dev/null) || true
+    # Tell pane-state.sh WHICH window is the orchestrator, so its §1b
+    # over-limit rule can consult the orchestrator activity marker for that
+    # pane and no other (your-org/nexus-code#1155 residual 2).
+    #
+    # WITHOUT THIS THE RULE WORKED BY A DUPLICATED LITERAL, not by a mechanism,
+    # and that is measured rather than reasoned (`#1171` skeptic finding 2,
+    # re-derived here by a different method than the one that produced it).
+    # Every production call site of pane-state.sh builds a FIXED argv — this
+    # array had exactly ONE append site, and retire-preflight.sh /
+    # cc-auto-update-apply.sh / ng pass a bare positional — so no caller could
+    # carry the flag. The env fallbacks were dead too: the RUNNING watcher
+    # (pid 15542, 2026-08-28) had BOTH `MONITOR_TARGET` and
+    # `NEXUS_ORCHESTRATOR_WINDOW` unset in `/proc/<pid>/environ`. So
+    # pane-state.sh fell to its literal default `orchestrator`, which matched
+    # the real window only because `_config.sh`'s `monitor.target_window`
+    # default is the same word in a different file.
+    #
+    # Two literals that agree until one moves is the #1143 defect this PR is
+    # about, so it does not get to survive inside the fix for it. `$TARGET` is
+    # the RESOLVED value (env override, then config, then default) and is in
+    # scope here because `_config.sh` is sourced before this file.
+    if [[ -n "${TARGET:-}" ]]; then
+        hb_args+=(--orchestrator-window "$TARGET")
+    fi
+    # your-org/nexus-code#1397: an EMPTY read is an INSTRUMENT outcome, not a
+    # pane property, and it used to be indistinguishable from pane-state.sh's
+    # own `state=unknown` — stderr was discarded and the rc never read, so a
+    # renderer that timed out, a probe that failed, and a classifier that
+    # genuinely could not decide all rendered `(state=unknown)`. Measured: one
+    # pane read `state=unknown` in four consecutive snapshots over an hour
+    # while a direct `pane-state.sh` read said `working-background`, with no
+    # stderr on either side. When the probe yields NO line, this now prints a
+    # DIAGNOSTIC line instead: `probe=failed probe_rc=<n> probe_stderr=<txt>`.
+    # It carries NO `state=` key on purpose — every consumer parses `state=`
+    # and treats its absence exactly as it treated an empty line (unknown /
+    # emit), so nothing downstream changes except that the snapshot can now
+    # SAY which of the two happened. The stderr excerpt is sanitised to a
+    # charset that cannot spell `=`, so a diagnostic can never forge a field.
+    local _ps_line _ps_rc=0 _ps_errf="" _ps_err=""
+    _ps_errf=$(mktemp "${TMPDIR:-/tmp}/pane-probe-err.XXXXXX" 2>/dev/null) || _ps_errf=""
+    if [[ -n "$_ps_errf" ]]; then
+        _ps_line=$("$pane_state_script" "${hb_args[@]}" "$window_index" 2>"$_ps_errf"); _ps_rc=$?
+        _ps_err=$(head -c 200 "$_ps_errf" 2>/dev/null | tr '\n' ' ' | tr -c 'A-Za-z0-9 ._:/,()-' '_')
+        rm -f "$_ps_errf"
+    else
+        _ps_line=$("$pane_state_script" "${hb_args[@]}" "$window_index" 2>/dev/null); _ps_rc=$?
+    fi
     if [[ -n "$_ps_line" ]] && declare -F _pane_cache_write >/dev/null 2>&1; then
         _pane_cache_write "$window_index" "$_ps_line"
     fi
-    [[ -n "$_ps_line" ]] && printf '%s\n' "$_ps_line"
+    if [[ -n "$_ps_line" ]]; then
+        printf '%s\n' "$_ps_line"
+    else
+        _ps_err="${_ps_err#"${_ps_err%%[! ]*}"}"; _ps_err="${_ps_err%"${_ps_err##*[! ]}"}"
+        printf 'probe=failed probe_rc=%s probe_stderr=%s\n' "$_ps_rc" "${_ps_err:-none}"
+    fi
     return 0
 }
+
+# _idle_bg_membership_turnover <window> <digest>
+#
+# Compare pane-state's `bg_members` digest for <window> with the one recorded
+# on the previous tick (your-org/nexus-code#1460). Prints ONE token:
+#   changed        the digest differs from the recorded one — a descendant
+#                  started or exited; a wedge cannot do that
+#   static:<secs>  identical to the recorded one, unchanged for <secs>
+#   first          a digest was seen but nothing was recorded yet
+#   absent         no digest on the line (older pane-state, or an override)
+# State: $STATE_DIR/bg-members/<window> = "<digest>\t<epoch first seen>".
+# Cleared when the digest is absent, so a window that stops reporting starts
+# fresh rather than inheriting a stale "static" reading.
+_idle_bg_membership_turnover() {
+    local window="$1" digest="${2:-}" dir="${STATE_DIR:-}/bg-members" f prev prev_at now
+    if [[ -z "$digest" || "$digest" == "-" ]]; then
+        [[ -n "${STATE_DIR:-}" ]] && rm -f "$dir/$window" 2>/dev/null
+        printf 'absent'; return 0
+    fi
+    [[ -n "${STATE_DIR:-}" ]] || { printf 'first'; return 0; }
+    f="$dir/$window"; now=$(date +%s)
+    mkdir -p "$dir" 2>/dev/null || { printf 'first'; return 0; }
+    if [[ -f "$f" ]]; then
+        IFS=$'\t' read -r prev prev_at < "$f" 2>/dev/null || prev=""
+        if [[ "$prev" == "$digest" && "$prev_at" =~ ^[0-9]+$ ]]; then
+            printf 'static:%d' $(( now - prev_at )); return 0
+        fi
+        printf '%s\t%s\n' "$digest" "$now" > "$f" 2>/dev/null
+        [[ -n "$prev" ]] && { printf 'changed'; return 0; }
+        printf 'first'; return 0
+    fi
+    printf '%s\t%s\n' "$digest" "$now" > "$f" 2>/dev/null
+    printf 'first'
+}
+
 
 # Extract `field=<token>` from a pane-state emit line. Empty stdout on
 # miss. Used by the over-limit path to pull `reset_at` from the same
@@ -642,7 +936,7 @@ _idle_pane_line_field() {
 # Stop-anchored heartbeat staleness). An older marker is treated as
 # absent; the window falls back to the normal wrap-up classification.
 _turn_failure_path() {
-    printf '%s/turn-failure/%s.json' "${STATE_DIR:-.}" "$1"
+    printf '%s/turn-failure/%s.json' "${STATE_DIR:-$(_ip_nostate_dir)}" "$1"
 }
 
 # _idle_turn_failure_fresh <window> <now> → exit 0 if a fresh marker
@@ -689,7 +983,7 @@ _idle_turn_failure_field() {
 # loop. Missing file or missing row is meaningful — see
 # _engagement_log_lookup.
 _engagement_log_path() {
-    printf '%s/engagement-log.tsv' "${STATE_DIR:-.}"
+    printf '%s/engagement-log.tsv' "${STATE_DIR:-$(_ip_nostate_dir)}"
 }
 
 # Print the last-engagement epoch for `window`. Prints nothing
@@ -912,7 +1206,7 @@ _engagement_log_drop() {
 # applies normally again.
 
 _openg_path() {
-    printf '%s/operator-engaged.tsv' "${STATE_DIR:-.}"
+    printf '%s/operator-engaged.tsv' "${STATE_DIR:-$(_ip_nostate_dir)}"
 }
 
 _openg_grace_seconds() {
@@ -957,14 +1251,14 @@ _openg_input_slack_seconds() {
 # written by _unstick.sh via the MACHINE_INPUT_TSV global and by
 # monitor/paste-followup.sh. Compacted by the per-cycle pruner.
 _machine_input_path() {
-    printf '%s/machine-input.tsv' "${STATE_DIR:-.}"
+    printf '%s/machine-input.tsv' "${STATE_DIR:-$(_ip_nostate_dir)}"
 }
 
 # Per-window "last user-prompt submitted" stamp, written by
 # monitor/worker-heartbeat.sh from the worker's UserPromptSubmit
 # hook (`<epoch>\t<session-id>`). THE engagement trigger.
 _user_prompt_stamp_path() {
-    printf '%s/user-prompt/%s' "${STATE_DIR:-.}" "$1"
+    printf '%s/user-prompt/%s' "${STATE_DIR:-$(_ip_nostate_dir)}" "$1"
 }
 
 # Epoch of the newest user-prompt submit stamped for `window`;
@@ -1010,7 +1304,7 @@ _openg_user_prompt_session() {
 _openg_window_own_session() {
     local window="$1" f sid=""
     [[ -n "$window" ]] || return 1
-    f="${STATE_DIR:-.}/windows/${window//[^a-zA-Z0-9_-]/_}.json"
+    f="${STATE_DIR:-$(_ip_nostate_dir)}/windows/$(wk_encode "$window").json"
     if [[ -f "$f" ]]; then
         if command -v jq >/dev/null 2>&1; then
             sid=$(jq -r '.session_id // empty' "$f" 2>/dev/null) || sid=""
@@ -1020,7 +1314,7 @@ _openg_window_own_session() {
     fi
     if [[ -z "$sid" ]]; then
         # Fallback: newest spawn action-log event's `session-id=` extra.
-        local log_file="${STATE_DIR:-.}/action-log.jsonl"
+        local log_file="${STATE_DIR:-$(_ip_nostate_dir)}/action-log.jsonl"
         if [[ -f "$log_file" ]] && command -v jq >/dev/null 2>&1; then
             sid=$(grep '"event":"spawn"' "$log_file" 2>/dev/null | tac \
                 | jq -r --arg w "$window" \
@@ -1100,7 +1394,7 @@ _openg_change_ttl_seconds() {
 # stamp — a screen read distorted by TUI redraws must not be the
 # load-bearing signal for holding a window open.
 _openg_change_path() {
-    printf '%s/pane-change/%s' "${STATE_DIR:-.}" "$1"
+    printf '%s/pane-change/%s' "${STATE_DIR:-$(_ip_nostate_dir)}" "$1"
 }
 
 # Epoch the pane content last changed for `window`; `0` when no stamp
@@ -1188,7 +1482,7 @@ _openg_change_drop() {
 # orchestrator re-tasked the worker after its hand-off, so the window
 # regresses to the normal busy → no-wrap-up lifecycle.
 _machine_submit_stamp_path() {
-    printf '%s/machine-submit/%s' "${STATE_DIR:-.}" "$1"
+    printf '%s/machine-submit/%s' "${STATE_DIR:-$(_ip_nostate_dir)}" "$1"
 }
 
 # Epoch of the newest machine-attributed submit for `window`; `0`
@@ -1242,7 +1536,7 @@ _machine_submit_stamp_drop() {
 _openg_machine_input_epoch() {
     local window="$1" best=0 e ts
     [[ -n "$window" ]] || { printf '0'; return 0; }
-    local log_file="${STATE_DIR:-.}/action-log.jsonl"
+    local log_file="${STATE_DIR:-$(_ip_nostate_dir)}/action-log.jsonl"
     if [[ -f "$log_file" ]]; then
         if command -v jq >/dev/null 2>&1; then
             ts=$(grep '"event":"paste-followup"' "$log_file" 2>/dev/null \
@@ -1424,7 +1718,7 @@ _idle_unconfirmed_paste_epoch() {
     # file is written by the same worker-heartbeat.sh that writes the
     # user-prompt stamp, so its absence means "cannot confirm",
     # not "unconfirmed".
-    [[ -f "${STATE_DIR:-.}/heartbeat/$window.json" ]] || { printf '0'; return 0; }
+    [[ -f "${STATE_DIR:-$(_ip_nostate_dir)}/heartbeat/$window.json" ]] || { printf '0'; return 0; }
     # Newest guaranteed-submit paste epoch.
     #
     # The TWO surfaces are NOT interchangeable, and treating them as such
@@ -1464,7 +1758,7 @@ _idle_unconfirmed_paste_epoch() {
         [[ "$e" =~ ^[0-9]+$ ]] && (( e > best )) && best=$e
     fi
     if (( best == 0 )); then
-        local log_file="${STATE_DIR:-.}/action-log.jsonl"
+        local log_file="${STATE_DIR:-$(_ip_nostate_dir)}/action-log.jsonl"
         if [[ -f "$log_file" ]] && command -v jq >/dev/null 2>&1; then
             ts=$(grep '"event":"paste-followup"' "$log_file" 2>/dev/null \
                 | tac \
@@ -1649,7 +1943,7 @@ _idle_unconfirmed_paste_epoch() {
 # there is no marker — a stale `no` from a previous cycle would render an
 # emit clause about a scan nobody ran.
 _idle_paste_scan_path() {
-    printf '%s/paste-verdicts/%s.%s.scan' "${STATE_DIR:-.}" "$1" "$2"
+    printf '%s/paste-verdicts/%s.%s.scan' "${STATE_DIR:-$(_ip_nostate_dir)}" "$1" "$2"
 }
 
 _idle_paste_scan_write() {
@@ -1706,7 +2000,7 @@ _idle_paste_marker_note() {
 # (0 submitted / 3 unconfirmed / 4 established-negative), or NOTHING
 # when there is no verdict to read — absence is `unknown`, never `no`.
 _idle_paste_verdict_path() {
-    printf '%s/paste-verdicts/%s.%s' "${STATE_DIR:-.}" "$1" "$2"
+    printf '%s/paste-verdicts/%s.%s' "${STATE_DIR:-$(_ip_nostate_dir)}" "$1" "$2"
 }
 
 _idle_paste_verdict() {
@@ -1785,7 +2079,7 @@ _idle_paste_verdict_note() {
 # without limit. Mirrors the other per-window `_*_drop` helpers.
 : "${_PASTE_VERDICT_RETAIN_DAYS:=7}"
 _paste_verdict_drop() {
-    local window="$1" dir="${STATE_DIR:-.}/paste-verdicts"
+    local window="$1" dir="${STATE_DIR:-$(_ip_nostate_dir)}/paste-verdicts"
     [[ -d "$dir" ]] || return 0
     if [[ -n "$window" ]]; then
         rm -f -- "$dir/$window".* 2>/dev/null || true
@@ -1816,7 +2110,7 @@ _idle_load_submit_evidence() {
 _idle_paste_consumed() {
     local window="$1" epoch="$2"
     _idle_load_submit_evidence || { printf 'unknown'; return 0; }
-    se_submission_since "$window" "${STATE_DIR:-.}" "$epoch"
+    se_submission_since "$window" "${STATE_DIR:-$(_ip_nostate_dir)}" "$epoch"
 }
 
 # CONTENT-identity probe: are the exact bytes this paste carried present
@@ -1828,7 +2122,7 @@ _idle_paste_content_consumed() {
     _idle_load_submit_evidence || { printf 'unknown'; return 0; }
     declare -F se_submission_with_digest >/dev/null 2>&1 \
         || { printf 'unknown'; return 0; }
-    se_submission_with_digest "$window" "${STATE_DIR:-.}" "$epoch" "$digest"
+    se_submission_with_digest "$window" "${STATE_DIR:-$(_ip_nostate_dir)}" "$epoch" "$digest"
 }
 
 # Drop machine-input rows for `window` (disappearance prune), and
@@ -1858,7 +2152,7 @@ _idle_paste_content_consumed() {
 # Cheap and additive by construction: it changes no decision, only makes the
 # decisions reviewable.
 _idle_class_stamp_path() {
-    printf '%s/idle-class/%s' "${STATE_DIR:-.}" "$1"
+    printf '%s/idle-class/%s' "${STATE_DIR:-$(_ip_nostate_dir)}" "$1"
 }
 
 _idle_class_stamp_drop() {
@@ -2340,7 +2634,7 @@ _openg_observe() {
 # (default 10MiB). Path is intentionally NOT under DIFF_DIR — it's
 # event data, not a per-cycle archive.
 _notifications_log_path() {
-    printf '%s/worker-notifications.jsonl' "${STATE_DIR:-.}"
+    printf '%s/worker-notifications.jsonl' "${STATE_DIR:-$(_ip_nostate_dir)}"
 }
 
 # Stamp file marking the epoch of the last `render_idle_prelude` call.
@@ -2350,7 +2644,7 @@ _notifications_log_path() {
 # "first render"; we treat that as "no scope yet" and skip the count
 # rather than over-reporting every historical row.
 _notifications_stamp_path() {
-    printf '%s/last-prelude.ts' "${STATE_DIR:-.}"
+    printf '%s/last-prelude.ts' "${STATE_DIR:-$(_ip_nostate_dir)}"
 }
 
 # Count distinct worker windows whose latest notification row is newer
@@ -2362,8 +2656,19 @@ _notifications_stamp_path() {
 # cycle from one worker shouldn't double-count toward "awaiting-input";
 # the operator's signal is "how many workers want my attention right
 # now", not "how many events arrived".
+#
+# THE ORCHESTRATOR IS NOT A WORKER AWAITING INPUT (your-org/nexus-code#1478).
+# It emits `idle_prompt` at the end of essentially every turn — waiting for
+# the operator is its RESTING state — so counting its rows inflated this
+# scalar by one nearly always: `0` was close to unreachable and a real worker
+# rendered as `2`. The observer counting itself (#1073), relocated into the
+# operator-facing summary. Excluded by the identity the watcher already uses
+# for its paste target (`$TARGET`, config monitor.target_window), never a
+# hardcoded name; the window lister above applies the same exclusion. Readers
+# of this count (the prelude render, _emit_dedup's strip, the calibrator's
+# stub) consume the number, not the population — checked per #1050.
 _notifications_count_distinct_since() {
-    local since_epoch="${1:-0}" path
+    local since_epoch="${1:-0}" path exclude="${TARGET:-orchestrator}"
     path=$(_notifications_log_path)
     [[ -f "$path" ]] || { printf '0'; return 0; }
     # Accept both integer and fractional epochs (the prelude stamps
@@ -2371,8 +2676,8 @@ _notifications_count_distinct_since() {
     # appends from a hook that fires during the prelude render).
     [[ "$since_epoch" =~ ^[0-9]+(\.[0-9]+)?$ ]] || since_epoch=0
     if command -v jq >/dev/null 2>&1; then
-        jq -r --argjson since "$since_epoch" \
-            'select((.ts // 0) > $since) | (.window // "")' \
+        jq -r --argjson since "$since_epoch" --arg excl "$exclude" \
+            'select((.ts // 0) > $since) | (.window // "") | select(. != $excl)' \
             "$path" 2>/dev/null \
             | awk 'NF>0' \
             | sort -u \
@@ -2381,7 +2686,7 @@ _notifications_count_distinct_since() {
         # sed fallback: tolerate the canonical jq-emitted compact form
         # the worker hook produces. Number-typed ts; double-quoted
         # window. Robust enough for the in-house log shape.
-        awk -v since="$since_epoch" '
+        awk -v since="$since_epoch" -v excl="$exclude" '
             { ts=""; win=""
               if (match($0, /"ts":[ ]*[0-9.]+/)) {
                   s = substr($0, RSTART+5, RLENGTH-5); gsub(/[ ]/,"",s); ts = s
@@ -2390,6 +2695,7 @@ _notifications_count_distinct_since() {
                   w = substr($0, RSTART+9, RLENGTH-9); gsub(/^[ ]*"|"$/,"",w); win = w
               }
               if (ts == "" || win == "") next
+              if (win == excl) next
               if (ts+0 > since+0) print win
             }' "$path" 2>/dev/null \
             | sort -u \
@@ -2450,7 +2756,7 @@ _notifications_rotate_if_oversized() {
 # of the union next cycle naturally because it's no longer in the
 # engagement-log when we re-read.
 _idle_previous_windows_path() {
-    printf '%s/idle-probe-previous-windows.txt' "${STATE_DIR:-.}"
+    printf '%s/idle-probe-previous-windows.txt' "${STATE_DIR:-$(_ip_nostate_dir)}"
 }
 
 # ---- public surface -----------------------------------------------------
@@ -2615,6 +2921,31 @@ _idle_skeptic_hang_seconds() {
 # Grace window: how long a fresh marker with NO live skeptic may still
 # confer the exemption (giving the orchestrator time to spawn the skeptic)
 # before the marker is declared orphaned. Env > config > default 600s.
+# THE TWO ARE COUPLED, AND THE COUPLING IS LOAD-BEARING (your-org/nexus-code#975).
+#
+# `_idle_skeptic_orphaned` requires BOTH `age <= hang` AND `now - req > grace`,
+# where `req` falls back to the marker mtime when no `skeptic-request` row is
+# found. On the path where marker mtime == request ts — which is the NORMAL
+# path, because `ng` writes the marker and logs the request in the same instant
+# — those two collapse to `age <= hang && age > grace`. That window is EMPTY
+# whenever `hang <= grace`, and both default to 600, so at stock config the
+# orphan backstop CANNOT FIRE on the equal-ages path. Measured across eleven
+# marker ages spanning the boundary, with a potency control that does fire.
+#
+# The only thing that separates mtime from req is a writer that TOUCHES an
+# existing marker without re-logging the request: `_await_heartbeat`
+# (skeptic-channel.sh) while a worker sits in `await`, and spawn-worker.sh's
+# re-stamp at an actual skeptic spawn. On the never-spawned re-arm path neither
+# runs — there is no worker awaiting precisely because no skeptic was spawned —
+# so the marker's mtime freezes at write time and crosses `hang` ~10 minutes
+# later, after which it is permanently invisible to the backstop built to catch
+# it. That is #975's mechanism.
+#
+# So DO NOT tune either value in isolation. `hang > grace` is what makes the
+# orphan window non-empty; raising `await_hang_seconds` to quiet a false
+# hang-flag, or lowering `orphan_grace_seconds` for faster nagging, silently
+# changes whether this class of stuck park is detectable at all — in opposite
+# directions, for reasons unrelated to skeptics.
 _idle_skeptic_orphan_grace() {
     local g="${MONITOR_SKEPTIC_ORPHAN_GRACE_SECONDS:-}"
     if [[ -z "$g" && -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/config/load.sh" ]]; then
@@ -2645,11 +2976,96 @@ _idle_skeptic_live_window() {
             | sed -n 's/.*"window":"\([^"]*\)".*/\1/p' \
             | awk 'NF{last=$0} END{if(last!="")print last}')
     fi
+    # your-org/nexus-code#845: the resolved NAME is printed on stdout, not
+    # discarded. This function computed the exact identifier the deadlock join
+    # needs and threw it away one line before use, so the row could never say
+    # WHICH skeptic the exemption rests on, let alone how long it has been
+    # idle. One authority for "who is reviewing this window"; callers that
+    # only want the boolean redirect stdout.
     if [[ -n "$sw" ]] && grep -qxF -- "$sw" <<<"$live"; then
+        printf '%s' "$sw"
         return 0
     fi
-    grep -qxF -- "${name}-skeptic" <<<"$live" && return 0
+    if grep -qxF -- "${name}-skeptic" <<<"$live"; then
+        printf '%s' "${name}-skeptic"
+        return 0
+    fi
     return 1
+}
+
+# The skeptic WINDOW the most recent `_idle_skeptic_parked` verdict rests on
+# (your-org/nexus-code#845), set beside `_IDLE_SKEPTIC_PARK_BASIS`; empty on
+# the `grace` basis (no live skeptic yet) and on every non-park verdict.
+_IDLE_SKEPTIC_PARK_WINDOW=""
+
+# _idle_window_activity_epoch <window-name> <worker-windows-tsv> — the
+# `#{window_activity}` epoch of one window from the sweep's own enumeration
+# (`name<TAB>activity<TAB>index` lines); empty when absent or non-numeric.
+_idle_window_activity_epoch() {
+    local want="$1" tsv="$2"
+    # A DRAINING reader (no `exit`): an early-exit awk under pipefail is the
+    # #622 shape the early-exit-reader manifest ratchets.
+    printf '%s\n' "$tsv" | awk -F'\t' -v w="$want" '!done && $1 == w && $2 ~ /^[0-9]+$/ { print $2; done = 1 }'
+}
+
+# Idle age (seconds) above which a parked target's resolved, un-retained,
+# idle skeptic is flagged as the #845 deadlock shape. Env > config > 1800.
+_idle_skeptic_deadlock_seconds() {
+    local s="${MONITOR_SKEPTIC_DEADLOCK_IDLE_SECONDS:-}"
+    if [[ -z "$s" && -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/config/load.sh" ]]; then
+        s=$("$NEXUS_ROOT/config/load.sh" monitor.skeptic.deadlock_idle_seconds 1800 2>/dev/null || echo 1800)
+    fi
+    [[ "$s" =~ ^[0-9]+$ ]] || s=1800
+    printf '%s' "$s"
+}
+
+# _idle_window_retained_within_ttl <window> <now> — rc 0 iff a `window-retain`
+# event names <window> and is within the retain TTL (env
+# MONITOR_RETAIN_TTL_SECONDS, default 86400 — the same window the `retained`
+# classification honours). A declared hold older than the TTL has lapsed.
+_idle_window_retained_within_ttl() {
+    local w="$1" now="$2" row ts reason ep ttl="${MONITOR_RETAIN_TTL_SECONDS:-86400}"
+    [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=86400
+    row=$(_idle_window_retain_event "$w") || return 1
+    IFS=$'\t' read -r ts reason <<<"$row"
+    ep=$(_idle_iso_to_epoch "$ts")
+    [[ "$ep" =~ ^[0-9]+$ ]] || return 1
+    (( now - ep >= 0 && now - ep <= ttl ))
+}
+
+# _idle_skeptic_join_detail <now> <worker-windows-tsv> — the JOIN the
+# `parked-awaiting-skeptic` row was missing (your-org/nexus-code#845): the
+# resolved skeptic's NAME and IDLE AGE, folded into the row where the
+# orchestrator already looks. Seven pairs in one session sat deadlocked for
+# 30m–4h06m — target parked and exempt, skeptic idle — because the two halves
+# lived in the same snapshot and nothing correlated them; #1039 then removed
+# the accidental age ceiling that used to bound the pair.
+#
+# Prints "; skeptic=<w> idle <age>s" (or "idle UNKNOWN" when the reviewer is
+# absent from the enumeration — never a guessed number), and appends a
+# DEADLOCK flag ONLY on positive evidence, every condition required, the
+# allowlist shape the 2026-08-09 objection asked for: a resolved skeptic
+# (this row is parked, so the marker is present), a KNOWN idle age, above the
+# threshold, and the skeptic NOT `retained` (a declared hold is intent, and no
+# predicate over pane state may override it). Anything else: the age alone.
+# The flag is a reading aid on a row that already exists; it authorises
+# nothing — `bk_pane_kill_authorized` never sees it.
+_idle_skeptic_join_detail() {
+    local now="$1" tsv="$2" sw="${_IDLE_SKEPTIC_PARK_WINDOW:-}"
+    [[ -n "$sw" ]] || return 0
+    local ep age
+    ep=$(_idle_window_activity_epoch "$sw" "$tsv")
+    if [[ ! "$ep" =~ ^[0-9]+$ ]]; then
+        printf '; skeptic=%s idle UNKNOWN (reviewer not in the worker-window enumeration)' "$sw"
+        return 0
+    fi
+    age=$(( now - ep )); (( age >= 0 )) || age=0
+    printf '; skeptic=%s idle %ds' "$sw" "$age"
+    local thr; thr=$(_idle_skeptic_deadlock_seconds)
+    if (( age > thr )) && ! _idle_window_retained_within_ttl "$sw" "$now"; then
+        printf ' — DEADLOCK SHAPE (#845): the target is parked on this skeptic and the skeptic has been idle longer than %ds; neither side can release the other. Push the delta to the skeptic (skeptic-channel.sh notify-delta / nudge) or resolve the requirement (ng skeptic resolve); if the hold is deliberate, declare it (ng log-action monitor --event window-retain --extra window=%s --extra reason=…) and this flag goes silent' "$thr" "$sw"
+    fi
+    return 0
 }
 
 # Epoch at which a skeptic was last REQUIRED for window $1 — the orphan
@@ -2671,13 +3087,86 @@ _idle_skeptic_request_epoch() {
     date -d "$ts" +%s 2>/dev/null || printf '0'
 }
 
+# _idle_skeptic_channel_active <target> <since-epoch>
+#
+# POSITIVE evidence that a skeptic is engaged in THIS round
+# (your-org/nexus-code#1153). `_idle_skeptic_live_window` answers from a SPAWN
+# LINKAGE RECORD, written only by `spawn-worker.sh --skeptic-role`; a skeptic
+# spawned with a bare -n/-c/-p works end to end and writes no linkage at all.
+# The CHANNEL is where a skeptic ACTS, so traffic there outranks the absence of
+# a spawn row — the detector was advising the operator to clear a LIVE
+# obligation because it read the weaker record and never opened the stronger one.
+#
+# SCOPED TO THE ROUND, AND THAT IS THE WHOLE DESIGN. `close` does NOT remove
+# `req-*.md` (measured), so "any request file exists" — the predicate #1153
+# itself proposes — is satisfied FOREVER after the first round. That would
+# exempt the re-armed never-spawned park this class exists to catch (#975) and
+# make retire-preflight's release path unreachable. `$2` is the round start: the
+# `skeptic-request` ts, written ONCE and never moved.
+#
+# NOT the marker mtime, which is the other tempting clock: measured on the
+# #1153 episode the channel file is 2.2s OLDER than the marker, because the
+# marker is written at wrap-up, AFTER the skeptic has already started asking.
+# The request ts is 710s older still, so the channel traffic falls on the right
+# side of it.
+_idle_skeptic_channel_active() {
+    local name="$1" since="$2" f m
+    local state_dir="${STATE_DIR:-}"; [[ -n "$state_dir" ]] || return 1
+    [[ "$since" =~ ^[0-9]+$ ]] && (( since > 0 )) || return 1
+    local safe; safe=$(wk_encode "$name")
+    local dir="${state_dir}/skeptic/${safe}"
+    [[ -d "$dir" ]] || return 1
+    for f in "$dir"/req-*.open.md "$dir"/req-*.ack.md "$dir"/req-*.answered.md; do
+        [[ -e "$f" ]] || continue
+        m=$(date +%s -r "$f" 2>/dev/null || echo 0)
+        [[ "$m" =~ ^[0-9]+$ ]] || continue
+        (( m >= since )) && return 0
+    done
+    return 1
+}
+
+# The BASIS on which the most recent `_idle_skeptic_parked` call granted the
+# exemption — the evidence the verdict actually rests on, so the emitted label
+# can carry it instead of asserting a bare "parked" (your-org/nexus-code#1039).
+# One of:
+#   await        marker FRESH and a live skeptic window — the ordinary park
+#   skeptic-live marker STALE (the worker's own await loop has stopped
+#                re-touching it) but a live skeptic window names this target.
+#                The exemption is real; what has ended is the WORKER's await,
+#                not the skeptic's review. This is the case that used to be
+#                mislabelled as an ordinary idle worker.
+#   grace        no live skeptic yet, still inside the orphan grace
+#   channel      no LINKED skeptic window, but the comms channel holds request
+#                traffic newer than this round's `skeptic-request` — a skeptic
+#                spawned without `--skeptic-role` is reviewing (#1153)
+# Set on every call that returns 0; cleared to empty on a non-park verdict so a
+# stale value can never decorate a later row.
+_IDLE_SKEPTIC_PARK_BASIS=""
+
 # Returns 0 (parked → exempt) / 1 (not parked → classify normally).
-# Exempt only when the marker is FRESH *and* (a live skeptic is reviewing
-# OR we are still within the orphan grace since the skeptic was required).
+# Exempt when a live skeptic is reviewing (at ANY marker age), or the marker is
+# FRESH and we are still within the orphan grace since the skeptic was required.
 # $3 = live tmux window names (optional; queried if empty).
+#
+# LIVENESS IS ASKED BEFORE AGE (your-org/nexus-code#1039), and the order is the
+# whole fix. The age gate used to run first and `return 1` on a stale marker,
+# discarding `$live` — which already contained the reviewing skeptic's window —
+# before the liveness question was ever put. Marker freshness is a PROXY for
+# "the worker is still waiting"; the property the exemption exists to express is
+# "a skeptic is still reviewing". They agree until the worker's await loop times
+# out while the skeptic keeps working, i.e. on LONG skeptic passes — exactly the
+# ones where the exemption matters most. Measured: two workers, identical marker
+# state and both skeptics alive, got opposite labels (`parked-awaiting-skeptic`
+# vs `idle 2254s`); the only difference was whose await loop was still ticking.
+#
+# The age gate is KEPT for the case it was written for — no live skeptic, stale
+# marker — where it correctly declines the exemption and lets the window
+# resurface through normal idle classification (the genuine-hang path).
 _idle_skeptic_parked() {
     local name="$1" now="$2" live="${3:-}"
-    local safe="${name//[^a-zA-Z0-9_-]/_}"
+    _IDLE_SKEPTIC_PARK_BASIS=""
+    _IDLE_SKEPTIC_PARK_WINDOW=""
+    local safe; safe=$(wk_encode "$name")
     local state_dir="${STATE_DIR:-}"
     [[ -n "$state_dir" ]] || return 1
     local marker="${state_dir}/skeptic/pending/${safe}"
@@ -2687,18 +3176,52 @@ _idle_skeptic_parked() {
     mtime=$(date +%s -r "$marker" 2>/dev/null || echo 0)
     [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
     age=$(( now - mtime ))
-    (( age <= hang )) || return 1
-    # Fresh marker — but require a live skeptic, else stay exempt only
-    # within the grace window (orchestrator may still be spawning).
-    if _idle_skeptic_live_window "$name" "$live"; then
+    # A live skeptic window naming this target is a STRONGER and more direct
+    # claim than the freshness of a file the OTHER process happens to touch.
+    local _sw=""
+    if _sw=$(_idle_skeptic_live_window "$name" "$live"); then
+        _IDLE_SKEPTIC_PARK_WINDOW="$_sw"
+        if (( age <= hang )); then
+            _IDLE_SKEPTIC_PARK_BASIS="await"
+        else
+            _IDLE_SKEPTIC_PARK_BASIS="skeptic-live"
+        fi
         return 0
     fi
+    # No live skeptic. Now the marker's freshness matters again: a stale marker
+    # with no skeptic is the genuine-hang path and must lapse.
+    (( age <= hang )) || return 1
     local req grace
     req=$(_idle_skeptic_request_epoch "$name")
     [[ "$req" =~ ^[0-9]+$ ]] || req=0
+    # CHANNEL TRAFFIC THIS ROUND IS POSITIVE EVIDENCE OF A LIVE SKEPTIC
+    # (your-org/nexus-code#1153, residual 1 — the PARK half). The orphan
+    # detector already reads it; the exemption did not, so a skeptic spawned
+    # without `--skeptic-role` (no linkage record) kept its target parked only
+    # until the orphan grace lapsed, and then the target proceeded toward
+    # retirement WHILE ITS SKEPTIC WAS MID-PASS. The argument for granting the
+    # permissive direction here, stated because the orphan-side change
+    # deliberately declined to make it:
+    #   * the evidence is scoped to THIS round — files newer than the
+    #     `skeptic-request` epoch, never "any request file exists", so #975's
+    #     re-armed never-spawned park is untouched (a leftover from a prior
+    #     round is older than the new request);
+    #   * it is gated on a FRESH marker (`age <= hang` above), so a worker
+    #     whose own await has died still lapses into the genuine-hang path;
+    #   * a request file is written only by a skeptic's `ask` or the target's
+    #     `ack`/`answer` on it — there is no other author, so its existence in
+    #     this round IS a skeptic, unlinked but real.
+    # The basis says so, so the row can name the evidence it rests on.
+    if (( req != 0 )) && _idle_skeptic_channel_active "$name" "$req"; then
+        _IDLE_SKEPTIC_PARK_BASIS="channel"
+        return 0
+    fi
     (( req == 0 )) && req="$mtime"
     grace=$(_idle_skeptic_orphan_grace)
-    (( now - req <= grace )) && return 0
+    if (( now - req <= grace )); then
+        _IDLE_SKEPTIC_PARK_BASIS="grace"
+        return 0
+    fi
     return 1
 }
 
@@ -2710,7 +3233,7 @@ _idle_skeptic_parked() {
 # normal idle classification (the genuine-hang path). $3 = live windows.
 _idle_skeptic_orphaned() {
     local name="$1" now="$2" live="${3:-}"
-    local safe="${name//[^a-zA-Z0-9_-]/_}"
+    local safe; safe=$(wk_encode "$name")
     local state_dir="${STATE_DIR:-}"
     [[ -n "$state_dir" ]] || return 1
     local marker="${state_dir}/skeptic/pending/${safe}"
@@ -2721,10 +3244,20 @@ _idle_skeptic_orphaned() {
     [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
     age=$(( now - mtime ))
     (( age <= hang )) || return 1
-    _idle_skeptic_live_window "$name" "$live" && return 1
+    _idle_skeptic_live_window "$name" "$live" >/dev/null && return 1
     local req grace
     req=$(_idle_skeptic_request_epoch "$name")
     [[ "$req" =~ ^[0-9]+$ ]] || req=0
+    # Channel traffic in THIS round is a live skeptic the linkage record missed
+    # (your-org/nexus-code#1153). Asked ONLY when a request epoch exists: with no
+    # round clock there is nothing to scope the traffic to, and an unscoped test
+    # is the false exemption documented on `_idle_skeptic_channel_active`.
+    #
+    # SUPPRESSING the orphan class is the safe direction. The same edit is
+    # deliberately NOT made in `_idle_skeptic_parked`: granting the PARK
+    # exemption on channel traffic is the permissive direction and needs its own
+    # argument, which this change does not make.
+    (( req != 0 )) && _idle_skeptic_channel_active "$name" "$req" && return 1
     (( req == 0 )) && req="$mtime"
     grace=$(_idle_skeptic_orphan_grace)
     (( now - req > grace ))
@@ -2764,7 +3297,7 @@ _bg_orphan_grace_seconds() {
 
 # Per-window background-CPU progress stamp: `<bg_cpu>\t<last_progress_epoch>`.
 _bg_progress_path() {
-    printf '%s/background-progress/%s' "${STATE_DIR:-.}" "$1"
+    printf '%s/background-progress/%s' "${STATE_DIR:-$(_ip_nostate_dir)}" "$1"
 }
 
 # Record this cycle's bg_cpu for `window` at `now`, advancing
@@ -2860,6 +3393,32 @@ _bg_progress_drop() {
 # disposes.
 
 # Backoff schedule constants (env- and config-overridable).
+#
+# BASE IS A CPU-FREEZE CLOCK, NOT A PROGRESS CLOCK, AND IT IS NOT THE PRIMARY
+# BOUND (your-org/nexus-code#1221). It measures seconds since `bg_cpu` --
+# utime+stime summed over the LIVE processes in the background-shell subtrees,
+# with cutime/cstime deliberately excluded, so an exited child contributes
+# nothing -- last CHANGED (`_bg_progress_check`, above). A single jiffy of
+# advance resets it to zero however stale it was, so `bg_stall_age >= bg_base`
+# is reachable ONLY while the subtree burns fewer than 1 jiffy (10 ms) per
+# `base` seconds: 2.8 parts per million of one CPU at the 3600 s default.
+#
+# ITS CONSTITUENCY IS A CHILD THAT FORKS NOTHING -- a blocking wait
+# (`sbatch --wait`, bare `wait`, `read` on a fifo, `flock`). Measured on this
+# host: 0 jiffies over 90 s, so the grace IS the operative bound for that
+# shape and fires 47 hours before the ceiling would.
+#
+# IT IS NOT THE BOUND FOR A POLL LOOP. Measured: ~1 jiffy per 51 fork+exec
+# iterations, so `until …; do sleep N; done` advances every ~51*N seconds and
+# defeats base for every N below ~70 s -- and by orders of magnitude for any
+# loop body doing real work. The bound that binds a polling child is
+# `bg_child_age >= bg_ceiling`, the INDEPENDENT `||` disjunct at the call site
+# below, which a CPU-advancing child cannot reset.
+#
+# THE SENTENCE THIS COMMENT MUST NEVER BECOME: "the grace bounds a child that
+# has stopped making progress." It bounds a child that has stopped BURNING
+# CPU. Those diverge by five orders of magnitude, and that divergence is
+# exactly the defect #1221 reports.
 _bg_children_grace_base_seconds() {
     local v="${MONITOR_BG_CHILDREN_GRACE_BASE_SECONDS:-}"
     if [[ -z "$v" && -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/config/load.sh" ]]; then
@@ -2902,7 +3461,7 @@ _worker_health_slack_seconds() {
 }
 
 # Per-window backoff state: `<child_sig>\t<level>\t<last_escalation_epoch>`.
-_bg_backoff_path() { printf '%s/bg-backoff/%s' "${STATE_DIR:-.}" "$1"; }
+_bg_backoff_path() { printf '%s/bg-backoff/%s' "${STATE_DIR:-$(_ip_nostate_dir)}" "$1"; }
 
 # Read the backoff row; echoes `<sig>\t<level>\t<last_esc>`. `sig` is `-`
 # (a sentinel, never a real child count) when the state file is
@@ -2960,7 +3519,7 @@ _bg_backoff_drop() {
 # no state file to migrate, leak, or go stale.
 
 # Worker-health clarification file, written by monitor/worker-health.sh.
-_worker_health_path() { printf '%s/worker-health/%s.json' "${STATE_DIR:-.}" "$1"; }
+_worker_health_path() { printf '%s/worker-health/%s.json' "${STATE_DIR:-$(_ip_nostate_dir)}" "$1"; }
 _worker_health_drop() {
     local window="$1"
     [[ -n "$window" ]] || return 1
@@ -3192,6 +3751,386 @@ _bg_wrapped_children_detail() {
     printf '%d live child process(es) after wrap-up%s — ask for clarification (monitor/worker-health.sh) or close' "$child_count" "$who"
 }
 
+# ---- skeptic-await recognition (your-org/nexus-code#1183) -------------------
+#
+# Does a RECORDED COMMAND LINE invoke `skeptic-channel.sh await`? Decided by a
+# PROPERTY of the argv, not by a substring of it — the distinction #1121 is
+# about. The first version required argv[0] to BE the script, which missed the
+# form the documentation PRESCRIBES: `skills/nexus.skeptic/SKILL.md` tells every
+# worker to run `monitor/skeptic-channel.sh await <task>; rc=$?; …`, a `;`-list
+# that async-run.sh records as `bash -c '<list>'`. Measured on the primary's
+# live async-run state at the reopen: 20 awaits matched, SEVEN were missed —
+# `bash <path>/skeptic-channel.sh await …` (6) and `bash -c '<list>'` (1) — and
+# all seven were told to install a second listener, the one action #1178
+# forbids.
+#
+# A substring test (`*skeptic-channel.sh*` and `* await *`, which is what
+# skeptic-channel.sh's own `_await_pid_is_ours` uses) would recognise all
+# seven — and also `bash -c 'echo skeptic-channel.sh await x is armed'`, a
+# `grep` over a log, or any prompt that quotes the phrase. That over-match is
+# precisely what the strict predicate was written to prevent, so the fix
+# keeps the property and widens the PARSE: strip the interpreter and wrapper
+# words that can precede a command, split a `-c` list at its command
+# boundaries, and require that some COMMAND POSITION holds the script with
+# `await` as its first argument. An `echo`, a `grep` or a prompt puts the
+# phrase in an ARGUMENT position, never in a command position.
+#
+# `_idle_words_are_skeptic_await <word>…` — one simple command, already
+# word-split. Prints the awaited TASK (the word after `await`, "" when absent)
+# and returns 0 iff word0 is the script and word1 is `await`, after stripping
+# leading `VAR=value` assignments and known wrappers (an interpreter, `command`,
+# `exec`, `nohup`, `setsid`, `time`, `timeout [opts] DURATION`). An interpreter
+# followed by `-c` is NOT a direct invocation and returns 1 here; the caller
+# parses that form.
+_idle_words_are_skeptic_await() {
+    # ONE definition, shared with the await lock (your-org/nexus-code#1426):
+    # `monitor/_proc_argv.sh` carries the parser this function used to hold
+    # (#1183). The probe's n_await recognition and skeptic-channel.sh's
+    # ownership check must agree on what an await IS, or a waiter the probe
+    # counts is one the lock refuses to reap, and vice versa. Absent library →
+    # rc 1 (not an await): the fail-CLOSED direction for n_await.
+    _idle_proc_argv_lib || return 1
+    proc_words_are_skeptic_await "$@"
+}
+
+# `_idle_argv_skeptic_await_task <nul-separated-argv-file>` — the recorded
+# argv of an async-run job (`<token>/argv`) or a live process
+# (`/proc/<pid>/cmdline`; same encoding). Prints the awaited task and returns
+# 0 iff the command line INVOKES `skeptic-channel.sh await`, in either the
+# direct form (optionally behind an interpreter or wrapper) or the
+# `<shell> [opts] -c '<list>'` form. Returns 1 for everything else, including
+# a `-c` list that merely MENTIONS the script.
+_idle_argv_skeptic_await_task() {
+    _idle_proc_argv_lib || return 1
+    proc_argv_skeptic_await_task "$@"
+}
+
+# Source monitor/_proc_argv.sh once, relative to this file. rc 1 (and one
+# stderr line, once) when it is missing — the callers treat that as "not an
+# await", never as an error that stops the probe.
+_IDLE_PROC_ARGV_STATE=""
+_idle_proc_argv_lib() {
+    case "$_IDLE_PROC_ARGV_STATE" in ok) return 0 ;; missing) return 1 ;; esac
+    local lib; lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_proc_argv.sh"
+    if [[ -r "$lib" ]] && source "$lib"; then _IDLE_PROC_ARGV_STATE=ok; return 0; fi
+    _IDLE_PROC_ARGV_STATE=missing
+    echo "_idle_probe: monitor/_proc_argv.sh missing — no process will be recognised as a skeptic await (fail-closed, your-org/nexus-code#1426)" >&2
+    return 1
+}
+
+# `_idle_orphan_blank_flags <token-dir>` (your-org/nexus-code#1355) — for a
+# FINISHED async-run job: prints `b` when rc=0 AND both capture files exist
+# and are 0 B (the shape async-run.sh _evidence mode 1 flags), `bx` when in
+# addition the recorded argv redirects its own output (a `>` or a `tee`), and
+# nothing otherwise. Scoped to rc=0 by the issue: a NON-ZERO rc with empty
+# streams is a status. A MISSING capture file is `?` to async-run.sh, not a
+# zero, and is not counted here either.
+_idle_orphan_blank_flags() {
+    local d="$1" rc=""
+    rc=$(sed -n 's/^rc=//p' "$d/status" 2>/dev/null); rc="${rc%%$'\n'*}"
+    [[ "$rc" == 0 ]] || return 0
+    [[ -f "$d/out" && ! -s "$d/out" && -f "$d/err" && ! -s "$d/err" ]] || return 0
+    local argv_txt=""
+    [[ -r "$d/argv" ]] && { argv_txt=$(tr '\0' ' ' < "$d/argv" 2>/dev/null) || argv_txt=""; }
+    if [[ "$argv_txt" == *">"* || "$argv_txt" == *" tee "* || "$argv_txt" == *"/tee "* ]]; then
+        printf 'bx'
+    else
+        printf 'b'
+    fi
+    return 0
+}
+
+# `_idle_skeptic_await_armed <task> [now]` — is the await on channel <task>
+# LIVE, by the channel's OWN record? The issue's ask, previously carried only
+# as prose inside the advice string: `.await-owner` must name a pid whose
+# cmdline is itself a `skeptic-channel.sh await <task>` (the same property,
+# read off /proc, so a recycled pid cannot satisfy it), and `.await-heartbeat`
+# must be within the await-hang threshold. ANY DOUBT RETURNS 1 — a stale
+# await genuinely is an orphan and keeps the running/orphan treatment.
+_idle_skeptic_await_armed() {
+    local task="$1" now="${2:-}"
+    [[ -n "$task" ]] || return 1
+    [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+    local enc; enc=$(wk_encode "$task" 2>/dev/null) || return 1
+    [[ -n "$enc" ]] || return 1
+    local dir="${STATE_DIR:-$(_ip_nostate_dir)}/skeptic/${enc}" owner="" hb="" otask=""
+    [[ -r "$dir/.await-owner" && -r "$dir/.await-heartbeat" ]] || return 1
+    # `<pid> <starttime>` since your-org/nexus-code#1426 (residual 1b); the
+    # first field is the pid either way.
+    read -r owner _ < "$dir/.await-owner" 2>/dev/null || owner=""
+    owner="${owner//[^0-9]/}"
+    [[ "$owner" =~ ^[0-9]+$ ]] || return 1
+    [[ -r "/proc/$owner/cmdline" ]] || return 1
+    otask=$(_idle_argv_skeptic_await_task "/proc/$owner/cmdline") || return 1
+    [[ "$otask" == "$task" ]] || return 1
+    IFS= read -r hb < "$dir/.await-heartbeat" 2>/dev/null || hb=""
+    hb="${hb//[^0-9]/}"
+    [[ "$hb" =~ ^[0-9]+$ ]] || return 1
+    local hang; hang=$(_idle_skeptic_hang_seconds)
+    (( now - hb <= hang )) || return 1
+    return 0
+}
+
+# Resolve a window's declared async waits to `terminal` or `unresolved`
+# (your-org/nexus-code#1240).
+#
+# WHY THIS EXISTS. The orchestrator advisory for `idle-orphan-async` says, in
+# effect, "a wait you have not confirmed dead must not be cleared". For a
+# `died` or `running` job that is correct and stays. For a job that has
+# ALREADY FINISHED it inverts: the job is confirmed finished, the correct
+# action is precisely to clear the wait, and the sentence forbids it -- the
+# reader can never satisfy a "confirmed dead" condition for a job that
+# terminated normally, so the text has no exit. Seven instances were recorded
+# across two evenings, every one on a job that had exited rc=0, one of them
+# stale for sixteen hours and re-flagged on the same token after the worker
+# had already published that job's results.
+#
+# WHY A STAT FIRST, AND THEN `async-run.sh --status-line`. SUPERSEDED IN PART
+# by your-org/nexus-code#1333 — this paragraph is kept because its cost argument
+# still governs, and CORRECTED because its conclusion no longer does.
+#
+# STILL TRUE: the `[[ -s status ]]` fast path stays, and it is what keeps the
+# cost bounded — the delegated call is reached ONLY for a wait with no status
+# file, the minority case (2 of 13 measured).
+#
+# NO LONGER TRUE, and this is the sentence #1333 refuted: "Two-valued is
+# exactly the split the guidance turns on." It is not. A job CANCELLED by its
+# owner and one that DIED unattended both land in pid-gone-and-no-status, and
+# they have OPPOSITE operator responses. `_verdict` emits SIX states and is the
+# only thing that separates them.
+#
+# AND THE ~580x RATIO COMPARES THE WRONG PAIR. It is `--status-line` against a
+# STAT; the call this actually replaced is `proc-exists-authorized`, itself a
+# shell-out. Re-measured on this host, 5-run means: `--status-line` 352 ms
+# against `proc-exists-authorized` 316 ms — an 11% change on the same bounded
+# path, not 580x. Quoted here so the next reader revisiting the budget is not
+# stopped by a ratio that was never about this substitution.
+#
+# FAIL-CLOSED EVERYWHERE. Anything not positively established terminal --
+# a truncated list, a non-`asyncrun` kind, a token that is not `ar-*`, an
+# unresolvable window, an empty list -- returns `unresolved` and keeps the
+# existing text. The truncation arm matters most and is the same reasoning
+# `_orphan_async_waits_truncated` records: `orphan_kinds` is capped at 80
+# chars, and "the waits I can see are all terminal" says nothing about the
+# ones the cap removed. Failing closed here costs a worker one advisory it
+# could have been spared; failing open tells a worker its running job is over.
+#
+# THREE STATES, NOT TWO (your-org/nexus-code#1292). The first cut answered
+# `terminal` or `unresolved`, which was enough to fix the guidance text but
+# collapsed two genuinely different situations into one word. Measured across
+# every window emitting `waits=` on this board: 11 of 13 listed waits had a
+# terminal `rc=` on disk, stale from 5 to 304 minutes — and the two that did
+# NOT, the genuinely indeterminate ones the warning actually exists for, were
+# invisible among them.
+#
+#   terminal    a `status` file exists: the job has ended, whatever its rc.
+#   running     no status, and the recorded (pid, pidstart) still identifies a
+#               live process: work really is in flight.
+#   unresolved  everything else — including no status with the process gone
+#               (the died shape) — and every doubt.
+#
+# `(pid, pidstart)`, NEVER pid ALONE. The recycled-pid case is not
+# hypothetical; it occurred in that sample, a recorded pid still present in
+# /proc carrying starttime 911215293 against a recorded 910769323. A liveness
+# check on the pid alone reports ALIVE, and a kill on it hits a stranger. That
+# is why `pidstart` is written beside `pid`. The identity discipline is
+# UNCHANGED and is still not re-derived here — but since #1333 it is
+# `async-run.sh`'s own `_pid_alive` that applies it, reached through
+# `--status-line`, NOT `monitor/proc-exists-authorized`. `_pid_alive` reads
+# /proc field 22 directly with the same (pid, pidstart) pair, so the
+# recycled-pid case above is still refused; only the DELEGATE changed.
+#
+# COST is bounded by construction: the primitive is invoked ONLY for a wait
+# with no `status` file, the minority case (2 of 13 measured). An ended job is
+# settled by the stat alone.
+_idle_orphan_wait_class() {
+    local window="$1" kinds="$2" pair kind tok root enc
+    local n=0 n_term=0 n_run=0 n_died=0 n_untr=0 n_canc=0 n_await=0 n_blank=0 n_redir=0 _bl=""
+    if ! enc=$(wk_encode "$window" 2>/dev/null) || [[ -z "$enc" ]]; then
+        printf 'unresolved|-'; return 0
+    fi
+
+    # AUTHORITATIVE LIST FIRST (your-org/nexus-code#1295 review). The caller
+    # passes pane-state`s `orphan_kinds`, which is capped at 80 chars for
+    # DISPLAY. An `asyncrun:ar-xxxxxxxxxxxx` entry is 24 chars plus a comma, so
+    # the cap truncates at FOUR waits — and the first cut of this function
+    # fail-closed on truncation, which made it INERT for every window with 4 or
+    # more. Measured against the population it was written for: it reached 1 of
+    # the 4 windows in #1292`s own table, and 0 of the two 13- and 11-wait
+    # windows an operator had to sort BY HAND. A guard that does not fire at
+    # the cardinality its defect occurs at is not a guard.
+    #
+    # So read `external_waits` from the heartbeat, which is the same record
+    # pane-state derived the capped string FROM and is uncapped. The capped
+    # string remains the fallback, still fail-closed on its ellipsis, for the
+    # case where the heartbeat cannot be read at all.
+    local full="" hb="${STATE_DIR:-$(_ip_nostate_dir)}/heartbeat/${enc}.json"
+    if [[ -r "$hb" ]] && command -v jq >/dev/null 2>&1; then
+        full=$(jq -r 'if (.external_waits | type) == "array" then
+                          (.external_waits | map("\(.kind):\(.id)") | join(","))
+                      else empty end' "$hb" 2>/dev/null) || full=""
+    fi
+    if [[ -z "$full" ]]; then
+        # Fallback: the DISPLAY string. Fail closed on truncation — a list we
+        # cannot vouch for never satisfies a terminating condition.
+        if [[ -z "$kinds" || "$kinds" == unknown || "$kinds" == *…* ]]; then
+            printf 'unresolved|-'; return 0
+        fi
+        full="$kinds"
+    fi
+
+    root="${STATE_DIR:-$(_ip_nostate_dir)}/async-run/${enc}"
+    # `_pea` is GONE: since #1333 liveness is decided by `async-run.sh`s own
+    # `_pid_alive` via `--status-line`, and an assigned-but-unused resolver is
+    # the greppable proof that a comment above has gone stale.
+    local _ar="" _d
+    _d=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || _d=""
+    [[ -n "$_d" && -r "$_d/../async-run.sh" ]] && _ar="$_d/../async-run.sh"
+
+    # `tr` rather than IFS word-splitting: zsh does NOT split an unquoted
+    # parameter, so `for p in $full` would iterate ONCE over the whole string.
+    while IFS= read -r pair; do
+        [[ -n "$pair" ]] || continue
+        n=$(( n + 1 ))
+        kind="${pair%%:*}"
+        tok="${pair#*:}"
+        # UNTRACKED, the fourth state. A `nohup` or `slurm` wait carries a
+        # synthetic id with no async-run directory, no pid, no pidstart and no
+        # status — unresolvable BY CONSTRUCTION rather than merely stale, which
+        # is a different fact and a different remedy. Measured live: 7 `nohup`
+        # waits on one window, 5 on two others. Reported apart so it stops
+        # being counted as evidence that something might still be running.
+        if [[ "$kind" != asyncrun || "$tok" != ar-* || ! -d "${root}/${tok}" ]]; then
+            n_untr=$(( n_untr + 1 )); continue
+        fi
+        if [[ -s "${root}/${tok}/status" ]]; then
+            n_term=$(( n_term + 1 ))
+            # your-org/nexus-code#1355: b= finished rc=0 with 0 B/0 B, x= of
+            # those, argv redirects its own output. Read by uncorr() in the
+            # emit so the empty-streams sentence is SCOPED and FAITHFUL.
+            _bl=$(_idle_orphan_blank_flags "${root}/${tok}")
+            [[ "$_bl" == b* ]] && n_blank=$(( n_blank + 1 ))
+            [[ "$_bl" == bx ]] && n_redir=$(( n_redir + 1 ))
+            continue
+        fi
+        # ASK THE AUTHORITY, DO NOT RESTATE IT (your-org/nexus-code#1333).
+        # This used to hand-roll a two-state subset of async-run.sh's `_verdict`,
+        # which already emits SIX: terminal | cancelled | cancel-requested |
+        # died | running | unknown. The subset FUSED `cancelled` with `died` —
+        # measured, a job cancelled by its owner and a job that died unattended
+        # produced BYTE-IDENTICAL rows, and those have OPPOSITE operator
+        # responses (nothing to do, versus investigate, work may be lost). A
+        # second hand-written status list is how that recurs, so there is now
+        # one definition and this asks it.
+        #
+        # `cancel-requested` is the member a naive fix drops: `_verdict` returns
+        # it when the marker exists AND THE PID IS STILL ALIVE, so a
+        # "marker => settled" rule would mark a LIVE job resolved and retire a
+        # working window — strictly worse than the bug it fixes. It counts as
+        # RUNNING here.
+        #
+        # COST: this REPLACES the proc-exists-authorized shell-out, it does not
+        # add one — `_verdict` reads /proc itself, with the same (pid, pidstart)
+        # identity discipline. The `-s status` gate above still bounds the
+        # invocation count to the minority no-status case.
+        #
+        # DOUBT FAILS CLOSED: an unreadable authority, an empty answer, a
+        # timeout and any unrecognised verdict all land in `n_died`, exactly as
+        # the else-arm they replace did.
+        local _v="" _cls="unknown"
+        if [[ -r "$_ar" ]]; then
+            _v=$(NEXUS_ASYNC_RUN_WINDOW="$window" NEXUS_STATE_DIR="${STATE_DIR:-$(_ip_nostate_dir)}" \
+                 timeout 5 bash "$_ar" --status-line "$tok" 2>/dev/null) || _v=""
+            [[ -n "$_v" ]] && _cls="${_v%%|*}"
+        fi
+        case "$_cls" in
+            terminal)         n_term=$(( n_term + 1 ))
+                              _bl=$(_idle_orphan_blank_flags "${root}/${tok}")
+                              [[ "$_bl" == b* ]] && n_blank=$(( n_blank + 1 ))
+                              [[ "$_bl" == bx ]] && n_redir=$(( n_redir + 1 )) ;;
+            cancelled)        n_canc=$(( n_canc + 1 )) ;;
+            running)          n_run=$((  n_run  + 1 )) ;;
+            cancel-requested) n_run=$((  n_run  + 1 )) ;;   # marker set, STILL ALIVE
+            died)             n_died=$(( n_died + 1 )) ;;
+            *)                n_died=$(( n_died + 1 )) ;;   # unknown/unreadable -> fail CLOSED
+        esac
+        # your-org/nexus-code#1183. A wait whose RECORDED ARGV is a
+        # `skeptic-channel.sh await` IS its own resume mechanism — the loop
+        # wakes on the channel. Telling the operator to install a second
+        # listener is the one action that must not be taken: a stacked await
+        # SIGTERMs the older one (#1178), and the losing direction leaves the
+        # window with NONE armed while believing it is parked.
+        #
+        # Keyed on `argv`, which async-run.sh writes from the REAL command —
+        # NOT on `desc`, which is freeform prose. Making a freeform label
+        # SELECT is the #1050 hazard.
+        #
+        # `running` ONLY, deliberately: a cancel-requested await is being torn
+        # down, not armed, and must keep the ordinary running advice.
+        #
+        # NO PIPELINE HERE, and that is not style. `tr … | grep -q` is an
+        # EARLY-EXIT READER: `grep -q` closes the pipe on its first match, `tr`
+        # takes SIGPIPE (141), and under `pipefail` the pipeline status becomes
+        # 141 — so the `if` would read FALSE on the very argv it just matched,
+        # and this arm would silently never fire. Caught by
+        # `test-sigpipe-assertion-lint.sh` on this exact line; it is a RATCHET,
+        # not a repro, because whether `tr` finishes before `grep` exits depends
+        # on the argv size. A bash substring test needs no second process.
+        local _argv_txt=""
+        if [[ "$_cls" == running && -r "${root}/${tok}/argv" ]]; then
+            _argv_txt=$(tr '\0' ' ' < "${root}/${tok}/argv" 2>/dev/null) || _argv_txt=""
+        fi
+        # THE PROPERTY, NOT A SUBSTRING (your-org/nexus-code#1121). A substring
+        # test is where "no input matches both" quietly becomes false: ANY
+        # async-run job whose argv merely CONTAINS this literal — a prompt, a
+        # grep, an echo — would be told it is "correctly ARMED … Do nothing",
+        # suppressing the poller advice for real work. `argv` is NUL-separated,
+        # so the property is available exactly. The first version demanded
+        # argv[0] BE the script and missed the prescribed `bash -c '<list>'`
+        # and `bash <path>/skeptic-channel.sh await` forms (#1183 reopen —
+        # 7 of 27 live awaits); `_idle_argv_skeptic_await_task` recognises a
+        # COMMAND POSITION in any of those shapes and still refuses a list that
+        # only mentions the script in an argument.
+        #
+        # AND THE CHANNEL MUST AGREE. The recorded argv says what was LAUNCHED;
+        # `_idle_skeptic_await_armed` asks the channel's own `.await-owner`
+        # (a live pid whose cmdline is this await) and `.await-heartbeat`
+        # (within the hang threshold) whether it is still ARMED. A stale await
+        # is an orphan and keeps the running treatment — fail closed, as the
+        # issue asks.
+        if [[ "$_cls" == running && -r "${root}/${tok}/argv" ]]; then
+            local _await_task=""
+            if _await_task=$(_idle_argv_skeptic_await_task "${root}/${tok}/argv") \
+               && _idle_skeptic_await_armed "$_await_task"; then
+                n_await=$(( n_await + 1 ))
+            fi
+        fi
+    done < <(printf '%s\n' "$full" | tr ',' '\n')
+
+    # ARM ORDER, stated because #1121 requires it. `running` is first among the
+    # non-empty arms so any live wait wins outright. The new `cancelled` arm sits
+    # AFTER `terminal` and is a CONJUNCTION (n_canc + n_term == n), so it is
+    # reachable only when n_term != n, hence only when n_canc > 0. Deliberately
+    # an ALL-arm: the fix for #1333 must not reintroduce #1311's existential
+    # shape in the arm next door.
+    #
+    # `skeptic-await` sits ABOVE `running` and is SAFE under #1121 because it is
+    # STRICTLY NARROWER than the arm it precedes — `n_await == n_run` accepts a
+    # subset of what `n_run > 0` accepts — and it replaces a permissive advice
+    # string with a more specific one. It shadows no DENY arm. `== n_run` and
+    # not `> 0`: a window with a skeptic await AND a live compute job still
+    # needs the poller advice (your-org/nexus-code#1183).
+    local counts="t=${n_term} r=${n_run} d=${n_died} u=${n_untr} c=${n_canc} n=${n} b=${n_blank} x=${n_redir}"
+    if   (( n == 0 ));                    then printf 'unresolved|-'
+    elif (( n_run > 0 && n_await == n_run )); then printf 'skeptic-await|%s' "$counts"
+    elif (( n_run > 0 ));                 then printf 'running|%s'    "$counts"
+    elif (( n_term == n ));               then printf 'terminal|%s'   "$counts"
+    elif (( n_canc + n_term == n ));      then printf 'cancelled|%s'  "$counts"
+    elif (( n_died == 0 && n_untr > 0 )); then printf 'untracked|%s'  "$counts"
+    else                                       printf 'unresolved|%s' "$counts"
+    fi
+}
+
 list_really_idle_workers() {
     local threshold="${MONITOR_IDLE_THRESHOLD_SECONDS:-60}"
     local close_hours="${MONITOR_IDLE_CLOSE_HOURS:-24}"
@@ -3408,13 +4347,19 @@ list_really_idle_workers() {
                     # Expected, named state — the PR #285 exemption.
                     bg_surface=1
                     bg_child_class="parked-awaiting-skeptic"
-                    bg_child_detail="skeptic reviewing; exempt from idle/close (${pane_bg_shells} await child(ren))"
+                    if [[ "${_IDLE_SKEPTIC_PARK_BASIS:-}" == "skeptic-live" ]]; then
+                        bg_child_detail="live skeptic window, worker await marker STALE — exempt on the skeptic, not on an active await loop (${pane_bg_shells} child(ren))"
+                    elif [[ "${_IDLE_SKEPTIC_PARK_BASIS:-}" == "channel" ]]; then
+                        bg_child_detail="skeptic reviewing — no linkage record, but the comms channel holds this round's traffic (spawned without --skeptic-role; #1153); exempt from idle/close (${pane_bg_shells} await child(ren))"
+                    else
+                        bg_child_detail="skeptic reviewing; exempt from idle/close (${pane_bg_shells} await child(ren))"
+                    fi
                 elif _idle_skeptic_orphaned "$name" "$now" "$live_windows"; then
                     # Fresh marker, no live skeptic past grace — a stuck park,
                     # actionable in its own right rather than mislabelled.
                     bg_surface=1
                     bg_child_class="orphaned-skeptic-pending"
-                    bg_child_detail="skeptic-pending marker but no live skeptic past grace — spawn the skeptic or clear the marker"
+                    bg_child_detail="skeptic-pending marker but no live skeptic past grace — run \`ng skeptic-evidence $name\` FIRST: a DELIVERED verdict the record cannot match looks identical to an absent one (your-org/nexus-code#1156), and clearing the marker also voids a LIVE obligation (#961, #1153)"
                 elif (( pane_bg_task_shells <= 0 )) && (( pane_bg_infra >= 1 )) \
                      && (( bg_child_age < bg_ceiling )); then
                     # Case (b0): wrapped, marker already cleared, and EVERY live
@@ -3662,6 +4607,13 @@ list_really_idle_workers() {
                 # advisory line.
                 cls=idle-orphan-async
                 detail="${pane_orphan_kinds:-unknown}"
+                # Still FOUR columns. `<class>|<kinds>` is read by the render
+                # arm alone; no other consumer of this stream looks at $4, and
+                # `idle-state.tsv` persists only $1 and $2, so nothing
+                # downstream can observe the prefix.
+                # `<class>|<counts>|<kinds>` — the classifier emits the first
+                # two joined, so this stays one substitution.
+                detail="$(_idle_orphan_wait_class "$name" "$detail")|$detail"
                 printf '%s\t%s\t%s\t%s\n' "$name" "$cls" "$age" "$detail"
                 continue
                 ;;
@@ -3785,8 +4737,19 @@ list_really_idle_workers() {
         # it's live. Runs AFTER interrupted detection above: a crashed
         # await beats a (momentarily-fresh) park because it's recoverable.
         if _idle_skeptic_parked "$name" "$now" "$live_windows"; then
+            local _park_detail="skeptic reviewing; exempt from idle/close"
+            # #1039: when the exemption rests on the live skeptic WINDOW rather
+            # than on a still-ticking await loop, say so in the row. The
+            # exemption is equally valid; the operator-relevant difference is
+            # that the worker is no longer polling for the verdict.
+            [[ "${_IDLE_SKEPTIC_PARK_BASIS:-}" == "skeptic-live" ]] \
+                && _park_detail="skeptic reviewing (live skeptic window); worker await marker STALE — exempt on the skeptic, not on an active await loop"
+            [[ "${_IDLE_SKEPTIC_PARK_BASIS:-}" == "channel" ]] \
+                && _park_detail="skeptic reviewing — no linkage record, but the comms channel holds this round's traffic (spawned without --skeptic-role; your-org/nexus-code#1153); exempt from idle/close"
+            # your-org/nexus-code#845: the JOIN — which skeptic, idle how long.
+            _park_detail+=$(_idle_skeptic_join_detail "$now" "$worker_windows")
             printf '%s\t%s\t%s\t%s\n' \
-                "$name" "parked-awaiting-skeptic" "$age" "skeptic reviewing; exempt from idle/close"
+                "$name" "parked-awaiting-skeptic" "$age" "$_park_detail"
             continue
         fi
 
@@ -3800,7 +4763,7 @@ list_really_idle_workers() {
         # and normal classification resumes.
         if _idle_skeptic_orphaned "$name" "$now" "$live_windows"; then
             printf '%s\t%s\t%s\t%s\n' \
-                "$name" "orphaned-skeptic-pending" "$age" "skeptic-pending marker but no live skeptic past grace — spawn the skeptic or clear the marker"
+                "$name" "orphaned-skeptic-pending" "$age" "skeptic-pending marker but no live skeptic past grace — run \`ng skeptic-evidence $name\` FIRST: a DELIVERED verdict the record cannot match looks identical to an absent one (your-org/nexus-code#1156), and clearing the marker also voids a LIVE obligation (#961, #1153)"
             continue
         fi
 
@@ -4288,6 +5251,23 @@ render_full_state_snapshot() {
         pane_state=$(printf '%s' "$pane_line" \
             | sed -n 's/.*state=\([a-z-]*\).*/\1/p')
         [[ -n "$pane_state" ]] || pane_state=unknown
+        # your-org/nexus-code#1397: `unknown` has TWO sources and they are
+        # different facts. pane-state.sh printing `state=unknown` is a
+        # CLASSIFIER verdict about the pane; the probe returning NO line is
+        # an INSTRUMENT failure (a render timeout, a refused read, a crash)
+        # and says nothing about the pane. `pane_state` stays `unknown` for
+        # both — that token is not on the kill allowlist, so both fail safe —
+        # but the RENDERED label says which one happened, with the rc and the
+        # first stderr line, so an operator does not treat a broken probe as
+        # an unclassifiable worker. Only the display string differs.
+        local pane_state_shown="$pane_state"
+        if [[ "$pane_state" == unknown ]]; then
+            if [[ "$(_idle_pane_line_field "$pane_line" probe)" == failed ]]; then
+                pane_state_shown="unknown; pane-state.sh READ FAILED (rc=$(_idle_pane_line_field "$pane_line" probe_rc), stderr: ${pane_line#*probe_stderr=}) — an INSTRUMENT failure, not a pane classification; a direct \`monitor/pane-state.sh ${name}\` may well classify it"
+            else
+                pane_state_shown="unknown; classifier verdict — pane-state.sh ran and could not classify this pane"
+            fi
+        fi
         pane_reset_at=$(_idle_pane_line_field "$pane_line" reset_at)
         # parked-awaiting-skeptic annotation (PR #285): a worker with a
         # live skeptic-pending marker is parked in `await`. It usually
@@ -4295,8 +5275,20 @@ render_full_state_snapshot() {
         # explicitly so the full-state snapshot shows parked workers
         # distinctly from ordinary active work.
         if _idle_skeptic_parked "$name" "$now" "$live_windows"; then
-            printf '  - %s parked-awaiting-skeptic (state=%s; skeptic reviewing — exempt from idle/close)\n' \
-                "$name" "$pane_state"
+            # your-org/nexus-code#845: the JOIN — which skeptic, idle how long.
+            local _snap_join; _snap_join=$(_idle_skeptic_join_detail "$now" "$raw")
+            if [[ "${_IDLE_SKEPTIC_PARK_BASIS:-}" == "skeptic-live" ]]; then
+                # #1039: stale await marker, live skeptic. Still exempt — and
+                # the row says which of the two facts the exemption rests on.
+                printf '  - %s parked-awaiting-skeptic (state=%s; live skeptic window, worker await marker STALE — exempt on the skeptic, not on an active await loop%s)\n' \
+                    "$name" "$pane_state_shown" "$_snap_join"
+            elif [[ "${_IDLE_SKEPTIC_PARK_BASIS:-}" == "channel" ]]; then
+                printf "  - %s parked-awaiting-skeptic (state=%s; skeptic reviewing — no linkage record, but the comms channel holds this round's traffic (spawned without --skeptic-role; #1153) — exempt from idle/close%s)\n" \
+                    "$name" "$pane_state_shown" "$_snap_join"
+            else
+                printf '  - %s parked-awaiting-skeptic (state=%s; skeptic reviewing — exempt from idle/close%s)\n' \
+                    "$name" "$pane_state_shown" "$_snap_join"
+            fi
             continue
         fi
         # Orphaned marker (emit/exemption fidelity): fresh marker, no live
@@ -4304,8 +5296,8 @@ render_full_state_snapshot() {
         # so a stuck park is visible at the heartbeat cadence, not masked as
         # ordinary activity.
         if _idle_skeptic_orphaned "$name" "$now" "$live_windows"; then
-            printf '  - %s orphaned-skeptic-pending (state=%s; skeptic-pending marker but no live skeptic — spawn or clear)\n' \
-                "$name" "$pane_state"
+            printf '  - %s orphaned-skeptic-pending (state=%s; no live skeptic — ask `ng skeptic-evidence %s` whether a verdict EXISTS before you spawn or clear; your-org/nexus-code#1156)\n' \
+                "$name" "$pane_state_shown" "$name"
             continue
         fi
         # Idle-with-children (your-org/nexus-code#455 refine): re-show the
@@ -4328,6 +5320,37 @@ render_full_state_snapshot() {
             [[ -n "$snap_bg_cmd" && "$snap_bg_cmd" != "-" ]] || snap_bg_cmd=""
             snap_bg_task=$(( snap_bg_shells - snap_bg_infra ))
             (( snap_bg_task >= 0 )) || snap_bg_task=0
+            # your-org/nexus-code#1446: a child whose elapsed dwarfs its CPU is
+            # BLOCKED, not long-running — three >5h stalls and a 5h36m waiter
+            # all read `working-background` here with nothing to tell them from
+            # a real compute job. pane-state now measures it (`bg_wedged=1`,
+            # with the CPU share in basis points); this renderer NAMES it so
+            # the operator sees a stall instead of healthy-with-a-job.
+            local snap_bg_wedged snap_bg_cpu_bp snap_wedge_note="" snap_bg_members snap_turnover
+            snap_bg_wedged=$(_idle_pane_line_field "$pane_line" bg_wedged)
+            snap_bg_cpu_bp=$(_idle_pane_line_field "$pane_line" bg_cpu_bp)
+            snap_bg_members=$(_idle_pane_line_field "$pane_line" bg_members)
+            # your-org/nexus-code#1460: lifetime CPU cannot tell a wedge from a
+            # sequential driver blocked in wait() — three false WEDGED? emits
+            # in one night, all on workers running the prescribed pre-push
+            # battery. MEMBERSHIP TURNOVER can: a wedge cannot produce an exit.
+            # pane-state emits a digest of the walked pid tree; this compares
+            # it with the previous tick's and only calls a static tree wedged.
+            snap_turnover=$(_idle_bg_membership_turnover "$name" "$snap_bg_members")
+            if [[ "$snap_bg_wedged" == "1" ]]; then
+                case "$snap_turnover" in
+                    changed)
+                        snap_wedge_note=" — child at ${snap_bg_cpu_bp:-?} bp CPU over its episode, but its process MEMBERSHIP changed since the last tick: a sequential driver blocked in wait() (guards-for-diff --run, run-ratchets.sh, a runner), not a wedge — a wedge cannot produce an exit (your-org/nexus-code#1460)" ;;
+                    first)
+                        snap_wedge_note=" — child at ${snap_bg_cpu_bp:-?} bp CPU over its episode; process membership recorded and compared next tick before this is called WEDGED (your-org/nexus-code#1460)" ;;
+                    static:*)
+                        snap_wedge_note=" — WEDGED? child at ${snap_bg_cpu_bp:-?} bp CPU (0.01%=1) over its whole episode AND its process membership has been STATIC for ${snap_turnover#static:}s (no descendant started or exited): read its wchan, fd/0 and cmdline in /proc; an existence query piped into head, or a wait on a token the producer never writes, looks exactly like this (your-org/nexus-code#1446, #1447, #1460)" ;;
+                    *)
+                        # No digest on the line (an older pane-state, or an
+                        # override): the pre-#1460 reading, stated as such.
+                        snap_wedge_note=" — WEDGED? child at ${snap_bg_cpu_bp:-?} bp CPU (0.01%=1) over its whole episode (membership not measured): read its wchan, fd/0 and cmdline in /proc; an existence query piped into head, or a wait on a token the producer never writes, looks exactly like this (your-org/nexus-code#1446, #1447)" ;;
+                esac
+            fi
             if (( snap_bg_reliable == 1 )) && (( snap_bg_shells >= 1 )); then
                 if _bg_window_is_wrapped "$name"; then
                     if (( snap_bg_task <= 0 )) && (( snap_bg_infra >= 1 )); then
@@ -4340,20 +5363,20 @@ render_full_state_snapshot() {
                             "$name" "$snap_bg_infra" "${snap_bg_cmd:+ [child: $snap_bg_cmd]}"
                         continue
                     fi
-                    printf '  - %s wrapped-with-children (%d live child(ren) after wrap-up%s — inconsistency; clarify or close)\n' \
-                        "$name" "$snap_bg_task" "${snap_bg_cmd:+ [child: $snap_bg_cmd]}"
+                    printf '  - %s wrapped-with-children (%d live child(ren) after wrap-up%s — inconsistency; clarify or close)%s\n' \
+                        "$name" "$snap_bg_task" "${snap_bg_cmd:+ [child: $snap_bg_cmd]}" "$snap_wedge_note"
                 else
-                    printf '  - %s idle-awaiting-job (state=working-background; %d live background child(ren) — long-timeout backoff)\n' \
-                        "$name" "$snap_bg_shells"
+                    printf '  - %s idle-awaiting-job (state=working-background; %d live background child(ren) — long-timeout backoff)%s\n' \
+                        "$name" "$snap_bg_shells" "$snap_wedge_note"
                 fi
                 continue
             fi
         fi
         case "$pane_state" in
             busy|user-typing|working-background|working-self-paced)
-                printf '  - %s (active, state=%s)\n' "$name" "$pane_state" ;;
+                printf '  - %s (active, state=%s)\n' "$name" "$pane_state_shown" ;;
             absent|blocked)
-                printf '  - %s pane-absent (state=%s)\n' "$name" "$pane_state" ;;
+                printf '  - %s pane-absent (state=%s)\n' "$name" "$pane_state_shown" ;;
             over-limit)
                 printf '  - %s OVER-LIMIT (resets %s)\n' \
                     "$name" "${pane_reset_at:-unknown}" ;;
@@ -4382,13 +5405,13 @@ render_full_state_snapshot() {
                     away=$(( now - openg_last ))
                     if (( away > engaged_grace )); then
                         printf '  - %s operator-engaged (operator away %ds; idle %ds, state=%s)\n' \
-                            "$name" "$away" "$age" "$pane_state"
+                            "$name" "$away" "$age" "$pane_state_shown"
                     else
                         printf '  - %s operator-engaged (idle %ds, state=%s)\n' \
-                            "$name" "$age" "$pane_state"
+                            "$name" "$age" "$pane_state_shown"
                     fi
                 else
-                    printf '  - %s idle %ds (state=%s)\n' "$name" "$age" "$pane_state"
+                    printf '  - %s idle %ds (state=%s)\n' "$name" "$age" "$pane_state_shown"
                 fi
                 ;;
         esac
@@ -4433,6 +5456,71 @@ _full_state_restat_live_windows() {
     '
 }
 
+# Re-stat a rendered `--- idle workers ---` body against the CURRENT tmux
+# window set, WITHHOLDING rows whose window no longer exists and SAYING SO
+# (your-org/nexus-code#1044).
+#
+# WHY THIS SECTION NEEDS IT AND DID NOT HAVE IT. The idle section is served to
+# compose_emit from an ASYNC-STAGED file (`idle_section.out`, 30 s cadence,
+# main.sh) exactly as the full-state snapshot is served from `full_state_snap.out`
+# (600 s). The full-state path has had `_full_state_restat_live_windows` since
+# the 2026-07-21 emit that listed two kill-window'd windows as live. The idle
+# path is its SIBLING and was never enrolled — so a window that died between
+# async renders lingered here as a live row while the `--- tmux ---` section of
+# the SAME message had already dropped it. That is the observed contradiction:
+# one emit asserting a window both gone and present.
+#
+# The harm is not the staleness, it is the INSTRUCTION. The lingering row read
+# `pane-absent (overlay awaiting the operator (blocked) — ANSWER it in the pane;
+# do NOT relaunch or close)` — an explicit do-not-clean-up directive aimed at a
+# window that provably did not exist.
+#
+# THE TRACKER ITSELF IS NOT THE BUG, and this is worth recording because the
+# original report guessed otherwise and then corrected itself. `list_idle_transitions`
+# persists the set derived from LIVE tmux, so a vanished window's row is dropped
+# on the very next pass — MEASURED: exactly ONE cycle. There is no missing
+# reaper. What there is, is a render served from a file up to one cadence old
+# and handed to the reader with no reconciliation.
+#
+# WITHHELD ROWS ARE NAMED, NOT SILENTLY DROPPED. A section that quietly shrinks
+# is the same defect wearing the remedy's clothes — the reader cannot tell a
+# reconciled section from one that had nothing to say. Deterministic order (the
+# order rows appeared), so the output is testable.
+#
+#   $1  live tmux window names (newline-separated; queried if empty)
+# Reads the section text on stdin, writes the reconciled text on stdout.
+_idle_restat_live_windows() {
+    local live="${1:-}"
+    if [[ -z "$live" ]]; then
+        live=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
+    fi
+    # Empty live set ⇒ cannot distinguish "no windows" from "tmux failed".
+    # Pass through unchanged rather than blank a real section on a transient
+    # probe failure — the same fail-open the full-state sibling uses.
+    [[ -n "$live" ]] || { cat; return 0; }
+    awk -v live="$live" '
+        BEGIN {
+            n = split(live, a, "\n")
+            for (i = 1; i <= n; i++) if (a[i] != "") L[a[i]] = 1
+            nd = 0
+        }
+        /^  - / {
+            if (!($2 in L)) {
+                if (!($2 in seen)) { seen[$2] = 1; order[++nd] = $2 }
+                next
+            }
+        }
+        { print }
+        END {
+            if (nd > 0) {
+                s = ""
+                for (i = 1; i <= nd; i++) s = s (i == 1 ? "" : ", ") order[i]
+                printf "  (%d row(s) WITHHELD — the window(s) no longer exist in tmux: %s. This section is rendered asynchronously and was reconciled against the live window set at emit time; do NOT act on a withheld window. your-org/nexus-code#1044)\n", nd, s
+            }
+        }
+    '
+}
+
 # Render the idle-workers section body for inclusion in the watcher
 # emit. Empty stdout if no transitions this cycle. Six shapes:
 # five per-row formats (one per non-retained class, matching the
@@ -4452,6 +5540,35 @@ render_idle_section() {
                 return sprintf("%dh%02dm", h, m)
             }
             return sprintf("%ds", s)
+        }
+        # your-org/nexus-code#1355. The empty-streams sentence, ONCE, and
+        # restating monitor/async-run.sh _evidence (mode 1) FAITHFULLY. The
+        # previous text appeared at three arms, DROPPED the source redirect
+        # clause and ADDED "not a result" — a phrase the source never says.
+        # Measured 7 of 7 false alarms on one window whose driver redirected
+        # per-suite output to files. Three corrections, all from the issue:
+        #   1. the REDIRECT clause is carried, and when the classifier saw a
+        #      redirect in the argv (x=) the case is named EMPTY BY DESIGN;
+        #   2. SCOPED TO rc=0: b= counts only finished rc=0 with 0 B / 0 B,
+        #      so a NON-ZERO rc with empty streams (2 = refused, 124 =
+        #      timeout) is reported as the STATUS it is;
+        #   3. "not a result" is gone; the source claim — UNCORROBORATED as
+        #      a verdict on the WORK — is the one that is true.
+        # A legacy counts string without b= (b < 0) gets the full faithful
+        # sentence rather than silence. NO APOSTROPHES (single-quoted awk).
+        function uncorr(wcnt,    _b, _x) {
+            _b = -1; _x = 0
+            if (match(wcnt, /b=[0-9]+/)) _b = substr(wcnt, RSTART+2, RLENGTH-2) + 0
+            if (match(wcnt, /x=[0-9]+/)) _x = substr(wcnt, RSTART+2, RLENGTH-2) + 0
+            if (_b == 0)
+                return "no finished job here has an rc=0 with 0 B out and 0 B err, so each rc reads as the status it is (a NON-ZERO rc with empty streams is a STATUS, e.g. 2 = refused, 124 = timeout, not an absence)"
+            if (_b < 0)
+                return "an rc=0 that arrives with 0 B out and 0 B err is UNCORROBORATED as a verdict on the work — it is the status of the payload LAST command, and a payload that redirects its own output leaves this surface blank by design; find the payload own log before treating rc=0 as a verdict. A NON-ZERO rc with empty streams is a STATUS (2 = refused, 124 = timeout), not an absence"
+            if (_x >= _b)
+                return sprintf("%d finished rc=0 with 0 B out and 0 B err — EMPTY BY DESIGN: the recorded argv redirects its own output, so find the payload own log rather than reading the empty streams as evidence of anything", _b)
+            if (_x > 0)
+                return sprintf("%d finished rc=0 with 0 B out and 0 B err: %d of those redirect their own output (EMPTY BY DESIGN — find the payload own log), and the other %d are UNCORROBORATED as a verdict on the work, being only the status of the payload LAST command. A NON-ZERO rc with empty streams is a STATUS, not an absence", _b, _x, _b - _x)
+            return sprintf("%d finished rc=0 with 0 B out and 0 B err, so that rc is UNCORROBORATED as a verdict on the work — it is the status of the payload LAST command, and a payload that redirects its own output leaves this surface blank; find the payload own log before treating rc=0 as a verdict. A NON-ZERO rc with empty streams is a STATUS (2 = refused, 124 = timeout), not an absence", _b)
         }
         $2 == "wrapped" {
             printf "  - %s wrapped up (idle %s; wrap-up logged)\n", $1, fmt_age($3)
@@ -4476,6 +5593,13 @@ render_idle_section() {
             printf "  - %s paste-unconfirmed (%s; no UserPromptSubmit fired and consumption COULD NOT BE CONFIRMED from the transcript — this is an unresolved question, not an established non-delivery). VERIFY CONSUMPTION FIRST — re-pasting duplicates completed work, so this advice is deliberately not self-executing. A paste whose sender recorded `submitted` no longer reaches you at all; what remains are shapes neither side could settle: a paste that landed via the retry-Enter path is delivered yet stamps nothing, and a paste QUEUED behind an in-flight turn fires no submit until that turn drains (monitor/pane-state.sh %s reporting `queued=1`, or `busy`, means delivered-and-pending — do NOT re-paste). Read the pane and the report filed by that worker for the pasted content having been acted on; re-paste via monitor/paste-followup.sh ONLY if it demonstrably was not.\n", $1, detail, $1
         }
         $2 == "parked-awaiting-skeptic" {
+            # #1039: the detail column ($4) names the BASIS of the exemption
+            # (an active await loop vs a live skeptic window over a stale
+            # marker). Render it when set rather than asserting a bare park.
+            if ($4 != "") {
+                printf "  - %s parked-awaiting-skeptic (idle %s; %s; see skills/nexus.skeptic)\n", $1, fmt_age($3), $4
+                next
+            }
             # PR #285: worker is parked in the skeptic-channel await
             # loop, legitimately waiting for the reviewing skeptic next
             # request. Exempt from idle-too-long / no-wrap-up until the
@@ -4490,7 +5614,14 @@ render_idle_section() {
             # (marker becomes a real park) or clears the marker (window
             # retires normally). Left unhandled it exempted the window from
             # idle/close forever (the bug this fixes).
-            printf "  - %s orphaned-skeptic-pending (idle %s; skeptic-pending marker but NO live skeptic — spawn the skeptic per skills/nexus.skeptic, or clear monitor/.state/skeptic/pending/%s)\n", $1, fmt_age($3), $1
+            # THE ADVICE MUST NOT BE "spawn or clear" (your-org/nexus-code#1153,
+            # #1156). Both arms are wrong when the verdict was DELIVERED and the
+            # record could not match it — spawning manufactures work against a
+            # reviewer that already discharged, and clearing the marker ALSO
+            # voids a live obligation derivedly (#961). Those two cases are
+            # indistinguishable from here; `ng skeptic-evidence` is the read
+            # that separates them, so it goes FIRST.
+            printf "  - %s orphaned-skeptic-pending (idle %s; marker but NO live skeptic — run `ng skeptic-evidence %s` FIRST. evidence NO-VERDICT [none]: nobody reviewed, spawn a skeptic per skills/nexus.skeptic. evidence CANNOT-ESTABLISH [? | resolved-only | discharge-without-verdict]: do NOT clear on it. evidence DELIVERED [attributed | unmatched-subject | no-open-arm | verdict-without-arm | unmatched-other | ambiguous-arms | rearm-after-close | superseded-verdict | prior-verdict-other-artefact]: a verdict WAS delivered, repair the record rather than clearing the marker, which also voids a live obligation)\n", $1, fmt_age($3), $1
         }
         $2 == "idle-awaiting-job" {
             # your-org/nexus-code#455 refine, case (a): idle worker with a
@@ -4549,8 +5680,20 @@ render_idle_section() {
             printf "  - %s pane-absent (%s)\n", $1, detail
         }
         $2 == "over-limit" {
+            # NAME THE LIMIT THE PANE NAMED, and never assert a reset that was
+            # not established (your-org/nexus-code#1488). This line said
+            # "weekly Opus limit hit" for every over-limit pane, including a
+            # worker whose pane said FABLE; the orchestrator then scheduled a
+            # resume against an Opus reset and the worker was refused again.
+            # `$4` carries reset_at and `$5` the limit flavour; an empty
+            # flavour renders as "usage", never as a tier nobody measured.
             reset_at = ($4 == "" ? "unknown" : $4)
-            printf "  - %s OVER-LIMIT (resets %s; weekly Opus limit hit — schedule resume)\n", $1, reset_at
+            flavour  = ($5 == "" || $5 == "unknown") ? "usage" : $5
+            gsub(/_/, " ", flavour)
+            if (reset_at == "unknown")
+                printf "  - %s OVER-LIMIT (%s limit hit; RESET TIME UNKNOWN — do not schedule a resume against a time nobody read; surface it)\n", $1, flavour
+            else
+                printf "  - %s OVER-LIMIT (resets %s; %s limit hit — schedule resume)\n", $1, reset_at, flavour
         }
         $2 == "idle-orphan-async" {
             # Issue #183: worker has self-declared external waits
@@ -4560,8 +5703,160 @@ render_idle_section() {
             # operator can see the contract violation at a glance,
             # and points at the worker-defaults skill so a fix is
             # one paste away.
-            kinds = ($4 == "" ? "unknown" : $4)
-            printf "  - %s idle-orphan-async (waits=%s; no resume mechanism — install Monitor / background poller, or `declare-no-wait.sh <kind> <id>`; see skills/nexus.worker-defaults)\n", $1, kinds
+            #
+            # `declare-no-wait.sh` USED TO BE OFFERED HERE AS A CO-EQUAL
+            # ALTERNATIVE. your-org/nexus-code#1071 removed it from the emit,
+            # for a reason that is asymmetric rather than stylistic: RESUMING a
+            # worker whose job is genuinely still running costs one wasted
+            # turn, whereas CLEARING that wait destroys the only record that
+            # work is outstanding. The emit cannot tell those two cases apart,
+            # because it reports that the worker HAS NO RESUME MECHANISM, never
+            # that the job is over. Offering both at the same level invited the
+            # destructive one at exactly the moment the operator had the least
+            # information. It remains the right tool occasionally (it was, once,
+            # for three `syn-` phantoms verified dead from OUTSIDE the session
+            # against an empty `squeue`), so it stays documented in
+            # skills/nexus.worker-defaults, WITH its precondition attached —
+            # which is the part an emit line cannot carry.
+            #
+            # The watcher now also resolves these waits itself and pastes the
+            # verdict (monitor/watcher/_orphan_async.sh), so this line is an
+            # operator NOTIFICATION rather than the only thing standing between
+            # the worker and an indefinite wait. Six workers in one session
+            # stalled while every advisory control fired correctly: a detection
+            # nobody reads is not a control.
+            #
+            # NB for editors: this awk program is inside a SINGLE-QUOTED bash
+            # string, so an apostrophe anywhere in these comments ends the
+            # string and breaks the file. Measured, while writing this block.
+            # $4 is `<wait-class>|<kinds>` (your-org/nexus-code#1240). The
+            # fallback keeps a row written by any producer that leaves the
+            # column empty on the UNRESOLVED text, which is the safe arm.
+            # $4 is `<class>|<counts>|<kinds>`. Both SHORTER legacy shapes are
+            # accepted and degrade to the safe arm WITHOUT losing the job list:
+            # a bare `<kinds>` (no pipe) is what a pre-#1240 producer writes, and
+            # dropping it here would strip the one thing an operator reads.
+            raw = ($4 == "" ? "unresolved|-|unknown" : $4)
+            _p = index(raw, "|")
+            if (_p == 0) { wcls = "unresolved"; wcnt = "-"; kinds = raw }
+            else {
+                wcls  = substr(raw, 1, _p - 1)
+                _rest = substr(raw, _p + 1)
+                _q    = index(_rest, "|")
+                if (_q == 0) { wcnt = "-"; kinds = _rest }
+                else { wcnt = substr(_rest, 1, _q - 1); kinds = substr(_rest, _q + 1) }
+            }
+            if (kinds == "") kinds = "unknown"
+            if (wcnt == "" ) wcnt  = "-"
+            # The COUNTS are the part an operator acts on at high cardinality:
+            # a 13-wait window is unreadable as a list and immediate as a tally.
+            tally = (wcnt == "-" ? "" : " [" wcnt "]")
+            if (wcls == "terminal")
+                # The TERMINAL branch. Ordering is deliberate and load-bearing:
+                # read the status FIRST, clear the wait only as a consequence of
+                # having read it. A terminal rc is not the same claim as "the
+                # worker consumed the result" -- one recorded instance was rc=0
+                # with 0 B on both streams, which async-run itself flags as
+                # UNCORROBORATED -- so the byte counts are named here rather
+                # than letting a bare rc read as a green light.
+                printf "  - %s idle-orphan-async (waits=%s%s; these async-run jobs have ALREADY FINISHED — a status file exists for each, so this is not an orphan and there is nothing to poll for. Read `monitor/async-run.sh --status-line <token>` first and check the byte counts: %s. Once you have the result, clear the wait with `ng declare-no-wait asyncrun <token>`)\n", $1, kinds, tally, uncorr(wcnt)
+            else if (wcls == "running")
+                # RUNNING: at least one job is verifiably still alive by its
+                # recorded (pid, pidstart). The do-not-clear guidance is exactly
+                # right here and is unchanged; the extra clause only says WHY it
+                # is right, so this window is distinguishable from one where
+                # nothing could be verified at all (your-org/nexus-code#1292).
+                printf "  - %s idle-orphan-async (waits=%s%s; a recorded job is still RUNNING — its pid and start-time both still match, so work is genuinely in flight. No resume mechanism — install a Monitor / background poller. The watcher resolves these waits and pastes the verdict; RESUME is the default, and a wait you have not confirmed dead must not be cleared. See skills/nexus.worker-defaults)\n", $1, kinds, tally
+            else if (wcls == "skeptic-await")
+                # your-org/nexus-code#1183. Every live wait here is a
+                # `skeptic-channel.sh await`, which IS its own resume mechanism —
+                # the loop wakes on the channel. The running arm below told the
+                # operator to install a Monitor for a recorded command that is
+                # already a poller, and acting on that is the one thing #1178
+                # forbids: a stacked await SIGTERMs the older one, and the loser
+                # leaves the window with NONE armed while believing it is parked.
+                # NO APOSTROPHES IN THIS BLOCK (single-quoted awk string).
+                printf "  - %s idle-orphan-async (waits=%s%s; this is a SKEPTIC AWAIT — `skeptic-channel.sh await` is itself the resume mechanism, so it is correctly ARMED, not orphaned. Do NOT install a second listener: a stacked await SIGTERMs the older one (your-org/nexus-code#1178) and the loser leaves the window with none armed while believing it is parked. Do nothing. To reach this arm the channel own `.await-owner` named a live await process and `.await-heartbeat` was within the hang threshold — a STALE await never lands here, it keeps the running advice)\n", $1, kinds, tally
+            else if (wcls == "cancelled") {
+                # CANCELLED ON REQUEST (your-org/nexus-code#1333). A cancel
+                # marker is on disk and the process is gone — neither a failure
+                # nor an unexplained death, and the classifier used to fuse it
+                # with `died`, producing a byte-identical row for two states
+                # whose operator responses are opposites.
+                #
+                # THE PROSE SPLITS ON c < n, AND THAT IS THE #1311 LESSON APPLIED
+                # HERE RATHER THAN ONLY NEXT DOOR. The gate is an ALL-arm over
+                # the UNION (`n_canc + n_term == n`), so it legitimately fires on
+                # a MIXED set of terminal + cancelled waits — and a universal
+                # sentence over that set is false for the terminal ones. Worse
+                # than untidy: "an empty or short out/err is expected and is not
+                # evidence of anything" is WRONG for a job that completed with a
+                # real rc, and it contradicts the terminal arm own
+                # UNCORROBORATED warning three arms up. The first version of this
+                # arm shipped that sentence and was caught in review.
+                # NO APOSTROPHES IN THIS BLOCK (single-quoted awk string).
+                _cc = 0; _ct = 0; _cn = 0
+                if (match(wcnt, /c=[0-9]+/)) _cc = substr(wcnt, RSTART+2, RLENGTH-2) + 0
+                if (match(wcnt, /t=[0-9]+/)) _ct = substr(wcnt, RSTART+2, RLENGTH-2) + 0
+                if (match(wcnt, /n=[0-9]+/)) _cn = substr(wcnt, RSTART+2, RLENGTH-2) + 0
+                if (_cn > 0 && _cc > 0 && _cc < _cn)
+                    printf "  - %s idle-orphan-async (waits=%s%s; %d of %d were CANCELLED ON REQUEST — a cancel marker is on disk and the process is gone, so for those an empty or short out/err is TRUNCATED BY DESIGN and is not evidence of anything. The other %d COMPLETED and have a real rc: read those with `monitor/async-run.sh --status-line <token>` and check the byte counts: %s. Nothing here is still running. Clear with `ng declare-no-wait asyncrun <token>`)\n", $1, kinds, tally, _cc, _cn, _ct, uncorr(wcnt)
+                else
+                    printf "  - %s idle-orphan-async (waits=%s%s; these jobs were CANCELLED ON REQUEST — a cancel marker is on disk and the process is gone. This is NOT an unexplained death and NOT a failure: output is TRUNCATED BY DESIGN at the point of the cancel, so an empty or short out/err is expected and is not evidence of anything. There is nothing to poll and nothing to wait for. Read `monitor/async-run.sh --status-line <token>` for who cancelled and when, then clear with `ng declare-no-wait asyncrun <token>`)\n", $1, kinds, tally
+            }
+            else if (wcls == "untracked") {
+                # ANY-vs-EVERY (your-org/nexus-code#1311). The ARM fires on
+                # `n_untr > 0`; the sentence asserted ALL. On a MIXED window that
+                # told the operator to clear waits whose rc is sitting on disk,
+                # unread — converting a readable result into an unread one, BY
+                # INSTRUCTION. The counts are already computed and correct, so
+                # the prose is now a function of THEM rather than of the arm that
+                # fired. The homogeneous emit is unchanged and was always true.
+                #
+                # PROSE ONLY, and the REASON is the issue own argument, not the
+                # existing assertion. #1311 prefers this over sending mixed
+                # windows to `unresolved`: a mixed window is the common case, and
+                # the generic arm loses the one thing the classifier newly knows.
+                # Also `unresolved` prose is itself wrong there — it says "no
+                # terminal status on disk" while t>0 waits have one.
+                #
+                # AN EARLIER DRAFT JUSTIFIED THIS BY CITING THE EXISTING
+                # ASSERTION (a mixed list classifies `untracked`), AND THAT WAS
+                # CIRCULAR. Provenance, by `git log -G` — `-S` is blind to a flip
+                # because the occurrence count does not change:
+                #   cbf61b0a 2026-09-01T18:01  +"a MIXED list … -> unresolved"
+                #   002f1138 2026-09-01T22:38  -"… -> unresolved"  +"… -> untracked"
+                # The assertion was WRITTEN as `unresolved` — exactly what #1311
+                # proposes — and flipped 4.5h later by the commit that CREATED the
+                # untracked class, in a block edit whose rationale argues only the
+                # homogeneous case. It FROZE the behaviour; it did not decide it.
+                # So it cannot be the reason, and the issue own argument is.
+                #
+                # RESOLVABLE = t + c (your-org/nexus-code#1333 coupling). Once
+                # `cancelled` became its own state, a mixed window can carry
+                # cancelled waits too, and those are just as resolvable as a
+                # terminal one — both have positive evidence on disk.
+                #
+                # NO APOSTROPHES ANYWHERE IN THIS BLOCK: this awk program lives
+                # inside a SINGLE-QUOTED bash string, and one apostrophe ends the
+                # string and stops the file parsing.
+                _nu = 0; _nt = 0; _nc = 0; _nn = 0
+                if (match(wcnt, /u=[0-9]+/)) _nu = substr(wcnt, RSTART+2, RLENGTH-2) + 0
+                if (match(wcnt, /t=[0-9]+/)) _nt = substr(wcnt, RSTART+2, RLENGTH-2) + 0
+                if (match(wcnt, /c=[0-9]+/)) _nc = substr(wcnt, RSTART+2, RLENGTH-2) + 0
+                if (match(wcnt, /n=[0-9]+/)) _nn = substr(wcnt, RSTART+2, RLENGTH-2) + 0
+                if (_nn > 0 && _nu > 0 && _nu < _nn)
+                    printf "  - %s idle-orphan-async (waits=%s%s; %d of %d waits are UNTRACKED — a nohup/slurm synthetic id with no recorded pid, start-time or status, unresolvable from the record by construction. The other %d have POSITIVE EVIDENCE on disk and CAN be resolved: read `monitor/async-run.sh --status-line <token>` for those FIRST and check the byte counts (%s). Only then confirm the untracked ones out-of-band and clear with `ng declare-no-wait <kind> <id>` — clearing a wait asserts only that nothing is still running, never what the job did. See skills/nexus.worker-defaults)\n", $1, kinds, tally, _nu, _nn, _nt + _nc, uncorr(wcnt)
+                else
+                    printf "  - %s idle-orphan-async (waits=%s%s; every wait here is UNTRACKED — a nohup/slurm synthetic id with no recorded pid, start-time or status, so it cannot be resolved from the record by construction and there is nothing to poll. Confirm out-of-band that the work is over, then clear with `ng declare-no-wait <kind> <id>`. See skills/nexus.worker-defaults)\n", $1, kinds, tally
+            }
+            else
+                # UNRESOLVED: no status file AND no verifiable live process —
+                # the `died` shape — plus truncated lists, non-asyncrun kinds and
+                # every doubt. THIS is the population the warning exists for, and
+                # separating it is the point: when most listed waits are stale,
+                # the genuinely indeterminate ones become invisible among them.
+                printf "  - %s idle-orphan-async (waits=%s%s; NOT verifiable — no terminal status on disk and no live process matching the recorded pid+start-time. No resume mechanism — install a Monitor / background poller. The watcher resolves these waits and pastes the verdict; RESUME is the default, and a wait you have not confirmed dead must not be cleared. See skills/nexus.worker-defaults)\n", $1, kinds, tally
         }
         $2 == "interrupted" {
             # stall-detection: last turn died to an API/model error
@@ -4651,7 +5946,7 @@ render_idle_section() {
 # inserts the section when stdout is non-empty).
 
 _decisions_dir() {
-    printf '%s/decisions' "${STATE_DIR:-.}"
+    printf '%s/decisions' "${STATE_DIR:-$(_ip_nostate_dir)}"
 }
 
 # ---- the pane gate (your-org/nexus-code#790, defect 1) ------------------
@@ -4852,7 +6147,7 @@ _reap_dead_window_decisions() {
 }
 
 _pending_decisions_emit_state_path() {
-    printf '%s/pending-decisions-emit-state.tsv' "${STATE_DIR:-.}"
+    printf '%s/pending-decisions-emit-state.tsv' "${STATE_DIR:-$(_ip_nostate_dir)}"
 }
 
 # Default cooldown — env overrideable. The 300s figure matches the

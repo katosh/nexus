@@ -20,7 +20,8 @@ FAIL=0
 
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s\n' "$label" >&2
@@ -379,9 +380,16 @@ rm -f "$STATE_DIR/last-mention-cursor.txt"
 out=$(snapshot_mentions 2>/dev/null)
 assert_contains "self-EYES does not suppress" "$out" "id=9011"
 
-# ---- processed-comments dedup ----
+# ---- processed-comments.txt is NOT a dedup source for this path (#1509) ----
+#
+# The `mention:<id>` / `mention:issue:<n>` prefix this case used to certify
+# was never written by anything (your-org/nexus-code#1509: 0 of 1253 live
+# rows, no writer, `_mark_processed` refuses the kind). A stale key in the
+# cache must therefore NOT hide an emit — the reaction filter is the whole
+# dedup. This is the inverse of the case it replaces, and it goes RED on the
+# tree that still consulted the cache.
 
-echo '=== processed-comments dedup hides comment / body emits ==='
+echo '=== a mention:-prefixed cache key does NOT hide comment / body emits (#1509) ==='
 SEARCH_FIXTURE='{
   "data": {
     "search": {
@@ -412,8 +420,8 @@ SEARCH_FIXTURE='{
 rm -f "$STATE_DIR/last-mention-cursor.txt"
 printf 'mention:9020\nmention:issue:21\n' > "$STATE_DIR/processed-comments.txt"
 out=$(snapshot_mentions 2>/dev/null)
-assert_not_contains "comment 9020 hidden by mention: dedup" "$out" "id=9020"
-assert_not_contains "issue 21 body hidden by mention:issue: dedup" "$out" "n=21"
+assert_contains "comment 9020 is emitted despite a mention:9020 cache key (no writer exists for it)" "$out" "id=9020"
+assert_contains "issue 21 body is emitted despite a mention:issue:21 cache key" "$out" "n=21"
 rm -f "$STATE_DIR/processed-comments.txt"
 
 # ---- word-boundary mention regex ----

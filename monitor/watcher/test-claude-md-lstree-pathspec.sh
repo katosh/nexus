@@ -47,6 +47,23 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$_test_dir/../.." && pwd)
 CLAUDE_MD="$REPO_ROOT/CLAUDE.md"
 
+# ── this suite DECLARES its own population (the --population protocol) ──────
+# your-org/nexus-code#1219. CLAUDE.md is the document this suite EXECUTES, so
+# an edit to the fenced block it pins is exactly the edit that can change its
+# verdict — and until #1219 no such edit could SELECT it: a suite that declares
+# no population is INVISIBLE to `guards-for-diff` rather than excluded by it
+# (#1078), appearing in neither SELECTED nor CONSIDERED AND EXCLUDED, so its
+# absence reads as a considered exclusion. `gp_handle` adds this suite's own
+# path and `monitor/_guard_population.sh` for free; everything else is declared
+# because this suite READS ITS BYTES to reach a verdict.
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    printf '%s\n' \
+        CLAUDE.md
+}
+gp_handle "$@"
+bash "$(dirname "${BASH_SOURCE[0]}")/claude-md-block-coverage.sh" LSTREE-PATHSPEC   # the entry's UNCHECKED share, in this suite's own output (#1239)
+
 PASS=0
 FAIL=0
 ok()  { printf '  PASS: %s\n' "$1"; PASS=$(( PASS + 1 )); }

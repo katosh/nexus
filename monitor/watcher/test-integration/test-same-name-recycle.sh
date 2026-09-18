@@ -118,7 +118,44 @@ export MONITOR_IDLE_THRESHOLD_SECONDS=10
 mkdir -p "$HARNESS_DIR/monitor/watcher" \
          "$HARNESS_DIR/config"
 cp "$HARNESS_REPO_ROOT/monitor/ng"          "$HARNESS_DIR/monitor/ng"
+# `ng` REFUSES TO RUN WITHOUT `_bookkeeping.sh`, and that refusal is correct
+# (your-org/nexus-code#1094). `ng` sources it from its OWN script dir — here
+# `$HARNESS_DIR/monitor` — and fails CLOSED when it is missing, because the
+# guards it carries replace code that silently coerced bad input (#601), so
+# degrading to that behaviour is worse than refusing. Copying `ng` alone
+# therefore installs a binary that cannot run:
+#
+#   ng: cannot read .../monitor/_bookkeeping.sh — the bookkeeping-contract
+#       guards are missing. This is a broken install, not a supported
+#       configuration
+#
+# That is what has made this suite red on `dev`: the very first
+# `ng log-action` refused, no first-life spawn event was ever recorded, and
+# all five failures below cascade from that one line — including
+# `phase-1 matcher returns the wrap-up basename — got ''`, whose empty value
+# is the #1038 shape (a capture whose producer failed) rather than a matcher
+# defect.
+#
+# `ng`s own comment states the convention this restores: its fixtures "build a
+# fake tree containing `ng` and `_bookkeeping.sh` and nothing else". Same shape
+# as #764, which added `_claude-bin.sh` to this harness for the same reason —
+# the harness exports NEXUS_ROOT=$HARNESS_DIR, so every file production code
+# resolves through that root has to be installed here or the scenario fails for
+# a reason unrelated to what it tests.
+# BOTH of ng's hard preconditions, ENUMERATED FROM THE SOURCE rather than
+# discovered one CI round at a time — `grep -n 'if \[\[ ! -r "\$_script_dir/'
+# monitor/ng` returns exactly these two at d2f4415e. `_nexus-root.sh` is the
+# second (#577, #1077): without it reports and asset uploads silently un-pin
+# from the primary clone, so it refuses too.
+cp "$HARNESS_REPO_ROOT/monitor/_bookkeeping.sh" "$HARNESS_DIR/monitor/_bookkeeping.sh"
+cp "$HARNESS_REPO_ROOT/monitor/_nexus-root.sh"  "$HARNESS_DIR/monitor/_nexus-root.sh"
 cp "$HARNESS_REPO_ROOT/monitor/pane-state.sh" "$HARNESS_DIR/monitor/pane-state.sh"
+# AND THE RESOLVER IT NOW REQUIRES (your-org/nexus-code#1281). pane-state.sh
+# refuses to classify when `_tmux-window.sh` is not beside it — the ambiguity
+# check cannot run, and a wrong-window answer here can authorise a kill. This
+# scenario drives `_idle_pane_state_line` with a BARE INDEX, so the refusal
+# lands on the production path and the idle set comes back EMPTY.
+cp "$HARNESS_REPO_ROOT/monitor/_tmux-window.sh" "$HARNESS_DIR/monitor/_tmux-window.sh"
 chmod +x "$HARNESS_DIR/monitor/ng" "$HARNESS_DIR/monitor/pane-state.sh"
 # `ng log-action` only touches the action log; it doesn't shell out to
 # `config/load.sh`. A no-op stub keeps the resolver chain inert without
@@ -128,6 +165,26 @@ cat > "$HARNESS_DIR/config/load.sh" <<'CFG'
 exit 2
 CFG
 chmod +x "$HARNESS_DIR/config/load.sh"
+
+# HARNESS SELF-TEST — fail LOUD here rather than as a cascade of empty
+# captures forty lines down (your-org/nexus-code#1094). A fake nexus that
+# cannot run `ng` makes every assertion in this file meaningless, and that is
+# exactly how this suite read on `dev`: `ng` refused for a missing helper, no
+# spawn event was ever written, and five assertions failed downstream — one of
+# them (`phase-1 matcher returns the wrap-up basename — got ''`) looking
+# precisely like a matcher defect. The empty value was the #1038 shape: a
+# capture whose producer failed.
+#
+# Placed AFTER config/load.sh because ng sources it, and written in the same
+# call shape the suite uses (`--event` / `--extra`, no `--window` flag) so the
+# probe exercises the real path rather than a spelling ng does not accept.
+if ! NEXUS_ROOT="$HARNESS_DIR" "$HARNESS_DIR/monitor/ng" log-action monitor \
+        --event harness-selftest --extra "window=harness-selftest" >/dev/null 2>&1; then
+    echo "FAIL: the fake nexus cannot run ng — every assertion below would be a cascade" >&2
+    NEXUS_ROOT="$HARNESS_DIR" "$HARNESS_DIR/monitor/ng" log-action monitor \
+        --event harness-selftest --extra "window=harness-selftest" >&2
+    exit 1
+fi
 
 # Source the real `_idle_probe.sh`. The matcher and the
 # `list_really_idle_workers` gate run from this in-process source —

@@ -33,6 +33,8 @@ cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
 # it (your-org/nexus-code#601/#605: degrading to the silent-coercion
 # behaviour it replaces is worse than refusing). Copy it alongside.
 cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
+# your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+cp "$(dirname "$NG_REAL")/_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 NG="$FAKE_NEXUS/monitor/ng"
 
 cat > "$FAKE_NEXUS/config/load.sh" <<'STUB'
@@ -129,7 +131,7 @@ assert_contains  "stderr mentions usage"             "$err" "usage: ng show"
 
 run_ng out err rc "$NON_GIT_CWD" show 1234 --bogus thing
 assert_eq        "unknown flag → exit non-zero"      "$rc" "1"
-assert_contains  "stderr names unknown flag"         "$err" "unknown flag: --bogus"
+assert_contains  "stderr names unknown flag"         "$err" "unknown flag: '--bogus'"
 
 # ---- Test 2: successful fetch -------------------------------------------
 

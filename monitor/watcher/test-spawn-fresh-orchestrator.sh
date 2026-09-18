@@ -42,13 +42,19 @@ assert_eq() {
     if [[ "$got" == "$want" ]]; then
         pass "$label"
     else
-        fail "$label — got %q want %q" "$got" "$want"
+        # fail() prints ONLY "$1", so passing printf ARGS to it drops both values
+        # and emits the literal "%q want %q" — the diagnostic naming the mismatch
+        # is exactly what a failing assertion exists to supply. Format HERE and
+        # hand fail() one finished string; this is the form the rest of the
+        # corpus already uses (test-fork-headroom-guard.sh, test-paste-*.sh).
+        fail "$(printf '%s — got %q want %q' "$label" "$got" "$want")"
     fi
 }
 
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         pass "$label"
     else
         fail "$label — missing literal: $needle"
@@ -156,7 +162,13 @@ printf '%s\n' "tmux \$*" >> "$TMUX_LOG"
 case "\$1" in
     list-windows)
         fmt="\$3"
-        if [[ -f "$WORK/tmux-orchestrator-absent" ]]; then
+        # The absence marker models a MISSING target; once this stub has
+        # logged a new-window the target exists again, or the helper could
+        # never resolve an index for the post-paste probe and every absence
+        # arm would read rc 4 for a reason unrelated to what it tests
+        # (your-org/nexus-code#1470 -- the same fixture shape test-respawn.sh
+        # had to repair).
+        if [[ -f "$WORK/tmux-orchestrator-absent" ]] && ! grep -q 'new-window' "$TMUX_LOG"; then
             names=("watcher" "worker-foo")
         else
             names=("watcher" "orchestrator" "worker-foo")
@@ -172,7 +184,22 @@ case "\$1" in
             idx=\$(( idx + 1 ))
         done
         ;;
-    kill-window|new-window|set-window-option|send-keys|load-buffer|paste-buffer|delete-buffer)
+    new-window)
+        # -P -F '#{window_id}' makes tmux print the id of the window it just
+        # created, and _respawn_spawn_window keys its rc=3 contract on that
+        # handle rather than on a presence-by-NAME probe (your-org/nexus-code
+        # #1327). A stub answering with ZERO BYTES models "created nothing",
+        # so the arm has to speak the handle or every spawn reads as a
+        # failure. Most stubs in this corpus already do -- spawn-worker.sh
+        # has used the same discriminator since #323; the respawn family
+        # was the outlier, in the code and in its fixtures alike.
+        # NO BACKTICKS IN THIS HEREDOC: it is UNQUOTED (<<STUB), so a
+        # backticked word in a COMMENT is command-substituted when the fixture
+        # is written (your-org/nexus-code#1157).
+        printf '@7\n'
+        exit 0
+        ;;
+    kill-window|set-window-option|send-keys|load-buffer|paste-buffer|delete-buffer)
         exit 0
         ;;
     *)
@@ -185,10 +212,33 @@ chmod +x "$TMUX_STUB_BIN/tmux"
 # Stub pane-state.sh at the location the helper looks for it
 # ($_monitor_dir/pane-state.sh). A small "scripted responses" file
 # under $WORK gates what state is reported on consecutive calls; the
-# stub pops one entry per invocation. When the file is missing or
-# empty, the stub answers `state=idle` so the readiness probe passes
-# instantly and the post-paste verify also passes — keeps unrelated
-# tests below from needing to seed the file explicitly.
+# stub pops one entry per invocation. When the file is missing or empty
+# the stub's DEFAULT answer is CAUSED by the paste, not scripted: `idle`
+# until an Enter appears in the tmux stub's log, `busy` after it
+# (your-org/nexus-code#1470). This comment used to say the static `idle`
+# default made "the post-paste verify also pass" -- it did, and that was
+# the #1470 defect certified by its own fixture: readiness accepts
+# `empty|idle`, submit-evidence accepts `busy` (then `busy|user-typing`), the sets are
+# DISJOINT, so a static answer can satisfy at most one of them, and the
+# helper reported rc 0 on an exhausted verification. When the helper began
+# reporting honestly (rc 4), all eleven arms here went red for that reason
+# alone. The log the default reads is one every arm already truncates.
+#
+# SECOND CAUSED RULE, a table keyed on HOW MANY Enters the tmux log holds:
+# "$WORK/pane-state-by-enters" carries three states -- for zero, one, and two
+# or more Enters -- and while it exists the default answers from it instead of
+# the idle/busy pair. Two arms need it, and both used to SCRIPT a fixed
+# sequence that assumed a particular PROBE COUNT: Test 7's `idle, empty,
+# empty, busy` assumed exactly two probes fit its 1 s verify window, and the
+# runaway-blocked arm's twenty `blocked` entries assumed they would all be
+# consumed inside a 2 s readiness budget. On a loaded CI runner one probe fits
+# the window and few fit the budget; the scripts then hand the WRONG state to
+# the post-paste verify, and the helper honestly reports rc 4 -- which is how
+# PR 1473's NEXUS_ROOT-unset band went red on Test 7 at minute 39 of 40, and
+# how the runaway arm reds under PSTUB_SLOW_S=0.7 (measured here; CI simply had
+# not been slow enough on that arm yet). A state CAUSED by the Enter count is
+# true at any probe rate. PSTUB_SLOW_S=<seconds> sleeps that long per probe to
+# reproduce the loaded-runner regime on demand.
 PANE_STATE_STUB="$FAKE_NEXUS/monitor/pane-state.sh"
 PANE_STATE_LOG="$WORK/pane-state-calls.log"
 PANE_STATE_SCRIPT="$WORK/pane-state-script.txt"
@@ -196,10 +246,18 @@ PANE_STATE_SCRIPT="$WORK/pane-state-script.txt"
 cat > "$PANE_STATE_STUB" <<PSTUB
 #!/bin/bash
 printf '%s\n' "pane-state \$*" >> "$PANE_STATE_LOG"
+[[ -n "\${PSTUB_SLOW_S:-}" ]] && sleep "\$PSTUB_SLOW_S"
 if [[ -s "$PANE_STATE_SCRIPT" ]]; then
     next=\$(head -n1 "$PANE_STATE_SCRIPT")
     tail -n +2 "$PANE_STATE_SCRIPT" > "$PANE_STATE_SCRIPT.tmp" && mv "$PANE_STATE_SCRIPT.tmp" "$PANE_STATE_SCRIPT"
     printf 'state=%s active=1 window=\$1 name=orchestrator\n' "\$next"
+elif [[ -s "$WORK/pane-state-by-enters" ]]; then
+    read -r s0 s1 s2 < "$WORK/pane-state-by-enters"
+    n=\$(grep -c 'send-keys .* Enter' "$TMUX_LOG" 2>/dev/null); n=\${n:-0}
+    if (( n >= 2 )); then st=\$s2; elif (( n == 1 )); then st=\$s1; else st=\$s0; fi
+    printf 'state=%s active=1 window=\$1 name=orchestrator\n' "\$st"
+elif grep -qs 'send-keys .* Enter' "$TMUX_LOG"; then
+    printf 'state=busy active=1 window=\$1 name=orchestrator\n'
 else
     printf 'state=idle active=1 window=\$1 name=orchestrator\n'
 fi
@@ -318,7 +376,7 @@ assert_contains "tmux set-window-option remain-on-exit on" "$tmux_log" \
 assert_contains "tmux load-buffer received the report file" "$tmux_log" \
                 "tmux load-buffer -b nexus-respawn"
 assert_contains "tmux paste-buffer targeted the new window" "$tmux_log" \
-                "paste-buffer -b nexus-respawn"
+                "paste-buffer -p -b nexus-respawn"
 assert_contains "tmux send-keys submitted with Enter"  "$tmux_log" "send-keys -t orchestrator Enter"
 
 # Pane-state probe was actually used to gate the paste.
@@ -594,16 +652,14 @@ echo '=== post-paste verify: when state stays empty, retry Enter once ==='
 : > "$TMUX_LOG"
 : > "$PANE_STATE_LOG"
 rm -f "$REPORT" "$COOLDOWN"
-# Sequence: readiness probe pops `idle` → paste fires; post-paste
-# verify pops `empty` twice (budget=1 s + 0.5 s polls ⇒ 2 probes) and
-# exits with timeout; retry Enter fires; verify-after-retry pops
-# `busy` and confirms.
-cat > "$PANE_STATE_SCRIPT" <<'EOF'
-idle
-empty
-empty
-busy
-EOF
+# CAUSED, not scripted: `idle` before any Enter (readiness passes), `empty`
+# after the first Enter (the paste's Enter "dropped" -- verify times out,
+# however many probes fit in its 1 s window), `busy` from the second Enter on
+# (the retry took). The former fixed sequence `idle, empty, empty, busy`
+# assumed exactly two probes in the window and went red on a loaded CI runner
+# where one fits (see the stub's second rule).
+: > "$PANE_STATE_SCRIPT"
+printf 'idle empty busy\n' > "$WORK/pane-state-by-enters"
 
 NEXUS_ROOT="$FAKE_NEXUS" \
 STATE_DIR="$STATE_DIR" \
@@ -616,6 +672,7 @@ PATH="$TMUX_STUB_BIN:$PATH" \
     bash "$SCRIPT" --target orchestrator --reason "test: enter retry" \
                    2>"$WORK/stderr-7.log"
 rc=$?
+rm -f "$WORK/pane-state-by-enters"
 assert_eq "exit 0 when Enter-retry succeeds" "$rc" "0"
 
 tmux_log=$(cat "$TMUX_LOG")
@@ -693,17 +750,15 @@ echo '=== readiness probe caps Escapes at MAX_DISMISS_ATTEMPTS ==='
 : > "$TMUX_LOG"
 : > "$PANE_STATE_LOG"
 rm -f "$REPORT" "$COOLDOWN"
-# Sequence: 20 blocked entries; with the cap at 3, only 3 Escapes
-# should fire, the rest stay in observe-mode.
-{
-    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-        echo blocked
-    done
-    # And a busy at the very end so post-paste verify can settle if
-    # the budget happens to reach that far (it won't with these
-    # numbers, but a defensive entry costs nothing).
-    echo busy
-} > "$PANE_STATE_SCRIPT"
+# CAUSED, not scripted: `blocked` for as long as no Enter has been sent --
+# the whole readiness budget, however many probes fit in it -- so the cap
+# of 3 Escapes is what bounds the Escapes, not the length of a script; then
+# `busy` from the paste's Enter on, so the post-paste verify settles. The
+# former script of twenty `blocked` entries plus a trailing `busy` assumed
+# the budget would consume all twenty; under PSTUB_SLOW_S=0.7 it did not, the
+# verify popped `blocked`, and the arm read rc 4 (see the stub's second rule).
+: > "$PANE_STATE_SCRIPT"
+printf 'blocked busy busy\n' > "$WORK/pane-state-by-enters"
 
 NEXUS_ROOT="$FAKE_NEXUS" \
 STATE_DIR="$STATE_DIR" \
@@ -719,6 +774,7 @@ PATH="$TMUX_STUB_BIN:$PATH" \
 # The paste is still attempted on readiness timeout (legacy fallback);
 # tmux send-keys etc. all return 0 from the stub so we still exit 0.
 rc=$?
+rm -f "$WORK/pane-state-by-enters"
 assert_eq "exit 0 even when readiness budget elapses on persistent blocked" "$rc" "0"
 
 tmux_log=$(cat "$TMUX_LOG")
@@ -906,7 +962,13 @@ EOF
 # Force `tmux new-window` to fail (rc 1) → the respawn helper returns 3.
 FAILING_TMUX_BIN="$WORK/failing-tmux-bin"
 mkdir -p "$FAILING_TMUX_BIN"
-sed 's|^    kill-window|    new-window) exit 1 ;;\n    kill-window|' \
+# The base stub's `new-window` arm now emits a `@id` and exits 0 (#1327), so
+# an arm INSERTED BELOW it would be unreachable — a fixture that silently
+# stopped being a fixture, which is the failure this suite's own Test 11
+# guards against one layer up. Anchor on `new-window` itself and put the
+# failing arm FIRST; the potency check below (`spawn_rc != 0`) is what proves
+# it took.
+sed 's|^    new-window)|    new-window) exit 1 ;;\n    new-window)|' \
     "$TMUX_STUB_BIN/tmux" > "$FAILING_TMUX_BIN/tmux"
 chmod +x "$FAILING_TMUX_BIN/tmux"
 
@@ -950,6 +1012,227 @@ if [[ -f "$MANIFEST_MARKER" ]]; then
     pass "the retry — which actually reached the agent — is what marks it delivered"
 else
     fail "successful retry did not mark delivery"
+fi
+rm -f "$MANIFEST" "$MANIFEST_MARKER"
+
+# --- Test 12: option-arm-only failure is NOT a spawn failure -------------
+#
+# The other half of the rc=3 contract, and the one Test 11 CANNOT see.
+#
+# `_respawn_spawn_window` arms `remain-on-exit` in ONE chained tmux command
+# list, so one status covers two commands, and it disambiguates by asking
+# whether the target window is present afterwards. Test 11 pins the direction
+# where that probe must NOT be believed: its stub reports the target present
+# unconditionally, so a `new-window` that failed is indistinguishable from one
+# that worked, and the helper must fail CLOSED (rc 3).
+#
+# But the stub is STATIC, so Test 11 alone is also satisfied by a helper that
+# samples presence BEFORE the kill instead of after it — measured: hoisting the
+# survival re-check above `tmux kill-window` leaves Test 11 fully green. That
+# mutant is a real regression of your-org/nexus-code#1102's intent: with a real
+# tmux the kill takes, every replace-spawn then looks like a surviving stale
+# window, and an option-arm-only failure gets counted as a spawn failure toward
+# the slow-grind consecutive-failure guard.
+#
+# So this case supplies what the static stub cannot: a tmux whose kill ACTUALLY
+# TAKES. The window list is state, held in a file. kill-window removes the
+# target; the chained new-window re-adds it and then exits 1 (the option arm
+# failing after a successful creation). Correct attribution is rc 0 — the
+# window exists because THIS call made it.
+
+echo '=== an option-arm-only failure is not a spawn failure (kill took; window is newly created) ==='
+
+STATEFUL_TMUX_BIN="$WORK/stateful-tmux-bin"
+mkdir -p "$STATEFUL_TMUX_BIN"
+WIN_STATE="$WORK/stateful-windows.txt"
+printf '%s\n' watcher orchestrator worker-foo > "$WIN_STATE"
+
+cat > "$STATEFUL_TMUX_BIN/tmux" <<STATEFUL
+#!/bin/bash
+printf '%s\n' "tmux \$*" >> "$TMUX_LOG"
+case "\$1" in
+    list-windows)
+        fmt="\$3"
+        idx=0
+        while IFS= read -r n; do
+            [[ -n "\$n" ]] || continue
+            case "\$fmt" in
+                '#{window_name}'|'')                 printf '%s\n' "\$n" ;;
+                '#I #W')                             printf '%d %s\n' "\$idx" "\$n" ;;
+                '#{window_index}|#{window_name}')    printf '%d|%s\n' "\$idx" "\$n" ;;
+                *)                                   printf '%s\n' "\$n" ;;
+            esac
+            idx=\$(( idx + 1 ))
+        done < "$WIN_STATE"
+        ;;
+    kill-window)
+        # The kill genuinely TAKES — this is the whole point of the fixture.
+        grep -vxF orchestrator "$WIN_STATE" > "$WIN_STATE.tmp" || true
+        mv "$WIN_STATE.tmp" "$WIN_STATE"
+        exit 0
+        ;;
+    new-window)
+        # Creation SUCCEEDS — the window list gains the name, AND the handle is
+        # emitted on stdout, which is what _respawn_spawn_window now reads
+        # (your-org/nexus-code#1327). Writing only to the state file would model
+        # a tmux that created a window without saying so, which no tmux does.
+        printf '%s\n' orchestrator >> "$WIN_STATE"
+        printf '@%d\n' 12
+        # …and the chained set-window-option arm is what fails.
+        exit 1
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+STATEFUL
+chmod +x "$STATEFUL_TMUX_BIN/tmux"
+
+rm -f "$MANIFEST" "$MANIFEST_MARKER"
+# TRUNCATE the shared call log. It is APPEND-ONLY across every test above, so
+# the potency controls below would otherwise be satisfied by test 1's calls and
+# would assert nothing about this fixture at all.
+: > "$TMUX_LOG"
+rc12=0
+NEXUS_ROOT="$FAKE_NEXUS" \
+STATE_DIR="$STATE_DIR" \
+FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+PANE_STATE_BIN="$PANE_STATE_STUB" \
+PATH="$STATEFUL_TMUX_BIN:$PATH" \
+    bash "$SCRIPT" --target orchestrator --reason "test: option arm fails, creation succeeded" \
+                   2>"$WORK/stderr-12.log" || rc12=$?
+
+# POTENCY CONTROL, run before the verdict is read: the fixture is worthless
+# unless the kill really removed the target and `new-window` really put it
+# back. Both are observable in the stub's own state file and call log.
+assert_contains "fixture is real: the kill was actually dispatched" \
+                "$(cat "$TMUX_LOG" 2>/dev/null)" "tmux kill-window -t orchestrator"
+assert_contains "fixture is real: the chained creation was dispatched" \
+                "$(cat "$TMUX_LOG" 2>/dev/null)" "tmux new-window -d -n orchestrator"
+assert_contains "fixture is real: the window exists only because this call created it" \
+                "$(cat "$WIN_STATE" 2>/dev/null)" "orchestrator"
+
+assert_eq "option-arm-only failure attributed correctly — NOT a spawn failure (rc 0, not 3)" \
+          "$rc12" "0"
+
+rm -f "$MANIFEST" "$MANIFEST_MARKER"
+
+# --- Test 13: a CONCURRENT CREATOR must not manufacture a spawn success ---
+#
+# The route `#1324` left open, and the reason `#1327` exists. Test 11 covers
+# "the kill did not take"; Test 12 covers "only the option arm failed". This
+# is the third arrangement, and until the handle landed it was the one no
+# fixture modelled:
+#
+#     the kill TAKES  +  `new-window` creates NOTHING  +  something else
+#     refills the slot with a window of the same NAME
+#
+# A presence-by-NAME probe answers `present` and the helper reports a spawn
+# that never happened. The window is real; it is simply not this call's. tmux
+# permits duplicate window names, and the concurrent creators are named in
+# `_respawn_spawn_window`'s own comment — rename heal, operator relaunch, a
+# successor watcher's respawn — so the precondition was documented one line
+# from the defect.
+#
+# The cost is not a log line. `spawn-fresh-orchestrator.sh` marks the
+# cold-boot dropped-worker manifest DELIVERED on helper rc 0, so a
+# manufactured success permanently swallows the record of everything the cold
+# boot dropped — the `#651` finding-2 catastrophe, which is exactly what Test
+# 11 was written to prevent through the other door.
+#
+# ASSERTED AS A PROPERTY, NOT AS A CALL SEQUENCE. The original defect needed a
+# refill landing between two specific probes; the fix removes both probes, so
+# an ordering-keyed fixture would go vacuous the moment it passed — green
+# because there is nothing left to race, which reads identically to green
+# because the defect is fixed. What this asserts instead is the invariant that
+# survives any implementation: with `new-window` having created nothing, a
+# same-named window being present at the end must NOT be read as success.
+CONCURRENT_TMUX_BIN="$WORK/concurrent-tmux-bin"
+mkdir -p "$CONCURRENT_TMUX_BIN"
+CWIN_STATE="$WORK/concurrent-windows.txt"
+printf '%s\n' watcher orchestrator worker-foo > "$CWIN_STATE"
+
+cat > "$CONCURRENT_TMUX_BIN/tmux" <<CONCURRENT
+#!/bin/bash
+printf '%s\n' "tmux \$*" >> "$TMUX_LOG"
+case "\$1" in
+    list-windows)
+        fmt="\$3"
+        idx=0
+        while IFS= read -r n; do
+            [[ -n "\$n" ]] || continue
+            case "\$fmt" in
+                '#{window_name}'|'')                 printf '%s\n' "\$n" ;;
+                '#I #W')                             printf '%d %s\n' "\$idx" "\$n" ;;
+                '#{window_index}|#{window_name}')    printf '%d|%s\n' "\$idx" "\$n" ;;
+                *)                                   printf '%s\n' "\$n" ;;
+            esac
+            idx=\$(( idx + 1 ))
+        done < "$CWIN_STATE"
+        ;;
+    kill-window)
+        # The kill genuinely TAKES. This is what sets the arrangement apart
+        # from Test 11 and what made \`#1324\`'s _stale_survived guard inert here.
+        grep -vxF orchestrator "$CWIN_STATE" > "$CWIN_STATE.tmp" || true
+        mv "$CWIN_STATE.tmp" "$CWIN_STATE"
+        exit 0
+        ;;
+    new-window)
+        # Creation FAILS and emits NO handle — nothing was created by this
+        # call. A CONCURRENT CREATOR then refills the slot with a window of
+        # the same name, which is the whole fixture: the name is back, the
+        # window is somebody else's.
+        printf '%s\n' orchestrator >> "$CWIN_STATE"
+        exit 1
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+CONCURRENT
+chmod +x "$CONCURRENT_TMUX_BIN/tmux"
+
+cat > "$MANIFEST" <<'EOF'
+# Cold boot dropped 1 worker agent(s)
+
+### `worker-concurrent`
+- session-id: `deadbeef-9999-8888-7777-666655554444`
+EOF
+rm -f "$MANIFEST_MARKER"
+: > "$TMUX_LOG"
+
+rc13=0
+NEXUS_ROOT="$FAKE_NEXUS" \
+STATE_DIR="$STATE_DIR" \
+FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+PANE_STATE_BIN="$PANE_STATE_STUB" \
+PATH="$CONCURRENT_TMUX_BIN:$PATH" \
+    bash "$SCRIPT" --target orchestrator --reason "test: concurrent creator refills the slot" \
+                   2>"$WORK/stderr-13.log" || rc13=$?
+
+# POTENCY CONTROLS, read before the verdict. Without these the assertion below
+# is satisfied by any fixture that fails for any reason at all — including one
+# where the kill was never dispatched, which is Test 11's arrangement wearing
+# this test's name.
+assert_contains "fixture is real: the kill was actually dispatched" \
+                "$(cat "$TMUX_LOG" 2>/dev/null)" "tmux kill-window -t orchestrator"
+assert_contains "fixture is real: the chained creation was dispatched" \
+                "$(cat "$TMUX_LOG" 2>/dev/null)" "tmux new-window -d -n orchestrator"
+assert_contains "fixture is real: a same-named window IS present afterwards — the name probe would have said SUCCESS" \
+                "$(cat "$CWIN_STATE" 2>/dev/null)" "orchestrator"
+
+assert_eq "a concurrent creator does NOT manufacture a spawn success (rc 3, not 0)" \
+          "$rc13" "3"
+if [[ ! -f "$MANIFEST_MARKER" ]]; then
+    pass "the dropped-worker manifest survives: not marked delivered by a spawn that never happened"
+else
+    fail "manifest consumed by a spawn that never happened — your-org/nexus-code#651 finding 2, through #1327's door"
 fi
 rm -f "$MANIFEST" "$MANIFEST_MARKER"
 

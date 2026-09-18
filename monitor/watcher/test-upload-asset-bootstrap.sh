@@ -40,7 +40,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s\n' "$label" >&2
@@ -75,6 +76,11 @@ write_fake_nexus_stubs() {
     mkdir -p "$FAKE_NEXUS/monitor" "$FAKE_NEXUS/config"
     cp "$_real_script" "$FAKE_NEXUS/monitor/upload-asset.sh"
     chmod +x "$FAKE_NEXUS/monitor/upload-asset.sh"
+    # your-org/nexus-code#1077: upload-asset.sh sources the SHARED primary-root
+    # resolver (monitor/_nexus-root.sh) and REFUSES to run without it, because a
+    # script that cannot tell which nexus an asset belongs to must not guess.
+    # The fake nexus is an install, so it ships the helper alongside the script.
+    cp "$_test_dir/../_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 
     cat > "$FAKE_NEXUS/monitor/mint-token.sh" <<'STUB'
 #!/usr/bin/env bash

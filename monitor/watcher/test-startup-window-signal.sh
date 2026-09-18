@@ -45,6 +45,17 @@ set -uo pipefail
 # test nothing. With -m each background job gets its own process group
 # and default signal dispositions.
 set -m
+# …for the children THIS shell starts. It cannot undo a SIGINT that was
+# already ignored when this shell was started — which is what every
+# backgrounded launcher on an operator's board hands us (async-run.sh's
+# `setsid … &`, the Bash tool's run_in_background). Under that inheritance
+# case 2 read `watcher STILL RUNNING after the startup-window signal` 6 of 7
+# runs on this host and never on CI, whose steps run in the foreground; the
+# TERM case stayed green in the same runs because `&` never ignores SIGTERM.
+# Restore the disposition by re-exec before anything else happens
+# (your-org/nexus-code#1445; mechanism and measurement in _entry_signals.sh).
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_entry_signals.sh"
+entry_signals_restore_or_exec "$0" "$@"
 
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 _src_root=$(cd "$_test_dir/../.." && pwd)

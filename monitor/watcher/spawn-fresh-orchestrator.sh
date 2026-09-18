@@ -32,10 +32,11 @@
 #      ready to accept paste). 30 s budget; on timeout, attempt the
 #      paste anyway and log the timeout — current behaviour is no
 #      worse. After load-buffer + paste-buffer + Enter, poll pane-state
-#      again: state=busy or state=user-typing confirms the turn
-#      submitted. If still `empty` after a couple of seconds, retry
-#      the Enter once (no further retries — a wedged claude won't be
-#      unstuck by hammering Enter).
+#      again: state=busy confirms the turn submitted (`user-typing` does
+#      NOT — it means the brief is still in the input box). If not busy
+#      after a couple of seconds, retry the Enter once; only while the
+#      pane positively shows typed text in the box is Enter re-sent on a
+#      bounded budget (_respawn.sh's typed-retry).
 #   6. Write a cooldown marker so the caller (main.sh's poll loop)
 #      can throttle repeat attempts.
 #   7. Log a structured event for post-hoc audit.
@@ -117,6 +118,7 @@ done
 command -v tmux >/dev/null 2>&1 || { echo "spawn-fresh-orchestrator.sh: tmux required" >&2; exit 2; }
 
 STATE_DIR="${STATE_DIR:-$NEXUS_ROOT/monitor/.state}"
+export NEXUS_STATE_DIR="$STATE_DIR"   # your-org/nexus-code#1335: `ng log-action` reads this name
 mkdir -p "$STATE_DIR" || { echo "spawn-fresh-orchestrator.sh: cannot create $STATE_DIR" >&2; exit 1; }
 
 # Shared respawn primitives (issue #161). Single source of truth for
@@ -249,13 +251,23 @@ _compose_situation_report() {
         printf 'Worker windows currently in tmux:\n'
         while IFS= read -r w; do
             [[ -z "$w" ]] && continue
-            local match=""
-            if [[ -d "$reports_dir" ]]; then
-                match=$(find "$reports_dir" -maxdepth 1 -type f -name "*${w}*.md" \
-                        -printf '%T@\t%f\n' 2>/dev/null | sort -nr | head -1 | cut -f2-)
+            # FRONTMATTER-keyed, not FILENAME-keyed (your-org/nexus-code#1195).
+            # The filename carries a cwd-derived project slug, `window:` comes
+            # from live tmux, and they disagree on 19% of this corpus — so the
+            # old `-name "*${w}*.md"` printed "no matching report" about
+            # windows that had filed one, on the situation report a fresh
+            # orchestrator reads to decide what to resume.
+            local match="" _m_rc=0 _ng="${NEXUS_ROOT:-}/monitor/ng"
+            if [[ -x "$_ng" ]]; then
+                match=$("$_ng" reports-for-window "$w" --reports-dir "$reports_dir" 2>/dev/null) || _m_rc=$?
+                [[ -n "$match" ]] && match=$(basename -- "$(printf '%s\n' "$match" | head -1)")
+            else
+                _m_rc=2
             fi
             if [[ -n "$match" ]]; then
                 printf -- '- %s — most recent report: %s\n' "$w" "$match"
+            elif (( _m_rc == 2 )); then
+                printf -- '- %s — COULD NOT LOOK (reports corpus not enumerable); this is NOT "no report"\n' "$w"
             else
                 printf -- '- %s — no matching report under reports/\n' "$w"
             fi

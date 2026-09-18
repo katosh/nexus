@@ -124,11 +124,19 @@ EOF
 # added the moment the historical replay disagreed, so the hole cannot reopen
 # unnoticed.
 #
-# (The env-var names are deliberately NOT spelled out above. run-tests.sh tags
-# a file `slow` by grepping its CONTENTS for the gate variable, so a mere
-# MENTION in a comment demotes this test out of the fast PR band — silently.
-# Observed on this file's first draft. Filed as an infrastructure note with
-# this PR's report; a mention-grep is not a usage-grep.)
+# (The env-var names are deliberately NOT spelled out above, because
+# run-tests.sh LABELS a file `slow` by grepping its CONTENTS for the gate
+# variable, so a mere MENTION in a comment makes `--list` mis-report this test
+# as gated. That is cosmetic and nothing more: the grep lives inside
+# run-tests.sh's `list_only` branch, which prints and exits, and the fast band
+# is built by an explicit `find` in tests.yml that passes every file. An
+# earlier revision of this comment claimed the mention "demotes this test out
+# of the fast PR band"; that consequence was asserted without being measured
+# and is FALSE — both tests added here run in the fast band regardless.
+# Corrected after the #809 skeptic reproduced the actual behaviour. Recorded
+# rather than deleted: this file's entire argument is that a stated
+# consequence nobody executed is not evidence, and the comment was an instance
+# of exactly that.)
 shape env-prefixed-command <<'EOF'
 set -uo pipefail
 FOO=1 BAR=2 env -u NOPE sh -c 'exit 7'

@@ -310,7 +310,13 @@ fi
 echo '=== case 10: helper — refusal message is situation-aware + actionable ==='
 RMETA=$'host: farhost\nboot_id: zzz\npid: 9001\nsandbox: /peer/root\nstarted_at: 2026-06-15T01:02:03Z\ntmux: none\n'
 MSG=$(_nexus_instance_lock_refusal "$RMETA" /tmp/x.lock /some/root)
-check_msg() { if grep -q "$1" <<<"$MSG"; then pass "refusal: $2"; else fail "refusal missing $2: [$MSG]"; fi; }
+check_msg() {
+    if [[ -z "${1:-}" ]]; then
+        fail "refusal: $2 — EMPTY needle: \`grep -q \"\"\` matches anything, so this assertion could only have passed VACUOUSLY (your-org/nexus-code#1110). Fix the CALLER: its expected value came back empty; check the rc of whatever produced it."
+        return
+    fi
+    if grep -q "$1" <<<"$MSG"; then pass "refusal: $2"; else fail "refusal missing $2: [$MSG]"; fi
+}
 check_msg "Suspected holder"           "states the suspected situation from metadata"
 check_msg "farhost"                    "surfaces the recorded host so the user can find the peer"
 check_msg "Normal resolution"          "gives the use/close/--replace normal path"

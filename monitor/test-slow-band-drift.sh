@@ -92,7 +92,13 @@ mutate() {  # mutate <label> <sed-expr>
 }
 
 # M1 — treat every status as green. NEW-RED can never fire.
-mutate "everything-is-green" 's|^_is_green() { \[ "\$1" = "PASS" \]; }|_is_green() { return 0; }|'
+# The predicate the checker dispatches on is _status_class's terminal arm, not
+# _is_green: #1283 made check() read `klass=$(_status_class …)` directly, which
+# left _is_green DEAD — and a mutant of dead code SURVIVES (measured: the old
+# anchor was a no-op, the re-anchored one survived). Turn the fail-closed `*)`
+# arm green: every non-PASS status then reads as a pass, and the selftest's
+# NEW-RED, SKIP-is-red and unknown-token cases must all catch it.
+mutate "everything-is-green" "s|^        \*)       printf 'red' ;;|        *)       printf 'green' ;;|"
 # M2 — drop the STALE-TOLERATION direction. The list becomes append-only, which
 #      is the failure mode #737 names: a tolerance that only ever grows.
 mutate "no-stale-toleration" 's|stale+=|_discarded+=|'

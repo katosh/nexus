@@ -68,6 +68,11 @@ rm -rf "$seed"
 
 cp "$_real_script" "$FAKE_NEXUS/monitor/upload-asset.sh"
 chmod +x "$FAKE_NEXUS/monitor/upload-asset.sh"
+# your-org/nexus-code#1077: upload-asset.sh sources the SHARED primary-root
+# resolver (monitor/_nexus-root.sh) and REFUSES to run without it, because a
+# script that cannot tell which nexus an asset belongs to must not guess.
+# The fake nexus is an install, so it ships the helper alongside the script.
+cp "$_test_dir/../_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 SCRIPT="$FAKE_NEXUS/monitor/upload-asset.sh"
 
 cat > "$FAKE_NEXUS/monitor/mint-token.sh" <<'STUB'
@@ -109,8 +114,17 @@ printf '# A report\n\nbody\n' > "$SRC"
 remote_tip() { "$REAL_GIT" --git-dir="$BARE" rev-parse refs/heads/main; }
 remote_paths() { "$REAL_GIT" --git-dir="$BARE" ls-tree -r --name-only refs/heads/main; }
 
+# NEXUS_ROOT is PINNED to the fixture, never inherited (your-org/nexus-code#655,
+# #706, #708, and now #1077). Since #1077 `upload-asset.sh` honours $NEXUS_ROOT,
+# so an inherited one is not cosmetic: run inside an agent shell this suite
+# stages six request markers into the OPERATOR'S REAL `<primary>/assets.staging`
+# — including one at `assets/846/report.md`, a live path — which the next
+# genuine upload would elect a manager for and COMMIT. Measured, 2026-08-27.
+# Pinning (rather than unsetting) asserts the property positively: the suite
+# controls the root for its own invocations.
 run_upload() {
-    OUT=$(PATH="$STUB_DIR:$PATH" bash "$SCRIPT" "$@" 2>&1)
+    OUT=$(env -u NEXUS_ASSET_REPO -u NEXUS_CONFIG NEXUS_ROOT="$FAKE_NEXUS" \
+          PATH="$STUB_DIR:$PATH" bash "$SCRIPT" "$@" 2>&1)
     RC=$?
 }
 

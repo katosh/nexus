@@ -202,7 +202,7 @@ assert_not_contains "no fallback to config default"  "$calls" "/repos/default-or
 echo '=== ng issue create --bogus → exit 1 ==='
 run_ng out err rc issue create --bogus foo --title t --body-file "$WORK/body.md"
 assert_eq        "exit 1"                            "$rc" "1"
-assert_contains  "stderr names the unknown flag"     "$err" "unknown flag: --bogus"
+assert_contains  "stderr names the unknown flag"     "$err" "unknown flag: '--bogus'"
 
 # ---- Test 13: cmd_issue_comment — required <n> --------------------------
 

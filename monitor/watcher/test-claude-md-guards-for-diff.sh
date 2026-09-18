@@ -104,9 +104,11 @@ gp_population() {
         monitor/guards-for-diff.sh \
         monitor/ng \
         monitor/_guard_population.sh \
-        monitor/watcher/test-guards-for-diff.sh
+        monitor/watcher/test-guards-for-diff.sh \
+        monitor/watcher/_test_helpers.sh
 }
 gp_handle "$@"
+bash "$(dirname "${BASH_SOURCE[0]}")/claude-md-block-coverage.sh" GUARDS-FOR-DIFF   # the entry's UNCHECKED share, in this suite's own output (#1239)
 
 . "$_test_dir/_test_helpers.sh"
 
@@ -130,6 +132,38 @@ done
 yn() { (( $1 )) && echo yes || echo no; }
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/cmgfd.XXXXXX") || { echo "mktemp -d failed" >&2; exit 1; }
+
+# ── PIN THE STATE DIR (your-org/nexus-code#1336, #1349) ────────────────────
+#
+# This suite DRIVES the real `ng guards-for-diff`, and every such call resolves
+# a state directory through a four-arm chain in which only arm 1 is
+# unconditional (`NEXUS_STATE_DIR`, then `$NEXUS_ROOT/monitor/.state`, then
+# `config nexus.root`, then `$_script_dir/.state`). Unpinned it appends
+# `ng-usage.jsonl` rows to whatever root it inherits — on an operator's primary,
+# the primary.
+#
+# THE THIRD MEMBER OF `#1336`'s CLASS, and outside the gate for a THIRD distinct
+# spelling: `fixture_suites()`'s NG arm greps four, `test-argloop-progress-guard`
+# uses a bare `./monitor/ng`, `test-ng-usage-flag-coverage` uses
+# `"$_test_dir/../ng"`, and this one reaches it through the dispatcher under
+# test. Three suites, three spellings, none matched — which is the issue's point
+# that the population predicate cannot be repaired by adding spellings.
+#
+# MEASURED, and the measurement needed a correction first. Run with the
+# inherited root's `monitor/.state` ABSENT, this suite reads HERMETIC — `ng`
+# does not create the directory, so there is no write to see. Clearing the
+# baseline with `rm -rf` is exactly what makes the leak invisible, and it is the
+# first thing a careful author does. With `monitor/.state` PRESENT, as it always
+# is on a live root: **7 rows**, every one attributed to this suite. That
+# condition is documented at `nexus-root-sensitivity.sh:161-162` and is why the
+# probe builds a decoy that already contains the directory.
+#
+# `th_pin_ng_state` rather than a bare export: it pins arm 1 AND proves it in
+# both directions, failing closed and distinguishing "did not contain" from "NOT
+# CHECKED". Its documented adoption hazard is real — a suite not sourcing
+# `_test_helpers.sh` gets rc 127 and a green summary with the leak intact — and
+# this suite sources it above, before this line.
+th_pin_ng_state "$REPO_ROOT/monitor/ng" "$WORK/state"
 
 # Control D plants a guard fixture INSIDE the repo (a relative suite path has to
 # resolve from the repo root), so unlike $WORK it cannot be left behind: that

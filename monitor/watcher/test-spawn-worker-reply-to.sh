@@ -44,7 +44,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — missing %q\n' "$label" "$needle" >&2
@@ -85,7 +86,14 @@ cp "$_test_dir/../guard-block.sh.in" "$FAKE_NEXUS/monitor/guard-block.sh.in"
 chmod +x "$FAKE_NEXUS/monitor/spawn-worker.sh"
 SCRIPT="$FAKE_NEXUS/monitor/spawn-worker.sh"
 
-for _dep in _claude-bin.sh _tmux-window.sh _fm_lib.sh _channel_lib.sh; do
+# _bookkeeping.sh is the same class of hard dependency as guard-block.sh.in
+# above: since your-org/nexus-code#941 BOTH spawn-worker.sh and _channel_lib.sh
+# load `wk_encode` from it and REFUSE rather than fall back to the lossy key.
+# Without it the spawn dies at exit 2 and _channel_lib's own helpers
+# (_chan_safe, _chan_apply_utf8_locale) are never defined, so request-channel.sh
+# fails downstream with `mv: cannot stat …/.new.md` — a symptom that names
+# neither the encoder nor this fixture.
+for _dep in _claude-bin.sh _tmux-window.sh _fm_lib.sh _channel_lib.sh _bookkeeping.sh; do
     cp "$_test_dir/../$_dep" "$FAKE_NEXUS/monitor/$_dep"
 done
 cp "$_test_dir/../request-channel.sh" "$FAKE_NEXUS/monitor/request-channel.sh"

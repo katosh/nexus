@@ -1,0 +1,12 @@
+# paste-buffer-sites.manifest — every FILE under monitor/ holding an executable
+# `tmux paste-buffer`, recorded as data so test-paste-bracketed.sh's population
+# floor is DERIVED and not a literal (your-org/nexus-code#1518, skeptic w237sk F6).
+#
+# One line per (file, count). A CHANGE here is a change to the population and
+# must be acknowledged in a commit message: a new site is expected to ADD a row,
+# and a removed site to drop one. Regenerating without saying which happened is
+# what the derived floor exists to prevent.
+monitor/paste-followup.sh	1
+monitor/watcher/_respawn.sh	1
+monitor/watcher/_unstick.sh	1
+monitor/watcher/main.sh	1

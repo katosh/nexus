@@ -29,6 +29,10 @@ bad() { printf '  FAIL: %s — %s\n' "$1" "$2" >&2; FAIL=$(( FAIL + 1 )); }
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
+# HERMETIC (your-org/nexus-code#1453 / #1336): the gh wrapper's capability cache
+# resolves NEXUS_STATE_DIR before NEXUS_ROOT; without this pin the decoy band
+# names this suite as a writer of gh-capable.d into the INHERITED root.
+export NEXUS_STATE_DIR="$TMP/state"; mkdir -p "$NEXUS_STATE_DIR"
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "SKIP: python3 unavailable — the audit cannot be exercised here."

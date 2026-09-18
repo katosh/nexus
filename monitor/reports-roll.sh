@@ -59,6 +59,17 @@
 
 set -uo pipefail
 
+# ARGUMENT-LOOP PROGRESS GUARD (your-org/nexus-code#924). Each argument loop
+# below asserts that every iteration consumes at least one argument. Without it
+# a value-taking flag given LAST spins forever — `shift 2` with `$#` == 1 is
+# refused, so the arm re-matches — and a hang here is worse than an error
+# because nothing on this board surfaces it. Full rationale: monitor/ng.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
+
 _prog=$(basename "$0")
 
 die() { printf '%s: %s\n' "$_prog" "$*" >&2; exit 1; }
@@ -127,7 +138,7 @@ _parse_report_date() {
 # Args
 # ---------------------------------------------------------------------------
 reports_dir_arg="" dry_run=0 now_arg="" quiet=0
-while (( $# > 0 )); do
+_argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
     case "$1" in
         --reports-dir) reports_dir_arg="${2:-}"; shift 2 ;;
         --dry-run)     dry_run=1; shift ;;

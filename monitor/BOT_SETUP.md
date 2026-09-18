@@ -27,7 +27,7 @@ when opening PRs against the upstream code.)
 Why a GitHub App and not a PAT:
 
 - **Scoped identity.** The App posts as its own `[bot]` account. The
-  eligibility filter in `monitor/watcher/main.sh:snapshot_github` keys
+  eligibility filter in `monitor/watcher/_github.sh:snapshot_github` keys
   off `author.login == github.user_login`, which means bot-authored
   comments are excluded from the user-directive stream by construction —
   no body-prefix convention needed, and the bot cannot read its own
@@ -44,8 +44,10 @@ Why a GitHub App and not a PAT:
 
 ## Prerequisites
 
-- `gh` CLI authenticated as yourself (for smoke tests; not used by the
-  minted-token path).
+- The `gh` CLI **binary** — `monitor/ng` shells out to `gh api` for
+  every GitHub call. Authenticating it as yourself is only needed for
+  the `gh repo create` / `gh repo view` in step 0; the smoke tests
+  below run on the bot's minted token, not your `gh` auth.
 - `python3` + `pyyaml` (used by `config/load.sh`).
 - `openssl`, `jq`, `curl`, `bash` — already listed in the tech stack in
   `monitor/README.md`.
@@ -143,7 +145,7 @@ specifically; step 11 wires its `<owner>/<name>` into `github.repo`.
     `github.repo`, so leave it commented unless you intentionally want
     assets and issues in different repos.
 12. Smoke test: `./monitor/ng issue 1` (or any existing issue number).
-    Expected output: `#1 state=OPEN title=…`. If that succeeds, the App
+    Expected output: `#1 state=OPEN|CLOSED title=…`. If that succeeds, the App
     is minting tokens and the token has the scope needed to read issues.
     Then run the verify section below to confirm asset uploads work
     end-to-end.
@@ -157,12 +159,14 @@ just that command before moving on.
 ```bash
 # 1. Token mint + repo metadata read.
 ./monitor/ng issue 1
-# expected: #1 state=… title=…  (or "ng: not found" — both prove
-# the token mints and the App can resolve the repo)
+# expected: #1 state=OPEN|CLOSED title=…  (or "ng: issue 1: fetch failed" on a
+# repo with no issue #1 — both prove the token mints and the App can
+# resolve the repo)
 
-# 2. Bot install scope (ng preflight, post-#31 omnibus).
+# 2. Bot install scope (ng preflight).
 ./monitor/ng preflight "$(./config/load.sh github.repo)"
-# expected: bot installed yes (or a clear "no" if step 9 was skipped)
+# expected: bot installed: yes (<repo>) — repository_selection=…
+# (or a clear "bot installed: NO" if step 9 was skipped)
 
 # 3. Asset upload end-to-end (commits one file to your asset repo's
 #    main branch, prints the URL).
@@ -186,7 +190,7 @@ value to set in step 4 above.
 | Permission                   | Grant      | Code paths (grep-verifiable)                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Why                                                                                                                                                                                                                                                                   |
 |------------------------------|------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Repository → **Metadata**    | Read       | Implicit — every `api …` call in `monitor/ng` depends on `/repos/:r` resolving. `monitor/mint-token.sh`'s output is useless without it.                                                                                                                                                                                                                                                                                                                                                 | GitHub mandates Metadata: read on every App. Without it the installation token cannot resolve the repo.                                                                                                                                                               |
-| Repository → **Issues**      | Read+Write | GET: `ng process` at `/repos/:r/issues/comments/:id` + `/reactions?per_page=100`; `ng issue` at `/repos/:r/issues/:n`; `_overview_number` at `/repos/:r/issues?labels=nexus:overview`; `cmd_dashboard_get`/`cmd_dashboard_put` at `/repos/:r/issues/:n`. GraphQL: `monitor/watcher/main.sh:snapshot_github` (`search(type: ISSUE)` + `comments.nodes { reactions }`). POST: `ng react`, `ng process`, `ng reply`, `ng close` (pre-close comment) at `/repos/:r/issues{,/comments}/:id{,/reactions,/comments}`. PATCH: `ng close` (state=closed) and `ng dashboard put` (body splice) at `/repos/:r/issues/:n`. | The dashboard is issue-body content; the eligibility filter reads comment bodies and reactions; every user-directive turn reacts 👀/🚀, posts replies, closes threads, or patches the overview body. All of that is the Issues scope. |
+| Repository → **Issues**      | Read+Write | GET: `ng process` at `/repos/:r/issues/comments/:id` + `/reactions?per_page=100`; `ng issue` at `/repos/:r/issues/:n`; `_overview_number` at `/repos/:r/issues?labels=nexus:overview`; `cmd_dashboard_get`/`cmd_dashboard_put` at `/repos/:r/issues/:n`. GraphQL: `monitor/watcher/_github.sh:snapshot_github` (`search(type: ISSUE)` + `comments.nodes { reactions }`). POST: `ng react`, `ng process`, `ng reply`, `ng close` (pre-close comment) at `/repos/:r/issues{,/comments}/:id{,/reactions,/comments}`. PATCH: `ng close` (state=closed) and `ng dashboard put` (body splice) at `/repos/:r/issues/:n`. | The dashboard is issue-body content; the eligibility filter reads comment bodies and reactions; every user-directive turn reacts 👀/🚀, posts replies, closes threads, or patches the overview body. All of that is the Issues scope. |
 | Repository → **Contents**    | Read+Write | `monitor/upload-asset.sh`: `git clone`/`git fetch`/`git reset`/`git push` against `https://x-access-token:<TOKEN>@github.com/<asset-repo>.git` (the `main` branch under `assets/...`).                                                                                                                                                                                                                                                                                                  | Pushing to the asset repo's `main` branch is gated by the repo's Contents permission for GitHub Apps. Without Contents: write the `git push origin main` in `upload-asset.sh` returns 403.                                                                            |
 | Repository → **Pull requests** | Read+Write | No monitor script invokes a PR endpoint directly. Granted for worker agents spawned in tmux windows that authenticate as the bot (`GH_TOKEN=$(monitor/mint-token.sh) gh pr create/edit/merge …`) to open, update, or land PRs on their feature branches.                                                                                                                                                                                                                                | Bot-authored PR operations require this scope; `gh pr create` and `gh pr merge` both 403 without it. Grep-present users: the agent flow documented in `skills/nexus.bot/SKILL.md` (the `ng pr ...` verb table and the `GH_TOKEN=$(./monitor/mint-token.sh) gh pr ...` escape hatch), not the monitor loop.                                          |
 | Organization → **Members**   | Read       | `gh pr edit` invoked as the bot against a PR in an org-owned head repo. Added **2026-04-23** after PR #13 (`<your-org>/<your-nexus>#13`) failed `gh pr edit` with an org-membership error.                                                                                                                                                                                                                                                                                                   | `gh pr edit` validates the authenticated identity's edit rights by checking org membership before issuing the REST call. Without this scope the CLI errors out client-side; adding it is the minimal fix.                                                             |
@@ -252,10 +256,26 @@ re-bootstraps:
   settings page and accept the new-permission request on the
   installation. This is the exact fix applied on 2026-04-23 for PR #13.
 
-- **`mint-token.sh` returns "private key not found"** — the pem moved,
-  or `github.bot_pem_path` in `config/nexus.yml` points somewhere that
-  doesn't exist. Check the path, `chmod 600`, try again. `ls -l
-  "$("$_cfg" github.bot_pem_path)"` must show `-rw-------`.
+- **`mint-token.sh` returns "private key not found at …"** — the pem
+  moved, or `github.bot_pem_path` in `config/nexus.yml` points
+  somewhere that doesn't exist. (A *present but unreadable* key gives
+  the distinct "private key not readable at …".) Check the path and
+  try again:
+
+  ```bash
+  ls -l "$(./config/load.sh github.bot_pem_path)"   # want -rw-------
+  ```
+
+  Note `mint-token.sh` REFUSES to sign (exit 4) when the key is
+  world-accessible **and** every ancestor directory grants
+  other-execute, i.e. when another local user can actually reach it
+  (<your-org>/nexus-code#1501). It does NOT refuse a loose mode that is
+  contained: `0644` under a mode-700 `~/.claude` is inert, because
+  traversal is denied and the file's own bits never come into play.
+  So `chmod 600` is still on you; the gate only catches the case
+  where the mode is the whole of the protection and it is open.
+  `./monitor/mint-token.sh --check-key` prints the verdict without
+  minting.
 
 - **Installation token expired mid-flight** — `mint-token.sh` checks the
   cache at `github.bot_token_cache` and re-mints when within 5 min of
@@ -269,7 +289,7 @@ re-bootstraps:
   `github.asset_repo` if set explicitly). Re-check step 9: install
   the App on **your asset+issue repo** specifically. Confirm with
   `./monitor/ng preflight "$(./config/load.sh github.repo)"` —
-  `bot installed yes` means the install scope covers the repo.
+  `bot installed: yes` means the install scope covers the repo.
 
 - **`ng upload` push returns 404 cloning the asset repo** — the
   asset+issue repo doesn't exist on GitHub yet, or `github.repo`

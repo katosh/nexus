@@ -105,8 +105,22 @@ while IFS= read -r f; do
 
     # Which resolver step does the construction pin? Ask it of the CREATING
     # lines only — a fixture may merely *mention* node_modules elsewhere.
-    if "$REAL_GREP" -hE "$CREATES_CLAUDE" "$f" 2>/dev/null \
-       | "$REAL_GREP" -qE "$CREATES_LOCAL"; then
+    #
+    # CAPTURE, THEN TEST — never `grep … | grep -q` (your-org/nexus-code#1372).
+    # Under `set -o pipefail` (line 54) a `-q` reader exits on its FIRST match
+    # and closes the pipe; a writer still emitting past the pipe buffer then
+    # takes SIGPIPE, the pipeline reports the WRITER's failure, and this `if`
+    # falls to its else arm — recording `step=path` for a fixture that IS
+    # `step=local`, at rc 0, into a manifest. Forced deterministically with a
+    # 20,001-line fixture whose needle is on line 1: OLD -> path, NEW -> local.
+    # In production the payload is small so it is racy rather than reliable,
+    # which is why it needs a tripwire and not a wait-and-see. The sigpipe lint
+    # cannot see this site: both readers are spelled `"$REAL_GREP"`, a variable,
+    # and its `_GREPQ_READER` keys on the literal token `grep`.
+    creating=$("$REAL_GREP" -hE "$CREATES_CLAUDE" "$f" 2>/dev/null) || creating=""
+    # The empty case is decided explicitly (the herestring remedy is documented
+    # to invert it at some call sites): no creating line, no local pin.
+    if [[ -n "$creating" ]] && "$REAL_GREP" -qE "$CREATES_LOCAL" <<<"$creating"; then
         step=local
     else
         step=path

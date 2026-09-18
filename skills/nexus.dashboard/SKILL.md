@@ -85,8 +85,16 @@ Verbs:
 
 ```
 ng dashboard scaffold                 # print the canonical skeleton (hints inline)
-ng dashboard validate [--body-file P] # strict: exit 1 if any required section missing
-ng dashboard put --body-file P        # splice + PATCH; WARNS on missing sections, never blocks
+ng dashboard validate                 # strict, on the LIVE dashboard (the default; #958)
+ng dashboard validate [--body-file P|-]  # a candidate; exit 1 if a required section is
+                                      #   missing OR DUPLICATED (#1058). `-` = stdin.
+ng dashboard put --body-file P        # splice + PATCH, then READ BACK to prove it landed
+                                      #   (#1118). Refuses: a body containing a marker
+                                      #   (#959), a live body without exactly ONE marker
+                                      #   pair, anything over GitHub's 262144-byte cap.
+                                      #   rc 4 = could not verify != failed. Cache and
+                                      #   freshness stamp only after verification.
+                                      #   WARNS on missing sections, never blocks.
 ng dashboard get                      # fetch the current dashboard middle
 ```
 
@@ -117,6 +125,43 @@ wrapping fresh sections-only content, and PATCH wholesale
 (`jq -Rs '{body:.}' | gh api -X PATCH …/issues/1 --input -`); verify
 `grep -c NEXUS_DASHBOARD_START` on the live body `== 1` and
 `ng dashboard validate`.
+
+## Presence is not uniqueness
+
+The dashboard verbs' recurring defect is a check that answers a WEAKER
+question than the one it reports on. `put`'s precondition asserted the
+markers were PRESENT and never that they were UNIQUE — the same sentence
+`#1058` writes about `validate` and section headings. A body carrying two
+`NEXUS_DASHBOARD_END` markers passed it and then silently no-oped: rc 0, URL
+printed, stderr empty, body unchanged. Measured at 198,236 bytes, 64 KB UNDER
+GitHub's cap, so size was not the cause.
+
+Two habits follow, and they are the whole skill:
+
+1. **Exactly one.** One START, one END, one of each required section. Ask it
+   at every entry point — `get`, `put` and `validate` — because whichever one
+   you skip is the one that hands the next verb a corrupt body. `get` matters
+   most: it produces what `put` consumes, so a bad `get` arms the next
+   round-trip.
+2. **Prove the write with an INDEPENDENT GET, not with the PATCH response.**
+   A 200 is not evidence — and neither is the response body. Measured on
+   scratch issue `<your-org>/nexus-code#1128`: an over-cap PATCH returns 200
+   whose `.body` is **the body you sent**, while the store keeps the old one
+   (`response_echoed_sent = YES` in every case, swallows included; the limit is
+   262,144 **bytes**, and 262,144 lands while 262,145 swallows). A check
+   comparing against that response compares the request with itself — its
+   true-positive set for a swallow is empty. This PR shipped exactly that
+   mistake and six tests "proved" it worked against a mock that had the forge
+   backwards. Only a separate GET observes the store.
+
+   Do NOT reconcile byte counts instead: size is a proxy that drifts.
+
+If a dashboard genuinely reaches the cap, `put` REFUSES and says by how much,
+splitting the total into the dashboard region and the prose outside it — so
+you can see whether trimming the dashboard can even help. It does not
+auto-trim: what to drop is editorial judgement, and a publish verb that
+quietly publishes something other than what it was handed is the same defect
+wearing better clothes.
 
 ## Consistency with the rest of the nexus
 

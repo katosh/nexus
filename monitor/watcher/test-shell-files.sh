@@ -39,6 +39,53 @@ LIB="$REPO_ROOT/monitor/shell-files.sh"
 TMP=$(mktemp -d -t shf-XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 
+# ── THE TWO LIVE-TREE SWEEPS, AS NAMED ENUMERATORS ─────────────────────────
+#
+# Extracted (your-org/nexus-code#1301) so `gp_population` can CALL them rather
+# than restate what they currently return. The protocol's one rule: a copy is a
+# second implementation of the population, and a second implementation drifts —
+# at which point the index reports, with total confidence, that this guard does
+# not read a file it does read.
+#
+# This guard's population really is repo-wide, and that is exactly why it is
+# worth declaring: `_shf_all_files` reads the first bytes of every executable
+# regular file under `monitor/` in order to reach its shebang-gap verdict, so
+# ADDING A FILE ANYWHERE UNDER `monitor/` can redden it. #1301's argument for
+# enrolling this class is that declaring FEELS redundant for precisely the
+# guards whose reach is widest, which is how they end up invisible to the index.
+_shf_glob_files() {
+    find "$REPO_ROOT/monitor" -type f \
+        \( -name '*.sh' -o -name '*.zsh' -o -name '*.bash' \)
+}
+# NUL-separated: the sweep below feeds a `read -d ''` loop, and -print0 is why a
+# filename containing a newline cannot split into two. `gp_population` converts;
+# the ASSERTION path keeps the safe form.
+_shf_all_files0() {
+    find "$REPO_ROOT/monitor" \
+        \( -name .git -o -name .state -o -name node_modules \) -prune -o \
+        -type f -print0
+}
+
+# The four consumers §7 reads with `cat`, named once and reused there.
+_SHF_CONSUMERS=(
+    monitor/cc-harness/lint-no-tmux-server-kill.sh
+    monitor/cc-harness/lint-no-mass-kill.sh
+    monitor/watcher/test-ambient-shell-option-scope.sh
+    monitor/watcher/early-exit-readers.sh
+)
+
+# `gp_handle` EXITS when it handles `--population`, so it stands above the first
+# line of output: anything printed before it lands in the probe's stdout and is
+# read as a population row (your-org/nexus-code#1193).
+# shellcheck disable=SC1091
+. "$_self_dir/../_guard_population.sh"
+gp_population() {
+    printf '%s\n' "$LIB"
+    _shf_all_files0 | tr '\0' '\n'
+    ( cd "$REPO_ROOT" && printf '%s\n' "${_SHF_CONSUMERS[@]}" )
+}
+gp_handle "$@"
+
 _plant() {   # <name> <content> -> path
     printf '%s\n' "$2" > "$TMP/$1"
     printf '%s' "$TMP/$1"
@@ -73,6 +120,22 @@ assert_eq "env -S does not swallow the interpreter" \
 assert_eq "an env VAR=value assignment does not swallow the interpreter" \
     "$(shf_class "$(_plant env-var-tool '#!/usr/bin/env LC_ALL=C bash
 :')")" shell
+# The two OTHER GNU spellings of `-S bash` carry the command INSIDE the option
+# token (your-org/nexus-code#1409). Both used to return rc 1 — EXCLUDED, the
+# unsafe direction — while the spaced `-S bash` control above passed, so a
+# probe that tested only the control could not see them.
+assert_eq "env --split-string=bash (long, attached) resolves the interpreter" \
+    "$(shf_class "$(_plant env-split-long '#!/usr/bin/env --split-string=bash -e
+:')")" shell
+assert_eq "env -Sbash (short, attached) resolves the interpreter" \
+    "$(shf_class "$(_plant env-s-attached '#!/usr/bin/env -Sbash -e
+:')")" shell
+assert_eq "env --split-string bash (long, detached) resolves the interpreter" \
+    "$(shf_class "$(_plant env-split-detached '#!/usr/bin/env --split-string bash
+:')")" shell
+assert_eq "env -Spython3 (attached) resolves to python, not shell — the peel keeps the vocabulary" \
+    "$(shf_class "$(_plant env-s-attached-py '#!/usr/bin/env -Spython3 -u
+:')")" python
 
 # A CRLF first line yields an interpreter of `bash<CR>` unless the CR is
 # stripped, which matches nothing and excludes the file with no diagnostic.
@@ -176,8 +239,7 @@ echo "=== non-vacuity: an enumeration that found nothing must be LOUD ==="
 # the same argument the tmux lint's `--selftest` makes about itself.
 _n_shell=$(shf_count "$REPO_ROOT/monitor" shell)
 _n_script=$(shf_count "$REPO_ROOT/monitor" script)
-_n_glob=$(find "$REPO_ROOT/monitor" -type f \
-            \( -name '*.sh' -o -name '*.zsh' -o -name '*.bash' \) | wc -l)
+_n_glob=$(_shf_glob_files | wc -l)
 
 assert_eq "the derived population clears its floor" \
     "$(shf_require_floor "$REPO_ROOT/monitor" shell 300 t >/dev/null 2>&1 \
@@ -199,8 +261,7 @@ _missing=0
 while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     shf_is_shell "$f" || { echo "    NOT covered: $f" >&2; _missing=$((_missing+1)); }
-done < <(find "$REPO_ROOT/monitor" -type f \
-            \( -name '*.sh' -o -name '*.zsh' -o -name '*.bash' \) )
+done < <(_shf_glob_files)
 assert_eq "every file the OLD glob saw is still seen (no silent regression)" \
     "$_missing" 0
 
@@ -217,18 +278,41 @@ assert_eq "every file the OLD glob saw is still seen (no silent regression)" \
 # the same breath, because a count behind a claim is exactly where this repo's
 # silent zeros live: a broken scan would report `0 unclassified` AND
 # `0 scanned`, and only the second number gives it away.
-_unclassified=""; _scanned=0
+_unclassified=""; _scanned=0; _longest=0; _longest_path=""; _fl=""
 while IFS= read -r -d '' f; do
     _scanned=$(( _scanned + 1 ))
+    # THE READ BOUND, PINNED ON THE LIVE TREE (your-org/nexus-code#1407).
+    #
+    # `shf_interpreter` used to be `read -r -n 200`, whose comment promised
+    # that "a binary file with no newline cannot make this read a gigabyte".
+    # `-n` is a bash spelling that yields EMPTY under zsh (#1338), so the fix
+    # reads a whole LINE and truncates afterwards — which drops that bound.
+    # Measured on a 20 MB newline-free file: old 0.00s / 3,388 kB maxrss,
+    # new 1.67s / 64,856 kB. Unreachable on today's corpus (longest first
+    # line repo-wide 297 bytes; zero files without a newline) — and
+    # "unreachable today" is a statement about the CORPUS, not the code.
+    #
+    # That promise now lives in PROSE, in the file whose own header argues
+    # prose cannot be made to fail. This is the same shape as the #799 F-3
+    # finding directly above, one release apart in the same file, so it gets
+    # the same remedy: measure the live tree rather than a fixture.
+    #
+    # Measured with the SAME primitive the predicate uses, so this is the
+    # actual exposure and not a proxy for it.
+    IFS= read -r _fl < "$f" 2>/dev/null || _fl=""
+    if (( ${#_fl} > _longest )); then _longest=${#_fl}; _longest_path="$f"; fi
     [[ -x "$f" ]] || continue
     shf_class "$f" >/dev/null 2>&1 || _unclassified+="$f"$'\n'
-done < <(find "$REPO_ROOT/monitor" \
-            \( -name .git -o -name .state -o -name node_modules \) -prune -o \
-            -type f -print0 2>/dev/null)
+done < <(_shf_all_files0 2>/dev/null)
 assert_eq "the live-tree sweep examined a real population (not a silent zero)" \
     "$(( _scanned > 400 ))" 1
 assert_empty "no executable file on the tree falls into the declared shebang gap ($_scanned scanned)" \
     "$_unclassified"
+# Ceiling with headroom over the measured 297, low enough that a vendored blob
+# or captured binary fixture trips it. A ratchet, not an inventory: it fails
+# when the corpus changes, which is the property the prose could not have.
+assert_eq "no file's first line exceeds 4096 B, so the unbounded read stays bounded in fact (longest ${_longest} B at ${_longest_path:-none}; $_scanned scanned)" \
+    "$(( _longest <= 4096 ))" 1
 
 # --- 7. the consumers actually use it ---------------------------------------
 echo "=== the shared helper is SHARED (not a fourth implementation) ==="
@@ -237,10 +321,7 @@ echo "=== the shared helper is SHARED (not a fourth implementation) ==="
 # bug, and they did. The point of this file is defeated if a consumer keeps its
 # own `find`. So assert the consumers source it, and assert no consumer still
 # carries the one-element allowlist that prompted the issue.
-for c in monitor/cc-harness/lint-no-tmux-server-kill.sh \
-         monitor/cc-harness/lint-no-mass-kill.sh \
-         monitor/watcher/test-ambient-shell-option-scope.sh \
-         monitor/watcher/early-exit-readers.sh; do
+for c in "${_SHF_CONSUMERS[@]}"; do
     assert_contains "$c sources the shared enumerator" \
         "$(cat "$REPO_ROOT/$c")" 'shell-files.sh'
 done
@@ -269,5 +350,152 @@ assert_eq "the corpus read for the next assertion is non-empty after stripping" 
 assert_contains "…and still contains real code" "$_consumers" 'shf_'
 assert_not_contains "no consumer still carries the one-element allowlist" \
     "$_consumers" "-name 'ng'"
+
+# ── BRACKET DEPTH SURVIVES THE NEWLINE (your-org/nexus-code#1227) ───────
+# `quote_mask` carried the QUOTE state across lines (`inq0`/`QM_END`) but not
+# the `$( … )` NESTING — `sp`/`stack`/`depth` were function-locals and reset on
+# every call. The consequence is not a lost `)`: on the next line that `)` is
+# read as an ordinary character, so the following `"` OPENS a string instead of
+# CLOSING one, every later line reads as quoted, `#` is skipped as text, and
+# THE REST OF THE FILE'S COMMENTS ARE EMITTED AS CODE. Measured before the fix:
+# 2,661 comment lines across 81 of 584 shell files; `monitor/ng:1129` is the
+# live instance and the issue's named fixture.
+#
+# KEYED ON THE INVARIANT THE ISSUE STATES, not on the carry's spelling: a file
+# with an unbalanced `$(` at a line boundary must not have its subsequent
+# comment lines classified as code.
+_b1227="$TMP/b1227.sh"
+cat > "$_b1227" <<'B1227'
+#!/usr/bin/env bash
+die "$(printf 'usage %s\nmore %s' \
+        "$(f "$x")" "$x")"
+# CANARY_1227_MUST_NOT_SURVIVE
+echo hi
+B1227
+_out1227=$(shf_strip_comments "$_b1227" 2>/dev/null)
+assert_not_contains "an open \$( at a newline does not leak later comments as code" \
+    "$_out1227" "CANARY_1227_MUST_NOT_SURVIVE"
+# NON-VACUITY: the same stripper must still emit the real code around it, or the
+# absence above would be satisfied by an empty haystack (#793(b)).
+assert_contains "…and the real code on both sides survives the strip" \
+    "$_out1227" "echo hi"
+assert_contains "…including the line that opens the substitution" \
+    "$_out1227" "printf"
+
+# ── A BACKSLASH OUTSIDE QUOTES ESCAPES THE NEXT CHARACTER (#1227 residue) ──
+# The `'…'\''…'` idiom — close, escaped literal quote, reopen — carries an
+# apostrophe through a single-quoted string. Read without the escape rule the
+# scanner OPENS a string at the escaped quote and is inverted for the rest of
+# the file: every later comment survives as code. Measured at 8ba5060e:
+# monitor/ng:11436 carried this shape and the 33 column-0 comment lines after
+# it were classified as code; corpus-wide the leak was concentrated in exactly
+# the files dense with printf messages. Keyed on the invariant, not the
+# spelling: after `\'` and `\"` OUTSIDE any quote, a comment is a comment.
+_b1227b="$TMP/b1227-backslash.sh"
+cat > "$_b1227b" <<'B1227B'
+#!/usr/bin/env bash
+printf '  ask %s to add %s to %s'\''s installation:\n' "$a" "$b" "$c"
+# CANARY_1227B_MUST_NOT_SURVIVE
+echo \" unbalanced-looking but escaped
+# CANARY_1227C_MUST_NOT_SURVIVE
+echo still_code
+B1227B
+_out1227b=$(shf_strip_comments "$_b1227b" 2>/dev/null)
+assert_not_contains "a comment after the '\\'' idiom is stripped (the escaped quote opens nothing)" \
+    "$_out1227b" "CANARY_1227B_MUST_NOT_SURVIVE"
+assert_not_contains "a comment after an escaped double quote outside strings is stripped" \
+    "$_out1227b" "CANARY_1227C_MUST_NOT_SURVIVE"
+assert_contains "…and the real code around both survives the strip" \
+    "$_out1227b" "echo still_code"
+assert_contains "…including the printf carrying the idiom" \
+    "$_out1227b" "installation"
+
+# THE PER-LINE CONTRACT IS UNCHANGED, which is what keeps the three 1-arg and
+# 2-arg callers (`_test_helpers.sh`, `uncounted-abort-lint.sh`,
+# `test-tmux-socket-ceiling.sh`, `early-exit-readers.sh`) on their previous
+# behaviour: `sp0`/`stack`/`depth` are OPTIONAL parameters, and awk gives an
+# unsupplied parameter a fresh local.
+_qawk="$REPO_ROOT/monitor/watcher/_shell_quotes.awk"
+assert_eq "quote_mask(s) with no carry still masks a plain quoted span" \
+    "$(awk "$(cat "$_qawk")"'BEGIN { print quote_mask("a \"b\" c") }')" \
+    "0011100"
+assert_eq "…and a 1-arg call reports sp 0, so a bare caller cannot inherit nesting" \
+    "$(awk "$(cat "$_qawk")"'BEGIN { quote_mask("x=\"$(f\""); print QM_SP+0 }')" \
+    "1"
+
+
+
+# ---------------------------------------------------------------------------
+# BOTH-SHELL AGREEMENT (your-org/nexus-code#1338).
+# ---------------------------------------------------------------------------
+# The predicate's whole job is to answer "what shell code is in this repo?", and
+# `CLAUDE.md` prescribes it as THE population rule — "never by a filename glob".
+# A population rule that answers differently depending on which shell sourced it
+# is not one rule, it is two, and the divergence is SILENT: `read -r -n 200` is
+# a bash spelling that zsh accepts at rc 0 while yielding an EMPTY string, so
+# the shebang arm reported "no shebang" for every file that has one.
+#
+# The failure shape was a plausible UNDER-COUNT, not a zero — the extension arm
+# still found every `*.sh`, so only EXTENSIONLESS files were lost, and in this
+# repo every one of those is a PATH-front shim or a default-deny guard. Measured
+# at `bbf8985b` before the fix: `shf_find0 monitor shell` returned 603 under
+# bash and 593 under zsh, and the 10 missing were `monitor/ng`, `ghwrap/gh`,
+# `pipwrap/pip`, `tmuxwrap/tmux`, `proc-kill-authorized`,
+# `proc-exists-authorized`, `git-https-setup`, `notifywrap/sandbox-notify` and
+# the two `client/` entry points.
+#
+# So this guard asserts AGREEMENT rather than any particular number — the
+# property actually being claimed, and the one nothing checked before. It is
+# deliberately a POSITIVE assertion in the sense of the header above: it
+# requires a named interpreter to be FOUND under the second shell, so an
+# enumerator that produced nothing cannot satisfy it.
+_zsh_bin=$(command -v zsh 2>/dev/null || true)
+if [[ -z "$_zsh_bin" ]]; then
+    # NOT a silent pass. A skip that looks like a pass is the defect this file
+    # exists to prevent, so the absence is recorded as a skip and named.
+    th_skip "both-shell agreement" \
+        "no zsh on this host (command -v zsh is empty) — the bash/zsh divergence axis #1338 is about is UNMEASURED here"
+else
+    _shf_probe=$(_plant 'shebang-only-tool' '#!/usr/bin/env bash')
+    printf 'body\n' >> "$_shf_probe"
+
+    # (a) The interpreter itself must agree, on the exact shape that used to
+    #     return empty under zsh.
+    assert_eq "both-shell: shf_interpreter agrees under bash" \
+        "$(bash -c '. "$1"; shf_interpreter "$2"' _ "$LIB" "$_shf_probe")" "bash"
+    assert_eq "both-shell: …and returns the SAME interpreter under zsh" \
+        "$("$_zsh_bin" -c '. "$1"; shf_interpreter "$2"' _ "$LIB" "$_shf_probe")" "bash"
+
+    # (b) An EXTENSIONLESS shim is the member class that was lost. `monitor/ng`
+    #     is the sharpest — the main CLI, and the file `#1214` records a sibling
+    #     predicate failing on for the same reason.
+    _shf_ng="$REPO_ROOT/monitor/ng"
+    if [[ -r "$_shf_ng" ]]; then
+        assert_eq "both-shell: shf_is_shell finds monitor/ng under bash" \
+            "$(bash -c '. "$1"; shf_is_shell "$2" && echo yes || echo no' _ "$LIB" "$_shf_ng")" "yes"
+        assert_eq "both-shell: …and finds it under zsh too (#1338's headline victim)" \
+            "$("$_zsh_bin" -c '. "$1"; shf_is_shell "$2" && echo yes || echo no' _ "$LIB" "$_shf_ng")" "yes"
+    else
+        th_skip "both-shell: the extensionless victim" \
+            "$REPO_ROOT/monitor/ng is not readable — #1338's headline victim is UNMEASURED"
+    fi
+
+    # (c) THE POPULATION COUNT ITSELF must agree. This is the assertion that
+    #     would have caught `#1338`, and it is kept off the whole repo tree
+    #     (seconds per shell) by running over a planted directory that contains
+    #     one member of each arm: extension, shebang-with-extension, and the
+    #     extensionless shebang that is the lost class.
+    _shf_pop="$TMP/pop"; mkdir -p "$_shf_pop"
+    printf '#!/bin/sh\n:\n'          > "$_shf_pop/by-shebang-extless"
+    printf '#!/usr/bin/env bash\n:\n'> "$_shf_pop/also-extless"
+    printf ':\n'                     > "$_shf_pop/by-extension.sh"
+    printf 'not a script\n'          > "$_shf_pop/plain.txt"
+    _shf_count='n=0; while IFS= read -r -d "" f; do n=$((n+1)); done < <(shf_find0 "$2" shell); echo "$n"'
+    _shf_nb=$(bash      -c ". \"\$1\"; $_shf_count" _ "$LIB" "$_shf_pop")
+    _shf_nz=$("$_zsh_bin" -c ". \"\$1\"; $_shf_count" _ "$LIB" "$_shf_pop")
+    # Pinned, not merely equal: two enumerators that both return 0 also "agree".
+    assert_eq "both-shell: the planted population is 3 under bash" "$_shf_nb" "3"
+    assert_eq "both-shell: …and the SAME 3 under zsh — counts agree" "$_shf_nz" "$_shf_nb"
+fi
 
 th_summary_and_exit

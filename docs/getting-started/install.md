@@ -34,11 +34,13 @@ debug the bootstrap.
   identity with its own minted token, **not** your personal account.
   If you're not an admin, you'll relay the App ID, Installation ID,
   and private key from whoever is.
-- `gh` CLI is **optional**. Its only install-time use is the one-time
+- The `gh` CLI **binary** is required — `monitor/ng` shells out to
+  `gh api` for every GitHub call. What is **optional** is `gh` being
+  *authenticated as you*: the bot supplies its own GitHub App token, so
+  an unauthenticated `gh` does **not** block the install. The only
+  install-time use of your personal auth is the one-time
   `gh repo create` in Phase 1, which has a browser/admin fallback
-  (create the empty private repo at `https://github.com/new`). The
-  bot uses its own GitHub App token at runtime, never your `gh` auth,
-  so an unauthenticated `gh` does **not** block the install.
+  (create the empty private repo at `https://github.com/new`).
 - Node.js ≥ 18 with `npm`. A pre-installed Claude Code is **not**
   required: when no `claude` binary is found, the bootstrap installs a
   project-local copy (`node_modules/.bin/claude`) via
@@ -194,9 +196,10 @@ The failure modes you're most likely to hit:
   tip in [Step 2](#step-2-launch-the-install-bootstrap). The
   bootstrap refuses to overwrite an existing config.
 - **`gh auth status` reports unauthenticated** — this is **not** a
-  blocker. The bot uses its own GitHub App token; personal `gh` is
-  only used for the one-time `gh repo create` in Phase 1, which has a
-  browser/admin fallback (create the empty private repo at
+  blocker (a *missing* `gh` binary is: `ng` calls `gh api`). The bot
+  uses its own GitHub App token; your personal auth is only used for
+  the one-time `gh repo create` in Phase 1, which has a browser/admin
+  fallback (create the empty private repo at
   `https://github.com/new`). Authenticate with `gh auth login` only
   if you prefer the CLI repo-creation path.
 - **`bootstrap-install: project-local Claude Code install failed`** —
@@ -375,12 +378,14 @@ fix the cause and re-run before moving on.
 ```bash
 cd "$NEXUS_ROOT"
 ./monitor/ng issue 1
-# expected: `#1 state=... title=...` or `ng: not found` — either proves
-# the token mints and the App resolves your asset+issue repo.
+# expected: `#1 state=OPEN|CLOSED title=...` on a repo that has an issue #1, or
+# `ng: issue 1: fetch failed` on an empty repo — either proves the token
+# mints and the App resolves your asset+issue repo.
 
 ./monitor/ng preflight "$(./config/load.sh github.repo)"
-# expected: `bot installed yes`. A `no` means the App is not installed
-# on your asset+issue repo — re-do step M4's install step.
+# expected: `bot installed: yes (<repo>) — repository_selection=...`.
+# A `bot installed: NO` means the App is not installed on your
+# asset+issue repo — re-do step M4's install step.
 
 ./monitor/ng upload README.md --message "preflight"
 # expected: a URL of the form

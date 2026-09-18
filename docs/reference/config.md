@@ -1,7 +1,31 @@
 # Configuration
 
-Every key the nexus monitor honours, what it does, what it defaults
-to, the environment variable that overrides it, and a runnable example.
+The keys an operator sets on a normal install — what each does, what
+it defaults to, the environment variable that overrides it, and a
+runnable example.
+
+**This page is a curated subset, not the full key set.** At
+`a3177ef6` the tree reads at least **207** distinct dotted keys and
+this page documents **63** keys — **53** of them inside that measured
+set, the rest either read through a wrapper the command below cannot
+see or, in three flagged cases, read by nothing at all. The two
+exhaustive surfaces are `config/nexus.example.yml` (the canonical
+template, with the long-form rationale in YAML comments) and the code
+itself. Re-derive
+the read set with (`git grep -o` does not exist at git 2.17.1, this
+host's default, so the walk goes through `xargs`):
+
+```bash
+git ls-files -z | xargs -0 grep -hodskip -E \
+  '(load\.sh|_cfg)"? +"?(github|monitor|nexus|notifications)\.[a-z0-9_.]+' \
+  | grep -oE '(github|monitor|nexus|notifications)\.[a-z0-9_.]+' \
+  | sed 's/[.]$//' | sort -u | wc -l
+```
+
+That number is a LOWER bound, and saying which direction it errs in is
+the point: it sees only keys passed as a literal argument to the
+loader, so a key composed at runtime is invisible to it. It
+under-counts; it never over-counts.
 
 The single source of truth is `config/nexus.yml` in your nexus
 checkout. Copy `config/nexus.example.yml` to `config/nexus.yml`,
@@ -48,9 +72,9 @@ the scripts refuse to read group/world-readable secret files.
 | [`github.bot_webhook_url`](#githubbot_webhook_url) | URL | — | empty |
 | [`github.bot_webhook_secret_path`](#githubbot_webhook_secret_path) | path | — | empty |
 | [`github.overview_issue_number`](#githuboverview_issue_number) | int | — | unset (live-resolved) |
-| [`notifications.pushover.user_key_path`](#notificationspushoveruser_key_path) | path | `NEXUS_PUSHOVER_USER_KEY_FILE` | unset |
-| [`notifications.pushover.app_token_path`](#notificationspushoverapp_token_path) | path | `NEXUS_PUSHOVER_APP_TOKEN_FILE` | unset |
-| [`notifications.ntfy.topic_url_path`](#notificationsntfytopic_url_path) | path | `NEXUS_NOTIFY_TOKEN` | unset |
+| [`notifications.pushover.user_key_path`](#notificationspushoveruser_key_path) | path | `NEXUS_PUSHOVER_USER_KEY_FILE` | `~/.claude/.nexus-pushover-user-key` |
+| [`notifications.pushover.app_token_path`](#notificationspushoverapp_token_path) | path | `NEXUS_PUSHOVER_APP_TOKEN_FILE` | `~/.claude/.nexus-pushover-app-token` |
+| [`notifications.ntfy.topic_url_path`](#notificationsntfytopic_url_path) | path | `NEXUS_NOTIFY_TOKEN` | `~/.claude/.nexus-notify-token` |
 | [`notifications.email.address`](#notificationsemailaddress) | email | `NEXUS_EMAIL_TO` | — (required for email tier) |
 | [`notifications.email.probe_address`](#notificationsemailprobe_address) | email\|`null` | — | `null` (probes go to `address`) |
 | [`notifications.email.smtp_host`](#notificationsemailsmtp_host) | host | `NEXUS_SMTP_HOST` | — (`smtp.example.org` placeholder) |
@@ -104,12 +128,31 @@ are tabulated with their defaults and exact semantics in the
 "Switching conditions and times" table — the single source of truth
 for lifecycle thresholds, deliberately not duplicated here.
 
-Two env vars have no corresponding YAML key:
+One env var has no corresponding YAML key:
 
 | Env var | Purpose |
 |---|---|
 | `ANTHROPIC_API_KEY` | Anthropic API key for the case-B rate-limit reset probe. Read only from the environment; never persisted to config. Required when `monitor.watcher.ratelimit_probe: true`. |
-| `NEXUS_ASSET_BRANCH` | Branch that `monitor/upload-asset.sh` pushes to in the asset repo (default `main`). Operationally a knob, not a site policy — kept env-only. |
+
+!!! failure "Retired: `NEXUS_ASSET_BRANCH` is inert — setting it does nothing"
+
+    This page listed it as an env-only knob for the asset-repo push branch.
+    **Nothing has read it since `5dc735cd` (2026-04-18)**, which deleted
+    `BRANCH="${NEXUS_ASSET_BRANCH:-main}"` from `monitor/upload-asset.sh`;
+    `main` is now hardcoded at every branch-touching site there
+    (`monitor/upload-asset.sh:639,659-661,840,915,947`). If you have it
+    exported, unset it — it is not honoured, and an asset push goes to
+    `main` regardless.
+
+    The tombstone stays rather than the row simply vanishing, because the
+    failure mode of a phantom knob is an operator setting it, observing no
+    effect, and concluding the whole config surface is unreliable. Verified
+    at `a3177ef6`: the name appears **nowhere** in the tree outside this
+    paragraph —
+
+    ```bash
+    git ls-files -z | xargs -0 grep -Fnodskip 'NEXUS_ASSET_BRANCH'
+    ```
 
 ---
 
@@ -140,7 +183,7 @@ environment-modules (e.g. <your-institution> <cluster>: `module load nodejs`).
 is absent: it sources the module init, `module load`s this name (then
 falls back to discovering the highest `>=18` versioned module if the
 site has no default), and re-checks. Leave as the default `nodejs`
-for FH <cluster> and most EasyBuild sites; override only if your site's
+for <your-institution> <cluster> and most EasyBuild sites; override only if your site's
 node module is named differently. No effect on hosts where `node` is
 already on `PATH`. Env var `NEXUS_NODE_MODULE` wins over this key.
 
@@ -315,23 +358,28 @@ unconditionally.
 
 ### `notifications.pushover.user_key_path`
 
-**Type** path · **Env** `NEXUS_PUSHOVER_USER_KEY_FILE` · **Default** unset
+**Type** path · **Env** `NEXUS_PUSHOVER_USER_KEY_FILE` · **Default** `~/.claude/.nexus-pushover-user-key`
 
 File whose first line is the Pushover **user key** from
-[pushover.net](https://pushover.net). `chmod 600`.
+[pushover.net](https://pushover.net). `chmod 600`. The key is
+optional because `monitor/notify.sh` falls back to the path above
+(`monitor/notify.sh:107`) — drop the file there and Pushover works
+with no config entry at all; with neither key nor file the tier
+silently no-ops.
 
 ### `notifications.pushover.app_token_path`
 
-**Type** path · **Env** `NEXUS_PUSHOVER_APP_TOKEN_FILE` · **Default** unset
+**Type** path · **Env** `NEXUS_PUSHOVER_APP_TOKEN_FILE` · **Default** `~/.claude/.nexus-pushover-app-token`
 
 File whose first line is the Pushover **application token** from
 [pushover.net/apps/build](https://pushover.net/apps/build). `chmod 600`.
+Same fallback shape as the user key (`monitor/notify.sh:108`).
 
 ### `notifications.ntfy.topic_url_path`
 
-**Type** path · **Env** `NEXUS_NOTIFY_TOKEN` · **Default** unset
+**Type** path · **Env** `NEXUS_NOTIFY_TOKEN` · **Default** `~/.claude/.nexus-notify-token`
 
-Fallback push channel. File's first line holds the full ntfy topic
+Fallback push channel; the code fallback is `monitor/notify.sh:109`. File's first line holds the full ntfy topic
 URL (e.g. `https://ntfy.sh/<unguessable-topic>`). The topic name is a
 bearer secret on `ntfy.sh`'s public instance — choose something
 unguessable.
@@ -692,8 +740,10 @@ seconds ago and **no** liveness signal (heartbeat / paste-received /
 jsonl / tool-results) has advanced past the paste, respawn
 unconditionally (subject to cooldown). The re-submit rescue cannot
 defer this ceiling. **Clamped up at startup** when it would sit at or
-below the maximum compose_emit gap
-(`full_state_emit_interval_seconds + interval_seconds`) — see
+below the maximum compose_emit gap (the full-state heartbeat,
+`ceil(full_state.safety_floor_seconds / full_state_emit_interval_seconds)`
+cadence ticks, plus one `interval_seconds` loop tick — 1260 s with
+defaults) — see
 [`dead_threshold_floor_margin_seconds`](#monitorwatcherdead_threshold_floor_margin_seconds)
 and [Orchestrator liveness](orchestrator-liveness.md). Must stay below
 [`stale_paste_ceiling_seconds`](#monitorwatcherstale_paste_ceiling_seconds).
@@ -717,11 +767,14 @@ never fires.
 
 Margin added when the watcher clamps the effective
 `orchestrator_dead_threshold_seconds` up to
-`full_state_emit_interval_seconds + interval_seconds + margin`. The
-clamp closes the static-workspace false-positive respawn race at the
-source (the 2026-06-15 incident): with defaults it lifts the deadline
-from 300 to `600 + 60 + 60 = 720` s, so a static-workspace full-state
-paste always resets the clock before the deadline. The clamp declines
+`heartbeat + interval_seconds + margin`, where `heartbeat` is
+`full_state_emit_interval_seconds` rounded up to cover
+`full_state.safety_floor_seconds`. The clamp closes the
+static-workspace false-positive respawn race at the source (the
+2026-06-15 incident): with defaults it lifts the deadline from 300 to
+`ceil(900/600)*600 + 60 + 60 = 1200 + 60 + 60 = 1320` s, so a
+static-workspace full-state paste always resets the clock before the
+deadline. The clamp declines
 (leaving the configured value, with a WARN) if it would cross
 `stale_paste_ceiling_seconds`.
 

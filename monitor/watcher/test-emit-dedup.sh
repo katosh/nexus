@@ -328,6 +328,32 @@ assert_rc "awaiting-input toggle 1→0 suppresses (identical state)" 1 "$rc2"
 _compose_emit_should_bypass_dedup "$body_a"
 assert_rc "helper no longer bypasses on awaiting-input>0 body" 1 "$?"
 
+# ---- 6b. STALE age: the `taken Ns ago` token is volatile (#1406) -----------
+# A render killed after a complete one re-emits the previous counts DATED. The
+# age changes every cycle; the marker text and the counts do not. Two bodies
+# differing ONLY in the age must hash identically, or every stale cycle would
+# be a fresh emit — the exact churn #1044's constant markers were built to
+# avoid, re-introduced by the fix for the emptiness they replaced.
+echo '=== 6b. stale-age token stripped from the stable hash ==='
+_stale_body() {  # <file> <age>
+    cat > "$1" <<EOF
+=== nexus state changed at 2026-09-04T12:00:00-07:00 (poll-resurface) ===
+workspace: 2 busy | 1 idle | 0 retained | 0 idle-too-long | 0 pane-absent | 0 over-limit | 0 orphan-async | 0 awaiting-input
+workspace: ^ STALE (TIMED OUT) — the counts above are the PREVIOUS complete render's, taken ${2}s ago; THIS cycle's render exceeded its wall-clock budget and was killed. (your-org/nexus-code#1406)
+last updated: 2026-09-04T12:00:00-07:00
+EOF
+}
+_stale_body "$body_a" 37
+_stale_body "$body_b" 41
+hash_a=$(_compose_emit_stable_hash "$body_a")
+hash_b=$(_compose_emit_stable_hash "$body_b")
+assert_eq "two STALE bodies differing only in the age hash identically" "$hash_a" "$hash_b"
+# CONTROL: the COUNTS on the stale line are NOT stripped — a real change
+# behind a stale marker must still emit.
+sed -i 's/^workspace: 2 busy/workspace: 3 busy/' "$body_b"
+hash_c=$(_compose_emit_stable_hash "$body_b")
+assert_ne "…while a changed count behind the stale marker still changes the hash" "$hash_a" "$hash_c"
+
 # ---- 7. content-change → emits, hash advances ------------------------------
 # Two flavours: bypass-path emit (eligible-comments present) and
 # non-bypass-path emit (workspace counts changed). Both should emit

@@ -25,16 +25,25 @@ interactions that should still use the user's identity are
 target a non-default repo. Unset, the cwd-derive default depends on
 whether the verb writes or reads:
 
-- **Read verbs** (`issue view`, `pr view`, `show`) prefer the cwd's
-  `git remote get-url origin` if it is a `github.com` URL (with a
-  one-line stderr warning when different from `$REPO`), else fall
-  back to `$REPO`.
-- **Write verbs** (`reply`, `issue create`, `issue comment`,
-  `pr create|edit|merge`, `upload`, `wrap-up`) prefer `$REPO` from
-  config. If the cwd has a `github.com` origin that **differs** from
-  `$REPO`, the verb refuses to write — closing the soon-to-be-public
-  nexus-code leak risk — and emits a structured error asking for an
-  explicit `--repo`.
+- **Read verbs** (`issue view`, `pr view`, `show`,
+  `stranded-branches`) prefer the cwd's `git remote get-url origin`
+  if it is a `github.com` URL (with a one-line stderr warning when
+  different from `$REPO`), else fall back to `$REPO`.
+- **Write verbs** (`process`, `process-issue`, `react`,
+  `react-issue`, `reply`, `comment`, `comment-edit`, `close`,
+  `close-set`, `issue create`, `issue comment`,
+  `pr create|edit|merge`, `wrap-up`, `interactive-sessions
+  --upsert-overview`, `nexus-identity --upsert-overview`) prefer
+  `$REPO` from config. If the cwd has a `github.com` origin that
+  **differs** from `$REPO`, the verb refuses to write — closing the
+  soon-to-be-public nexus-code leak risk — and emits a structured
+  error asking for an explicit `--repo`.
+
+Both rules live in one place, `_resolve_repo <read|write>` in
+`monitor/ng`. **[`ng upload`](#ng-upload) is the exception and does
+not use it**: its destination is the *asset* repo, resolved from
+`github.asset_repo` with its own default-deny rules, and on that verb
+`--repo` means something different. See its section.
 
 **Body input** — verbs that POST a body (`reply`, `issue create`,
 `issue comment`, `pr create`, `pr edit`) accept the body via
@@ -45,12 +54,77 @@ short replies via `echo "thanks" | ng reply 7` works too.
 (URL, SHA, comment ID, …) on stdout. Stderr carries warnings and
 errors. This makes pipelines (`url=$(ng pr create …)`) trivial.
 
-**Exit codes** — `0` on success, `1` on usage/operation failure,
-verb-specific codes documented per verb (e.g.
-[`ng fetch-asset`](#ng-fetch-asset), [`ng report-check`](#ng-report-check),
-[`ng watcher-status`](#ng-watcher-status)).
+**Exit codes** — `0` on success and `1` on the general refusal path
+(`die`), plus **`64` = EX_USAGE for one specific condition: a flag
+given no value, or an empty value where the flag's contract requires
+one** (`_die_usage` / `_argloop_stuck`; `<your-org>/nexus-code#990`
+aligned `ng` with the sixteen other scripts in this repo that already
+used `64`). So `ng pr merge 42 --sha` and `ng pr merge 42 --sha ""`
+both exit `64` rather than merging unpinned — a caller that branches
+only on `1` will read that as success. Beyond those, verbs carry
+their own codes, documented per verb (e.g.
+[`ng wrap-up`](#ng-wrap-up) `3`,
+[`ng fetch-asset`](#ng-fetch-asset) `4`,
+[`ng upload`](#ng-upload) `4`/`7`,
+[`ng report-check`](#ng-report-check) `2`,
+[`ng watcher-status`](#ng-watcher-status) `0`–`4`).
 
 ## Quick reference
+
+**This page is not the complete verb list — `ng verbs` is.** `ng`
+dispatches **59** operational verbs; the sections below cover 35 of
+them. The other 24 are mostly pass-through facades over a standalone
+`monitor/*.sh` (whose own `--help` is the reference), plus narrow
+state queries and aliases. `ng verbs` — the categorized index printed
+by `ng --help` / `ng help` / `ng -h`, generated from `_verb_index` in
+`monitor/ng` — gives each a one-liner. It is hand-maintained and
+nothing asserts it against the dispatch table, so **11** of the 59
+are currently missing from it (see [Maintenance
+burden](#maintenance-burden)). **The table below is derived from the
+dispatch table itself and covers every verb `ng` dispatches that is
+not one of the 35 with its own section above — plus the handful whose
+section is new, pointed at with `[→]`.** Most are a thin `exec` over
+a standalone script that is the real reference; the right-hand column
+says where to look.
+
+| Verb | What it is | Reference |
+|---|---|---|
+| `ci-attempts <sha\|branch\|PR#>` | was this head green, and green on the *first* attempt? | `monitor/ci-head-attempts.sh`; [`nexus.ci-triage`](skills.md) |
+| `close-set --bodies <dir> <issue>…` | bulk close with per-issue verification | [→](#ng-close-set) |
+| `comment <n>` | alias of [`ng reply`](#ng-reply) | [→](#ng-reply) |
+| `comment-edit <id>` | compare-and-swap edit of an existing comment | [→](#ng-comment-edit) |
+| `declare-wait` / `declare-no-wait` | worker self-declares (or releases) an async external wait | `monitor/declare-wait.sh`, `monitor/declare-no-wait.sh` |
+| `guards-for-diff` | which construct-keyed guards read the files you changed | [→](#ng-guards-for-diff) |
+| `obligation <sub>` | the who-owes-whom ledger (`open\|settle\|note\|state\|show\|list\|gate\|pairs\|preserve-closures`) | `monitor/obligations.sh` |
+| `pane-state <window>` | classify a worker pane | `monitor/pane-state.sh`; [Worker states](worker-states.md) |
+| `paste-followup <window>` | the canonical follow-up paste into a window | `monitor/paste-followup.sh`; [`nexus.tmux-spawn`](skills.md) |
+| `remote <sub>` | confined remote SSH endpoint | `monitor/remote-enroll.sh`; [`nexus.remote-access`](skills.md) |
+| `report-grep <pattern>` | ignore-file-blind search of the reports corpus | [→](#ng-report-grep) |
+| `reports-for-window <window>` | which reports name this window | `monitor/ng`; [`nexus.report`](skills.md) |
+| `reports-roll [--dry-run]` | archive pre-buffer reports into `reports/YYYY-MM/` | `monitor/reports-roll.sh` |
+| `request <sub>` | worker→orchestrator request inbox (`file\|await\|fetch\|show\|reqfile\|dir\|list\|reply\|ack\|fail`) | `monitor/request-channel.sh` |
+| `retire-preflight <window>` | synchronous go/no-go gate before a kill | `monitor/retire-preflight.sh`; [`nexus.window-cleanup`](skills.md) |
+| `retire-window <window>` | preflight + kill + prune every state surface + verify | `monitor/ng`; [`nexus.window-cleanup`](skills.md) |
+| `send <agent> …` | harness-neutral agent delivery with a receipt | `monitor/send.sh`; [`nexus.agent-delivery`](skills.md) |
+| `session-id <window>` | the Claude Code session-id behind a window | `monitor/window-session-id.sh` |
+| `skeptic-arm` · `skeptic-disposition` · `skeptic-evidence` · `skeptic-obligations` · `skeptic-orphans` | the skeptic **bookkeeping** verbs (distinct from the `ng skeptic` channel) | [→](#skeptic-bookkeeping-verbs) |
+| `stranded-branches` | pushed branches that never got a PR | [→](#ng-stranded-branches) |
+| `token` / `user-pat` | print the bot installation token / the user PAT | `monitor/mint-token.sh`, `monitor/user-pat.sh` |
+| `usage [--json]` | which `ng` mechanisms are used, how often, what is cold | `monitor/usage-report.py` |
+| `write-probe <path>` | pre-flight that a deliverable path is writable | `monitor/write-probe.sh` |
+
+Most verbs also answer `ng <verb> --help` with their own usage line
+(`_usage_for` in `monitor/ng`, or — for a facade — the target
+script's own usage). `monitor/watcher/test-ng-usage-flag-coverage.sh`
+is a **ratchet** over that: it fails CI on any *new* flag the parser
+accepts but the usage line omits, and equally when a recorded known
+drift is fixed and left in its manifest, so that gap can only shrink.
+It makes the per-verb `--help` the *flag* surface least able to
+drift. It does **not** guarantee the verb has a `--help` at all:
+measured at `a3177ef6`, `ng skeptic-arm --help` and
+`ng skeptic-obligations --help` die `unknown flag`, and
+`ng skeptic-disposition --help` prints the whole file header instead
+of a usage line.
 
 | Verb | One-line | Section |
 |---|---|---|
@@ -61,6 +135,8 @@ verb-specific codes documented per verb (e.g.
 | `ng show <id>` | read a comment body (no eligibility filter) | [→](#ng-show) |
 | `ng reply <n>` | post a comment on an issue/PR | [→](#ng-reply) |
 | `ng close <n>` | close an issue, optionally with a comment | [→](#ng-close) |
+| `ng comment-edit <id>` | compare-and-swap edit of an existing comment | [→](#ng-comment-edit) |
+| `ng close-set <issue>…` | bulk close with per-issue verification | [→](#ng-close-set) |
 | `ng issue <n>` | view issue (one-liner; flags expand) | [→](#ng-issue) |
 | `ng issue create` | open a new issue | [→](#ng-issue-create) |
 | `ng issue comment <n>` | alias of `ng reply` under `issue` namespace | [→](#ng-issue-comment) |
@@ -69,10 +145,13 @@ verb-specific codes documented per verb (e.g.
 | `ng pr merge <n>` | merge a PR via REST | [→](#ng-pr-merge) |
 | `ng pr view <n>` | one-line PR summary | [→](#ng-pr-view) |
 | `ng preflight <repo>` | is the bot installed on this repo? | [→](#ng-preflight) |
+| `ng stranded-branches` | pushed branches that never got a PR | [→](#ng-stranded-branches) |
+| `ng guards-for-diff` | which guards read the files you changed (pre-push) | [→](#ng-guards-for-diff) |
 | `ng upload <file>` | push asset to asset repo, print pinned URL | [→](#ng-upload) |
 | `ng wrap-up <n> <report>` | end-of-task hand-off (upload + comment + rocket + log + retain) | [→](#ng-wrap-up) |
 | `ng wrap-up-check <window>` | verify a worker's wrap-up obligations before closing | [→](#ng-wrap-up-check) |
 | `ng skeptic <sub>` | worker↔skeptic comms channel + nudge (delegator) | [→](#ng-skeptic) |
+| `ng skeptic-arm\|-obligations\|-evidence\|-orphans\|-disposition` | skeptic pending-marker bookkeeping | [→](#skeptic-bookkeeping-verbs) |
 | `ng respawn <window\|sid>` | resume a wrapped/closed worker's session in a tmux window | [→](#ng-respawn) |
 | `ng service-incident <svc>` | assemble a service incident report from recorded state | [→](#ng-service-incident) |
 | `ng spawn-decision <window>` | advisory continue-vs-spawn classifier for a window | [→](#ng-spawn-decision) |
@@ -81,6 +160,7 @@ verb-specific codes documented per verb (e.g.
 | `ng suppress-emit <id>` | operator-side manual emit-suppression of a comment | [→](#ng-suppress-emit) |
 | `ng report-init <slug>` | create a frontmatter'd report skeleton | [→](#ng-report-init) |
 | `ng report-check <path>` | validate a report against the schema | [→](#ng-report-check) |
+| `ng report-grep <pattern>` | search the reports corpus without a silent zero | [→](#ng-report-grep) |
 | `ng fetch-asset <url>` | fetch a `user-attachments/...` URL via user PAT | [→](#ng-fetch-asset) |
 | `ng dashboard get` | read the overview-issue dashboard middle | [→](#ng-dashboard-get) |
 | `ng dashboard put` | splice + PATCH the dashboard middle | [→](#ng-dashboard-put) |
@@ -195,10 +275,25 @@ is in the *processing* path, not the read path.
 **Usage**
 
 ```
-ng show <comment-id> [--repo <owner>/<name>]
+ng show <comment-id> [--repo <owner>/<name>] [--meta]
 ```
 
-**Output** — comment body, raw.
+**Output** — the comment body, raw. `--meta` switches to a
+key=value + heredoc block instead:
+
+```
+id=<comment-id>
+updated_at=<ISO ts>
+body<<EOF
+…body…
+EOF
+```
+
+That `updated_at` is the compare-and-swap snapshot
+`ng comment-edit --expect-updated-at <ts>` compares against, so the
+safe read-modify-write loop is `ng show <id> --meta` → edit →
+`ng comment-edit <id> --expect-updated-at <ts>` (exit `4` if the
+comment changed underneath you).
 
 ---
 
@@ -231,7 +326,7 @@ Optionally post a comment and then close an issue.
 **Usage**
 
 ```
-ng close <issue> [--comment <text>]
+ng close <issue> [--comment <text>] [--repo <owner>/<name>]
 ```
 
 Prints `CLOSED` on success.
@@ -241,6 +336,87 @@ Prints `CLOSED` on success.
 ```bash
 monitor/ng close 12 --comment "shipped in linked PR"
 ```
+
+### `ng comment-edit`
+
+Compare-and-swap edit of an existing issue/PR comment. **Prefer
+[`ng reply`](#ng-reply) (append) on a contended thread** — editing is
+the operation that can destroy somebody else's words.
+
+**Usage**
+
+```
+ng comment-edit <comment-id> (--expect-updated-at <ts> | --force)
+                [--repo <owner>/<name>] [--body-file <path>]
+```
+
+One of `--expect-updated-at` / `--force` is **required** and they are
+mutually exclusive: the verb is compare-and-swap by design and will
+not guess. The safe loop:
+
+```bash
+monitor/ng show 4272693242 --meta        # 1. read body + updated_at
+$EDITOR new.md                           # 2. modify
+monitor/ng comment-edit 4272693242 \
+    --body-file new.md --expect-updated-at 2026-09-08T17:41:02Z
+```
+
+**Exit codes** — `0` prints the comment URL; **`4`** the comment's
+`updated_at` no longer matches what you passed, so a concurrent edit
+would have been clobbered and nothing was written; `1` on the usual
+failures. `--force` is deliberate last-writer-wins and warns loudly
+on stderr before writing.
+
+### `ng close-set`
+
+Close a **set** of issues, each with its own body, verifying every
+one individually. Built for the end of a batch — a PR that closes
+eleven issues — where a partial success reported as success is the
+failure that matters (`<your-org>/nexus-code#1444`).
+
+**Usage**
+
+```
+ng close-set --bodies <dir> [--pr <n>] [--merge <sha>]
+             [--repo <owner>/<name>] [--dry-run | --only-verify]
+             <issue>...
+```
+
+**Behaviour**, per issue `N`:
+
+1. Read `<dir>/<N>.md`. **No file ⇒ that issue is NOT-CLOSED** and the
+   run continues to the next.
+2. Substitute `__PR__` (from `--pr`) and `__MERGE__` (from `--merge`).
+   **Any surviving `__TOKEN__` refuses that issue** — including a
+   `__PR__` / `__MERGE__` you did not supply a value for. The guard
+   matches the placeholder SHAPE (`__[A-Z][A-Z_]*__`), not any
+   two-underscore substring, so an `a__b` in an evidence table does
+   not trip it. An unfilled placeholder posted to a thread is worse
+   than no comment.
+3. POST the comment, then `assert-bot-author.sh` it. A comment whose
+   author cannot be vouched for leaves the issue NOT-CLOSED and says
+   so — repair by hand, do not re-post.
+4. Close, then **re-read the issue** and require `state=closed` from
+   that direct read. The close PATCH's own status is deliberately
+   discarded (`|| true`): the read is the property, and a PATCH that
+   reports success proves nothing the read does not.
+
+**Output** — one `ISSUE <n>: CLOSED …` / `ISSUE <n>: NOT-CLOSED — <why>`
+line each, then both sets with their counts:
+
+```
+CLOSED SET (9): 1401 1402 …
+NOT-CLOSED SET (2): 1408 1411
+```
+
+**Exit codes** — `0` iff the NOT-CLOSED set is **empty**; `1`
+otherwise. So the verb is safe to `&&` against.
+
+`--dry-run` runs steps 1–2 (so a missing body or an unfilled token is
+still reported), prints `ISSUE <n>: DRY-RUN — would post <bytes> and
+close` instead of writing, and returns `0` regardless.
+`--only-verify` skips steps 1–4's writes entirely and does nothing
+but the per-issue read — `--bodies` is not required with it.
 
 ---
 
@@ -378,12 +554,43 @@ Merge a PR via REST. Prints the merge commit SHA.
 **Usage**
 
 ```
-ng pr merge <n> [--squash|--merge|--rebase] [--delete-branch] [--repo <owner>/<name>]
+ng pr merge <n> [--squash|--merge|--rebase] [--sha <verified-head>]
+                [--base-sha <verified-base>|--verify-base]
+                [--delete-branch] [--repo <owner>/<name>]
 ```
 
 Default merge method is `--squash`. `--delete-branch` removes the
 head ref after a successful merge (logs a warning if the branch is
 already gone).
+
+**Pinning what you verified.** A green describes a `<head>` merged into
+a `<base>`, and both can move between the check and the merge.
+
+- `--sha <verified-head>` pins the HEAD you verified. GitHub rejects
+  the merge (409) if the head moved (`#628`). Absent it, the freshly
+  fetched head is pinned, which closes the fetch→PUT window but does
+  not vouch for a head verified earlier.
+- `--base-sha <verified-base>` pins the BASE that head's green was
+  computed against. `ng ci-attempts` prints that sha **in full** on its
+  `Merge-ref base: VERIFIED` line for exactly this purpose.
+- `--verify-base` does the same **without a sha**: it re-runs the
+  merge-ref base check inside this verb, milliseconds before the PUT.
+  Prefer it — measured on this repo, the window between a verdict and
+  the merge has been as short as **4 seconds** (`#899`), which is
+  shorter than the round trip a caller needs to carry a sha.
+
+Why either is needed: GitHub 409s a moved head, and 409s a base that
+moved *conflictingly*. It accepts a base that advanced and still merges
+**cleanly** — which is the whole hazard (`#823`), and measured at
+**5 of 17 merges** on this board (`#880`). Both are **opt-in**: a base
+check that fired on every merge would block the board every time the
+base moved during a review, and a gate that always fires is a gate
+somebody disables.
+
+A missing flag value is refused, not defaulted — `ng pr merge 42 --sha`
+exits **`64`** (EX_USAGE) rather than merging unpinned, and so does
+`--sha ""`: an empty value is the same user-visible condition as a
+missing one (`<your-org>/nexus-code#990`).
 
 ### `ng pr view`
 
@@ -392,7 +599,7 @@ One-line PR summary.
 **Usage**
 
 ```
-ng pr view <n> [--repo <owner>/<name>]
+ng pr view <n> [--repo <owner>/<name>] [--json [field,...]]
 ```
 
 **Output**
@@ -400,6 +607,13 @@ ng pr view <n> [--repo <owner>/<name>]
 ```
 #<n> state=OPEN author=<login> <head>-><base> title=<title>
 ```
+
+`--json` switches to scriptable output instead: bare, the whole
+`/pulls/<n>` object (`jq -S .`); with a comma-separated field list
+(`--json number,state,mergeable_state`), only those keys, each
+`null` when absent. Field names are validated against
+`^[A-Za-z0-9_.]+$` — anything else is refused rather than
+interpolated into the `jq` filter.
 
 ---
 
@@ -430,6 +644,92 @@ monitor/ng preflight <your-org>/sibling-repo
 # or: bot installed: NO — ask org admin to install <bot-name> on <your-org>/sibling-repo
 ```
 
+### `ng stranded-branches`
+
+List remote branches that are **not** merged into the integration
+branch — pushed work that no surface an orchestrator reads can see
+(`<your-org>/nexus-code#1399`). Open issues, live windows, open PRs and
+cross-reference events all miss a branch that was pushed and never
+PR'd; this enumerates them directly from refs.
+
+**Usage**
+
+```
+ng stranded-branches [--since <date>] [--base <ref>] [--remote <name>]
+                     [--with-prs] [--repo <owner>/<name>]
+```
+
+Must run inside a git checkout. It **fetches first** — a stale
+negative is the failure mode here — and warns on stderr if the fetch
+failed rather than silently answering from an old tree. `--base`
+defaults to the repo's integration branch resolved via
+`monitor/_integration_branch.sh`, falling back to `dev`; `--remote`
+defaults to `origin`; `--since <date>` drops branches whose last
+commit is older.
+
+**Output** — a `base: <remote>/<branch> @ <short-sha>` header, then
+one tab-separated row per stranded branch, then a total:
+
+```
+<branch>	<n> ahead	<YYYY-MM-DD>	<pr-col>	<last commit subject>
+stranded: 72 branch(es) ahead of origin/dev; 65 with NO open PR  [fetched origin just now; …]
+```
+
+`--with-prs` adds the `pr=` column by asking GitHub (a read) which
+branches have an open PR. **A failed PR listing prints `pr=?`, never
+`pr=NONE`** — an empty list would mark every branch un-PR'd, which is
+the silent-zero direction — and a warning goes to stderr.
+
+Always exits `0` when it could look; `1` (via `die`) when the ref or
+`--since` date is unusable, or when the cwd is not a checkout.
+
+### `ng guards-for-diff`
+
+Before you push a change under `monitor/`: **which construct-keyed
+guards read the files you changed?** A PR's green covers the suites
+its *diff touches*, not the suites its *change affects*
+(`<your-org>/nexus-code#803`). Facade over
+`monitor/guards-for-diff.sh`; `CLAUDE.md` carries the canonical
+invocation block.
+
+**Usage**
+
+```
+ng guards-for-diff [--run] [--timeout <s>]
+```
+
+It is a **pass-through facade**: every flag `monitor/guards-for-diff.sh`
+accepts works here too (`--base`, `--quiet`, `--changed-files`,
+`--suites-from`), and that script's header is the authority for the
+flag set and the exit codes — the table below is a reading aid, not a
+second source.
+
+It asks each guard for its population via a `--population` protocol,
+prints what it **considered and excluded** as well as what it
+selected, and states how many suites declare nothing and are
+therefore invisible to it. `--run` additionally runs the selected
+guards and reports each verdict.
+
+**Exit codes — none of them is a clearance:**
+
+| Code | Meaning |
+|---|---|
+| `0` | at least one registered guard reads a file in your diff (under `--run`, they all passed). Says *some* declaring guard matched — never that the guard that matters ran (`#1078`) |
+| `1` | `--run`: a selected guard **FAILED** |
+| `2` | **REFUSED** — a guard's population probe errored, or the diff could not be computed. Fail-closed on purpose |
+| `3` | **no** registered guard reads your diff. A measured answer, not a green light |
+| `4` | `--run`: every selected guard came back green, but at least one green is **UNVERIFIED** — a population guard enumerates `git ls-files`, so it cannot see an **untracked** file in your diff (`#1054`). `git add` and re-run |
+| `5` | `--run`: the `--timeout` deadline expired with selected guards left **without a verdict** |
+
+Read the tool's own per-run **blind-spot count**, not the exit code:
+that line prints byte-identically at `0` and at `3`. And `git add`
+before you trust it — selection counts your whole working set
+including untracked files, while a population guard enumerates
+tracked files only, so a guard can be selected, run, and return a
+confident green about a tree that does not contain your new file.
+This is **not** a substitute for the full suite. Worked exit-code
+detail: [`nexus.self-fix`](skills.md).
+
 ---
 
 ## Asset upload
@@ -448,7 +748,13 @@ ng upload <local-path>
           [--repo-path <path>]
           [--shape pin|latest]
           [--message <msg>]
+          [--asset-repo <owner>/<name>]
 ```
+
+Exactly **one** positional (the local path). A second bare positional
+is refused — a bare number used to bind to `--repo-path` and write
+`assets/<N>` as a *file* where that issue's asset *directory* lives,
+at exit 0 with a resolving URL (`<your-org>/nexus-code#858`).
 
 **URL shapes**
 
@@ -467,20 +773,47 @@ link.
 
 | Path | When |
 |---|---|
-| `assets/<issue-N>/<basename>` | `--issue N` is passed |
+| `assets/<N>/<basename>` | `--issue N` is passed (e.g. `assets/13/fig.png`) |
 | `assets/reports/<basename>` | uploading from `reports/` |
 | `assets/general/<basename>` | everything else |
 | `<free-form>` | `--repo-path <path>` overrides the default placement |
 
+A `--repo-path` without a leading `assets/` gets one — every push
+lands under `assets/`.
+
+**Destination repo** — this verb pushes to the **asset** repo, and
+that is the one place on the `ng` surface where `--repo` does not
+mean the issue repo:
+
+- The default is `github.asset_repo`, falling back to `github.repo`.
+  Env override: `NEXUS_ASSET_REPO`. The branch is `main`, and is not
+  configurable.
+- `--asset-repo <owner>/<name>` is the flag that says what it means.
+  Use it when you genuinely mean a different asset repo.
+- `--repo` is the **deprecated spelling** of `--asset-repo`. It is
+  accepted only when it *restates* the configured asset repo; any
+  other value is **refused (exit 7)**, because every other `ng` verb
+  that takes `--repo` means the ISSUE repo by it, and a worker who
+  typed it that way pushed a report onto the implementation repo
+  (`<your-org>/nexus-code#1173`).
+- Pushing to the repository this nexus checkout itself came from is
+  also refused (exit 7) unless `NEXUS_ALLOW_ORIGIN_ASSET_REPO=1`.
+
 **Defaults**
 
-- `--repo` — from `github.asset_repo`, falling back to `github.repo`.
-  Env override: `NEXUS_ASSET_REPO`. Branch: `main` (env override:
-  `NEXUS_ASSET_BRANCH`).
+- `--shape` — `pin`.
 - `--message` — `"Add asset <basename> via upload-asset.sh"`.
 
 **Exit codes** — `0` URL on stdout; `1` bad usage; `2`
-`mint-token.sh` failed; `3` asset-repo clone/pull/push failed.
+`mint-token.sh` failed; `3` asset-repo clone/pull/push failed; `4`
+REFUSED, the nexus primary root could not be established or
+`<root>/assets` is not a git repository rooted at itself
+(`<your-org>/nexus-code#1077` — distinct from `3` on purpose: `3` means
+the asset repo was reached and the operation failed, `4` means the
+script declined to act because it could not prove *where* it was
+acting); `7` REFUSED, wrong destination repository (the two rules
+above). Both `4` and `7` are decided before anything is staged and
+before any git verb runs.
 
 **Example**
 
@@ -510,6 +843,17 @@ ng report-init <slug>
               [--comment-id <id>]
               [--reports-dir <path>]
 ```
+
+`--repo` is **rejected** with a structured error, not accepted and
+ignored: `reports/` is always written under `$NEXUS_ROOT`, including
+from a worktree or a secondary clone.
+
+> **Known divergence.** `ng report-init --help` advertises a
+> `[--skeptic-role]` the verb does not parse: it takes the
+> `unknown flag` arm and exits `1`. Deliberately absent from the
+> synopsis above, which describes what the parser accepts.
+> `test-ng-usage-flag-coverage.sh` checks parsed-flag → usage-line,
+> not the reverse, so this direction is unguarded.
 
 **Path shape**
 
@@ -549,7 +893,7 @@ Validate a report against the schema enforced by
 **Usage**
 
 ```
-ng report-check <path> [--allow-todo]
+ng report-check <path> [--allow-todo] [--skeptic-gate-settling]
 ```
 
 **Schema** — defined in the `nexus.report` skill; this verb is the
@@ -564,10 +908,26 @@ machine check:
   `## What Was Done`, `## Current State`, `## What Remains`,
   `## How to Resume`.
 - Body length ≥ [`monitor.report_min_chars`](config.md#monitorreport_min_chars)
-  (default 500), counting everything after the frontmatter.
+  (default 500; `MONITOR_REPORT_MIN_CHARS` overrides it for one run),
+  counting everything after the frontmatter.
 - No literal `TODO`, `FIXME`, `<...>`, `_(fill in)_`, or
   `_(later)_` placeholder text. `--allow-todo` bypasses these last
   four checks for intentional in-progress checkpoints.
+- A frontmatter `disposition: no-further-pass` must not **contradict a
+  skeptic gate** for the report's `window:` (`<your-org>/nexus-code#1363`):
+  it is refused when a skeptic-pending marker
+  (`monitor/.state/skeptic/pending/<window>`) is live for that window, or
+  the window record is spawn-stamped `skeptic_mode: require`.
+  `retire-preflight.sh` reads this field as its first gate and
+  `no-further-pass` is the permissive value, so the contradiction can only
+  ever make retirement easier than the marker says it should be. State
+  `second-pass`, or settle the gate first. Skeptic-*role* windows are
+  exempt (their verdict path clears their own marker); a report with no
+  `window:` is not compared (`ng wrap-up` repeats the check keyed on the
+  invoking pane, and adds `--skeptic-decision require`, which is not on
+  disk until the wrap-up records it). `--skeptic-gate-settling` is passed
+  by a `--skeptic-waive` / `--skeptic-satisfied` wrap-up, whose run is the
+  settlement rather than a contradiction; it is not an authoring override.
 
 **Exit codes**
 
@@ -584,6 +944,52 @@ monitor/ng report-check reports/nexus_2026-05-11_142233_docs-w4.md
 # → report-check: nexus_2026-05-11_142233_docs-w4.md OK (3247 body chars)
 ```
 
+### `ng report-grep`
+
+**Search the reports corpus. Use this, not `grep -r reports/`.**
+`reports/.gitignore` is a bare `*`, so an ignore-file-honouring
+`grep` — which the operator's interactive `grep` is — matches
+**nothing** across thousands of files and returns a confident,
+wrong "no" (`<your-org>/nexus-code#618`). This verb searches with
+`command grep -r` — the `command` builtin bypasses that shell
+function — recurses (so it also sees `reports/YYYY-MM/` archives),
+and **refuses a zero it cannot vouch for**. The residual vector the
+guard exists for is an ignore-file-aware `grep` *executable* ahead of
+`/bin/grep` on `PATH`, which `command grep` would still honour.
+
+**Usage**
+
+```
+ng report-grep [grep-opts] <pattern> [path...]
+```
+
+Default search root is the resolved reports dir; explicit paths
+override it. Options before the pattern are forwarded to `grep`
+(`-l`, `-n`, `-i`, `-c`, `-E`, `--include=…`); `--` terminates
+options so a pattern may start with `-`. **Grep options taking a
+separate argument (`-m 5`) are not supported** — use `--opt=value`
+form, or `command grep` directly.
+
+**Exit codes** — this is the whole point of the verb:
+
+| Code | Meaning |
+|---|---|
+| `0` | matches printed |
+| `1` | genuine no-match — **and the corpus was proven visible** |
+| `3` | the corpus is **INVISIBLE** to the search; the visibility guard fired and printed a diagnostic. Not a no-match |
+| ≥2 (other) | the underlying `grep`'s own error, passed through |
+
+The `1`/`3` split is the contract: nothing else in this workspace
+distinguishes "searched and found none" from "could not search". The
+guard keys on a sentinel — a root holding at least one standard
+`ng report-init` report is reliable; **a root of only non-standard
+files is a `3` ("don't know"), never a false zero.**
+
+The guard is **one-directional**: it converts an untrustworthy zero
+inside this verb into a loud refusal. It does not neutralise a bare
+`grep -r reports/` typed elsewhere — that still returns a silent
+zero.
+
 ### `ng wrap-up`
 
 End-of-task hand-off folded into one verb.
@@ -597,13 +1003,65 @@ ng wrap-up <issue> <report-path>
           [--trigger-repo <owner>/<name>]
           [--comment-body-file <path> | --no-comment]
           [--allow-stub]
+          [--guards | --no-guards-preflight] [--strict-guards]
           [--retain <reason> | --no-retain]
-          [--skeptic-decision require|deny] [--skeptic-rationale <text>]
-          [--skeptic-waive <reason>]
-          [--skeptic-role] [--skeptic-verdict credible|check|suspect|refuted]
-          [--skeptic-target <window>] [--skeptic-depth <n>]
-          [--skeptic-findings <n>] [--skeptic-orig <window>]
+          <skeptic flags — see below>
+
+ng wrap-up --reply-to <request-id> <report-path>
+          [--issue <n>] [--answer-file <path>]
+          [--repo <owner>/<name>] [--allow-stub]
+          [--retain <reason> | --no-retain]
+
+ng wrap-up --last [<window>]
+ng wrap-up --explain [<window>]
 ```
+
+**Skeptic flags** — producer side (the worker being reviewed):
+
+```
+[--skeptic-decision require|deny --skeptic-rationale <why>]
+[--skeptic-waive <reason>]
+[--skeptic-satisfied --skeptic-satisfied-by <report-path|sha256>]
+[--skeptic-contradicted <what>]
+[--skeptic-delta <what changed since a DECLINED prior request>]
+[--skeptic-rearm <what changed>]
+```
+
+…and the skeptic's own wrap-up:
+
+```
+[--skeptic-role --skeptic-verdict credible|check|suspect|refuted
+ [--skeptic-target <window>] [--skeptic-depth <n>]
+ [--skeptic-findings <n>] [--skeptic-orig <window>]]
+[--skeptic-subject <report-path|sha256>]
+[--not-a-skeptic-verdict <why>]
+```
+
+`--skeptic-subject` is what you actually READ, and it is the one
+field on this path that is your assertion rather than an inference:
+`--skeptic-target` is a spawn-time stamp and goes stale the moment a
+retained reviewer is re-tasked (`<your-org>/nexus-code#963`).
+
+**Channel delivery — `--reply-to`** (`ng request`'s inbox). Delivers
+the answer over the request/reply channel instead of a GitHub issue:
+no issue comment, no rocket, unless `--issue <n>` is also passed,
+which does **both**. `--answer-file <path>` supplies the reply body.
+
+**Re-reading a run — `--last` / `--explain` (read-only)**
+
+Every `ng wrap-up` invocation persists its stdout, stderr (prefixed
+`[stderr] `) and exit code under
+`monitor/.state/wrap-up-output/<window>/`, and `--last` prints the most
+recent record verbatim; `--explain` appends the window's pending-marker
+state and its `ng skeptic-evidence` line. Both are **read-only**: no
+upload, no comment, no skeptic step, no ledger row, no action-log event.
+Use them to re-read output a pipe truncated. Do **not** re-run the verb
+for that — every run re-arms the skeptic step (Step 0b), and a re-run whose
+only purpose was to read the diagnostic appended discharge rows that bind
+to nothing (`<your-org>/nexus-code#1370`). `<window>` defaults to the
+invoking tmux window; off-tmux runs are recorded under `_no-window`.
+A run that exits from inside a parse refusal leaves a record without an
+`rc:` footer, and `--last` says so.
 
 **Steps**
 
@@ -634,6 +1092,66 @@ ng wrap-up <issue> <report-path>
    bounded recursion (`--skeptic-depth` / `--skeptic-findings`, chain
    root via `--skeptic-orig`). `--skeptic-waive` is the operator override
    that releases a required skeptic.
+
+   `--skeptic-findings` is **optional, and its absence is recorded AS
+   absence** (`<your-org>/nexus-code#881`). Omitted, it prints
+   `new findings : not stated`, logs `findings-stated=false` with **no**
+   `findings` key, and never reaches the threshold comparison — where it
+   used to be defaulted to `0`, making "measured zero new issues" and
+   "never said" the same record. There is no sentinel number. With
+   **neither** a count nor a readable frontmatter `disposition:` in the
+   report, wrap-up **refuses** (`<your-org>/nexus-code#1095`, superseding
+   `#881`'s escalation) rather than terminating on a value nobody
+   supplied. Stating either one — `--skeptic-findings 0` or
+   `disposition: no-further-pass` — lifts the refusal. Whether the chain
+   then *terminates* depends on the verdict, not on the statement: at
+   `credible` / `check` either statement ends it; at `suspect` /
+   `refuted` **neither does** — the verdict sets the severity signal on
+   its own, which `#678` makes non-overridable by a disposition, so a
+   second pass is recommended regardless, and the refusal text says so
+   rather than promising a termination it cannot deliver
+   (`<your-org>/nexus-code#914`).
+
+   `--not-a-skeptic-verdict "<why>"` is for a window whose **provenance**
+   carries `skeptic_role: true` but whose current wrap-up is ordinary
+   worker work (`<your-org>/nexus-code#879`). Windows are stamped for their
+   lifetime, not per task, so a retained skeptic that later authors a
+   patch would otherwise have to supply a `--skeptic-verdict` on its own
+   diff — a self-review indistinguishable downstream from an independent
+   clearance. The flag takes the ordinary producer path and records
+   `skeptic-role-not-asserted` with the reason (mandatory, >= 20 chars).
+   It **clears no skeptic marker — including the opting-out window's
+   own**: an opt-out is a statement about *this hand-off*, not a release
+   of a pending obligation (`#879` F1; the three producer branches that
+   would otherwise clear it are guarded, and say so loudly). It is
+   mutually exclusive with `--skeptic-role` and `--skeptic-verdict`, and
+   refused outright on a window that was never stamped.
+0c. **Async-wait pre-flight** (`<your-org>/nexus-code#1181`). Reads
+   `monitor/.state/orphan-async-state.tsv` for the invoking window. A wait
+   with a **parsed handle** (`asyncrun:ar-…`, `slurm:<jobid>`) **refuses**
+   the wrap-up, naming it — it is answerable (`async-run.sh --status-line`,
+   `sacct -j`) and the agent still has the context to settle it with
+   `monitor/declare-no-wait.sh <kind> <id>` once it is confirmed dead. A
+   `syn-` wait (the launcher retained no handle; possibly a phantom) only
+   **warns**. A token the pre-flight cannot parse refuses. Nothing is ever
+   auto-cleared. Runs before Step 0b, so a refusal arms nothing.
+0d. **Disposition-vs-gate check** (`<your-org>/nexus-code#1363`), the
+   `report-check` rule above repeated for the invoking window plus this
+   invocation's `--skeptic-decision require`. Skipped when the wrap-up
+   itself settles the gate (`--skeptic-waive`, `--skeptic-satisfied`).
+0f. **Guards-for-diff pre-flight** (`<your-org>/nexus-code#1459`). Runs
+   [`ng guards-for-diff`](#quick-reference)'s selector and names every
+   selected guard the report never mentions. **Advisory by default**;
+   `--strict-guards` turns an unreported selection into a refusal
+   (return 1). It is expensive (~80 s measured), so the automatic arm
+   fires only for a wrap-up that plainly describes nexus-code work —
+   cwd inside a repository carrying `monitor/guards-for-diff.sh`
+   **and** the report under the primary's reports corpus. `--guards`
+   forces it; `--no-guards-preflight` or `NG_WRAPUP_GUARDS_PREFLIGHT=0`
+   skips it. Every non-selector outcome (selector exit `2`/`3`, the
+   `NG_WRAPUP_GUARDS_TIMEOUT` expiry, a missing binary) prints
+   **UNMEASURED / not a clearance** and returns 0 — it never converts
+   "could not look" into "looked and it was fine".
 1. **Upload the report** via `monitor/upload-asset.sh` →
    `assets/<issue>/<basename>` on the asset repo.
 2. **Post the link comment** on `<issue>` in `--repo`:
@@ -659,11 +1177,31 @@ ng wrap-up <issue> <report-path>
    (no source window to retain), and a retain-logging failure does
    **not** flip the exit code — the hand-off already succeeded.
 
-**Exit code** — `0` only if every attempted step succeeded. On
-partial failure the verb still attempts every reachable step (rocket
-and log-action do not depend on the upload), then emits a structured
+**Exit codes** — three, and the third is the one callers get wrong:
+
+| Code | Meaning |
+|---|---|
+| `0` | published — every attempted step succeeded |
+| `1` | a step **FAILED**. Retry it |
+| `3` | nothing failed and **NOTHING WAS PUBLISHED** |
+
+On a `1`, the verb still attempts every reachable step (rocket and
+log-action do not depend on the upload), then emits a structured
 stderr report naming which steps ok/failed so the caller can retry
 just the failed ones.
+
+A `3` is **not** a retryable failure: no step failed, so re-running
+the command unchanged reproduces it exactly. Either the composed
+teaser carried no claim (`<your-org>/nexus-code#1114`), or your report
+changed outside its `## Summary` section while the composed comment
+body did not (`#862`) — the comment is built from the first ~200
+characters of `## Summary` alone, so a correction anywhere else
+leaves it byte-identical and there is nothing to publish. stderr
+names which and lists the ways out. **A re-run is not free**: the
+upload runs again and so does the skeptic step (0b), which *arms* —
+"no step failed" is not "no step had an effect"
+(`<your-org>/nexus-code#1230`). To re-read the diagnostic, use
+`ng wrap-up --last`, which replays it read-only.
 
 **Cross-repo trigger** — pass `--trigger-repo` when the trigger
 comment lives in a different repo from the issue thread (e.g. a
@@ -727,14 +1265,27 @@ ng wrap-up-check <window>
    `spawn` event).
 2. The cited report exists on disk (under `$NEXUS_ROOT/reports/` or
    `reports/`) and passes [`ng report-check`](#ng-report-check).
-3. The trigger comment was rocketed, or the rocket step was skipped at
-   wrap-up time (both pass; only a `failed` rocket flips to missing).
+3. The trigger comment was rocketed, or the rocket step was legitimately
+   skipped at wrap-up time — both normalise to `rocket=ok`. A `failed`
+   rocket becomes `missing`; a rocket withheld because nothing was
+   published becomes `withheld`; any other recorded value becomes
+   `unknown`.
+4. The link comment was actually **published** — a wrap-up that exited
+   `3` (`degenerate-teaser` / `nothing-published`) reports
+   `comment=unpublished` and is **not** ok.
 
-**Output**
+**Output** — five fields, on one line:
 
 ```
-status=<ok|incomplete> wrap_up=<present|missing> report_check=<ok|fail|missing> rocket=<ok|skipped|missing>
+status=<ok|incomplete> wrap_up=<present|missing> report_check=<ok|fail|missing> rocket=<ok|missing|withheld|unknown> comment=<ok|unpublished|failed>
 ```
+
+`status=ok` requires all four to read positively — `wrap_up=present`
+**and** `report_check=ok` **and** `rocket=ok` **and** `comment=ok`.
+Each is compared for **equality** against its ok-value, not against a
+denylist of bad ones, so `withheld` and `unknown` — every state
+nobody thought of — read as `incomplete` rather than slipping through
+a permissive default (`<your-org>/nexus-code#1116` F1).
 
 **Exit codes**
 
@@ -753,7 +1304,9 @@ codes are the channel's own.
 **Usage**
 
 ```
-ng skeptic <ask|await|answer|await-answer|reconcile|close|poll|status|list|nudge|init|dir> ...
+ng skeptic <init|dir|reqfile|ask|poll|status|list|await|answer
+            |await-answer|reconcile|close|resolve|reset|defer
+            |nudge|notify-delta> ...
 ```
 
 **Subcommands**
@@ -761,17 +1314,49 @@ ng skeptic <ask|await|answer|await-answer|reconcile|close|poll|status|list|nudge
 | Sub | Who runs it | What it does |
 |---|---|---|
 | `ask <task> <slug> …` | skeptic | write a request (`<slug>.open.md`) |
-| `await <task>` | worker | block for `*.open.md`, ack each (→`.ack.md`), exit `0`; `DONE` sentinel → exit `10`; timeout → exit `4` |
+| `await <task>` | worker | block for `*.open.md`, ack each (→`.ack.md`), exit `0`; `DONE` sentinel → exit `10`; counterpart finished without closing → `11`; displaced by a newer await → `12`; `defer`red → `13`; timeout → `4` |
 | `answer <task> <req> …` | worker | reply to a request (→`.answered.md`) |
 | `await-answer <task> <req> …` | skeptic | block for the worker's answer |
 | `reconcile <task> …` | skeptic | ensure every open request was acked |
 | `close <task>` | skeptic | drop the `DONE` sentinel that ends the worker's await loop |
+| `resolve <task> --reason …` | **orchestrator only** | clear a skeptic-pending marker a returned verdict failed to clear, with a mandatory rationale + audit event — the sanctioned replacement for a hand-`rm` (`#577`). `--disposition` additionally releases `retire-preflight` check 1c and is the one form that succeeds with **no** marker present (`#813`) |
+| `defer <task> --reason …` | skeptic/orchestrator | release the worker's *current* await (exit `13`) while the requirement **stands** — the pending marker is untouched and `retire-preflight` keeps gating (`#845` H) |
+| `reset <task>` | skeptic | open a new round: archive the prior `DONE` + `.answered.md` under `skeptic/.archive/<task>.reset-<ts>/` |
 | `poll \| status \| list <task>` | either | inspect channel state (open/ack/answered) |
 | `nudge <window> …` | orchestrator/skeptic | wake an idle worker |
+| `notify-delta <skeptic-window> --target <w> …` | target side | the reverse of `nudge`: wake a **pinned skeptic** that a new round exists. Its absence is why a parked target and its idle skeptic could each wait on the other for hours (`#845`) |
 | `init \| dir <task>` | either | create / print the channel directory |
+| `reqfile <task> <req>` | either | resolve a req id/stem/filename → path |
 
 The rename is the signal at every step. Run `ng skeptic --help` for the
 full surface and exit-code contract.
+
+#### Skeptic bookkeeping verbs
+
+Five **top-level** verbs — not `ng skeptic` sub-verbs — read and write
+the pending-marker bookkeeping that gates retirement. They are
+read-only except `skeptic-arm`. Each exit code is stated because the
+whole family exists to keep "nothing outstanding" distinguishable
+from "could not look":
+
+| Verb | What it answers | Exit codes |
+|---|---|---|
+| `skeptic-arm <window> --report <path> [--issue N] [--state-dir D]` | **records what an arm is about**, for the writers of armed state that live outside `ng` (`spawn-worker.sh --skeptic-role`) | `0` an `armed` row was appended · `2` usage · `3` this artefact is **already outstanding**, so nothing was appended (a second arm for one artefact *is* `ambiguous-N-arms-outstanding`, `#1156` pole B) · `4` could not name a subject — a marker may still exist |
+| `skeptic-obligations <window> [--state-dir D]` | **what this window owes, by task** — one line per artefact still outstanding, naming its issue and report | `0` nothing outstanding · `1` one or more · `2` usage · `3` no marker store. The pending *marker* cannot answer this: its content is `1`, so presence cannot say **which** obligation (`#961`) |
+| `skeptic-evidence <window> [--state-dir D]` | **does a verdict exist, and could the bookkeeping match it** — separates "no verdict exists" from "a verdict was delivered and could not be matched to an arm", opposite instructions printed identically until `#1156` | `0` looked · `3` could not look |
+| `skeptic-orphans [--state-dir D]` | **every** pending marker, classified by whether its window is present in tmux — the only discriminator separating a live pairing from an orphan (age does not, measured). Report only; reaps nothing | `0` looked · `3` no marker store |
+| `skeptic-disposition <window> [--reports-dir D]` | the window's `disposition:` as read from its reports, emitted `key=value` (`state= source= report= report_mtime= blocking= reports= detail=`) | `0` read · `2` could not determine (`state=unknown`) |
+
+Per orphan the remedy is `ng skeptic-evidence <window>`, then
+`ng skeptic resolve <task> --reason "<why>"`.
+
+> **Known divergence at `a3177ef6`.** `ng skeptic-arm --help` and
+> `ng skeptic-obligations --help` die `unknown flag` — neither
+> function calls `_help_check`, though both have a `_usage_for` arm.
+> `ng skeptic-disposition --help` has the inverse defect: it calls
+> `_help_check`, has **no** `_usage_for` arm, and so falls back to
+> printing `monitor/ng`'s whole file header. Use the table above
+> until that is repaired.
 
 ### `ng respawn`
 
@@ -834,8 +1419,11 @@ decision=<continue|spawn|ambiguous> reason=<short> pane_state=<state> retain_age
 
 | Code | Meaning |
 |---|---|
-| `0` | a decision was rendered (any class) |
-| `1` | window unknown to tmux / classifier couldn't run |
+| `0` | a decision was rendered (any class) — including `decision=spawn reason=window-absent`, which is a genuine verdict about a missing window, not a failure |
+| `1` | the classifier could not run: `reason=no-tmux` or `reason=enumeration-failed` |
+
+The `no-tmux` line is the one short row — it carries `decision=` and
+`reason=` only. Parse defensively, or key on the exit code first.
 
 ### `ng engaged-done`
 
@@ -869,13 +1457,17 @@ PATCH), so repeated runs replace it in place.
 **Usage**
 
 ```
-ng interactive-sessions [--limit N] [--days D] [--upsert-overview] [--dry-run]
+ng interactive-sessions [--limit N] [--days D] [--upsert-overview]
+                        [--dry-run] [--repo <owner>/<name>]
 ```
 
 - `--limit N` — include at most N sessions (default 20).
 - `--days D` — only sessions active within the last D days (default 30).
+  Both must be positive integers; anything else is refused.
 - `--upsert-overview` — PATCH the rendered block into the overview issue.
 - `--dry-run` — print the block; skip the GitHub PATCH.
+- `--repo <owner>/<name>` — which repo holds the overview issue
+  (write-verb resolution; only consulted for the PATCH).
 
 **Exit codes** — `0` on success (rendered, and patched when
 `--upsert-overview` without `--dry-run`); `1` if a write failed.
@@ -983,16 +1575,39 @@ ng dashboard put --body-file <path>
 
 **Behaviour**
 
-1. Read the new middle from `--body-file` (refuse if empty).
-2. Fetch the overview body; refuse if the `<!-- NEXUS_DASHBOARD_START -->`
-   / `<!-- NEXUS_DASHBOARD_END -->` markers are missing.
-3. Replace the middle between the markers (header + footer
-   preserved), PATCH the issue body.
-4. Cache the new middle to `monitor/.state/dashboard.md` and write
-   `monitor/.state/dashboard-updated.ts` (the freshness timestamp
+1. Read the new middle from `--body-file` (or stdin; `-` asks for stdin
+   explicitly). Refuse if empty — the diagnostic names the INPUT, not the
+   dashboard.
+2. **Refuse if the supplied body contains a dashboard marker.** `put` takes
+   the INNER region; `gh issue edit --body-file` takes the whole body.
+   Accepting the wrong one nests the markers and every later put duplicates
+   the content (`#959`).
+3. Fetch the overview body; refuse unless it carries **exactly one** START
+   and **exactly one** END marker. Presence is not uniqueness (`#1058`,
+   `#1118`): a body with two ENDs used to pass this check and then no-op.
+4. Replace the middle between the markers (header + footer preserved).
+5. **Refuse before sending** if the merged body exceeds GitHub's
+   262,144-byte issue-body cap; warn from 90%.
+6. PATCH, then **verify the write by reading the body back with an
+   INDEPENDENT GET.** A 200 is not evidence of a write — and neither is the
+   PATCH response, which echoes the body you SENT even when the store keeps
+   the old one (measured on scratch issue `#1128`). The response is compared
+   too, but that only catches corruption on *our* side of the wire.
+7. Only once verified: cache the new middle to `monitor/.state/dashboard.md`
+   and write `monitor/.state/dashboard-updated.ts` (the freshness timestamp
    the watcher reads).
 
-Prints the overview issue's HTML URL.
+Prints the overview issue's HTML URL, and only when the write is verified.
+
+**Exit codes**
+
+| rc | meaning |
+|----|---------|
+| `0` | verified applied (or `#1010` UNCHANGED — nothing to do) |
+| `1` | refused before sending, PATCH failed, or **verified NOT applied** |
+| `4` | the PATCH may have applied but could **not be verified** — a refusal to claim, not a claim of failure |
+
+On any non-zero rc no cache is written and no freshness stamp is advanced.
 
 `put` runs the section-schema check in **warn-only** mode: if the body
 is missing any required section (see
@@ -1026,16 +1641,42 @@ in `monitor/ng`:
 
 ### `ng dashboard validate`
 
-Strict schema gate: exit `0` if every required section heading is
-present, exit `1` (listing the missing ones on stderr) otherwise. The
-hard-failure counterpart to `put`'s warn-only check — use it for CI,
-pre-commit, or a deliberate conformance check.
+Strict schema gate: exit `0` if every required section heading is present
+**exactly once**, exit `1` otherwise (missing and duplicated sections listed
+on stderr). The hard-failure counterpart to `put`'s warn-only check — use it
+for CI, pre-commit, or a deliberate conformance check.
 
 **Usage**
 
 ```
-ng dashboard validate --body-file <path>     # or pipe via stdin
+ng dashboard validate                        # the LIVE dashboard (default)
+ng dashboard validate --body-file <path>     # a candidate, before pushing
+ng dashboard validate --body-file -          # explicitly stdin
 ```
+
+With **no `--body-file` it validates the LIVE dashboard**, which is what the
+verb name implies. It used to read stdin — empty in every non-interactive
+shell — and report that emptiness as `empty dashboard body`, a verdict about
+the dashboard derived from the caller's empty pipe (`#958`). A healthy 15 kB
+dashboard failed that way, and the message's obvious consequent action
+(regenerate and push) would have overwritten it.
+
+**What it checks**
+
+- every required section present — searched in the whole issue body, not just
+  the region, so a `## Identity` pointer whose generated block sits *above*
+  the START marker is not reported missing;
+- each required section appears **once** — a duplicate is always a defect on a
+  routing surface;
+- exactly one START and one END marker, when given a whole body;
+- near-miss headings (`## 🛑 Infra — …`) are named rather than silently
+  counted as missing;
+- duplicate *names* that differ after their separator are reported as a NOTE
+  and the verdict stops calling itself an unqualified OK (rc stays `0`);
+- body size and section counts accompany every verdict.
+
+Given only a region it says so, rather than asserting a section is absent
+when it cannot see the rest of the body.
 
 ---
 
@@ -1125,10 +1766,24 @@ heartbeat age, no window check):
 
 | Code | Meaning |
 |---|---|
-| `0` | Fresh: heartbeat age ≤ `2× + slack` of `monitor.interval_seconds`, pid identity-validated alive |
-| `1` | Stale: heartbeat age within `(2× + slack, 5×]` of `monitor.interval_seconds` |
+| `0` | Fresh: heartbeat age ≤ `2× + 15 s` of `monitor.interval_seconds`, pid identity-validated alive |
+| `1` | Stale: heartbeat age within `(2× + 15 s, 5×]` of `monitor.interval_seconds` |
 | `2` | Very stale (> 5×), or heartbeat pid dead / recycled to a non-watcher process |
 | `3` | No heartbeat file |
+| `4` | **Wedged**: pid alive and the heartbeat is fresh, but the progress/cycle signal has stalled — the liveness ticker is beating for a loop that no longer moves (`<your-org>/nexus-code#491`). A distinct bucket precisely so a caller cannot conflate it with DEAD or with merely-slow |
+
+The DEAD threshold (`5×`) can be **raised** by a third argument to
+`_watcher_alive` — the supervise-tick passes a cutoff above the
+watcher's own async hang-watchdog floor so it does not race a
+self-recovery in progress. It is never lowered. `ng watcher-status`
+itself passes no override.
+
+A pid that fails the identity check is not immediately `2`: the
+check reads `/proc/<pid>/cmdline` and is therefore pid-namespace
+local, so a live watcher across a sandbox boundary would false-read
+as dead. Before declaring `2`, `_watcher_alive` consults the
+state-dir `flock`; a held instance lock falls through to the
+heartbeat-age buckets instead.
 
 ### `ng decision-ack`
 
@@ -1343,14 +1998,41 @@ No CLI wrapper saves enough to justify the surface area.
 
 ## Maintenance burden
 
-The verb list, exit codes, and flag semantics on this page mirror
-`monitor/ng`'s own `--help` text and the per-verb code comments.
-Whenever you add, rename, or remove a verb, or change a flag:
+**The code is canonical; this page is a narrative over it.** **Four**
+surfaces describe `ng`. The first is ground truth — it *is* what
+dispatches. Of the other three, exactly **one** is machine-checked:
 
-1. Update `monitor/ng`'s top-of-file usage block (canonical) and the
-   per-verb function comment.
+| Surface | Meant to be canonical for | Guarded by |
+|---|---|---|
+| the `case "$sub"` in `main()` | the verb set — the **only** surface that decides what dispatches | the shell |
+| `_verb_index` in `monitor/ng` | the browsable index (`ng verbs`) | **nothing** |
+| `_usage_for` in `monitor/ng` | each verb's flag set | `test-ng-usage-flag-coverage.sh` (parsed flag ⇒ must appear in the usage line) |
+| this page | *why* a verb behaves as it does — exit-code semantics, refusal rationale, worked examples | **nothing** |
+
+Whenever you add, rename, or remove a verb, or change a flag or an
+exit code:
+
+1. Update `monitor/ng`'s top-of-file usage block, its `_usage_for`
+   arm, and `_verb_index`.
 2. Update the section for the verb on this page and the
-   [Quick reference](#quick-reference) table.
+   [Quick reference](#quick-reference) table — **including the
+   subset list**, if a verb gained or lost a section here.
 
-Drift between `ng --help` and this page is the failure mode to
-watch. See [Development](../contributing/development.md).
+**Three known gaps, so you know what the guards do *not* buy you.**
+`test-ng-usage-flag-coverage.sh` checks parsed-flag → usage-line and
+**not the reverse** — a usage line may advertise a flag no parser
+accepts (see [`ng report-init`](#ng-report-init)). Nothing compares
+this page against either source. And **nothing asserts `_verb_index`
+against the dispatch table**, so a verb can ship without ever
+reaching the index that exists to make verbs findable. Measured at
+`a3177ef6` (`monitor/ng` is unmodified at that ref), the `case` in
+`main()` dispatches **59** verbs and `_verb_index` names **48** of
+them. The **11** it omits: `ci-attempts`, `close-set`,
+`reports-for-window`, `send`, `session-id`, `skeptic-arm`,
+`skeptic-disposition`, `skeptic-evidence`, `skeptic-obligations`,
+`skeptic-orphans`, `stranded-branches`. All 11 dispatch; `--help`
+support among them is **uneven** — see the measured examples in the
+[Quick reference](#quick-reference) note above, which is a separate
+gap from this one. Add a verb to `_verb_index` in the same commit
+that adds its `case` arm. See
+[Development](../contributing/development.md).

@@ -296,7 +296,8 @@ unset NEXUS_TEST_NOW
 _clone_drift_tick
 rendered=$(_version_emit_section "$STATE" "$C")
 assert_contains "behind renders the headline" "$rendered" "PRIMARY CLONE is BEHIND origin/dev"
-assert_contains "behind names the deploy command" "$rendered" "pull --ff-only origin dev"
+assert_contains "behind names the deploy command for the measured ref (#1529)" "$rendered" "pull --ff-only origin dev"
+assert_contains "behind names the branch as the operator's configuration" "$rendered" "monitor.integration_branch"
 assert_contains "behind states the human-timed constraint" "$rendered" "human-timed action"
 
 echo "== detection only: the clone is never mutated =="

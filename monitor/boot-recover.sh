@@ -36,6 +36,17 @@
 # trigger"): the real ~/.zprofile (edited outside the sandbox) or a
 # sandbox.conf on-start entry, each invoking THIS script.
 #
+# IDENTITY MARKER — do not remove, and do not copy it into anything that is not
+# a nexus cold-boot recovery trigger (your-org/nexus-code#1247 (b)).
+# `monitor/boot-recover-hook-check.sh` used to establish identity by BASENAME,
+# so any two-line executable so named, anywhere on the host, reported ARMED rc 0
+# — a check keyed on a NAME standing in for a check of the PROPERTY, which is
+# the same shape as the false clearance that checker was rebuilt to remove. It
+# now looks for this OWNED marker in the wired command, because the corpus here
+# is small and repo-controlled and no better string exists (`#1073`).
+#
+#   NEXUS-COLD-BOOT-RECOVERY-MARKER
+#
 # Behaviour
 # ---------
 #   1. Debounce. If this guard ran within BOOT_RECOVER_DEBOUNCE_SECONDS

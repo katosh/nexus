@@ -28,6 +28,57 @@
 # `TIMEOUT` is red, never a pass (#499). An allowlist, not a denylist: a status
 # this script has never heard of fails toward RED.
 #
+#   ENV-UNPROVEN       an `ENVSKIP` row: a suite that RAN, asserted, and then
+#                      declined on MEASURED environment grounds. Never green,
+#                      never a regression — reported, and exits 4.
+#
+# WHY `ENVSKIP` IS A SEPARATE TOKEN AND NOT A TOLERATED `SKIP`
+# (your-org/nexus-code#1283). `SKIP` above carries a specific accusation — the
+# `SLOW_TESTS=1` gate DID NOT TAKE, so the suite silently left the band — and
+# that accusation must stay loud, which is what the `SKIP is not a pass` arm of
+# the selftest pins. But it is indistinguishable, on the token alone, from an
+# HONEST decline by a suite that did run and found the MACHINE unable to build
+# its fixture. Opposite situations, opposite actions, one token; so the ENV/
+# PRODUCT distinction was inert in exactly the band that needed it, because the
+# tolerated set is empty by design and every `exit 77` was therefore NEW-RED.
+#
+# The remedy is a token, not a threshold. `ENVSKIP` says "I ran and could not
+# conclude", and it is treated as EVIDENCE OF NEITHER SIDE:
+#   * it is NOT green — it never counts toward the pass tally;
+#   * it never CLEARS a toleration — a tolerated test that ENVSKIPs has not
+#     been shown to pass, and deleting its line on that basis would be acting
+#     on no evidence at all;
+#   * it never MASKS a real deviation — rc 1 outranks rc 4, so a NEW-RED in the
+#     same ledger still decides the verdict;
+#   * a TOLERATED test that ENVSKIPs is reported too, because a toleration that
+#     is never re-confirmed rots exactly as UNACCOUNTED describes.
+# Fail-closed is unchanged: the classifier's arms are literal EQUALITY over
+# disjoint sets and the terminal arm is RED, so `envskip`, `ENV-SKIP` or any
+# other spelling is a red, not a quiet exemption (`#1121` arm-order rule: no
+# permissive arm precedes a deny arm that could fire on the same input).
+#
+# WHERE THE TOKEN COMES FROM. `run-tests.sh` writes it: a suite that exits 69
+# (EX_UNAVAILABLE) is tallied `ENVSKIP`, while `exit 77` stays `SKIP`. A
+# DECLARED CODE, not an inference — `#1283` suggests separating the two by
+# assertion count, and that discriminator is INERT, because the ledger's
+# assertion column is forced to `?` for every non-PASS row in two independent
+# places. It is also the wrong shape: an inference fails OPEN, a declared code
+# fails CLOSED.
+#
+# EITHER MERGE ORDER IS SAFE, and in both directions the failure is a RED
+# rather than a silent pass — which is the property to check, not the mere
+# absence of breakage:
+#   * this arm WITHOUT the runner half — no ledger ever carries `ENVSKIP`, so
+#     the arm is unreachable and nothing changes;
+#   * the runner half WITHOUT this arm — `ENVSKIP` is an unknown status and the
+#     terminal `*)` reds it, which is the fail-closed default doing its job;
+#   * a SUITE adopting `exit 69` before the runner half — the runner's `rc != 0`
+#     range arm makes it a FAIL, i.e. loud and attributable.
+# This paragraph previously read "nothing writes `ENVSKIP` today"; that was true
+# when the consumer arm was written alone and is recorded here as corrected
+# rather than deleted, because the inert-arm reasoning above is what makes the
+# split safe to land in two pieces.
+#
 # COVERAGE BOUNDARY (on the axis the mechanism varies on — WHICH deviations from
 # the tolerated set are caught). This compares a ledger the runner already wrote
 # against the pinned set, so it catches every per-test status deviation the
@@ -44,6 +95,9 @@
 #       1 at least one NEW-RED / STALE-TOLERATION / UNACCOUNTED
 #       2 refusal — unreadable/empty ledger, malformed tolerated set, bad usage
 #       3 --selftest failed
+#       4 ENV-UNPROVEN and nothing worse — NOT a clearance. Some row could not
+#         be concluded on this machine; read the named rows before treating the
+#         band as evidence about the code.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,7 +106,22 @@ DEFAULT_KNOWN_RED="$HERE/slow-band-known-red.tsv"
 # Every ledger status, classified. Fail-closed: `case` ends in a `*)` that
 # treats an unknown token as RED, so a new status the runner learns to emit can
 # never be silently absorbed as a pass.
-_is_green() { [ "$1" = "PASS" ]; }
+#
+# ARM ORDER IS NOT LOAD-BEARING HERE, AND THAT IS A PROPERTY WORTH STATING
+# (your-org/nexus-code#1121). Every non-terminal arm is literal EQUALITY over a
+# one-element set, so no input can match two of them and no reordering can
+# change an answer. It would stop being true the day an arm gained a glob — at
+# which point a permissive arm above the terminal RED would silently exempt
+# whatever it happened to match. Keep the arms literal.
+_status_class() {  # -> green | unproven | red
+    case "$1" in
+        PASS)    printf 'green' ;;
+        ENVSKIP) printf 'unproven' ;;
+        *)       printf 'red' ;;
+    esac
+}
+# Retained as the narrow predicate the reporting reads. Defined in terms of the
+# classifier so there is ONE place that decides what green means.
 
 refuse() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
 
@@ -82,9 +151,9 @@ check() {  # check <ledger> <known-red>
     done < "$known"
 
     # --- walk the ledger ----------------------------------------------------
-    local -a new_red=() stale=() seen=()
-    local status
-    local n_pass=0 n_red=0 n_skip=0 total=0
+    local -a new_red=() stale=() seen=() unproven=()
+    local status klass
+    local n_pass=0 n_red=0 n_skip=0 n_env=0 total=0
     while IFS=$'\t' read -r path status _rest || [ -n "${path:-}" ]; do
         [ -n "${path:-}" ] || continue
         total=$((total + 1))
@@ -94,9 +163,21 @@ check() {  # check <ledger> <known-red>
             [ "${tol_path[$i]}" = "$path" ] && tolerated="${tol_issue[$i]}"
             i=$((i + 1))
         done
-        if _is_green "$status"; then
+        klass=$(_status_class "$status")
+        if [ "$klass" = green ]; then
             n_pass=$((n_pass + 1))
             [ -n "$tolerated" ] && stale+=("$path	$tolerated")
+            continue
+        fi
+        # ENV-UNPROVEN. Deliberately BEFORE the red tally and deliberately not
+        # falling through to it: an `ENVSKIP` is not a red the tolerated set can
+        # excuse, so it is neither a NEW-RED (which would re-red the band for a
+        # machine's shortcoming) nor a silently tolerated one (which would let a
+        # test that never concludes hold its toleration open forever). It is
+        # reported EITHER WAY — tolerated or not — with which of the two it was.
+        if [ "$klass" = unproven ]; then
+            n_env=$((n_env + 1))
+            unproven+=("$path	$status	${tolerated:-not tolerated}")
             continue
         fi
         [ "$status" = "SKIP" ] && n_skip=$((n_skip + 1))
@@ -122,7 +203,7 @@ check() {  # check <ledger> <known-red>
     done
 
     echo "=== SLOW-band drift check ==="
-    echo "ledger        : $ledger ($total test(s): $n_pass pass, $n_red not-pass of which $n_skip skipped)"
+    echo "ledger        : $ledger ($total test(s): $n_pass pass, $n_red not-pass of which $n_skip skipped, $n_env env-unproven)"
     echo "tolerated set : $known (${#tol_path[@]} entry/entries)"
 
     local rc=0
@@ -145,6 +226,18 @@ check() {  # check <ledger> <known-red>
         echo "covering a test that is no longer being RUN, which reads identically to one"
         echo "that is working:"
         printf '    %s\n' "${unaccounted[@]}"
+    fi
+
+    # ENV-UNPROVEN is reported LAST and scored LOWEST. `rc=1` above is never
+    # downgraded: a real deviation outranks "could not conclude", so an ENVSKIP
+    # sharing a ledger with a NEW-RED cannot launder it.
+    if [ "${#unproven[@]}" -gt 0 ]; then
+        [ "$rc" -eq 0 ] && rc=4
+        echo
+        echo "ENV-UNPROVEN — these rows RAN and declined on measured environment grounds."
+        echo "This is NOT a pass and NOT a regression: the band has no evidence either way"
+        echo "about them, and rc 4 says so rather than pretending to a verdict:"
+        printf '    %s\n' "${unproven[@]}"
     fi
 
     if [ "$rc" -eq 0 ]; then
@@ -201,6 +294,37 @@ selftest() {
     _case "stale toleration"      'a.sh\tPASS\t1\t0\t2\n' 1 STALE-TOLERATION
     _case "unaccounted toleration" 'b.sh\tPASS\t1\t0\t2\n' 1 UNACCOUNTED
 
+    # ENV-UNPROVEN (your-org/nexus-code#1283). Five arms, because the token is
+    # only worth having if it is scored EXACTLY between the two things it sits
+    # between — and each of the four ways to get that wrong is a real hole:
+    # scoring it green re-opens #737, scoring it red re-creates the inertness
+    # #1283 reports, letting it clear a toleration acts on no evidence, and
+    # letting it outrank a NEW-RED launders a regression.
+    echo "-- ENV-UNPROVEN: an ENVSKIP is evidence of NEITHER side --"
+    _case "ENVSKIP is rc 4, not 0"      'a.sh\tFAIL\t1\t0\t2\nb.sh\tENVSKIP\t1\t0\t?\n' 4 ENV-UNPROVEN
+    _case "ENVSKIP is NOT a NEW-RED"    'a.sh\tFAIL\t1\t0\t2\nb.sh\tENVSKIP\t1\t0\t?\n' 4 -
+    # rc 4 already proves NEW-RED did not fire (it would have forced rc 1), and
+    # the grep above cannot express "this string is ABSENT". Assert the absence
+    # directly, with a POSITIVE CONTROL beside it so an absence produced by the
+    # needle never appearing at all cannot pass for one produced by the fix.
+    printf 'b.sh\tENVSKIP\t1\t0\t?\n' > "$tmp/ledger"
+    _env_out="$(check "$tmp/ledger" "$tmp/known" 2>&1)"
+    if grep -q 'NEW-RED' <<<"$_env_out"; then
+        printf '  FAIL %-34s an ENVSKIP was reported as NEW-RED\n' "ENVSKIP absent from NEW-RED"; fail=$((fail + 1))
+    elif ! grep -q 'ENV-UNPROVEN' <<<"$_env_out"; then
+        printf '  FAIL %-34s CONTROL: the ENV-UNPROVEN heading never printed, so the absence above proves nothing\n' "ENVSKIP absent from NEW-RED"; fail=$((fail + 1))
+    else
+        printf '  ok   %-34s (and the ENV-UNPROVEN heading DID print)\n' "ENVSKIP absent from NEW-RED"; pass=$((pass + 1))
+    fi
+    _case "ENVSKIP does not clear a tol" 'a.sh\tENVSKIP\t1\t0\t?\n' 4 ENV-UNPROVEN
+    _case "…and is not STALE-TOLERATION" 'a.sh\tENVSKIP\t1\t0\t?\n' 4 -
+    _case "a NEW-RED outranks ENVSKIP"    'a.sh\tFAIL\t1\t0\t2\nb.sh\tFAIL\t1\t0\t2\nc.sh\tENVSKIP\t1\t0\t?\n' 1 NEW-RED
+    # Fail-CLOSED on spelling: only the exact token is the exemption. A
+    # near-miss must be RED, not a quiet pass — this is the arm that stops
+    # `#1283`'s remedy from becoming a hole of its own.
+    _case "lowercase envskip is RED"      'a.sh\tFAIL\t1\t0\t2\nb.sh\tenvskip\t1\t0\t?\n' 1 NEW-RED
+    _case "ENV-SKIP (hyphen) is RED"      'a.sh\tFAIL\t1\t0\t2\nb.sh\tENV-SKIP\t1\t0\t?\n' 1 NEW-RED
+
     echo "-- controls: the checker MUST NOT fire --"
     _case "exact match"           'a.sh\tFAIL\t1\t0\t2\nb.sh\tPASS\t1\t0\t9\n' 0 -
 
@@ -235,7 +359,12 @@ selftest() {
 case "${1:-}" in
     --selftest) selftest; exit $? ;;
     ""|-h|--help)
-        sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+        # RANGE PINNED BY CONTENT, NOT BY A LITERAL (your-org/nexus-code#1163).
+        # This used to be a hard-coded `2,45p`; every line added to the header
+        # above silently truncated --help mid-sentence, which is how run-tests.sh's
+        # own --help came to omit four options. `/^set -uo/` is the first line
+        # AFTER the header, so the range tracks the header instead of dating it.
+        sed -n '2,/^set -uo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
         exit 2 ;;
 esac
 

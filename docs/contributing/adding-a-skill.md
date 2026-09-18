@@ -7,8 +7,18 @@ how the nexus extends the agent's behaviour without bloating
 `CLAUDE.md`: a skill loads only when it's relevant, leaving the
 default context lean.
 
-See the [Skills catalog](../reference/skills.md) for the fourteen
-skills that ship today.
+See the [Skills catalog](../reference/skills.md) for the skills that
+ship today. **The catalog is the list; this page carries no count**, so
+that the two cannot drift. The generator, if you need the number:
+
+```bash
+git ls-files -- ':(glob)skills/*/SKILL.md' | wc -l
+```
+
+(`:(glob)` is not optional — git's pathspec `*` crosses `/`, so the
+bare form counts a different set. One skill, `nexus.cc-update`, ships
+as `GUIDE.md` rather than `SKILL.md` by design and is not in that
+count; the catalog lists it.)
 
 ## When to add a skill vs editing prose
 

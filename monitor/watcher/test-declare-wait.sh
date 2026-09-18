@@ -235,6 +235,220 @@ else
 fi
 
 echo
+# ---------------------------------------------------------------
+# your-org/nexus-code#1326 — shape floor + effect reporting.
+#
+# TWO SEPARATE DEFENCES, and the split is deliberate:
+#   * the SHAPE floor (monitor/_wait_id.sh) refuses a value that
+#     cannot have come from a launch — rc 2, nothing written;
+#   * the EFFECT report distinguishes "a wait was lifted" (rc 0) from
+#     "a row was appended and nothing was lifted" (rc 4). A truncated
+#     but ASCII id such as a bare `syn-` is well formed, so only the
+#     second defence can catch it. Asserting both is what stops a
+#     later reader mistaking either half for the whole fix.
+# ---------------------------------------------------------------
+echo "=== #1326 shape floor ==="
+
+quiet() { run "$@" >/dev/null 2>&1; }
+
+# (17) Every hazard input from #1326 is REFUSED at rc 2 — on BOTH
+# verbs, because a floor on one side only would let a worker declare
+# a wait it could not then dismiss.
+reset_hb
+_shape_fail=0
+for bad_id in 'syn-…' 'not an id at all' '../../etc/passwd' '$(whoami)' '-i' 'a	b'; do
+    for helper in "$DECLARE_WAIT" "$DECLARE_NO_WAIT"; do
+        quiet "$helper" nohup "$bad_id"
+        rc=$?
+        [[ $rc -eq 2 ]] || { bad "shape refusal" "id=[$bad_id] helper=${helper##*/} rc=$rc (want 2)"; _shape_fail=1; }
+    done
+done
+for bad_kind in 'bad kind' '-k' 'k…'; do
+    quiet "$DECLARE_NO_WAIT" "$bad_kind" syn-abcdef012345
+    rc=$?
+    [[ $rc -eq 2 ]] || { bad "shape refusal (kind)" "kind=[$bad_kind] rc=$rc (want 2)"; _shape_fail=1; }
+done
+(( _shape_fail )) || ok "malformed kind/id refused at rc 2 on both verbs"
+
+# (18) NEGATIVE CONTROL for the floor: a refusal must write NOTHING.
+# A validator that refuses loudly and records anyway would leave the
+# ledger in exactly the state the issue is about.
+reset_hb
+quiet "$DECLARE_WAIT" slurm 4242 "real"
+before=$(cat "$hb_file")
+quiet "$DECLARE_NO_WAIT" nohup 'syn-…'
+quiet "$DECLARE_WAIT"    nohup 'syn-…'
+after=$(cat "$hb_file")
+if [[ "$before" == "$after" ]]; then
+    ok "refused call writes nothing (heartbeat byte-identical)"
+else
+    bad "refusal wrote" "before=$before after=$after"
+fi
+
+# (19) POSITIVE CONTROL: the whole live population and every
+# documented example must still be ACCEPTED. #1326 proposed a kind
+# allowlist (nohup|slurm|asyncrun) and a per-kind id grammar; both are
+# measurably wrong against this nexus's own heartbeats — kind
+# `slurm-srun-async` and kind `service` are live, kind `slurm` carries
+# BOTH `2219913` and `syn-02ce6257b730`, and `declare-wait`'s own
+# docstring documents a `ci` example with slashes. This case is the
+# reason the floor is a character class.
+reset_hb
+_accept_fail=0
+while IFS='|' read -r k i; do
+    quiet "$DECLARE_WAIT" "$k" "$i" "d"
+    rc=$?
+    [[ $rc -eq 0 ]] || { bad "shape acceptance" "kind=$k id=$i rc=$rc (want 0)"; _accept_fail=1; }
+done <<'CASES'
+slurm|2219913
+slurm|52527284_4
+slurm|syn-02ce6257b730
+asyncrun|ar-e156942f7283
+nohup|syn-0919b1641f12
+slurm-srun-async|syn-066ab96b3f71
+service|myviewer-8766
+ci|your-org/nexus-code/runs/26304173692
+CASES
+(( _accept_fail )) || ok "live kinds + documented examples all accepted"
+
+echo "=== #1326 effect reporting ==="
+
+# (20) Dismissing a wait that IS on record: rc 0.
+reset_hb
+quiet "$DECLARE_WAIT" slurm 777 "real"
+quiet "$DECLARE_NO_WAIT" slurm 777
+rc=$?
+waits=$(read_waits)
+if [[ $rc -eq 0 && "$waits" == "[]" ]]; then
+    ok "dismiss of a real wait → rc 0, wait lifted"
+else
+    bad "dismiss real" "rc=$rc waits=$waits"
+fi
+
+# (21) Dismissing a wait that is NOT on record: rc 4, and the record
+# is still made. The sticky pre-detection path (test 11) is
+# legitimate and must survive; what changes is that the caller can
+# now tell the two apart. A bare `syn-` is the motivating input —
+# well formed, so the shape floor passes it, and short, so it matches
+# nothing.
+reset_hb
+quiet "$DECLARE_WAIT" nohup syn-0919b1641f12 "real"
+quiet "$DECLARE_NO_WAIT" nohup 'syn-'
+rc=$?
+dismissed=$(read_dismissed)
+waits=$(read_waits)
+if [[ $rc -eq 4 \
+   && "$dismissed" == '[{"kind":"nohup","id":"syn-"}]' \
+   && "$waits" == '[{"kind":"nohup","id":"syn-0919b1641f12","desc":"real"}]' ]]; then
+    ok "dismiss of a truncated id → rc 4, recorded, real wait UNTOUCHED"
+else
+    bad "dismiss truncated" "rc=$rc dismissed=$dismissed waits=$waits"
+fi
+
+# (22) declare-wait --remove that matches nothing: rc 4. Its
+# docstring promised a "silent no-op"; that is the same defect one
+# verb over.
+reset_hb
+quiet "$DECLARE_WAIT" slurm 111 "real"
+quiet "$DECLARE_WAIT" --remove slurm 999
+rc=$?
+[[ $rc -eq 4 ]] && ok "--remove matching nothing → rc 4" \
+                || bad "--remove no-match rc" "rc=$rc (want 4)"
+
+# (23) --un-dismiss that matches nothing: rc 4.
+reset_hb
+quiet "$DECLARE_NO_WAIT" slurm 222
+quiet "$DECLARE_NO_WAIT" --un-dismiss slurm 999
+rc=$?
+[[ $rc -eq 4 ]] && ok "--un-dismiss matching nothing → rc 4" \
+                || bad "--un-dismiss no-match rc" "rc=$rc (want 4)"
+
+# (24) …and the matching cases stay rc 0, so rc 4 means what it says
+# rather than "this verb always complains".
+reset_hb
+quiet "$DECLARE_WAIT" slurm 333 "real"
+quiet "$DECLARE_WAIT" --remove slurm 333;      rc_rm=$?
+quiet "$DECLARE_NO_WAIT" slurm 444
+quiet "$DECLARE_NO_WAIT" --un-dismiss slurm 444; rc_un=$?
+if [[ $rc_rm -eq 0 && $rc_un -eq 0 ]]; then
+    ok "--remove / --un-dismiss that DO match → rc 0"
+else
+    bad "matching removals" "rc_rm=$rc_rm rc_un=$rc_un (want 0/0)"
+fi
+
+# (25) COUPLING TEST — the watcher's reaper must read rc 4 as SUCCESS.
+# `monitor/watcher/_orphan_async.sh:_orphan_async_reap_real` shells out to
+# `declare-wait.sh --remove`, and its one caller logs "could not reap … it
+# will re-flag" on ANY non-zero. Introducing rc 4 above therefore reached
+# into the watcher; without this assertion the coupling is invisible from
+# either file and a later author would restore the false diagnostic. A
+# MALFORMED id must still fail (rc non-zero) — that one genuinely cannot be
+# reaped and the hand-remedy log line is the right outcome.
+if [[ -r "$_repo_root/monitor/watcher/_orphan_async.sh" ]]; then
+    reset_hb
+    _rc_out=$(
+        NEXUS_STATE_DIR="$WORK/.state" NEXUS_ROOT="$_repo_root" \
+        bash -c '
+            set -u
+            . "'"$_repo_root"'/monitor/watcher/_orphan_async.sh" 2>/dev/null || exit 9
+            NEXUS_WORKER_WINDOW=testw bash "'"$_repo_root"'/monitor/declare-wait.sh" slurm 900 d
+            _orphan_async_reap_real testw slurm 900;      printf "%s " "$?"
+            _orphan_async_reap_real testw slurm 900;      printf "%s " "$?"
+            # A MALFORMED id must be REAPABLE, not refused. The shape floor
+            # gates the CREATE path only; gating removal would strand a row
+            # written by the pre-fix code, with no `--clear` on the dismiss
+            # verb and hand-edited JSON as the only way out
+            # (your-org/nexus-code#1373 skeptic finding 2). Plant one directly,
+            # the way the old code would have written it, and require the
+            # reaper to clear it.
+            printf %s "{\"window\":\"testw\",\"last_activity\":1788000000,\"external_waits\":[{\"kind\":\"nohup\",\"id\":\"syn-…\"}],\"dismissed_waits\":[]}" \
+                > "'"$WORK"'/.state/heartbeat/testw.json"
+            _orphan_async_reap_real testw nohup "syn-…"; printf "%s " "$?"
+            printf "%s" "$(jq -r ".external_waits|length" "'"$WORK"'/.state/heartbeat/testw.json")"
+        ' 2>/dev/null
+    )
+    if [[ "$_rc_out" == "0 0 0 0" ]]; then
+        ok "watcher reaper: present→0, already-absent→0 (rc 4 is success), MALFORMED row reaped not stranded"
+    else
+        bad "watcher reaper rc coupling" "got=[$_rc_out] want=[0 0 0 0]"
+    fi
+else
+    bad "watcher reaper rc coupling" "_orphan_async.sh unreadable"
+fi
+
+# (26) your-org/nexus-code#1373 skeptic finding 2 — THE FLOOR GATES THE WRITE
+# VERBS, NOT THE REMOVE VERBS. Gating removal is the one place a shape floor
+# can only STRAND: a malformed row written by the PRE-FIX code is exactly what
+# an operator needs to delete, `declare-no-wait` has no `--clear` hatch, and
+# hand-edited JSON would be the only way out. Removal can only shrink the
+# record, so an unvalidated id there is harmless; every hazard input still
+# arrives on the CREATE path and is still refused.
+reset_hb
+printf '%s' '{"window":"testw","last_activity":1788000000,"external_waits":[{"kind":"nohup","id":"syn-…"}],"dismissed_waits":[{"kind":"nohup","id":"syn-…"}]}' \
+    > /dev/null 2>&1 || true
+mkdir -p "$WORK/.state/heartbeat"
+printf '%s' '{"window":"testw","last_activity":1788000000,"external_waits":[{"kind":"nohup","id":"syn-…"}],"dismissed_waits":[{"kind":"nohup","id":"syn-…"}]}' \
+    > "$hb_file"
+quiet "$DECLARE_WAIT"    --remove      nohup 'syn-…'; _rm_rc=$?
+quiet "$DECLARE_NO_WAIT" --un-dismiss  nohup 'syn-…'; _un_rc=$?
+_left_w=$(read_waits); _left_d=$(read_dismissed)
+if [[ $_rm_rc -eq 0 && $_un_rc -eq 0 && "$_left_w" == "[]" && "$_left_d" == "[]" ]]; then
+    ok "pre-fix MALFORMED entries are removable — the floor does not strand them"
+else
+    bad "malformed removal stranded" "rm=$_rm_rc un=$_un_rc waits=$_left_w dismissed=$_left_d"
+fi
+
+# (27) …and the CREATE path is still closed to every hazard input, so
+# ungating removal bought the escape hatch without reopening the door.
+reset_hb
+_create_fail=0
+for bad_id in 'syn-…' 'not an id at all' '../../etc/passwd' '$(whoami)' '-i'; do
+    quiet "$DECLARE_WAIT"    nohup "$bad_id"; [[ $? -eq 2 ]] || _create_fail=1
+    quiet "$DECLARE_NO_WAIT" nohup "$bad_id"; [[ $? -eq 2 ]] || _create_fail=1
+done
+(( _create_fail )) && bad "create path reopened" "a hazard input was accepted" \
+                   || ok "CREATE path still refuses every hazard input at rc 2"
+
 echo "=== summary ==="
 printf '  %d pass / %d fail\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

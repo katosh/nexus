@@ -39,7 +39,7 @@ The body has two auto-managed regions plus operator prose. The first is the **Ne
 <!-- text below the END marker also stays -->
 ```
 
-Six sections, in this fixed order. The set is the single source of truth in `DASH_REQUIRED_SECTIONS` (`monitor/ng`); change it there and it propagates to every operator nexus on the next `nexus-code` pull.
+Six sections, in this fixed order. `DASH_REQUIRED_SECTIONS` (`monitor/ng`) is what `validate` checks against; `scaffold` emits its own literal skeleton from `_dashboard_template`, and the two are held in agreement by `monitor/watcher/test-ng-dashboard.sh` (Test 15 asserts every required section appears in the scaffold; Test 18 asserts the scaffold passes `validate`). So a rename must touch BOTH, and the suite goes red if it touches only one. Once both are updated it propagates to every operator nexus on the next `nexus-code` pull.
 
 | Section | What's in it |
 |---|---|
@@ -94,7 +94,7 @@ monitor/ng dashboard validate [--body-file new-dashboard-middle.md]
 monitor/ng dashboard put --body-file new-dashboard-middle.md
 ```
 
-`scaffold` and `validate` share their section check (`_dashboard_missing_sections` in `monitor/ng`) with the same source of truth as `DASH_REQUIRED_SECTIONS`. The split is deliberate: `validate` is the hard gate (exit 1 on drift), while `put` runs the *same* check in warn-only mode — it prints which sections are missing to stderr but still pushes, so the operator can update the dashboard in a hurry without a footgun-y hard block. Seed a fresh dashboard by piping `scaffold` into `put`.
+`validate` and `put` share their section check — `_dashboard_missing_sections` in `monitor/ng`, reading `DASH_REQUIRED_SECTIONS`. (`scaffold` runs no check at all; it just prints `_dashboard_template`.) The split is deliberate: `validate` is the hard gate (exit 1 on a missing required section, and also on an exactly-duplicated one), while `put` runs the *same* missing-section check in warn-only mode — it prints which sections are missing to stderr but still pushes, so the operator can update the dashboard in a hurry without a footgun-y hard block. Seed a fresh dashboard by piping `scaffold` into `put`.
 
 `ng dashboard put` always re-reads the live body before splicing, so static prose around the markers (operator notes above the START marker, your own running scratchpad below the END marker) — and the identity block — is preserved across writes. The cache at `monitor/.state/dashboard.md` is for the orchestrator's diff-before-overwrite check, not the canonical state.
 

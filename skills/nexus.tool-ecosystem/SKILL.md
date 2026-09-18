@@ -103,8 +103,9 @@ For a bug in an external-upstream lab tool:
   report and STOP for operator review** before anything lands
   upstream, and grep the draft for internal identifiers (study
   names, sample IDs, cell counts, internal-repo refs) and redact.
-  See the "GitHub writes — WHETHER, by repo tier" section of the
-  workspace `CLAUDE.md` and `skills/nexus.bot/SKILL.md`.
+  See the workspace `CLAUDE.md`, section "GitHub writes — identity and
+  authorization" and its **WHETHER — by repo tier** rule, plus
+  `skills/nexus.bot/SKILL.md`.
 
 ## Tool → owner → routing table
 
@@ -146,7 +147,7 @@ nexus asset repo below.
 | **kdpeak** | KDE-based ATAC peak caller | `<your-org>/kdpeak` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **spatial-smooth** | Composable spatial & cell-state smoothing of gene signatures | `<your-org>/spatial-smooth` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **convert2anndata** | R package: SingleCellExperiment / Seurat → AnnData | `<your-org>/convert2anndata` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
-| **annzarro** | Zarr-based AnnData visualization tool | `<your-org>/annzarro` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
+| **myviewer** | Zarr-based AnnData visualization tool | `<your-org>/myviewer` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **barnacle** | Persistent shared-node HPC workspaces via self-extending SLURM chains | `<your-org>/shared-node-tool` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **labsh** | Project-local JupyterLab management CLI for humans & agents | `katosh/labsh` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
 | **agent_sandbox** | Sandbox AI agents on HPC / SLURM (the lab's agent sandbox) | `katosh/agent_sandbox` | operator (`@<operator>`) | `<your-org>/<your-nexus>` |
@@ -200,7 +201,7 @@ redact internal identifiers first. Route the <your-org>-side report to
 >
 > **Ambiguous / low-signal repos not tabled** (a member should claim
 > or disclaim them): `spatial-trajectory`, `spatial-visualization`
-> (`@otheruser`, 1 commit each — likely scratch); `dolimap`,
+> (`@otheruser`, 1 commit each — likely scratch); `mysite`,
 > `knmap` (`@<operator>` knowledge-base engines, not single-cell tools).
 
 ## Maintaining this table

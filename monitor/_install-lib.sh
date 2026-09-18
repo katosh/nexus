@@ -63,8 +63,63 @@ install_acquire_lock() {
     return 0
 }
 
-# install_dir_is_repo <dir> — true if <dir> looks like a git checkout.
-install_dir_is_repo() { [ -d "$1/.git" ]; }
+# install_dir_is_repo <dir> — true if <dir> is a git checkout ROOTED AT ITSELF.
+#
+# This was `[ -d "$1/.git" ]`, which is `#1080`'s arm 1 exactly: it tests for a
+# DIRECTORY NAMED `.git`, not for a repository. An interrupted clone leaves
+# `<dir>/.git/objects/` and passes — `work/kompot-milodesc-sk/.git/` on this
+# host holds precisely that and nothing else. The caller then runs
+# `git -C "$dir" config --get remote.origin.url`, which WALKS UP and answers
+# with the ENCLOSING repository's origin; `install_remote_matches` compares
+# that against the URL it wants and the answer decides whether a directory
+# gets OVERWRITTEN.
+#
+# It fails safe today only by accident of the substrings involved (the nexus's
+# own origin does not contain `hpc-skills` or `labsh`, so the comparison
+# happens to say "unexpected remote" and the installer refuses). That is a
+# property of two URL spellings, not of the guard.
+#
+# It also read FALSE for a linked worktree and for a `--separate-git-dir`
+# checkout, whose `.git` is a FILE — a silent false negative in the opposite
+# direction.
+# shellcheck source=repo-root.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/repo-root.sh"
+
+# install_dir_repo_state <dir> — the THREE-VALUED form: 0 repo, 1 not a repo,
+# 3 could not determine. Callers that gate a WRITE must use this one.
+install_dir_repo_state() { rr_has_own_history "$1"; }
+
+# install_dir_is_repo <dir> — the boolean form, and it FAILS CLOSED.
+#
+# A PLAIN `rr_has_own_history` WRAPPER IS NOT SAFE HERE, and this is the
+# three-valued contract being violated at one of its own call sites
+# (your-org/nexus-code#1243 round 2). Both callers read:
+#
+#     if install_dir_is_repo "$target" && ! install_remote_matches …; then
+#         die "refusing to overwrite …"
+#     fi
+#     mv "$target" "$bak"
+#
+# `rc 3` is non-zero, so the `if` is FALSE, the refusal is SKIPPED, and
+# execution falls through to the rename-aside — for a target we could not
+# examine. That is precisely the collapse the third value exists to prevent,
+# and it is how a three-valued predicate silently becomes two-valued: not in
+# the predicate, but in a one-line wrapper at the call site.
+#
+# So the boolean answers the question the CALLERS are really asking — "must I
+# be careful with this directory?" — and undetermined answers YES. The
+# allowlist is "definitely not a repository"; everything else, including
+# "could not look", takes the careful branch. Callers that want to refuse
+# outright on undetermined (both shipped ones do) ask
+# `install_dir_repo_state` first.
+install_dir_is_repo() {
+    install_dir_repo_state "$1"
+    case "$?" in
+        0) return 0 ;;   # it is a repo
+        1) return 1 ;;   # positively established: it is not
+        *) return 0 ;;   # could not determine -> be careful, never clobber
+    esac
+}
 
 # install_remote_matches <dir> <substr> — true if <dir>'s origin URL matches.
 install_remote_matches() {

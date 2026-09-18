@@ -1,0 +1,235 @@
+# nullglob-bare-form.manifest — the REVIEWED disposition of every site that
+# pairs a possibly-empty GLOB with a command having a MEANINGFUL BARE FORM.
+# your-org/nexus-code#1214 S1.
+#
+# Columns (TAB-separated). Fields 1-3 are the KEY; 4-5 are the classifier's
+# extraction; 6-7 are the human's verdict:
+#   1 file          the shell file the site is in
+#   2 line          the site's SOURCE TEXT, whitespace runs collapsed to one
+#                   space and the ends trimmed. THIS IS THE KEY, not a comment.
+#   3 occurrence    1-based ordinal among sites in the SAME file with the SAME
+#                   normalized line, ascending by line number. 1 for 41 of 73.
+#   4 command       the bare-form command
+#   5 glob          the globbing token, quoted spans blanked
+#   6 disposition   defect | safe | unreviewed
+#   7 reason        required for `defect` and `safe`; `unreviewed` needs none
+#
+# THERE IS NO LINE NUMBER HERE, ON PURPOSE. See the next section. To locate a
+# row in the tree:  bash monitor/watcher/nullglob-bare-form.sh --locate
+#
+# ── THE KEY IS CONTENT, BECAUSE A LINE NUMBER MOVES ─────────────────────
+#
+# This file used to key each site by `<file>:<LINE>`, and that broke SILENTLY
+# across a merge. `#1238` inserts ONE line at `monitor/ng:548`; the three rows
+# recorded at 1316/1326/1329 shift to 1317/1327/1330; and the guard reports
+# THREE NEW sites and THREE REMOVED ones for a tree in which nothing was added
+# and nothing was removed. Reproducer, four commands, rc 0 on both merges:
+#
+#     git merge --no-ff <#1238 head>   # CLEAN
+#     git merge --no-ff <#1214 head>   # CLEAN
+#     bash monitor/watcher/test-nullglob-bare-form-manifest.sh
+#
+# Neither PR touches the other's file. There is no textual overlap, so there is
+# NO diff-level artefact of the dependency at all — the merges are clean, and
+# the guard is the only thing that disagrees. A key that is load-bearing on a
+# number every unrelated edit moves is not a key.
+#
+# So: `<file>` + `<normalized line>` + `<occurrence>`.
+#
+# WHY IT IS STABLE. Insertion, deletion and reindentation ELSEWHERE in the file
+# move line numbers and leave all three components untouched. The key changes
+# when the site's OWN TEXT changes — which is exactly when a recorded
+# disposition should stop being trusted, because the disposition was an argument
+# about that text.
+#
+# WHAT WOULD STILL BREAK IT. A key with an unstated failure mode is the defect
+# this re-key removes, so:
+#
+#   1. ORDINAL CHURN, AND IT IS WORSE THAN AN ATTRIBUTABLE RED. Inserting or
+#      deleting a BYTE-IDENTICAL site above its identical siblings shifts their
+#      ordinals. Reachable only inside the four duplicate groups (13, 13, 5, 5).
+#      An earlier version of this line claimed the resulting red is
+#      "attributable, because the offending line is in that file's own diff".
+#      MEASURED, IT IS NOT (`#1214` sk F1): plant a `safe` verdict on occurrence
+#      7 of the 13-member `launchers_before` group in `test-respawn.sh`, then
+#      insert ONE identical sibling above line 154. The result is ONE red naming
+#      `test-respawn.sh:1638` — the LAST sibling, 1,484 lines from the edit, a
+#      line nobody touched — alongside `PASS: no STALE row naming a pairing that
+#      is gone`; and the occurrence-7 disposition now silently describes what was
+#      occurrence 6. Ordinals 7..13 all shift REFERENT and nothing says so. So it
+#      is a red pointing at the WRONG SITE plus a SILENT re-attribution, not an
+#      attributable red and not a silent green.
+#
+#      AND THE GROUP IS FORMED ON *NORMALISED* TEXT, which discards the one axis
+#      a `safe (b)` argument can turn on: two sites differing only by leading
+#      whitespace — one inside a block that runs `shopt -s nullglob`, one not —
+#      are different REACHABILITY in ONE group. The ordinal keeps the KEYS
+#      distinct, so nothing collides; what is positional rather than textual is
+#      which SITE a disposition refers to.
+#
+#      NO KEY FIXES THIS, and that is why the remedy is a refusal rather than a
+#      better key: inside a duplicate group there is by construction no text
+#      distinguishing the members, so nothing content-derived can carry a
+#      per-member verdict. `test-nullglob-bare-form-manifest.sh` therefore
+#      ASSERTS that no `defect`/`safe` row sits in a non-singleton group. All 8
+#      reviewed rows are singletons today, so it is green on arrival and turns
+#      into a loud precondition the day somebody classifies one of the 36
+#      duplicate-group sites — which is exactly what this file exists to
+#      accumulate, so the horizon is "as the ratchet does its job".
+#   2. FILE RENAME rekeys every row in that file, exactly as before.
+#   3. DELETE+ADD OF AN IDENTICAL SITE (net-zero count). Move one of N identical
+#      lines into a different function and file, normalized line and the ordinal
+#      SET are all unchanged — so this guard stays GREEN while the CALL PATH
+#      changed. INHERENT to content-derivation: identical text is
+#      indistinguishable. Line-keying did not close this either (swapping two
+#      identical sites leaves the same set of line-keys occupied); it merely
+#      also failed on case (1)-shaped noise. It is the BOUND, not a regression.
+#      Note where it does and does not bite: all eight rows carrying a `defect`
+#      or `safe` verdict are in SINGLETON groups, so there is no identical
+#      sibling to swap them with.
+#
+# And the bound no key of any kind can carry: `safe (b)` below is a claim about
+# REACHABILITY, not about text. A stable key tells you the text is unchanged. It
+# never revalidates the argument, and nothing here pretends otherwise.
+#
+# ── `safe` HAS TWO GROUNDS AND THEY ARE DIFFERENT CLAIMS ────────────────
+#
+# Either
+#   (a) the glob CANNOT be empty -- say why, checkably; or
+#   (b) NULLGLOB IS NOT IN EFFECT at that site, so an unmatched glob stays
+#       LITERAL, the command gets a path that does not exist, and it fails
+#       loudly instead of running bare.
+# (b) is a claim about REACHABILITY and is the harder one to make honestly,
+# because `shopt` is DYNAMIC: it is not enough that the file carries no
+# `shopt`, nor that the site precedes one. It requires that no call path
+# reaches the site with the option set. Say which ground you are on.
+#
+# Generated by:  bash monitor/watcher/nullglob-bare-form.sh
+#                (its default output IS fields 1-5 of this file, in order —
+#                 one definition of the key, not two)
+# Enforced by:   bash monitor/watcher/test-nullglob-bare-form-manifest.sh
+#
+# ── WHY THIS FILE EXISTS ────────────────────────────────────────────────
+#
+# `#1214` D1 fixed one site and wrote the enumeration into a COMMIT MESSAGE.
+# That closes neither the class nor its instances: nothing fails when site N+1
+# appears, and the knowledge sits where no future author reads it. The same
+# defect shape the branch spent all day on — an assertion nothing can disagree
+# with — arriving in the audit of it.
+#
+# REGENERATING THIS FILE IS NOT A FIX. If the guard goes red, a pairing was
+# added or removed. Decide which:
+#   * a NEW site — can that glob legitimately match nothing? If yes it is a
+#     `defect`: the command will run BARE and answer about the CWD or STDIN.
+#     Fix it, do not record it. If no, record `safe` and say WHY it cannot be
+#     empty — a claim a reader can check.
+#   * a REMOVED site — good; regenerate and say so.
+#   * a REKEYED site — the text changed. Re-read the disposition against the
+#     NEW text before carrying it across; that is the whole reason the key is
+#     the text.
+#
+# ── THE BOUNDARY, STATED RATHER THAN IMPLIED ────────────────────────────
+#
+# 73 sites are enumerated: FOUR carry a reviewed `defect` verdict, FOUR a
+# reviewed `safe` one (one on ground (a), three on ground (b)), and the
+# remaining SIXTY-FIVE are `unreviewed`. Census, checkable:
+#     cut -f6 monitor/watcher/nullglob-bare-form.manifest | grep -v '^#' | sort | uniq -c
+# `unreviewed` is deliberate and it is not a claim that those sites are safe —
+# it means exactly what it says. Per-site disposition of 65 sites is more than
+# this change can honestly do, and recording a guessed `safe` on each would be
+# worse than recording nothing, because a false `safe` is the thing a future
+# reader would trust.
+#
+# What the guard buys TODAY is the ratchet: site 74 is a RED rather than a
+# discovery. What it does not buy is a verdict on those 65. Both halves are
+# true and the second is tracked separately.
+#
+# ── AND THE POPULATION IS SHELL-WIDE ────────────────────────────────────
+#
+# `#1214`'s first enumeration scoped itself to "the files that SET nullglob"
+# and under-counted TWICE OVER.
+#
+# First, it said FOURTEEN such files and the number is FIFTEEN. The one it
+# missed is `monitor/ng` -- the main CLI, and the holder of three of the sites
+# below -- because that enumeration used a `*.sh` PATHSPEC, and `monitor/ng` is
+# a shell file by SHEBANG with no extension. So the population predicate failed
+# on the most important member, which is exactly why membership here is decided
+# by `shell-files.sh:shf_is_shell` (shebang-aware) instead of by a filename.
+#
+# Second, and more fundamentally: `nullglob` is a SHELL option and reaches
+# SOURCED code that never mentions it. A library sourced by a nullglob-setting caller is exposed
+# while containing no `shopt` at all. So membership here is decided by the
+# SHARED predicate `shell-files.sh:shf_is_shell` over every tracked shell file
+# under `monitor/`, not by which file carries the option.
+monitor/_trash.sh	du -sh "$root"/* 2>/dev/null || printf '(trash empty: %s)\n' "$root"	1	du	/*	defect	PRODUCTION. Bare `du -sh` SUCCEEDS on the cwd, so the `|| printf "(trash empty)"` fallback beside it is UNREACHABLE — an empty trash reports the cwd size instead of saying it is empty.
+monitor/ng	latest=$(ls -t "$match"/*.jsonl 2>/dev/null | head -1)	1	ls	/*.jsonl	safe	safe (b): NOT REACHABLE under nullglob. TWO INDEPENDENT LINES OF ARGUMENT, NOT "four ways" -- an earlier wording overstated the independence (#1214 sk2 F4): legs 1 and 4 both answered "can it arrive from OUTSIDE?" and legs 2 and 3 both answered "can it arise INSIDE ng?", so it was two lines seen four ways, and the false leg and the incomplete leg sat one in each pair. LINE A -- from outside. `ng` IS SOURCED, by exactly FIVE unit suites (test-bookkeeping-contract.sh:787, test-obligations.sh:380, test-window-key.sh:127, watcher/test-pending-decisions.sh:1038+1041, watcher/test-skeptic-channel.sh:354), and ng's own trailer at 11909-11913 says so; an earlier version of this row claimed ZERO source sites and was FALSE, contradicted by the file it was a claim about. AND IT WAS FALSE WITHIN ITS OWN STATED SCOPE -- it said "across monitor/", and all five real source sites ARE under monitor/ -- so it cannot be repaired by narrowing the scope, and this row does not try to. It is replaced by the statement that is both TRUE and still sufficient. It does not flip the disposition: none of the five calls cmd_report_init or _report_session_id, and the only one carrying `shopt` (test-pending-decisions.sh) has nullglob OFF at its source point. Across the process boundary the CARRIERS are BASHOPTS, SHELLOPTS, BASH_ENV together with its NEXUS_PREV_BASH_ENV chain, and invocation options such as `bash -O nullglob` -- measured n=0 for BASH_ENV and for `-O nullglob`. GLOBIGNORE was measured NOT to be a carrier (unmatched glob stays literal, n=1; even a GLOBIGNORE-eliminated sole match stays literal) -- recorded so nobody adds it as a fifth. LINE B -- from inside. Zero top-level `shopt`; four function-local set/restore windows (5744->5746, 6695->6700, 6732->6744, 11592->11598) read for an intervening return/exit and having none; one more (6403) inside a command-substitution SUBSHELL. Line B is FILE-scoped and would therefore miss a sourced library setting it -- WRONG RULE 1 from CLAUDE.md, in this row's own reasoning -- so: ng top-level-sources only _nexus-root.sh and _bookkeeping.sh (350, 355), neither carries any `shopt`, and neither sources anything further. AND A FIFTH ARGUMENT, STRONGER THAN EITHER LINE: cmd_report_init is reachable ONLY from top-level dispatch at 11863, so ONE `ng` PROCESS RUNS EXACTLY ONE VERB and the resolver can never follow a nullglob window in the same process. That does not depend on reading any restore. EXERCISED, not merely read: monitor/ng was copied inside monitor/, instrumented at the entry of _report_session_id, and run through the real `ng report-init` dispatch -- plain `off`, caller-nullglob-on with BASHOPTS unset `off`, caller-nullglob-on with BASHOPTS exported `on`. RESIDUAL, stated as what it is: NO FILE ON THE LIVE BASH_ENV CHAIN SETS NULLGLOB, measured at c5a86488d1b2 on 2026-08-31. BASH_ENV is exported by this nexus's OWN monitor/locals-env.sh into every agent process, and monitor/shellenv/bash_env.sh (blob 751c552c8e6c) carries zero `shopt` -- now ASSERTED by test-nullglob-bare-form-manifest.sh rather than left as prose. Its NEXUS_PREV_BASH_ENV half points OUTSIDE this repo (/app/lmod/lmod/init/bash live) and CANNOT be guarded from here; that half is unmeasured beyond a one-time read. THE MECHANISM IS REAL IF EVER REACHED: with nullglob on, an empty projects dir yields latest=<first cwd entry> and `basename -s .jsonl` returns a WRONG SESSION ID into a real report's frontmatter -- reproduced by sk2 through the real unmodified binary via BASH_ENV. So this row is safe-BY-REACHABILITY, not safe-by-harmlessness.
+monitor/ng	latest=$(ls -t "$projects_dir/$cwd_slug"/*.jsonl 2>/dev/null | head -1)	1	ls	/*.jsonl	safe	safe (b): NOT REACHABLE under nullglob. TWO INDEPENDENT LINES OF ARGUMENT, NOT "four ways" -- an earlier wording overstated the independence (#1214 sk2 F4): legs 1 and 4 both answered "can it arrive from OUTSIDE?" and legs 2 and 3 both answered "can it arise INSIDE ng?", so it was two lines seen four ways, and the false leg and the incomplete leg sat one in each pair. LINE A -- from outside. `ng` IS SOURCED, by exactly FIVE unit suites (test-bookkeeping-contract.sh:787, test-obligations.sh:380, test-window-key.sh:127, watcher/test-pending-decisions.sh:1038+1041, watcher/test-skeptic-channel.sh:354), and ng's own trailer at 11909-11913 says so; an earlier version of this row claimed ZERO source sites and was FALSE, contradicted by the file it was a claim about. AND IT WAS FALSE WITHIN ITS OWN STATED SCOPE -- it said "across monitor/", and all five real source sites ARE under monitor/ -- so it cannot be repaired by narrowing the scope, and this row does not try to. It is replaced by the statement that is both TRUE and still sufficient. It does not flip the disposition: none of the five calls cmd_report_init or _report_session_id, and the only one carrying `shopt` (test-pending-decisions.sh) has nullglob OFF at its source point. Across the process boundary the CARRIERS are BASHOPTS, SHELLOPTS, BASH_ENV together with its NEXUS_PREV_BASH_ENV chain, and invocation options such as `bash -O nullglob` -- measured n=0 for BASH_ENV and for `-O nullglob`. GLOBIGNORE was measured NOT to be a carrier (unmatched glob stays literal, n=1; even a GLOBIGNORE-eliminated sole match stays literal) -- recorded so nobody adds it as a fifth. LINE B -- from inside. Zero top-level `shopt`; four function-local set/restore windows (5744->5746, 6695->6700, 6732->6744, 11592->11598) read for an intervening return/exit and having none; one more (6403) inside a command-substitution SUBSHELL. Line B is FILE-scoped and would therefore miss a sourced library setting it -- WRONG RULE 1 from CLAUDE.md, in this row's own reasoning -- so: ng top-level-sources only _nexus-root.sh and _bookkeeping.sh (350, 355), neither carries any `shopt`, and neither sources anything further. AND A FIFTH ARGUMENT, STRONGER THAN EITHER LINE: cmd_report_init is reachable ONLY from top-level dispatch at 11863, so ONE `ng` PROCESS RUNS EXACTLY ONE VERB and the resolver can never follow a nullglob window in the same process. That does not depend on reading any restore. EXERCISED, not merely read: monitor/ng was copied inside monitor/, instrumented at the entry of _report_session_id, and run through the real `ng report-init` dispatch -- plain `off`, caller-nullglob-on with BASHOPTS unset `off`, caller-nullglob-on with BASHOPTS exported `on`. RESIDUAL, stated as what it is: NO FILE ON THE LIVE BASH_ENV CHAIN SETS NULLGLOB, measured at c5a86488d1b2 on 2026-08-31. BASH_ENV is exported by this nexus's OWN monitor/locals-env.sh into every agent process, and monitor/shellenv/bash_env.sh (blob 751c552c8e6c) carries zero `shopt` -- now ASSERTED by test-nullglob-bare-form-manifest.sh rather than left as prose. Its NEXUS_PREV_BASH_ENV half points OUTSIDE this repo (/app/lmod/lmod/init/bash live) and CANNOT be guarded from here; that half is unmeasured beyond a one-time read. THE MECHANISM IS REAL IF EVER REACHED: with nullglob on, an empty projects dir yields latest=<first cwd entry> and `basename -s .jsonl` returns a WRONG SESSION ID into a real report's frontmatter -- reproduced by sk2 through the real unmodified binary via BASH_ENV. So this row is safe-BY-REACHABILITY, not safe-by-harmlessness.
+monitor/ng	match=$(ls -t -d "$projects_dir"/*"$tail_slug"* 2>/dev/null | head -1)	1	ls	/*	safe	safe (b): NOT REACHABLE under nullglob. TWO INDEPENDENT LINES OF ARGUMENT, NOT "four ways" -- an earlier wording overstated the independence (#1214 sk2 F4): legs 1 and 4 both answered "can it arrive from OUTSIDE?" and legs 2 and 3 both answered "can it arise INSIDE ng?", so it was two lines seen four ways, and the false leg and the incomplete leg sat one in each pair. LINE A -- from outside. `ng` IS SOURCED, by exactly FIVE unit suites (test-bookkeeping-contract.sh:787, test-obligations.sh:380, test-window-key.sh:127, watcher/test-pending-decisions.sh:1038+1041, watcher/test-skeptic-channel.sh:354), and ng's own trailer at 11909-11913 says so; an earlier version of this row claimed ZERO source sites and was FALSE, contradicted by the file it was a claim about. AND IT WAS FALSE WITHIN ITS OWN STATED SCOPE -- it said "across monitor/", and all five real source sites ARE under monitor/ -- so it cannot be repaired by narrowing the scope, and this row does not try to. It is replaced by the statement that is both TRUE and still sufficient. It does not flip the disposition: none of the five calls cmd_report_init or _report_session_id, and the only one carrying `shopt` (test-pending-decisions.sh) has nullglob OFF at its source point. Across the process boundary the CARRIERS are BASHOPTS, SHELLOPTS, BASH_ENV together with its NEXUS_PREV_BASH_ENV chain, and invocation options such as `bash -O nullglob` -- measured n=0 for BASH_ENV and for `-O nullglob`. GLOBIGNORE was measured NOT to be a carrier (unmatched glob stays literal, n=1; even a GLOBIGNORE-eliminated sole match stays literal) -- recorded so nobody adds it as a fifth. LINE B -- from inside. Zero top-level `shopt`; four function-local set/restore windows (5744->5746, 6695->6700, 6732->6744, 11592->11598) read for an intervening return/exit and having none; one more (6403) inside a command-substitution SUBSHELL. Line B is FILE-scoped and would therefore miss a sourced library setting it -- WRONG RULE 1 from CLAUDE.md, in this row's own reasoning -- so: ng top-level-sources only _nexus-root.sh and _bookkeeping.sh (350, 355), neither carries any `shopt`, and neither sources anything further. AND A FIFTH ARGUMENT, STRONGER THAN EITHER LINE: cmd_report_init is reachable ONLY from top-level dispatch at 11863, so ONE `ng` PROCESS RUNS EXACTLY ONE VERB and the resolver can never follow a nullglob window in the same process. That does not depend on reading any restore. EXERCISED, not merely read: monitor/ng was copied inside monitor/, instrumented at the entry of _report_session_id, and run through the real `ng report-init` dispatch -- plain `off`, caller-nullglob-on with BASHOPTS unset `off`, caller-nullglob-on with BASHOPTS exported `on`. RESIDUAL, stated as what it is: NO FILE ON THE LIVE BASH_ENV CHAIN SETS NULLGLOB, measured at c5a86488d1b2 on 2026-08-31. BASH_ENV is exported by this nexus's OWN monitor/locals-env.sh into every agent process, and monitor/shellenv/bash_env.sh (blob 751c552c8e6c) carries zero `shopt` -- now ASSERTED by test-nullglob-bare-form-manifest.sh rather than left as prose. Its NEXUS_PREV_BASH_ENV half points OUTSIDE this repo (/app/lmod/lmod/init/bash live) and CANNOT be guarded from here; that half is unmeasured beyond a one-time read. THE MECHANISM IS REAL IF EVER REACHED: with nullglob on, an empty projects dir yields latest=<first cwd entry> and `basename -s .jsonl` returns a WRONG SESSION ID into a real report's frontmatter -- reproduced by sk2 through the real unmodified binary via BASH_ENV. So this row is safe-BY-REACHABILITY, not safe-by-harmlessness.
+monitor/spawn-worker.sh	done < <(ls -t "$NEXUS_ROOT/reports/"*.md 2>/dev/null)	1	ls	*.md	unreviewed	-
+monitor/spawn-worker.sh	done < <(ls -t "$pdir"/*.jsonl 2>/dev/null)	1	ls	/*.jsonl	unreviewed	-
+monitor/spawn-worker.sh	other_jsonl=$(ls "$HOME/.claude/projects/"*/"$SESSION_ID.jsonl" 2>/dev/null | head -1 || true)	1	ls	*/	unreviewed	-
+monitor/watcher/_test_helpers.sh	done < <(ls -l /proc/[0-9]*/cwd 2>/dev/null) )	1	ls	/proc/[0-9]*/cwd	safe	safe (a): the glob is `/proc/[0-9]*/cwd` and the RUNNING SHELL'S OWN PID guarantees at least one match for as long as the command exists, so it cannot be empty. Measured 182 matches in one sample -- the count varies with load and is not the claim; the claim is the floor of one, which is structural. Verified: `shopt -s nullglob; a=( /proc/[0-9]*/cwd )` -> ${#a[@]}>0 with /proc/$$/cwd present.
+monitor/watcher/bootstrap.sh	last_diff=$(ls -1 "$STATE_DIR/diffs"/*.md 2>/dev/null | tail -1 || true)	1	ls	/*.md	unreviewed	-
+monitor/watcher/test-agent-delivery.sh	found=$(grep -lxF "nonce=$N2" "$ST"/paste-verdicts/"$W".* 2>/dev/null | wc -l | tr -d ' ')	1	grep	.*	unreviewed	-
+monitor/watcher/test-agent-delivery.sh	tr_side=$(cat "$ST"/paste-verdicts/"$W".* 2>/dev/null | awk -F= '$1=="transport"{print $2}' | sort -u | tr '\n' ',')	1	cat	.*	unreviewed	-
+monitor/watcher/test-bootstrap-race.sh	skipped=$(cat "$WORK1"/r*.err | grep -c "another agent is bootstrapping" || true)	1	cat	/r*.err	unreviewed	-
+monitor/watcher/test-bootstrap-recover.sh	archived_of() { ls -1 "$1".archived.* 2>/dev/null | sort | tail -1; }	1	ls	.archived.*	unreviewed	-
+monitor/watcher/test-entry.sh	archived=$(ls "$ROOT/monitor/.state/"orchestrator-session-id.archived.* 2>/dev/null | head -1 || true)	1	ls	orchestrator-session-id.archived.*	unreviewed	-
+monitor/watcher/test-entry.sh	archived=$(ls "$ROOT/monitor/.state/"orchestrator-session-id.archived.* 2>/dev/null | head -1)	1	ls	orchestrator-session-id.archived.*	unreviewed	-
+monitor/watcher/test-helper-honesty.sh	_f1_after=$(ls /tmp/.th-missing-assert.* 2>/dev/null | wc -l)	1	ls	/tmp/.th-missing-assert.*	unreviewed	-
+monitor/watcher/test-helper-honesty.sh	_f1_before=$(ls /tmp/.th-missing-assert.* 2>/dev/null | wc -l)	1	ls	/tmp/.th-missing-assert.*	unreviewed	-
+monitor/watcher/test-helper-honesty.sh	_f1_child=$(ls "$_922_child_tmp"/.th-missing-assert.* 2>/dev/null | wc -l)	1	ls	/.th-missing-assert.*	unreviewed	-
+monitor/watcher/test-infra-review-recursion.sh	flat_only=$(grep -l '^## Infrastructure Issues' reports/*.md 2>/dev/null | wc -l | tr -d ' ')	1	grep	reports/*.md	unreviewed	-
+monitor/watcher/test-integration/test-wrapup-retain-close.sh	ls -t "$DIFF_DIR/"*.md 2>/dev/null | head -3 | while read -r f; do	1	ls	*.md	unreviewed	-
+monitor/watcher/test-ng-wrap-up.sh	_f1_ledger=$(cat "$SK984_PENDING"/.wf1.* 2>/dev/null)	1	cat	/.wf1.*	defect	Bare `cat` reads STDIN. With no ledger file the assignment silently takes whatever stdin offers (empty under the runner, the terminal when run by hand) instead of failing.
+monitor/watcher/test-ng-wrap-up.sh	_f2_ledger=$(cat "$SK984_PENDING"/.wf2.* 2>/dev/null)	1	cat	/.wf2.*	defect	Bare `cat` reads STDIN. With no ledger file the assignment silently takes whatever stdin offers (empty under the runner, the terminal when run by hand) instead of failing.
+monitor/watcher/test-notify-gate.sh	captured=$( { cat "$STATE"/notify-cooldown/failure.batch* 2>/dev/null | cut -f2	1	cat	/notify-cooldown/failure.batch*	unreviewed	-
+monitor/watcher/test-notify-gate.sh	t27_rem=$(cat "$STATE"/notify-cooldown/failure.batch* 2>/dev/null | wc -l | tr -d ' ')	1	cat	/notify-cooldown/failure.batch*	unreviewed	-
+monitor/watcher/test-notify-gate.sh	t29_rem=$(cat "$STATE"/notify-cooldown/failure.batch* 2>/dev/null | grep -c 'old-') || t29_rem=0	1	cat	/notify-cooldown/failure.batch*	unreviewed	-
+monitor/watcher/test-pane-cache.sh	entries=$(ls "$STATE_DIR/pane-cache"/*.line 2>/dev/null | wc -l)	1	ls	/*.line	unreviewed	-
+monitor/watcher/test-pane-cache.sh	tmp_left=$(ls "$STATE_DIR/pane-cache"/*.tmp.* 2>/dev/null | wc -l)	1	ls	/*.tmp.*	unreviewed	-
+monitor/watcher/test-pending-decisions.sh	idle_files=( $(grep -l '"kind":"idle_prompt"' "$DECISIONS_DIR/worker-A".*.json 2>/dev/null) )	1	grep	.*.json	defect	Bare `grep -l PATTERN` reads STDIN, so a vanished glob turns a file search into a stdin read and the array is populated from the wrong source.
+monitor/watcher/test-remote-enroll.sh	rec=$(ls "$PDIR/enroll/"*.token | head -1)	1	ls	*.token	unreviewed	-
+monitor/watcher/test-remote-self-enroll.sh	pending_count() { ls "$PDIR/enroll/"*.token 2>/dev/null | wc -l | tr -d ' '; }	1	ls	*.token	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	1	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	10	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	11	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	12	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	13	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	2	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	3	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	4	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	5	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	6	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	7	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	8	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	9	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	1	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	10	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	11	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	12	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	13	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	2	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	3	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	4	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	5	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	6	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	7	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	8	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-respawn.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	9	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-secondary-clone-state.sh	body=$(cat "$SPAWN_TMP/spawn-launcher-$name".*.sh 2>/dev/null)	1	cat	.*.sh	unreviewed	-
+monitor/watcher/test-secondary-clone-state.sh	body=$(cat "$SPAWN_TMP/spawn-launcher-plainw".*.sh 2>/dev/null)	1	cat	.*.sh	unreviewed	-
+monitor/watcher/test-secondary-clone-state.sh	body=$(cat "$SPAWN_TMP/spawn-launcher-standalone".*.sh 2>/dev/null)	1	cat	.*.sh	unreviewed	-
+monitor/watcher/test-secondary-clone-state.sh	gbody=$(cat "$SPAWN_TMP/spawn-launcher-gatefallback".*.sh 2>/dev/null)	1	cat	.*.sh	unreviewed	-
+monitor/watcher/test-spawn-fresh-orchestrator.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	1	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-spawn-fresh-orchestrator.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	2	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-spawn-fresh-orchestrator.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	3	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-spawn-fresh-orchestrator.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	4	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-spawn-fresh-orchestrator.sh	launchers_after=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	5	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-spawn-fresh-orchestrator.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	1	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-spawn-fresh-orchestrator.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	2	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-spawn-fresh-orchestrator.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	3	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-spawn-fresh-orchestrator.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	4	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-spawn-fresh-orchestrator.sh	launchers_before=$(ls "$RESPAWN_TMPDIR"/nexus-respawn-launch-* 2>/dev/null || true)	5	ls	/nexus-respawn-launch-*	unreviewed	-
+monitor/watcher/test-worker-nproc-bound.sh	body=$(cat "$SPAWN_TMP/spawn-launcher-$1".*.sh 2>/dev/null)	1	cat	.*.sh	unreviewed	-
+monitor/assert-shims-wrapped.sh	_asw_ps_list=$(ls -t "$_asw_ps_home"/shell-snapshots/snapshot-*.sh 2>/dev/null)	1	ls	/shell-snapshots/snapshot-*.sh	safe	safe (a): STRUCTURALLY IMMUNE at the site, not safe-by-reachability — REKEYED 2026-09-07 (#1477 F1): the two former `ls -t … | head -1` sites moved into `_asw_pick_snapshot`, which now walks the listing. Under nullglob an unmatched glob VANISHES and `ls -t` lists the CWD with RELATIVE names; the walk applies a per-candidate POST-CONDITION `case "$_asw_ps_f" in "$_asw_ps_home"/shell-snapshots/*) … *) continue` before any candidate is read, so a bare-`ls` listing contributes NOTHING and the leg degrades to NOT CHECKED (79). Same disposition as the rows it replaces, re-read against the new text.

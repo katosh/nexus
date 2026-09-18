@@ -32,7 +32,7 @@ nexus:
   # absent: it sources the module init, `module load`s this name (then
   # falls back to discovering the highest >=18 versioned module if the
   # site has no default), and re-checks. Leave as the default `nodejs`
-  # for FH <cluster> and most EasyBuild sites; override only if your site's
+  # for <your-institution> <cluster> and most EasyBuild sites; override only if your site's
   # node module is named differently. Env var NEXUS_NODE_MODULE wins
   # over this key. Has no effect on hosts where node is already on PATH.
   # See <your-org>/<other-nexus>#41.
@@ -562,18 +562,30 @@ monitor:
   # (base dev) and holds for operator approval. Gate RED or any
   # residual uncertainty -> block, surface, no bump.
   cc_auto_update:
-    # Master enable. DEFAULT TRUE — paired with cc_update.emit_enabled:
-    # false above, the autonomous gated routine is the STANDARD cc-update
-    # path and the manual nag it replaces is silenced (<your-org>/<operator>-
-    # nexus#229, operator decision 2026-06-16 — option (a): emit silent +
-    # auto-update on). The autonomy is bounded, not blind: a bump happens
+    # Master enable. TWO DEFAULTS, AND THEY DIFFER (<your-org>/nexus-code#1476):
+    # code default off, shipped template on.
+    #   * the CODE fallback (monitor/watcher/_config.sh, key ABSENT from
+    #     the config file in use) is FALSE — an auto-bump routine must
+    #     never go live as a silent side effect of `git pull` into an
+    #     existing install whose nexus.yml never gained this key;
+    #   * THIS TEMPLATE sets it TRUE, per the operator decision of
+    #     2026-06-16 (<your-org>/<your-nexus>#229, option (a): emit silent +
+    #     auto-update on). config/load.sh picks ONE file whole
+    #     ($NEXUS_CONFIG, else config/nexus.yml, else this file), so a
+    #     tree with NO config/nexus.yml (fresh clone, CI, a copied
+    #     template) runs with it ON, while an existing nexus.yml that
+    #     lacks the key runs with it OFF.
+    # Paired with cc_update.emit_enabled: false above, the autonomous
+    # gated routine is the STANDARD cc-update path and the manual nag it
+    # replaces is silenced. The autonomy is bounded, not blind: a bump happens
     # ONLY behind a cc-harness GREEN gate — monitor/cc-auto-update-apply.sh
     # refuses any verdict whose evidence does not contain `GATE GREEN`, so
     # a RED gate never bumps; a candidate needing a nexus-code compat
     # change is held on a `cc-compat` PR for operator approval, never
-    # auto-bumped. NOTE the cross-operator implication of this default: a
-    # fresh install now grants the stack autonomy to self-update Claude
-    # Code at `fire_time` out of the box. To opt OUT, set this false (and,
+    # auto-bumped. NOTE the cross-operator implication of the template
+    # value: a fresh install (this file copied, or no nexus.yml at all)
+    # grants the stack autonomy to self-update Claude Code at `fire_time`
+    # out of the box. To opt OUT, set this false (and,
     # if you also want the manual "update available" nag back, set
     # cc_update.emit_enabled: true above). Env:
     # MONITOR_CC_AUTO_UPDATE_ENABLED.
@@ -616,16 +628,21 @@ monitor:
     # Env: MONITOR_CC_AUTO_UPDATE_TRACKING_ISSUE.
     tracking_issue: ""
     # Deployment gate (nexus-code#512): the release gate vets the Claude
-    # Code BINARY; this vets the ACT of deploying it — restarting the
-    # watcher under N mid-flight agents is a different risk from
-    # restarting an idle nexus. When more than this many live tmux
-    # windows count as agents-at-risk (everything except the
-    # orchestrator, the evaluator + restart-watchdog windows and
-    # `services`), the apply is DEFERRED — nothing bumped, verdict
-    # recorded, retried at the next daily fire. 0 disables the window
-    # gate (the count is still logged in every apply record). The gate
-    # also defers while any open <your-org>/nexus-code PR touches the
-    # watcher restart path, and records how far the clone lags the
+    # Code BINARY; this vets the ACT of deploying it. It defers while any
+    # open <your-org>/nexus-code PR touches the watcher restart path or is
+    # under active review (both bounded — see defer_streak_cap below).
+    #
+    # RETIRED 2026-09-12 — `max_live_windows` IS NO LONGER READ. The
+    # live-window COUNT arm and the board-quiet arm were removed by
+    # operator decision, in these words: "a cc-update will not kill the
+    # worker, and if they, for whatever reason, would crash, then the
+    # orchestrator can continue them with no context lost." The premise
+    # was measured first (monitor/cc-auto-update-apply.sh, deployment-
+    # gate knob block). The live-window count is still ENUMERATED and
+    # written to every apply record (`live_windows=`, `unquiet_windows=`);
+    # a value for this key is inert. Left here, commented out, so an
+    # existing nexus.yml that carries it is understood rather than
+    # silently ignored. The gate still records how far the clone lags the
     # INTEGRATION branch — `monitor.integration_branch` (`#763`; was
     # `monitor.clone_drift.branch`), the branch merged fixes actually
     # land on, not `main` (`#754`) — as
@@ -633,8 +650,17 @@ monitor:
     # decisions.tsv. Pre-`#754` rows carry `behind_main=` and
     # under-report, so the two are not comparable. Read by
     # monitor/cc-auto-update-apply.sh at run time (not a watcher env).
-    # Env: CC_AUTO_MAX_LIVE_WINDOWS.
-    max_live_windows: 8
+    # (was: Env CC_AUTO_MAX_LIVE_WINDOWS — also no longer read.)
+    # max_live_windows: 8
+    # How long an open PR touching the watcher RESTART PATH counts as
+    # "under repair" after its last update (<your-org>/nexus-code#1414).
+    # The arm used to have NO recency bound, so a stalled cosmetic PR on
+    # monitor/svc.sh blocked the routine forever while the broader
+    # active-review arm (pr_active_seconds, default 7200) aged it out.
+    # Deliberately much longer than pr_active_seconds — a restart-path PR
+    # is categorically more dangerous — and independently tunable.
+    # Env: CC_AUTO_GATE_RESTART_PR_ACTIVE_SECONDS.
+    restart_pr_active_seconds: 604800
     # NOTE — `enabled` above is REGISTRATION-TIME ONLY (nexus-code#513):
     # a running watcher never re-reads it, so flipping it cannot stop an
     # armed orchestrator restart. The runtime off switch is the durable
@@ -642,6 +668,59 @@ monitor:
     #     monitor/cc-auto-update-apply.sh hold --reason "…" \
     #         [--until-version X.Y.Z | --ttl-seconds N]
     #     monitor/cc-auto-update-apply.sh unhold
+
+  # Over-limit wake loop and emit gate (issue #87, #592, #593, #976).
+  # When the orchestrator's pane renders the weekly-budget notice, the
+  # WATCHER owns the resume — the orchestrator cannot schedule its own
+  # wake while suspended. The same module also gates the operator emit,
+  # which is why the visibility knobs live here and not in a log file:
+  # withholding the operator channel silently is a strictly worse outage
+  # than the hold itself. See monitor/watcher/_over_limit.sh.
+  #
+  # Every key below is optional; the value shown IS the in-code default,
+  # so deleting the whole block changes nothing. It is spelled out because
+  # `over_limit` was previously advertised as a namespace with no example
+  # and three of its eight keys were not wired at all (#976).
+  over_limit:
+    # Seconds of margin added to the parsed reset epoch before the first
+    # wake attempt — clock skew plus the rate-limit bucket not refilling
+    # exactly on the dot. Env: MONITOR_OVER_LIMIT_WAKE_MARGIN_SECONDS.
+    wake_margin_seconds: 300
+    # Delay before the first retry when a wake attempt finds the pane
+    # still suspended. Env: MONITOR_OVER_LIMIT_INITIAL_BACKOFF_SECONDS.
+    initial_backoff_seconds: 60
+    # Cap on the exponential backoff between retries. Env:
+    # MONITOR_OVER_LIMIT_MAX_BACKOFF_SECONDS.
+    max_backoff_seconds: 300
+    # Fail OPEN (paste the resume brief, drop the row) after this many
+    # still-over-limit wake attempts. 4 ≈ 7 min of grace past the reset
+    # margin. Env: MONITOR_OVER_LIMIT_MAX_ATTEMPTS.
+    max_attempts: 4
+    # Absolute per-row hold ceiling (25h). Env:
+    # MONITOR_OVER_LIMIT_MAX_HOLD_SECONDS.
+    max_hold_seconds: 90000
+    # How long an OBSERVED over-limit sighting keeps the orchestrator
+    # emit gate suppressed. The scan refreshes it every ~60s during a
+    # genuine hold, so 600 tolerates ten consecutive missed cycles before
+    # the gate OPENS. The polarity is deliberate: absent evidence of
+    # suspension, emit. A wrong reset epoch once severed the
+    # operator↔orchestrator channel for fifteen hours in silence.
+    # RAISING this lengthens that worst case. Env:
+    # MONITOR_OVER_LIMIT_OBSERVATION_STALENESS_SECONDS.
+    observation_staleness_seconds: 600
+    # How long a hold must last before the FIRST out-of-band announcement
+    # that the orchestrator's emit channel is being withheld. 0 disables
+    # the announcement entirely (the hold then remains visible only in
+    # watcher.log, which is what made a 15h blackout pass unnoticed). Env:
+    # MONITOR_OVER_LIMIT_SUPPRESSION_ALERT_SECONDS.
+    suppression_alert_seconds: 900
+    # Cadence of the reminders AFTER that first announcement. Separate
+    # from the announcement delay on purpose: a legitimate 5h hold fired
+    # 20 critical-class bells when both used the same 15-min interval,
+    # which trains the operator to ignore exactly the signal this exists
+    # to send. Raise it if the default is still too loud for your site.
+    # Env: MONITOR_OVER_LIMIT_SUPPRESSION_REMINDER_SECONDS.
+    suppression_reminder_seconds: 3600
 
   # Continuous service-health watch (service-health-watch). The
   # `service_health` watcher task runs every registered infra service's
@@ -810,6 +889,61 @@ monitor:
     # alarm always remains). Env: MONITOR_ROFS_GITHUB_ESCALATION_ENABLED.
     github_escalation_enabled: true
 
+  # longjob-watch dispatcher (<your-org>/nexus-code#1535): ONE host-armed
+  # plugin monitor per session (`claude --plugin-dir monitor/longjob-plugin`)
+  # that polls the session's watch spool and WAKES the agent when a Slurm
+  # job / async-run token / pid / file predicate / command probe reaches
+  # ANY terminal state. Tool: monitor/longjob-watch.sh (`ng longjob`).
+  longjob:
+    # THE kill switch, and its own — not shared with any other feature (a
+    # field that selects is not a label, #1050). false = no launcher passes
+    # --plugin-dir, no session has a dispatcher, and every `longjob-watch.sh
+    # add` says so on stdout (rc 3). Default true. Env: MONITOR_LONGJOB_ENABLED.
+    enabled: true
+    # Auto-arm a watch for every `sbatch` / `srun --no-block` the PostToolUse
+    # launch hook (monitor/hooks/async-launch-detect.sh) detects, so a worker
+    # is woken on the job's terminal state with NO extra command. Jobs
+    # dismissed via declare-no-wait.sh are not watched. Default true. Env:
+    # MONITOR_LONGJOB_AUTO_WATCH.
+    auto_watch_launches: true
+    # Dispatcher loop cadence (seconds) — how often the spool is scanned and
+    # the ledger rewritten. Watches poll no more often than this, and the
+    # ledger is FRESH for 3×poll+30 s. Minimum 5. Env: MONITOR_LONGJOB_POLL_SECONDS.
+    poll_seconds: 20
+    # Per-watch probe interval (seconds) when `add` gives none. 60 keeps
+    # `sacct` load at one call per watch per minute. Env:
+    # MONITOR_LONGJOB_DEFAULT_INTERVAL_SECONDS.
+    default_interval_seconds: 60
+    # Event caps. Every delivered line costs a wake PLUS whatever work the turn
+    # decides to do (measured: 3m26s and $1.53 for one line). After
+    # session_max_events the dispatcher prints ONE final MUTED line and
+    # logs the rest (`longjob-watch.sh unmute` resumes); after
+    # watch_max_events a single watch is retired. Envs:
+    # MONITOR_LONGJOB_SESSION_MAX_EVENTS / MONITOR_LONGJOB_WATCH_MAX_EVENTS.
+    session_max_events: 60
+    watch_max_events: 8
+    # `unknown` is the probe's fifth answer ("could not tell"). After this many
+    # CONSECUTIVE unknown probes the watch emits UNKNOWN and is parked — never
+    # silence, never assumed running. Env: MONITOR_LONGJOB_UNKNOWN_MAX.
+    unknown_max: 5
+    # A watch that reaches no terminal state within this many seconds emits
+    # EXPIRED and retires (7 days). 0 = never. Env: MONITOR_LONGJOB_TTL_SECONDS.
+    ttl_seconds: 604800
+    # Bound on a single probe run (`sacct`, a `cmd:` command, …); a probe that
+    # exceeds it answers `unknown`. RELATION GUARD: must be ≤ 2×poll_seconds+30
+    # (the ledger's freshness window minus one poll), because one probe is
+    # uninterruptible and the mid-pass heartbeat fires only between probes;
+    # `dispatch` refuses a config that breaks it (stays alive, service=disabled,
+    # says so on stderr). Env: MONITOR_LONGJOB_PROBE_TIMEOUT_SECONDS.
+    probe_timeout_seconds: 30
+    # Minimum gap between two delivered lines (ms). The host's per-monitor
+    # rate limiter (2.1.272: 10 batches, refill one per 2000 ms) DISCARDS a
+    # burst and delivers only a count — invisible to this side — so the
+    # dispatcher never presents one: keep this ABOVE the host's refill
+    # interval. Costs latency (N events ≈ N × gap), never content. Env:
+    # MONITOR_LONGJOB_EMIT_MIN_GAP_MS.
+    emit_min_gap_ms: 2500
+
   # Content-hash dedup gate (issue #190 follow-up; ring + shared
   # strip in emit-gate-recover). After compose_emit assembles the
   # candidate body, the watcher computes a sha256 over a canonical
@@ -933,6 +1067,12 @@ monitor:
   # 66s startup stall). Past the budget each aborts LOUDLY and continues with
   # a partial render. Env: MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS.
   startup_render_timeout_seconds: 20
+  # Per-window allowance ADDED to that budget for the per-emit workspace
+  # renders (render_idle_prelude / the inline full-state render), which probe
+  # every worker pane and so cost O(windows): measured ~1.3 s per live window
+  # at loadavg ~40 (<your-org>/nexus-code#1406). budget = base + windows × this.
+  # 0 restores the constant budget. Env: MONITOR_RENDER_SECONDS_PER_WINDOW.
+  render_seconds_per_window: 2
 
   # Worker notifications log size cap in bytes (issue #76). The
   # default `Notification` hook (see "## Worker hooks" in
@@ -1705,14 +1845,27 @@ monitor:
     #   # default — substitute your own CIDR.
     #   from_cidr: "140.107.0.0/16"
     #
-    #   # single client — MAX security: only this one host may reach the
-    #   # pre-auth stage. Swap in the client's IP.
+    #   # single client — one address only. This is "max security" ONLY IF that
+    #   # address is the CLIENT's own. See the box below before relying on it.
     #   # from_cidr: "10.0.0.5/32"
     #
-    #   # snail2 / bastion-proxy users: if you reach this host by ProxyJump
-    #   # through a bastion, the SOURCE IP the host sees is the BASTION's, not
-    #   # your laptop's — pin the bastion. Example (FH sn2 hop):
-    #   # from_cidr: "140.107.116.184/32"
+    #   # ── THE PIN CONSTRAINS THE LAST HOP, NOT THE CLIENT ──────────────
+    #   # If you reach this host through a bastion / jump host / VPN
+    #   # concentrator / NAT, the SOURCE ADDRESS the host sees is that SHARED
+    #   # DEVICE's, not your laptop's. Pinning it authenticates infrastructure
+    #   # every user of that device shares, and constrains NOTHING about which
+    #   # client sits behind it — while reading in authorized_keys as though it
+    #   # were a client restriction. A /32 naming an institutional bastion is
+    #   # among the WEAKEST pins you can write, precisely because it reads like
+    #   # the strongest. Determine which case you are in: the peer address the
+    #   # server actually sees is the ground truth (not this file), and
+    #   # `ssh -G <target>` on the client shows the route it takes.
+    #   #
+    #   # What confines this endpoint UNCONDITIONALLY, on any topology: the
+    #   # pinned host key, public-key-only auth, the forced command, and the
+    #   # kernel sandbox. from_cidr shrinks the pre-auth surface — worth having,
+    #   # but not what makes a routable bind acceptable.
+    #   # `monitor/remote-up.sh` prints the effective meaning on every run.
     #
     #   # ANY source — conscious opt-in: exposes the SSH PRE-AUTH surface to the
     #   # whole reachable network. Auth stays pubkey-only + forced-command +
@@ -1720,6 +1873,17 @@ monitor:
     #   # channel login; but pre-auth SSH 0-days are the class this pin defends
     #   # against. Type it on purpose, not by accident.
     #   # from_cidr: "0.0.0.0/0"
+    #
+    # jump_hosts — OPTIONAL comma-separated CHAIN of ssh hops the rendered client
+    # connect lines should carry (`-J hop1,hop2`, applied IN ORDER). Empty = none.
+    # There is deliberately no default: nexus-code is cloned by every operator, so
+    # a hop name here would hand one site's topology to somebody else.
+    #
+    # Use a CHAIN, not a single hop, when the endpoint host is not directly
+    # reachable from your first bastion — off-site that is the common case, and a
+    # single -J silently assumes otherwise.
+    #
+    #   jump_hosts: "bastion.example.org,gateway.internal.example.org"
     #
     # A malformed CIDR is REFUSED (a typo must never silently degrade to
     # no-pin). Env: MONITOR_REMOTE_FROM_CIDR.

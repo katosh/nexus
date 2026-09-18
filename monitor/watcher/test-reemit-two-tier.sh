@@ -33,7 +33,8 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PASS=0; FAIL=0
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$((PASS+1))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$((PASS+1))
     else printf '  FAIL: %s\n         expected: %s\n         in:\n%s\n' "$label" "$needle" "$hay" >&2; FAIL=$((FAIL+1)); fi
 }
 assert_not_contains() {
@@ -82,9 +83,13 @@ for fn in _gh_filter_dedup_pipeline _prune_processed_comments; do
     [[ -n "$fn_def" ]] || { echo "setup: could not extract $fn" >&2; exit 1; }
     eval "$fn_def"
 done
-# `log` is undefined here (main.sh owns it); _prune_processed_comments calls
-# it. Stub to a no-op so the extracted function runs standalone.
-log() { :; }
+# `log` is undefined here (main.sh owns it); _prune_processed_comments and
+# `_reemit_log` call it. Production's `log` prints to stderr, which the
+# launcher redirects into watcher.log — so append there, mirroring the
+# effective destination. A no-op stub (what this was) makes every
+# `_reemit_log` line UNOBSERVABLE, which is how a warning can be asserted
+# green while reaching nobody.
+log() { printf '[%s] %s\n' "$(date -Is)" "$*" >> "$STATE_DIR/watcher.log"; }
 
 reg="$STATE_DIR/unacked-mentions.lines"
 CR_ID="4746440400"
@@ -221,6 +226,148 @@ assert_not_contains "foreign block NEVER enters direct emission" "$direct_out" "
 assert_contains     "operator block DOES direct-emit"            "$direct_out" "id=$CR_ID"
 # The context block is still retained after the pending pass (not consumed).
 assert_contains     "context block still retained post-pending"  "$(cat "$reg" 2>/dev/null)" "id=$FID"
+
+echo '=== 9. ISSUE-keyed mention (your-org/nexus-code#1500): the reaction target is the ISSUE, not a comment ==='
+# WHAT THIS COVERS AND WHY IT WAS MISSING. Sections 1-8 above all use a
+# COMMENT-keyed block (`kind=pr` + a comment database id), and the classifier
+# was correct for exactly that shape — so the whole suite stayed green while
+# every `issue_new=` mention (i.e. every new issue the operator opens in a
+# cross-repo) re-emitted on the 5-minute FAST tier and could be evicted by
+# neither a rocket nor eyes. A test asserting only the comment path is what
+# let it through; this section asserts the ISSUE path.
+#
+# The `gh` stub emulates GitHub's real 404 surface rather than a generic
+# failure: reactions exist ONLY at `repos/<r>/issues/<n>/reactions`, and the
+# issue-COMMENT endpoint answers `HTTP 404` on stderr at rc 1, exactly as
+# `gh api` does for an issue NUMBER fed to the comment endpoint. Before the
+# fix the classifier asked the comment endpoint, got that 404, returned
+# "unknown", and the entry was never evicted.
+ISSUE_ID="1499"
+ISSUE_BLOCK=$'mention=your-org/nexus-code kind=issue_new n=1499 id=1499 author=operator src=body\n  body: @your-org-bot ensure full consistency of the documentation'
+# The block as it is ALREADY PERSISTED in a live registry — registered before
+# `_deliveries.sh` learned to stamp `src=body`. The fix must classify this one
+# too, or the live noise does not stop without hand-editing watcher state.
+LEGACY_BLOCK=$'mention=your-org/nexus-code kind=issue_new n=1499 id=1499 author=operator\n  body: @your-org-bot ensure full consistency of the documentation'
+
+gh_issue_only() {
+    [[ "$1" == api ]] || return 1
+    case "$2" in
+        repos/*/issues/1499/reactions)
+            printf '%s' '[{"content":"rocket","user":{"login":"your-org-bot[bot]"}},{"content":"eyes","user":{"login":"your-org-bot[bot]"}}]' ;;
+        repos/*/issues/1499)
+            printf 'open' ;;
+        *)  printf 'gh: Not Found (HTTP 404)\n' >&2; return 1 ;;
+    esac
+}
+export -f gh_issue_only
+
+for label in "src=body (current emitter)" "legacy entry, no src= (already on disk)"; do
+    case "$label" in
+        src=body*) blk="$ISSUE_BLOCK" ;;
+        *)         blk="$LEGACY_BLOCK" ;;
+    esac
+    reset_state
+    printf '%s\n' "$blk" | _reemit_register
+    assert_contains "issue-keyed entry registered — $label" "$(cat "$reg")" "id=$ISSUE_ID"
+    MONITOR_REEMIT_LIVE_RECHECK=true MONITOR_REEMIT_GH_CMD=gh_issue_only _reemit_gc
+    assert_not_contains "🚀 on the ISSUE evicts the issue-keyed entry — $label" \
+        "$(cat "$reg" 2>/dev/null)" "id=$ISSUE_ID"
+    assert_contains "eviction logged reason=rocket-live — $label" \
+        "$(cat "$STATE_DIR/watcher.log" 2>/dev/null)" "reason=rocket-live"
+done
+
+echo '=== 10. _mention_target_key: which object carries the reaction (#1500) ==='
+assert_eq "issue_new → the ISSUE, keyed on n (NOT on id)" "issue:1499" \
+    "$(_mention_target_key 'mention=your-org/nexus-code kind=issue_new n=1499 id=1499 author=operator src=body')"
+assert_eq "legacy issue_new without src= still resolves to the issue" "issue:1499" \
+    "$(_mention_target_key 'mention=your-org/nexus-code kind=issue_new n=1499 id=1499 author=operator')"
+assert_eq "body mention: id is the issue databaseId, n is the key" "issue:33" \
+    "$(_mention_target_key 'cross_repo=external/repo-c kind=issue n=33 id=5003 author=operator src=body')"
+assert_eq "PR OPEN marked src=body → the PR itself" "issue:12" \
+    "$(_mention_target_key 'mention=your-org/nexus-code kind=pr n=12 id=987654321 author=operator src=body')"
+assert_eq "conversation comment → the comment id" "comment:4746440400" \
+    "$(_mention_target_key 'mention=your-org/nexus-code kind=pr n=310 id=4746440400 author=operator')"
+assert_eq "PR review COMMENT (has path=) → the pulls/comments endpoint" "review_comment:555" \
+    "$(_mention_target_key 'mention=your-org/nexus-code kind=pr_review n=9 id=555 author=operator path=monitor/x.sh')"
+assert_eq "top-level PR review (no path=) → no reactable object" "none:9" \
+    "$(_mention_target_key 'mention=your-org/nexus-code kind=pr_review n=9 id=555 author=operator')"
+assert_eq "no identity at all → none:0 (fail closed)" "none:0" \
+    "$(_mention_target_key 'mention=your-org/nexus-code kind=issue author=operator')"
+
+echo '=== 11. permanent 404 vs TRANSIENT gh failure are DIFFERENT answers (#1500) ==='
+# The constraint this fix had to respect: a 404 must become loud WITHOUT the
+# transient arm losing its fail-soft behaviour. Asserted as two separate
+# facts — the return codes, and that neither one evicts.
+gh_404() { [[ "$1" == api ]] || return 1; printf 'gh: Not Found (HTTP 404)\n' >&2; return 1; }
+gh_flaky() { return 7; }   # network/5xx shape: non-zero, nothing about 404
+export -f gh_404 gh_flaky
+out=$(MONITOR_REEMIT_GH_CMD=gh_404 _reemit_reaction_state x/y 1 'comment:1'); rc=$?
+assert_eq "permanent 404 → rc 4, no output" "4|" "${rc}|${out}"
+out=$(MONITOR_REEMIT_GH_CMD=gh_flaky _reemit_reaction_state x/y 1 'comment:1'); rc=$?
+assert_eq "transient failure → rc 2, no output (unchanged fail-soft)" "2|" "${rc}|${out}"
+out=$(MONITOR_REEMIT_GH_CMD=gh_404 _reemit_reaction_state x/y 9 'none:9'); rc=$?
+assert_eq "no reactable object → rc 3, no call, no output" "3|" "${rc}|${out}"
+# Endpoint selection is observable: capture the path the classifier asks for.
+ASKED_FILE="$STATE_DIR/asked.txt"
+gh_echo() { [[ "$1" == api ]] || return 1; printf 'ASKED %s\n' "$2" >> "$ASKED_FILE"; printf '[]'; }
+export -f gh_echo; export ASKED_FILE
+ask() { : > "$ASKED_FILE"; MONITOR_REEMIT_GH_CMD=gh_echo _reemit_reaction_state your-org/nexus-code "$1" "$2" >/dev/null; cat "$ASKED_FILE"; }
+assert_contains "issue target asks the ISSUE endpoint" "$(ask 1499 issue:1499)" \
+    "ASKED repos/your-org/nexus-code/issues/1499/reactions"
+assert_contains "comment target asks the issue-COMMENT endpoint" "$(ask 4746440400 comment:4746440400)" \
+    "ASKED repos/your-org/nexus-code/issues/comments/4746440400/reactions"
+assert_contains "review-comment target asks the pulls/comments endpoint" "$(ask 555 review_comment:555)" \
+    "ASKED repos/your-org/nexus-code/pulls/comments/555/reactions"
+assert_contains "omitted target keeps the historical comment contract" "$(ask 4746440400 '')" \
+    "ASKED repos/your-org/nexus-code/issues/comments/4746440400/reactions"
+
+echo '=== 12. a TRANSIENT gh failure must NEVER evict a live mention (#1500 constraint) ==='
+# The failure direction that would be WORSE than the bug. Same registry, same
+# GC, only the stub differs: 404 and flaky both leave the entry standing.
+for stub in gh_404 gh_flaky; do
+    reset_state
+    printf '%s\n' "$ISSUE_BLOCK" | _reemit_register
+    MONITOR_REEMIT_LIVE_RECHECK=true MONITOR_REEMIT_GH_CMD="$stub" _reemit_gc
+    assert_contains "$stub: entry RETAINED (no eviction on an unclassifiable probe)" \
+        "$(cat "$reg" 2>/dev/null)" "id=$ISSUE_ID"
+    assert_contains "$stub: entry stays tier=fast (not spuriously demoted)" \
+        "$(cat "$reg" 2>/dev/null)" "tier=fast"
+    # …and the two are told APART in the log: the permanent one is named, the
+    # transient one stays quiet (a WARN on every flaky poll is noise that
+    # trains the operator to ignore the line that matters).
+    if [[ "$stub" == "gh_404" ]]; then
+        assert_contains "$stub: permanent 404 is LOGGED, not silent" \
+            "$(cat "$STATE_DIR/watcher.log" 2>/dev/null)" "HTTP 404"
+    else
+        assert_not_contains "$stub: transient failure logs NO 404 warning" \
+            "$(cat "$STATE_DIR/watcher.log" 2>/dev/null)" "HTTP 404"
+    fi
+done
+
+echo '=== 13. backoff stamp names its target kind and repo-scopes issue numbers (#1500) ==='
+# `comment-1499.ts` for what was actually ISSUE #1499 is the artefact that
+# made #1500 cost twenty minutes to localize, and an issue NUMBER is
+# repo-LOCAL, so two repos' #1499 shared one stamp.
+bdir="$STATE_DIR/reemit-backoff"; rm -rf "$bdir"
+MONITOR_REEMIT_BACKOFF_SECONDS=300 _filter_reemit_backoff <<<"$ISSUE_BLOCK" >/dev/null
+[[ -f "$bdir/issue-your-org_nexus-code-1499.ts" ]] \
+    && { echo "  PASS: issue-keyed stamp is kind-qualified and repo-scoped"; PASS=$((PASS+1)); } \
+    || { echo "  FAIL: expected $bdir/issue-your-org_nexus-code-1499.ts; got: $(ls "$bdir" 2>/dev/null)" >&2; FAIL=$((FAIL+1)); }
+[[ -f "$bdir/comment-1499.ts" ]] \
+    && { echo "  FAIL: an ISSUE was stamped as a comment (the #1500 naming defect)" >&2; FAIL=$((FAIL+1)); } \
+    || { echo "  PASS: no misleading comment-1499.ts"; PASS=$((PASS+1)); }
+# Another repo's #1499 must NOT collide with the one above.
+OTHER_BLOCK=$'mention=your-org/other-repo kind=issue_new n=1499 id=1499 author=operator src=body\n  body: @your-org-bot different repo, same number'
+o13=$(MONITOR_REEMIT_BACKOFF_SECONDS=300 _filter_reemit_backoff <<<"$OTHER_BLOCK")
+assert_contains "another repo's #1499 is NOT suppressed by the first repo's stamp" "$o13" "your-org/other-repo"
+# And the comment spelling is byte-identical to the pre-change one, so stamps
+# already on disk keep working with no migration.
+rm -rf "$bdir"
+MONITOR_REEMIT_BACKOFF_SECONDS=300 _filter_reemit_backoff <<<"$CR_BLOCK" >/dev/null
+[[ -f "$bdir/comment-$CR_ID.ts" ]] \
+    && { echo "  PASS: comment stamps keep the pre-change filename (no migration)"; PASS=$((PASS+1)); } \
+    || { echo "  FAIL: comment stamp filename changed; existing stamps invalidated" >&2; FAIL=$((FAIL+1)); }
+rm -rf "$bdir"
 
 echo
 echo "=== summary: $PASS passed, $FAIL failed ==="

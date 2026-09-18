@@ -108,14 +108,6 @@ build_case() {
     # Health verdict is a file the fixture flips: `test -f $ROOT/healthy`.
     HEALTH_FLAG="$ROOT/healthy"
 
-    # Spawned-sleeper ledger. A FILE, not a variable, and that is the whole
-    # of your-org/nexus-code#860's first cause: `start_sleeper` is called as
-    # `SP=$(start_sleeper …)`, and a command substitution runs its body in a
-    # SUBSHELL, so `SLEEPERS="$SLEEPERS $!"` was discarded on every return.
-    # Measured: the variable was empty on every run, so `cleanup_case`'s reap
-    # loop iterated ZERO times while the suite reported ALL TESTS PASSED.
-    SLEEPER_LEDGER="$ROOT/.sleepers"
-    : > "$SLEEPER_LEDGER"
 
     printf '#!/usr/bin/env bash\necho "${2:-}"\n' > "$ROOT/config/load.sh"
     chmod +x "$ROOT/config/load.sh"
@@ -149,14 +141,30 @@ TM
 cleanup_case() {
     local pf p
     [[ -n "${ROOT:-}" ]] || return 0
-    # 1. The sleepers this case recorded. Signalled through the fixture-root
-    #    identity guard, which works on a reparented pid where the own-child
-    #    guard cannot.
-    if [[ -n "${SLEEPER_LEDGER:-}" && -f "$SLEEPER_LEDGER" ]]; then
-        while read -r p; do
-            [[ "$p" =~ ^[0-9]+$ ]] && th_kill_fixture_pid "$p" "$ROOT" KILL
-        done < "$SLEEPER_LEDGER"
-    fi
+    # 1. NO RECORDED-PID REAP. `#890` reaped the sleepers this case recorded,
+    #    through `th_kill_fixture_pid`'s fixture-root identity guard. That
+    #    guard cannot discriminate here, and it introduced a ~35% flake in
+    #    case 6 (your-org/nexus-code#918). Bisected single-variable at
+    #    loadavg ~46, six runs each:
+    #
+    #      pre-#890 (no reap at all)          case 6 failed 0 / 6
+    #      #890 as merged                     case 6 failed 2 / 6
+    #      #890 without the /proc sweep       case 6 failed 1 / 6, LEAK 6 / 6
+    #      #890 without THIS reap             case 6 failed 0 / 6, LEAK 0 / 6
+    #
+    #    A recorded pid is exactly what `th_kill_fixture_pid`'s own header
+    #    warns about — it can be RECYCLED — and the fixture-root check that
+    #    normally saves it is blind in this case, because the process the pid
+    #    was recycled onto lives in the SAME root running the SAME wrapper
+    #    (case 6 kills the orphan and relaunches a supervisor into it). The
+    #    identity guard is then satisfied by the wrong process. That chain is
+    #    the best-supported reading, not something I isolated directly; what
+    #    IS measured is the table above.
+    #
+    #    The /proc sweep below subsumes it anyway: it enumerates from the
+    #    LIVE world by cwd instead of trusting a pid recorded earlier, which
+    #    is this whole cluster's thesis. Dropping the reap keeps the leak
+    #    property intact — 6/6 runs, LEAK assertion green.
     # 2. Supervisors svc.sh itself recorded during the case.
     for pf in "$ROOT"/monitor/.state/services/*.pid; do
         [[ -f "$pf" ]] || continue
@@ -171,13 +179,30 @@ cleanup_case() {
     th_reap_fixture_root "$ROOT" KILL 4 >/dev/null || \
         echo "WARN: fixture root $ROOT still had live processes after the sweep" >&2
     rm -rf "$ROOT"
-    unset ROOT SVC RECOVER REG BIN WINDOWS HEALTH_FLAG SLEEPER_LEDGER
+    unset ROOT SVC RECOVER REG BIN WINDOWS HEALTH_FLAG
 }
 
 # An interrupted run (^C, or the TERM run-tests.sh sends on a timeout) used to
 # skip cleanup entirely — the file carried no trap at all. Idempotent: every
 # step above is guarded on $ROOT still being set.
-trap 'cleanup_case' EXIT INT TERM HUP
+#
+# INT/TERM/HUP EXIT, they do not resume (your-org/nexus-code#913). A bare
+# handler returns to the interrupted line, so the suite carried on with ROOT
+# unset and every later case ran against a torn-down fixture. Re-raising with
+# the default disposition is what makes the exit status honest to whatever is
+# waiting on it — `run-tests.sh` reads it. The EXIT arm still fires on the way
+# out and is idempotent, so cleanup does not run twice destructively.
+_on_signal() {
+    local sig="$1"
+    cleanup_case
+    rm -f "$ROOT_LEDGER" 2>/dev/null || true
+    trap - "$sig" EXIT
+    kill -"$sig" $$
+}
+trap 'cleanup_case; rm -f "$ROOT_LEDGER" 2>/dev/null || true' EXIT
+trap '_on_signal INT'  INT
+trap '_on_signal TERM' TERM
+trap '_on_signal HUP'  HUP
 
 # A wrapper that marks its own pid and idles — stands in for a supervised
 # daemon. Re-runs append to $marker, so a genuine bounce is visible as a 2nd
@@ -202,18 +227,10 @@ health_tracks_daemon() { printf 'p=$(cat %q 2>/dev/null); [ -n "$p" ] && kill -0
 
 # Start a live process whose argv contains the wrapper path AND whose cwd is
 # the service workdir — both halves of the discovery predicate. Echoes its pid.
-#
-# The pid is recorded to a FILE. Every caller uses `X=$(start_sleeper …)`, and
-# a command substitution body runs in a subshell whose variable writes are
-# discarded on return — so the previous `SLEEPERS="$SLEEPERS $p"` never
-# reached the parent shell and the reap list was empty on every run
-# (your-org/nexus-code#860). A file crosses the subshell boundary; a variable
-# cannot.
 start_sleeper() {
     local wrapper="$1" workdir="${2:-$ROOT/wd}"
     ( cd "$workdir" && exec bash "$wrapper" >/dev/null 2>&1 ) &
     local p=$!
-    printf '%s\n' "$p" >> "$SLEEPER_LEDGER"
     sleep 0.4
     printf '%s' "$p"
 }
@@ -543,19 +560,24 @@ if [[ -s "$ROOT_LEDGER" ]]; then
     while read -r _r; do
         [[ -n "$_r" && "$_r" == /* && "$_r" != "/" ]] && _roots+=( "$_r" )
     done < "$ROOT_LEDGER"
-    while IFS= read -r _line; do
-        [[ "$_line" =~ /proc/([0-9]+)/cwd\ -\>\ (.*)$ ]] || continue
-        _p="${BASH_REMATCH[1]}"
-        _cw="${BASH_REMATCH[2]}"
-        _cw="${_cw% (deleted)}"
-        (( _p == $$ )) && continue
-        for _r in "${_roots[@]}"; do
-            if [[ "$_cw" == "$_r" || "$_cw" == "$_r"/* ]]; then
-                leak_survivors+="  pid $_p cwd=$_cw"$'\n'
-                break
-            fi
-        done
-    done < <(ls -l /proc/[0-9]*/cwd 2>/dev/null)
+    # ROUTED THROUGH `_th_reap_scan`, NOT RE-IMPLEMENTED (your-org/nexus-code#913).
+    # This check used to carry its own copy of the /proc cwd walk, excluding
+    # only `$$` and never leaving the root — i.e. `#913`'s exact shape, sixty
+    # lines from the primitive that was hardened against it, inside the diff of
+    # the PR that generalised the principle. Measured on EMPTY roots, where the
+    # correct answer is "no survivors": from a main shell inside a checked root
+    # it reported 1 false survivor (its own scan subshell), and from a `$( )`
+    # inside one, 2. Not reachable here — this suite's main shell never `cd`s
+    # into a fixture root — which is precisely the accidental safety that made
+    # `#890`'s helper look correct too.
+    #
+    # A second copy of the walk is a second place to get the observer wrong, so
+    # the primitive now takes several roots and there is one copy.
+    while read -r _p; do
+        [[ "$_p" =~ ^[0-9]+$ ]] || continue
+        _cw=$(readlink "/proc/$_p/cwd" 2>/dev/null) || _cw='<unreadable>'
+        leak_survivors+="  pid $_p cwd=${_cw% (deleted)}"$'\n'
+    done < <(cd / 2>/dev/null; _th_reap_scan "${_roots[@]}")
 fi
 rm -f "$ROOT_LEDGER"
 if [[ -z "$leak_survivors" ]]; then

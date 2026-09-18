@@ -47,9 +47,22 @@ RUN_INTEGRATION=1 monitor/watcher/run-tests.sh --filter integration
 `run-tests.sh` picks the suite up automatically (each file self-
 skips when the env gate is unset, so the default fast loop pays
 only the ~50 ms of `bash -c '<skip>'` per scenario). `--list` tags
-them as `(integration)` and `--filter` matches by path suffix, so a
-filter like `integration` catches both the file in this directory
-and the legacy `test-respawn-loop-integration.sh` in `watcher/`.
+them `(integration? mentions RUN_INTEGRATION; …)` and `--filter`
+matches by path suffix, so a filter like `integration` catches both
+the file in this directory and the legacy
+`test-respawn-loop-integration.sh` in `watcher/`.
+
+**The tag says "mentions", and that is the honest word**
+(<your-org>/nexus-code#1041 item 2). The `--list` predicate is a
+`grep -q` over the whole file, so a usage comment or a `grep`
+pattern earns the tag — it is not evidence that a file GATES on the
+variable. Most scenarios here mention `RUN_INTEGRATION` only in
+their usage header; the real gate is `_harness.sh`, which they
+source. Do not read the tag as a gating claim, and do not "tighten"
+the predicate: five of the six scenarios that mention the token
+mention it only in a comment, so a comment-excluding rule would
+drop them while keeping the one known false positive, which carries
+the token inside a `grep` pattern string.
 
 ## Layout
 
@@ -106,20 +119,29 @@ and the legacy `test-respawn-loop-integration.sh` in `watcher/`.
   `list_really_idle_workers`'s suppression branch), and the
   disappearance prune end-to-end.
 
-## What's NOT here yet
+## The `#78` two-pass landing — COMPLETE
 
-The issue calls for a two-pass landing — Pass A (this directory)
-ships the infrastructure plus one example. Pass B fills in the
-remaining four end-to-end scenarios; **scenarios 1/4 and 2/4
-have shipped (`test-slow-grind-respawn.sh`,
-`test-wrapup-retain-close.sh`)**. Two remain, each tracked in the
-issue body and a follow-up PR:
+The issue called for a two-pass landing: Pass A (this directory)
+shipped the infrastructure plus one example, Pass B the remaining
+four end-to-end scenarios. **All four of Pass B have shipped:**
 
-1. **Spawn → busy → claude exits → operator relaunches** — requires
-   tmux `remain-on-exit on` plus a respawn assertion through
-   `main.sh`'s eligible-comments loop.
-2. **Spawn → same-name recycled spawn → stale wrap-up ignored** —
-   asserts on the spawn-time seed introduced by `#73`'s D2.
+1. `test-slow-grind-respawn.sh` (1/4)
+2. `test-wrapup-retain-close.sh` (2/4)
+3. `test-graceful-exit-relaunch.sh` (3/4) — graceful `claude` exit →
+   relaunch, over tmux `remain-on-exit on` plus the
+   `monitor/claude-loop.sh` opt-in wrapper.
+4. `test-same-name-recycle.sh` (4/4) — same-name worker recycle →
+   stale wrap-up ignored, asserting on the spawn-time seed from
+   `#73`'s D2.
+
+The directory has since grown a second family the Layout section
+above does not enumerate: `test-realmodel-*.sh` drives the REAL
+`claude` binary against the auth-free mock backend
+(`monitor/cc-harness/mock-backend.py`), and
+`test-jupyter-service-real.sh` drives real labsh servers on
+throwaway ports. **`ls monitor/watcher/test-integration/` is the
+list; the Layout section above is a reading aid for the original
+four files and is not exhaustive.**
 
 Adding a scenario is mechanical once the harness is in place: source
 `_harness.sh`, call `harness_setup`, spawn the stub with the env

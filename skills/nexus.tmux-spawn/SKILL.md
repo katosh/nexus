@@ -61,29 +61,155 @@ The orchestrator learns about their progress through the watcher loop
 (reports under `reports/`, the dashboard, `tmux list-windows` snapshots),
 not through the Agent tool's transcript.
 
-**Never instruct a worker to `SendMessage` the orchestrator.** A
-tmux-spawned worker is an independent `claude` session — not an
-in-process subagent and not an Agent Team peer — so the call fails
-("No agent named 'orchestrator' is currently addressable"). The
-worker→orchestrator channel is the report + `ng wrap-up` event
-(surfaced by the watcher), plus `sandbox-notify` for urgent
-out-of-band pings. True cross-session messaging would require Agent
-Teams (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` + `TeamCreate`),
-which the standard spawn path does not set up.
+**Cross-session `SendMessage` WORKS between tmux-spawned sessions —
+but it is NOT a drop-in replacement for a paste.** This paragraph used
+to say the call fails ("No agent named 'orchestrator' is currently
+addressable") and that real cross-session messaging needed Agent Teams.
+That was true when it was written (`b0e44230`, 2026-06-02) and is false
+now: the feature shipped in Claude Code **2.1.224**. Measured on
+2.1.246 against a purpose-spawned probe peer, with a negative control
+(`<your-org>/nexus-code#1043`):
+
+- an idle peer is **woken** — it starts a turn with no other stimulus;
+- a **busy** peer receives it *between tool calls, mid-turn*, without
+  interrupting the running tool or aborting its remaining work;
+- a dead peer **on the LOCAL registry** fails loud (`success:false`) —
+  measured for both a graceful exit and a `SIGKILL`. This is a TIE, not
+  a win: `paste-followup.sh` is fail-closed against a dead pane too:
+  it `die`s at `paste-followup.sh:1030-1033` before the send-keys —
+  once for a positively DEAD pane and once for a verdict it could
+  not establish — and refuses outright at `paste-followup.sh:555`
+  when `_pane-live.sh` is unavailable at all. `#745` (a paste into a dead pane kills
+  the tmux server, 20/20 measured) is the hazard of **raw** `tmux
+  send-keys`, which no nexus caller uses. **Do not generalise the loud
+  failure past the local path:** a send to a dead peer's *Remote
+  Control* registration was measured returning `success:true` with a
+  `msg_id` ~3 min after `SIGKILL`, with no receipt written — i.e. success
+  reported into a void;
+- it fires the receiver's `UserPromptSubmit` hook and is visible in the
+  receiver's pane.
+
+**worker→orchestrator: use it.** That direction previously had no
+mechanism at all, only the report + `ng wrap-up` event and
+`sandbox-notify` (which has been observed missed). It is now carried in
+the always-injected worker floor (`skills/nexus.worker-defaults`), so
+every worker is told the capability exists; `<your-org>/nexus-code#1096`
+is why.
+
+**Resolve the name from `ListAgents`. Do not construct it, and do not
+scan `~/.claude/sessions/` for it.** `ListAgents` is the only source
+measured to answer this correctly, because it filters for LIVENESS and
+the session files do not:
+
+- **`cwd == $NEXUS_ROOT` is NOT unique.** This paragraph said "(measured
+  unique)" and that was refuted on 2026-08-27: **two** rows matched, both
+  named `orchestrator`, same `sessionId` and `bridgeSessionId`, different
+  `pid` and different `pidDomain` — a stale row surviving a sandbox
+  restart (`0:@388.%388`, pid dead) beside the live one (`0:@1.%1`).
+  `ListAgents` listed only the live one.
+- **The `monitor.target_window` equivalence did not typecheck.** That key
+  is a window **NAME** (default `orchestrator`); the session row's `tmux`
+  field is `session:@window-id.%pane-id`. No string match relates them.
+  The key is also absent from `config/nexus.yml` here, so a bare
+  `config/load.sh monitor.target_window` exits **2**; every real caller
+  passes the `orchestrator` default (`spawn-worker.sh:1973`,
+  `watcher/_config.sh:24`).
+
+Since `#1047` the messaging name of a TMUX-BACKED session IS its tmux window
+name. **The two name sets are NOT equal, though, and reading them as equal is
+its own mis-delivery.** Measured 2026-08-28T00:1x PDT on this board:
+
+```
+ListAgents names (18 peers + self) : 19
+tmux list-windows names            : 12
+intersection                       : 11   ← every tmux-backed agent, name == window
+ListAgents only                    :  8   ← Remote Control sessions, no tmux window
+tmux only                          :  1   ← `services`, a window that is not an agent
+```
+
+So each side contains something the other does not: an addressable agent need
+not have a window, and a window need not be an addressable agent. **Never
+enumerate `tmux list-windows` to find agents** — that is how you address
+`services`, and how you miss every Remote Control peer.
+
+The older hazard (a workdir-derived `nexus-code-agentmsg-1c` beside `-37`)
+survives only on the DEGRADED path, where a Claude Code pin without `--name`
+falls back to the derived form (`spawn-worker.sh:907` prints "NOT passing
+--name; this worker self-names from its cwd basename"). That is the reason to
+*read* the name rather than assume the window name, not a reason to go to the
+session files.
+
+**Never follow the `success:false` did-you-mean hint blind** — it
+proposes near-neighbour names, and with sibling workers differing by two
+characters (`overlay` beside `overlay-sk`) a blind retry is a
+mis-delivery to the wrong agent. Re-read `ListAgents` instead.
+
+**orchestrator→worker: keep using `monitor/paste-followup.sh`.**
+A raw `SendMessage` fires the worker's `UserPromptSubmit` hook but
+writes **no** `machine-input.tsv` stamp — six `SendMessage`s to a
+worker produced zero ledger rows; two `paste-followup.sh` calls to the
+same worker produced two.
+
+It does **not** cause `operator-engaged`, and an earlier revision of
+this paragraph wrongly said it did. The `UserPromptSubmit` hook fires
+inside the *receiving* session, so the stamp carries the window's OWN
+spawn session-id (`monitor/worker-heartbeat.sh` reads `.session_id`
+from the hook payload); `_openg_prompt_is_self` (`_idle_probe.sh:1339`) compares it against
+`windows/<window>.json`'s `session_id`, they match, and the SELF
+branch at `_idle_probe.sh:2541` — which sits between MACHINE and
+OPERATOR — classifies it as the worker's own pane activity. **The
+stall-nag is not muted.**
+
+**The real harm is that the re-task is INVISIBLE to the watcher**,
+which is worse. A stamped paste re-anchors the window's idle-age and
+supersedes its last wrap-up; a raw `SendMessage` does neither. So a
+wrapped worker re-tasked by raw `SendMessage` never supersedes its
+wrap-up, and once it idles again it classifies **`wrapped`** — an
+affirmative all-clear for work it never reported.
+
+**Live `pane-state` busy is NOT a backstop for this.** It defers
+retirement and does not restore the report signal; by consuming the
+standing `window-retain` it *promotes* the row from a suppressed
+`retained` to a confident `wrapped`. `retire-preflight.sh:1609-1631`
+applies the same `up_is_self` qualifier and will not defer either.
+The failure mode is a **silently unreported task**, stated by the
+board as a completed one.
+
+`paste-followup.sh` also confirms submission against the target's own
+transcript and reports exit 3 rather than asserting an outcome it did
+not observe. That check cannot see a `SendMessage` at all: cross-session
+messages arrive `promptSource=system`, `isMeta=true`, and the
+`_JQ_SUBMISSION` filter at `paste-followup.sh:660-671` rejects both
+(`select((.isMeta // false) | not)` and
+`.promptSource != "system" and .promptSource != "sdk"`).
+`SendMessage` confirms hand-off, not that the peer acted.
 
 For worker-pane inspection, call `monitor/pane-state.sh <window-index>`
-instead of parsing `tmux capture-pane` output yourself. It
-classifies the pane into ELEVEN states — `idle | busy |
-user-typing | autosuggest-only | empty | blocked | absent |
-over-limit | working-background | working-self-paced |
-idle-orphan-async` — and reports `active=<0|1>`, the
-source-of-truth for "is this real user input or just Claude
-Code's autosuggest ghost". Do not match against a shorter
-list: `working-background` and `working-self-paced` both mean
-the worker is ACTIVE, and dropping them into an else branch
-is how a live worker gets retired (the misread
-`retire-preflight.sh` Hard gate 0 exists to prevent,
-2026-06-15).
+instead of parsing `tmux capture-pane` output yourself.
+**`monitor/pane-state.sh --states` IS the vocabulary — run it
+rather than trusting any list, here or elsewhere.** At the time of
+writing it prints twelve: `idle | busy | user-typing |
+autosuggest-only | empty | blocked | absent | over-limit |
+working-background | working-self-paced | idle-orphan-async |
+unknown`. The line also reports `active=<0|1>` and
+`input=<typed|ghost|blank|?>` — the latter is the source-of-truth
+for "is this real user input or just Claude Code's autosuggest
+ghost", which is undecidable from plain text.
+
+Do not match against a shorter list, and **never make a kill
+decision from a list you enumerated by hand** — ask
+`monitor/_bookkeeping.sh:bk_pane_kill_authorized`, an allowlist
+(`idle`, `autosuggest-only`, `absent`, `idle-orphan-async`) with a
+default-DENY arm. `working-background` and `working-self-paced`
+both mean the worker is ACTIVE; `empty` means "don't know yet";
+`unknown` means the classifier could not look at all. Dropping any
+of them into a permissive else branch is how a live worker gets
+retired — the misread that `retire-preflight.sh` Hard gate 0
+exists to prevent (2026-06-15). Two FIELDS ride the `busy` line rather than
+being states of their own — `queued=1` (input already waiting
+behind a running turn: do not paste again) and `throttled=1`
+(mid-turn under `/low-priority`, retry banner up, no tokens
+moving).
 
 **Manual fallback** when the helper returns something surprising or
 appears miscalibrated (e.g. after a Claude Code release): inspect
@@ -148,8 +274,17 @@ monitor/spawn-worker.sh \
 
 ### What the helper does
 
-- Resolves `NEXUS_ROOT` from its own location, so it works from
-  forks and fresh clones with no path hardcoding.
+- Resolves `NEXUS_ROOT` with no path hardcoding, so it works from
+  forks and fresh clones. **An inherited, valid `$NEXUS_ROOT` wins**
+  (`#577`); otherwise the script-relative root is used, *unless*
+  that root is structurally a SECONDARY CLONE (it sits under some
+  ancestor's `work/`), in which case it re-roots loudly to the
+  primary so nexus STATE — action log, skeptic markers, reports —
+  never forks into a clone nothing reads. The WORKDIR is untouched;
+  the worker still works in the clone. `NEXUS_ALLOW_SECONDARY_ROOT=1`
+  forces the old script-relative behaviour, which is what you want
+  only when you are testing a MODIFIED floor / `worker-settings.json`
+  / `claude-loop.sh` from inside a clone.
 - Reads `$NEXUS_ROOT/skills/nexus.worker-defaults/SKILL.md`,
   extracts the `## Worker floor` section body up to the next
   `## ` H2 (or EOF), and prepends it to the prompt with a `---`
@@ -661,6 +796,23 @@ which are relevant. Read full reports only if they directly inform
 your task.
 ```
 
+`{project}` is the report's **filename slug**, and it is **cwd-derived**:
+`report-init` takes the first path segment after the last `/work/` in `$PWD`,
+and only falls back to the window name when it ran OUTSIDE a `work/` tree. So
+**the slug is not the window name**, and a filename glob is a SILENT ZERO
+whenever they differ — measured, 136 of 709 reports on this corpus, with 21
+windows indexed under two or more slugs (`<your-org>/nexus-code#1195`).
+
+To find the reports a WINDOW claims, key on the frontmatter instead:
+
+```
+monitor/ng reports-for-window <window>     # newest first
+# rc 0 found · rc 1 looked and found none · rc 2 COULD NOT LOOK
+```
+
+Read `rc 2` as *"the corpus was not enumerable"*, never as *"no reports"* —
+that distinction is the whole of `#813`.
+
 This lets the agent triage itself instead of bloating the
 orchestrator's prompt with pre-digested summaries that may be wrong
 or stale. Replace `{project}` with the actual subdirectory name
@@ -733,10 +885,12 @@ wholesale — point at them.
 | "Fix at the source" decision | dispatching a fix to a tool the lab/operator owns | this skill, "Fix at the source" below |
 | Watcher-isolation rule | worker touches `monitor/watcher/*` | `CLAUDE.md` "Spawning workers" |
 | Independent clone vs worktree | two workers might collide on the same project, or worker reads/edits files the watcher reads | `CLAUDE.md` "Independent clones for parallel work" |
+| Shared-clone commit rule | two or more workers share ONE clone (a fan-out, or several legs briefed on the same tree) | this skill, "A shared clone has a shared INDEX" below |
 | `#N` auto-link gotcha | worker authors GitHub comment markdown | `CLAUDE.md` "Common gotchas" |
 | `user-attachments` `fetch-asset` rule | worker reads user-pasted assets | `nexus.bot` "Reading user-pasted assets" |
 | `uv pip` over `pip` | worker installs Python packages | `CLAUDE.md` "Common gotchas" |
 | HPC efficiency reminders | worker submits Slurm / batch jobs | `CLAUDE.md` "Shared infrastructure" |
+| State-isolation rule, BY CLASS | worker runs nexus suites or ad-hoc `ng`/`declare-wait`/`log-action` calls against a fixture | `docs/contributing/tests.md` "Two isolation classes" — brief it as: SPAWN class (`spawn-worker.sh`, `launcher.sh`) → `env -u NEXUS_ROOT -u NEXUS_LOCALS`; STATE class (`ng`, `obligations.sh`, `paste-followup.sh`, …) → pin `NEXUS_STATE_DIR` to a `mktemp -d` you also `mkdir -p`, for PROBES only, never as ambient env around a suite that manages its own state dir (<your-org>/nexus-code#1349, #1386). `env -u` alone advances the STATE chain to config `nexus.root`, which on the primary IS the primary |
 | Deliverable-write-path probe | worker writes a result to a path outside its working tree | this skill, "Deliverable-write targets" below |
 | Push-author-verify (REST form) | worker `git push`-es to an existing PR branch they didn't open | `nexus.bot` "Pushing to an existing PR branch" |
 | Three-tier taxonomy rationale | worker is itself orchestrator-shaped (e.g. `nexus.self-fix`) | "Why three tiers" below |
@@ -745,6 +899,74 @@ wholesale — point at them.
 Not exhaustive. When briefing, skim `CLAUDE.md` and `nexus.bot`
 for items pertinent to *this* task; consult the full source rather
 than a remembered subset.
+
+### A shared clone has a shared INDEX, and correct staging does not protect it
+
+`<your-org>/nexus-code#1308`. Three agents in one clone. Agent A staged its
+own paths explicitly. Agent B staged its own path explicitly — the
+documented reason to stage, so `guards-for-diff` can see an untracked
+file (`#1054`). Agent C then ran a **pathless** `git commit` after its
+own explicit `git add`, and the commit swept **six files across three
+agents** into one commit, freezing a **mid-flight** version of another
+agent's file (blob `e44bb051d6d0` in the commit against `3d01e10a3914`
+in the working tree minutes later — so that agent's next `git diff HEAD`
+would have compared against a snapshot of its own half-finished work).
+
+**Every `git add` involved was correct and explicitly path-scoped.** The
+defect is one level down: `git commit` without a pathspec commits the
+**entire index**, and the index is shared. So the natural remedy —
+"stage explicit paths" — is necessary and **not sufficient**, which is
+the shape this workspace warns about everywhere else: it *feels* like
+the fix and leaves the hazard. Nothing detected it; another agent
+noticed an unexpected HEAD move.
+
+**The remedy has a caveat `#1308` does not state, and it is a second
+silent loss.** `git commit -- <paths>` is pathspec-scoped and does
+protect the siblings — but it commits **WORKING-TREE** content, not what
+you staged, and then **overwrites the index entry too**. Measured on
+this host, git 2.17.1, in a throwaway fixture: `a.txt` staged at `v2`
+and edited on to `v3` in the worktree, with a sibling's `sibling.txt`
+also in the index —
+
+    BEFORE  staged a.txt=v2  worktree a.txt=v3  index=[a.txt sibling.txt]
+    git commit -m scoped -- a.txt
+    AFTER   committed a.txt=v3  files=[a.txt]  index still=[sibling.txt]
+            worktree a.txt=v3   staged a.txt now=v3
+
+The sibling survived; the **deliberate partial stage did not**. A worker
+that staged a reviewed hunk and kept editing gets the *unreviewed* edit
+committed, silently, at rc 0. So the remedy trades a loud-ish
+cross-agent sweep for a quiet within-agent one.
+
+**What to put in the brief, in order of preference:**
+
+1. **A worker in a shared clone should not commit at all.** The
+   orchestrator sequences commits — that is what was actually done on
+   `#1308` after the fact, and it is the only form with no caveat.
+2. If a worker must commit, brief it as **`git commit -m … -- <explicit
+   paths>`**, *and* brief the caveat: the worktree is what lands, so do
+   not leave a partial stage you care about.
+3. **Isolation beats discipline.** If the legs need to commit
+   independently, give each its own worktree or clone — the index is
+   then not shared and neither remedy is needed. Lockfiles are not the
+   mechanism; isolation is.
+
+The same shared-clone class covers two more hazards worth naming in a
+fan-out brief: **concurrent runs of one suite produce false reds** (`#1308`
+§1 — measured `130 passed / 1 failed` overlapped against `128 / 0` solo,
+and separately a `test-helper-honesty` red under three overlapping
+`ng guards-for-diff --run` jobs), and **an accidental `async-run` job
+cannot be stopped by its launcher** (`#1308` §3). Tell each leg to give
+every scratch path a **unique per-leg** directory: a shared one silently
+destroyed a parent's fixtures. **And "scratch" never means `/tmp/c71780`**
+(<your-org>/nexus-code#1422): that directory holds SOCKETS ONLY — its short
+name exists for the 107-byte `sun_path` limit — and briefs that named it
+as general scratch left 16.5 GiB of worker payload there, which the
+tmpfs reaper deliberately never touches. Scratch goes under the session
+scratchpad (`$TMPDIR`, the directory the spawn brief names) or inside the
+leg's own clone; the tmpfs reporter (`tmpfs-check` in
+`monitor/services.registry.example`, `#1441`) now flags non-socket
+bytes under `c71780` as a contract violation.
 
 ### Why three tiers (orchestrator meta-knowledge)
 

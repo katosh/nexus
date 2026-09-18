@@ -64,22 +64,60 @@ steps = doc["jobs"]["slow-band"]["steps"]
 band = [s for s in steps if s.get("id") == "band"]
 assert len(band) == 1, f"expected exactly one step with id: band, got {len(band)}"
 out.joinpath("band.sh").write_text(band[0]["run"])
-# The verdict step is the one whose ENTIRE body is a drift-check invocation on
-# a real ledger. Substring matching alone is not enough: the band step's own
-# comments name slow-band-drift.sh, and the selftest step invokes it too.
+# The verdict step is the one that INVOKES the drift check on a real ledger.
+# Substring matching alone is not enough: the band step's own comments name
+# slow-band-drift.sh, and the selftest step invokes it too — hence the id and
+# --selftest exclusions.
+#
+# MATCHED PER-LINE, NOT BY `startswith` ON THE WHOLE BODY
+# (your-org/nexus-code#1283). The old form required the invocation to be the
+# FIRST thing in the body, which silently encoded "the body is exactly one
+# command" into a selector whose stated job is to FIND the step. The moment the
+# step grew an exit-code `case` — needed so drift rc 4 (ENV-UNPROVEN) does not
+# hard-fail the band — the selector matched NOTHING and the guard failed on its
+# `len(verdict) == 1` assertion, i.e. it reported the step as ABSENT rather than
+# as changed. A selector that answers "gone" when it means "different" is the
+# false-zero shape this repo names as its dominant defect class.
+#
+# Fail-closed is preserved: the `len(verdict) == 1` assertion below still
+# refuses zero matches AND refuses two, so a second real verdict step is still
+# a red rather than a silent pick.
+def _invokes_drift(body):
+    return any(line.strip().startswith("bash monitor/slow-band-drift.sh")
+               for line in str(body).splitlines())
 verdict = [s for s in steps
            if s.get("id") != "band"
-           and str(s.get("run", "")).strip().startswith("bash monitor/slow-band-drift.sh")
+           and _invokes_drift(s.get("run", ""))
            and "--selftest" not in str(s.get("run", ""))]
 assert len(verdict) == 1, f"expected exactly one real verdict step, got {len(verdict)}"
 # `if:` may be absent -> empty string, which is what the assertion below rejects.
 out.joinpath("verdict_if.txt").write_text(str(verdict[0].get("if", "")))
+# THE BODY TOO (your-org/nexus-code#1283). Until now this suite extracted the
+# verdict step's `if:` and never its `run:`, so the step's exit-code handling
+# was PRESENT IN THE WORKFLOW AND EXECUTED BY NOTHING. That distinction is the
+# whole point of the rc-4 arm: an arm that is merely present is indistinguishable
+# from one that is unreachable, and both read identically in a diff.
+out.joinpath("verdict.sh").write_text(str(verdict[0].get("run", "")))
 # Positional fact: the verdict must come AFTER the band step it consumes.
 out.joinpath("order.txt").write_text(
     "ok" if steps.index(verdict[0]) > steps.index(band[0]) else "bad")
 PY
 
 BAND_SRC="$TMP/band.sh"
+VERDICT_SRC="$TMP/verdict.sh"
+
+# run_verdict <ledger-file> -> "<rc>|<stdout+stderr>"
+# Executes the REAL extracted step body under `bash -e`, exactly as the runner
+# does, against a REAL ledger. The `${{ }}` expression the step uses for the
+# ledger path is substituted the way Actions would, and nothing else is altered.
+run_verdict() {
+    local ledger="$1" d rc=0 out
+    d=$(mktemp -d -t slow-band-verdict-XXXXXX)
+    sed 's|\${{ steps.band.outputs.ledger }}|'"$ledger"'|g' "$VERDICT_SRC" > "$d/v.sh"
+    out=$( cd "$REPO" && bash -e "$d/v.sh" 2>&1 ) || rc=$?
+    printf '%s|%s\n' "$rc" "$out"
+    rm -rf "$d"
+}
 
 # ---- fixture: a fake repo the band body can run against ---------------------
 mk_fixture() {
@@ -203,6 +241,65 @@ case "$vif" in
 esac
 [ "$(cat "$TMP/order.txt")" = "ok" ] && ok "A6b verdict step is ordered after the band step" \
                                      || bad "A6b verdict step precedes the band step it consumes"
+
+# ---------------------------------------------------------------------------
+# A7 — THE VERDICT STEP'S EXIT-CODE HANDLING IS REACHABLE, NOT MERELY PRESENT
+# (your-org/nexus-code#1283).
+#
+# WHY THIS EXISTS. Until now this suite extracted the verdict step's `if:` and
+# never its `run:`, so the body was PRESENT IN THE WORKFLOW AND EXECUTED BY
+# NOTHING. `#1283` added an exit-code `case` to that body — rc 4 (ENV-UNPROVEN)
+# must NOT hard-fail the band, or the whole fix is inert and an honest
+# environment decline still reds the blocking band. A `case` arm that is merely
+# present is indistinguishable from one that is unreachable, and both read
+# identically in a diff. So the arms are DRIVEN, against REAL ledgers, through
+# the REAL extracted body.
+#
+# The four drift verdicts, and what the step must do with each:
+#   rc 0  clean            -> step SUCCEEDS, no warning
+#   rc 4  ENV-UNPROVEN     -> step SUCCEEDS **and says so**: not a clearance
+#   rc 1  NEW-RED          -> step FAILS. The fix must not have widened the gate.
+#   rc 2  REFUSED          -> step FAILS. An unreadable/empty ledger is not a pass.
+echo "=== A7: the verdict step's exit-code arms, EXECUTED ==="
+VTMP=$(mktemp -d -t slow-band-vfx-XXXXXX)
+printf '# empty tolerated set, as shipped\n' > "$VTMP/known.tsv"
+
+# Positive control FIRST: the executor can produce a PASS at all. Without this,
+# every "step failed" assertion below could be an artefact of a broken harness.
+printf 'a.sh\tPASS\t1\t0\t2\n' > "$VTMP/clean.tsv"
+v=$(run_verdict "$VTMP/clean.tsv"); rc="${v%%|*}"
+[ "$rc" = "0" ] && ok "A7a CONTROL: a clean ledger -> the step SUCCEEDS (harness works)" \
+                || bad "A7a CONTROL FAILED: a clean ledger did not succeed (rc=$rc) — every assertion below is uninterpretable"
+
+# rc 4 — the arm the whole #1283 fix depends on.
+printf 'a.sh\tENVSKIP\t1\t0\t?\n' > "$VTMP/env.tsv"
+v=$(run_verdict "$VTMP/env.tsv"); rc="${v%%|*}"; out="${v#*|}"
+[ "$rc" = "0" ] && ok "A7b rc4 ENV-UNPROVEN does NOT fail the step (the fix is not inert)" \
+                || bad "A7b rc4 FAILED the step (rc=$rc) — an honest ENV decline still reds the blocking band; #1283 is inert"
+case "$out" in
+    *"::warning::"*) ok "A7c …and it is NOT laundered into a silent pass: a ::warning:: is emitted" ;;
+    *)               bad "A7c rc4 passed SILENTLY — a caveat nobody is told is not a caveat" ;;
+esac
+
+# rc 1 — the gate must not have been widened.
+printf 'a.sh\tFAIL\t1\t0\t2\n' > "$VTMP/red.tsv"
+v=$(run_verdict "$VTMP/red.tsv"); rc="${v%%|*}"
+[ "$rc" != "0" ] && ok "A7d a NEW-RED still FAILS the step (rc=$rc) — the gate was not widened" \
+                 || bad "A7d a NEW-RED PASSED — the rc-4 arm swallowed a real regression"
+
+# rc 1 again, but MIXED: the case that matters most. An ENVSKIP sharing a
+# ledger with a real red must not launder it.
+printf 'a.sh\tFAIL\t1\t0\t2\nb.sh\tENVSKIP\t1\t0\t?\n' > "$VTMP/mixed.tsv"
+v=$(run_verdict "$VTMP/mixed.tsv"); rc="${v%%|*}"
+[ "$rc" != "0" ] && ok "A7e FAIL + ENVSKIP still FAILS (rc=$rc) — an ENVSKIP cannot launder a red" \
+                 || bad "A7e FAIL + ENVSKIP PASSED — a regression laundered by an environment decline"
+
+# rc 2 — REFUSED. An unreadable/empty ledger is not a clearance.
+: > "$VTMP/empty.tsv"
+v=$(run_verdict "$VTMP/empty.tsv"); rc="${v%%|*}"
+[ "$rc" != "0" ] && ok "A7f an EMPTY ledger still REFUSES and fails the step (rc=$rc)" \
+                 || bad "A7f an empty ledger PASSED — a vacuous green"
+rm -rf "$VTMP"
 
 echo "== mutants: each must redden a NAMED assertion above =="
 

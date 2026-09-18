@@ -1,0 +1,24 @@
+# trap-bare-return.allowlist — ADJUDICATED-BENIGN sites for
+# monitor/watcher/trap-bare-return-lint.sh (your-org/nexus-code#1513).
+#
+# A row records a bare `return` in a function the lint's static walk REACHES
+# from a trap handler, whose status a human has established NO caller consumes
+# — so the wrong status a trap-time `return` reports (bash return.def: the
+# status of the last command BEFORE the trap fired, not of the test above it)
+# decides nothing. The reason must say WHERE the status is dropped: which call
+# site ignores it, or that the function is the handler itself (an EXIT/signal
+# handler's own status is discarded by bash).
+#
+# Columns (TAB-separated): <repo-relative path>	<function>	<reason>
+# The reason is REQUIRED; a row without one is a REFUSAL (exit 3), not a pass.
+#
+# BOTH DIRECTIONS RED. A reachable bare return with no row reddens the lint;
+# a row with no reachable bare return at that path/function is STALE and
+# reddens it too — the function was fixed, renamed, or the walk no longer
+# reaches it — so this list keeps describing the tree instead of accreting.
+# The fix is always preferable to a row: `return 0` / `return 1` explicitly,
+# or `return $?` immediately after the deciding command.
+#
+# Census at 8d0cff30 (bash monitor/watcher/trap-bare-return-lint.sh): 92
+# functions in the tracked shell corpus hold a bare return; the walk reaches
+# NONE of them, so this list is empty. Before adding a row, prefer the fix.

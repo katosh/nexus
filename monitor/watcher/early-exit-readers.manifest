@@ -25,13 +25,38 @@
 # double-report every site.
 #
 # file<TAB>kind<TAB>scope<TAB>count
+#
+# SCOPE, DECIDED (your-org/nexus-code#1130). An EXECUTED COMMAND STRING IS ITS
+# OWN PIPEFAIL SCOPE — see the classifier header, axis item 5. Three effects on
+# this file, each measured against the 114-row manifest at `ca6205c`:
+#
+#   +1  monitor/watcher/test-service-health-selfmatch.sh  head  test  1
+#       The `#1130` worked example, and a TRUE positive that was absent. That
+#       file sets only `set -u` and has zero sourcers, so it is off the FILE
+#       axis; its `:156` `"set -o pipefail; pgrep -f $M | head -1"` enables the
+#       option in the string the runner evaluates, and the `| head -1` in that
+#       same string really does run under it. Its `:152` (`"false | head -1"`)
+#       is correctly still absent — that string carries no pipefail.
+#   -1  monitor/watcher/test-fm-lib.sh        (2 -> 1)
+#   -1  monitor/watcher/test-remote-enroll.sh (3 -> 2)
+#       Both are PROSE: `echo "… old sed|head -1 …"` in a section banner. The
+#       pipe is inside a string that enables nothing, so it is not a site.
+#
+# Nothing else moved. The classifier now decides scope from whether the PIPE is
+# quoted rather than from whether the file is on the axis, and that reading was
+# cross-checked against the two alternatives before it shipped: masking per line
+# alone loses `_github.sh:374` (a `| head -n1` after a six-line single-quoted
+# `jq` program) and carrying the mask alone loses eight, including
+# `monitor/ng:6354`. "Quoted" is therefore believed only when both readings
+# agree.
 monitor/_labsh_build_evidence.sh	head	prod	2
 monitor/_remote_lib.sh	awk-exit	prod	2
 monitor/_remote_lib.sh	head	prod	1
 monitor/bootstrap-recover.sh	head	prod	3
 monitor/calibrate-pressure-thresholds.sh	head	prod	1
-monitor/cc-auto-update-apply.sh	head	prod	2
+monitor/cc-auto-update-apply.sh	head	prod	4
 monitor/cc-harness/_lib.sh	awk-exit	prod	1
+monitor/cc-harness/_lib.sh	head	prod	1
 monitor/cc-harness/demo.sh	head	prod	1
 monitor/cc-restart-watchdog-loop.sh	head	prod	3
 monitor/claude-loop.sh	head	prod	1
@@ -41,7 +66,7 @@ monitor/jupyter-up.sh	head	prod	1
 monitor/labsh-supervised.sh	head	prod	4
 monitor/lit.sh	head	prod	1
 monitor/nexus-root-sensitivity.sh	head	prod	3
-monitor/ng	head	prod	8
+monitor/ng	head	prod	9
 monitor/node-forensics.sh	head	prod	3
 monitor/remote-up.sh	awk-exit	prod	1
 monitor/skeptic-channel.sh	awk-exit	prod	1
@@ -51,7 +76,9 @@ monitor/test-ci-trigger-audit.sh	head	test	1
 monitor/test-coldbuild-guard.sh	head	test	5
 monitor/test-interactive-sessions.sh	head	test	1
 monitor/test-interpreter-parity.sh	head	test	1
+monitor/tmpfs-guard.sh	head	prod	2
 monitor/toolchain-bash.sh	head	prod	1
+monitor/verify-worker-started.sh	head	prod	1
 monitor/watcher/_clone_drift.sh	awk-exit	prod	1
 monitor/watcher/_clone_drift.sh	head	prod	1
 monitor/watcher/_deliveries.sh	head	prod	2
@@ -63,19 +90,22 @@ monitor/watcher/_lib.sh	awk-exit	prod	1
 monitor/watcher/_lib.sh	head	prod	1
 monitor/watcher/_mentions.sh	head	prod	1
 monitor/watcher/_respawn.sh	head	prod	2
-monitor/watcher/_service_health.sh	head	prod	3
+monitor/watcher/_service_health.sh	head	prod	6
 monitor/watcher/_unstick.sh	head	prod	2
 monitor/watcher/launcher.sh	head	prod	1
 monitor/watcher/main.sh	head	prod	8
-monitor/watcher/run-tests.sh	grep-m	prod	1
+monitor/watcher/run-tests.sh	grep-m	prod	2
 monitor/watcher/run-tests.sh	head	prod	1
 monitor/watcher/spawn-fresh-orchestrator.sh	head	prod	2
 monitor/watcher/test-absent-evidence-precedence.sh	awk-exit	test	3
 monitor/watcher/test-absent-evidence-precedence.sh	head	test	2
+monitor/watcher/test-auth-hold.sh	awk-exit	test	7
+monitor/watcher/test-auth-hold.sh	head	test	1
 monitor/watcher/test-bootstrap-recover.sh	head	test	3
 monitor/watcher/test-bootstrap-stub-claude.sh	head	test	3
 monitor/watcher/test-bootstrap-venv.sh	head	test	1
 monitor/watcher/test-calibrate-pressure-thresholds.sh	head	test	2
+monitor/watcher/test-cc-auto-update.sh	head	test	4
 monitor/watcher/test-channel-integration.sh	head	test	1
 monitor/watcher/test-claude-md-ancestor-timeline.sh	head	test	2
 monitor/watcher/test-claude-md-count-provenance.sh	head	test	3
@@ -84,7 +114,7 @@ monitor/watcher/test-emit-gate.sh	head	test	1
 monitor/watcher/test-engage-stress.sh	head	test	1
 monitor/watcher/test-entry.sh	head	test	2
 monitor/watcher/test-erofs-escalation.sh	head	test	1
-monitor/watcher/test-fm-lib.sh	head	test	2
+monitor/watcher/test-fm-lib.sh	head	test	1
 monitor/watcher/test-fs-guard.sh	head	test	2
 monitor/watcher/test-hosting-migration.sh	head	test	1
 monitor/watcher/test-install-prompt-content.sh	head	test	1
@@ -92,6 +122,7 @@ monitor/watcher/test-integration/_harness.sh	awk-exit	test	3
 monitor/watcher/test-integration/test-graceful-exit-relaunch.sh	awk-exit	test	1
 monitor/watcher/test-integration/test-jupyter-service-real.sh	head	test	6
 monitor/watcher/test-integration/test-realmodel-apispoof.sh	awk-exit	test	1
+monitor/watcher/test-integration/test-realmodel-longjob-wake.sh	head	test	2
 monitor/watcher/test-integration/test-realmodel-overlimit.sh	awk-exit	test	1
 monitor/watcher/test-integration/test-same-name-recycle.sh	awk-exit	test	3
 monitor/watcher/test-integration/test-same-name-recycle.sh	head	test	1
@@ -103,19 +134,25 @@ monitor/watcher/test-ng-close.sh	head	test	1
 monitor/watcher/test-over-limit.sh	head	test	1
 monitor/watcher/test-pane-state-boot-absent.sh	awk-exit	test	6
 monitor/watcher/test-pane-state-boot-absent.sh	head	test	6
-monitor/watcher/test-pane-state.sh	head	test	3
+monitor/watcher/test-pane-state-claude-identity.sh	awk-exit	test	2
+monitor/watcher/test-pane-state-claude-identity.sh	head	test	5
+monitor/watcher/test-pane-state-longjob-discount.sh	head	test	2
+monitor/watcher/test-pane-state.sh	head	test	2
 monitor/watcher/test-paste-followup.sh	head	test	2
 monitor/watcher/test-prune-rotation.sh	head	test	2
-monitor/watcher/test-remote-enroll.sh	head	test	3
+monitor/watcher/test-registry-unreadable-refusal.sh	head	test	1
+monitor/watcher/test-remote-enroll.sh	head	test	2
 monitor/watcher/test-remote-forced-command.sh	head	test	1
 monitor/watcher/test-remote-service-log.sh	head	test	1
 monitor/watcher/test-reports-cache-stable.sh	awk-exit	test	1
 monitor/watcher/test-reports-roll.sh	head	test	2
 monitor/watcher/test-request-channel.sh	head	test	1
+monitor/watcher/test-request-reply-skeptic-ledger.sh	head	test	2
 monitor/watcher/test-respawn-loop-integration.sh	head	test	1
 monitor/watcher/test-respawn.sh	head	test	13
 monitor/watcher/test-run-tests-bounded.sh	head	test	2
 monitor/watcher/test-secondary-clone-state.sh	head	test	2
+monitor/watcher/test-service-health-selfmatch.sh	head	test	1
 monitor/watcher/test-service-health.sh	head	test	2
 monitor/watcher/test-sigpipe-assertion-lint.sh	head	test	1
 monitor/watcher/test-skeptic-channel.sh	head	test	2
@@ -126,8 +163,10 @@ monitor/watcher/test-spawn-pathfront.sh	head	test	1
 monitor/watcher/test-spawn-worker-reply-to.sh	head	test	4
 monitor/watcher/test-spawn-worker-resume.sh	head	test	2
 monitor/watcher/test-spawn-worker.sh	head	test	6
+monitor/watcher/test-stub-claude-classifier-sigpipe.sh	head	test	1
 monitor/watcher/test-svc.sh	head	test	3
 monitor/watcher/test-task-registration-table.sh	head	test	1
+monitor/watcher/test-tmux-selection-restore.sh	head	test	5
 monitor/watcher/test-tmux-window-resolver.sh	head	test	5
 monitor/watcher/test-unstick.sh	head	test	3
 monitor/watcher/test-upload-asset-concurrency.sh	head	test	1

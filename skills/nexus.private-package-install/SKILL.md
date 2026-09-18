@@ -14,6 +14,17 @@ Bootstrap scripts that install private dependencies MUST use the **user's OAuth 
 
 This mirrors the fail-loud rule in `nexus.bot` (empty `GH_TOKEN` → exit non-zero, never fall through to user `gh` auth). Same principle, inverted direction: there we refuse silent bot → user fallback for writes; here we refuse silent user → bot fallback for reads.
 
+### Get the PAT from `ng user-pat`, not from a bare `gh auth token`
+
+`monitor/user-pat.sh` (alias `ng user-pat`) is the nexus's accessor for exactly this token, and it is the form to prefer everywhere `gh auth token` appears below. What it buys over the bare call:
+
+- **A resolution chain**, highest first: `$NEXUS_USER_PAT` → `$GITHUB_PAT` → `gh auth token` → `$NEXUS_USER_PAT_FILE` (default `~/.claude/.nexus-user-pat`, chmod 600). A bare `gh auth token` is only the third of those, so it fails on any host where `gh` is not logged in even though a PAT is provisioned.
+- **It refuses to read `GH_TOKEN` or `GITHUB_TOKEN`, deliberately** — by nexus convention those carry the BOT installation token at many call sites, and quietly substituting one reproduces the precise silent-404 this skill exists to prevent.
+- **Distinct exit codes**: `0` token printed (or validation/probe succeeded), `2` no PAT available (stderr says how to provision one), `3` validation/probe FAILED (401 / 403 / 404). Two failures that a bare `gh auth token` collapses into one empty string.
+- **Pre-flight verbs**: `./monitor/user-pat.sh --validate` (the PAT is alive — hits `/user`) and `./monitor/user-pat.sh --probe <owner>/<repo>` (the PAT can actually read THAT repo). Run `--probe` before a ten-minute bootstrap: a `repo`-scope-too-narrow PAT fails identically to a missing one, and only the probe separates them.
+
+Every form below is written with `$(gh auth token)` because that is the primitive; inside a nexus, substitute `$(./monitor/user-pat.sh)` for it verbatim.
+
 ## R — `remotes::install_github` and friends
 
 ```bash

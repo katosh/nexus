@@ -213,72 +213,144 @@ fi
 
 # --- Case D: Phase 6 lab-addons matrix walkthrough --------------------
 #
-# The matrix table in 6.1 names a Cartesian (your-org/* repo) × (HPC
-# host) combo per row. Assert all four cells are present and each cell
-# carries the expected action keyword. This catches a class of bug
-# where someone reorders the matrix or drops a row during a rewrite
-# and the prompt becomes ambiguous.
+# The matrix table in 6.1 drives the addon offer. Assert every cell is
+# present and carries the expected action keyword — this catches the
+# class of bug where someone reorders the matrix or drops a row during
+# a rewrite and the prompt becomes ambiguous.
+#
+# TWO VARIANTS, ONE ASSERTION. This suite SHIPS to the public mirror,
+# where `monitor/public-mirror/overlay/install-prompt.phase6.md` has
+# already replaced Phase 6 by the time the suite runs. The mirror's
+# matrix is deliberately conditioned on the HPC signal ALONE (2 cols,
+# 2 rows) because the fork has no lab-org gate; source's is the
+# Cartesian org × HPC (3 cols, 4 rows). Pinning the source-only header
+# literal made this suite fail 2 on every built tree
+# (your-org/nexus-code#979 defect 1). So locate the table STRUCTURALLY
+# — the first pipe-row after the `Decision matrix` lead-in, which both
+# variants carry — and assert the shape that the column count declares.
+# Anything that is neither shape is a FAIL, never a skip.
 
 echo '=== Case D: Phase 6 lab-addons matrix is well-formed ==='
 
-# Extract the matrix section: everything from the matrix header
-# `| your-org/* repo` down to the next blank line.
 matrix=$(awk '
-    /^\| your-org\/\* repo/ { capture = 1 }
-    capture && NF == 0 { capture = 0 }
-    capture { print }
+    /^Decision matrix/ { seen = 1; next }
+    seen && /^\|/      { capture = 1 }
+    capture && NF == 0 { exit }
+    capture            { print }
 ' "$PROMPT")
 
 if [[ -z "$matrix" ]]; then
-    fail "Phase 6.1 matrix header not found (table moved or renamed?)"
+    fail "Phase 6.1 decision matrix not found (no pipe-table after a 'Decision matrix' lead-in)"
 else
-    # Count data rows (skip the header + separator).
+    # Column count from the header row: `| a | b |` splits to N+2 fields.
+    matrix_cols=$(head -1 <<<"$matrix" | awk -F'|' '{ print NF - 2 }')
     data_rows=$(echo "$matrix" | awk '/^\|---/ { sep=1; next } sep { print }' | wc -l)
-    if (( data_rows == 4 )); then
-        pass "matrix has exactly 4 data rows"
-    else
-        fail "matrix expected 4 data rows; got $data_rows"
-    fi
 
-    # Per-cell assertions.
-    if grep -qE '^\| yes \| yes \|.*Offer' <<<"$matrix"; then
-        pass "matrix row (your-org=yes, HPC=yes) → Offer"
-    else
-        fail "matrix row (your-org=yes, HPC=yes) missing 'Offer' keyword"
-    fi
-    if grep -qE '^\| yes \| no .*\|.*[Ss]kip install|^\| yes \| no .*\|.*[Hh]PC contexts' <<<"$matrix"; then
-        pass "matrix row (your-org=yes, HPC=no) → note / skip install"
-    else
-        fail "matrix row (your-org=yes, HPC=no) missing note/skip keyword"
-    fi
-    if grep -qE '^\| no  \| yes \|.*[Ss]kip silently' <<<"$matrix"; then
-        pass "matrix row (your-org=no, HPC=yes) → Skip silently"
-    else
-        fail "matrix row (your-org=no, HPC=yes) missing 'Skip silently' keyword"
-    fi
-    if grep -qE '^\| no  \| no  \|.*[Ss]kip silently' <<<"$matrix"; then
-        pass "matrix row (your-org=no, HPC=no) → Skip silently"
-    else
-        fail "matrix row (your-org=no, HPC=no) missing 'Skip silently' keyword"
-    fi
+    case "$matrix_cols" in
+    3)  # source variant: (asset-repo owner) × (HPC host) × Action
+        if (( data_rows == 4 )); then
+            pass "matrix (2-signal variant) has exactly 4 data rows"
+        else
+            fail "matrix (2-signal variant) expected 4 data rows; got $data_rows"
+        fi
+        if grep -qE '^\| yes \| yes \|.*Offer' <<<"$matrix"; then
+            pass "matrix row (org=yes, HPC=yes) → Offer"
+        else
+            fail "matrix row (org=yes, HPC=yes) missing 'Offer' keyword"
+        fi
+        if grep -qE '^\| yes \| no .*\|.*([Ss]kip install|[Hh]PC contexts)' <<<"$matrix"; then
+            pass "matrix row (org=yes, HPC=no) → note / skip install"
+        else
+            fail "matrix row (org=yes, HPC=no) missing note/skip keyword"
+        fi
+        if grep -qE '^\| no  \| yes \|.*[Ss]kip silently' <<<"$matrix"; then
+            pass "matrix row (org=no, HPC=yes) → Skip silently"
+        else
+            fail "matrix row (org=no, HPC=yes) missing 'Skip silently' keyword"
+        fi
+        if grep -qE '^\| no  \| no  \|.*[Ss]kip silently' <<<"$matrix"; then
+            pass "matrix row (org=no, HPC=no) → Skip silently"
+        else
+            fail "matrix row (org=no, HPC=no) missing 'Skip silently' keyword"
+        fi
+        ;;
+    2)  # mirror variant: (HPC host) × Action
+        if (( data_rows == 2 )); then
+            pass "matrix (1-signal variant) has exactly 2 data rows"
+        else
+            fail "matrix (1-signal variant) expected 2 data rows; got $data_rows"
+        fi
+        if grep -qE '^\| yes \|.*Offer' <<<"$matrix"; then
+            pass "matrix row (HPC=yes) → Offer"
+        else
+            fail "matrix row (HPC=yes) missing 'Offer' keyword"
+        fi
+        if grep -qE '^\| no  \|.*([Ss]kip install|[Hh]PC contexts)' <<<"$matrix"; then
+            pass "matrix row (HPC=no) → note / skip install"
+        else
+            fail "matrix row (HPC=no) missing note/skip keyword"
+        fi
+        ;;
+    *)
+        fail "Phase 6.1 matrix has $matrix_cols columns; expected 3 (source) or 2 (mirror overlay)"
+        ;;
+    esac
 fi
 
-# --- Case E: bootstrap context block names the three matrix signals ----
+# --- Case E: bootstrap context block names the Phase 6 signals ---------
 #
-# The bootstrap-install.sh HEADER block surfaces three lab-context
-# signals. If the prompt's matrix references signals the bootstrap
-# doesn't emit (or vice versa), the agent can't make the documented
+# The bootstrap-install.sh HEADER block surfaces the lab-context
+# signals Phase 6 decides on. If the prompt names a signal the
+# bootstrap doesn't emit, the agent can't make the documented
 # decision. Tie the loop with a name-match assertion.
+#
+# DERIVED, NOT PINNED. The labels used to be a hardcoded list, which
+# made this the second half of the same drift: the mirror overlay
+# renames what Phase 6 calls its signals, and bootstrap-install.sh is
+# source-only — it cannot be overlaid to match. Derive the labels from
+# whichever Phase 6 is actually installed and require the EMITTER to
+# carry each one; that is the direction the coupling really runs.
+#
+# The comparison strips angle brackets from both sides. scrub.pl is
+# mode-dependent — `.md` gets the angle replacement and `.sh` the bare
+# one — so on a scrubbed tree the prose label and the emitted label
+# differ by exactly `<`/`>` and can never match literally. No signal
+# label legitimately contains an angle bracket, so the normalization
+# only ever widens by that one character class.
 
 echo '=== Case E: matrix signals match bootstrap context lines ==='
 
-for signal in "HPC host (your-institution)" "hpc-skills installed" "labsh installed"; do
-    if grep -qF "$signal" "$PROMPT"; then
-        pass "prompt references context signal '$signal'"
-    else
-        fail "prompt does not reference context signal '$signal'"
-    fi
-    if grep -qF "$signal" "$SRC_ROOT/monitor/bootstrap-install.sh"; then
+_debracket() { tr -d '<>'; }
+
+# Phase 6's own signal bullets: ``- `LABEL` — yes/no, …`` inside the
+# section, whichever variant of the section is installed.
+signals=()
+while IFS= read -r sig; do
+    [[ -n "$sig" ]] && signals+=("$sig")
+done < <(awk '
+    /^## Phase 6 /  { inphase = 1; next }
+    /^## Phase 7 /  { inphase = 0 }
+    inphase && /^- `[^`]+` — yes\/no/ {
+        s = $0
+        sub(/^- `/, "", s)
+        sub(/` — yes\/no.*$/, "", s)
+        print s
+    }
+' "$PROMPT")
+
+# ANTI-VACUITY: a derivation that returns nothing makes the loop below
+# iterate zero times and the case pass having asserted nothing. That is
+# the exact failure mode this repo keeps shipping, so the count is an
+# assertion in its own right, not a precondition.
+if (( ${#signals[@]} == 3 )); then
+    pass "Phase 6 declares exactly 3 context signals (derivation is live)"
+else
+    fail "Phase 6 signal derivation yielded ${#signals[@]} labels, expected 3 — extraction broken or the prompt changed shape"
+fi
+
+_emitter_normalized=$(_debracket < "$SRC_ROOT/monitor/bootstrap-install.sh")
+for signal in "${signals[@]}"; do
+    if grep -qF -- "$(_debracket <<<"$signal")" <<<"$_emitter_normalized"; then
         pass "bootstrap-install emits context signal '$signal'"
     else
         fail "bootstrap-install does NOT emit context signal '$signal'"

@@ -1,0 +1,62 @@
+# grep-delegation-arms.manifest — what CLAUDE.md ASSUMES about Claude Code's
+# `grep` shell function, recorded so a `cc` bump cannot invalidate it silently.
+# your-org/nexus-code#1234.
+#
+# THE EXPOSURE. Claude Code's shell snapshot installs `grep` as a shell FUNCTION
+# that runs ugrep embedded in the `claude` executable — except that it opens
+# with a delegation loop whose `case` arms route certain ARGUMENTS straight to
+# `command grep` (the system GNU binary) instead. Two adjacent CLAUDE.md entries
+# straddle that split, and each is accurate only on its own side of it:
+#
+#   GREP-BRE-DIALECT      needs its patterns to REACH ugrep, so that a bare
+#                         `grep -c '^\+\+\+'` is LOUD (invalid syntax, rc 2)
+#                         while `command grep` is the silent wrong answer.
+#   DASH-PATTERN-OPTION   says Mode 1 (`grep -vF '---'`) is LOUD under GNU and
+#                         SILENT under ugrep, and that a bare call here reaches
+#                         GNU. It reaches GNU ONLY because `---`-leading
+#                         arguments are DELEGATED.
+#
+# Nothing pinned that arm set. It is a property of the HARNESS BUILD, not of
+# this repo, so a version bump can move it with no diff anywhere a suite looks.
+# It has already produced one defect: `#1186`'s "measured identical under GNU
+# grep 3.1 and ugrep 7.8.4" was true for Mode 2 and FALSE for Mode 1, because
+# the two "independent" measurements were the same binary answering twice —
+# the delegation arm made them one instrument. This repo's own rule, firing
+# inside the diff that documents it: a cross-check that agrees with itself is
+# not verification (`#946` F1, `#931`).
+#
+# WHAT IS ASSERTED, AND WHY IT IS NOT THE ARM SET. Recording this host's arm set
+# and comparing it verbatim would be GREEN FOR THIS OPERATOR AND RED FOR EVERY
+# OTHER ONE — a harness-build property masquerading as a repo invariant. So the
+# ARMS rows below are a REVIEW RECORD, never an assertion, and the assertion is
+# on the DEPENDENCY: for each documented remedy, does a representative argument
+# still land on the side of the split that remedy assumes? That question has the
+# same right answer on every host, and when it changes, the documentation really
+# has been invalidated there.
+#
+# Columns are TAB-separated. Three record types:
+#
+#   ARMS       <cc-version>   <the case arm set, verbatim>
+#              A REVIEW RECORD. An unrecorded version, or a recorded version
+#              whose live arms differ, is reported UNREVIEWED (exit 4) — a
+#              prompt for `skills/nexus.cc-update` collision analysis, not a
+#              failure. Nothing here can make an unreviewed bump a red without
+#              also making every other operator's host a red.
+#
+#   DELEGATES  <argument>  <CLAUDE.md block>  <what breaks if it stops>
+#              The argument MUST match some arm, i.e. must reach `command grep`.
+#
+#   REACHES    <argument>  <CLAUDE.md block>  <what breaks if it stops>
+#              The argument MUST match NO arm, i.e. must reach the embedded
+#              ugrep.
+#
+# DELEGATES/REACHES are EVALUATED against the live arm set — the arms are run as
+# a shell `case`, not string-compared — so a reworded but equivalent arm set
+# passes and a genuinely moved boundary fails.
+
+ARMS	2.1.246	-*-filter*|-*-pager*|-*-view*|-*-format-open*|-*-config*|---*|-@*|-*-save-config*|-[Zz]*|-[!-]*[Zz]*|--null|--null-data
+
+DELEGATES	---	DASH-PATTERN-OPTION	Mode 1 (`grep -vF '---'`) is LOUD only because a `---`-leading argument is handed to GNU grep. Under the embedded ugrep it is SILENT (rc 0-1, empty stderr) — Mode 1 BECOMES Mode 2. If this stops being delegated, that entry's "at least Mode 1 is loud" reading is false on this harness, which is the entry's own dangerous direction.
+REACHES	^\+\+\+	GREP-BRE-DIALECT	The entry's LOUD half is that a bare `grep -c '^\+\+\+'` is rejected by ugrep (invalid syntax, rc 2) while `command grep` silently keeps 1 line of 4. If this pattern started being delegated, the bare call would become the silent wrong answer too and the entry's contrast would be gone.
+REACHES	-c	GREP-BRE-DIALECT	`-c` must not itself trigger delegation, or every counting call in that entry measures GNU rather than the wrapper and the entry describes an instrument nobody is using.
+REACHES	-vF	DASH-PATTERN-OPTION	The flags that accompany Mode 1 must not be what causes the delegation, or the entry's attribution of the split to the `---` ARGUMENT is wrong even where its outcome is right.

@@ -52,5 +52,5 @@ The detailed path — including a fully manual fallback — is [Install](getting
 - **[Operating](operating/overview.md)** — day-to-day operator playbook: dashboard, workers, watcher, notifications, reports, troubleshooting.
 - **[Admin](admin/github-app.md)** — GitHub App creation, repo topology, security tiers, runtime monitoring.
 - **[Reference](reference/architecture.md)** — architecture, every config key, every `ng` verb, the watcher protocol, skills catalog, file layout.
-- **[Contributing](contributing/development.md)** — local dev, the test suite, adding a skill, release flow.
+- **[Contributing](contributing/development.md)** — local dev, the test suite, adding a skill, release flow. Start with **[Design guidelines](contributing/design-guidelines.md)** if you are about to write a check, a count, or a guard: it names the one defect class this repo keeps producing.
 - **[GitHub](https://github.com/<your-org>/nexus-code)** — source, issues, releases.

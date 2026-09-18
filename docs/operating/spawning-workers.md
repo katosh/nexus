@@ -53,11 +53,11 @@ For anything more substantive than a one-liner, write a plain comment describing
 
 1. It writes the task-specific prompt to `/tmp/prompt-<window>.txt`.
 2. It calls `monitor/spawn-worker.sh -n <window> -c <workdir> -p /tmp/prompt-<window>.txt`.
-3. `spawn-worker.sh` reads the **worker floor** (the always-applies safety contract: bot identity for GitHub writes, no `--no-verify`, no force-push, [report convention](reports.md), `ng wrap-up` at end-of-task) from `skills/nexus.worker-defaults/SKILL.md`'s `## Worker floor` section, prepends a `## Worker environment` header with absolute paths, then prepends the floor body, all separated by `---`.
-4. It launches `claude` in a detached tmux window via the [`monitor/nexus.tmux-spawn`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.tmux-spawn/SKILL.md) launcher pattern (separate `new-window` + `send-keys`, `-d` for non-stealing focus, `-c` for the workdir).
+3. `spawn-worker.sh` reads the **worker floor** (the always-applies safety contract: bot identity for GitHub writes, no `--no-verify`, no force-push to a *shared* branch, [report convention](reports.md), `ng wrap-up` at end-of-task) from `skills/nexus.worker-defaults/SKILL.md`'s `## Worker floor` section, prepends a `## Worker environment` header with absolute paths, then prepends the floor body, all separated by `---`.
+4. It launches `claude` in a detached tmux window via the [`skills/nexus.tmux-spawn`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.tmux-spawn/SKILL.md) launcher pattern (separate `new-window` + `send-keys`, `-d` for non-stealing focus, `-c` for the workdir).
 5. The orchestrator posts a confirmation comment naming the new window and its tracking issue.
 
-The worker reads its prompt as the first user turn of an interactive `claude` session and starts working. Every worker is a **fresh** `claude` session — `spawn-worker.sh` does not pass `--continue`, so a worker never inherits prior conversational state. (The `--continue` resume flag only applies to the cold-start orchestrator path in `monitor/watcher/entry.sh`.)
+The worker reads its prompt as the first user turn of an interactive `claude` session and starts working. A worker spawned this way is a **fresh** `claude` session — `spawn-worker.sh` passes no `--continue` and no `--resume` on the spawn path, so it inherits no prior conversational state. (Two deliberate exceptions: `spawn-worker.sh --resume <window>` / `ng respawn` re-attaches a named session on purpose, and the opt-in loop wrapper `monitor/claude-loop.sh` — off unless `monitor.retain.use_loop_wrapper` is truthy — re-invokes `claude --continue` after a graceful exit so a retained window stays live. The orchestrator's own cold start in `monitor/watcher/entry.sh` has a separate `--continue`.)
 
 ### Why a prompt file, not inline shell
 
@@ -99,18 +99,18 @@ Check `tmux list-windows` or the dashboard before spawning to avoid collisions. 
 
 ## Closing windows
 
-Workers do not tear themselves down. The orchestrator decides cleanup on every wake, weighing four triggers and a handful of retention overrides. Full policy lives in [`skills/nexus.window-cleanup/SKILL.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.window-cleanup/SKILL.md); the operator-visible shape:
+Workers do not tear themselves down. The orchestrator decides cleanup on every wake, weighing a set of triggers and a handful of retention overrides. Full policy lives in [`skills/nexus.window-cleanup/SKILL.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.window-cleanup/SKILL.md); the operator-visible shape:
 
 - **Wrapped + idle.** A matching report exists, `ng wrap-up` ran, the session jsonl hasn't been modified for ≥ 30 min. The clean case.
 - **Long-idle without report.** Pane idle for ≥ 90 min and no matching report. The orchestrator pastes a *Finish-and-report* follow-up; closes after another 30 min if the report still doesn't land.
 - **Stuck after auto-unstick.** Pane `blocked`, [unstick library](watcher.md#auto-unstick) has exhausted retries. The orchestrator pastes a stuck-window template asking the worker to report what it tried and why it blocked.
 - **Idle-too-long (≥ 24 h).** Strong default to close; retention overrides (recent user engagement, loaded-kernel cost, open-ended research thread) still apply.
-- **Pane absent.** Window already gone — drop the row from the dashboard.
+- **Pane absent.** The window is still in tmux but its pane needs a human: either the inner `claude` has exited (`state=absent`) — relaunch or close — or the pane is sitting on an overlay it wants answered (`state=blocked`), in which case the agent is ALIVE and you **answer it rather than relaunch**. A window that has actually vanished from tmux is a different case: drop the row from the dashboard.
 
 Two states *block* cleanup entirely:
 
 - **Operator-engaged.** You typed into the worker's pane; the window is yours. The orchestrator does not close it and does not paste follow-ups while the engagement mark is valid (it self-expires once the pane goes static; `ng engaged-done` ends it explicitly).
-- **Over-limit.** The worker hit the weekly Opus limit. Never closed; the watcher owns the scheduled resume.
+- **Over-limit.** The worker hit a usage limit — the row names the tier the pane itself reported (`weekly Opus`, `weekly Fable`, …), so don't assume Opus. Never closed; the watcher owns the scheduled resume.
 
 The authoritative lifecycle — every state, every transition threshold, the orchestrator reaction per state — is the diagram in [`monitor/docs/agent-state-machine.md`](https://github.com/<your-org>/nexus-code/blob/main/monitor/docs/agent-state-machine.md).
 

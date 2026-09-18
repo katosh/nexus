@@ -36,6 +36,8 @@ cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
 # it (your-org/nexus-code#601/#605: degrading to the silent-coercion
 # behaviour it replaces is worse than refusing). Copy it alongside.
 cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
+# your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+cp "$(dirname "$NG_REAL")/_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 NG="$FAKE_NEXUS/monitor/ng"
 
 cat > "$FAKE_NEXUS/config/load.sh" <<'STUB'
@@ -89,7 +91,7 @@ assert_no_file   "no log file on missing --event"     "$STATE1/action-log.jsonl"
 
 run_ng out err rc "$STATE1" log-action my-agent --event smoke --bogus thing
 assert_eq        "unknown flag → exit non-zero"      "$rc" "1"
-assert_contains  "stderr names unknown flag"         "$err" "unknown flag: --bogus"
+assert_contains  "stderr names unknown flag"         "$err" "unknown flag: '--bogus'"
 
 # ---- Test 2: base JSON shape (ts/agent/event) ---------------------------
 
@@ -129,6 +131,20 @@ assert_eq        "exit 0"                            "$rc" "0"
 line=$(<"$STATE3b/action-log.jsonl")
 note_key=$(jq -r 'has("note")' <<<"$line")
 assert_eq        "empty --note dropped"              "$note_key" "false"
+
+# A SUPPLIED EMPTY VALUE AND A MISSING ONE ARE DIFFERENT QUESTIONS, and the case
+# above is the one that discriminates them. The `--note` arm is the single
+# `--allow-empty` opt-out in `ng`'s valueless-flag guard: collapsing the guard's
+# two predicates into `[[ -n "$2" ]]` — as the first cut of that class fix did —
+# turns the accepted call above into a hard error, and this suite is where it
+# surfaces (26/2 here, 28/0 on the unswept tree). So assert the OTHER side too:
+# opting out of the emptiness check must NOT opt out of the arity check, or the
+# opt-out silently reinstates the spinning parse loop for that one flag.
+STATE3c="$WORK/state-3c"; mkdir -p "$STATE3c"
+run_ng out err rc "$STATE3c" log-action validator --event smoke --note
+assert_eq        "a BARE --note (no value at all) still refuses with EX_USAGE (#990)" "$rc" "64"
+assert_contains  "…naming the flag"                  "$err" "--note requires a value"
+assert_eq        "…and wrote no log line"            "$([[ -s "$STATE3c/action-log.jsonl" ]] && echo wrote || echo none)" "none"
 
 # ---- Test 4: --extra k=v folding ---------------------------------------
 

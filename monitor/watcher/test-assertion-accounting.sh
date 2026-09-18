@@ -76,9 +76,60 @@ mkfix declares-zero   'ALL TESTS PASSED (0 checks — skipped on source tree)'
 # A spelling deliberately OUTSIDE the measured set. Section 2's whole point.
 mkfix unmeasured      'checks completed: seventeen of seventeen' 'ALL TESTS PASSED'
 
+# ── #1031 / #997: the footer is ONE line, and both fields come from it ──────
+#
+# skip-banner   the #1031 shape. `th_summary_and_exit` prints the SKIP-QUALIFIED
+#               banner AFTER the summary, so the runner's `tail -n1` landed on
+#               it and the `ALL TESTS PASSED (N` capture — written for
+#               `(63 assertions)` — took the SKIP COUNT. Measured on `dev` at
+#               `ca62020`: test-tmux-shim.sh ran 102 and its row said 1.
+#               EXPECT 102 assertions AND 1 skipped case, from one line.
+#
+# echoed-spec   the #997 shape, and it is not a hypothetical: section 8 of THIS
+#               file prints exactly this line, and the runner scored this suite
+#               on it for every full run in the repo. The specimen is echoed
+#               FIRST and the suite's own clean footer follows, which is the
+#               real ordering — a suite cannot echo anything after its summary,
+#               because the summary exits.
+#               EXPECT 63 assertions and NO skip annotation.
+#
+# lower-skip    `th_summary_and_exit` spells it `SKIPPED`, but the corpus does
+#               not only contain that: test-claude-md-618-remedies.sh emits
+#               `%d skipped` on a summary line. The absence of an annotation
+#               used to mean "no UPPERCASE SKIPPED", read as "nothing was
+#               declined". EXPECT 7 assertions AND 2 skipped cases.
+#
+# two-digit     the greedy-`.*` trap on the SKIP capture, the same one the
+#               assertion capture documents: without the explicit `[^0-9]`,
+#               `12 SKIPPED` captures `2`. EXPECT 12, never 2.
+mkfix skip-banner     '=== summary: 102 passed, 0 failed, 1 SKIPPED (precondition absent — NOT covered) ===' \
+                      'ALL TESTS PASSED (1 case(s) SKIPPED — NOT covered)'
+mkfix echoed-spec     '  PASS: capture: === summary: 41 passed, 0 failed, 2 SKIPPED (precond' \
+                      '=== summary: 63 passed, 0 failed ===' 'ALL TESTS PASSED'
+mkfix lower-skip      '=== summary: 7 passed, 0 failed, 2 skipped (7 assertions; expected 7) ==='
+# suffix-noise  the OTHER end of the same `tail -n1` mechanism, and the reason
+#               the repair is a two-tier SELECT rather than a widened regex.
+#               #1031's overriding line is the harness's own banner; here it is
+#               ordinary trailing prose, and it wins for exactly the same
+#               reason. Measured before the fix: 88 read as 0, which also
+#               selects the `0 ASSERTIONS — this PASS covers nothing` wording
+#               and NAMES the suite in `=== N passing file(s) declared ZERO
+#               assertions ===`. A suite is published as vacuous by a sentence
+#               it printed about itself. EXPECT 88.
+mkfix suffix-noise    '=== summary: 88 passed, 0 failed ===' 'ALL TESTS PASSED' \
+                      'hint: 0 passed, 0 failed means nothing ran'
+mkfix two-digit       '=== summary: 55 passed, 0 failed, 12 SKIPPED (precondition absent — NOT covered) ===' \
+                      'ALL TESTS PASSED (12 case(s) SKIPPED — NOT covered)'
+
 EXPECT_CANON=41  EXPECT_ASSERTIONS=92 EXPECT_CHECKS=16   EXPECT_BAREN=111
 EXPECT_NOVERM=37 EXPECT_PF=4          EXPECT_LABEL=23    EXPECT_EQ=75
 EXPECT_COLON=108 EXPECT_SLASH=127     EXPECT_CAPS=9      EXPECT_TESTS=18
+# The #1031/#997 fixtures (section 9). Carried into section 4's total on
+# purpose: a run total that did not move when four counting fixtures were added
+# would mean they contributed nothing, and section 4 is the only place that
+# notices.
+EXPECT_SKIPBANNER=102 EXPECT_ECHOED=63 EXPECT_LOWERSKIP=7 EXPECT_TWODIGIT=55
+EXPECT_SUFFIX=88
 
 LEDGER="$WORK/ledger.tsv"
 OUT="$WORK/run.log"
@@ -91,12 +142,41 @@ mapfile -t fixtures < <(find "$FIX" -name 'test-*.sh' -type f | LC_ALL=C sort)
 timeout 300 bash "$RUNNER" --jobs 1 --state "$LEDGER" "${fixtures[@]}" > "$OUT" 2>&1
 run_rc=$?
 
-if (( run_rc != 0 )); then
-    printf '  FAIL: the runner did not complete over the fixtures (rc %d)\n' "$run_rc" >&2
+# RC 1 IS THE EXPECTED VERDICT HERE, AND IT IS A CONTRACT CHANGE, NOT A BUG
+# (your-org/nexus-code#1145). This fixture set deliberately contains
+# `declares-zero` — a suite that exits 0 having asserted NOTHING — and the
+# runner now treats that as RED rather than merely naming it. Printing the
+# census was not enough: `#568 A6` added the third state and fixed the RUNNER,
+# two real suites never adopted the CONVENTION it depends on, and the hole
+# stayed open for months with the census naming them on every run and the run
+# staying green. So the gate below asserts the rc AND its cause, because
+# `rc == 1` on its own is satisfied by any unrelated failure.
+if (( run_rc != 1 )); then
+    printf '  FAIL: the runner over the fixtures should be RED for the zero-assertion fixture (rc %d, want 1)\n' "$run_rc" >&2
     FAIL=$(( FAIL + 1 ))
     tail -20 "$OUT" | sed 's/^/    /' >&2
     th_summary_and_exit
 fi
+if grep -qE '^  (FAIL|TIMEOUT) ' "$OUT"; then
+    printf '  FAIL: a fixture FAILED or TIMED OUT — the rc above is not the zero-assertion red\n' >&2
+    FAIL=$(( FAIL + 1 ))
+    grep -E '^  (FAIL|TIMEOUT) ' "$OUT" | sed 's/^/    /' >&2
+    th_summary_and_exit
+fi
+assert_eq "0. the run is RED, and the census names the zero-assertion fixture" \
+    "$(grep -c 'declared ZERO assertions' "$OUT")" "1"
+assert_eq "0. …and names it by path, not merely by count" \
+    "$(grep -c '0 assertions: .*test-declares-zero\.sh' "$OUT")" "1"
+# CONTROL — the SAME fixture set minus the zero-assertion suite must be GREEN.
+# Without it, "rc 1" is satisfied by a runner that reds on everything, which is
+# the shape that makes a ratchet worthless.
+_ctl_fixtures=(); for _f in "${fixtures[@]}"; do
+    case "$_f" in */test-declares-zero.sh) continue ;; esac
+    _ctl_fixtures+=("$_f")
+done
+timeout 300 bash "$RUNNER" --jobs 1 --state "$WORK/ledger-ctl.tsv" "${_ctl_fixtures[@]}" > "$WORK/run-ctl.log" 2>&1
+_ctl_rc=$?
+assert_eq "0. CONTROL: the same fixtures WITHOUT the zero-assertion one are GREEN" "$_ctl_rc" "0"
 
 # row_count <fixture-name> — the count the runner printed on that suite's row.
 # Reads the RENDERED row, not the ledger: the row is what a human reading a CI
@@ -107,6 +187,14 @@ row_count() {
 # ledger_count <fixture-name> — field 5 of the durable ledger.
 ledger_count() {
     awk -F'\t' -v n="/test-$1.sh" 'index($1, n) { c=$5 } END { print c }' "$LEDGER"
+}
+# row_skips <fixture-name> — the CASE-SKIP count the runner annotated that row
+# with, or `-` if it annotated none. Read from the RENDERED row for the same
+# reason row_count is: the annotation is #997's filed surface.
+row_skips() {
+    local n
+    n=$(sed -n "s/^  PASS  test-$1\.sh .*(\([0-9][0-9]*\) CASE(S) SKIPPED.*/\1/p" "$OUT" | tail -1)
+    printf '%s' "${n:--}"
 }
 
 echo "=== 1. every spelling this repo actually uses is READ ==="
@@ -146,7 +234,12 @@ else
 fi
 assert_eq "an unmeasured footer is '?' in the ledger too, not 0" \
     "$(ledger_count unmeasured)" "?"
-if grep -qE '=== assertions: [0-9]+ declared across the run; 1 file\(s\) declared no machine-readable count ===' "$OUT"; then
+# MATCHED ON STRUCTURE, NOT PROSE. This pinned the exact wording
+# `declared across the run;`, which the #1031 sweep changed to name the
+# population and the scope — so the label repair reddened three assertions that
+# were not about the label. A test that pins prose it does not assert anything
+# about turns every honesty improvement into a false red.
+if grep -qE '=== assertions: [0-9]+ declared across [^;]*; 1 file\(s\) declared no machine-readable count ===' "$OUT"; then
     printf '  PASS: the footer COUNTS the unreadable file rather than dropping it\n'
     PASS=$(( PASS + 1 ))
 else
@@ -185,9 +278,11 @@ echo
 echo "=== 4. the footer total is the SUM of what was declared ==="
 want_total=$(( EXPECT_CANON + EXPECT_ASSERTIONS + EXPECT_CHECKS + EXPECT_BAREN
              + EXPECT_NOVERM + EXPECT_PF + EXPECT_LABEL + EXPECT_EQ
-             + EXPECT_COLON + EXPECT_SLASH + EXPECT_CAPS + EXPECT_TESTS ))
+             + EXPECT_COLON + EXPECT_SLASH + EXPECT_CAPS + EXPECT_TESTS
+             + EXPECT_SKIPBANNER + EXPECT_ECHOED + EXPECT_LOWERSKIP
+             + EXPECT_TWODIGIT + EXPECT_SUFFIX ))
 got_total=$(sed -n 's/^=== assertions: \([0-9][0-9]*\) declared.*/\1/p' "$OUT" | tail -1)
-assert_eq "footer total == sum of the twelve declared counts (+ the 0)" \
+assert_eq "footer total == sum of the declared counts (twelve spellings, four #1031/#997 fixtures, + the 0)" \
     "${got_total:-<none>}" "$want_total"
 
 echo
@@ -254,7 +349,7 @@ for _j in 2 4; do
     assert_eq "--jobs $_j: run total equals the --jobs 1 total" \
         "${_ptotal:-<none>}" "$want_total"
 
-    _pnocount=$(sed -n 's/^=== assertions: [0-9]* declared across the run; \([0-9][0-9]*\) file.*/\1/p' "$_pout" | tail -1)
+    _pnocount=$(sed -n 's/^=== assertions: [0-9]* declared across [^;]*; \([0-9][0-9]*\) file.*/\1/p' "$_pout" | tail -1)
     assert_eq "--jobs $_j: exactly one unreadable footer, as at --jobs 1" \
         "${_pnocount:-<none>}" "1"
 
@@ -269,8 +364,19 @@ for _j in 2 4; do
         "$(awk -F'\t' -v n="/test-pass-eq-caps.sh" 'index($1,n){c=$5} END{print c}' "$_pled")" \
         "$EXPECT_CAPS"
 
-    # A run that is otherwise green must stay green.
-    assert_eq "--jobs $_j: the runner still exits 0 on a green fixture set" "$_prc" "0"
+    # THE VERDICT MUST AGREE WITH THE SERIAL PATH, which is what this section is
+    # about. It used to assert `0` outright — correct until `#1145` made a
+    # zero-assertion PASS red, at which point the fixture set (which contains
+    # `declares-zero` ON PURPOSE) stopped being green and the assertion was
+    # demanding the wrong answer. Comparing against `$run_rc` keeps the claim on
+    # the axis the mechanism varies on — dispatcher, not fixture content — and
+    # cannot go stale the next time the contract moves.
+    assert_eq "--jobs $_j: the verdict AGREES with the --jobs 1 verdict" "$_prc" "$run_rc"
+    # …and the green direction, on the control set, so "agrees" cannot be
+    # satisfied by a dispatcher that reds unconditionally.
+    timeout 300 bash "$RUNNER" --jobs "$_j" --state "$WORK/ledger-ctl-$_j.tsv" \
+        "${_ctl_fixtures[@]}" > "$WORK/run-ctl-$_j.log" 2>&1
+    assert_eq "--jobs $_j: CONTROL a genuinely green fixture set still exits 0" "$?" "0"
 done
 
 echo
@@ -341,8 +447,26 @@ extract_line() {   # extract_line <footer-line> -> the count, or `?`
     printf '%s\n' "$1" > "$WORK/oneline.out"
     _rt_declared_assertions "$WORK/oneline.out" 2>/dev/null || printf '?'
 }
+# THE WHOLE READER, not one function of it (your-org/nexus-code#1031, #997).
+# `_rt_declared_assertions` used to be self-contained; it now delegates line
+# SELECTION to `_rt_footer_line`, which both it and `_rt_footer_skips` read, so
+# extracting it alone leaves the callee undefined — `command not found`, an
+# empty line, `return 1`, and every case below reading `?`. That failure is
+# loud here only because of the potency check that follows it; without one, an
+# extraction that silently pulled in nothing would make this section a row of
+# vacuous `?` comparisons against `?` expectations.
 # shellcheck source=monitor/watcher/run-tests.sh
-source <(sed -n '/^_rt_declared_assertions() {/,/^}/p' "$RUNNER")
+source <(sed -n '/^_rt_footer_line() {/,/^}/p;/^_rt_declared_assertions() {/,/^}/p;/^_rt_footer_skips() {/,/^}/p' "$RUNNER")
+# POTENCY. Assert the extraction landed before believing anything it produces.
+for _fn in _rt_footer_line _rt_declared_assertions _rt_footer_skips; do
+    if declare -F "$_fn" >/dev/null 2>&1; then
+        assert_eq "extracted \`$_fn\` from the runner" "yes" "yes"
+    else
+        printf '  FAIL: could not extract %s from %s — every capture below would read `?`\n' \
+            "$_fn" "$RUNNER" >&2
+        _th_fail
+    fi
+done
 
 while IFS='|' read -r want line; do
     [[ -n "$line" ]] || continue
@@ -362,5 +486,105 @@ done <<'CASES'
 ?|1..14
 ?|Results: 17 of 17 checks OK
 CASES
+
+echo "=== 9. ONE footer line, TWO fields — the row's numbers cannot describe different lines (#1031, #997) ==="
+#
+# THE UNIFYING DEFECT, stated once because both issues are it: the runner
+# derived the assertion count and the case-skip count by scraping the SAME
+# stdout with DIFFERENT, independently-written patterns. #1031 is the capture
+# taking a skip count out of a banner it was never written for; #997 is the
+# selection taking a line the suite merely echoed. Both are repaired at the
+# SELECTION step, in `_rt_footer_line`, which is now the only place a line is
+# chosen — so the two fields cannot disagree about which line they describe.
+#
+# Driven through the RUNNER rather than the extracted function, deliberately:
+# section 8 covers the capture in isolation and would have kept passing through
+# both defects. #1031's damage is on the ROW, and the row is the artefact other
+# agents quote into reports and merge decisions.
+
+# #1031. Was `1 assertions` for a suite that ran 102 — and note the direction:
+# the number is ANTI-CORRELATED with coverage, so a suite that skips more looks
+# like it asserted more. That is why an off-by-N framing understates it.
+assert_eq "#1031 the skip-qualified BANNER does not become the assertion count" \
+    "$(row_count skip-banner)" "102"
+assert_eq "#1031 …and the same line still yields the skip count" \
+    "$(row_skips skip-banner)" "1"
+assert_eq "#1031 the ledger agrees with the row" \
+    "$(ledger_count skip-banner)" "102"
+
+# #997. Was annotated `(2 CASE(S) SKIPPED)` against a suite whose real footer
+# declines nothing — scored on a fixture it printed as test data.
+assert_eq "#997 an ECHOED specimen footer is not read as the suite's result" \
+    "$(row_count echoed-spec)" "63"
+assert_eq "#997 …and the echoed SKIPPED count does not annotate the row" \
+    "$(row_skips echoed-spec)" "-"
+
+# The class sweep, not the two filed instances.
+assert_eq "the lowercase 'skipped' spelling is seen (a predicate narrower than its population)" \
+    "$(row_skips lower-skip)" "2"
+assert_eq "…and its assertion count is unaffected" \
+    "$(row_count lower-skip)" "7"
+assert_eq "a TWO-DIGIT skip count survives the greedy-.* trap (12, never 2)" \
+    "$(row_skips two-digit)" "12"
+assert_eq "…and its assertion count comes from the summary, not the banner" \
+    "$(row_count two-digit)" "55"
+
+# RE-DERIVABILITY (#1031 non-negotiable): a qualified row prints the line both
+# of its numbers came from, so a reader can check them without the suite's log.
+# Asserted on CONTENT, not on presence — a `footer:` line naming a different
+# line would satisfy a presence check and defeat the entire point.
+_ftr=$(sed -n 's/^    footer: //p' "$OUT" | grep -F '102 passed' | tail -1)
+assert_eq "a qualified row prints the footer line its numbers were read from" \
+    "$_ftr" "=== summary: 102 passed, 0 failed, 1 SKIPPED (precondition absent — NOT covered) ==="
+# NEGATIVE CONTROL. Unqualified rows must NOT print it — otherwise the assertion
+# above passes on a runner that echoes a footer for all ~300 suites, which is a
+# different (and much noisier) behaviour than the one being specified.
+assert_eq "an UNQUALIFIED row prints no footer line" \
+    "$(sed -n 's/^    footer: //p' "$OUT" | grep -cF '41 passed, 0 failed ===')" "0"
+
+# THE SUFFIX-OVERRIDE, which is the same mechanism as #1031 read from the other
+# end: `tail -n1` over ONE combined pattern lets any later match beat the real
+# footer. Two tiers fix it — a marker-led footer wins outright, and the weak
+# shape-only spellings are consulted only when there is no marker-led line at
+# all. Asserted through the runner AND on the derived wordings, because the
+# damage was not just a wrong number: it renamed a 88-assertion suite as vacuous.
+assert_eq "trailing prose does NOT override a real footer (was 0, is 88)" \
+    "$(row_count suffix-noise)" "88"
+assert_eq "…so the suite is not branded '0 ASSERTIONS — this PASS covers nothing'" \
+    "$(grep -c 'test-suffix-noise.sh.*0 ASSERTIONS' "$OUT")" "0"
+assert_eq "…nor named in the ZERO-assertion footer list" \
+    "$(grep -c '0 assertions:.*test-suffix-noise\.sh' "$OUT")" "0"
+
+# THE SELECTION RULE ITSELF, at the boundary this fix draws. The anchor is
+# PER-ALTERNATIVE: marker-led spellings must lead the line (modulo indentation),
+# shape-only ones may carry a label. A global `^` anchor is the obvious repair
+# and it would turn eight real suites (`  127 pass / 0 fail`) and one documented
+# spelling (`cc-update: 23 passed, …`) into `?`.
+assert_eq "an INDENTED real footer is still read (8 suites emit this)" \
+    "$(extract_line '  127 pass / 0 fail')" "127"
+assert_eq "a LABELLED footer is still read (a documented spelling)" \
+    "$(extract_line 'cc-update: 23 passed, 0 failed')" "23"
+assert_eq "a MARKER-LED banner behind non-blank text is refused — '?', not a guess" \
+    "$(extract_line '  PASS: capture: ALL TESTS PASSED (92 assertions)')" "?"
+# THE DECLARED RESIDUE, asserted so it is a stated boundary rather than an
+# unexamined gap. The same echoed line still yields 41 through a SHAPE-ONLY
+# alternative (`N passed, M failed`), which carries no marker to anchor. Closing
+# that means dropping the five weak spellings, which costs ten real suites — so
+# it is priced, not fixed. Anyone who narrows the weak set later should expect
+# this assertion to change, and that is the signal.
+assert_eq "…while a SHAPE-ONLY spelling on the same line still reads (declared residue)" \
+    "$(extract_line '  PASS: capture: === summary: 41 passed, 0 failed ===')" "41"
+assert_eq "a lone skip banner declares no assertion count — '?', never the skip count" \
+    "$(extract_line 'ALL TESTS PASSED (1 case(s) SKIPPED — NOT covered)')" "?"
+# TIER PRECEDENCE, driven directly: a marker-led footer beats a LATER
+# shape-only line, and a shape-only line still wins when there is no
+# marker-led one. Both directions, because asserting only the first would pass
+# on a runner that had simply dropped the weak spellings.
+printf '%s\n' '=== summary: 88 passed, 0 failed ===' 'hint: 0 passed, 0 failed' > "$WORK/tier.out"
+assert_eq "tier 1 (marker-led) outranks a LATER tier-2 match" \
+    "$(_rt_declared_assertions "$WORK/tier.out" 2>/dev/null || printf '?')" "88"
+printf '%s\n' 'cc-update: 23 passed, 0 failed' '  127 pass / 0 fail' > "$WORK/tier2.out"
+assert_eq "with NO marker-led line, tier 2 still reads — and takes the LAST" \
+    "$(_rt_declared_assertions "$WORK/tier2.out" 2>/dev/null || printf '?')" "127"
 
 th_summary_and_exit

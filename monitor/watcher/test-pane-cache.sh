@@ -135,8 +135,19 @@ printf 'state=over-limit active=0 window=7 name=worker-a reset_at=6pm\n' > "$STU
 MONITOR_PANE_CACHE_MODE=record _idle_pane_state_line 7 worker-a >/dev/null   # the sweep records
 old_count=$(fork_count)
 probe=$(_over_limit_probe_pane 7 worker-a)
-assert_eq "over-limit verdict from the recording" "$probe" "over-limit 6pm"
+# THREE fields since your-org/nexus-code#1488: state, reset_at, and WHICH limit.
+# A recording that predates the field degrades to `unknown`, which renders as
+# "usage" — never as a model tier nobody measured, which is the whole defect.
+assert_eq "over-limit verdict from the recording (limit absent ⇒ unknown)" "$probe" "over-limit 6pm unknown"
 assert_eq "over-limit probe did not fork" "$(fork_count)" "$old_count"
+
+# …and a recording that HAS the field carries it through, so the assertion
+# above is a degradation control rather than the only case covered.
+printf 'state=over-limit active=0 window=7 name=worker-a reset_at=6pm limit=weekly_Fable\n' > "$STUB_SCENARIO"
+MONITOR_PANE_CACHE_MODE=record _idle_pane_state_line 7 worker-a >/dev/null
+probe=$(_over_limit_probe_pane 7 worker-a)
+assert_eq "…and a recording carrying limit= propagates the REAL limit, not Opus" "$probe" "over-limit 6pm weekly_Fable"
+printf 'state=over-limit active=0 window=7 name=worker-a reset_at=6pm\n' > "$STUB_SCENARIO"
 
 echo '=== (8) fail-open: unwritable cache dir → probe unaffected ==='
 rm -rf "$STATE_DIR/pane-cache"

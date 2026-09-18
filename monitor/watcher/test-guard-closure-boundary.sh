@@ -52,6 +52,73 @@ REPO_ROOT=$(cd "$_test_dir/../.." && pwd)
 
 . "$_test_dir/_test_helpers.sh"
 
+# ---- the corpus §3 sweeps, EXTRACTED INTO A FUNCTION -----------------------
+#
+# Every regular non-Markdown file under monitor/, NUL-separated. §3's jq_all
+# pipeline used to spell this `find` inline; it is a function so the walk is
+# defined ONCE and can be called by anything that needs the same corpus.
+#
+# THE PRUNE IS THE FIX (your-org/nexus-code#1301). Without it this walk
+# descended into `monitor/.state/`, which exists on every LIVE operator tree and
+# never on CI. Measured 2026-09-05 on the primary nexus at d733d7be, this blob
+# byte-identical to the one CI runs green: 22,583 files walked, 21,796 of them
+# under .state, and §3 RED 71/2 because 29 archived
+# `.state/.trash/claude-code-*/bin/claude.exe` binaries, 9
+# `.state/async-run/*/out` job logs and one spawn prompt matched the jq-probe
+# regex byte-wise. A guard that classifies jq GATES IN THE SOURCE TREE was
+# reading retired binaries and job logs as gates — and it was red only where
+# operators run it and green in the one environment that gates merges, the
+# inverse of the usual failure shape, which is why it survived. The prune set is
+# `_shf_all_files0`'s (test-shell-files.sh), so the two repo-wide sweeps in this
+# directory agree on what "under monitor/" means. On a clean checkout the pruned
+# names do not exist and the count is unchanged (780 -> 780 at d733d7be).
+_gcb_corpus0() {
+    find "$REPO_ROOT/monitor" \
+        \( -name .git -o -name .state -o -name node_modules \) -prune -o \
+        -type f ! -name '*.md' -print0 2>/dev/null
+}
+
+# ---- the `--population` protocol (your-org/nexus-code#803, #1301) ----------
+#
+# THE POPULATION IS `_gcb_corpus0` — CALLED, never copied (the protocol's one
+# rule for an implementor: a copy is a second implementation, and a second
+# implementation drifts, at which point the index reports with total confidence
+# that this guard does not read a file it does read).
+#
+# THE FULL WALK, NOT THE `grep -l` NARROWING, is what this guard READS: §3 greps
+# every one of these files for a jq probe, so their bytes are in its read set
+# and the narrowing to matches is a speed optimisation (the
+# test-spawn-shape-manifest.sh precedent). It is also the only APPLICABILITY-
+# keyed form: a population of "files that already carry a jq gate" would be
+# CONFORMANCE-keyed, and removing a gate would deselect this guard for exactly
+# the edit it exists to classify (#1197, #1224). §1/§2/§4/§5 read named files
+# under monitor/ by path; every one of them is inside this walk.
+#
+# WHY IT MATTERS HERE, dated: on 2026-09-05 a jq probe added to
+# monitor/cc-harness/gate.sh (the #1448 fix) made this suite red 71/2 — the
+# ONLY guard with something to say about that diff — while `ng guards-for-diff`
+# selected 52 guards, all green, and listed this one under neither SELECTED nor
+# CONSIDERED AND EXCLUDED, because it declared nothing (#1301 thread). A green
+# from that tool described everything it could see; this was not in it.
+#
+# THE PRUNE ABOVE IS A PRECONDITION OF DECLARING, not only of correctness:
+# `gp_render` refuses (exit 3) a path that no longer exists, and
+# `guards-for-diff` turns a probe refusal into REFUSED (exit 2), so the ~22k
+# volatile .state paths the unpruned walk returned on a live tree would have
+# made the index fail closed for every worker the moment one vanished
+# mid-probe. Filtering them here instead would be a second enumerator.
+#
+# PLACED HERE — above §1 and above the sandbox mktemp, not merely above the
+# first scan — because `gp_handle` EXITS when it handles the flag, so anything
+# printed before it lands in the probe's STDOUT and is read as a population
+# row (measured on test-sigpipe-assertion-lint.sh: four lines of section-1
+# output ahead of 615 real rows, all refused by `gp_render`).
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    _gcb_corpus0 | tr '\0' '\n'
+}
+gp_handle "$@"
+
 SB=$(mktemp -d)
 trap 'rm -rf "$SB"' EXIT
 
@@ -207,11 +274,32 @@ echo "=== 3. OUTSIDE the boundary — the MANIFEST of listed-but-unfixed sites =
 #   DEGRADES  behaviour changes when jq is absent, silently or announced.
 #             THIS is the manifest (`expected_jq`).
 #
-# `.md` is excluded: `monitor/install-prompt.md` names `command -v jq` in prose
-# (a dependency checklist), which is documentation, not a gate.
+# A MENTION OF A GATE IS NOT A GATE, and the probe must say so on BOTH axes.
+# The `.md` rule is one INSTANCE of that class, not the class: `.md` is excluded
+# because `monitor/install-prompt.md` names `command -v jq` in prose (a
+# dependency checklist), which is documentation, not a gate. A full-line `#`
+# comment inside a SHELL file is documentation too, and a per-FILE rule cannot
+# see it.
+#
+# `#1277` is the measured instance. It added a comment to
+# `monitor/watcher/run-tests.sh` quoting the gate shape verbatim as prose about
+# what ships elsewhere; that file calls jq NOWHERE (zero non-comment
+# occurrences), yet it joined this population and turned the two assertions
+# below red. Note that NO classification was honestly available to it: putting
+# it in `jq_loud`, `jq_fallback` or `expected_jq` asserts a property of a gate
+# that does not exist, so "just add it to the manifest" buys a green with a
+# FALSE STATEMENT. The population predicate was the thing that was wrong.
+#
+# The line filter is ONE-DIRECTIONAL, which is why it cannot hide a defect: a
+# line whose first non-blank character is `#` cannot execute — in a `.sh`, in a
+# `.sh.in` template, or in a heredoc body — so dropping it can never conceal a
+# live gate. It deliberately does NOT strip TRAILING comments: `foo && command
+# -v jq` sitting after a `#` on the same line stays in the population, because
+# that direction COULD hide one. Measured at 2b598430: 37 -> 36 files, the sole
+# departure being `monitor/watcher/run-tests.sh`.
 mapfile -t jq_all < <(
-    find "$REPO_ROOT/monitor" -type f ! -name '*.md' -print0 2>/dev/null \
-    | xargs -0 grep -lE '(command -v|type|hash)[[:space:]]+jq' 2>/dev/null \
+    _gcb_corpus0 \
+    | xargs -0 grep -lE '^[[:space:]]*([^#[:space:]].*)?(command -v|type|hash)[[:space:]]+jq' 2>/dev/null \
     | grep -v '/test-' | sed "s|^$REPO_ROOT/||" | LC_ALL=C sort
 )
 # `mapfile` from a `find -print0 | xargs -0` pipeline, NOT `grep -r`: the
@@ -229,11 +317,62 @@ jq_loud=(
     monitor/ci-run-execution.sh
     monitor/declare-no-wait.sh
     monitor/declare-wait.sh
+    monitor/ensure-workdir-trusted.sh
     monitor/lit.sh
     monitor/nexus-root-sensitivity.sh
     monitor/resolve-settings.sh
+    monitor/watcher/_gh_stub.sh
     monitor/worker-health.sh
 )
+# `monitor/watcher/_gh_stub.sh` — a NEW jq dependency, recorded as a DECISION
+# rather than a manifest bump (your-org/nexus-code#932, #1125). It arrives with
+# the `gh` test double that APPLIES the caller's `--jq` through REAL jq instead
+# of returning pre-digested output; the whole point of that library is that the
+# repo's run/job SELECTION lives inside those expressions, so a stub that does
+# not evaluate them is blind to the layer the defect lives in.
+#
+# LOUD, and closed at BOTH of its sites, which is why it is not a manifest
+# member:
+#   :180  the top-level pre-flight — `[ -n "$jq_expr" ] && ! command -v jq` ->
+#         prints `gh-stub: --jq ... refusing to answer unfiltered` on stderr and
+#         `exit 3`. Deliberately checked at the TOP LEVEL, before any pipeline
+#         exists, because inside one the status would be the pipeline's.
+#   :227  the emit filter — `command -v jq >/dev/null 2>&1 || exit 3`.
+# Nothing degrades to `cat`, which is the failure this classification is about:
+# a stub that answered UNFILTERED when jq was missing would return a superset of
+# what the caller asked for, and a suite asserting on that superset would go
+# green for a reason unrelated to the property under test. That is the same
+# class as the stub ignoring `--jq` in the first place, arriving through the
+# environment rather than through the code.
+#
+# The refusal is machine-checked by the `jq_loud` verification below, so this
+# comment is a claim the suite tests rather than one it takes on trust.
+
+# `ensure-workdir-trusted.sh` — THE DECISION THIS ASSERTION EXISTS TO FORCE
+# (your-org/nexus-code#1094). It arrived with #888 and has been unclassified
+# since, which is what has kept this suite and `test-public-mirror-overlay-
+# drift.sh` red on `dev`. The assertion's own wording is the instruction: a new
+# jq dependency must be a DECISION, so here it is, with its reasoning rather
+# than a manifest bump.
+#
+# LOUD, and it is the CLOSED form end to end. The gate announces on stderr
+# ("jq not found; cannot seed workspace trust for <dir>") and `return 2`; the
+# file's own header documents `2 cannot proceed (no jq, unwritable/corrupt
+# config)`; and the ONE caller — `spawn-worker.sh:_seed_workspace_trust` —
+# treats non-zero as a spawn BLOCKER and `exit 10`s with a message. So jq's
+# absence costs a refused spawn, never a spawn that proceeds with something
+# quietly missing. Nothing degrades at this site, which is what excuses it from
+# the manifest.
+#
+# The blocking is not incidental politeness, either: the thing this script
+# prevents is the trust dialog, which `pane-state` reads as `state=empty
+# active=0` rather than `blocked`, so the watcher never sees a pane to unstick.
+# Degrading here would trade a loud refusal for a silently hung worker — the
+# manifest's own defect class, in its worst shape.
+#
+# NOTE FOR THE NEXT CLASSIFIER: this is the first LOUD member whose refusal is
+# `return`, not `exit`, because its gate lives inside a function. That is why
+# `_loud_site_tally` below had to grow the `return` arm; see the note there.
 # `ci-run-execution.sh` (your-org/nexus-code#846) is LOUD by the same argument
 # its own header makes for refusing rather than degrading: without jq it cannot
 # read the jobs payload, and emitting rows whose execution column says
@@ -324,6 +463,22 @@ expected_jq=(
     # not on #665's PR.
     monitor/_submit_evidence.sh
     monitor/cc-auto-update-apply.sh
+    # your-org/nexus-code#1448. A DECISION, and it belongs in DEGRADES rather
+    # than LOUD or FALLBACK. `_gate_resolve_tui` uses jq to read ONE key
+    # (`.tui`) out of the operator's settings.json, so the gate can run the
+    # scenarios in the geometry production actually renders. With jq absent it
+    # does not refuse (so: not LOUD) and there is no jq-free path that
+    # preserves behaviour (so: not FALLBACK) — it leaves `CCH_TUI` unset,
+    # falls back to the binary's own default geometry, and SAYS SO on stderr
+    # and in the gate log (`mode=binary-default source=unresolved`).
+    #
+    # That is exactly this manifest's class: jq absent CHANGES BEHAVIOUR,
+    # announced rather than silent. Hand-parsing JSON to dodge the dependency
+    # would be worse — it would put a bespoke parser between a credentials
+    # file and a gate log. Recording the degradation is the honest trade, and
+    # the log line is what makes it observable after the fact rather than
+    # inferred.
+    monitor/cc-harness/gate.sh
     monitor/guard-block.sh.in
     monitor/hooks/async-launch-detect.sh
     monitor/hooks/bash-footgun-guard.sh
@@ -340,6 +495,14 @@ expected_jq=(
     monitor/hooks/orchestrator-session-pin.sh
     monitor/hooks/over-limit-emit.sh
     monitor/hooks/turn-failure-emit.sh
+    # your-org/nexus-code#1535, skeptic F6. A DECISION: `dispatch` — the
+    # host-armed plugin-monitor command — must NEVER exit (an exit is a
+    # delivered "script failed" notice that costs a turn, and the host does not
+    # relaunch it), so with jq absent it stays alive polling NOTHING, says so
+    # once on stderr, and every `add` in that session reports NOT ARMED. That
+    # is "jq absent changes behaviour", announced and three-valued, so it
+    # belongs here rather than in jq_loud — every OTHER verb still dies 5.
+    monitor/longjob-watch.sh
     monitor/ng
     monitor/pane-state.sh
     # #719. Announced, three-valued: VERIFY=0 with UNVERIFIABLE_REASON naming
@@ -351,6 +514,19 @@ expected_jq=(
     # member and not a bug: the behaviour change is real but bounded.
     monitor/request-channel.sh
     monitor/spawn-worker.sh
+    # `verify-worker-started.sh` — a DECISION, per this assertion's wording
+    # (your-org/nexus-code#1334). MANIFEST, not LOUD: LOUD means announce AND
+    # REFUSE, and this file announces (`value: UNKNOWN (jq not on PATH …)`) then
+    # returns 0 deliberately — the jq call feeds the trust-key READ-BACK, a
+    # DIAGNOSTIC bolted onto the verdict, not the verdict. The verdict (did the
+    # pane leave `blocked`) comes from pane-state.sh alone. Refusing would
+    # manufacture the false negative this script exists to prevent. Not FALLBACK
+    # either: without jq the read-back cannot produce the value that
+    # discriminates #1334's two hypotheses, so the one occurrence that would
+    # have answered the question answers nothing. It never prints `false` for a
+    # read failure — UNKNOWN is a distinct third value, asserted both ways in
+    # test-verify-worker-started.sh.
+    monitor/verify-worker-started.sh
     # #719. `return 1` with no message — the update check reports "unreachable"
     # and fails safe, so a jq-less host stops seeing CC updates without saying
     # so.
@@ -360,6 +536,35 @@ expected_jq=(
     # GitHub escalation and its recovery close-comment. The failure mode is
     # that the durable GitHub record of an outage is never written.
     monitor/watcher/_lib.sh
+    # your-org/nexus-code#1129 — THE DECISION THIS ASSERTION EXISTS TO FORCE.
+    # It arrived with #1101's `066d514` and has been unclassified since, which
+    # is what kept this suite (and `test-public-mirror-overlay-drift.sh`, which
+    # runs it as a consumer suite on the built tree) RED on `dev`.
+    #
+    # ONE site, `:337` — `command -v jq >/dev/null 2>&1 || return 1` inside
+    # `_orphan_async_declared_waits`, gating the `jq -r` at `:339` that reads
+    # the heartbeat's `external_waits` array.
+    #
+    # Manifest, NOT `jq_fallback`, and the distinction is the whole point. There
+    # IS a jq-free route — the caller at `:709` takes `if full=…; then` and on
+    # failure keeps the ROW's `waits` string — but that route does NOT preserve
+    # the behaviour, and this file's own header (`:310-330`) says so in its own
+    # words: the row is `pane-state.sh`'s 80-CHARACTER-CAPPED `orphan_kinds=`
+    # display string, and "a truncated list can therefore license a wake into
+    # live work — the exact thing the header says it must never do".
+    #
+    # So jq's absence IS observable here, and the manifest tracks observability.
+    # Its BOUND, stated because it is narrower than the entry might suggest: a
+    # window declaring 3 or fewer waits has an untruncated row, so the row and
+    # the heartbeat agree and nothing changes. The divergence appears only past
+    # the cap — and there it fails CLOSED, not open: `:712`
+    # `_orphan_async_waits_truncated` sets `truncated=1`, and the terminating
+    # decision at `:76x` is gated `(( probe_rc == 3 )) && (( truncated == 0 ))`,
+    # so a wait list jq could not read never licenses a wake. The cost is a
+    # window that is never woken, never one woken into live work. That is the
+    # safe direction — but "designed and safe" is not "unobservable", which is
+    # the same line `monitor/_submit_evidence.sh` is listed on above.
+    monitor/watcher/_orphan_async.sh
     # #719. Two sites of DIFFERENT kinds, which is why the file is listed once
     # and annotated: :577 announces (`unstick_log WARN … action=jq-missing`),
     # :932 is SILENT — the orchestrator-ack fast path is skipped and case B
@@ -435,13 +640,40 @@ assert_eq "no stale LOUD/FALLBACK exemption (each must still carry a jq gate)" \
 # nearby passed (69/0, measured). Comments are stripped before matching.
 _loud_site_tally() {   # <file> -> "<refusing>/<sites>"
     awk '
-      { line = $0; sub(/#.*/, "", line) }          # strip comments: prose must not vouch
+      # WHOLE-LINE comments only (your-org/nexus-code `#1023`, `#1024`). A bare
+      # `sub(/#.*/, "", line)` is not shell-aware: it cuts from the first `#`
+      # whatever the quoting, so `die "see nexus-code#810"` loses its own `die`
+      # and — worse — a `command -v jq` probe sitting right of a `#` in a
+      # string vanishes from the SITE count entirely, which is the fail-OPEN
+      # direction. Residual, declared: a TRAILING comment can still vouch for
+      # the line it sits on; that needs a tokeniser, not a line-based idiom.
+      { line = ($0 ~ /^[[:space:]]*#/) ? "" : $0 }
       # No `next`: the probe LINE itself is part of the window. The common
       # one-liner `command -v jq >/dev/null || die "jq required"` carries its
       # refusal on the same line, and skipping it scored that site 0/1.
       line ~ /(command -v|type|hash)[[:space:]]+jq/ { n++; win = 4; ref[n] = 0 }
       win > 0 {
-          if (line ~ /exit[[:space:]]+[1-9][0-9]*/ || line ~ /(^|[^[:alnum:]_])die([^[:alnum:]_]|$)/)
+          # `return N` COUNTS, and omitting it was a real hole rather than a
+          # nicety (your-org/nexus-code#1094). A gate inside a FUNCTION cannot
+          # `exit` without taking the whole caller down, so the CLOSED form
+          # there is `return N` — and `ensure-workdir-trusted.sh`, the first
+          # such member, scored 0/1 against the exit-only regex while refusing
+          # perfectly. An `exit`-only recogniser therefore pushes every
+          # function-scoped refusal either into the manifest (wrong: nothing
+          # degrades) or onto the LOUD list where it reads as a stale entry.
+          # Measured on that file: 0/1 before, 1/1 after.
+          #
+          # SCOPE, stated because this list EXCUSES a file from the manifest:
+          # the tally answers whether the gate ARM ITSELF refuses, never
+          # whether the CALLER honours the refusal. The second is a human
+          # judgement and belongs in the LOUD entry comment above, where it
+          # is written out for each member. Widening the arm does not widen
+          # that claim.
+          #
+          # NOTE: no apostrophe may appear below this line inside the awk
+          # program — it is a single-quoted shell string and one apostrophe
+          # in a comment ends it. Cost one syntax error while writing this.
+          if (line ~ /(exit|return)[[:space:]]+[1-9][0-9]*/ || line ~ /(^|[^[:alnum:]_])die([^[:alnum:]_]|$)/)
               ref[n] = 1
           win--
       }
@@ -456,6 +688,64 @@ for _f in "${jq_loud[@]}"; do
 done
 assert_eq "every LOUD entry really refuses (non-zero exit or die at its gate)" \
     "${_notloud[*]:-none}" "none"
+
+# ── POTENCY CONTROL FOR THE TALLY ITSELF (your-org/nexus-code#1094) ──────────
+# `_loud_site_tally` had none, which is the shape this whole suite polices: a
+# recogniser whose ability to FAIL is unproven, standing in front of the list
+# that EXCUSES files from the manifest. The assertion above reads "none" both
+# when every LOUD entry refuses and when the tally can no longer tell.
+#
+# That is not hypothetical. Widening the arm to accept `return N` was done by
+# editing this awk program, and the edit CLOBBERED the `if (...)` line, leaving
+# `ref[n] = 1` unconditional — every site scoring as refusing, the tally
+# answering "none" for any input. The suite went 69/0 on it. It was caught by
+# reading the block, not by any assertion, and these four fixtures are what
+# would have caught it: against the clobbered tally the silent fixture scores
+# 1/1 instead of 0/1.
+#
+# FOUR FIXTURES, because one direction is not a control. A recogniser must
+# accept what qualifies AND reject what does not, and here it must also keep
+# the weakest-site rule that the block above states in prose.
+_tally_fx="$SB/tally-fixtures"
+mkdir -p "$_tally_fx"
+# NOTE on fixture wording: no comment below may contain the word "die". The
+# tally strips WHOLE-LINE comments only, so a TRAILING comment vouches for the
+# line it sits on — a declared residual of this recogniser, and the first draft
+# of the silent fixture tripped it with the phrase "we do not die here",
+# scoring 1/1 for a gate that refuses nothing.
+cat > "$_tally_fx/silent.sh" <<'TFX'
+f() {
+    command -v jq >/dev/null 2>&1 || {
+        DEGRADED=1
+        return 0; }
+}
+TFX
+cat > "$_tally_fx/loud-return.sh" <<'TFX'
+f() {
+    command -v jq >/dev/null 2>&1 || { echo "no jq" >&2; return 2; }
+}
+TFX
+cat > "$_tally_fx/loud-exit.sh" <<'TFX'
+command -v jq >/dev/null 2>&1 || { echo "no jq" >&2; exit 2; }
+TFX
+cat > "$_tally_fx/mixed.sh" <<'TFX'
+f() {
+    command -v jq >/dev/null 2>&1 || { echo "no jq" >&2; return 2; }
+}
+g() {
+    command -v jq >/dev/null 2>&1 || {
+        DEGRADED=1
+        return 0; }
+}
+TFX
+assert_eq "TALLY CONTROL: a SILENT gate scores 0/1 (the recogniser has teeth)" \
+    "$(_loud_site_tally "$_tally_fx/silent.sh")" "0/1"
+assert_eq "TALLY CONTROL: a \`return N\` refusal scores 1/1 (the #1094 arm works)" \
+    "$(_loud_site_tally "$_tally_fx/loud-return.sh")" "1/1"
+assert_eq "TALLY CONTROL: an \`exit N\` refusal still scores 1/1 (no regression)" \
+    "$(_loud_site_tally "$_tally_fx/loud-exit.sh")" "1/1"
+assert_eq "TALLY CONTROL: one refusing + one silent scores 1/2 (weakest site, not first)" \
+    "$(_loud_site_tally "$_tally_fx/mixed.sh")" "1/2"
 
 # Of those, the two ENFORCEMENT hooks are the high-severity members: losing an
 # observability hook loses visibility, losing these loses a GUARANTEE.
@@ -479,23 +769,41 @@ assert_eq "…and bash-footgun-guard really can block a tool call (exit 2)" "$ok
 assert_contains "pane-state's jq gate announces rather than degrades" \
     "$(grep -A1 'command -v jq' "$REPO_ROOT/monitor/pane-state.sh")" "unknown:no-jq"
 
+# _occurrences <pattern> <file> — OCCURRENCES, not lines (your-org/nexus-code
+# `#1026`). `grep -c` counts matching LINES, so two constructs sharing a line
+# read as one and an `== 1` assertion stays green with the construct
+# duplicated. `-F`: every caller below passes a LITERAL, and the literals carry
+# `[`, `$` and `\` — as a BRE those are metacharacters, so the pattern would be
+# matching something other than what it looks like. On no match `grep` prints
+# nothing and exits 1, which yields 0 here: a replacement, never an appended
+# second value (your-org/nexus-code#725, so no `|| echo 0` belongs here).
+#
+# Scope note: an `== N` census pins MEMBERSHIP only. None of the three call
+# sites below claims placement — each asserts that a construct is STILL PRESENT
+# in a named file, which is exactly what a census answers.
+_occurrences() { grep -oF -- "$1" "$2" 2>/dev/null | wc -l | tr -d ' '; }
+
 # The non-jq members of the class, each verified STILL PRESENT so that this
 # manifest describes the tree rather than a memory of it. If one is fixed, this
 # reddens and the manifest must be updated — which is the intended workflow.
 assert_eq "UNFIXED: the deliverable-write probe is still gated with no else" \
-    "$(grep -c 'if \[ -x "\$WRITE_PROBE" \]; then' "$REPO_ROOT/monitor/spawn-worker.sh")" "1"
+    "$(_occurrences 'if [ -x "$WRITE_PROBE" ]; then' "$REPO_ROOT/monitor/spawn-worker.sh")" "1"
 assert_contains "…still documents itself as a silent skip, and now cross-refs the boundary" \
     "$(grep -B30 'if \[ -x "\$WRITE_PROBE" \]; then' "$REPO_ROOT/monitor/spawn-worker.sh")" "silent skip"
-assert_contains "UNFIXED: the footgun ruleset is gated with no else" \
-    "$(grep -c 'if \[ -f "\$_pattern_file" \]; then' "$REPO_ROOT/monitor/hooks/bash-footgun-guard.sh")" "1"
+# assert_EQ, not assert_contains: the haystack here is a NUMBER, and a
+# containment test on a number is satisfied by 1, 10, 11, 21 alike — the
+# assertion could not distinguish one gated site from eleven.
+assert_eq "UNFIXED: the footgun ruleset is gated with no else" \
+    "$(_occurrences 'if [ -f "$_pattern_file" ]; then' "$REPO_ROOT/monitor/hooks/bash-footgun-guard.sh")" "1"
 assert_contains "…and the write-probe site cross-refs this boundary file" \
     "$(grep -B30 'if \[ -x "\$WRITE_PROBE" \]; then' "$REPO_ROOT/monitor/spawn-worker.sh")" \
     "test-guard-closure-boundary.sh"
 assert_contains "…naming the axis, so the path-drawn reading cannot return" \
     "$(grep -B30 'if \[ -x "\$WRITE_PROBE" \]; then' "$REPO_ROOT/monitor/spawn-worker.sh")" \
     "NOT on execution"
-assert_contains "UNFIXED: the orchestrator idle guard probes pane-state under [ -x ]" \
-    "$(grep -c 'if \[\[ -x "\$NEXUS_ROOT/monitor/pane-state.sh" \]\]; then' "$REPO_ROOT/monitor/watcher/main.sh")" "1"
+# assert_EQ, not assert_contains — see the note above.
+assert_eq "UNFIXED: the orchestrator idle guard probes pane-state under [ -x ]" \
+    "$(_occurrences 'if [[ -x "$NEXUS_ROOT/monitor/pane-state.sh" ]]; then' "$REPO_ROOT/monitor/watcher/main.sh")" "1"
 
 echo
 echo "=== 4. ONE SOURCE — the two launchers cannot diverge ==="

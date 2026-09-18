@@ -46,7 +46,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — missing %q\n' "$label" "$needle" >&2
@@ -100,7 +101,7 @@ assert_eq "T2 first invocation green so far but selection=1, exit 0" "$RC" "0"
 run --state "$WORK/t2.tsv" --resume "$FIX/ok-a.sh" "$FIX/ok-b.sh"
 assert_eq       "T3 second invocation exit 0 (sweep complete, all green)" "$RC" "0"
 assert_contains "T3 announced the resume skip"    "$OUT" "resume: 1 already recorded"
-assert_contains "T3 ledger accounts for both"     "$OUT" "2 PASS, 0 SKIP, 0 FAIL, 0 TIMEOUT, 0 not yet run"
+assert_contains "T3 ledger accounts for both"     "$OUT" "2 PASS, 0 SKIP, 0 ENVSKIP, 0 FAIL, 0 TIMEOUT, 0 not yet run"
 assert_eq       "T3 ok-a ran exactly once (skipped on resume)" \
     "$(grep -c 'ok-a.sh' "$WORK/t2.tsv")" "1"
 # T3b — resume on a FULLY-recorded ledger: the counts must read zero
@@ -129,7 +130,7 @@ assert_eq "T4 resumed invocation completes green (exit 0)" "$RC" "0"
 echo '=== T5: complete-but-red ledger exits 1 ==='
 run --state "$WORK/t5.tsv" "$FIX/ok-a.sh" "$FIX/red.sh"
 assert_eq       "T5 exit 1"                    "$RC" "1"
-assert_contains "T5 ledger shows the fail"     "$OUT" "1 PASS, 0 SKIP, 1 FAIL, 0 TIMEOUT, 0 not yet run"
+assert_contains "T5 ledger shows the fail"     "$OUT" "1 PASS, 0 SKIP, 0 ENVSKIP, 1 FAIL, 0 TIMEOUT, 0 not yet run"
 
 # ---- T5b: SKIP is a THIRD outcome — not a pass, not a failure -------------
 # your-org/nexus-code#568 A6. `status=PASS` whenever `rc == 0` meant every
@@ -142,7 +143,7 @@ run --state "$WORK/t5b.tsv" "$FIX/ok-a.sh" "$FIX/skip.sh"
 assert_eq       "T5b a SKIP does not turn the run red"  "$RC" "0"
 assert_contains "T5b prints a SKIP row"                 "$OUT" "SKIP  skip.sh"
 assert_contains "T5b row carries the test's own reason" "$OUT" "needs a thing this host lacks"
-assert_contains "T5b summary counts it separately"      "$OUT" "1 PASS, 1 SKIP, 0 FAIL, 0 TIMEOUT, 0 not yet run"
+assert_contains "T5b summary counts it separately"      "$OUT" "1 PASS, 1 SKIP, 0 ENVSKIP, 0 FAIL, 0 TIMEOUT, 0 not yet run"
 assert_contains "T5b states the PASS count is not coverage over it" \
     "$OUT" "DECLINED TO RUN"
 assert_contains "T5b lists the skipped path"            "$OUT" "SKIPPED (declined to run"
@@ -300,26 +301,94 @@ fi
 # T6b — the noun. With ~T6_THREADS tasks deliberately parked in one process,
 # a task-derived floor clears the PROCESS count by ~gap; a process-derived
 # one cannot clear it at all. Margin gap/2 ≫ the 32-wide search granularity.
+#
+# THE VERDICT IS A FUNCTION, AND THAT IS THE FIX (your-org/nexus-code#925).
+# This used to be an if/else whose `else` was reached by TWO different
+# outcomes — a floor that is a number and too low (the real finding), and a
+# floor that is not a number at all (no measurement happened) — while the
+# message asserted the first: `floor '' is process-scale … still counting the
+# wrong noun`. Observed with the floor as the EMPTY STRING. Neither "is
+# process-scale" nor "counts the wrong noun" is established by an absent
+# value; a reader who trusts it goes hunting in the floor computation for a
+# defect that may not be there.
+#
+# That is this repo's dominant defect class — absence reported as a finding —
+# inside a guard whose own job is to catch it, and it is the same remedy
+# `_merge_ref_base` took for a non-numeric `total_count`: a value the parse
+# cannot read is `unread`, never a verdict about what it would have said.
+#
+# Extracted to a pure classifier so the distinction is TESTABLE rather than
+# merely correct: the synthetic cases below drive it with the empty floor that
+# produced the report, which no live run can be made to reproduce on demand.
+#
+# _t6b_verdict <farm_ready> <floor> <procs> <tasks> <threads>
+#   -> unmeasured | skip | task-scale | process-scale
+_t6b_verdict() {
+    local ready="${1-}" floor="${2-}" procs="${3-}" tasks="${4-}" threads="${5-}"
+    # Inputs the arm's own arithmetic needs. Checked BEFORE any (( )) touches
+    # them: `(( x >= 1 ))` on a non-numeric x is a bash `set -u` fatal and a
+    # silent 0 elsewhere, which is the #903 total_count trap one file over.
+    if ! [[ "$procs" =~ ^[0-9]+$ && "$tasks" =~ ^[0-9]+$ && "$threads" =~ ^[0-9]+$ ]]; then
+        printf 'unmeasured'; return
+    fi
+    local gap=$(( tasks - procs ))
+    if [[ "$ready" != 1 ]] || (( gap < threads / 2 )); then printf 'skip'; return; fi
+    # The discriminator IS decidable here — so an unreadable floor is the one
+    # thing left unmeasured, and it is reported as that and nothing more.
+    if ! [[ "$floor" =~ ^[0-9]+$ ]]; then printf 'unmeasured'; return; fi
+    if (( floor >= procs + gap / 2 )); then printf 'task-scale'; else printf 'process-scale'; fi
+}
+
 t6_gap=$(( t6_tasks - t6_procs ))
-if (( t6_farm_ready == 1 )) && (( t6_gap >= T6_THREADS / 2 )); then
-    if [[ "$t6_floor" =~ ^[0-9]+$ ]] && (( t6_floor >= t6_procs + t6_gap / 2 )); then
+case "$(_t6b_verdict "$t6_farm_ready" "$t6_floor" "$t6_procs" "$t6_tasks" "$T6_THREADS")" in
+    task-scale)
         printf '  PASS: T6b floor %s counts TASKS not processes (procs=%s tasks=%s gap=%s, needed >= %s)\n' \
             "$t6_floor" "$t6_procs" "$t6_tasks" "$t6_gap" "$(( t6_procs + t6_gap / 2 ))"
-        PASS=$(( PASS + 1 ))
-    else
-        printf '  FAIL: T6b floor %q is process-scale (procs=%s tasks=%s gap=%s, needed >= %s) — still counting the wrong noun\n' \
+        PASS=$(( PASS + 1 )) ;;
+    process-scale)
+        # The floor IS a number and it IS too low. Only this arm has earned the
+        # noun claim, so only this arm makes it.
+        printf '  FAIL: T6b floor %s is process-scale (procs=%s tasks=%s gap=%s, needed >= %s) — still counting the wrong noun\n' \
             "$t6_floor" "$t6_procs" "$t6_tasks" "$t6_gap" "$(( t6_procs + t6_gap / 2 ))" >&2
-        FAIL=$(( FAIL + 1 ))
+        FAIL=$(( FAIL + 1 )) ;;
+    unmeasured)
+        # NOT a finding, and deliberately not a FAIL: nothing was measured, so
+        # there is nothing to conclude about the noun. Counted as a SKIP so the
+        # summary reports it as NOT COVERED rather than as a pass.
+        SKIP=$(( ${SKIP:-0} + 1 ))
+        printf '  SKIP: T6b UNMEASURED — the floor is %q, not a number, so the task-vs-process\n' "$t6_floor" >&2
+        printf '        question was never asked. This is NOT a claim that the floor is\n' >&2
+        printf '        process-scale or that anything counts the wrong noun (procs=%q tasks=%q).\n' \
+            "$t6_procs" "$t6_tasks" >&2 ;;
+    *)
+        # Loud, counted, and it names the numbers so the reader can act. The
+        # alternative — asserting over ambient counts anyway — is exactly the
+        # tie-on-a-runner flake this replaced.
+        SKIP=$(( ${SKIP:-0} + 1 ))
+        printf '  SKIP: T6b task-vs-process discriminator — %s (procs=%s tasks=%s gap=%s, need gap >= %s)\n' \
+            "${t6_farm_why:-manufactured task/process gap did not materialise}" \
+            "$t6_procs" "$t6_tasks" "$t6_gap" "$(( T6_THREADS / 2 ))" >&2 ;;
+esac
+
+# T6c — the classifier itself, driven with synthetic inputs. THE EMPTY FLOOR IS
+# THE POINT: it is the value that produced `#925`'s misreport, and no live run
+# can be made to yield it on demand, so the only way it is ever covered is here.
+_t6c() {   # <want> <label> <args...>
+    local want="$1" label="$2"; shift 2
+    local got; got=$(_t6b_verdict "$@")
+    if [[ "$got" == "$want" ]]; then
+        printf '  PASS: T6c %s\n' "$label"; PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: T6c %s — got %q want %q\n' "$label" "$got" "$want" >&2; FAIL=$(( FAIL + 1 ))
     fi
-else
-    # Loud, counted, and it names the numbers so the reader can act. The
-    # alternative — asserting over ambient counts anyway — is exactly the
-    # tie-on-a-runner flake this replaced.
-    SKIP=$(( ${SKIP:-0} + 1 ))
-    printf '  SKIP: T6b task-vs-process discriminator — %s (procs=%s tasks=%s gap=%s, need gap >= %s)\n' \
-        "${t6_farm_why:-manufactured task/process gap did not materialise}" \
-        "$t6_procs" "$t6_tasks" "$t6_gap" "$(( T6_THREADS / 2 ))" >&2
-fi
+}
+_t6c unmeasured    "an EMPTY floor is UNMEASURED, never a noun verdict (#925's own observation)" 1 ''    100 1000 64
+_t6c unmeasured    "…and so is a non-numeric floor"                                              1 'n/a' 100 1000 64
+_t6c process-scale "a numeric floor at process scale IS the finding — the arm still fires"       1 '105' 100 1000 64
+_t6c task-scale    "a task-derived floor passes"                                                 1 '600' 100 1000 64
+_t6c skip          "no manufactured gap → skip, not a verdict"                                   1 '600' 100 100  64
+_t6c skip          "farm not ready → skip"                                                       0 '600' 100 1000 64
+_t6c unmeasured    "unreadable procs/tasks are UNMEASURED before any arithmetic touches them"    1 '600' ''  1000 64
 
 # ---- T7: a red must print the failing test's OWN diagnosis ------------------
 #

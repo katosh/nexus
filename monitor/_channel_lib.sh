@@ -23,6 +23,7 @@
 # Sourcing contract: this file defines functions only — no side effects,
 # no `set` changes, no global writes. Source it after resolving STATE_DIR.
 
+
 # The keyed-field primitive lives in _fm_lib.sh (the single reader/writer both
 # channels + the token records share, #405 P2). Pull it in from this lib's own
 # directory so every _channel_lib.sh consumer gets `_fm_get` in scope; the guard
@@ -35,7 +36,25 @@
 # filename-safe token. Mirrors skeptic-channel.sh:_safe and the rule
 # spawn-worker.sh uses for window-keyed state files. Anything outside
 # [A-Za-z0-9_-] collapses to `_`.
-_chan_safe() { printf '%s' "${1//[^a-zA-Z0-9_-]/_}"; }
+# your-org/nexus-code#941 — the window-key encoder lives in ONE place
+# (monitor/_bookkeeping.sh). Sourced only if not already present, because the
+# usual caller has loaded it long before this file. NO fallback to the lossy
+# `${w//[^a-zA-Z0-9_-]/_}` form: a writer and a reader disagreeing about the
+# key is the very defect this closes, and a silent fallback would recreate it
+# exactly when nobody is watching.
+if ! declare -F wk_encode >/dev/null 2>&1; then
+    _wk_lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_bookkeeping.sh"
+    if [[ -r "$_wk_lib" ]]; then
+        # shellcheck source=monitor/_bookkeeping.sh
+        source "$_wk_lib"
+    else
+        printf '%s: cannot load the window-key encoder from %s — refusing\n' \
+            "${BASH_SOURCE[0]##*/}" "$_wk_lib" >&2
+        return 2 2>/dev/null || exit 2
+    fi
+fi
+
+_chan_safe() { wk_encode "${1-}"; }
 
 # Force a UTF-8 locale so an inherited C/POSIX (ASCII) locale — the common
 # default for a daemon-spawned SSH forced command, and for a bare cron/

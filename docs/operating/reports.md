@@ -19,12 +19,14 @@ Example: `reports/kompot_2026-04-14_153200_fig2-revision.md`.
 
 ```markdown
 ---
-project: <slug>
-date: <YYYY-MM-DD>
-session-id: <uuid>
-window: <tmux-window>
-trigger: <issue#> [comment-id]
-status: completed | partial | blocked
+project: <slug>                          # enforced
+date: <YYYY-MM-DD>                       # enforced
+session-id: <uuid>                       # enforced (never the literal "unknown")
+window: <tmux-window>                    # conventional
+trigger: <issue#> [comment-id]           # conventional
+status: completed | partial | blocked    # enforced — exactly one of these three
+disposition: no-further-pass | second-pass   # skeptic reports only; report-init
+                                         # seeds `TODO`, an ordinary worker deletes it
 ---
 
 # <Title>
@@ -76,10 +78,10 @@ The trail of progressive reports preserves history; an overwritten file loses it
 
 ```bash
 # 1. Start the report — frontmatter'd skeleton, captures session id + tmux window.
-monitor/ng report-init <slug> [--project <name>] [--issue <#>] [--comment-id <id>]
+monitor/ng report-init <slug> [--project <name>] [--issue <#>] [--comment-id <id>] [--reports-dir <path>]
 
 # 2. Validate the report against the schema.
-monitor/ng report-check <path> [--allow-todo]
+monitor/ng report-check <path> [--allow-todo] [--skeptic-gate-settling]
 
 # 3. Wrap up — upload + link comment + rocket + retain + log-action, all atomic.
 monitor/ng wrap-up <issue> <report-path> \
@@ -91,9 +93,15 @@ monitor/ng wrap-up <issue> <report-path> \
 
 Writes a correctly-frontmatter'd skeleton at the canonical `<reports-dir>/<project>_<YYYY-MM-DD>_<HHMMSS>_<slug>.md` path. Reads the session id from the running Claude Code session, captures the current tmux window, and fills in the issue / comment refs from the flags. The agent then opens the file and fills in the five content sections.
 
+`<project>` is **cwd-derived** — the first segment after the last `/work/` in `$PWD`, falling back to the window name only when it ran outside a `work/` tree — so it need not equal the frontmatter `window:`. Don't index reports by a filename glob on a window name; use `monitor/ng reports-for-window <window>`, which keys on the frontmatter and keeps *found* / *looked-and-found-none* / *could not look* apart as rc 0 / 1 / 2.
+
+The skeleton is written **into the primary clone's `reports/`** regardless of which worktree you are in; `report-init` rejects `--repo` outright for that reason. It ships full of placeholders (`_(fill in)_`, `disposition: TODO`), so a freshly-initialised report **fails `report-check` by design** until you fill it in.
+
 ### `ng report-check`
 
 Validates a report against the schema: frontmatter fields, the five required sections (`Infrastructure Issues` conditional), body length ≥ `monitor.report_min_chars` (default 500), and absence of placeholder text (`TODO`, `FIXME`, `<...>`, `_(fill in)_`, `_(later)_`).
+
+Exits **0** complete, **1** incomplete (specifics on stderr), **2** file missing or unreadable. Of the frontmatter, only `project`, `date`, `session-id` and `status` are *enforced* — `window:` and `trigger:` are conventional, written by `report-init` but not failed on. `status` must be exactly one of `completed | partial | blocked`. Two further fields are validated *only when present*: `disposition:` (must parse as `no-further-pass` or `second-pass` — nothing else does, `merge` included) and `fanout:` (must read `<N> spawned / <M> returned`, with `M <= N`).
 
 `ng wrap-up` runs `report-check` as a pre-flight and refuses to ship a stub asset URL. If you're intentionally checkpointing mid-flight (e.g. a context-pressure save) and the body legitimately contains placeholders, pass `--allow-stub` to `wrap-up`, which forwards `--allow-todo` to the check.
 
@@ -108,7 +116,15 @@ The end-of-task hand-off, folded into one verb:
 5. **Retain the worker's tmux window.** `wrap-up` *auto-retains by default* — it logs a `window-retain` event so the orchestrator's window-cleanup loop keeps the window alive (default `monitor.retain_ttl_seconds`, 24 h) under the tag `wrap-up-<YYYY-MM-DD>`, giving you a resume surface. Pass `--retain <reason>` for a custom tag, or `--no-retain` to close-immediately (`--no-retain` and `--retain` are mutually exclusive). The retain is logged only when the verb runs inside the tmux window it's retaining.
 6. Append a `wrap-up` event to `monitor/.state/action-log.jsonl`.
 
-Exit 0 only when every attempted step succeeds; on partial failure, prints which steps ok / failed on stderr so the caller can retry just the failed ones.
+**Exit codes — and `3` is the one that is not a failure.**
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| `0` | every attempted step succeeded | nothing |
+| `1` | a step failed | the stderr block names which steps were ok / failed; retry just those |
+| `3` | **NOTHING FAILED, AND NOTHING PUBLISHED** — the composed link comment carried no claim the author wrote | **an unchanged retry cannot clear it** — it reproduces the outcome exactly. Two causes, both projections losing your content: the teaser composed to a fragment or to nothing (`#1114`), or the report changed while the composed body did not, so only the asset link moved (`#862`). Edit the **opening** of `## Summary` — its first sentence, within the first 200 chars — so the correction is *in* the composed body, then re-run; or pass `--comment-body-file`. **Re-running is not free**: no step failed, so every step that already succeeded runs again, including the skeptic step (Step 0b), which *arms* a round keyed on the report sha — and the edit this remedy asks for moves that sha (`#1230`). To re-read the diagnostic without re-running the verb, use `ng wrap-up --last`, which replays the record read-only and arms nothing. |
+
+The guarantee behind `3`: `wrap-up` publishes a composed link comment only when that comment carries a claim the author wrote; when the composition cannot carry one it publishes **nothing**, exits 3, and names the cause. It is stated over the *mechanism*, not over a list of steps, so a lossy stage nobody has enumerated yet is still covered. Full treatment in [`skills/nexus.report/SKILL.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.report/SKILL.md) under "`## Summary` IS the comment".
 
 ## Why `reports/` is gitignored
 

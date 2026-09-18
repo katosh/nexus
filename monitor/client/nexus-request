@@ -79,6 +79,7 @@
 #     --- end reply-body ---
 #   TERMINAL non-reply (no body block):
 #     nexus-request: state=acked   id=<id> note=orchestrator-acked-no-body ts=<utc>
+#     nexus-request: state=already-emitted id=<id> note=<kind>-already-delivered sentinel=<path> ts=<utc>
 #     nexus-request: state=failed  id=<id> reason=<r> detail="…" ts=<utc>
 #     nexus-request: state=timeout id=<id> reason=budget_exhausted waited_s=<s> ts=<utc>
 #   reason ∈ { file_failed | terminal_failed | not_found | confinement_reject |
@@ -88,6 +89,10 @@
 #   0   state=replied (body emitted)  OR  state=acked (terminal ack, no body)
 #   2   state=failed  (terminal error — see reason=)
 #   3   state=timeout (wall-clock lifetime budget exhausted, still pending)
+#   4   state=already-emitted — this id's terminal event was ALREADY delivered
+#       by an earlier run; the once-only sentinel short-circuited it. NOT a
+#       loss. This used to be exit 0 with EMPTY stdout, which is exactly what a
+#       lost reply looks like; it is now a distinct code AND a stdout line.
 #   64  usage error   (bad invocation — fix the launch, not the channel)
 #
 # USAGE
@@ -126,7 +131,29 @@ PROG=nexus-request
 # alongside this script + nexus-reply-watch (client-side tooling saved next to
 # the key), sourced from the same dir.
 _wl_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd 2>/dev/null) || _wl_dir=$(dirname -- "$0")
+_wl_path="${NEXUS_WATCH_LIB:-$_wl_dir/_nexus_watch_lib.sh}"
+# CHECK BEFORE SOURCING — the `|| { … exit 64; }` arm below CANNOT run under the
+# interpreter this script declares. POSIX makes a `.` that cannot find its file
+# abort a non-interactive shell outright, so under `#!/bin/sh` (dash here) the
+# shell dies at the dot with rc 2 and the arm is dead code; only bash reaches
+# it. Measured on this host, same lonely install: bash rc=64 (arm fires), dash
+# rc=2 (arm never runs). The failure was still loud and named the missing path,
+# so this was never silent — but the DESIGNED message and exit code have to be
+# reachable on the interpreter in the shebang, so test readability first.
+if [ ! -r "$_wl_path" ]; then
+    printf '%s: cannot load _nexus_watch_lib.sh (expected next to this script)\n' "$PROG" >&2
+    printf '%s: looked for: %s\n' "$PROG" "$_wl_path" >&2
+    printf '%s: the client helpers are a SET — nexus-request, nexus-reply-watch and\n' "$PROG" >&2
+    printf '%s: _nexus_watch_lib.sh all install into ONE directory. Re-request the full\n' "$PROG" >&2
+    printf '%s: set from your orchestrator (ng remote client-helper --base64).\n' "$PROG" >&2
+    exit 64
+fi
 # shellcheck source=_nexus_watch_lib.sh
+# The source target is spelled out INLINE rather than via $_wl_path (which holds
+# the identical value, checked just above). The static source-graph resolver
+# reads this token literally: naming a variable here makes the edge unresolvable
+# and lands both scripts in aso-unresolved-sources.manifest for no behavioural
+# gain. Keep the literal — the readability guard above is what changed, not this.
 . "${NEXUS_WATCH_LIB:-$_wl_dir/_nexus_watch_lib.sh}" || {
     printf '%s: cannot load _nexus_watch_lib.sh (expected next to this script)\n' "$PROG" >&2
     exit 64
@@ -256,7 +283,7 @@ progress() {  # $1 = state; $2… = extra tokens
 # is tool-specific here (nexus-reply-watch's acked carries the ack envelope as
 # a body; nexus-request's is a bare status line).
 emit_acked() {
-    if already_emitted; then log "terminal ack for id=$id already emitted — no re-emit"; exit 0; fi
+    if already_emitted; then emit_already_emitted ack; fi
     compose_status acked note=orchestrator-acked-no-body
     mark_emitted
     deliver

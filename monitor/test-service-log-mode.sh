@@ -50,6 +50,26 @@ assert_ne() {
 }
 
 mode() { stat -c %a "$1" 2>/dev/null || echo "MISSING"; }
+
+# _await_content <file> [<ceiling-s>] — a BOUNDED POLL for a detached writer's
+# output, in place of a bare `sleep` (your-org/nexus-code#1417). `sleep 0.3` is
+# not a synchronisation primitive: it is a bet that a setsid-detached process is
+# scheduled, runs, and flushes within 300 ms. On CI's 2-cpu runners under PSI
+# stall (cpu-stall%=65.74 measured) that bet lost and the suite reported
+# `service output landed — got '' want hello`: a CONTENT failure for a
+# scheduling delay, whose first reading is a defect in the code under test.
+# The ceiling stays bounded so a writer that never writes still fails, and
+# fails fast enough; a slow schedule no longer manufactures a wrong answer.
+# rc 0 when the file is non-empty before the deadline, rc 1 otherwise.
+_await_content() {
+    local f="$1" ceiling="${2:-5}" i n
+    n=$(( ceiling * 20 ))          # 50 ms polls
+    for (( i = 0; i < n; i++ )); do
+        [[ -s "$f" ]] && return 0
+        sleep 0.05
+    done
+    [[ -s "$f" ]]
+}
 # Group- or other-writable? The property the issue is actually about.
 group_or_other_writable() {
     local m; m=$(stat -c %a "$1" 2>/dev/null) || { echo "MISSING"; return; }
@@ -95,10 +115,22 @@ echo "## 2. helper + the actual '>>' redirect keeps 0640"
 lf="$WORK/serve.log"
 _ensure_service_log "$lf"
 ( setsid bash -c 'echo hello' </dev/null >>"$lf" 2>&1 & ) 2>/dev/null
-sleep 0.3
+_await_content "$lf" 5 || true    # the assertion below reports the content
 assert_eq "mode still 640 after the redirect" "$(mode "$lf")" "640"
 assert_ne "and differs from the bare-redirect control" "$(mode "$lf")" "$(mode "$ctl")"
 assert_eq "service output landed"             "$(cat "$lf" 2>/dev/null)" "hello"
+
+# ── 2b. The poll survives a writer slower than the old bare sleep ──────────
+# your-org/nexus-code#1417's mechanism, made deterministic: a detached writer
+# that lands at +600 ms is exactly the CI stall the old `sleep 0.3` lost to.
+# The old form reads '' here every time; the poll reads the content. This is
+# the assertion that goes red if someone puts the bare sleep back.
+echo "## 2b. a writer delayed past the old 300 ms bet is still observed (#1417)"
+lf="$WORK/slow.log"
+_ensure_service_log "$lf"
+( setsid bash -c 'sleep 0.6; echo late' </dev/null >>"$lf" 2>&1 & ) 2>/dev/null
+_await_content "$lf" 5 || true
+assert_eq "a 600 ms-late detached writer's output is observed by the poll" "$(cat "$lf" 2>/dev/null)" "late"
 
 # ── 3. A pre-existing 0660 log is repaired ───────────────────────────────
 echo "## 3. pre-existing 0660 log is repaired to 0640 on next launch"
@@ -167,7 +199,7 @@ fi
 # ── 9. END-TO-END: the real fleet-wide launcher, bootstrap-recover.sh ─────
 # _recover_launch_service is THE create-by-redirect site for every
 # registry service (remote-ssh.log, labsh-service.log, serve.log,
-# deploy.log, annzarro.log …). bootstrap-recover.sh is source-safe: it
+# deploy.log, myviewer.log …). bootstrap-recover.sh is source-safe: it
 # runs _recover_main only when executed directly.
 echo "## 9. end-to-end: bootstrap-recover.sh::_recover_launch_service"
 if [[ "${LOG_MODE_HELPER:-real}" == "noop" ]]; then
@@ -186,7 +218,10 @@ else
         declare -F _recover_launch_service >/dev/null || { echo "NO_FUNC"; exit 0; }
         lf="$2/svc/serve.log"
         _recover_launch_service "testsvc" "$2/svc" "/bin/echo started" "$lf" >/dev/null 2>&1
-        sleep 0.4
+        # Bounded poll, not a bare sleep (your-org/nexus-code#1417): this runs
+        # inside a child bash, so the helper above is out of scope — same
+        # shape inline, same 5 s ceiling.
+        for (( _i = 0; _i < 100; _i++ )); do [[ -s "$lf" ]] && break; sleep 0.05; done
         stat -c %a "$lf" 2>/dev/null || echo MISSING
     ' _ "$_test_dir" "$E2E"
   )

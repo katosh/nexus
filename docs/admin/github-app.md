@@ -246,19 +246,21 @@ Run each command in order from the nexus root. Each step is
 independently re-runnable; fix the cause and re-run before moving on.
 
 ```bash
-# 1. Mint an installation token. Should print a JWT-shaped value.
+# 1. Mint an INSTALLATION token (a `ghs_...` value, not a JWT).
 ./monitor/mint-token.sh
 
-# 2. App-JWT smoke (used by the deliveries probe).
+# 2. App-JWT smoke — this one IS a JWT (three dot-separated segments).
+#    Used by the deliveries probe.
 ./monitor/mint-token.sh --jwt-only
 
-# 3. Resolve an issue via the bot token. Both "ok" and "ng: not found"
-#    prove the token mints and the App can read the repo.
+# 3. Resolve an issue via the bot token. Both `#1 state=OPEN|CLOSED title=...`
+#    and `ng: issue 1: fetch failed` (an empty repo) prove the token
+#    mints and the App can read the repo.
 ./monitor/ng issue 1
 
 # 4. Bot install scope.
 ./monitor/ng preflight "$(./config/load.sh github.repo)"
-# expected: "bot installed yes"
+# expected: "bot installed: yes (<repo>) — repository_selection=..."
 
 # 5. End-to-end asset upload. Commits one file to the asset repo's
 #    main branch and prints the SHA-pinned URL.
@@ -274,8 +276,9 @@ watcher.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `private key not found` | `bot_pem_path` is wrong or the file moved | `ls -l "$(./config/load.sh github.bot_pem_path)"` must show `-rw-------`. Re-`chmod 600`. |
+| `REFUSING to sign … verdict=exposed` (exit 4) | the key is world-accessible **and** every ancestor directory is world-traversable, so other local users can read it (<your-org>/nexus-code#1501) | `chmod 600 "$(./config/load.sh github.bot_pem_path)"`, then **rotate** — a chmod does not un-expose a key that was readable. `./monitor/mint-token.sh --check-key` reports the verdict without minting. |
 | `Bad credentials` on the deliveries probe | `bot_app_id` doesn't match the pem you downloaded | Recheck the App page; the App ID is at the top. |
-| `ng preflight` returns `bot installed no` | App is not installed on the asset+issue repo | Re-do [Step 7](#step-7-install-the-app-on-your-assetissue-repo). |
+| `ng preflight` returns `bot installed: NO` | App is not installed on the asset+issue repo | Re-do [Step 7](#step-7-install-the-app-on-your-assetissue-repo). |
 | `ng upload` 403 on push | Contents permission granted on the App but not installed on the asset repo | Same — re-do Step 7. |
 | `ng upload` 404 cloning the asset repo | The repo doesn't exist on GitHub, or `github.repo` is misspelled | `gh repo view "$(./config/load.sh github.repo)"`. |
 | `gh pr edit` fails with `Resource not accessible by integration` or `could not look up members of organisation` | Missing Organization → Members: read permission | Add it via App settings, accept the new-permission request on the installation. |
@@ -377,7 +380,9 @@ If the `.pem` leaks or you suspect compromise:
 2. Replace the file at `github.bot_pem_path` with the new one
    (`chmod 600`).
 3. Mint a token to confirm: `./monitor/mint-token.sh` should print a
-   fresh JWT-shaped value.
+   fresh installation token (`ghs_...`). Note the token cache at
+   `github.bot_token_cache` may still hold a valid token from the old
+   key — delete it if you want to prove the new key signs.
 4. On the App settings page, **delete the old key** to invalidate
    any in-flight JWT signed with it.
 5. The next watcher cycle picks up the new key automatically — no

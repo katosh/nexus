@@ -57,6 +57,8 @@ cp "$NG_REAL" "$WORKTREE/monitor/ng"
 # it (your-org/nexus-code#601/#605: degrading to the silent-coercion
 # behaviour it replaces is worse than refusing). Copy it alongside.
 cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$WORKTREE/monitor/_bookkeeping.sh"
+# your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+cp "$(dirname "$NG_REAL")/_nexus-root.sh" "$WORKTREE/monitor/_nexus-root.sh"
 WORKTREE_NG="$WORKTREE/monitor/ng"
 
 # Primary-clone-shape: where the watcher reads from. Has its

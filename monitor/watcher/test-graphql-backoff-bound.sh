@@ -227,4 +227,95 @@ out=$(_graphql_note_success new_issues)
 assert_empty "success with no prior failure -> silent" "$out"
 assert_eq "  no alerts written" "$(alerts | wc -l)" "0"
 
+echo "== your-org/nexus-code#966 follow-up: the STILL-DEGRADED heartbeat =="
+#
+# The storm (`#966`) and this are the two halves of one outage, and fixing
+# only the first makes the second worse. Measured 2026-08-17: the escalation
+# announced at 10:45:41, the emit stream stormed until ~10:56, and then went
+# quiet while `issue_comments` kept failing (`count` 5 -> 8 by 11:15:40, zero
+# recoveries). An operator reading that silence as resolution is reading the
+# design correctly and being misled, because a REAL recovery does emit
+# `ingest-recovered`.
+#
+# WHAT IS ACTUALLY UNDER TEST — and it is not "does a restatement exist".
+# It does: `announced` + `MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS` is a
+# working re-nag, and the observed 25-minute silence sat inside the 3600s
+# default rather than outside a broken mechanism. The property is the
+# INTERVAL, and one thing about its content: a restatement whose `held_s`
+# does not move is just a slower storm, so freshness is asserted here rather
+# than assumed.
+#
+# The poll granularity is the non-obvious constraint. `_graphql_note_failure`
+# is only ever called from the `github_poll` path (600s), so the effective
+# restatement period is the remind window ROUNDED UP to a multiple of 600 --
+# setting remind below 600 buys nothing at all.
+
+# Simulate an outage: escalate, then <n_polls> failures at the real 600s
+# github_poll cadence. Echoes only the blocks that actually EMIT.
+simulate_outage() {  # <remind_seconds> <n_polls>
+    reset_state
+    NOW=1785000000
+    MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS=1800
+    MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS="$1"
+    local n="$2" i out all=""
+    _graphql_note_failure issue_comments >/dev/null
+    NOW=$(( NOW + 1900 ))
+    all+=$(_graphql_note_failure issue_comments)$'\n'   # the escalation
+    for (( i = 0; i < n; i++ )); do
+        NOW=$(( NOW + 600 ))
+        out=$(_graphql_note_failure issue_comments)
+        [[ -n "$out" ]] && all+="$out"$'\n'
+    done
+    printf '%s' "$all"
+}
+# Count EMITTED blocks, not matching lines (`grep -c` counts lines, and each
+# block is header + body).
+count_emits() { grep -o 'watcher_alert=ingest-degraded' <<<"$1" | wc -l | tr -d ' '; }
+
+# --- witness the silent half at the OLD 3600s default ---
+# Three polls = 30 minutes of continuous, still-true failure after the
+# escalation. At 3600 the operator hears nothing for the whole stretch.
+silent=$(simulate_outage 3600 3)
+assert_eq "at remind=3600, 30 min of live failure restates ZERO times" \
+    "$(count_emits "$silent")" "1"
+
+# --- the shipped default must restate inside that window ---
+unset MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS
+beat=$(simulate_outage "${MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS:-}" 3)
+assert_eq "the DEFAULT restates at least once in the same 30 min" \
+    "$(( $(count_emits "$beat") > 1 ? 1 : 0 ))" "1"
+
+# --- and every restatement must carry a LIVE held_s ---
+# The storm's repeats were byte-identical with a frozen held_s=2403; a
+# heartbeat that repeats a stale number is the same defect at a slower rate.
+held_vals=$(grep -o 'held_s=[0-9]*' <<<"$beat" | cut -d= -f2)
+n_held=$(printf '%s\n' "$held_vals" | grep -c .)
+n_uniq=$(printf '%s\n' "$held_vals" | sort -u | grep -c .)
+# VACUITY GUARD. With a single emitted block the two assertions below are
+# 1-of-1 unique and trivially sorted — they PASS while witnessing nothing.
+# That is the shape this repo keeps finding (an assertion placed where it
+# cannot fail), and it fires here by default, so it is asserted rather than
+# assumed.
+assert_eq "  freshness assertions are non-vacuous (>1 restatement observed)" \
+    "$(( n_held > 1 ? 1 : 0 ))" "1"
+assert_eq "every restatement carries a DISTINCT held_s (no frozen repeats)" \
+    "$n_uniq" "$n_held"
+sorted=$(printf '%s\n' "$held_vals" | sort -n)
+assert_eq "  and held_s is strictly INCREASING (it is an age, not a label)" \
+    "$sorted" "$held_vals"
+
+# --- NEGATIVE CONTROL: the heartbeat must not fire without an escalation ---
+# Otherwise "restate while degraded" degenerates into "emit on every poll",
+# which is `#966` rebuilt one layer down.
+reset_state
+NOW=1785000000
+MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS=1800
+unset MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS
+quiet=""
+for _i in 1 2; do
+    quiet+=$(_graphql_note_failure issue_comments)
+    NOW=$(( NOW + 600 ))
+done
+assert_empty "below the escalate window the heartbeat stays silent" "$quiet"
+
 th_summary_and_exit

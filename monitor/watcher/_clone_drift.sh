@@ -92,6 +92,9 @@ _CLONE_DRIFT_SOURCED=1
 # shellcheck source=../_integration_branch.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/_integration_branch.sh"
 
+# shellcheck source=../repo-root.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/repo-root.sh"
+
 _clone_drift_git() { "${_CLONE_DRIFT_GIT_BIN:-git}" "$@"; }
 _clone_drift_gh()  { "${_CLONE_DRIFT_GH_BIN:-gh}" "$@"; }
 
@@ -153,8 +156,35 @@ _clone_drift_slug() {
 _clone_drift_probe() {
     local root="$1" branch="$2"
 
-    if [[ ! -d "$root/.git" ]] && ! _clone_drift_git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+    # THIS GUARD USED TO BE `#1080`'s SHAPE VERBATIM —
+    #
+    #   [[ ! -d "$root/.git" ]] && ! _clone_drift_git -C "$root" rev-parse --git-dir …
+    #
+    # — and both arms walk up (your-org/nexus-code#1196). `--git-dir` succeeds
+    # for any path INSIDE a repository, so a `$root` that is not a repository
+    # passed the guard and every measurement below was then taken against the
+    # nearest ENCLOSING repository: `rev-parse HEAD` returns that repo's HEAD,
+    # `ls-remote` its origin, and the verdict is a confident `up-to-date` or
+    # `behind` about a clone that was never examined. In a nexus the enclosing
+    # repository is the nexus itself, so the wrong answer is also a plausible
+    # one. Latent rather than live today — both call sites pass a real clone
+    # root — but this is the deployment gate, and a gate that can be answered
+    # about the wrong repository is not a gate.
+    #
+    # `rr_has_own_history` is the READ-side question, so a LINKED WORKTREE
+    # still probes correctly: its HEAD and branch are genuinely its own. 131
+    # of the 881 directories under this nexus's `work/` are linked worktrees,
+    # so the stricter write-side predicate would refuse a large, legitimate
+    # population.
+    local _cd_rc
+    rr_has_own_history "$root"; _cd_rc=$?
+    if [[ $_cd_rc -eq 1 ]]; then
         printf 'verdict=unknown reason=not_a_git_repo detail=%s\n' "$root"; return 0
+    elif [[ $_cd_rc -ne 0 ]]; then
+        # UNDETERMINED IS NOT "NOT A REPO". Collapsing it would report a
+        # repository we merely could not inspect as one that does not exist,
+        # and the operator would read a real clone as absent.
+        printf 'verdict=unknown reason=repo_root_undetermined detail=%s\n' "$root"; return 0
     fi
 
     local head

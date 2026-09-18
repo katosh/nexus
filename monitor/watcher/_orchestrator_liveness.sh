@@ -335,6 +335,37 @@ _orchestrator_pasted_without_response() {
 # Stateful pieces (the unresponsive-since file's mtime, the
 # resubmit marker) are managed by the caller / by
 # `_orchestrator_liveness_step`.
+# Is the orchestrator's pane showing a login surface? (your-org/nexus-code#1518)
+#
+# Sets `ORCH_AUTH_BLOCK_KIND` to `hold` (a `/login` dialog is up and emits are
+# being held) or `expired` (the session is logged out and saying so). rc 0 when
+# either obtains.
+#
+# DEGRADES TO "NOT BLOCKED" WHEN `_auth_hold.sh` IS ABSENT, and that direction
+# is the one to state: a test or tool sourcing this module alone keeps the
+# pre-#1518 behaviour exactly, rather than acquiring a gate whose substrate is
+# missing. The cost of the degradation is `#1517`'s behaviour — which is the
+# behaviour such a caller already had — not a new failure.
+#
+# The `hold` arm needs NO target: it reads the hold row, which only exists
+# because a cycle observed the dialog. The `expired` arm needs one, because
+# expiry must be answerable while no hold is active at all; `$TARGET` is
+# main.sh's global and an unset one simply skips that arm.
+_orchestrator_auth_blocked() {
+    ORCH_AUTH_BLOCK_KIND=""
+    declare -F _auth_hold_active >/dev/null 2>&1 || return 1
+    if _auth_hold_active; then
+        ORCH_AUTH_BLOCK_KIND=hold
+        return 0
+    fi
+    if [[ -n "${TARGET:-}" ]] && declare -F _auth_hold_auth_expired >/dev/null 2>&1 \
+        && _auth_hold_auth_expired "$TARGET"; then
+        ORCH_AUTH_BLOCK_KIND=expired
+        return 0
+    fi
+    return 1
+}
+
 _orchestrator_liveness_decide() {
     local heartbeat_file="${1:?heartbeat file required}"
     local paste_received_file="${2:?paste-received file required}"
@@ -365,6 +396,37 @@ _orchestrator_liveness_decide() {
     # manifested yet — turn machinery legitimately takes this long.
     if (( age <= grace_s )); then
         printf 'healthy reason=within-grace age=%ds grace=%ds' "$age" "$grace_s"
+        return 1
+    fi
+
+    # AUTH GATE (your-org/nexus-code#1518, closing the liveness half of #1517).
+    #
+    # `#1517` measured 45 h of `Login expired · Please run /login` on this
+    # orchestrator drawing **8 resubmits** and **10 `recovered after …` lines**
+    # — and, over 1,648 watcher-log lines in the span, **0 lines mentioning
+    # login, auth or expiry**. The mechanism is this function's own premise: a
+    # paste with no answer past grace is read as a possibly-lost paste, whose
+    # remedies are a re-paste and then a respawn. **Neither can fix an expired
+    # credential**, and a respawn inherits it.
+    #
+    # Checked HERE — after grace, before `_orchestrator_pasted_without_response`
+    # — for a specific reason. That predicate decides health from the MTIME of a
+    # heartbeat / paste-received / session-jsonl / tool-results file newer than
+    # the paste, and reads no content. Under an expired login every input is
+    # answered within about a second by a synthetic error record written to the
+    # session jsonl, which is precisely a newer mtime; so that predicate is the
+    # thing producing the false `recovered`, and a gate placed after it would be
+    # adjudicating a verdict already corrupted. The ordering is the fix.
+    #
+    # `return 1` — no action — is the right verdict rather than a new escalation
+    # class, because there is no remedy in this module's vocabulary. The REMEDY
+    # is a human `/login`, and `_auth_hold.sh` has already fired the
+    # out-of-band `sandbox-notify` that asks for it. What this gate adds is the
+    # two things `#1517` found missing: the remedies do not fire, and the log
+    # says `auth`.
+    if _orchestrator_auth_blocked; then
+        printf 'healthy reason=auth-%s age=%ds (login surface on the orchestrator: no resubmit, no respawn — neither can fix an expired credential; the operator has been notified out-of-band, your-org/nexus-code#1518/#1517)' \
+            "$ORCH_AUTH_BLOCK_KIND" "$age"
         return 1
     fi
 

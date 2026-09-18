@@ -4,6 +4,19 @@ How a running nexus picks up new code, and specifically how a
 deployment on the old **watcher-in-a-window** setup converges to the
 current **headless service** hosting.
 
+> **Derived at `main` @ `e382e9fd`** — the 2026-09-04 promotion. The previous
+> derivation was `ca6205c8` (2026-08-28, PR `#1172`), so this revision closes a
+> **444-commit** delta, of which **395** touched `monitor/`
+> (`git rev-list --count ca6205c8..e382e9fd`, and the same with `-- monitor`;
+> `ca6205c8` is an ancestor of `e382e9fd`, so the range is a real timeline).
+>
+> **Re-derive this page from the tree, not from the page.** A doc page's own
+> staleness is invisible from inside it: the previous revision described a
+> candidate 444 commits behind while reading as current, and nothing said so
+> until somebody measured (<your-org>/nexus-code#1466). Restate this line at
+> every promotion — it is what lets the next one measure its own drift in one
+> command instead of rediscovering it.
+
 ## The standard update routine: `git pull` — that's it
 
 One step, on the live clone:
@@ -69,6 +82,203 @@ guards against on the automatic path.)
 which replaces the orchestrator session deliberately), and any worker
 sessions already in flight — both keep running what they started with,
 by design.
+
+## Upgrading across a large jump
+
+The routine above assumes you pull often. A clone that has sat on a
+release branch for weeks is a different operation: the gap is not a
+bigger version of the same pull, it is a pull that crosses tooling
+which did not exist when you last synced. Nothing here is a migration
+step — there is **no config migration** and no manual data conversion
+— but several commands that used to fail quietly, or not exist, now
+**refuse loudly**, and a refusal you have never seen reads like a
+break.
+
+**Config: no key you must add.** `config/nexus.example.yml` carries
+the same six top-level keys it always has. It grew substantially
+(1709 -> 1995 lines between the 2026-08-28 `main` and `dev` tips) but
+entirely in sub-keys and commentary, all of which have defaults. An
+existing `config/nexus.yml` keeps working untouched. Diff the example
+against your own config if you want the new knobs; you do not need
+them to come up.
+
+**What to do first, in order:**
+
+1. `git -C <nexus-root> pull`.
+2. `monitor/assert-shims-wrapped.sh` — see below. Run it *before* you
+   trust any subsequent `gh` write. It is new, and it is the one check
+   that fails loudly for a problem that is otherwise silent.
+3. `monitor/svc.sh status` — every registry service should be `UP`.
+4. `monitor/ng watcher-status` — expect exit 0 and `hosting: headless`.
+
+## Loud refusals you may meet after upgrading
+
+Each of these is a **deliberate refusal**, not a crash. The exit code
+is the message. They are listed with what is genuinely new relative to
+an older clone, because a refusal from a tool you did not know existed
+is the one most likely to be misread as a regression.
+
+### `monitor/assert-shims-wrapped.sh` — exit 0 / 1 / 79
+
+New. Every agent launcher runs it as a spawn-time precondition and
+refuses to spawn if the PATH-front `gh` shim is unreachable in a
+spawned shell. **Exit 79 is the one to understand: "NOT CHECKED".**
+It means the script could not examine the shims at all, and it is
+deliberately *not* 0 — three states are not two, and a check that
+could not run must never read as a check that passed. Exit 1 is a
+genuine failure (the shim is reachable and wrong); exit 0 is a pass.
+
+`monitor/assert-gh-wrapped.sh` still exists as a deprecated forwarder,
+so old call sites keep working. Both files are new relative to a clone
+predating this change — if neither is present in yours, every write
+your agents make is running unverified.
+
+### `monitor/spawn-worker.sh` — exit 19 and exit 78
+
+Both new refusals in a script you already have, which is why they
+surprise.
+
+- **Exit 19** — `NEXUS_STATE_DIR` is set but not creatable or
+  writable. It refuses rather than silently falling back to
+  `$NEXUS_ROOT/monitor/.state`. A caller that pinned the state dir has
+  already concluded it is isolated; honouring the pin or failing are
+  the only safe options.
+- **Exit 78** — the shim guard template
+  (`monitor/guard-block.sh.in`) is missing or unreadable. An empty
+  guard block is a guard that does not run, so it refuses to spawn
+  instead of emitting one.
+
+If you vendor or symlink parts of `monitor/`, these two are the
+refusals a partial copy will produce.
+
+### `monitor/guards-for-diff.sh` — six exit codes, none of them a clearance
+
+New. Reports which registered guards read the files you changed;
+`--run` runs exactly those. It has **six** exit codes, and the
+authoritative list is the `# Exit codes:` block in the header of
+`monitor/guards-for-diff.sh` — read it there rather than trusting a
+copy. The point for an upgrade reader is that **not one of them is a
+merge clearance**, including the green:
+
+| Exit | Meaning |
+|---|---|
+| 0 | Some declaring guard read a file you changed (and under `--run` they all passed). **Not a clearance** — a suite that declares no population is invisible to the index, appearing in neither the selected nor the excluded list. Read the tool's own blind-spot count, not this code. |
+| 1 | `--run`: a selected guard FAILED. |
+| 2 | REFUSED — a guard's population probe errored, or the diff could not be computed. Fail-closed on purpose. |
+| 3 | No registered guard reads your diff. A measured answer, not a green light. |
+| 4 | `--run`: green but UNVERIFIED — at least one guard answered about a tree that does not contain your untracked files. `git add` and re-run. |
+| 5 | `--run`: the `--timeout` deadline expired with selected guards left WITHOUT A VERDICT (never started, or cut off mid-run). They are named. A guard that did not finish is not a guard that passed. |
+
+### `monitor/tmux-socket-fits.sh` — exit 3
+
+New. A unix socket path holds 107 usable bytes (`sun_path` is 108
+including the NUL). tmux composes
+`${TMUX_TMPDIR:-/tmp}/tmux-<uid>/<socket-name>`, so a long
+`TMUX_TMPDIR` puts you over before the suffix is added. Exit 3 means
+the path does not fit, and names the measured length; `--suggest`
+prints a directory that does. `monitor/watcher/run-tests.sh` now
+refuses such a run outright rather than dispatching suites that would
+all fail `File name too long` and be misread as code defects.
+
+Keep `TMUX_TMPDIR` short — `/tmp/<something-brief>`.
+
+### `monitor/mutation-gate.sh` — exit 3 / 5
+
+New. Use it instead of hand-rolling a mutation test. Exit 3 refuses a
+mutation it will not perform — notably commenting a line that does not
+end a logical line, which does not delete that line but *promotes* the
+next one to a standalone command. Exit 5 is the free-space halt.
+Independently of the refusal, it bounds every mutant with `timeout`,
+`ulimit -f` and a free-space floor.
+
+### `monitor/public-mirror/build.sh` — exit 6 / 7
+
+New refusals in an existing script, and worth reading before you run
+it: **it destroys the checkout it is invoked from.** It now dry-runs
+by default (exit 6) and refuses a dirty tree (exit 7) unless
+`--allow-dirty`. Use a throwaway clone.
+
+### `monitor/proc-kill-authorized` and `monitor/proc-exists-authorized`
+
+New. Both replace hand-rolled `ps | grep` predicates, which cannot
+distinguish a process from another agent's *description* of it — an
+agent's argv is its prompt. `proc-kill-authorized --filter` prints
+only pids whose session is yours and names every refusal.
+`proc-exists-authorized` owns its own wait loop, so the polarity
+cannot be inverted, and returns **rc 3 for "refused / could not
+determine"** — neither present nor absent, which is what stops a
+shell `until`/`while` from reading a refusal as an answer.
+
+Sharpened since the previous derivation: a **bare `--pid` on a number that
+is currently occupied** now STOPS the wait at **rc 3** rather than running
+to **rc 4 (timeout)**. Pid numbers are recycled, so a bare pid is not an
+identity — pass `--start-time` with it. The old reading was the worse of the
+two: a timeout looks like *"the thing is still running"*, when the truth was
+*"I cannot tell which process this number refers to"*.
+
+### `monitor/async-run.sh` — exit 9, and 6 / 7 / 8 on the status side
+
+New since the previous derivation. The launcher that keeps a background
+job's **exit status**, which a bare `nohup … &` destroys. Two refusal
+families, and they answer different questions:
+
+* **exit 9 — REFUSED, an identical job is already running.** Same argv, same
+  window. This is the duplicate-launch guard; it is not a failure to launch.
+* **exit 6 / 7 / 8 on `--signal` and status verbs.** `6` DENIED (the token
+  belongs to a *different session*), `7` REFUSED (ownership could not be
+  determined), `8` REFUSED (the recorded pid's identity could not be
+  verified — nothing was signalled). `5` is the plain "no such token in this
+  window's namespace", and `4` means signalled but **still alive** after TERM
+  and KILL.
+
+Note the shape shared by 7 and 8: *could not determine* is its own answer and
+is never folded into *absent*. `--help`/`-h` answer at exit **0** and are
+resolved **before** the context gate, so asking for usage outside a nexus
+context is not itself a refusal.
+
+### `monitor/declare-no-wait.sh` — exit 4 and exit 5
+
+New. Marks an async launch as deliberately fire-and-forget.
+
+* **exit 4 — the write happened and MATCHED NOTHING.** Not an error, and
+  deliberately not exit 0: a dismissal that dismissed nothing is a typo in
+  the `(kind, id)` you passed, and returning 0 would let it read as done.
+* **exit 5 — REFUSED, the heartbeat file EXISTS but does not parse.** The
+  distinction that matters: an unparseable heartbeat is not an absent one,
+  and treating it as absent is how a live wait gets declared finished.
+
+### `monitor/svc.sh` — an unreadable registry does not render as an empty one
+
+Not an exit code — a rendering change you may notice and misread. When
+`monitor/services.registry` exists but cannot be read, the cockpit now says
+so instead of printing an empty service list. *"You have no services"* and
+*"I could not read your services"* are different sentences, and the old
+behaviour said the first when it meant the second.
+
+### What did *not* change
+
+`config/load.sh --check-identity` still exits 4 on placeholder
+identity keys. That behaviour predates this jump and is called out
+only because it is easy to attribute to the upgrade when you meet it
+for the first time.
+
+**Your config needs no edit.** Across the whole 444-commit delta
+`config/nexus.example.yml` gained exactly **one** key and changed nothing
+else — verified by
+`diff <(git show ca6205c8:config/nexus.example.yml) <(git show e382e9fd:config/nexus.example.yml)`,
+whose entire output is that one addition:
+
+* `cc_auto_update.restart_pr_active_seconds` (default `604800`, env
+  `CC_AUTO_GATE_RESTART_PR_ACTIVE_SECONDS`) — how long an open PR touching
+  the watcher **restart path** counts as "under repair". The arm previously
+  had no recency bound at all, so a stalled cosmetic PR could block the
+  cc-update routine indefinitely while the broader `pr_active_seconds`
+  (default `7200`) aged everything else out. Deliberately far longer,
+  because a restart-path PR is categorically more dangerous.
+
+It is optional: the default is compiled in, so an untouched config keeps
+working. Stating this positively is the point — "no config changes" is the
+sentence an upgrade page most often carries forward without re-checking.
 
 ## Coming from the windowed watcher: the upgrade is self-delivering
 

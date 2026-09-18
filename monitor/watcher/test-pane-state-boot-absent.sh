@@ -53,10 +53,65 @@ assert_eq() {
     fi
 }
 
-command -v tmux >/dev/null 2>&1 || { echo "SKIP: tmux not installed"; exit 0; }
+# EXIT 77, NEVER `exit 0` (your-org/nexus-code#1277). A decline that exits 0 is
+# tallied PASS, and `run-tests.sh:102` says so in as many words: "a test that
+# DECLINES TO RUN exits 77 and is tallied SKIP". These three sites exited 0, so
+# on a host without tmux this suite — a guard on `absent`, the ONE
+# kill-authorising state — left the population as a GREEN member rather than
+# visibly declining. Its nearest sibling, test-absent-evidence-precedence.sh,
+# already exits 77 for the identical skips; two copies of one idiom disagreeing
+# about the skip contract is how the contract stops meaning anything.
+command -v tmux >/dev/null 2>&1 || { echo "SKIP: tmux not installed"; exit 77; }
 
 # ---- containment, proved before anything is created ---------------------
-REAL_TMUX=$(type -P tmux) || { echo "SKIP: no tmux binary on PATH"; exit 0; }
+
+# --- REAL tmux BINARY, not whatever `tmux` resolves to (your-org/nexus-code#1033)
+# `type -P tmux` / `command -v tmux` under an agent PATH return THE NEXUS
+# WRAPPER, because monitor/tmuxwrap is PATH-fronted for every agent process.
+# Binding that as "the real tmux" and then exec'ing it from a stub that is
+# ITSELF named `tmux` and ITSELF on PATH makes the two select each other
+# forever: the wrapper picks the stub (a different file, so every identity gate
+# passes), the stub re-prepends its `-L <sock>` and execs the wrapper back.
+# Measured live on 2026-08-26: argv grew one `-L` per round trip to 22,370
+# characters and the uid reached 942 wrapper processes. Take the first PATH
+# candidate that is an actual BINARY — a real tmux is ELF, every wrapper and
+# every stub is a `#!` script — which is what "the real tmux" was always meant
+# to denote.
+_nx_real_tmux_bin() {
+    # TWO ZSH DIVERGENCES, BOTH FIXED HERE (your-org/nexus-code#1319). This
+    # body is byte-identical in four places (see the note above); keep it so.
+    #
+    # (1) THE SPLIT. `for _d in $PATH` under `IFS=:` is a BASH-ONLY idiom —
+    #     zsh does not word-split an unquoted parameter, so the loop ran ONCE
+    #     over the whole PATH string, every candidate test failed, and the
+    #     function returned 1: "no real tmux BINARY on PATH" on a host that
+    #     has one. Callers spell rc 1 as `exit 77` SKIP, so the failure was
+    #     coverage silently leaving the population. Measured, interpreter the
+    #     only variable and $PATH pinned identical: bash -> /usr/bin/tmux,
+    #     zsh -> rc 1. Parameter expansion splits identically in both shells
+    #     and needs no IFS bookkeeping at all.
+    #
+    # (2) THE MAGIC BYTES, and this one is worse — `read -N` DOES NOT EXIST
+    #     IN ZSH (`zsh:read:1: bad option: -N`, rc 1), so the old `||
+    #     _magic=""` arm fails OPEN toward "this is a real binary". Repairing
+    #     only the split would therefore have turned a silent SKIP into a
+    #     silent WRONG ANSWER: measured, the split-repaired body under zsh
+    #     returns `monitor/tmuxwrap/tmux` — the wrapper — and a shim written
+    #     from that names the wrapper, loses its `-L` pin, and reaches the
+    #     operator's live board, which is the 2026-08-27 mechanism this
+    #     file's header exists to prevent. `head -c 2` behaves identically in
+    #     both shells, and `|| continue` is fail-CLOSED: a candidate whose
+    #     bytes cannot be read is treated as a wrapper and skipped.
+    local _d _magic _rest="$PATH:"
+    while [ -n "$_rest" ]; do
+        _d="${_rest%%:*}"; _rest="${_rest#*:}"
+        [ -n "$_d" ] && [ -x "$_d/tmux" ] && [ ! -d "$_d/tmux" ] || continue
+        _magic=$(head -c 2 -- "$_d/tmux" 2>/dev/null) || continue
+        [ "$_magic" = '#!' ] || { printf '%s' "$_d/tmux"; return 0; }
+    done
+    return 1
+}
+REAL_TMUX=$(_nx_real_tmux_bin) || { echo "SKIP: no real tmux BINARY on PATH"; exit 77; }
 # The operator's interactive `grep` is a shell FUNCTION wrapping ugrep
 # (your-org/nexus-code#618). Explicit file arguments are not suppressed by it,
 # but `-c` semantics differ between implementations and Test 11 turns a COUNT
@@ -86,7 +141,7 @@ cleanup() {
 trap cleanup EXIT
 
 tx -f /dev/null new-session -d -s "$SESSION" -x 200 -y 50 2>/dev/null \
-    || { echo "SKIP: cannot start a private tmux server here"; exit 0; }
+    || { echo "SKIP: cannot start a private tmux server here"; exit 77; }
 
 priv=$(tx display-message -p '#{socket_path}' 2>/dev/null)
 shim=$(PATH="$SHIMDIR:$PATH" tmux display-message -p '#{socket_path}' 2>/dev/null)

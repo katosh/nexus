@@ -113,6 +113,29 @@
 #                      declines to override the src for exactly this
 #                      reason. Changing a src token is a behavioural
 #                      change, not a logging change.
+#   --nonce <hex>      delivery nonce for this send, recorded in the
+#                      epoch-keyed sidecar as `nonce=`. Set by
+#                      monitor/send.sh so one logical delivery keeps ONE
+#                      nonce across a transport fallback, which is what
+#                      makes "did this agent get instruction X twice?"
+#                      answerable after the fact. AUDIT ONLY: it is not
+#                      injected into the pasted bytes, so the receiving
+#                      agent never sees it and cannot dedupe on it. The
+#                      double-delivery defence is the exclusivity rule in
+#                      skills/nexus.agent-delivery §4, not this value.
+#   --transport <name> which transport carried this send (`tmux-paste`,
+#                      …), recorded in the same sidecar as `transport=`.
+#                      DESCRIPTIVE, never selective — unlike --src, which
+#                      is a SELECTOR. It is deliberately NOT the src
+#                      column: the delivery guard matches
+#                      `$3 == "paste-followup"` EXACTLY, so encoding the
+#                      transport there would exempt every non-tmux
+#                      transport from `paste-unconfirmed` — the same trap
+#                      your-org/nexus-code#683 avoided by using column 4.
+#                      A SIDECAR rather than a 5th TSV column because the
+#                      ledger's compaction rebuilds rows as exactly four
+#                      columns (_idle_probe.sh:1964-1967), so a 5th would
+#                      be dropped silently past 200 lines.
 #   --administrative   (alias --no-retask) this follow-up does NOT
 #                      re-task the worker, so it must not consume the
 #                      window's standing `window-retain` nor supersede
@@ -128,6 +151,11 @@
 #                      still checked by `paste-unconfirmed`, because a
 #                      lost administrative paste is exactly as lost.
 #   --no-enter         paste without submitting (rare; queue text only).
+#   --allow-blocked    paste even if the pane is sitting on an overlay. The
+#                      trailing Enter is then consumed by the overlay and
+#                      SELECTS ITS HIGHLIGHTED DEFAULT rather than delivering
+#                      the message (your-org/nexus-code#1200). Only for a
+#                      caller that has looked and decided.
 #                      Skips confirmation — nothing was meant to submit.
 #   --help, -h         print this reference plus the derived synopsis.
 #                      Accepted as the FIRST argument too — it used to be
@@ -198,6 +226,17 @@
 
 set -uo pipefail
 
+# ARGUMENT-LOOP PROGRESS GUARD (your-org/nexus-code#924). Each argument loop
+# below asserts that every iteration consumes at least one argument. Without it
+# a value-taking flag given LAST spins forever — `shift 2` with `$#` == 1 is
+# refused, so the arm re-matches — and a hang here is worse than an error
+# because nothing on this board surfaces it. Full rationale: monitor/ng.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
+
 _script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Every LINE carries the prefix. The unknown-option arm now appends the
@@ -214,24 +253,37 @@ readonly RC_NOT_SUBMITTED=4
 # State dir resolution — same precedence as monitor/ng:
 # NEXUS_STATE_DIR override → NEXUS_ROOT → config nexus.root →
 # script-relative fallback.
+# THE PRIMARY's state dir, never a secondary clone's (your-org/nexus-code#1428,
+# #1368, #577): every arm below the NEXUS_STATE_DIR test seam goes through
+# `monitor/_nexus-root.sh`, the one resolver that de-nests a clone out of
+# `<primary>/work/`. Called directly from such a clone this file used to stamp
+# the CLONE's machine-input ledger, where the watcher's delivery guard never
+# looks. Fail-CLOSED on a missing resolver, as send.sh does.
+# SELF-CONTAINED on purpose: test-send-ledger-primary.sh extracts this one
+# function by its sed range and runs it, so it may not lean on a sibling helper.
 _resolve_state_dir() {
     if [[ -n "${NEXUS_STATE_DIR:-}" ]]; then
         printf '%s' "$NEXUS_STATE_DIR"
         return 0
     fi
+    local _cand="" _root=""
     if [[ -n "${NEXUS_ROOT:-}" ]]; then
-        printf '%s/monitor/.state' "$NEXUS_ROOT"
-        return 0
+        _cand="$NEXUS_ROOT"
+    else
+        local cfg_root=""
+        if [[ -x "$_script_dir/../config/load.sh" ]]; then
+            cfg_root=$("$_script_dir/../config/load.sh" nexus.root 2>/dev/null) || cfg_root=""
+        fi
+        _cand="${cfg_root:-$_script_dir/..}"
     fi
-    local cfg_root=""
-    if [[ -x "$_script_dir/../config/load.sh" ]]; then
-        cfg_root=$("$_script_dir/../config/load.sh" nexus.root 2>/dev/null) || cfg_root=""
+    if [[ ! -r "$_script_dir/_nexus-root.sh" ]]; then
+        echo "paste-followup: cannot read $_script_dir/_nexus-root.sh — refusing to guess a state dir (your-org/nexus-code#1428)" >&2
+        return 2
     fi
-    if [[ -n "$cfg_root" ]]; then
-        printf '%s/monitor/.state' "$cfg_root"
-        return 0
-    fi
-    printf '%s/.state' "$_script_dir"
+    # shellcheck source=monitor/_nexus-root.sh
+    . "$_script_dir/_nexus-root.sh" || return 2
+    _root=$(nexus_primary_root "$_cand") || { echo "paste-followup: cannot resolve a nexus root from '$_cand'" >&2; return 2; }
+    printf '%s/monitor/.state' "$_root"
 }
 
 # Total confirmation budget: env → config → default.
@@ -267,29 +319,103 @@ _resolve_confirm_timeout() {
 # is true of every list on the day it is written.
 #
 # This is a DERIVATION, not a second parser. It reads the arm patterns; it
-# never interprets an argument. And it FAILS LOUD when it cannot find them:
+# never interprets an argument. And it FAILS LOUD when it cannot read them:
 # a synopsis that silently omits flags IS the defect, so a degraded one
 # would be the defect wearing the fix's clothes.
+#
+# ---- your-org/nexus-code#906 B: DEGRADED ARITY IS THE SAME GARMENT -------
+#
+# The first cut fell loud only when it found ZERO arms, and that is the wrong
+# boundary. Arity was taken from `shift 2` on the arm's PATTERN LINE, so an
+# arm written across several lines —
+#
+#     --src)
+#         SRC="${2:-}"
+#         shift 2 || die "--src needs a label" ;;
+#
+# — read as a switch and printed `[--src]`, while the parser went on eating a
+# value. A caller who follows that writes `--src --no-enter` and loses
+# `--no-enter` into SRC. Not "the flag is invisible" but "the flag's shape is
+# wrong", arrived at, again, by consulting the interface. The multi-line style
+# is native here: this file's own `--help` arm was written that way until
+# `#900` collapsed it, so the next maintainer had a coin-flip.
+#
+# The fix is NOT to abandon derivation — two hand-maintained lists drift, which
+# is why `#883` was filed. It is to make the derivation's own degradation loud.
+# Each arm is now read as a BLOCK (its pattern line plus every line up to the
+# next arm), and the block must declare its arity unambiguously:
+#
+#   `shift 2` on the PATTERN LINE      → takes a value; placeholder from `#=`
+#   `shift`   on the PATTERN LINE      → switch
+#   `#= none` on the PATTERN LINE      → switch that does not shift at all
+#                                        (`--help`, which exits)
+#   anything else                      → REFUSE, naming the arm
+#
+# The refusal is the point. An arm whose body shifts twice while its pattern
+# line says nothing is exactly the silent case, and it now names itself
+# instead of publishing a confident wrong shape.
 #
 # The sed ranges are written `ARG-LOOP[-]BEGIN` so this function's own
 # source lines cannot match the sentinels it is looking for.
 _usage_synopsis() {
-    local line pat ph n=0 out=""
-    while IFS= read -r line; do
-        [[ "$line" =~ ^[[:space:]]*(-[a-zA-Z0-9|_-]*[a-zA-Z0-9])\) ]] || continue
-        pat="${BASH_REMATCH[1]}"
-        if [[ "$line" == *"shift 2"* ]]; then
+    local line pat ph n=0 out="" cur_pat="" cur_line="" cur_body=""
+    local -a bad=()
+
+    # Classify the arm whose pattern line is $cur_line and whose body (every
+    # line up to the next arm) is $cur_body. Appends to `out` or to `bad`.
+    _emit_arm() {
+        [[ -n "$cur_pat" ]] || return 0
+        if [[ "$cur_line" == *"shift 2"* ]]; then
             ph="<arg>"
-            [[ "$line" =~ '#='[[:space:]]*(\<[^\>]*\>) ]] && ph="${BASH_REMATCH[1]}"
-            out+=" [$pat $ph]"
+            [[ "$cur_line" =~ '#='[[:space:]]*(\<[^\>]*\>) ]] && ph="${BASH_REMATCH[1]}"
+            out+=" [$cur_pat $ph]"
+        elif [[ "$cur_line" == *"shift"* || "$cur_line" == *'#= none'* ]]; then
+            out+=" [$cur_pat]"
         else
-            out+=" [$pat]"
+            # Cannot classify from the pattern line. If the BODY shifts, this
+            # is #906 B exactly — say which, so the diagnostic is actionable
+            # rather than a generic "declare your arity".
+            if [[ "$cur_body" == *"shift 2"* ]]; then
+                bad+=("$cur_pat (body has 'shift 2'; the pattern line does not — it would print as a switch)")
+            elif [[ "$cur_body" == *"shift"* ]]; then
+                bad+=("$cur_pat (body has 'shift'; the pattern line does not)")
+            else
+                bad+=("$cur_pat (no 'shift'/'shift 2' and no '#= none' marker)")
+            fi
         fi
         n=$(( n + 1 ))
+        cur_pat=""; cur_line=""; cur_body=""
+    }
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*(-[a-zA-Z0-9|_-]*[a-zA-Z0-9])\) ]]; then
+            # Capture BEFORE closing the previous arm: _emit_arm runs its own
+            # `=~` for the placeholder, which CLOBBERS BASH_REMATCH. Reading
+            # it after the call silently yields the previous arm's
+            # placeholder as this arm's name — measured, and it produced a
+            # plausible-looking synopsis full of `[<path> <text>]`.
+            local _next_pat="${BASH_REMATCH[1]}"
+            _emit_arm                       # close the previous arm
+            cur_pat="$_next_pat"; cur_line="$line"; cur_body=""
+            continue
+        fi
+        # The catch-all arm ends the flag region; nothing after it belongs to
+        # the arm we were accumulating.
+        if [[ "$line" =~ ^[[:space:]]*\*\) ]]; then _emit_arm; continue; fi
+        [[ -n "$cur_pat" ]] && cur_body+="$line"$'\n'
     done < <(sed -n '/ARG-LOOP[-]BEGIN/,/ARG-LOOP[-]END/p' "${BASH_SOURCE[0]}" 2>/dev/null)
+    _emit_arm                                # close the last arm
+
     if (( n == 0 )); then
         printf 'paste-followup: INTERNAL: could not derive the flag synopsis from %s — refusing to print a usage line that would silently omit flags (your-org/nexus-code#883)\n' \
             "${BASH_SOURCE[0]}" >&2
+        return 1
+    fi
+    if (( ${#bad[@]} > 0 )); then
+        printf 'paste-followup: INTERNAL: cannot determine the arity of %d argument-loop arm(s) in %s (your-org/nexus-code#906 B):\n' \
+            "${#bad[@]}" "${BASH_SOURCE[0]}" >&2
+        printf '  - %s\n' "${bad[@]}" >&2
+        printf 'Refusing to print a synopsis that would advertise the wrong shape. Put `shift`/`shift 2` on the arm'"'"'s PATTERN line, or mark a non-shifting arm `#= none`.\n' >&2
         return 1
     fi
     printf 'usage: paste-followup.sh <window>%s\n' "$out"
@@ -328,12 +454,15 @@ NOTE=""
 ISSUE=""
 COMMENT=""
 SRC=""
+NONCE=""
+TRANSPORT=""
 SEND_ENTER=1
+ALLOW_BLOCKED=0
 ADMINISTRATIVE=0
 CONFIRM_TIMEOUT=""
 # ARG-LOOP-BEGIN — the single declaration of this script's flags. Every arm
 # is read by _usage_synopsis above; `#= <placeholder>` names the value.
-while (( $# > 0 )); do
+_argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
     case "$1" in
         --file)     MSG_FILE="${2:-}"; shift 2 || die "--file needs a path" ;; #= <path>
         --message)  MSG_TEXT="${2:-}"; shift 2 || die "--message needs text" ;; #= <text>
@@ -342,9 +471,14 @@ while (( $# > 0 )); do
         --issue)    ISSUE="${2:-}";    shift 2 || die "--issue needs a number" ;; #= <n>
         --comment)  COMMENT="${2:-}";  shift 2 || die "--comment needs an id" ;; #= <id>
         --src)      SRC="${2:-}";      shift 2 || die "--src needs a label" ;; #= <label>
+        --nonce)    NONCE="${2:-}";    shift 2 || die "--nonce needs a value" ;; #= <hex>
+        --transport) TRANSPORT="${2:-}"; shift 2 || die "--transport needs a name" ;; #= <name>
         --confirm-timeout) CONFIRM_TIMEOUT="${2:-}"; shift 2 || die "--confirm-timeout needs seconds" ;; #= <sec>
         --no-enter) SEND_ENTER=0;      shift ;;
-        --help|-h)  _print_help; exit 0 ;;
+        # your-org/nexus-code#1200. Deliberate override for a caller that has
+        # looked at the overlay and decided; the receipt names it either way.
+        --allow-blocked) ALLOW_BLOCKED=1; shift ;;
+        --help|-h)  _print_help; exit 0 ;; #= none
         *) die "unknown option: $1"$'\n'"$(_usage_synopsis 2>&1)" ;;
     esac
 done
@@ -369,10 +503,7 @@ fi
 [[ "$CONFIRM_TIMEOUT" =~ ^[0-9]+$ ]] || die "--confirm-timeout must be a non-negative integer: $CONFIRM_TIMEOUT"
 POLL="${PASTE_CONFIRM_POLL_SECONDS:-0.3}"
 
-command -v tmux >/dev/null 2>&1 || die "tmux not found on PATH"
-if ! grep -qxF -- "$WINDOW" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"; then
-    die "tmux window not found: $WINDOW (tmux list-windows to inspect; spawn-worker.sh --resume to recreate)"
-fi
+
 
 # Re-resolve the window NAME → its current @id and target the paste by
 # id (#323). A dotted name (`cc-update-2.1.183`) handed to `send-keys
@@ -383,6 +514,23 @@ fi
 # ephemeral @id only for the actual tmux targeting here.
 # shellcheck disable=SC1091
 . "$_script_dir/_tmux-window.sh"
+
+command -v tmux >/dev/null 2>&1 || die "tmux not found on PATH"
+# ACCEPT AN INDEX OR A NAME (your-org/nexus-code#905). This used to be an exact
+# NAME match, while the sibling `pane-state.sh` took only an INDEX — so
+# `pane-state.sh 9` and `paste-followup.sh 9`, typed in adjacent commands
+# against the same window, disagreed about what a window key is. Both helpers
+# now go through `resolve_window_key`, so they cannot disagree. The NAME stays
+# the durable key everything below targets by; this only widens what a caller
+# may TYPE.
+_wkey_rc=0
+_RESOLVED_WINDOW=$(resolve_window_key "$WINDOW") || _wkey_rc=$?
+case "$_wkey_rc" in
+    0) WINDOW="$_RESOLVED_WINDOW" ;;
+    4) die "ambiguous window key '$WINDOW' — it is both a window NAME and a window INDEX (see the diagnostic above). Refusing to guess; pass the unambiguous name." ;;
+    3) die "could NOT determine whether window '$WINDOW' exists (tmux would not answer) — refusing to paste. This is not 'the window is gone'." ;;
+    *) die "tmux window not found: $WINDOW (tmux list-windows to inspect; spawn-worker.sh --resume to recreate)" ;;
+esac
 # Dead-pane paste guard (#745). This helper is THE canonical follow-up
 # paste into a worker window, and every worker window carries
 # `remain-on-exit` — so this is the site the hazard is reached through
@@ -414,16 +562,25 @@ fi
 # distinguish them, because "the window closed under you" and "tmux would not
 # answer" send the operator to completely different places. The old single
 # message guessed "race with a close?" for all of them.
+# Carry the SESSION the key named, or this re-resolution looks in the current
+# one and reports a cross-session window as closed (your-org/nexus-code#944).
+_PF_SESSION="${RESOLVED_WINDOW_SESSION:-}"
 _wid_rc=0
-WIN_ID=$(resolve_window_id "$WINDOW") || _wid_rc=$?
+WIN_ID=$(resolve_window_id "$WINDOW" "$_PF_SESSION") || _wid_rc=$?
 if (( _wid_rc == 1 )); then
-    die "tmux has no window named: $WINDOW — it closed between the check above and now (race with a close; spawn-worker.sh --resume to recreate)"
+    die "tmux has no window named: $WINDOW${_PF_SESSION:+ in session $_PF_SESSION} — it closed between the check above and now (race with a close; spawn-worker.sh --resume to recreate)"
 elif (( _wid_rc != 0 )); then
     die "could NOT determine whether window '$WINDOW' exists (resolver rc $_wid_rc; see the diagnostic above) — refusing to paste. This is not 'the window is gone'; tmux itself would not answer."
 fi
 
 STATE_DIR="$(_resolve_state_dir)"
 mkdir -p "$STATE_DIR" || die "cannot create state dir: $STATE_DIR"
+# Hand the RESOLVED dir to every child under the name they read
+# (your-org/nexus-code#1335). `ng log-action` below re-resolves independently
+# and honours only NEXUS_STATE_DIR; with no override in play this is a no-op
+# (the child would compute the same dir), and it diverges exactly when a
+# caller scoped this run — which is when the audit row must follow.
+export NEXUS_STATE_DIR="$STATE_DIR"
 
 # ---- the CONTENT MARKER (your-org/nexus-code#665, item 1) --------------
 #
@@ -475,6 +632,13 @@ _write_paste_sidecar() {
         [[ -n "$rc_val" ]] && printf 'rc=%s\n' "$rc_val"
         printf 'window=%s\nepoch=%s\n' "$WINDOW" "$PASTE_EPOCH_KEY"
         [[ -n "$PASTE_DIGEST" ]] && printf 'digest=%s\n' "$PASTE_DIGEST"
+        # your-org/nexus-code#1049 / skills/nexus.agent-delivery: PER-SEND
+        # facts, so they ride the epoch-keyed sidecar rather than new TSV
+        # columns — the ledger's compaction rebuilds rows as exactly four
+        # columns (_idle_probe.sh:1964-1967), so a 5th/6th would be dropped
+        # silently past 200 lines. Same distinction #676 drew for the verdict.
+        [[ -n "$NONCE" ]] && printf 'nonce=%s\n' "$NONCE"
+        [[ -n "$TRANSPORT" ]] && printf 'transport=%s\n' "$TRANSPORT"
         # `${OUTCOME:-}`: the pre-paste call runs before OUTCOME exists.
         # The `&&` short-circuit already prevents the expansion under
         # `set -u`, but that safety is a property of the CALL ORDER, and
@@ -637,6 +801,95 @@ if (( SEND_ENTER )); then
     fi
 fi
 
+# ── OVERLAY GUARD (your-org/nexus-code#1200) ─────────────────────────────
+#
+# A paste into a pane with a PERMISSION OVERLAY up does not deliver a message.
+# The trailing Enter is consumed by the overlay and SELECTS THE HIGHLIGHTED
+# DEFAULT; the text then queues behind whatever that selection triggers.
+#
+# Measured: a worker raised a three-option overlay whose highlighted default
+# was `Commit all 325 MB`. The orchestrator chose option 3 (HOLD) and delivered
+# that instruction here. The paste selected the default. 384 files were
+# committed and pushed to a repo carrying a standing history-scrub obligation,
+# and the instruction that arrived seconds later read, verbatim, "OPTION 3 —
+# HOLD. Do not commit the assets." The send reported `delivered`, correctly by
+# its own definition: the bytes reached the pane. The receipt contract answers
+# DID THE TEXT ARRIVE, never DID THE TEXT GET READ, and with an overlay up
+# those diverge.
+#
+# THE ASYMMETRY IS WHY THIS IS NOT RARE. A caller sends a worker a message
+# precisely when it wants to change what that worker is doing — which is
+# disproportionately when the worker is STOPPED, and a stopped worker is
+# disproportionately stopped ON A PROMPT.
+#
+# FAIL CLOSED. A refusal costs one round trip; a mis-selection is whatever the
+# highlighted default does, and is irreversible. The blast radius is not
+# bounded by this tool: it is a 325 MB push here, and could as easily be a
+# destructive filesystem operation or an external-repo write.
+#
+# SCOPE, and it is the issue's own ask 2. This guard belongs on the
+# MESSAGE-DELIVERY path only. The watcher deliberately answers overlays —
+# `_unstick.sh` sends a bare Enter to a permission prompt as documented policy,
+# and `_respawn.sh` sends Escape to a readiness dialog — and those call `tmux`
+# directly rather than coming through here. That separation IS the "explicit,
+# different verb" the issue asks for: `send this agent a message` and `make
+# this selection` are different acts and do not share this code path. Guarding
+# here therefore covers every agent-authored message entry point (`ng send`,
+# `ng paste-followup`, `ng skeptic ask|nudge|notify-delta`, and direct callers)
+# without disarming the unstick path that exists to clear a stuck overlay.
+#
+# `--allow-blocked` is the deliberate override, for a caller that has looked
+# and decided. It is NOT a way to silence the check: it names the overlay in
+# the receipt so the choice is on the record.
+#
+# EVERY DOUBT PASTES. Unlike the dead-pane guard above, an unreadable pane
+# state is NOT a refusal here: this guard prevents a WRONG DELIVERY, while
+# refusing on doubt would break every delivery whenever `pane-state.sh` is
+# unavailable — including the fixtures and hermetic suites that inject a stub
+# tmux. Only a POSITIVE `state=blocked` refuses.
+# `NEXUS_PASTE_PANE_STATE_BIN` is a test seam, the same shape as
+# `SKEPTIC_PASTE_BIN` in skeptic-channel.sh. It can only ever cause a
+# REFUSAL — the guard has no path that turns a blocked pane into a paste — so
+# a wrong value costs a false refusal, never a wrong delivery.
+_ovl_bin="${NEXUS_PASTE_PANE_STATE_BIN:-$_script_dir/pane-state.sh}"
+# FIELD-EXACT, never `sed 's/.*state=...'`. That pattern is GREEDY, so it binds
+# to the LAST `state=` on the line and a field merely ENDING in `state=` matches
+# it: on `state=idle … refined_state=blocked` it extracts `blocked`, refusing a
+# paste into an idle pane. The mirror case is worse — a trailing `…_state=idle`
+# after a real `state=blocked` would extract `idle` and let the paste through,
+# which is the defect this guard exists to stop. Splitting on fields and taking
+# the FIRST whose NAME is exactly `state` has neither failure, and no regex
+# dialect to get wrong (your-org/nexus-code#1295 review).
+_ovl_field() {   # $1 = line, $2 = field name
+    printf '%s' "$1" | awk -v k="$2" '{
+        for (i = 1; i <= NF; i++) {
+            n = index($i, "=")
+            if (n > 0 && substr($i, 1, n - 1) == k) { print substr($i, n + 1); exit }
+        }
+    }'
+}
+_ovl_line=""; _ovl_state=""; _ovl_kind=""
+if [[ -x "$_ovl_bin" ]]; then
+    _ovl_line=$("$_ovl_bin" "$WINDOW" 2>/dev/null) || _ovl_line=""
+    _ovl_state=$(_ovl_field "$_ovl_line" state)
+    _ovl_kind=$(_ovl_field "$_ovl_line" overlay)
+fi
+if (( ALLOW_BLOCKED == 1 )) && [[ "$_ovl_state" == blocked ]]; then
+    # THE OVERRIDE IS AUDITED, and this is what makes that sentence true. The
+    # first cut DOCUMENTED an audit trail and wrote nothing — a claim the code
+    # did not implement, which is the proxy-vs-property defect this bundle is
+    # about, occurring in its own new code. The note rides the existing action
+    # log, so the record exists wherever every other paste decision is kept.
+    _ovl_note="--allow-blocked OVERRIDE: pasted into state=blocked overlay=${_ovl_kind:-unknown}; the trailing Enter may have answered that overlay rather than delivering this message (your-org/nexus-code#1200)"
+    NOTE="${NOTE:+$NOTE; }$_ovl_note"
+    printf 'paste-followup: %s\n' "$_ovl_note" >&2
+fi
+if (( ALLOW_BLOCKED == 0 )); then
+    if [[ "$_ovl_state" == blocked ]]; then
+        die "window $WINDOW is sitting on an overlay (state=blocked overlay=${_ovl_kind:-unknown}) — refusing to paste. The trailing Enter would be consumed by the overlay and SELECT ITS HIGHLIGHTED DEFAULT, not deliver this message (your-org/nexus-code#1200: an instruction to HOLD 325 MB selected the default and committed it, and the send still reported delivered). Resolve the overlay first — the operator answers it, or the watcher unstick path does — then re-send. To answer the overlay ON PURPOSE, that is a different act: send the keystroke directly, or pass --allow-blocked if you have looked and decided."
+    fi
+fi
+
 # 1. Authoritative machine-input stamp, BEFORE the paste. Plain
 #    append — the watcher-side reader takes the max epoch per window
 #    and compacts the ledger periodically. A --no-enter paste stamps
@@ -766,8 +1019,18 @@ fi
 # into a worker whose agent has already exited is an ordinary Tuesday,
 # and it kills the tmux server: 20/20 measured on this exact `-p -d`
 # call form. Refuse before the send-keys, not just before the paste.
+# THE ONE AN OPERATOR READS (your-org/nexus-code#1020). `rc 0` means dead OR
+# could-not-tell, and this message used to assert the corpse either way — then
+# told the operator to RESPAWN THE WINDOW. On a transient `list-panes` failure
+# (a fork that could not be made under the worker RLIMIT_NPROC ceiling, a busy
+# socket) that is misdirection toward a DESTRUCTIVE action against a window
+# that is very probably healthy. The refusal is unconditional; only the wording
+# and the remedy differ, because the two verdicts have opposite recoveries.
 if _tmux_pane_is_dead "$WIN_ID"; then
-    die "window $WINDOW is a DEAD pane (its agent has exited; remain-on-exit left the window listed). Refusing to paste — a paste into a dead pane kills the tmux SERVER, taking the watcher and every other window with it (your-org/nexus-code#745). Respawn the window, or use \`tmux send-keys\` if you only need to poke a corpse."
+    if [[ "${NEXUS_PANE_LIVE_VERDICT:-}" == "dead" ]]; then
+        die "window $WINDOW is a DEAD pane (its agent has exited; remain-on-exit left the window listed). Refusing to paste — a paste into a dead pane kills the tmux SERVER, taking the watcher and every other window with it (your-org/nexus-code#745). Respawn the window, or use \`tmux send-keys\` if you only need to poke a corpse."
+    fi
+    die "could NOT establish that window $WINDOW is a live pane (verdict='${NEXUS_PANE_LIVE_VERDICT:-unset}'). Refusing to paste, because a paste into a DEAD pane kills the tmux SERVER (your-org/nexus-code#745) and this check cannot rule that out. THIS IS NOT A FINDING THAT THE WINDOW IS DEAD — nobody looked successfully, and the window may be perfectly healthy. Do NOT respawn it on the strength of this message. The usual cause is transient (a failed fork under a process-count ceiling, a busy tmux socket), so RETRY first; if it persists, check tmux and the process/fd ceilings."
 fi
 
 BUF="nexus-followup-$$-${RANDOM}"

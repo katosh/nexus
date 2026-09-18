@@ -1,28 +1,51 @@
 # RFC — inbound agent channels: a watcher-mediated request inbox, signal-source standardization, confined remote access, and the bidirectional client↔orchestrator protocol over SSH
 
-**Status:** 🟢 **PARTS A, B and D ARE SHIPPED**; the remainder is still a
-proposal. Shipped surface: `monitor/remote-up.sh`, `monitor/request-channel.sh`,
-`ng request` / `ng remote`, `spawn-worker.sh --reply-to`, and the four-file
-`skills/nexus.remote-access/`. This banner used to read "nothing implemented",
-contradicted by an `> **IMPLEMENTED**` callout inside this very file — so the
-repo's largest document opened by telling a self-fix worker that a subsystem it
-was about to touch did not exist (<your-org>/nexus-code#568 C4). Treat unmarked
-sections below as design intent; check for an `IMPLEMENTED` callout before
-concluding something is unbuilt. This is the
+**Status:** 🟢 **PARTS A, B and D ARE SHIPPED. PART C IS NOT.** The
+per-part mapping below is the authoritative one; every section carries a
+matching status callout at its head.
+
+| Part | Status | Where it lives now |
+|---|---|---|
+| **B** — request inbox | **SHIPPED**, and **ON by default** | `monitor/request-channel.sh`, `monitor/watcher/_requests.sh`, `ng request`, `monitor.requests.*` |
+| **D** — bidirectional reply | **SHIPPED** (rides B) | `ng request reply` (incl. `--amend`)/`await`/`fetch`, `spawn-worker.sh --reply-to` |
+| **A** — confined remote access | **the nexus-code half is SHIPPED**; the residual `agent_sandbox` dependency is *"does the image ship an `sshd` a non-root in-sandbox user can bind"* (§4.6, Phase A1). Without it `remote-up.sh` still registers the row + host key and reports unhealthy. | `monitor/remote-{up,sshd-supervised,ssh-health,forced-command,enroll,enroll-session,port-change-notify}.sh`, `ng remote`, the four-file `skills/nexus.remote-access/` |
+| **C** — signal-source standardization | **NOT SHIPPED** | nothing implements the `_produce`/`_is_acked` interface of §3.3 (`grep -rnE '_produce\(\)|_is_acked' monitor/` → 0 hits @ `a3177ef6`; `-E`, because a BRE `\|` is not portable across this workspace's two `grep` implementations). The one §2.8 fragment that DID land is `monitor/_channel_lib.sh`, and only `request-channel.sh` sources it. |
+
+**Read the per-section callout, not the absence of one.** This banner used to
+read "nothing implemented", contradicted by an `> **IMPLEMENTED**` callout
+inside this very file — so the repo's largest document opened by telling a
+self-fix worker that a subsystem it was about to touch did not exist
+(<your-org>/nexus-code#568 C4). The remedy then written here — *"check for an
+`IMPLEMENTED` callout before concluding something is unbuilt"* — was the same
+defect one level up: there is exactly **one** such callout in 1,916 lines
+(§D.6), so its absence carried no information and the instruction pointed a
+reader at Parts A/B/D and told them nothing was built. Sections now carry an
+explicit status line each; **an unmarked subsection inherits its part's
+status from the table above**, and where the shipped code diverged from the
+design the divergence is named inline (`SHIPPED DIFFERENTLY`).
+
+This is the
 "thorough review, then clean design" the operator asked for: a self-contained
 context document a future developer can read to understand *why* the inbound
 channels are shaped the way they are, and to extend them without drift.
-**Baseline:** `dev` @ `f6d6a25`. **Scope:** four coupled asks — a unified
+**Baseline:** `dev` @ `f6d6a25` — **every `path:line` citation in this
+document, including Appendix A, is pinned to that commit** and was re-verified
+against it (not against HEAD) on 2026-09-09. `f6d6a25` is an ancestor of the
+current `dev`, so `git show f6d6a25:<path>` resolves them; do NOT read them
+against a later tree. **Scope:** four coupled asks — a unified
 request-inbox channel (Part B), a standardization of the watcher's signal
 sources (Part C), authenticated remote access into the running sandbox
 (Part A), and the **full bidirectional request/reply protocol** a remote SSH
 client uses to file a request *and* detect, read, and follow the orchestrator's
 reply (Part D — the round-trip the operator asked be made concrete and
-implementation-ready). **Decision gate:** the operator greenlights (or amends)
-the design before any code lands. Parts that touch
+implementation-ready). **Decision gate (HISTORICAL):** the operator greenlights
+(or amends) the design before any code lands. *That gate was passed for A, B and
+D — the sentence is retained as the record of how the work was authorized, not
+as a live precondition.* Parts that touch
 [`katosh/agent_sandbox`](https://github.com/katosh/agent_sandbox) (the kernel
-sandbox layer) are **proposed here, not implemented** — that repo is public,
-has no bot install, and is the operator's call.
+sandbox layer) are **still proposed here, not implemented** — that repo is
+public, has no bot install, and is the operator's call. That boundary is
+unchanged by Part A shipping: everything that landed is nexus-code-side.
 **Validation:** an independent adversarial **skeptic pass** reviewed this RFC and
 returned **`credible`** — boundary preserved, inbox backlog-safe, harmony real,
 Part C coherent, ~14 review citations verified accurate — with three minor
@@ -371,6 +394,19 @@ Established from this repo (facts), with agent_sandbox internals flagged as
 
 ## 2. Part B — the watcher-mediated request inbox
 
+> **STATUS: SHIPPED, AND ON BY DEFAULT.** `monitor/request-channel.sh` +
+> `monitor/watcher/_requests.sh` + the `ng request` façade + the
+> `monitor.requests.*` knobs. Phase B2's *"flip default on after a soak"* HAS
+> happened: `monitor/watcher/_config.sh` resolves
+> `MONITOR_REQUESTS_ENABLED` with a built-in fallback of **`true`**, and
+> `_requests_enabled` ALSO turns the inbox on whenever the `nexus-remote-ssh`
+> row is registered — two enables, not one. Note the residual inconsistency
+> a reader will hit: `config/nexus.example.yml` still ships an explicit
+> `requests: enabled: false` with a "MASTER SWITCH — default OFF" comment, so
+> a clone that copies the example config gets the inbox **off** while a clone
+> with no key gets it **on**. Where this section's design text and the code
+> diverge, the divergence is marked `SHIPPED DIFFERENTLY` inline.
+
 ### 2.1 Goal and the one-paragraph design
 
 Give any agent (canonically a worker) a durable, first-class way to send a
@@ -491,6 +527,19 @@ of the **single** id the client receives; there is no separate
 | `.done.md` | orchestrator (atomic rename) | acknowledged / handled, **no reply body** needed | stop emitting; retain for audit |
 | `.failed.md` | orchestrator or watcher | unactionable (malformed, stale origin) | stop emitting; surfaced once as an error |
 
+> **SHIPPED DIFFERENTLY — there are two more suffixes than this table lists.**
+> A state transition that also writes CONTENT (`reply`, `fail`) cannot be one
+> atomic rename, so `request-channel.sh` claims into a **non-authoritative
+> transient intermediate** first, writes the body there, then does one atomic
+> finalize: `.claimed → [.replying] → .replied` and
+> `{.new,.claimed} → [.failing] → .failed`. `.replying` / `.failing` are
+> PENDING, never terminal; `monitor/watcher/_requests.sh` reaps them (a
+> complete `.replying` → `.replied` byte-exact; an incomplete one, or any aged
+> `.failing`, → `.failed`). `ng request list` renders them literally, and
+> `request fetch <id> status` reports the rename-state word. The table's
+> invariant — *observing `.replied` ⇒ the body is complete* — is unchanged and
+> is exactly what the intermediates buy.
+
 Two-step claim/ack mirrors the GitHub model precisely: **claim** = the watcher's
 👀 (I've seen it, I'm surfacing it); **done**/**replied** = the orchestrator's 🚀
 (acted). The producer only ever writes `.new.md`; the watcher only ever does
@@ -549,6 +598,25 @@ A new scheduler task `requests_poll` (cheap, ~5–10 s cadence, matching
 4. **GC.** `.done.md` and `.failed.md` are retained for audit and pruned at
    `monitor.requests.retention_seconds` (default 3 days, matching `_reemit` and
    webhook retention).
+
+> **SHIPPED DIFFERENTLY — the re-emit engine.** The scheduler task landed with
+> the name and shape this section specifies: `_schedule_task requests_poll 10
+> _v2_task_requests_poll --class cheap` (`monitor/watcher/main.sh:5008` @
+> `a3177ef6`), staging to `requests_poll.out`. The producer it wraps is
+> `requests_poll_emit` (`monitor/watcher/_requests.sh`), which ALSO runs
+> directly in the startup sweep (`main.sh:3437`), outside the scheduler, so a
+> request claimed before a crash is re-surfaced. What did NOT ship as designed
+> is the engine underneath:
+> step 3 says *"reuse the `_reemit.sh` two-tier discipline"* and the shipped
+> code **does not source `_reemit.sh` at all**. `_requests.sh` carries its own
+> per-id cooldown TSV with **exponential doubling** —
+> `_requests_effective_cooldown` doubles the base per DELIVERED-but-unacked
+> emit up to `MONITOR_REQUESTS_REEMIT_BACKOFF_MAX_SECONDS` (default 3600) —
+> rather than `_reemit`'s fast-then-slow two tiers. The count advances only on
+> a *successful* paste (`requests_commit_emitted`), so an undelivered render
+> cannot consume the budget. Cap, fairness, max-age eviction and the
+> self-clearing glob are all as designed. This duplication is precisely what
+> Part C's C1/C2 would have removed, and Part C did not ship.
 
 ### 2.5 The orchestrator's drain (ack protocol)
 
@@ -651,6 +719,21 @@ ng request reply <id> [--file reply.md | --message "…"] \
 ng request fail  <id> --reason "<why>"                # mark unactionable
 ```
 
+> **SHIPPED DIFFERENTLY — the verb set above is a strict SUBSET of what
+> `monitor/request-channel.sh` dispatches.** Read its own header (`## Subcommands`
+> / `## Exit codes`) as the authority; this block is the design sketch. What is
+> missing here: `reqfile <id>` (id → path) and `dir`; `fetch … status` as a
+> third fetch target; `reply --status <spawned|declined|deferred|answered>`,
+> a **closed** vocabulary that rejects unknown values, plus `--skeptic-resolved`;
+> `reply <id> --amend` (the `replied → replied` same-state transition, the
+> sanctioned second write — see §D.3; note it is a FLAG on `reply`, **not** an
+> `amend` subcommand — `request-channel.sh amend` is an unknown subcommand);
+> and `file --no-publish`. The exit-code space is likewise wider than §D.4's
+> await table: `3` not-ready, `5` ownership check failed, `6` illegal state
+> transition (which is how `ack` REFUSES a live `reply: required` id rather
+> than merely "honouring" it, §2.3), and `64` from the argument-loop progress
+> guard.
+
 `ng request file` is what a worker (or remote client) calls instead of trying to
 reach the orchestrator directly — it **prints the stable id on stdout** so the
 caller can correlate a reply. `ng request await` is the client's blocking
@@ -685,9 +768,32 @@ rename-state-machine into a tiny `_channel_lib.sh` both `skeptic-channel.sh` and
 `request-channel.sh` source — single home for "the rename is the signal," per
 the repo's no-bloat / single-source-of-truth principle.
 
+> **STATUS: HALF SHIPPED.** `monitor/_channel_lib.sh` exists and
+> `request-channel.sh` sources it (`request-channel.sh:218`), so the primitive
+> has a single home. **`skeptic-channel.sh` was deliberately NOT migrated** —
+> it is a working, independently-tested channel and rewriting its internals
+> buys no behaviour; the lib's own header records that decision and states
+> that every helper in it mirrors a `skeptic-channel.sh` counterpart 1:1 so
+> the migration stays a mechanical later step. So "both … source" is still
+> future tense for one of the two. `monitor/remote-forced-command.sh` sources
+> it as well.
+
 ---
 
 ## 3. Part C — signal-source standardization
+
+> **STATUS: NOT SHIPPED. This whole part is still a proposal — read every
+> sentence below as future tense.** Verified @ `a3177ef6`:
+> `grep -rnE '_produce\(\)|_is_acked' monitor/` returns **zero** hits (checked
+> against a positive control, so the zero is not a pattern failure), so no
+> source implements the §3.3 interface; `monitor/watcher/_reemit.sh` was never
+> generalized into the shared ack-gated registry; mentions and pending
+> decisions each keep their own hand-rolled bookkeeping; and the request inbox
+> (Part B) reuses `_reemit.sh`'s *discipline* without going through any shared
+> producer contract. Phases **C1** and **C2** in §5 are both outstanding. The
+> one §2.8 fragment that did land — `monitor/_channel_lib.sh` — is the
+> *channel* rename primitive, not this registry, and is only half-adopted (see
+> the callout at the end of §2.8). Nothing in Parts A/B/D depends on Part C.
 
 ### 3.1 The question, answered
 
@@ -762,9 +868,24 @@ anti-drift property the operator asked for.
 
 ## 4. Part A — confined remote access into the sandbox
 
-> **This part touches `katosh/agent_sandbox` (public, no bot install). It is
-> PROPOSED, not implemented. The operator decides.** The design's prime
-> directive: an authenticated remote client gets **exactly** what a local
+> **STATUS: THE NEXUS-CODE HALF IS SHIPPED; the `agent_sandbox` half is still
+> PROPOSED.** This callout used to read "It is PROPOSED, not implemented" flat,
+> which contradicted the banner at the top of this file — the same
+> self-contradiction `#568` C4 filed, pointing the other way. Precisely:
+> **shipped** are `monitor/remote-forced-command.sh` (A0),
+> `monitor/remote-sshd-supervised.sh` + `monitor/remote-ssh-health.sh` +
+> `monitor/remote-up.sh` (A0b), `monitor/remote-enroll.sh` +
+> `remote-enroll-session.sh` + host-key generation + `ng remote guard` (A0c),
+> and `skills/nexus.remote-access/` — now four files, SKILL + RUNBOOK + CLIENT
+> + REFERENCE (A0d). **Still the operator's / `agent_sandbox`'s call** (A1):
+> whether the sandbox image ships an `sshd` a non-root in-sandbox user can
+> bind, and the alternative-(1) inbound chaperon drop of §4.7 — which was NOT
+> the route taken; the shipped design is the §4.1–4.5 in-sandbox sshd with a
+> request-only forced command. Without a bindable `sshd` the shipped half
+> degrades honestly: `remote-up.sh` registers the row and the host key and the
+> healthcheck reports unhealthy.
+>
+> **The design's prime directive:** an authenticated remote client gets **exactly** what a local
 > in-sandbox agent has — the tmux + the request channel — and **nothing more**.
 > No host access, no other sandbox, no escape, **no weakening of the
 > kernel-enforced filesystem sandbox.** Any element that would require loosening
@@ -965,10 +1086,13 @@ required. Either way, **attach is opt-in and read-only**.
 
 The remote endpoint is a **supervised infra service**, modelled exactly on the
 jupyterlab pattern (`jupyter-up.sh` + a `services.registry` row + a healthcheck;
-[`skills/nexus.jupyter`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.jupyter/SKILL.md)). It is **registered
-but DISABLED by default**; a single config knob enables it, and the
-**orchestrator can flip it on by direct action** (config edit + a register/start
-step) — no operator shell required.
+[`skills/nexus.jupyter`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.jupyter/SKILL.md)). It is **UNregistered
+and therefore off by default**; **registration itself is the enable** (§4.8.1
+below, and this is what shipped), and the **orchestrator flips it on by direct
+action** — `monitor/remote-up.sh` to register+start, `--down` to remove the row
+— no operator shell required. *(This paragraph used to say "registered but
+DISABLED by default; a single config knob enables it", which §4.8.1 immediately
+contradicts. There is no such knob and never shipped as one.)*
 
 **4.8.1 Config schema (`config/nexus.yml`).** A `monitor.remote` block of
 **behavioral** parameters (committed to `config/nexus.example.yml` with safe
@@ -986,7 +1110,14 @@ monitor:
                                   #   channel-only (default) — forced command: request file/await/fetch
                                   #   unfiltered — a sandbox-confined login SHELL (arbitrary commands)
     bind_address: 127.0.0.1       # LAN/host-only; NEVER 0.0.0.0 on a public NIC (§4.3)
-    port: 22022                   # in-sandbox sshd port (high, unprivileged)
+    port: 22022                   # SHIPPED DIFFERENTLY: no longer a CONSTANT default.
+                                  # `monitor/_remote_lib.sh:_remote_configured_port`
+                                  # falls back to `_remote_derived_port` — the flat
+                                  # 22022 collided with foreign endpoints already held
+                                  # on this node. An explicit `monitor.remote.port` /
+                                  # MONITOR_REMOTE_PORT still wins; in
+                                  # config/nexus.example.yml the key ships COMMENTED
+                                  # OUT (`# port: 22022  # <- a pin`), i.e. unset.
     allow_attach: false           # read-only `attach -r` opt-in (§4.2); channel-only
     principals_dir: ~/.claude/nexus-remote/   # authorized_keys + host key live here (op-only, 0700)
     enrollment_token_ttl_seconds: 900         # one-time token lifetime (§4.9)
@@ -1316,6 +1447,15 @@ no shell; unfiltered = sandbox-confined shell) and the **available commands**.
 
 ## D. Part D — the bidirectional client↔orchestrator protocol over SSH
 
+> **STATUS: SHIPPED** (phases D1 and D2). `ng request reply` / `await` /
+> `fetch` (and `reply --amend`) in `monitor/request-channel.sh`, the `.replied.md` state and
+> the per-request reply dir, `spawn-worker.sh --reply-to`, and the orchestrator
+> reply protocol in `monitor/agent-prompt.md`. It rides Part B's enable, so the
+> note in Part B's status callout about `config/nexus.example.yml` applies here
+> too. §D.4's await exit-code table was re-verified against `cmd_await` and is
+> accurate; §D.3's "one reply per request" is where the implementation went
+> further than the design — see the callout there.
+
 > **This part answers the operator's follow-up directly** (PR `#374`): *"full
 > communication with the orchestrator through ssh — how to place the request
 > file, and how to detect a reply and read it… the orchestrator may spawn a
@@ -1449,7 +1589,19 @@ must amend (e.g. the spawned worker finished and final results are ready), it
 updates the **progress/results files** (§D.6), not the terminal request file —
 keeping "one reply per request" invariant, mirroring the skeptic channel's "one
 answer per request; ask a follow-up with a new slug" rule
-(`skeptic-channel.sh:514`).
+(`skeptic-channel.sh:514` @ `f6d6a25`).
+
+> **SHIPPED DIFFERENTLY — a sanctioned in-place amend exists.**
+> `ng request reply` on an already-`.replied` id is refused with **rc 6**, as
+> designed — *"use `--amend` to update"*. That flag is the second write:
+> `ng request reply <id> --amend` performs a same-state `replied → replied`
+> content update (one atomic temp+`mv` over the stable `.replied` name;
+> `--amend` against a non-`replied` id is likewise rc 6, and the amended copy
+> carries `amended_at`). It is a flag on `reply`, not a subcommand — there is
+> no `ng request amend`. So the invariant that actually holds
+> is *"one **reply**; corrections go through an explicit, recorded `amend`"* —
+> not "the terminal request file is never touched again". The progress/results
+> route of §D.6 is still the right one for streaming work in flight.
 
 ### D.4 Reply detection + read (the client's side)
 
@@ -1747,6 +1899,16 @@ A compact statement of the invariants a skeptic should check:
 Ordered so each phase is independently valuable and the risky/cross-repo parts
 land last, behind flags.
 
+> **STATUS PER PHASE, verified @ `a3177ef6`.** **DONE:** B0, B1, B2 (the flip is
+> in `monitor/watcher/_config.sh`, fallback `true`), D1, D2, A0, A0b, A0c, A0d.
+> **OUTSTANDING:** C1, C2 (nothing implements `_produce`/`_is_acked` — §3
+> status callout) and A1 (the `agent_sandbox` side).
+> **The `Flag / default` column is stale in the A-rows: `monitor.remote.enabled`
+> DOES NOT EXIST and never shipped.** Registration of the `nexus-remote-ssh`
+> row is the single enable (§4.8.1); `monitor/_remote_lib.sh`,
+> `remote-up.sh`, `remote-sshd-supervised.sh` and `remote-ssh-health.sh` each
+> say so in as many words. Read those cells as "off until registered".
+
 | Phase | Lands | Flag / default | Depends on |
 |---|---|---|---|
 | **B0** | `request-channel.sh` + `ng request` façade + schema + `test-request-channel.sh`; **no watcher wiring** (inert, like the scheduler Phase 0) | n/a (new scripts, unused) | — |
@@ -1876,7 +2038,20 @@ effort** once this spec is confirmed credible — this round locks the spec only
 
 ## Appendix A — file:line index (review citations)
 
-| Mechanism | Primary citation |
+> **EVERY LINE NUMBER BELOW IS PINNED TO `dev` @ `f6d6a25`, THE BASELINE
+> DECLARED AT THE TOP OF THIS FILE — NOT TO HEAD.** Resolve one with
+> `git show f6d6a25:<path> | sed -n '<n>p'`. `f6d6a25` is an ancestor of the
+> current `dev`, so it resolves in any clone. Spot-checked against that commit
+> on 2026-09-09 (`monitor/ng:1222` → `_skeptic_cfg_int() {`;
+> `monitor/ng:3815` → `cmd_skeptic() {`; `skeptic-channel.sh:251` →
+> `_next_req_num() {`) — the index was accurate when written and remains so
+> **at its own ref**. It does NOT describe HEAD: `monitor/ng` alone has grown
+> past 14,800 lines since, so reading these against a current checkout lands on
+> unrelated code that still parses — the failure mode this note exists to
+> prevent. Where you need the construct rather than the line, grep for the
+> function name; the names have been stable.
+
+| Mechanism | Primary citation (@ `f6d6a25`) |
 |---|---|
 | compose report body + section order | `monitor/watcher/main.sh:1274-1428` |
 | emit filter pipeline | `monitor/watcher/main.sh:3029-3040` |
@@ -1902,6 +2077,8 @@ effort** once this spec is confirmed credible — this round locks the spec only
 | config knob read pattern (`monitor.*` from `config/nexus.yml`) | `config/nexus.example.yml`; `monitor/ng:1222` (`_skeptic_cfg_int`) |
 
 ## Appendix B — design conventions reused
+
+Line numbers here are pinned to `f6d6a25`, as in Appendix A.
 
 | This RFC reuses | From |
 |---|---|

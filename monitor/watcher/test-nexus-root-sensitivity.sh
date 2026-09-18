@@ -44,7 +44,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — missing %q\n' "$label" "$needle" >&2
@@ -67,6 +68,22 @@ command -v jq >/dev/null || { echo "jq required" >&2; exit 1; }
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/nrs-test-XXXXXX") || exit 1
 trap 'rm -rf "$WORK"' EXIT
 export TMPDIR="$WORK"
+
+# PRE-RUN SWEEP (your-org/nexus-code#1511). Until #1511 the attribution block
+# below planted its `test-zz-attr-*.sh` fixtures INTO THE LIVE CHECKOUT at
+# $REPO/monitor/watcher/ and removed them from an EXIT trap — which does not
+# survive SIGKILL, and the band is SIGKILLed routinely (88 ceiling kills in one
+# week, #1511). A leftover plant is an executable `test-*.sh` inside CI's and
+# run-tests.sh's discovery glob: it does not merely confuse a population probe,
+# it JOINS the suite population. The plants now live under $WORK (via the
+# tool's NRS_SUITE_ROOT seam), so nothing this run does can leave one; this
+# sweep is for residue from a killed PRE-#1511 run, and it is LOUD when it
+# removes anything — a stray is reported, never silently reaped.
+for _stray in "$REPO"/monitor/watcher/test-zz-attr-*.sh; do
+    [ -e "$_stray" ] || continue
+    printf '  SWEEP: removing leftover plant %s (residue of a killed run; your-org/nexus-code#1511)\n' "$_stray" >&2
+    rm -f "$_stray"
+done
 
 mk_target() {   # mk_target <name> <body...>
     local name="$1"; shift
@@ -91,6 +108,218 @@ assert_contains "the report says rc=0 (the suite passed)" "$out" "rc=0"
 assert_contains "the sensitive-but-green case is called out by name" "$out" "SENSITIVE BUT GREEN"
 assert_contains "the leaked path is named" "$out" "monitor/.state/action-log.jsonl"
 assert_eq "a leak exits 1" "$rc" "1"
+
+# ---------------------------------------------------------------------------
+echo "=== a suite that re-roots itself past the decoy is LEAK-AT-SOURCE, not hermetic (#1431) ==="
+# `export NEXUS_ROOT="$_repo_root"` from BASH_SOURCE overrides the probe's
+# NEXUS_ROOT before any child runs, so the write lands in the SOURCE checkout:
+# nothing in the decoy, nothing in the output, and the verdict read HERMETIC
+# while the checkout's live monitor/.state grew a heartbeat file. The source
+# root is planted via NRS_SOURCE_ROOT so the test never touches this repo's own
+# state directory; the plant writes there through a value it computes itself
+# (as a BASH_SOURCE re-root does), not through the probe's NEXUS_ROOT.
+srcroot="$WORK/srcroot"; mkdir -p "$srcroot/monitor/.state" "$srcroot/reports"
+rerooter=$(mk_target rerooter \
+    'export NEXUS_ROOT="'"$srcroot"'"' \
+    'mkdir -p "$NEXUS_ROOT/monitor/.state/heartbeat"' \
+    'echo "{}" > "$NEXUS_ROOT/monitor/.state/heartbeat/w1.json"' \
+    'echo "=== summary: 1 passed, 0 failed ==="' \
+    'exit 0')
+out=$(NRS_SOURCE_ROOT="$srcroot" "$TOOL" probe "$rerooter" 2>&1); rc=$?
+assert_contains "a re-rooted write into the SOURCE tree is LEAK-AT-SOURCE" "$out" "verdict=LEAK-AT-SOURCE"
+assert_contains "…and the new source path is named" "$out" "monitor/.state/heartbeat/w1.json"
+assert_not_contains "…and it is NOT reported hermetic" "$out" "verdict=hermetic"
+assert_eq "LEAK-AT-SOURCE GATES BY DEFAULT: exit 1 like LEAK (a detector that reports and never blocks is the #1400 shape)" "$rc" "1"
+assert_contains "…and it is listed under its own heading with the remedy" "$out" "WROTE INTO THE SOURCE CHECKOUT, not the decoy"
+# The ONLY exemption is the per-suite, reason-required marker — the same
+# mechanism the decoy arm proves out. Exempted, still PRINTED and counted.
+rm -rf "$srcroot/monitor/.state/heartbeat"   # the plant must be NEW again, or the arm has nothing to gate
+marked=$(mk_target marked \
+    '# nexus-root-sensitivity: allow-source-leak — known BASH_SOURCE re-root, tracked as #1451' \
+    'export NEXUS_ROOT="'"$srcroot"'"' \
+    'mkdir -p "$NEXUS_ROOT/monitor/.state/heartbeat"' \
+    'echo "{}" > "$NEXUS_ROOT/monitor/.state/heartbeat/w1.json"' \
+    'echo "=== summary: 1 passed, 0 failed ==="' \
+    'exit 0')
+out=$(NRS_SOURCE_ROOT="$srcroot" "$TOOL" probe "$marked" 2>&1); rc=$?
+assert_contains "a per-suite allow-source-leak marker WITH a reason → ALLOWED-AT-SOURCE" "$out" "verdict=ALLOWED-AT-SOURCE"
+assert_contains "…the reason is printed (the leak stays VISIBLE and attributed)" "$out" "reason: known BASH_SOURCE re-root, tracked as #1451"
+assert_eq "…and an allowed-at-source suite does not fail the probe" "$rc" "0"
+rm -rf "$srcroot/monitor/.state/heartbeat"
+bareled=$(mk_target bareled \
+    '# nexus-root-sensitivity: allow-source-leak' \
+    'export NEXUS_ROOT="'"$srcroot"'"' \
+    'mkdir -p "$NEXUS_ROOT/monitor/.state/heartbeat"' \
+    'echo "{}" > "$NEXUS_ROOT/monitor/.state/heartbeat/w1.json"' \
+    'echo "=== summary: 1 passed, 0 failed ==="' \
+    'exit 0')
+out=$(NRS_SOURCE_ROOT="$srcroot" "$TOOL" probe "$bareled" 2>&1); rc=$?
+assert_contains "POTENCY: a marker WITHOUT a reason does not exempt — still LEAK-AT-SOURCE" "$out" "verdict=LEAK-AT-SOURCE"
+assert_contains "…and the rejection says why" "$out" "marker REJECTED"
+assert_eq "…and it still exits 1" "$rc" "1"
+rm -rf "$srcroot/monitor/.state/heartbeat"
+# CONTROL: a pre-existing source-tree file that merely CHANGES is the watcher's
+# noise on a primary, not this suite's write — only NEW paths count.
+printf 'old\n' > "$srcroot/monitor/.state/action-log.jsonl"
+appender=$(mk_target appender \
+    'echo "{\"event\":\"x\"}" >> "'"$srcroot"'/monitor/.state/action-log.jsonl"' \
+    'echo "=== summary: 1 passed, 0 failed ==="' \
+    'exit 0')
+out=$(NRS_SOURCE_ROOT="$srcroot" "$TOOL" probe "$appender" 2>&1)
+assert_not_contains "CONTROL: an append to an EXISTING source file is not LEAK-AT-SOURCE (primary noise)" "$out" "verdict=LEAK-AT-SOURCE"
+
+# ---------------------------------------------------------------------------
+echo "=== a QUOTED marker is fixture DATA, not a declaration (#1454) ==="
+# The parser used to be an unanchored `grep -m1 -F` over the whole file, so a
+# suite that merely QUOTED the marker — in a mk_target argument, a heredoc, a
+# comment about the marker — was read as declaring it, and the "reason" it
+# extracted still carried the trailing `' \` of the shell literal. THIS suite
+# plants both markers as fixture data (the `marked`/`withmk` targets above),
+# so under the old parser the gate's own unit suite, a band member, was
+# self-exempt on BOTH arms: a real leak from it would have read ALLOWED.
+#
+# A fixture that contains the construct it tests is indistinguishable from the
+# construct itself to any predicate that does not anchor. So: the marker is a
+# COMMENT AT LINE START, or it is not a marker.
+rm -rf "$srcroot/monitor/.state/heartbeat"
+quoted_src=$(mk_target quoted_src \
+    "fixture_line='# nexus-root-sensitivity: allow-source-leak — this is fixture DATA, not a declaration'" \
+    'export NEXUS_ROOT="'"$srcroot"'"' \
+    'mkdir -p "$NEXUS_ROOT/monitor/.state/heartbeat"' \
+    'echo "{}" > "$NEXUS_ROOT/monitor/.state/heartbeat/w1.json"' \
+    'echo "=== summary: 1 passed, 0 failed ==="' \
+    'exit 0')
+out=$(NRS_SOURCE_ROOT="$srcroot" "$TOOL" probe "$quoted_src" 2>&1); rc=$?
+assert_contains "a QUOTED allow-source-leak literal does not exempt — still LEAK-AT-SOURCE" "$out" "verdict=LEAK-AT-SOURCE"
+assert_not_contains "…and is never reported ALLOWED-AT-SOURCE" "$out" "verdict=ALLOWED-AT-SOURCE"
+assert_eq "…exiting 1" "$rc" "1"
+rm -rf "$srcroot/monitor/.state/heartbeat"
+quoted_dec=$(mk_target quoted_dec \
+    "note='# nexus-root-sensitivity: allow-inherited-root — fixture DATA, not a declaration'" \
+    'mkdir -p "$NEXUS_ROOT/monitor/.state"' \
+    'echo leak >> "$NEXUS_ROOT/monitor/.state/action-log.jsonl"' \
+    'echo "=== summary: 1 passed, 0 failed ==="' \
+    'exit 0')
+out=$("$TOOL" probe "$quoted_dec" 2>&1); rc=$?
+assert_contains "a QUOTED allow-inherited-root literal does not exempt — still LEAK" "$out" "verdict=LEAK"
+assert_not_contains "…and is never reported ALLOWED" "$out" "verdict=ALLOWED"
+assert_eq "…exiting 1" "$rc" "1"
+# THE SELF-EXEMPTION CONTROL: this very file plants both markers as data and
+# must declare NEITHER. Asked of the parser directly (the `marker-reason`
+# seam), because probing this suite from inside itself is recursion, not a
+# control. The positive control beside it is what makes the two zeros mean
+# something: the same parser, over a file that DOES declare, returns the reason.
+"$TOOL" marker-reason "${BASH_SOURCE[0]}" allow-source-leak >/dev/null 2>&1; rc=$?
+assert_eq "SELF-EXEMPTION CONTROL: this suite does NOT declare allow-source-leak (rc 1)" "$rc" "1"
+"$TOOL" marker-reason "${BASH_SOURCE[0]}" allow-inherited-root >/dev/null 2>&1; rc=$?
+assert_eq "SELF-EXEMPTION CONTROL: this suite does NOT declare allow-inherited-root (rc 1)" "$rc" "1"
+r=$("$TOOL" marker-reason "$marked" allow-source-leak 2>&1); rc=$?
+assert_eq "POSITIVE CONTROL: the marked fixture DOES declare (rc 0)" "$rc" "0"
+assert_eq "…with exactly its reason, no separator and no trailing syntax" "$r" "known BASH_SOURCE re-root, tracked as #1451"
+# The separator is a TOKEN, not a byte class: under a C locale `[—-]` stripped
+# two of an en dash's three bytes and left one as a "non-empty" reason.
+endash=$(mk_target endash '# nexus-root-sensitivity: allow-inherited-root – deliberate en dash, see #1454' 'exit 0')
+r=$("$TOOL" marker-reason "$endash" allow-inherited-root 2>&1); rc=$?
+assert_eq "an EN-DASH separator is stripped whole (rc 0)" "$rc" "0"
+assert_eq "…leaving exactly the reason" "$r" "deliberate en dash, see #1454"
+indented=$(mk_target indented '    #  nexus-root-sensitivity: allow-inherited-root: indented, colon-separated' 'exit 0')
+r=$("$TOOL" marker-reason "$indented" allow-inherited-root 2>&1); rc=$?
+assert_eq "an INDENTED comment marker still declares (rc 0)" "$rc" "0"
+assert_eq "…with a colon separator stripped" "$r" "indented, colon-separated"
+bare=$(mk_target bare '# nexus-root-sensitivity: allow-inherited-root' 'exit 0')
+"$TOOL" marker-reason "$bare" allow-inherited-root >/dev/null 2>&1; rc=$?
+assert_eq "a marker with NO reason is rc 2 (present, invalid) — not 0, not 1" "$rc" "2"
+prefixed=$(mk_target prefixed '# nexus-root-sensitivity: allow-inherited-rootless — a DIFFERENT token' 'exit 0')
+"$TOOL" marker-reason "$prefixed" allow-inherited-root >/dev/null 2>&1; rc=$?
+assert_eq "a marker name that is only a PREFIX of the line's token does not match (rc 1)" "$rc" "1"
+
+# ---------------------------------------------------------------------------
+echo "=== attribute: the RUN-DERIVED population, gated on src (#1336) ==="
+# The exported band runs EVERY suite; whatever they wrote into the checkout's
+# monitor/.state is the population, and `ng`'s usage tap names the producer
+# (#720). No predicate selects it, so no spelling can walk past it. Driven
+# against a PLANTED root; the marker is read from the suite tree at
+# monitor/<src>. That tree is NRS_SUITE_ROOT — a fixture under $WORK — so each
+# case plants its `watcher/test-zz-attr-*.sh` file THERE, never into this
+# checkout (your-org/nexus-code#1511: a plant in the live tree is an executable
+# inside the discovery glob, and the EXIT trap that removed it does not survive
+# the SIGKILL this band routinely gets). The assertion right after the first
+# plant is the pin: the live checkout must hold NO such file while this block
+# runs. It goes RED against the pre-#1511 tool, which ignored the seam here
+# and looked the planted suite up in the live tree.
+AROOT="$WORK/aroot"; mkdir -p "$AROOT/monitor/.state"
+SUITEROOT="$WORK/suiteroot"; mkdir -p "$SUITEROOT/monitor/watcher"
+_plant_suite() { printf '#!/usr/bin/env bash\n%s\nexit 0\n' "$2" > "$SUITEROOT/monitor/watcher/$1"; chmod +x "$SUITEROOT/monitor/watcher/$1"; }
+_row() { printf '{"ts":"2026-09-04T10:30:13+0000","verb":"log-action","sub":"","origin":"agent","win":"","src":"%s","pid":1}\n' "$1"; }
+_live_plants() { local n=0 f; for f in "$REPO"/monitor/watcher/test-zz-attr-*.sh; do [ -e "$f" ] && n=$(( n + 1 )); done; printf '%s\n' "$n"; }
+# absent file -> 0
+out=$(NRS_SUITE_ROOT="$SUITEROOT" "$TOOL" attribute "$AROOT" 2>&1); rc=$?
+assert_eq "no ng-usage.jsonl in the root -> exit 0 (no attributable write)" "$rc" "0"
+assert_contains "…and says so" "$out" "no attributable write"
+# attributed, unmarked -> 1
+_plant_suite test-zz-attr-leaker.sh ': leaks through ng'
+assert_eq "the plant lives under \$WORK — the live checkout holds NO test-zz-attr-*.sh (#1511)" "$(_live_plants)" "0"
+[ -x "$SUITEROOT/monitor/watcher/test-zz-attr-leaker.sh" ] || printf '  FAIL: the fixture plant is missing from NRS_SUITE_ROOT — the assertion above passed vacuously\n' >&2
+{ _row watcher/test-zz-attr-leaker.sh; _row watcher/test-zz-attr-leaker.sh; } > "$AROOT/monitor/.state/ng-usage.jsonl"
+out=$(NRS_SUITE_ROOT="$SUITEROOT" "$TOOL" attribute "$AROOT" 2>&1); rc=$?
+assert_eq "a row whose src names an UNMARKED suite -> exit 1" "$rc" "1"
+assert_contains "…the suite is named as LEAK with its row count" "$out" "LEAK              2 row(s)  watcher/test-zz-attr-leaker.sh"
+assert_contains "…and the remedy names th_pin_ng_state" "$out" "th_pin_ng_state"
+# attributed + anchored marker -> 0, ALLOWED, reason printed
+_plant_suite test-zz-attr-marked.sh '# nexus-root-sensitivity: allow-inherited-root — deliberate, attribution fixture #1336'
+_row watcher/test-zz-attr-marked.sh > "$AROOT/monitor/.state/ng-usage.jsonl"
+out=$(NRS_SUITE_ROOT="$SUITEROOT" "$TOOL" attribute "$AROOT" 2>&1); rc=$?
+assert_eq "a named suite carrying the anchored marker -> exit 0" "$rc" "0"
+assert_contains "…reported ALLOWED with its reason (visible, counted, not failing)" "$out" "ALLOWED           1 row(s)  watcher/test-zz-attr-marked.sh   marker reason: deliberate, attribution fixture #1336"
+# a QUOTED marker is not a declaration here either (#1454, same parser)
+_plant_suite test-zz-attr-quoted.sh "x='# nexus-root-sensitivity: allow-inherited-root — fixture data'"
+_row watcher/test-zz-attr-quoted.sh > "$AROOT/monitor/.state/ng-usage.jsonl"
+out=$(NRS_SUITE_ROOT="$SUITEROOT" "$TOOL" attribute "$AROOT" 2>&1); rc=$?
+assert_eq "a QUOTED marker does not exempt an attributed suite (exit 1)" "$rc" "1"
+# empty src -> UNATTRIBUTED, rc 0
+printf '{"ts":"2026-09-04T10:30:13+0000","verb":"usage","sub":"","origin":"agent","win":"","src":"","pid":2}\n' > "$AROOT/monitor/.state/ng-usage.jsonl"
+out=$(NRS_SUITE_ROOT="$SUITEROOT" "$TOOL" attribute "$AROOT" 2>&1); rc=$?
+assert_eq "a row with EMPTY src is UNATTRIBUTED and does not gate (exit 0)" "$rc" "0"
+assert_contains "…and is printed as such with the limit stated" "$out" "UNATTRIBUTED      1 row(s) with no src"
+# a non-tap file is listed, never gated
+: > "$AROOT/monitor/.state/tmux-refused.log"
+rm -f "$AROOT/monitor/.state/ng-usage.jsonl"
+out=$(NRS_SUITE_ROOT="$SUITEROOT" "$TOOL" attribute "$AROOT" 2>&1); rc=$?
+assert_eq "a file the tap does not write (tmux-refused.log) is listed, exit 0" "$rc" "0"
+assert_contains "…under the UNATTRIBUTED files heading" "$out" "> tmux-refused.log"
+# mixed: one marked, one not -> 1, both printed
+_row watcher/test-zz-attr-marked.sh > "$AROOT/monitor/.state/ng-usage.jsonl"
+_row watcher/test-zz-attr-leaker.sh >> "$AROOT/monitor/.state/ng-usage.jsonl"
+out=$(NRS_SUITE_ROOT="$SUITEROOT" "$TOOL" attribute "$AROOT" 2>&1); rc=$?
+assert_eq "one marked + one unmarked -> exit 1 (the unmarked one gates)" "$rc" "1"
+assert_contains "…summary counts one leaking and one allowed" "$out" "leaking suites 1   allowed-by-marker 1"
+# A src naming a suite ABSENT from the suite tree is attributed by name, and
+# the tree it was looked up in is the one the seam selected — not this checkout.
+_row watcher/test-zz-attr-nowhere.sh > "$AROOT/monitor/.state/ng-usage.jsonl"
+out=$(NRS_SUITE_ROOT="$SUITEROOT" "$TOOL" attribute "$AROOT" 2>&1); rc=$?
+assert_eq "a src naming a suite present in NEITHER tree -> exit 1 (attributed by name)" "$rc" "1"
+assert_contains "…and the lookup tree named in the diagnostic is the seam's, not the checkout" "$out" "not present under $SUITEROOT/monitor"
+assert_eq "after the block, the live checkout still holds NO test-zz-attr-*.sh (#1511)" "$(_live_plants)" "0"
+# The longjob launcher's arming.log carries the same producer field (column
+# 5, from NEXUS_TEST_SUITE) and is gated the same way. Added after the
+# bundle-2609 soak measured 17 fixture rows in the operator's LIVE arming.log
+# that this gate printed as UNATTRIBUTED and did not flip on.
+_arow() { printf '1789600000\torchestrator\tskipped\tbinary does not advertise --plugin-dir\t%s\n' "$1"; }
+rm -f "$AROOT/monitor/.state/ng-usage.jsonl"; mkdir -p "$AROOT/monitor/.state/longjob"
+_arow watcher/test-zz-attr-leaker.sh > "$AROOT/monitor/.state/longjob/arming.log"
+out=$(NRS_SUITE_ROOT="$SUITEROOT" "$TOOL" attribute "$AROOT" 2>&1); rc=$?
+assert_eq "an arming.log row whose column 5 names an UNMARKED suite -> exit 1 (no ng row at all)" "$rc" "1"
+assert_contains "…the LEAK line names the suite and the file" "$out" "LEAK              1 row(s)  watcher/test-zz-attr-leaker.sh   in longjob/arming.log"
+assert_not_contains "…and arming.log is no longer listed as an unattributed FILE" "$out" "    > longjob/arming.log"
+_arow watcher/test-zz-attr-marked.sh > "$AROOT/monitor/.state/longjob/arming.log"
+out=$(NRS_SUITE_ROOT="$SUITEROOT" "$TOOL" attribute "$AROOT" 2>&1); rc=$?
+assert_eq "an arming.log row naming a suite with the anchored marker -> exit 0" "$rc" "0"
+assert_contains "…reported ALLOWED" "$out" "ALLOWED           1 row(s)  watcher/test-zz-attr-marked.sh"
+_arow '' > "$AROOT/monitor/.state/longjob/arming.log"
+out=$(NRS_SUITE_ROOT="$SUITEROOT" "$TOOL" attribute "$AROOT" 2>&1); rc=$?
+assert_eq "an arming.log row with an EMPTY column 5 (a real launch) -> exit 0, not gated" "$rc" "0"
+assert_contains "…printed as UNATTRIBUTED in that file" "$out" "UNATTRIBUTED      1 row(s) with no src in longjob/arming.log"
+rm -rf "$AROOT/monitor/.state/longjob"
 
 # ---------------------------------------------------------------------------
 echo "=== the detector stays quiet on a suite that touches nothing ==="
@@ -120,6 +349,40 @@ pinned=$(mk_target pinned \
     'exit 0')
 out=$("$TOOL" probe "$pinned" 2>&1)
 assert_contains "pinning (not scrubbing) is accepted as hermetic" "$out" "verdict=hermetic"
+
+# ---------------------------------------------------------------------------
+echo "=== a STATE-class suite 'fixed' by env -u NEXUS_ROOT is reported LEAK, not hermetic ==="
+# your-org/nexus-code#1349. `ng`'s state resolver is FOUR arms; scrubbing
+# NEXUS_ROOT advances it to arm 3 (config nexus.root), which on an operator's
+# primary IS the primary. A tracked-files decoy had no config/nexus.yml, so
+# arm 3 answered the example placeholder, `ng` wrote nowhere, and this probe
+# reported the scrub-"fixed" suite hermetic — the false negative produced by
+# following the gate's own remediation text. The decoy now names itself.
+scrub=$(mk_target scrub \
+    'root="$NEXUS_ROOT"' \
+    'env -u NEXUS_ROOT -u NEXUS_LOCALS -u NEXUS_STATE_DIR "$root/monitor/ng" log-action probe --event scrub-leak >/dev/null 2>&1' \
+    'echo "=== summary: 1 passed, 0 failed ==="' \
+    'exit 0')
+out=$("$TOOL" probe "$scrub" 2>&1); rc=$?
+assert_contains "env -u NEXUS_ROOT on a STATE-class writer is LEAK (arm 3 lands in the decoy)" "$out" "verdict=LEAK"
+assert_contains "…and the leaked path is the decoy's action log" "$out" "monitor/.state/action-log.jsonl"
+assert_eq "…exiting 1" "$rc" "1"
+assert_not_contains "…with no warning that the decoy could not name itself" "$out" "does not resolve nexus.root to the decoy"
+
+# The complement (#1386): an AMBIENT NEXUS_STATE_DIR in the caller's shell —
+# the very pin #1349 prescribes for ad-hoc tooling — must not blind the
+# probe. Arm 1 is unconditional, so without the scrub every `ng` write in
+# every probed suite would land in the pin and every suite would read
+# hermetic. The target must write THROUGH `ng` — a direct `echo >>` into
+# the root cannot be redirected by any pin and would pass here vacuously.
+ngwriter=$(mk_target ngwriter \
+    '"$NEXUS_ROOT/monitor/ng" log-action probe --event pin-blind >/dev/null 2>&1' \
+    'echo "=== summary: 1 passed, 0 failed ==="' \
+    'exit 0')
+_pin=$(mktemp -d "$WORK/ambient-pin-XXXXXX")
+out=$(NEXUS_STATE_DIR="$_pin" "$TOOL" probe "$ngwriter" 2>&1)
+assert_contains "an ambient NEXUS_STATE_DIR does not blind the probe (an ng-writing suite is still LEAK)" "$out" "verdict=LEAK"
+assert_eq "…and nothing was routed into the ambient pin" "$(find "$_pin" -type f | wc -l)" "0"
 
 # ---------------------------------------------------------------------------
 echo "=== a probe that could not have observed a leak is VACUOUS, not clean ==="
@@ -195,6 +458,23 @@ assert_contains "exit 77 is reported SKIP" "$out" "verdict=SKIP"
 assert_contains "SKIP is spelled out as no evidence" "$out" "NO EVIDENCE"
 assert_eq "a lone skip exits 77 (measured nothing), never 0" "$rc" "77"
 
+# ENVSKIP — the SAME claim for the OTHER decline (your-org/nexus-code#1283).
+# A suite that RAN, asserted, then found the machine unable exits 69. Before
+# this arm existed it matched no case here and fell to `else verdict=hermetic`
+# — a CLEAN BILL OF HEALTH for a suite that produced no evidence, issued by the
+# tool whose exit-code note says a run that measured nothing must never be 0.
+#
+# The asymmetry worth remembering: run-tests.sh's terminal arm is
+# `rc != 0 -> FAIL`, so an unknown code fails CLOSED there; this classifier's
+# terminal arm is PERMISSIVE, so the same code was absorbed as a pass. One new
+# exit code, opposite directions in two consumers.
+envskipper=$(mk_target envskipper 'exit 69')
+out=$("$TOOL" probe "$envskipper" 2>&1); rc=$?
+assert_contains "exit 69 is reported ENVSKIP, NOT hermetic" "$out" "verdict=ENVSKIP"
+assert_not_contains "…and is never called hermetic" "$out" "verdict=hermetic"
+assert_contains "ENVSKIP is spelled out as no evidence" "$out" "NO EVIDENCE"
+assert_eq "a lone env-decline exits 77 (measured nothing), never 0" "$rc" "77"
+
 # ---------------------------------------------------------------------------
 echo "=== the decoy is a plausible AND sufficient nexus root ==="
 # Two distinct requirements, and the second is the one that bit. The predicate
@@ -252,7 +532,7 @@ synthlog="$WORK/action-log.jsonl"
   printf '{"event":"spawn","window":"%s","workdir":"/tmp/x/nexus/work/s","rerooted-from":"/tmp/x/nexus","ts":"2026-07-30T12:53:23-07:00"}\n' "$pid_win"
   printf '{"event":"spawn","window":"%s","workdir":"/tmp/y/nexus/work/s","rerooted-from":"/tmp/y/nexus","ts":"2026-07-30T13:06:23-07:00"}\n' "$lit_win"
   printf '{"event":"spawn","window":"%s","workdir":"/tmp/z/nexus/work/s","rerooted-from":"/tmp/z/nexus","ts":"2026-07-30T13:10:00-07:00"}\n' "$orphan_win"
-  printf '{"event":"spawn","window":"real-worker","workdir":"/fh/real/work/x","ts":"2026-07-30T13:11:00-07:00"}\n'
+  printf '{"event":"spawn","window":"real-worker","workdir":"/shared/real/work/x","ts":"2026-07-30T13:11:00-07:00"}\n'
 } > "$synthlog"
 out=$("$TOOL" audit --no-verify --log "$synthlog" 2>&1)
 assert_contains "PID-suffixed window maps via the stem fallback" "$out" "test-spawn-worker-cwd.sh"
@@ -289,7 +569,7 @@ echo "=== an empty audit says lower-bound, not all-clear ==="
 # root. Zero rows is silence, and this chain's dominant defect is silence read
 # as absence.
 empty="$WORK/empty-log.jsonl"
-echo '{"event":"spawn","window":"w","workdir":"/fh/real/work/x"}' > "$empty"
+echo '{"event":"spawn","window":"w","workdir":"/shared/real/work/x"}' > "$empty"
 out=$("$TOOL" audit --log "$empty" 2>&1)
 assert_contains "an empty audit refuses to read as a clearance" "$out" "not a clearance"
 

@@ -29,7 +29,8 @@ assert_contains() {
     # when this exact assertion reddened dev under fork pressure
     # (your-org/nexus-code#638), the missing `actual:` line hid WHICH wrong
     # project slug was emitted, costing a debugging cycle.
-    if grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else printf '  FAIL: %s\n           expected: %s\n           actual:   %s\n' "$label" "$needle" "$hay" >&2; FAIL=$(( FAIL + 1 )); fi
 }
 assert_not_contains() {
@@ -55,6 +56,8 @@ cp "$NG_REAL" "$FAKE_NEXUS/monitor/ng"
 # it (your-org/nexus-code#601/#605: degrading to the silent-coercion
 # behaviour it replaces is worse than refusing). Copy it alongside.
 cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
+# your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+cp "$(dirname "$NG_REAL")/_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 NG="$FAKE_NEXUS/monitor/ng"
 
 cat > "$FAKE_NEXUS/config/load.sh" <<'STUB'
@@ -293,8 +296,14 @@ touch "$TARGET"
 # source. This is an integration test; we'll trust the unit at
 # this point.
 true
+# _occurrences <pattern> <file> — OCCURRENCES, not lines (your-org/nexus-code
+# `#1026`). `grep -c` counts matching LINES, so two writes sharing one line read
+# as 1. On no match grep prints nothing and exits 1, yielding 0 — a replacement,
+# never an appended second value (your-org/nexus-code#725).
+_occurrences() { grep -oE -- "$1" "$2" 2>/dev/null | wc -l | tr -d ' '; }
+
 assert_eq        "collision-guard probe (source-level)" \
-                 "$(grep -c 'refusing to overwrite existing file' "$NG")" "1"
+                 "$(_occurrences 'refusing to overwrite existing file' "$NG")" "1"
 
 # ---- Test 8: session-id slug matches Claude Code's path normalisation --
 #

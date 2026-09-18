@@ -1,0 +1,96 @@
+# claude-md-markers.manifest — every `<!-- BEGIN X -->` block in `CLAUDE.md`
+# and the suite that owns it, recorded as DATA rather than prose, because
+# prose cannot be made to fail.
+#
+# Enforced by:  bash monitor/watcher/test-claude-md-marker-ownership.sh
+#
+# ── WHY THIS FILE EXISTS (your-org/nexus-code#1264 R2) ────────────────────
+#
+# `CLAUDE.md` states its own convention: "a `BEGIN`/`END` marker in this file
+# is a promise that a suite executes the block". Nothing checked the promise.
+# `run-tests.sh` discovers suites by GLOB, so a marker added with no owner is
+# indistinguishable from one whose owner was deleted — and from one that never
+# needed an owner. All three read as silence.
+#
+# The failure mode is not a red test. It is a block that is UNOWNED AND
+# CURRENTLY TRUE: nothing is visibly broken, so nothing prompts anyone to look,
+# and it rots at the speed the code beneath it moves. `WINDOW-KEY-VOCABULARY`
+# is exactly that case and is why the `drives` mode below exists rather than
+# being rounded to `executes`.
+#
+# ── NO NAME-DERIVATION. THIS IS MEASURED, NOT STYLISTIC. ──────────────────
+#
+# The obvious implementation is "derive the owner from the marker name" with an
+# exception list. That is #1121's shape — a permissive arm deciding by a string
+# heuristic — and both natural spellings of the heuristic are wrong, in
+# OPPOSITE directions. Measured on this tree at the ref in the suite header:
+#
+#   narrow   `git grep -l "BEGIN <NAME> -->" -- monitor/watcher`
+#            UNDER-finds 4 of 24. The owners spell the marker three different
+#            ways: `<!-- BEGIN X -->`, a bare `BEGIN X` in an awk range, and a
+#            `_block X` helper argument. FROMISOFORMAT, ISO-PARSE-36,
+#            SHOPT-DYNAMIC-SCOPE and WINDOW-KEY-VOCABULARY all read as unowned
+#            while three of them are executed.
+#
+#   broad    `git grep -l "<NAME>" -- monitor`
+#            OVER-finds. `DASH-PATTERN-OPTION` matches 6 files and
+#            `GREP-BRE-DIALECT` 5 — cross-references and a separate manifest,
+#            none of which executes the block.
+#
+# A predicate that is wrong in both directions cannot be repaired by widening
+# or narrowing it. So ownership is DECLARED, one row per marker, all 24, and
+# the only generated thing is the marker SET the rows are checked against.
+#
+# ── WHAT A ROW CLAIMS, AND WHAT IT DOES NOT ──────────────────────────────
+#
+# Structural, never behavioural — the same boundary `guard-populations.manifest`
+# draws about itself. A row does NOT assert the suite would catch any
+# particular defect. It asserts: this marker exists in `CLAUDE.md` with a
+# matching `END`, the named suite EXISTS and is tracked, and that suite names
+# both the marker and `CLAUDE.md`. Set equality runs BOTH directions, so a
+# marker added without a row and a row left behind by a deleted marker are
+# each RED rather than silently changing what this file covers.
+#
+# ── COLUMNS  marker|owner_suite|mode|reason ───────────────────────────────
+#
+#   executes  the suite EXTRACTS the block from `CLAUDE.md` and drives the
+#             forms inside it. The block is checked, not asserted.
+#   drives    the suite asserts the block's CLAIMS against real behaviour but
+#             never extracts the block, so an edit to the PROSE cannot fail it.
+#             DELIBERATELY WEAKER, and named so it is countable: see the
+#             `drives`/`unowned` ceiling in the suite. `reason` must say what
+#             is driven and what is not.
+#   unowned   a declared gap. `reason` must say why. Counted against a ceiling
+#             so the gap cannot grow one row at a time.
+#
+# `owner_suite` is repo-relative. One suite may own several markers
+# (`test-claude-md-count-provenance.sh` owns two by design); a marker has
+# exactly one owner row.
+
+REPO-WALKUP|monitor/watcher/test-claude-md-repo-walkup.sh|executes|reverts each caller to its pre-fix form and requires the assertion to flip
+618-REMEDIES|monitor/watcher/test-claude-md-618-remedies.sh|executes|each listed remedy is run against a planted fixture in a gitignored tree
+SHELL-WRAPPED-COREUTIL|monitor/watcher/test-claude-md-shell-wrapped-coreutil.sh|executes|asserts the REMEDIES return the planted count; deliberately does NOT assert the broken form returns zero
+GREP-BRE-DIALECT|monitor/watcher/test-claude-md-grep-bre-dialect.sh|executes|planted +one/++two/+++three/plain diff fixture AND a planted x=$(cmd) shell-source fixture (the mid-pattern $ silent zero, polarities reversed); pins the structural half only, not which grep a bare call resolves to
+DASH-PATTERN-OPTION|monitor/watcher/test-claude-md-dash-pattern-option.sh|executes|drives both modes against a fixture, including the stdin-slide
+LSTREE-PATHSPEC|monitor/watcher/test-claude-md-lstree-pathspec.sh|executes|runs both forms against this tree and requires the glob pathspec to return zero
+PATHSPEC-GLOB-DEPTH|monitor/watcher/test-claude-md-pathspec-glob-depth.sh|executes|planted nested layout; the depth-1 and wide forms must differ
+ANCESTOR-TIMELINE|monitor/watcher/test-claude-md-ancestor-timeline.sh|executes|purpose-built divergent-vs-linear fixture
+COUNT-PROVENANCE|monitor/watcher/test-claude-md-count-provenance.sh|executes|two-ref fixture; all four counting forms driven
+LOCATION-PROVENANCE|monitor/watcher/test-claude-md-count-provenance.sh|executes|same two-ref fixture; the blob and content forms driven
+MERGE-ENUMERATION|monitor/watcher/test-claude-md-merge-enumeration.sh|executes|the three enumeration forms run against real history
+PIPELINE-STATUS|monitor/watcher/test-claude-md-pipeline-status.sh|executes|both directions driven, masking and manufacturing
+PRINTF-STATUS-CLOBBER|monitor/watcher/test-claude-md-printf-status-clobber.sh|executes|all three argument orders driven; the boundary line is the assertion
+BACKTICK-SUBSTITUTION|monitor/watcher/test-claude-md-backtick-substitution.sh|executes|both modes plus the quoted/unquoted heredoc delimiters
+PYTHON-BACKREF-ESCAPE|monitor/watcher/test-claude-md-python-backref-escape.sh|executes|drives the documented table AND probes non-members, after #1249
+FROMISOFORMAT|monitor/watcher/test-claude-md-fromisoformat.sh|executes|extracts the block via its own _block helper and runs all three probes
+ISO-PARSE-36|monitor/watcher/test-claude-md-fromisoformat.sh|executes|the substitute is extracted to a file and executed; same suite as FROMISOFORMAT
+ZSH-PATH-TIE|monitor/watcher/test-claude-md-zsh-path-tie.sh|executes|drives zsh and bash side by side and asserts the tie
+SHOPT-DYNAMIC-SCOPE|monitor/watcher/test-claude-md-shopt-dynamic-scope.sh|executes|extracts via an awk BEGIN/END range (no `-->`) and executes every carrier line
+WORKTREE-BLIND-SPOT|monitor/watcher/test-claude-md-worktree-blind-spot.sh|executes|planted repo with one file of each trackedness; guards and positive control driven
+WINDOW-KEY-VOCABULARY|monitor/watcher/test-pane-state-claude-identity.sh|drives|DRIVES the accepted-key claim against both helpers and asserts the old false sentence is gone. Does NOT extract the block and does NOT witness the three documented EXIT CODES (pane-state 2 / paste-followup 1 / _tmux-window key 4); its cross-session arms also SKIP without a provably private tmux socket, so coverage is conditional. This row is the #1264 R2 case: unowned as a BLOCK, currently accurate, nothing visibly broken.
+PROC-EXISTS-AUTHORIZED|monitor/watcher/test-claude-md-procmatch-argv.sh|executes|every line run against planted own-session and foreign-session processes
+ARM-ORDER-SHADOWING|monitor/watcher/test-claude-md-arm-order-shadowing.sh|executes|the block's own three classifiers are executed and their verdicts asserted
+GUARDS-FOR-DIFF|monitor/watcher/test-claude-md-guards-for-diff.sh|executes|both documented invocations driven, and the exit-code semantics asserted
+TIMEOUT-STATUS-INJECTION|monitor/watcher/test-claude-md-printf-status-clobber.sh|executes|the block's four documented injectors are each RUN and their manufactured status asserted; added for your-org/nexus-code#1248, whose marker post-dates this manifest
+NULLCMD-REDIRECT|monitor/watcher/test-claude-md-nullcmd-redirect.sh|executes|all four forms run in a scratch dir; the blocking form under `timeout` against a held-open fifo (rc 124, no output) so a regression cannot hang the suite; the conf row is driven through the hook
+GREP-H-ORDER|monitor/watcher/test-claude-md-grep-h-order.sh|executes|the three documented forms are extracted and pinned at 3; the structural half is DRIVEN against a stand-in sorting grep FUNCTION (potency: -h loses argument order, total unchanged), `command grep -h` preserves it, `-H` keeps the filenames so the order is checkable; the --no-sort non-remedy is asserted on its annotation, not executed (your-org/nexus-code#1461)

@@ -22,8 +22,12 @@ current base is expected — the merge gate requires it, because a
 creation, and `rerun-failed-jobs` reuses that same ref. The merge ref is
 **demand-triggered** — recomputed when something queries the PR's
 mergeability, not on a timer — so a stale ref can persist indefinitely,
-*and* the act of querying refreshes it. Before trusting a green: query
-the PR, then create a new run, then enumerate that run.
+*and* the act of querying refreshes it. That model has a measured
+exception — a `GET` refreshed `mergeable` while the ref's base stayed
+put (n=2) — so see `monitor/_merge_ref_base.sh` and
+<your-org>/nexus-code#923 before leaning on "one GET refreshes it".
+Before trusting a green: query the PR, then create a new run, then
+enumerate that run.
 CI checks (`ci-signal.yml`,
 `tests.yml`, `cc-harness.yml`, `docs.yml`,
 `check-no-reports-leaked.yml`) must be green before merge.

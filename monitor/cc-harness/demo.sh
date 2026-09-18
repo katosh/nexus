@@ -64,7 +64,28 @@ for arg in "$@"; do
     esac
 done
 
-_real_tmux() { type -P tmux 2>/dev/null || echo /usr/bin/tmux; }
+# THE REAL TMUX BINARY, NEVER A PATH-FRONT WRAPPER (your-org/nexus-code#1119).
+#
+# This was `type -P tmux 2>/dev/null || echo /usr/bin/tmux`, and in this
+# workspace that is the WRONG ANSWER BY CONSTRUCTION: `monitor/locals-env.sh`
+# and `monitor/shellenv/front-path.zsh` prepend `monitor/tmuxwrap` to the FRONT
+# of PATH for every agent process, so `type -P tmux` in an agent shell resolves
+# THE WRAPPER. Under `--here` the shim planted at :158 below then reads
+# `exec <wrapper> "$@"` with NO `-L` pin — the shape `#1105` exists to prevent,
+# planted by production code rather than a fixture. It was classified SAFE-STUB
+# by the old hand-off denylist and is UNSAFE under the mockness inversion, which
+# is how it was found.
+#
+# `nx_real_tmux_bin` discriminates on the `#!` MAGIC BYTES — the one property no
+# wrapper can shed while remaining a wrapper — and needs no list of wrapper
+# paths to keep current. It is the shared definition `#1105` asked for; sourcing
+# it here is what makes the assignment below legible to the shim scanner's
+# provenance pass, so this fix stays checkable rather than merely correct.
+# shellcheck source=../watcher/_tmux-fixture.sh
+. "$REPO_ROOT/monitor/watcher/_tmux-fixture.sh"
+_REAL_TMUX=$(nx_real_tmux_bin) || _REAL_TMUX=/usr/bin/tmux
+[[ -n "$_REAL_TMUX" ]] || _REAL_TMUX=/usr/bin/tmux
+_real_tmux() { printf '%s' "$_REAL_TMUX"; }
 # Socket args: empty under --here (default socket), -L ccdemo otherwise.
 if [[ -n "$HERE" ]]; then SOCKET_ARGS=(); else SOCKET_ARGS=(-L "$DEMO_SOCKET"); fi
 dtmux() { "$(_real_tmux)" "${SOCKET_ARGS[@]}" "$@"; }
@@ -155,9 +176,9 @@ echo "mock backend up on 127.0.0.1:$PORT (no auth, no egress)"
 # PATH-shadow tmux so pane-state.sh hits our socket. Under --here the demo
 # lives on the default socket, so the shadow forwards verbatim (no -L).
 if [[ -n "$HERE" ]]; then
-    printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$(_real_tmux)" > "$STATE_ROOT/.bin/tmux"
+    printf '#!/usr/bin/env bash\nexec %q "$@"\n' "$_REAL_TMUX" > "$STATE_ROOT/.bin/tmux"
 else
-    printf '#!/usr/bin/env bash\nexec %q -L %q "$@"\n' "$(_real_tmux)" "$DEMO_SOCKET" > "$STATE_ROOT/.bin/tmux"
+    printf '#!/usr/bin/env bash\nexec %q -L %q "$@"\n' "$_REAL_TMUX" "$DEMO_SOCKET" > "$STATE_ROOT/.bin/tmux"
 fi
 chmod +x "$STATE_ROOT/.bin/tmux"
 

@@ -31,23 +31,64 @@ pin). Choose along a breadth ladder:
 - **Broad subnet — recommended set-once default.** Pin your campus/LAN block once
   and any client on it can reach the auth stage; no per-client lookup. E.g.
   `140.107.0.0/16` (an EXAMPLE — the <your-institution> campus block; substitute your own
-  network).
-- **`/32` — max security.** Pin the single client host so only that machine can
-  even reach the auth stage.
+  network). Broader than any one client **by construction** — defence in depth,
+  never a client identity control.
+- **`/32` — one address, and READ THE NEXT PARAGRAPH before calling it "max
+  security".** It admits exactly one source address. Whether that is a real
+  client restriction depends entirely on **whose** address arrives.
 - **`0.0.0.0/0` — any source, a conscious opt-in.** Exposes the SSH *pre-auth*
   surface to the whole reachable network. Auth stays pubkey-only + forced-command
   + strong-crypto + sandbox-confined (worst case: a confined channel login), but
   pre-auth SSH 0-days are the class this pin defends against — type it on purpose.
 
+> ### `from_cidr` pins the LAST HOP, not the client
+>
+> **This is the sharpest trap in the subsystem, because the pin is present,
+> correctly written, and still means much less than it looks like.** Where
+> arrival is mediated by a **bastion, jump host, VPN concentrator or NAT**, the
+> address the server sees is that **shared device's**. Pin it, and the `from=`
+> line authenticates *the shared device* — infrastructure every user of it
+> shares — while constraining **nothing about which client** sits behind it.
+> Combined with a routable bind, that is the weaker posture wearing the
+> appearance of the stronger. A green `from=` line is not evidence of a client
+> restriction, and a `/32` is not automatically "max security": a `/32` naming
+> an institutional bastion is among the *weakest* pins you can write, because
+> it reads like the strongest.
+>
+> **Determine which case you are in, and say so.** The pin is meaningful when
+> the **client's own** address is what arrives; it is largely decorative when a
+> **shared hop's** address is what arrives. The ground truth is the peer
+> address the server actually sees (`SSH_CLIENT`, which is what
+> `_remote_source_guard` evaluates) — **not** the configured value. On the
+> client, `ssh -G <target>` shows the route it will take and therefore which
+> address arrives. If the pin resolves to a shared bastion, record that in the
+> capability note rather than counting it as a control.
+>
+> **This also weakens a re-enrollment justified by the pin.** If you revoke and
+> re-enroll to get `from=` onto a credential, and the CIDR you write is a
+> shared hop, the new line is pinned in form and unpinned in substance. Re-derive
+> the justification **before** the move, not after.
+>
+> **What is doing the work unconditionally** — on any topology, in either
+> posture: the **pinned host key**, **public-key-only auth**, the **forced
+> command**, and the **kernel sandbox boundary**. `from_cidr` shrinks the
+> pre-auth surface, which is genuinely worth having; it is not what makes a
+> routable bind acceptable.
+>
+> `monitor/remote-up.sh` prints the effective meaning of your configured pin on
+> every bring-up, so the weak case is reportable rather than silent.
+
 **Bastion hop — optional, most clients skip it.** Most clients reach the host
 **directly** and need no jump host. ONLY if the client's network cannot route to
 the endpoint directly (e.g. it sits behind a campus bastion reached by
-`ProxyJump`) does the connect line need a `-J <jump-host>` hop. In that case the
-source IP the host sees is the BASTION's, not the client's laptop — pin the
-bastion's address (e.g. a `<BASTION-IP>/32`; a concrete value such as
-`140.107.116.184/32` is an EXAMPLE for one specific network, never a
-recommendation). Config + connect (broad-subnet default shown, direct connect —
-no jump host):
+`ProxyJump`) does the connect line need `-J`. Set `monitor.remote.jump_hosts` to
+a **comma-separated chain** (`hop1,hop2`, applied in order) and the rendered
+client lines carry it — a *single* hop assumes the endpoint host is directly
+reachable from that hop, which off-site it often is not. In this case the source
+IP the host sees is the BASTION's, not the client's laptop, so per the box above
+a pin naming it restricts the bastion and not the client; pin it for pre-auth
+surface reduction, and do not record it as a client control. Config + connect
+(broad-subnet default shown, direct connect — no jump host):
 
 ```yaml
 monitor: { remote: { bind_address: <HOST-LAN-IP>, from_cidr: "<YOUR-SUBNET>/16" } }   # or <CLIENT-IP>/32, or 0.0.0.0/0
@@ -123,18 +164,28 @@ monitor/ng remote enroll-invite --principal alice --ttl 3600   # → REMOTE_ENRO
 monitor/ng remote host-fingerprint    # → <HOST-FINGERPRINT> (pin; non-secret)
 whoami                                 # → <SSH-USER> (the in-sandbox login user)
 # <ENDPOINT> = host LAN IP (Posture 1) or localhost via tunnel (Posture 2);
-# <PORT> = monitor.remote.port; <TUNNEL-TARGET> = user@node for THIS sandbox's host.
+# <PORT> = the port IN FORCE (monitor/remote-up.sh --port, or its `Port:` line at bring-up)
+#   — the recorded setup choice, not necessarily monitor.remote.port;
+# <TUNNEL-TARGET> = user@node for THIS sandbox's host.
 
 # 3. Fill the single client-agent prompt (next subsection) and hand the WHOLE
 #    block to the operator to paste into their client agent. The client
 #    self-enrolls over SSH with the enroll key — you run NO `ng remote enroll`.
 #
 # 4. If the client is an AGENT that should not block on await, ALSO hand over
-#    the background reply-watcher (out-of-band, like the key — never over the
-#    channel): the file monitor/client/nexus-reply-watch. The client saves it
-#    next to its key + adds a one-line ~/.ssh/config alias. See "Background
-#    reply-watcher" in CLIENT.md; the post-connect onboarding already points the
-#    client at it.
+#    the client helper SET (out-of-band, like the key — never over the channel).
+#    It is THREE files, not one — nexus-request, nexus-reply-watch and the
+#    shared _nexus_watch_lib.sh they both source from beside themselves — and
+#    either script installed alone exits 64. Do not enumerate or transcribe
+#    them by hand, and NEVER quote a sha256 from memory or from a document:
+#
+#        monitor/ng remote client-helper --base64
+#
+#    That emits a one-paste installer for the whole set plus digests computed
+#    AT CALL TIME. A hash written into a document is correct when written and
+#    wrong forever after, and both sides then agree on the stale value — the
+#    exact failure this verb exists to make impossible.
+#    See "Delivering the helper set" in CLIENT.md.
 ```
 
 > **Manual fallback** (only if the self-enroll bootstrap is unavailable — e.g.
@@ -169,22 +220,32 @@ filled form deterministically. Work top-to-bottom; row 8 is the only SECRET
 | 1 | `<PRINCIPAL>` | short name for this client (`[A-Za-z0-9_-]`) | you choose |
 | 2 | **bind posture** + `from_cidr` | LAN-direct + a source-CIDR pin (off-host, recommended) **or** loopback + tunnel (zero LAN exposure) — see "Network exposure" | decide, then set in `config/nexus.yml` and apply with `monitor/remote-up.sh` |
 | 3 | `<ENDPOINT>` | the host's LAN IP (Posture 1) **or** `localhost` reached via a tunnel (Posture 2) | `monitor/remote-up.sh` prints the bind address |
-| 4 | `<PORT>` | listener port | `monitor.remote.port` (default `22022`) |
+| 4 | `<PORT>` | listener port — the one actually IN FORCE, which is the port `remote-up.sh` recorded at setup, **not** necessarily `monitor.remote.port` (a preference). Unset, the preference itself is DERIVED per-operator — `22100 + cksum(<operator identity>) % 900`, where the identity is `$MONITOR_REMOTE_OPERATOR_IDENTITY`, else `$USER`/`whoami`, else `github.user_login` (`_remote_operator_identity`) — never the legacy constant `22022` (<your-org>/nexus-code#893). | `monitor/remote-up.sh --port` (prints in-force / recorded / configured / derived) |
 | 5 | `<SSH-USER>` | the in-sandbox login user | `whoami` |
-| 6 | `<HOST-FINGERPRINT>` | host-key fingerprint to PIN (**non-secret**) | `monitor/ng remote host-fingerprint` (also printed by `remote-up.sh`) |
+| 6 | `<HOST-KEY-LINE>` + `<ALIAS>` + `<HOST-FINGERPRINT>` | the **full public key line** the client appends to `known_hosts.nexus`, the `HostKeyAlias` it keys the pin on, and the fingerprint as a CROSS-CHECK (all **non-secret**). **A fingerprint alone is not pinnable** — a client holding only `SHA256:…` must TOFU to populate the pin, and `ssh-keyscan` reports a key a server merely *claims*. Pin on the alias, not the address: `127.0.0.1` is not an identity here, and an address-keyed pin breaks on every posture move. | `monitor/remote-up.sh` (prints the line, the alias and the fingerprint, read off the live endpoint) |
 | 7 | **TTL** | token lifetime — generous enough to survive the human paste + the client's self-enroll round-trip (≤ `86400`s) | you choose, passed as `--ttl S` |
 | 8 | `<ONE-TIME-TOKEN>` + `<ENROLL-PRIVATE-KEY>` | **SECRET** bundle — the one-time token + throwaway enroll private key, bound to the principal | `monitor/ng remote enroll-invite --principal <PRINCIPAL> --ttl <TTL>` |
-| 9 | `[-J <jump-host>]` | **OPTIONAL**, site-specific — only if the SSH path crosses a bastion | your network topology (omit for a direct-reachable client) |
+| 9 | `<JUMP-CHAIN>` | **OPTIONAL**, site-specific — `-J hop1,hop2`, **comma-separated and in order**, only if the SSH path crosses one or more bastions. A SINGLE hop assumes the endpoint host is directly reachable from it, which off-site it often is not. | `monitor.remote.jump_hosts` (omit for a direct-reachable client) |
+| 10 | `<PIN-OPTS>` | `-o HostKeyAlias=… -o UserKnownHostsFile=… -o StrictHostKeyChecking=yes` — carried EXPLICITLY so the connect line does not depend on the client's `ssh_config`. A wildcard `Host <prefix>*` stanza with `HostName %h.<domain>` re-qualifies a FULLY-QUALIFIED name (`<host>.<domain>.<domain>`), and the doubled suffix shows up only in `ssh -G`'s `hostname` field — so it presents as DNS, not as config. | rendered by `remote-up.sh`; verify with `ssh -G -F /dev/null …` |
 
 Rows 1 + 3–8 come from the [orchestrator-side recipe](#enrolling-a-remote-client--one-paste-token-self-enroll-over-ssh)
 above (`remote-up.sh` → the connect coordinates + fingerprint; `enroll-invite` →
 the SECRET bundle); row 2 is the posture decision from "Network exposure". Once
-all nine are in hand, drop them into the enrollment-response form in
+all ten are in hand, drop them into the enrollment-response form in
 [`CLIENT.md`](CLIENT.md) and hand it over. **You do
 NOT enumerate the rest of the setup here** — everything past connect (the
-reply-watcher, byte-exact bodies, the capability note) is delivered on request
+helper set, byte-exact bodies, the capability note) is delivered on request
 over the channel once the client is connected (the engaged mechanism the form
 bootstraps). Fill only what connects + engages.
+
+**No row here is a digest, and none ever will be.** When you later hand over
+the client helper set, produce it with `monitor/ng remote client-helper
+--base64` and paste what that prints. Never type a sha256 into the form, a
+comment, or a chat message: a literal digest is correct at the moment it is
+written and silently wrong from the next commit onward, and because the client
+verifies against the value YOU gave it, both sides agree and nothing errors.
+That is not hypothetical — it shipped a client a four-revisions-stale helper
+that reported a clean verification.
 
 
 ## Answering a client request — dispatch with `--reply-to`
@@ -194,7 +255,7 @@ the answer needs real work (not a one-liner you can `ng request reply`
 yourself), spawn a worker — and spawn it **on the channel rail**:
 
 ```bash
-monitor/spawn-worker.sh -n <window> -c <workdir> -p <prompt> \
+monitor/spawn-worker.sh -n <window> -c <workdir> -p <prompt-file> \
     --reply-to <request-id>          # channel only: NO GitHub issue
 monitor/spawn-worker.sh … --reply-to <request-id> --issue <n>   # both
 ```

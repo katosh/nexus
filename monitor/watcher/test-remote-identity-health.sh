@@ -998,10 +998,34 @@ echo "== 14. an UNCLASSIFIABLE probe result is definite-foreign, never overridab
 #
 # Simulated through the REMOTE_SSH_BIN seam rather than by neutering the patterns,
 # so the test exercises the real classifier.
+# THE FIXTURE MODELS A CLIENT THAT STARTS (your-org/your-nexus#331).
+#
+# It used to fail for EVERY invocation, which made it an equally good model of
+# two conditions nothing could then tell apart: "a working ssh emitting a
+# diagnostic we do not recognise" (what this case is ABOUT, and what its label
+# says) and "an ssh that cannot execute at all" (what #331 turned out to be).
+# The verdict was the same either way, so the ambiguity cost nothing and nobody
+# had to notice it. It costs something now, because #331 separates them — and a
+# fixture left ambiguous would have this case asserting the OPPOSITE of what it
+# was written to assert.
+#
+# So it starts cleanly and emits the unrecognised diagnostic only for the
+# verdict probe. The F9 property below is unchanged and every assertion on it is
+# unchanged; it is now pinned by a fixture that isolates it. The original bytes
+# are NOT discarded — they are the `ssh-cannot-start` fixture immediately after,
+# asserted against the verdict they should always have had.
 cat > "$WORK/ssh-gibberish" <<'STUB'
 #!/usr/bin/env bash
-echo "totally unrecognised diagnostic from a future openssh" >&2
-exit 255
+for a in "$@"; do
+    case "$a" in
+        UserKnownHostsFile=*)
+            echo "totally unrecognised diagnostic from a future openssh" >&2
+            exit 255 ;;
+    esac
+done
+# Any non-probe invocation (a potency check, `-V`, …): this client runs fine.
+echo "OpenSSH_9.9p9 (test fixture)" >&2
+exit 0
 STUB
 chmod +x "$WORK/ssh-gibberish"
 gib=$(REMOTE_SSH_BIN="$WORK/ssh-gibberish" bash -c \
@@ -1021,6 +1045,53 @@ g2=$(REMOTE_SSH_BIN="$WORK/ssh-gibberish" MONITOR_REMOTE_HEALTH_REQUIRE_IDENTITY
     MONITOR_REMOTE_PORT=$OURS_PORT bash "$HEALTH" 2>&1); g2rc=$?
 assert_rc "knob OFF + unclassifiable → STILL UNHEALTHY (F9)" "$g2rc" "1"
 assert_not_contains "…never accepts protocol-only evidence for it" "$g2" "accepting protocol-only evidence"
+
+# ── THE OTHER HALF OF THAT DISTINCTION (your-org/your-nexus#331) ────────
+# The bytes above are the ORIGINAL ssh-gibberish fixture: a client that fails
+# every invocation because it cannot execute. On 2026-08-24 that was not a
+# hypothetical — a corrupted passwd file inside the sandbox made the real `ssh`
+# behave exactly like this (`No user exists for uid 71780`, rc 255, for `-V` as
+# much as for the probe), and this endpoint was reported as `a FOREIGN sshd
+# holds 127.0.0.1:22100` for 22 minutes while the daemon served continuously.
+#
+# The distinction is the whole fix: an unclassified PROTOCOL outcome is hostile
+# (asserted directly above, unchanged), an instrument that never ran is UNKNOWN.
+# Both fixtures emit an unrecognised diagnostic on the probe; only the potency
+# invocation tells them apart, which is why the verdict may not be taken from
+# the wording.
+cat > "$WORK/ssh-cannot-start" <<'STUB'
+#!/usr/bin/env bash
+echo "No user exists for uid 71780" >&2
+exit 255
+STUB
+chmod +x "$WORK/ssh-cannot-start"
+cs=$(REMOTE_SSH_BIN="$WORK/ssh-cannot-start" bash -c \
+    "source '$LIB'; _remote_verify_live_host_key 127.0.0.1 '$OURS_PORT' 6; \
+     printf '%s|%s' \"\$?\" \"\$_REMOTE_VERIFY_DETAIL\"")
+assert_eq "an ssh that cannot EXECUTE → rc 2 (unknown), not rc 1 (hostile)" "${cs%%|*}" "2"
+assert_contains "…and the detail blames OUR TOOLING, not the endpoint" "$cs" "could not run at all"
+csv=$(REMOTE_SSH_BIN="$WORK/ssh-cannot-start" bash -c \
+    "source '$LIB'; _remote_identity_probe 127.0.0.1 '$OURS_PORT' 6; \
+     printf '%s|%s' \"\$?\" \"\$_REMOTE_ID_VERDICT\"")
+assert_eq "…so the identity verdict is indeterminate, not foreign" "$csv" "2|indeterminate"
+
+# END TO END, AND THIS IS THE POINT OF THE WHOLE CHANGE: rc 2 is the one verdict
+# `health_require_identity` may override, so restoring the classification
+# restores the operator knob that #331 was bypassing BY CONSTRUCTION. Default
+# still reports DOWN — an unverifiable endpoint is never silently healthy.
+c1=$(REMOTE_SSH_BIN="$WORK/ssh-cannot-start" MONITOR_REMOTE_PORT=$OURS_PORT \
+    bash "$HEALTH" 2>&1); c1rc=$?
+assert_rc "knob DEFAULT + unrunnable client → still UNHEALTHY (never silently green)" "$c1rc" "1"
+assert_contains "…and the emit no longer accuses a foreign sshd" "$c1" "cannot verify endpoint identity"
+assert_not_contains "…specifically, it does not say a FOREIGN sshd holds the port" \
+    "$c1" "a FOREIGN sshd holds"
+assert_contains "…while surfacing the socket attribution it had all along" \
+    "$c1" "socket owner"
+c2=$(REMOTE_SSH_BIN="$WORK/ssh-cannot-start" MONITOR_REMOTE_HEALTH_REQUIRE_IDENTITY=false \
+    MONITOR_REMOTE_PORT=$OURS_PORT bash "$HEALTH" 2>&1); c2rc=$?
+assert_rc "knob OFF + unrunnable client → the override now APPLIES (it could not before)" "$c2rc" "0"
+assert_contains "…saying so explicitly rather than greening in silence" \
+    "$c2" "accepting protocol-only evidence"
 # NEGATIVE CONTROL: rc 2 must still exist for GENUINE unknowns, or the fix above
 # would just be "return 1 always" and the knob would be dead code.
 cat > "$WORK/ssh-refused" <<'STUB2'

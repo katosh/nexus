@@ -54,6 +54,25 @@
 #                            time): restarting discards the build and starts the
 #                            clock over, which is what makes a slow bring-up
 #                            look like a crash loop. Also via SVC_FORCE=1.
+#   svc.sh orphans           READ-ONLY: list supervisor processes with ppid 1
+#                            whose source path no registry row names, or which
+#                            run from outside $NEXUS_ROOT (a retired clone, an
+#                            ephemeral scratch dir). Signals nothing. Exit 0 =
+#                            none found AND both positive controls held; 1 =
+#                            found; 3 = REFUSED, could not determine.
+#   svc.sh retire-orphan <pid> [--yes]
+#                            the SANCTIONED retirement path for exactly the
+#                            set `orphans` prints (your-org/nexus-code#1034
+#                            rec. 2). Re-runs the scan and REFUSES (rc 2) any
+#                            pid it does not classify as an orphan — a
+#                            registered supervisor is never touched, and a
+#                            scan whose controls did not hold retires nothing.
+#                            Without --yes it prints the plan (the supervisor
+#                            + its descendants, by recorded PPid, and the
+#                            signals) and exits 4. With --yes: TERM the
+#                            process group, escalate to KILL after the grace,
+#                            append a row to monitor/.state/svc-retire.log.
+#                            0 = retired; 1 = signalled but still present.
 #   svc.sh logs <name>       tail -F the service's log(s) in this
 #                            terminal — for labsh JupyterLab services
 #                            the server's own stdout
@@ -168,9 +187,31 @@ fi
 # line: name\tworkdir\tlaunch\thealth\tlogfile  (logfile may be empty →
 # caller defaults it). Blank/`#` lines skipped; a row with fewer than the
 # 4 required fields is skipped with a warning, never fatal.
+# Registry readability — the REPLICATED half of the contract documented in
+# bootstrap-recover.sh ("registry READABILITY: three states, not two",
+# your-org/nexus-code#1266). svc.sh is a THIRD parser, absent from that
+# issue's consumer table; it feeds the cockpit, so an unreadable registry
+# rendered an EMPTY service list that reads exactly like "you have no
+# services". Replicated rather than sourced (the cockpit does not source
+# bootstrap-recover.sh); the CONTRACT is identical. Keep in step.
+#   0  readable, or genuinely ABSENT (both are adjudications)
+#  79  exists and could not be read — no statement about contents available
+svc_registry_readable() {
+    local file="$1"
+    [[ -e "$file" ]] || return 0
+    [[ -f "$file" ]] || return 79
+    # `2>/dev/null` FIRST — redirections apply left to right.
+    { : ; } 2>/dev/null < "$file" || return 79
+    return 0
+}
+
 svc_parse_registry() {
     local file="$1"
-    [[ -f "$file" ]] || return 0
+    if ! svc_registry_readable "$file"; then
+        echo "[svc] registry: NOT READABLE at $file — refusing to report its contents (rc 79)" >&2
+        return 79
+    fi
+    [[ -e "$file" ]] || return 0
     local line name workdir launch health logfile rest
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -184,7 +225,9 @@ svc_parse_registry() {
         workdir="${workdir/#\~/$HOME}"; workdir="${workdir//\$NEXUS_ROOT/$NEXUS_ROOT}"
         logfile="${logfile/#\~/$HOME}"; logfile="${logfile//\$NEXUS_ROOT/$NEXUS_ROOT}"
         printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$workdir" "$launch" "$health" "$logfile"
-    done < "$file"
+    # Two separate opens (probe, then this); a fault between them is a SHORT
+    # read, which is worse than a zero because it is plausible.
+    done < "$file" || return 79
 }
 
 # Resolve a service's logfile: explicit 5th column if present, else the
@@ -334,13 +377,59 @@ svc_jupyter_url() {
     printf '%s' "$url"
 }
 
-# Best-effort human endpoint for a healthcheck: the URL for curl checks
-# (rewritten to the real host when externally bound), pid:N for pgrep
-# checks, else "-". Purely cosmetic.
+# A service's OWN declaration of the endpoint it serves, read from its tree:
+# `<workdir>/.deploy/endpoint`, first line, one URL.
+#
+# WHY A FILE AND NOT A REGISTRY COLUMN (your-org/nexus-code#1144). The DETAIL
+# cell used to be derived ENTIRELY from the healthcheck COMMAND TEXT, so it was
+# a property of HOW A HEALTHCHECK IS SPELLED rather than of the service. That
+# inverts the incentive, because the better probe is the one that loses: an
+# inline `curl -fsS … http://localhost:8773/` renders a copy-pasteable URL,
+# while a SCRIPT healthcheck — which is what you must write when the endpoint is
+# auth-gated, or when one probe has to assert several properties — renders `-`,
+# indistinguishable from a service that genuinely has no endpoint.
+#
+# The precedent is `svc_jupyter_url`, which already reads PORT/SCHEME from the
+# service's own `.jupyter/labsh-service.env` rather than from anything the
+# registry says. This generalises it: the endpoint is the SERVICE's fact, so ask
+# the service. A registry column would have worked too, but it needs an operator
+# edit per service, it is the 7th positional field behind two optional ones, and
+# three other tools parse that file.
+#
+# VALIDATE THE SHAPE, NEVER MERELY NON-EMPTINESS. The bytes come from a file
+# outside this repo and land in a terminal render, so a URL that is not
+# URL-shaped is REFUSED rather than printed: an emptiness check would pass a
+# line of ANSI escapes. Returns 1 when there is nothing valid to show, so the
+# caller falls through to its next source. Never errors.
+svc_declared_endpoint() {
+    local workdir="${1:-}" line
+    # A URL contains no whitespace, so stripping all of it also eats a stray
+    # CR from a CRLF file — which would otherwise fail the shape check for a
+    # reason nobody could see.
+    local re='^https?://[A-Za-z0-9._~:/?#@%+=,&-]+$'
+    [[ -n "$workdir" ]] || return 1
+    line=$(head -1 "$workdir/.deploy/endpoint" 2>/dev/null) || return 1
+    line="${line//[[:space:]]/}"
+    [[ "$line" =~ $re ]] || return 1
+    svc_display_url "$line"
+}
+
+# Best-effort human endpoint for a service: the URL named in a curl-style
+# healthcheck, else the service's own `.deploy/endpoint` declaration, else
+# pid:N for pgrep checks, else "-". All of them rewritten to the real host when
+# externally bound. Purely cosmetic — nothing here changes what is PROBED, and
+# healthcheck commands are still never rewritten (see the rule above).
+#
+# ORDER. The healthcheck's URL is consulted FIRST, so every rendering that was
+# correct before this change is byte-identical after it — the declaration is
+# additive and cannot silently redirect a cell that already worked. The cost of
+# that choice, stated because it is a real limit: a service whose healthcheck
+# names a URL that is NOT its front door cannot override the cell from its tree.
 svc_endpoint() {
-    local health="$1" url pat pid
+    local health="$1" workdir="${2:-}" url pat pid
     url=$(grep -oE 'https?://[^ ]+' <<<"$health" | head -1)
     if [[ -n "$url" ]]; then svc_display_url "$url"; return; fi
+    if url=$(svc_declared_endpoint "$workdir"); then printf '%s' "$url"; return; fi
     if [[ "$health" == *pgrep* ]]; then
         pat=$(sed -nE 's/.*pgrep[[:space:]]+(-[a-zA-Z]+[[:space:]]+)*-f[[:space:]]+([^ ]+).*/\2/p' <<<"$health")
         [[ -z "$pat" ]] && pat=$(sed -nE 's/.*pgrep[[:space:]]+([^ -][^ ]*).*/\1/p' <<<"$health")
@@ -365,6 +454,11 @@ fmt_age() {
 # Populated by load_services(): parallel arrays indexed 1..N for the menu.
 declare -a SVC_NAME SVC_WORKDIR SVC_LAUNCH SVC_HEALTH SVC_LOG
 SVC_N=0
+# 1 when the registry EXISTS and could not be READ, so SVC_N==0 is "could not
+# look" rather than "nothing registered" (your-org/nexus-code#1266). The two
+# render differently everywhere SVC_N==0 is reported; a flag nobody reads
+# would be the same silence in a new place.
+SVC_REGISTRY_UNREADABLE=0
 
 load_services() {
     SVC_NAME=() SVC_WORKDIR=() SVC_LAUNCH=() SVC_HEALTH=() SVC_LOG=()
@@ -379,6 +473,16 @@ load_services() {
         SVC_HEALTH[$SVC_N]="$health"
         SVC_LOG[$SVC_N]="$(svc_logfile "$workdir" "$logfield")"
     done < <(svc_parse_registry "$SERVICES_REGISTRY")
+    # `while … done < <(cmd)` DISCARDS cmd's rc, so the parser's 79 is
+    # unobservable at the loop; re-ask the predicate here. An unreadable
+    # registry must not render as an empty cockpit — "you have no services"
+    # and "I could not read your services" are different sentences
+    # (your-org/nexus-code#1266).
+    if ! svc_registry_readable "$SERVICES_REGISTRY"; then
+        SVC_REGISTRY_UNREADABLE=1
+    else
+        SVC_REGISTRY_UNREADABLE=0
+    fi
 }
 
 # --- advertised capability: jupyterlab --------------------------------------
@@ -440,6 +544,9 @@ svc_require() {
     echo "svc.sh: unknown service '$name' (registry: $SERVICES_REGISTRY)" >&2
     if (( SVC_N > 0 )); then
         echo "  registered: ${SVC_NAME[*]:1:$SVC_N} (+ watcher)" >&2
+    elif (( SVC_REGISTRY_UNREADABLE )); then
+        echo "  registry at $SERVICES_REGISTRY is NOT READABLE — the name may well be registered;" >&2
+        echo "  this listing could not be produced. ('watcher' is still addressable.)" >&2
     else
         echo "  registry is empty; 'watcher' is still addressable" >&2
     fi
@@ -693,8 +800,13 @@ build_footer() {
     fi
     if (( SVC_N == 0 )); then
         FOOT+=('')
-        printf -v l '%sno registered services%s (expected at %s)' \
-            "$C_R" "$C_0" "$SERVICES_REGISTRY"
+        if (( SVC_REGISTRY_UNREADABLE )); then
+            printf -v l '%sREGISTRY NOT READABLE%s at %s — this is NOT "no services"; the list below is EMPTY because it could not be read' \
+                "$C_R" "$C_0" "$SERVICES_REGISTRY"
+        else
+            printf -v l '%sno registered services%s (expected at %s)' \
+                "$C_R" "$C_0" "$SERVICES_REGISTRY"
+        fi
         FOOT+=("$l")
     fi
     if (( advertise && ! compact )); then
@@ -859,7 +971,7 @@ render_status() {
         # withholding its URL would help nobody.
         detail=''
         [[ "$up" == UP || "$up" == DEGRADED ]] && detail=$(svc_jupyter_url "$workdir")
-        [[ -n "$detail" ]] || detail=$(svc_endpoint "$health")
+        [[ -n "$detail" ]] || detail=$(svc_endpoint "$health" "$workdir")
         gut=' '; [[ "$SVC_FOLLOW" == "$name" ]] && gut='>'
         format_row "$gut" "$i" "$name" "$upc" "$up" "$supc" "$sup" "$detail"
         R_TXT[$i]="$ROW"
@@ -1244,7 +1356,8 @@ _svc_locate_orphan_daemon() {
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
         (( pid == $$ || pid == PPID )) && continue
         [[ -r "/proc/$pid/cmdline" ]] || continue
-        cl=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+        # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+        cl=$( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null ) || continue
         [[ "$cl" == *"$base"* ]] || continue
         cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || continue
         [[ "$cwd" == "$wd_real" ]] || continue
@@ -1759,6 +1872,562 @@ cmd_logs() {
 }
 
 # --- entrypoint ---------------------------------------------------------------
+# --- retire-orphan: the SANCTIONED retirement path (your-org/nexus-code#1034) ----
+#
+# WHOSE AUTHORISATION THIS IS, stated because it is the whole point. The two
+# orphans #1034 found were `setsid`-detached session leaders, so
+# `proc-kill-authorized` refused them `not-owned` — CORRECTLY: that guard keys
+# on session ownership because a hand-rolled kill list once reaped sibling
+# agents' runs (#851), and a detached supervisor is never in anyone's session.
+# The workspace could therefore CREATE a supervised daemon from any clone and
+# RETIRE it from nowhere. This verb is the missing path, and its authorisation
+# is deliberately NOT session ownership. It is two things, both explicit:
+#
+#   1. THE SCAN'S CLASSIFICATION. `cmd_orphans` is re-run here and the pid
+#      must appear in ITS orphan set — ppid 1, a supervisor-shaped script, at
+#      a path NO registry row names — with all three of its controls held.
+#      A registered supervisor never appears in that set (control C is the
+#      independent instrument that refuses when the scan disagrees with the
+#      pidfile probe), so a registered service cannot be retired through
+#      here even by pid. A scan that REFUSED (rc 3) retires nothing.
+#   2. THE OPERATOR'S EXPLICIT `--yes`. Without it the verb prints the plan
+#      and exits 4 — not 0 (nothing was retired) and not 2 (nothing was
+#      refused): a plan is a third state and it must not read as either.
+#
+# WHAT IS SIGNALLED, and why not by name. The kill set is the supervisor plus
+# its DESCENDANTS as recorded in /proc's PPid chain (depth-bounded), delivered
+# to the supervisor's PROCESS GROUP first (a setsid supervisor is its own group
+# leader, pid == pgid, exactly as `svc.sh stop` reasons) and to the individual
+# pids as a fallback. Nothing here matches a NAME: a sibling agent's argv
+# carries every script name in this file verbatim (#1073), and the scan has
+# already identified the process by its /proc identity.
+#
+# THE KILL IS A SEAM. `NEXUS_SVC_KILL_CMD`, when set, receives the exact
+# arguments `kill` would and is invoked INSTEAD of it; liveness is read from
+# `$SVC_PROCFS` (the scan's own seam). Both exist so the suite can drive the
+# refusal arms and the computed kill list against a PLANTED procfs with no
+# live processes — a real setsid daemon in a test is unreapable if the suite
+# dies mid-run. Nothing in production sets either.
+#
+# Exit codes:
+#   0  retired: every pid in the set is gone from procfs
+#   1  signalled (TERM, then KILL after the grace) but still present — inspect
+#   2  REFUSED: not an orphan by the scan, the scan itself refused, bad args
+#   4  PLAN ONLY (no --yes): printed what it would do, did nothing
+
+# _svc_orphan_descendants <pid> — descendants by recorded PPid, depth <= 3,
+# one per line. Reads the same procfs seam the scan reads.
+_svc_orphan_descendants() {
+    local root="$1" depth=0 d pid ppid f
+    local -a frontier=( "$root" ) next=()
+    while (( depth < 3 )) && (( ${#frontier[@]} > 0 )); do
+        next=()
+        for d in "$SVC_PROCFS"/[0-9]*; do
+            pid=${d##*/}
+            ppid=$(awk '/^PPid:/{print $2}' "$d/status" 2>/dev/null)
+            [[ "$ppid" =~ ^[0-9]+$ ]] || continue
+            for f in "${frontier[@]}"; do
+                [[ "$ppid" == "$f" ]] && { printf '%s\n' "$pid"; next+=( "$pid" ); break; }
+            done
+        done
+        frontier=( "${next[@]}" )
+        depth=$(( depth + 1 ))
+    done
+    return 0
+}
+
+_svc_retire_signal() {   # _svc_retire_signal <sig> <target>
+    if [[ -n "${NEXUS_SVC_KILL_CMD:-}" ]]; then
+        "$NEXUS_SVC_KILL_CMD" "-$1" -- "$2"
+    else
+        kill "-$1" -- "$2" 2>/dev/null
+    fi
+}
+
+_svc_retire_alive() {   # sets `alive` from the caller's `kill_set`; rc 0 iff any remain
+    local p
+    alive=()
+    for p in "${kill_set[@]}"; do [[ -d "$SVC_PROCFS/$p" ]] && alive+=( "$p" ); done
+    (( ${#alive[@]} > 0 ))
+}
+
+cmd_retire_orphan() {
+    local pid="" yes=0 a
+    for a in "$@"; do
+        case "$a" in
+            --yes) yes=1 ;;
+            -*)    die "retire-orphan: unknown flag $a (usage: svc.sh retire-orphan <pid> [--yes])" ;;
+            *)     [[ -z "$pid" ]] || die "retire-orphan: one pid at a time (got '$pid' and '$a')"; pid="$a" ;;
+        esac
+    done
+    [[ "$pid" =~ ^[0-9]+$ ]] || { echo "[svc] retire-orphan: usage: svc.sh retire-orphan <pid> [--yes]" >&2; return 2; }
+
+    # ARM 1 — THE SCAN DECIDES. Its stdout carries the machine-readable ORPHAN
+    # rows (SVC_ORPHANS_TSV=1 adds them beside the human report); its rc is
+    # the verdict on the SCAN, read before any row is believed.
+    local scan_out scan_rc=0
+    scan_out=$(SVC_ORPHANS_TSV=1 cmd_orphans 2>&1) || scan_rc=$?
+    if (( scan_rc == 3 )); then
+        echo "[svc] retire-orphan: REFUSED — the orphans scan itself REFUSED (rc 3), so no classification" >&2
+        echo "[svc] retire-orphan:   is available to authorise a retirement. Its reason:" >&2
+        # awk, not `grep | head`: an early-exit reader would join the
+        # early-exit-reader manifest for a diagnostic whose status nobody reads.
+        awk '/REFUSED|CONTROL/ && n++ < 3 { print "[svc] retire-orphan:     " $0 }' <<<"$scan_out" >&2
+        return 2
+    fi
+    if (( scan_rc == 0 )); then
+        echo "[svc] retire-orphan: REFUSED — the scan found NO orphans, so pid $pid is not one." >&2
+        echo "[svc] retire-orphan:   A registered supervisor is retired with \`svc.sh stop <name>\`, never here." >&2
+        return 2
+    fi
+    if (( scan_rc != 1 )); then
+        echo "[svc] retire-orphan: REFUSED — the orphans scan exited $scan_rc, which is not a verdict I know." >&2
+        return 2
+    fi
+    local row src
+    row=$(awk -F'\t' -v p="$pid" '$1 == "ORPHAN" && $2 == p { print; exit }' <<<"$scan_out")
+    if [[ -z "$row" ]]; then
+        echo "[svc] retire-orphan: REFUSED — pid $pid is NOT in the scan's orphan set." >&2
+        echo "[svc] retire-orphan:   The scan classifies as orphans ONLY: ppid 1, a supervisor-shaped script, a path" >&2
+        echo "[svc] retire-orphan:   no registry row names. A REGISTERED supervisor, a process with a live parent," >&2
+        echo "[svc] retire-orphan:   or a non-supervisor never qualifies, whatever its pid. The scan's orphan set:" >&2
+        awk -F'\t' '$1 == "ORPHAN" { printf "[svc] retire-orphan:     pid %s  %s\n", $2, $3 }' <<<"$scan_out" >&2
+        return 2
+    fi
+    src=$(cut -f3 <<<"$row")
+
+    # THE KILL SET — recorded relationships, never names.
+    local -a kill_set=( "$pid" ) alive=()
+    local d
+    while IFS= read -r d; do [[ -n "$d" ]] && kill_set+=( "$d" ); done < <(_svc_orphan_descendants "$pid")
+
+    local grace="${NEXUS_SVC_RETIRE_GRACE:-5}"
+    echo "[svc] retire-orphan: pid $pid is an orphan by the scan: $src"
+    echo "[svc] retire-orphan:   kill set (supervisor + descendants by recorded PPid): ${kill_set[*]}"
+    echo "[svc] retire-orphan:   plan: TERM process group $pid (fallback: each pid), wait ${grace}s, KILL survivors"
+    if (( ! yes )); then
+        echo "[svc] retire-orphan: PLAN ONLY — nothing was signalled. Re-run with --yes to retire (exit 4)."
+        return 4
+    fi
+
+    # ARM 2 — THE OPERATOR SAID SO. Log FIRST, so the record exists whether or
+    # not the signals land (stamp-then-act fails loud; act-then-stamp fails silent).
+    local logdir="${NEXUS_STATE_DIR:-$STATE_DIR}"
+    mkdir -p "$logdir" 2>/dev/null || true
+    printf '%s\tuser=%s\tpid=%s\tsrc=%s\tkill_set=%s\tby=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" "$(id -un 2>/dev/null || echo '?')" \
+        "$pid" "$src" "${kill_set[*]}" "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-operator}}" \
+        >> "$logdir/svc-retire.log" 2>/dev/null \
+        || echo "[svc] retire-orphan: WARNING — could not append to $logdir/svc-retire.log" >&2
+
+    local p waited=0
+    _svc_retire_signal TERM "-$pid" || for p in "${kill_set[@]}"; do _svc_retire_signal TERM "$p"; done
+    while _svc_retire_alive && (( waited < grace )); do sleep 1; waited=$(( waited + 1 )); done
+    if _svc_retire_alive; then
+        echo "[svc] retire-orphan: still present after TERM + ${grace}s: ${alive[*]} — escalating to KILL"
+        _svc_retire_signal KILL "-$pid" || for p in "${alive[@]}"; do _svc_retire_signal KILL "$p"; done
+        sleep 1
+    fi
+    if _svc_retire_alive; then
+        echo "[svc] retire-orphan: WARNING — still present after KILL: ${alive[*]}. Inspect: ps -o pid,ppid,pgid,args -p ${alive[*]}" >&2
+        return 1
+    fi
+    echo "[svc] retire-orphan: retired pid $pid (${#kill_set[@]} process(es)); logged to $logdir/svc-retire.log"
+    return 0
+}
+
+# --- orphans: READ-ONLY enumeration of UNREGISTERED supervisors ------------
+#
+# A DIFFERENT ORPHAN FROM `_svc_reconcile_orphan` ABOVE, and the distinction is
+# the whole reason this verb exists (your-org/nexus-code#1034). That one is a
+# REGISTERED service whose healthcheck passes while its supervisor RECORD is
+# stale — it is found by name, through the registry, via _recover_pidfile. Its
+# domain is exactly the registry.
+#
+# This one is a supervisor with NO REGISTRY ROW AT ALL: a `*-supervised.sh`
+# left running from a retired clone or an ephemeral scratch directory after the
+# agent that started it went away. Nothing keyed on a registry name can see it,
+# because there is no name to key on. `status`, the cockpit and every existing
+# verb iterate `load_services`, i.e. the registry — so an unregistered
+# supervisor is outside their domain BY CONSTRUCTION, not by oversight. #1034
+# reported three `remote-sshd-supervised.sh` processes of which one was
+# registered, one held a LIVE sshd on a port nobody knew about, and concluded
+# "enumeration first: today nobody can even LIST the problem". This is that
+# enumeration.
+#
+# STRICTLY READ-ONLY. It signals nothing, writes nothing and starts nothing;
+# there is deliberately no `--reap` and no kill path here, so the verb cannot
+# become the thing that retires a live service by mistake. Retirement is
+# recommendation 2 of #1034 and is NOT implemented here.
+#
+# ── ppid==1 IS NOT THE DISCRIMINATOR ────────────────────────────────────────
+# Every CORRECTLY supervised service is also ppid 1: `recover_service` detaches
+# with `setsid`, so re-parenting to init is the NORMAL state, not the anomaly.
+# Measured on this nexus 2026-09-02, `ps -eo pid=,ppid=` over supervisor-shaped
+# processes: 10 of 10 had ppid 1, and 9 of them were healthy registered
+# services. A verb keyed on ppid alone would flag the entire stack.
+# The discriminator is the SOURCE PATH: is this the script the registry says
+# should be running, at the path the registry says it should run from?
+#
+# ── THE POPULATION PREDICATE UNDER-COUNTS, AND HERE IS THE DIRECTION ────────
+# Candidates are drawn from the UNION of two rules:
+#   (1) basename matches the basename of some registry launch command — this
+#       is what catches a foreign clone running the SAME script from a
+#       DIFFERENT path, which is exactly #1034's two orphans;
+#   (2) basename matches the supervisor SHAPE (`*-supervised.sh`, `*-watch.sh`,
+#       `watch.sh`) — this catches a supervisor from a clone whose registry row
+#       we do not have.
+# Rule (2) alone is demonstrably insufficient ON THIS REGISTRY: the
+# `myviewer-xiulan` row launches `run-supervised-xiulan.sh`, whose basename
+# does NOT end in `-supervised.sh`, so a shape-only predicate misses it. Rule
+# (1) alone is insufficient because a retired clone may run a script this
+# registry never mentions. The union is still an APPROXIMATION and it errs
+# DOWNWARD: a supervisor with a novel name from a clone with no registry row is
+# invisible to both rules. That is stated rather than hidden, per this repo's
+# rule that a source-text predicate for a runtime property must declare which
+# way it is wrong.
+#
+# ── WHY A ZERO HERE NEEDS TWO POSITIVE CONTROLS ─────────────────────────────
+# "No orphans" and "my scan is broken" produce the same empty table, and a
+# confident zero it cannot vouch for is this repo's dominant defect class. So
+# `none found` is reported ONLY when both controls hold, and REFUSED (rc 3)
+# otherwise:
+#   CONTROL A (the walk)    — the /proc walk must see this very process. If it
+#                             cannot see a pid we KNOW exists, no absence it
+#                             reports means anything.
+#   CONTROL B (the matcher) — at least one REGISTERED supervisor must have been
+#                             matched by the predicate. A matcher that has
+#                             never matched anything has not been shown to be
+#                             able to match, so its zero is unvouched.
+# Control B fails legitimately when the whole stack is down. That is REFUSED,
+# not "none" — the honest answer is that this scan cannot tell.
+#
+# Exit codes:
+#   0  scan complete, NO orphans — and both controls held
+#   1  scan complete, orphans FOUND (count on stdout)
+#   3  REFUSED — could not determine (a control failed, or /proc is unusable).
+#      DISTINCT from 0 on purpose: "none found" and "I could not look" are
+#      different claims and only one of them is a clearance.
+
+# The process table this verb reads. Overridable ONLY so the test suite can
+# plant a synthetic one: creating a REAL ppid-1 process to test a ppid-1
+# detector would need `setsid` inside a test, which is both a footgun and
+# unreapable if the suite dies mid-run. A planted tree exercises the exact same
+# classification code with no live processes at all. Defaults to /proc; nothing
+# in production sets it.
+SVC_PROCFS="${SVC_PROCFS:-/proc}"
+
+# _svc_proc_argv_script <pid> — the script this pid is running, as invoked:
+# argv[0] when executed directly, argv[1] under an interpreter. Empty when the
+# cmdline is unreadable or holds neither. Reads /proc directly rather than
+# matching `ps` output text, because a sibling agent's PROMPT contains these
+# script names verbatim and a text match would return the DESCRIPTION of a
+# process instead of the process (your-org/nexus-code#1073).
+_svc_proc_argv_script() {
+    local pid="$1" a n=0
+    local -a args=()
+    [[ -r "$SVC_PROCFS/$pid/cmdline" ]] || return 1
+    while IFS= read -r -d '' a; do
+        args+=( "$a" ); n=$(( n + 1 ))
+        (( n >= 3 )) && break
+    done < "$SVC_PROCFS/$pid/cmdline"
+    (( ${#args[@]} > 0 )) || return 1
+    case "${args[0]}" in
+        */bash|bash|*/sh|sh|*/dash|dash|*/zsh|zsh|*/env|env)
+            [[ ${#args[@]} -gt 1 ]] && { printf '%s' "${args[1]}"; return 0; }
+            return 1 ;;
+    esac
+    printf '%s' "${args[0]}"
+    return 0
+}
+
+# _svc_abs_path <maybe-relative> <cwd> — absolute form, WITHOUT requiring the
+# path to exist. A retired clone's script may have been deleted out from under
+# the running process, and `readlink -f` on a vanished path still composes the
+# absolute name, which is what we want to REPORT.
+_svc_abs_path() {
+    local p="$1" cwd="$2"
+    [[ "$p" == /* ]] || p="$cwd/$p"
+    _svc_norm_path "$p"
+}
+
+# _svc_norm_path <abs-path> — collapse `//`, `/./` and `x/..` LEXICALLY.
+#
+# NOT `readlink -f`, which returns EMPTY for a path that does not exist — and a
+# retired clone's script being deleted out from under its still-running process
+# is the CENTRAL case here, so resolving would blank exactly the orphan we came
+# to report.
+#
+# THIS IS NOT COSMETIC, and it is the bug the first live run actually had. The
+# registry writes workdirs as `$NEXUS_ROOT/work/x` with launch `./serve.sh`,
+# composing `/work/x/./serve.sh`, while the running process carries the
+# ABSOLUTE `/work/x/serve.sh`. Those are the same file and differ by three
+# characters, so a string compare called 8 of 10 healthy registered services
+# ORPHANS on this nexus at 2026-09-02T10:06Z. A false positive on this verb is
+# a nudge toward killing a live production service, so it is the expensive
+# direction.
+_svc_norm_path() {
+    local p="$1" out="" seg
+    local -a parts=() keep=()
+    while [[ "$p" == *//* ]]; do p="${p//\/\///}"; done
+    local IFSSAVE="$IFS"; IFS='/'; read -r -a parts <<<"$p"; IFS="$IFSSAVE"
+    for seg in "${parts[@]}"; do
+        case "$seg" in
+            ''|'.') continue ;;
+            '..')   [[ ${#keep[@]} -gt 0 ]] && unset 'keep[-1]' && keep=( "${keep[@]}" ) ;;
+            *)      keep+=( "$seg" ) ;;
+        esac
+    done
+    for seg in "${keep[@]}"; do out="$out/$seg"; done
+    printf '%s' "${out:-/}"
+}
+
+cmd_orphans() {
+    [[ $# -eq 0 ]] || die "usage: svc.sh orphans   (read-only; takes no arguments)"
+
+    # NOTE — there is deliberately no separate `[[ -d "$SVC_PROCFS/$$" ]]` pre-check
+    # here. There used to be, and it made CONTROL A below UNREACHABLE AS A
+    # DISTINCT FAILURE: both fire on exactly the same condition, so the earlier
+    # one always won and the later one could be disarmed with no test noticing.
+    # A mutant that pre-set `self_seen=1` left the suite fully green. Two guards
+    # for one condition is not defence in depth; it is one guard plus an
+    # untested claim. Control A now carries it alone, and is proven live by
+    # mutation (M2).
+
+    # Expected supervisor paths + basenames, from the registry.
+    local -a expect_path=() expect_name=() expect_base=()
+    local line name workdir launch health logfile tok abs
+    while IFS=$'\t' read -r name workdir launch health logfile; do
+        [[ -n "$name" ]] || continue
+        tok=${launch%% *}
+        [[ -n "$tok" ]] || continue
+        abs=$(_svc_abs_path "$tok" "$workdir")
+        expect_path+=( "$abs" ); expect_name+=( "$name" ); expect_base+=( "${tok##*/}" )
+    done < <(svc_parse_registry "$SERVICES_REGISTRY")
+
+    if ! svc_registry_readable "$SERVICES_REGISTRY"; then
+        echo "[svc] orphans: REFUSED — the registry at $SERVICES_REGISTRY EXISTS and could NOT be READ." >&2
+        echo "[svc] orphans:   This is NOT 'no services registered'. No classification is possible." >&2
+        return 3
+    fi
+    if (( ${#expect_path[@]} == 0 )); then
+        echo "[svc] orphans: REFUSED — the registry at $SERVICES_REGISTRY yielded no rows, so there is" >&2
+        echo "[svc] orphans:   nothing to classify AGAINST. Every supervisor would read as unregistered," >&2
+        echo "[svc] orphans:   which is an artefact of the empty registry, not a finding." >&2
+        return 3
+    fi
+
+    # ---- the scan ---------------------------------------------------------
+    local self_seen=0 registered_seen=0 orphan_n=0
+    local -a o_pid=() o_src=() o_why=()
+    local d pid ppid script cwd src i matched base
+
+    for d in "$SVC_PROCFS"/[0-9]*; do
+        pid=${d##*/}
+        # CONTROL A is set HERE — before the readability filter below — because
+        # it asserts that the WALK ENUMERATED this entry, which is a different
+        # claim from "the entry was parseable". A `continue` past an unreadable
+        # cmdline must not be able to retract the walk's own positive control.
+        (( pid == $$ )) && self_seen=1        # CONTROL A
+        [[ -r "$d/cmdline" ]] || continue
+        script=$(_svc_proc_argv_script "$pid") || continue
+        [[ -n "$script" ]] || continue
+        base=${script##*/}
+
+        # population: registry basename OR supervisor shape
+        matched=0
+        for i in "${!expect_base[@]}"; do
+            [[ "$base" == "${expect_base[$i]}" ]] && { matched=1; break; }
+        done
+        if (( ! matched )); then
+            case "$base" in
+                *-supervised.sh|*-supervised-*.sh|*-watch.sh|watch.sh|deploy-watch.sh) matched=1 ;;
+            esac
+        fi
+        (( matched )) || continue
+
+        cwd=$(readlink "$d/cwd" 2>/dev/null) || cwd=""
+        src=$(_svc_abs_path "$script" "${cwd:-/}")
+
+        ppid=$(awk '/^PPid:/{print $2}' "$d/status" 2>/dev/null)
+        [[ "$ppid" =~ ^[0-9]+$ ]] || continue
+
+        # Is this exactly a registry-declared supervisor path?
+        local is_reg=0
+        for i in "${!expect_path[@]}"; do
+            [[ "$src" == "${expect_path[$i]}" ]] && { is_reg=1; break; }
+        done
+        if (( is_reg )); then
+            registered_seen=1                  # CONTROL B
+            continue
+        fi
+
+        # Not registry-declared. Only ppid 1 is an ORPHAN — a supervisor with a
+        # live parent is somebody's child and is being managed by whoever
+        # started it; reporting it would be a false positive on, for instance,
+        # a test fixture's own supervisor.
+        (( ppid == 1 )) || continue
+
+        local why
+        case "$src" in
+            "$NEXUS_ROOT"/*) why="unregistered: inside NEXUS_ROOT but no registry row names this path" ;;
+            *)               why="unregistered: source path is OUTSIDE NEXUS_ROOT ($NEXUS_ROOT)" ;;
+        esac
+        o_pid+=( "$pid" ); o_src+=( "$src" ); o_why+=( "$why" )
+        orphan_n=$(( orphan_n + 1 ))
+    done
+
+    # ---- controls ---------------------------------------------------------
+    if (( ! self_seen )); then
+        echo "[svc] orphans: REFUSED — CONTROL A FAILED: the walk over $SVC_PROCFS did not enumerate" >&2
+        echo "[svc] orphans:   this very process (pid $$), so no scan is possible. A scan that cannot see a" >&2
+        echo "[svc] orphans:   pid it KNOWS exists cannot vouch for any absence it reports." >&2
+        return 3
+    fi
+    # CONTROL C — AN INDEPENDENT INSTRUMENT MUST NOT DISAGREE.
+    #
+    # Controls A and B are both self-referential: they ask this scan whether it
+    # can see things, using this scan. Neither can catch a matcher that matches
+    # the WRONG set, and that is not hypothetical — the first live version of
+    # this verb passed BOTH while calling 8 of 10 healthy registered services
+    # orphans, because control B only ever needed ONE match and two registry
+    # rows happened to use absolute launch paths.
+    #
+    # So ask a DIFFERENT instrument the same question: `_recover_supervisor_state`
+    # resolves a service by NAME through its pidfile, a path with nothing in
+    # common with the /proc argv walk above. If it says a registered service's
+    # supervisor is alive at pid N, and this scan put pid N in the orphan list,
+    # then one of the two is wrong and this verb must not adjudicate its own
+    # correctness. Refuse.
+    local _cc_i _cc_st _cc_pid _cc_j
+    for _cc_i in "${!expect_name[@]}"; do
+        _cc_st=$(_recover_supervisor_state "${expect_name[$_cc_i]}" "${expect_path[$_cc_i]}" 2>/dev/null)
+        [[ "$_cc_st" == alive:* ]] || continue
+        _cc_pid="${_cc_st#alive:}"
+        for _cc_j in "${!o_pid[@]}"; do
+            [[ "${o_pid[$_cc_j]}" == "$_cc_pid" ]] || continue
+            echo "[svc] orphans: REFUSED — CONTROL C FAILED: pid $_cc_pid is flagged as an orphan here," >&2
+            echo "[svc] orphans:   but the INDEPENDENT pidfile probe resolves it as the live supervisor of the" >&2
+            echo "[svc] orphans:   REGISTERED service '${expect_name[$_cc_i]}'. Two instruments disagree about a" >&2
+            echo "[svc] orphans:   registered service, so this scan's classification is not trustworthy and" >&2
+            echo "[svc] orphans:   nothing here should be acted on. Source seen: ${o_src[$_cc_j]}" >&2
+            echo "[svc] orphans:   Registry expects: ${expect_path[$_cc_i]}" >&2
+            return 3
+        done
+    done
+
+    if (( ! registered_seen )); then
+        echo "[svc] orphans: REFUSED — CONTROL B FAILED: the predicate matched NO registered supervisor," >&2
+        echo "[svc] orphans:   so it has not been shown able to match one. Either the whole stack is down" >&2
+        echo "[svc] orphans:   (check \`svc.sh status\`) or the population predicate is broken; this scan" >&2
+        echo "[svc] orphans:   cannot tell those apart, and 'none found' would be a guess." >&2
+        if (( orphan_n > 0 )); then
+            echo "[svc] orphans:   NOTE: $orphan_n candidate(s) WERE flagged and are printed below — a" >&2
+            echo "[svc] orphans:   positive finding does not need control B. The REFUSAL is about the ZERO." >&2
+            _svc_orphans_report
+        fi
+        return 3
+    fi
+
+    if (( orphan_n == 0 )); then
+        echo "orphans: none found"
+        echo "  scanned $SVC_PROCFS; population = registry launch basenames ∪ supervisor shape"
+        echo "  CONTROL A (walk saw pid $$): ok"
+        echo "  CONTROL B (matched a registered supervisor): ok"
+        echo "  registry: $SERVICES_REGISTRY (${#expect_path[@]} rows)"
+        return 0
+    fi
+
+    _svc_orphans_report
+    return 1
+}
+
+# Printing is a separate function so the control-B refusal path can show its
+# candidates without duplicating the formatter. Reads the o_* arrays from the
+# caller's scope (bash dynamic scope on `local`).
+_svc_orphans_report() {
+    local i pid src ssout have_pid_attr
+    printf 'orphans: %s unregistered supervisor(s) with ppid 1\n' "${#o_pid[@]}"
+    # Machine-readable rows for `retire-orphan` (SVC_ORPHANS_TSV=1): one per
+    # orphan, `ORPHAN<TAB>pid<TAB>source<TAB>descendants`. Emitted from the
+    # SAME arrays the human report prints, so the two cannot disagree.
+    if [[ "${SVC_ORPHANS_TSV:-0}" == 1 ]]; then
+        for i in "${!o_pid[@]}"; do
+            printf 'ORPHAN\t%s\t%s\t%s\n' "${o_pid[$i]}" "${o_src[$i]}" \
+                "$(_svc_orphan_descendants "${o_pid[$i]}" | tr '\n' ' ' | sed 's/ $//')"
+        done
+    fi
+    ssout=$(ss -lntp 2>/dev/null) || ssout=""
+    have_pid_attr=0
+    [[ "$ssout" == *"pid="* ]] && have_pid_attr=1
+    for i in "${!o_pid[@]}"; do
+        pid="${o_pid[$i]}"; src="${o_src[$i]}"
+        printf '\n  pid      %s\n' "$pid"
+        printf '  source   %s\n' "$src"
+        printf '  why      %s\n' "${o_why[$i]}"
+        printf '  exists   %s\n' "$( [[ -e "$src" ]] && echo 'yes' || echo 'NO — the script file is GONE (retired clone or cleaned scratch dir)' )"
+        printf '  cwd      %s\n' "$(readlink "$SVC_PROCFS/$pid/cwd" 2>/dev/null || echo '<unreadable>')"
+        printf '  uptime   %ss\n' "$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ' || echo '?')"
+        printf '  started  %s\n' "$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//' || echo '?')"
+        _svc_orphan_children "$pid"
+        _svc_orphan_sockets  "$pid" "$ssout" "$have_pid_attr"
+    done
+    printf '\nREAD-ONLY: nothing above was signalled, stopped or restarted. To retire ONE of\n'
+    printf 'the pids above (and only one the scan classifies as an orphan), the sanctioned\n'
+    printf 'path is: svc.sh retire-orphan <pid>   (plan)   then   --yes   (your-org/nexus-code#1034).\n'
+}
+
+# Descendants (one level, plus their own children) — enough to show what a
+# supervisor is actually holding open without walking the whole tree.
+_svc_orphan_children() {
+    local parent="$1" d pid ppid n=0 cl
+    printf '  children\n'
+    for d in "$SVC_PROCFS"/[0-9]*; do
+        pid=${d##*/}
+        ppid=$(awk '/^PPid:/{print $2}' "$d/status" 2>/dev/null)
+        [[ "$ppid" == "$parent" ]] || continue
+        cl=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+        printf '    %-8s %s\n' "$pid" "$(printf '%s' "${cl:0:160}")"
+        n=$(( n + 1 ))
+    done
+    (( n == 0 )) && printf '    (none — supervising nothing)\n'
+    return 0
+}
+
+# Listening sockets held by the supervisor or any of its children.
+# `ss -lntp` attributes a pid directly. When it produces NO pid attribution at
+# all we say so rather than printing an empty list: "ss could not tell us" and
+# "this process listens on nothing" are different facts, and a live sshd on an
+# unknown port is precisely what #1034 was about.
+_svc_orphan_sockets() {
+    local parent="$1" ssout="$2" have="$3" d pid ppid n=0
+    local -a pids=( "$parent" )
+    for d in "$SVC_PROCFS"/[0-9]*; do
+        pid=${d##*/}
+        ppid=$(awk '/^PPid:/{print $2}' "$d/status" 2>/dev/null)
+        [[ "$ppid" == "$parent" ]] && pids+=( "$pid" )
+    done
+    printf '  listening\n'
+    if [[ -z "$ssout" ]]; then
+        printf '    UNKNOWN — `ss -lntp` produced no output (ss missing or refused); NOT a claim of none\n'
+        return 0
+    fi
+    if (( ! have )); then
+        printf '    UNKNOWN — `ss -lntp` returned no pid attribution on this host; NOT a claim of none\n'
+        return 0
+    fi
+    local p line
+    for p in "${pids[@]}"; do
+        while IFS= read -r line; do
+            [[ "$line" == *"pid=$p,"* ]] || continue
+            printf '    %s\n' "$line"
+            n=$(( n + 1 ))
+        done <<<"$ssout"
+    done
+    (( n == 0 )) && printf '    (none)\n'
+    return 0
+}
+
 usage() { awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"; }
 
 main() {
@@ -1782,6 +2451,8 @@ main() {
         -h|--help)        usage ;;
         status|--status|-1) cmd_status ;;
         up)               shift; cmd_up "$@" ;;
+        orphans)          shift; cmd_orphans "$@" ;;
+        retire-orphan)    shift; cmd_retire_orphan "$@" ;;
         start|stop|restart|logs)
             local verb="$1" name="${2:-}"
             [[ -n "$name" ]] || die "usage: svc.sh $verb <name>"

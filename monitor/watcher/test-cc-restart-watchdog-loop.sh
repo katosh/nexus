@@ -159,7 +159,15 @@ run_loop() {
         WATCHDOG_DEADLINE_SECONDS=1 \
         "$@" \
         bash "$script" >/dev/null 2>&1
-    [[ -f "$state/restart-watchdog-armed" ]] && ARMED=1 || ARMED=0
+    # "It armed" = it wrote the armed marker at some point. Every run here ends
+    # in fail() at the 1 s deadline (the stub pid never dies), and fail() now
+    # RELEASES the marker its own run wrote — so the marker's presence after
+    # exit no longer answers the question. The baseline file is written only
+    # AFTER the marker (and never by a refused or pre-arm run), so either one
+    # being present is the discriminator. The pre-fix loop, which writes no
+    # baseline file and keeps its marker, still reads correctly.
+    [[ -f "$state/restart-watchdog-armed" || -f "$state/restart-watchdog-baseline" ]] && ARMED=1 || ARMED=0
+    rm -f "$state/restart-watchdog-baseline"
     QUERIED=$(sort -u "$root/tmux.log" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
 }
 

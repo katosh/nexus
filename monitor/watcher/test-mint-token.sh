@@ -52,7 +52,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" haystack="$2" needle="$3"
-    if [[ "$haystack" == *"$needle"* ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" && "$haystack" == *"$needle"* ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else printf '  FAIL: %s — needle %q not in %q\n' "$label" "$needle" "$haystack" >&2; FAIL=$(( FAIL + 1 )); fi
 }
 assert_ne_zero() {
@@ -447,6 +448,115 @@ STUB
 chmod +x "$WORK/bin/curl"
 assert_eq    "488/control: failed mint still exits 3" "$rc" "3"
 assert_empty "488/control: failed mint prints no token" "$out"
+
+# ---- Tests 9-13: the KEY EXPOSURE GATE (your-org/nexus-code#1501) -------
+#
+# `mint-token.sh` used to check `-f` and `-r` only, while the words
+# "should be 600" sat in the unreadable-key FAILURE MESSAGE and two documents
+# asserted the script rejects a loose mode. It did not.
+#
+# THE NEGATIVE IS THE LOAD-BEARING HALF HERE, and it is Test 10. A naive
+# `mode == 600` gate would refuse a key whose ancestors deny traversal — the
+# exact setup #1501 was filed against and then withdrawn on: mode 644 under a
+# 700 `~/.claude` is INERT, because a file mode is the last gate and not the
+# only one. Refusing that setup would take down every GitHub write in the
+# nexus in answer to a non-problem, so "a loose mode under a closed ancestor
+# still mints" is pinned as hard as "an exposed key is refused".
+#
+# THE FIXTURE'S OWN PATH IS THE PROPERTY UNDER TEST, which is why these two
+# cases cannot use $WORK: a per-session `mktemp -d` is typically 700, so a key
+# planted under it is CONTAINED no matter what its own mode says, and the
+# positive control would be structurally unreachable — green, and about
+# nothing. They plant under a root that is world-traversable and SKIP loudly
+# when the host does not provide one, rather than passing vacuously.
+
+_kx_root_ok=1
+_KXBASE=""
+if [[ "$(id -u)" == "0" ]]; then
+    _kx_root_ok=0
+    printf '  SKIP: running as root — every path is traversable, so the containment arm cannot be distinguished\n'
+elif _KXBASE=$(mktemp -d --tmpdir=/tmp mint-kx-XXXXXX 2>/dev/null) && [[ -n "$_KXBASE" ]]; then
+    chmod 755 "$_KXBASE" 2>/dev/null || _kx_root_ok=0
+    # Walk it: /tmp itself must be other-executable or the "exposed" arm is
+    # not reachable on this host and a green would be vacuous.
+    _d="$_KXBASE"
+    while :; do
+        _m=$(stat -c '%a' -- "$_d" 2>/dev/null) || { _kx_root_ok=0; break; }
+        (( (8#$_m & 8#1) != 0 )) || { _kx_root_ok=0; break; }
+        [[ "$_d" == "/" ]] && break
+        _u=$(dirname -- "$_d"); [[ "$_u" == "$_d" ]] && break; _d="$_u"
+    done
+    (( _kx_root_ok )) || printf '  SKIP: no world-traversable temp root on this host — the exposed arm is unreachable\n'
+else
+    _kx_root_ok=0
+    printf '  SKIP: could not create a temp root under /tmp\n'
+fi
+if (( _kx_root_ok )); then trap 'rm -rf "$WORK" "$_KXBASE"' EXIT; fi
+
+if (( _kx_root_ok )); then
+    echo '=== #1501 exposed key: world bits AND a fully traversable path — REFUSED ==='
+    clean_cache
+    KEY_EXPOSED="$_KXBASE/exposed.pem"
+    echo 'placeholder-key' > "$KEY_EXPOSED"; chmod 644 "$KEY_EXPOSED"
+    out=$(env "${HAPPY_ENV[@]}" "TEST_KEY_PATH=$KEY_EXPOSED" \
+        "$NEXUS/monitor/mint-token.sh" 2>"$WORK/err.txt"); rc=$?
+    err=$(cat "$WORK/err.txt")
+    assert_eq       "exit code is 4 (distinct from 2: hygiene, not broken config)" "$rc" "4"
+    assert_empty    "no token on stdout"                              "$out"
+    assert_contains "stderr states the verdict"                       "$err" "verdict=exposed"
+    assert_contains "stderr names the one-command remedy"             "$err" "chmod 600"
+    assert_contains "stderr raises ROTATION, which a chmod does not do" "$err" "ROTATING"
+
+    echo '=== #1501 CONTAINED loose mode: 644 under a 700 ancestor STILL MINTS ==='
+    # The anti-false-refusal control. This is the setup #1501 was filed
+    # against and withdrawn on; a gate that refuses it is worse than no gate.
+    clean_cache
+    mkdir -p "$_KXBASE/closed"; chmod 700 "$_KXBASE/closed"
+    KEY_CONTAINED="$_KXBASE/closed/contained.pem"
+    echo 'placeholder-key' > "$KEY_CONTAINED"; chmod 644 "$KEY_CONTAINED"
+    out=$(env "${HAPPY_ENV[@]}" "TEST_KEY_PATH=$KEY_CONTAINED" \
+        "$NEXUS/monitor/mint-token.sh" 2>"$WORK/err.txt"); rc=$?
+    err=$(cat "$WORK/err.txt")
+    assert_eq "a loose mode under a NON-traversable ancestor mints (exit 0)" "$rc" "0"
+    assert_eq "…and returns the token"      "$out" "ghs_testtoken123abc"
+    assert_eq "…with nothing on stderr"     "$err" ""
+
+    echo '=== #1501 --check-key REPORTS the exposure rather than dying through it ==='
+    out=$(env "${HAPPY_ENV[@]}" "TEST_KEY_PATH=$KEY_EXPOSED" \
+        "$NEXUS/monitor/mint-token.sh" --check-key 2>"$WORK/err.txt"); rc=$?
+    assert_eq       "--check-key exits 4 on an exposed key"      "$rc" "4"
+    assert_contains "--check-key prints the verdict on STDOUT"   "$out" "verdict=exposed"
+
+    echo '=== #1501 --check-key on a CONTAINED key: exit 5, not silence ==='
+    out=$(env "${HAPPY_ENV[@]}" "TEST_KEY_PATH=$KEY_CONTAINED" \
+        "$NEXUS/monitor/mint-token.sh" --check-key 2>"$WORK/err.txt"); rc=$?
+    assert_eq       "exit 5 — tolerated by the gate, still surfaced" "$rc" "5"
+    assert_contains "names containment as the reason it is inert"    "$out" "verdict=contained"
+fi
+
+echo '=== #1501 --check-key on a 600 key: verdict=ok, exit 0, and NO token printed ==='
+out=$(env "${HAPPY_ENV[@]}" "$NEXUS/monitor/mint-token.sh" --check-key 2>"$WORK/err.txt"); rc=$?
+assert_eq       "exit 0 on a 600 key"                    "$rc"  "0"
+assert_contains "verdict is ok"                          "$out" "verdict=ok"
+# The cache arm EXITS 0 with a token. A `--check-key` run that found a warm
+# cache would print a CREDENTIAL and never reach its own report; this asserts
+# the diagnostic verb cannot become a token dispenser.
+assert_eq       "…and no ghs_ token leaked into the report" \
+    "$(printf '%s' "$out" | grep -c 'ghs_' || true)" "0"
+
+echo '=== #1501 the documented escape hatch actually opens the gate ==='
+# The MINT path's refusal is pinned by the first case above, which runs the
+# bare script and gets exit 4 — so the gate is not wired only into the
+# diagnostic verb. What is asserted HERE is the other direction: the one
+# documented override works, so an operator locked out by a false verdict has
+# a stated way through that is not "edit the script".
+if (( _kx_root_ok )); then
+    clean_cache
+    out=$(env "${HAPPY_ENV[@]}" "TEST_KEY_PATH=$KEY_EXPOSED" "NEXUS_SKIP_KEY_EXPOSURE_GATE=1" \
+        "$NEXUS/monitor/mint-token.sh" 2>"$WORK/err.txt"); rc=$?
+    assert_eq "the documented escape hatch lets an exposed key through (exit 0)" "$rc" "0"
+    assert_eq "…and it is the same token the happy path returns" "$out" "ghs_testtoken123abc"
+fi
 
 echo
 echo "=== summary: $PASS passed, $FAIL failed ==="

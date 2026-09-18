@@ -42,7 +42,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s\n           expected: %s\n' "$label" "$needle" >&2
@@ -86,6 +87,8 @@ cp "$NG_REAL"    "$FAKE_NEXUS/monitor/ng"
 # it (your-org/nexus-code#601/#605: degrading to the silent-coercion
 # behaviour it replaces is worse than refusing). Copy it alongside.
 cp "$(dirname "$NG_REAL")/_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
+# your-org/nexus-code#1077: `ng` also refuses without the primary-root resolver.
+cp "$(dirname "$NG_REAL")/_nexus-root.sh" "$FAKE_NEXUS/monitor/_nexus-root.sh"
 chmod +x "$FAKE_NEXUS/monitor/spawn-worker.sh" "$FAKE_NEXUS/monitor/ng"
 
 # spawn-worker.sh sources monitor/_claude-bin.sh. We do NOT drop a
@@ -161,6 +164,10 @@ WORKDIR="$FAKE_NEXUS/work/cwd-leak-slug"
 PROMPT_FILE="$WORK/task.txt"
 echo "test prompt" > "$PROMPT_FILE"
 
+# The launcher lives at ${TMPDIR:-/tmp}/spawn-launcher-…: the stub's pattern
+# follows TMPDIR too (`*/spawn-launcher-*`), because run-tests.sh hands every
+# suite a PRIVATE TMPDIR and a `/tmp/spawn-launcher-*` literal missed it —
+# this suite was one of six bands' worth of red on your-org/nexus-code#1481.
 # Stub bin: tmux captures the launcher path from `send-keys` instead
 # of executing it; everything else no-ops. We'll exec the launcher
 # ourselves below.
@@ -178,7 +185,7 @@ case "\$1" in
         # generated launcher writes itself out to.
         for arg in "\$@"; do
             case "\$arg" in
-                /tmp/spawn-launcher-*) printf '%s' "\$arg" > "$LAUNCHER_CAPTURE"; exit 0 ;;
+                */spawn-launcher-*) printf '%s' "\$arg" > "$LAUNCHER_CAPTURE"; exit 0 ;;
             esac
         done
         exit 0 ;;
@@ -356,7 +363,7 @@ case "\$1" in
     send-keys)
         for arg in "\$@"; do
             case "\$arg" in
-                /tmp/spawn-launcher-*) printf '%s' "\$arg" > "$LAUNCHER_CAPTURE_LOOP"; exit 0 ;;
+                */spawn-launcher-*) printf '%s' "\$arg" > "$LAUNCHER_CAPTURE_LOOP"; exit 0 ;;
             esac
         done
         exit 0 ;;
@@ -416,7 +423,7 @@ case "\$1" in
     send-keys)
         for arg in "\$@"; do
             case "\$arg" in
-                /tmp/spawn-launcher-*) printf '%s' "\$arg" > "$LAUNCHER_CAPTURE_REL"; exit 0 ;;
+                */spawn-launcher-*) printf '%s' "\$arg" > "$LAUNCHER_CAPTURE_REL"; exit 0 ;;
             esac
         done
         exit 0 ;;

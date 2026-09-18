@@ -142,7 +142,41 @@ export NEXUS_PUBLIC_ENABLED=1
 # gets its own `$$` and its own ledger, so a fixture script that itself uses
 # these helpers cannot contaminate the parent's count. That property is load
 # bearing; several suites run helper-sourcing fixtures.
-_TH_LEDGER="${TMPDIR:-/tmp}/.th-ledger.$$"
+# ── A COLLISION-PROOF PROCESS KEY (your-org/nexus-code#939 F1) ─────────────
+#
+# These paths used to be keyed on `$$` alone. A pid is REUSABLE: `pid_max` on
+# this host is 36864, so on a busy board the same number comes round in
+# minutes. The ledger tolerated that — a fresh process truncates it, see
+# `_TH_LEDGER_INIT` below — but the SENTINEL does not: nothing truncates it,
+# and `th_summary_and_exit` reads its mere existence as "a helper was missing".
+# So a sentinel left behind by a dead process turns a later, wholly CLEAN suite
+# RED when the pid comes round, with a diagnostic pointing at FAIL lines that
+# were never printed. Measured on this board: 67 such files in /tmp at once.
+#
+# `$$`+start-time cannot collide: a reused pid necessarily has a later start
+# time, so the key is unique for as long as /proc is readable. Field 22 of
+# /proc/<pid>/stat is the process start time in clock ticks since boot.
+#
+# WHY NOT A `mktemp` PATH: it would have to be created at SOURCE time in all
+# ~133 sourcing suites and then removed, which means an EXIT trap — and bash
+# keeps exactly ONE EXIT trap per shell while 121 of those suites already
+# install their own. Registering another silently replaces theirs (or is
+# replaced by it). A key that cannot collide needs no cleanup to be SAFE, which
+# is why this closes the hazard rather than narrowing its window.
+#
+# WHY NOT `export`: a subshell must share the parent's key (that is how a
+# `command_not_found_handle` firing inside `$( )` reaches the parent's ledger),
+# but a genuinely separate `bash` re-sourcing this file must NOT — a fixture
+# that uses these helpers would otherwise contaminate its parent's count. A
+# plain shell variable has exactly those semantics; an exported one does not.
+_th_proc_key() {
+    local st
+    st=$(awk '{print $22}' "/proc/$$/stat" 2>/dev/null) || st=""
+    [[ -n "$st" ]] || st=x        # /proc unreadable: degrade to bare pid
+    printf '%s-%s' "$$" "$st"
+}
+_TH_KEY="$(_th_proc_key)"
+_TH_LEDGER="${TMPDIR:-/tmp}/.th-ledger.$_TH_KEY"
 # Truncate ONCE per test process, never in a subshell. `_TH_LEDGER_INIT` is a
 # plain shell variable, so a subshell that re-sources this file inherits it set
 # and leaves the parent's ledger alone; a genuinely separate process does not
@@ -242,8 +276,85 @@ assert_eq() {
     fi
 }
 
+# REFUSE AN EMPTY NEEDLE (your-org/nexus-code#1038).
+#
+# THE DEFECT THIS EXISTS TO MAKE UNSPELLABLE. `grep -qF ""` matches EVERY line
+# of any haystack — including an empty one, since the here-string supplies one
+# empty line — so an empty `$needle` made this assertion pass VACUOUSLY. It did
+# not assert a weaker thing; it asserted NOTHING, and then reported the
+# caller's failed probe as a success. Measured against the real helper before
+# the guard, haystack deliberately carrying the WRONG value:
+#
+#     needle=[] len=0
+#       PASS: line carries the client key      <- hay was AAAATOTALLYWRONGKEY
+#       FAIL: control (a genuinely-absent key) <- the same helper, working
+#
+# WHY IT IS REACHABLE, NOT THEORETICAL. The needle is almost always a captured
+# probe — `$(awk … )`, `$(gh api … )`, `$(<file)`. When the PRODUCER of that
+# capture fails, it prints nothing and the capture is empty; if its rc is never
+# consulted, the assertion downstream certifies a value it never saw. That is
+# CLAUDE.md's `fromisoformat` MODE 2 exactly — the error is not lost, it is
+# merely off the path that produces the verdict. Two such sites were confirmed
+# fail-open (`test-remote-enroll.sh`, `test-remote-self-enroll.sh`) and fixed at
+# the call site in `#1036`; their needle came from a `ssh-keygen` whose rc was
+# never checked, behind a `command -v ssh-keygen` guard that proves the tool
+# EXISTS, not that it SUCCEEDED.
+#
+# WHY REFUSING IS SAFE. A caller passing an empty needle is ALREADY asserting
+# nothing, so turning it red surfaces a pre-existing defect rather than creating
+# one. There is no legitimate reading of "assert that this output contains the
+# empty string" — it is true of every output, so it can never discriminate. A
+# caller that genuinely wants to assert emptiness has `assert_empty`; one that
+# wants "this may or may not be present" has no business calling an assertion.
+#
+# THE DIAGNOSTIC POINTS AT THE CALLER, NOT AT THE HAYSTACK. That is the whole
+# value: the haystack is a red herring here — it is the EXPECTED value that came
+# back empty, and a reader shown a haystack dump will go looking in the wrong
+# place. Naming the producer is what turns this red into a five-minute fix.
+#
+# THE MIRROR IS NOT SYMMETRIC, AND WAS MEASURED RATHER THAN ASSUMED.
+# `assert_not_contains` below already fails CLOSED on an empty needle (the same
+# `grep -qF ""` matches, so it takes its FAIL arm), which is the correct
+# DIRECTION — a malformed assertion is loud. Its message is misleading, so it
+# gains a diagnostic here, but its VERDICT is deliberately unchanged: it failed
+# before this commit and it fails after, on exactly the same inputs.
+#
+# THIS GUARD DOES NOT REACH EVERY CALL SITE, AND THE GAP IS THE MAJORITY.
+# Measured at `072e4b0` — `git grep -nE '\bassert_contains\b' 072e4b0 -- '*.sh'`
+# for sites, `-l` for files. The partition RECONCILES, which an earlier draft of
+# this comment did not: it counted THIS FILE among the "local copies" and its
+# parts summed to one less than the total.
+#
+#   files mentioning assert_contains          203
+#     local definers (their own copy)          87   ->  1867 call sites
+#     sourcers of this file                   114   ->  1832 call sites
+#     neither (cc-harness lint)                 1   ->     1
+#     this file itself (the shared definer)     1   ->     2
+#                                             ---       ----
+#                                             203       3702  (= the total)
+#
+# Excluding this file's own 2 lines, 3700 are CALLS, of which the guard reaches
+# the 1832 in sourcing files — **49.5%**. The other half is still fail-open.
+#
+# The local copies come in THREE spellings, all vacuous on an empty needle
+# (each measured, not assumed):
+#   72x  `grep -qF -- "$needle" <<<"$hay"`
+#   10x  `[[ "$2" == *"$3"* ]]`            — `*""*` matches anything
+#    5x  `"$REAL_GREP" -qF -- "$needle"`   — grep via a variable (the `#618`
+#         silent-zero remedy), so the vacuity sits INSIDE the suites written to
+#         guard a related silent-zero class
+# Tracked at `#1092`. Do NOT read a green board as "the class is closed".
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
+    if [[ -z "$needle" ]]; then
+        printf '  FAIL: %s — EMPTY needle: `grep -qF ""` matches anything, so this\n' "$label" >&2
+        printf '         assertion could only have passed VACUOUSLY (your-org/nexus-code#1038).\n' >&2
+        printf '         Fix the CALLER, not the haystack: its expected value came back empty.\n' >&2
+        printf '         Check the rc of whatever produced the needle (a capture that failed\n' >&2
+        printf '         prints nothing, and an unconsulted rc turns that into a silent pass).\n' >&2
+        _th_fail
+        return
+    fi
     if grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"
         _th_pass
@@ -255,8 +366,20 @@ assert_contains() {
     fi
 }
 
+# The mirror. It already failed CLOSED on an empty needle before `#1038`, so
+# the VERDICT below is unchanged by design — only the diagnostic is added, for
+# the same reason as above: "unexpectedly found ''" sends the reader to the
+# haystack, when the fault is a caller whose expected value came back empty.
 assert_not_contains() {
     local label="$1" hay="$2" needle="$3"
+    if [[ -z "$needle" ]]; then
+        printf '  FAIL: %s — EMPTY needle: this assertion is malformed, not merely\n' "$label" >&2
+        printf '         unsatisfied (your-org/nexus-code#1038). It already failed before that\n' >&2
+        printf '         fix, for the wrong stated reason. Fix the CALLER: its expected value\n' >&2
+        printf '         came back empty — check the rc of whatever produced the needle.\n' >&2
+        _th_fail
+        return
+    fi
     if grep -qF -- "$needle" <<<"$hay"; then
         printf '  FAIL: %s — unexpectedly found %q\n' "$label" "$needle" >&2
         _th_fail
@@ -288,8 +411,39 @@ assert_file_exists() {
     fi
 }
 
+# EMPTY PATH (your-org/nexus-code#1038, same class as assert_contains above).
+# `[[ ! -e "" ]]` is TRUE, so an empty `$path` made this assertion pass
+# VACUOUSLY — it certified the absence of a file whose path it never learned.
+# Note the asymmetry with its own mirror, measured at `3458180`: the positive
+# form `assert_file_exists` fails CLOSED on an empty path (`[[ -f "" ]]` is
+# false), so only this negative half was exposed — the exact inverse of the
+# assert_contains/assert_not_contains pair, where the POSITIVE half was the
+# exposed one. Which half is fail-open is a property of the operator, not of
+# the polarity, so neither pair's safety transfers to the other.
+#
+# DECLARED HONESTLY: hardening, not a live bug fix — but NOT for the reason an
+# earlier draft of this comment gave. That draft claimed every call site passes
+# a COMPOSED path (`"$VAR/suffix"`, non-empty even when `$VAR` is). That is
+# FALSE and a reader would have inferred a structural invariant that does not
+# hold. Measured at `072e4b0` over the 139 call-site lines outside this file
+# (`git grep -n assert_no_file 072e4b0 -- '*.sh'`): 83 composed, ~20 literal,
+# and **30 pass a BARE `$VAR`** (`$HISTFILE`, `$LPIDFILE`, `$MARKER`, `$OUT`,
+# `$SF`, …) — each of which WOULD be empty if its variable were.
+#
+# So the real basis is EMPIRICAL, not structural: across two full 356-suite runs
+# (at `3458180` and at this branch's head) this guard fired ZERO times, i.e. no
+# such variable was empty on any executed path. That is an observation over the
+# EXECUTED population, not a proof over all paths — the 30 bare-`$VAR` sites are
+# where a future empty would come from, and they are unguarded by shape.
 assert_no_file() {
     local label="$1" path="$2"
+    if [[ -z "$path" ]]; then
+        printf '  FAIL: %s — EMPTY path: `[[ ! -e "" ]]` is TRUE, so this assertion\n' "$label" >&2
+        printf '         could only have passed VACUOUSLY (your-org/nexus-code#1038).\n' >&2
+        printf '         Fix the CALLER: the path it meant to check came back empty.\n' >&2
+        _th_fail
+        return
+    fi
     if [[ ! -e "$path" ]]; then
         printf '  PASS: %s\n' "$label"
         _th_pass
@@ -444,6 +598,92 @@ th_kill_own_child() {
 # rows on this host, and a read-only `pgrep` on it once matched all four
 # (`#608`). The fixture root is the whole predicate.
 #
+# AND THAT IS EXACTLY WHY THE OBSERVER MUST STAND OUTSIDE IT
+# (your-org/nexus-code#913). The sentence above is true and the reassuring
+# conclusion people drew from it — including the author of this header —
+# does NOT follow. Removing the name witness removed one way to
+# self-match; it did not remove self-matching. The predicate is the
+# fixture root, so when the CALLER'S cwd is inside that root, every
+# process the scan forks in order to look — the process-substitution
+# subshell, `ls`, their forks — inherits that cwd and is scanned as a
+# fixture process. Measured on an EMPTY root, where the correct answer is
+# unambiguously zero, 3/3 trials returned the caller plus four of its own
+# scan processes; in the documented `n=$(th_reap_fixture_root …)` shape
+# the reaper then SIGKILLed the very subshell that invoked it (rc 137,
+# verdict never returned). Same shape and magnitude as the
+# `grep -F "$root" /proc/*/cmdline` -> 100 hits / 100 trials the argv
+# witness produced.
+#
+# WHICH PART IS LOAD-BEARING, measured ON THIS TREE rather than assumed —
+# an earlier draft asserted the wrong one, which is the same defect as
+# `#913` itself: a precise-sounding mechanism sentence is what stops the
+# next reader looking. Each row is a single-element revert against
+# test-fixture-reap-ownership.sh, baseline 50 passed / 0 failed:
+#
+#   drop the CALLER-FRAME BASHPID exclusion      45/5   NECESSARY
+#   drop the three CONSUMER `cd /`s              46/4   NECESSARY
+#   drop the PRIMITIVE's own `cd /`              50/0   redundant
+#
+#   * The caller-frame `BASHPID` exclusion is necessary. `$$` names the
+#     TOP-LEVEL shell and never the subshell this function is running in,
+#     so excluding only `$$` is what let the reaper signal the very
+#     subshell that invoked it (rc 137).
+#   * The consumers' `cd /` is necessary — and it was NOT, one commit ago.
+#     This inverted when `_th_reap_scan`'s `cd /` moved INSIDE a subshell
+#     (so that a direct caller's cwd is no longer silently changed). A
+#     function call does not fork, so while that `cd` ran in the function's
+#     own frame it also moved the consumer's process substitution and
+#     covered for it. Subshelled, it no longer does. Two placements that
+#     used to be redundant are now one necessary and one not.
+#   * The primitive's `cd /` is therefore redundant for the public path and
+#     is kept deliberately, for DIRECT callers of `_th_reap_scan` — a
+#     primitive that is only correct when its caller knows the trick is the
+#     same shape as the defect. That is an exemption, stated, not implied.
+#
+# NOT the reason, though an earlier draft said it was: `cd /` inside
+# `_th_reap_scan` does not "leave the outer `< <(…)` subshell in the root".
+# When it ran unsubshelled it moved that frame — instrumented directly, the
+# frame's own /proc/$BASHPID/cwd read `/` after the call. The reason it was
+# insufficient alone was the CALLER frame, above.
+#
+# The general lesson, which is the whole cluster's: a predicate that
+# describes WHERE a process is cannot be evaluated from inside the place
+# it describes. Whatever the witness, ask where the observer is standing.
+#
+# THE POPULATION THAT COULD REACH THIS, enumerated so nobody re-derives it.
+# SEVENTEEN sites across 15 suites — the number this command actually prints,
+# checked against it rather than counted by hand (an earlier draft said
+# sixteen; `test-tmux-lookup-sigpipe.sh` has two `$PTMP` sites and they were
+# collapsed into one). Treat it as a FLOOR, not a census: the pattern requires
+# an all-caps name and a closing quote immediately after, so it misses
+# `cd "$RIG/A"` and any mid-line `cd`. A widened pattern gives 23 sites across
+# 18 suites; the SUITE LIST below is what matters and it is complete either
+# way. At the ref this note was written:
+#
+#   git ls-files 'monitor/watcher/test-*.sh' 'monitor/test-*.sh' \
+#       'monitor/watcher/test-integration/*.sh' \
+#     | while IFS= read -r f; do
+#         awk -v F="$f" '/^[[:space:]]*cd "\$[A-Z_]+"/ {print F"\t"$2}' "$f"; done
+#
+#   * EIGHT cd into `$REPO_ROOT` — the checkout, not a fixture root
+#     (test-conflict-marker-lint, test-diagnostics-outlive-their-paths,
+#     test-fixture-port-lint, test-guards-for-diff, test-strip-heredocs,
+#     test-summary-honesty-manifest, test-tmux-lookup-sigpipe,
+#     test-zsh-modifier-lint). Harmless for a reason that has nothing to do
+#     with the `/` guard, which an earlier draft credited: a caller standing
+#     in `$REPO_ROOT` is never standing in the mktemp root it passes.
+#   * EIGHT cd into a real mktemp fixture dir (test-claude-md-ancestor-timeline
+#     `$FIX`, test-claude-md-count-provenance `$FIX`, test-force-push-check
+#     `$TMP`, test-infra-review-recursion `$T`, test-respawn-loop-integration
+#     `$F`, test-tmux-lookup-sigpipe `$PTMP`, and both
+#     test-integration/*.sh `$HARNESS_DIR`). These are the ones that WOULD
+#     have tripped it — and none of them calls the reaper today: the only
+#     three files mentioning `th_reap_fixture_root` / `_th_reap_scan` /
+#     `th_reap_fixture_survivors` are this file and the two suites in `#890`
+#     (`git ls-files | xargs grep -l`). So the hazard was prospective, which is
+#     exactly why the header mattered more than the blast radius: it told the
+#     next adopter this could not happen.
+#
 # FIXED POINT, not a single pass. The code under test relaunches
 # supervisors, so a process can appear between the scan and the signal;
 # one pass looked clean exactly once during #860's diagnosis and was not
@@ -462,19 +702,42 @@ th_kill_own_child() {
 # a safety fix gets reverted for being slow. Both witnesses are therefore
 # collected in a single pass each: `ls -l` over the cwd symlinks, and one
 # `grep -l` over the cmdline files. Measured at 0 s for the same 512 pids.
-_th_reap_scan() {   # _th_reap_scan <root> -> owned pids, one per line
-    local root="$1" line pid tgt
-    while IFS= read -r line; do
-        [[ "$line" =~ /proc/([0-9]+)/cwd\ -\>\ (.*)$ ]] || continue
-        pid="${BASH_REMATCH[1]}"
-        tgt="${BASH_REMATCH[2]}"
-        # A removed directory is reported as `<path> (deleted)`. That is KEPT
-        # as a match: a process whose cwd no longer exists outlived the
-        # fixture that made it, which is the signature, not a disqualifier.
-        tgt="${tgt% (deleted)}"
-        [[ "$tgt" == "$root" || "$tgt" == "$root"/* ]] || continue
-        printf '%s\n' "$pid"
-    done < <(ls -l /proc/[0-9]*/cwd 2>/dev/null)
+_th_reap_scan() {   # _th_reap_scan <root> [<root>…] -> owned pids, one per line
+    # THE WHOLE BODY RUNS IN A SUBSHELL, and that is the point of this file's
+    # title (your-org/nexus-code#913). `cd /` is what takes the observer — this
+    # frame and every fork it makes, the `ls` and the process substitution —
+    # out of any fixture root, so a caller standing inside the root it is
+    # asking about still gets a correct answer. Doing it in a subshell means
+    # the caller's own cwd is not silently changed to `/` as a side effect,
+    # which an earlier draft did.
+    #
+    # BASHPID, not just `$$`: `$$` names the TOP-LEVEL shell and never the
+    # subshell a function call is running in. Excluding only `$$` is what let
+    # the reaper signal its own caller.
+    #
+    # Several roots, because the leak check needs to ask about a whole run's
+    # worth at once. One walk of /proc answers for all of them, and — the
+    # reason it lives here rather than being re-implemented at the call site —
+    # a second copy of this walk is a second place to get the observer wrong.
+    ( cd / 2>/dev/null || true
+      local line pid tgt r
+      while IFS= read -r line; do
+          [[ "$line" =~ /proc/([0-9]+)/cwd\ -\>\ (.*)$ ]] || continue
+          pid="${BASH_REMATCH[1]}"
+          tgt="${BASH_REMATCH[2]}"
+          # A removed directory is reported as `<path> (deleted)`. That is KEPT
+          # as a match: a process whose cwd no longer exists outlived the
+          # fixture that made it, which is the signature, not a disqualifier.
+          tgt="${tgt% (deleted)}"
+          (( pid == $$ || pid == BASHPID )) && continue
+          for r in "$@"; do
+              [[ -n "$r" ]] || continue
+              if [[ "$tgt" == "$r" || "$tgt" == "$r"/* ]]; then
+                  printf '%s\n' "$pid"
+                  break
+              fi
+          done
+      done < <(ls -l /proc/[0-9]*/cwd 2>/dev/null) )
 }
 #
 # CWD IS THE ONLY WITNESS, AND THAT IS THE POINT. An earlier draft added a
@@ -525,12 +788,16 @@ th_reap_fixture_root() {
         found=0; seen=" "
         while read -r pid; do
             [[ "$pid" =~ ^[0-9]+$ ]] || continue
-            (( pid == $$ )) && continue
+            # $$ names the TOP-LEVEL shell, never the subshell this function
+            # is usually running in (`n=$(th_reap_fixture_root …)`). BASHPID
+            # names the current process; excluding only $$ let the reaper
+            # SIGKILL its own caller. See the header (your-org/nexus-code#913).
+            (( pid == $$ || pid == BASHPID )) && continue
             [[ "$seen" == *" $pid "* ]] && continue    # the two witnesses overlap
             seen+="$pid "
             found=1
             kill "-$sig" "$pid" 2>/dev/null && total=$(( total + 1 ))
-        done < <(_th_reap_scan "$root")
+        done < <(cd / 2>/dev/null; _th_reap_scan "$root")
         (( found == 0 )) && { printf '%s' "$total"; return 0; }
         sleep 0.3
     done
@@ -543,7 +810,7 @@ th_reap_fixture_root() {
     # (`#622`). The output here is a handful of pids, so there is nothing to
     # save by stopping early and a hazard population to stay out of.
     local remaining
-    remaining=$(_th_reap_scan "$root")
+    remaining=$(cd / 2>/dev/null; _th_reap_scan "$root")
     if [[ -z "$remaining" ]]; then
         printf '%s' "$total"; return 0
     fi
@@ -562,7 +829,7 @@ th_reap_fixture_survivors() {
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
         cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || cwd='<unreadable>'
         printf 'pid %s cwd=%s; ' "$pid" "$cwd"
-    done < <(_th_reap_scan "$root" | sort -u)
+    done < <(cd / 2>/dev/null; _th_reap_scan "$root" | sort -u)
 }
 
 # ---------------------------------------------------------------------------
@@ -616,6 +883,168 @@ set -g pane-base-index 0
 set -g status off
 set -g history-limit 5000
 CONF
+}
+
+# ---------------------------------------------------------------------------
+# tmux SOCKET-PATH CEILING (your-org/nexus-code#991)
+# ---------------------------------------------------------------------------
+#
+# THE THREE OUTCOMES, and the one that used to wear another's clothes. A suite
+# that drives a real tmux server can end in three states, and before this block
+# the second was INDISTINGUISHABLE from the third:
+#
+#   1. the socket path FITS and tmux answers        -> assertions run
+#   2. the socket path CANNOT BE FORMED             -> was a FAIL
+#   3. the code under test is genuinely broken      -> is a FAIL
+#
+# `sun_path` is 108 bytes and 107 is the longest path a NUL-TERMINATING caller
+# can bind (108 binds with a full-struct `addrlen` — the limit is the calling
+# convention, not the kernel); tmux composes `${TMUX_TMPDIR:-/tmp}/tmux-<uid>/<socket-name>`; and a
+# session-scratchpad `TMUX_TMPDIR` (~124 bytes here) is over the limit BEFORE
+# the suffix. Every `tmux -L` then dies `File name too long`, the suite takes
+# its precondition branch, and reports FAIL. Five suites went red that way in
+# one session, five attributions were wrong, and a published finding had to be
+# retracted.
+#
+# WHY IT IS NOT AN ORDINARY FLAKE, and therefore why prose was never going to
+# be enough. It reproduces IDENTICALLY on every tree, so the standard triage —
+# "does this also fail on clean `dev`?" — answers YES, which reads as
+# "pre-existing, not mine" and actually means "the apparatus is broken in
+# both". A differential where one side PASSES is sound; one where BOTH fail
+# establishes nothing about either.
+#
+# EXIT 78 IS THE SEPARATION, and it needs no change to the runner's status
+# vocabulary. `run-tests.sh` prints the rc on every non-zero row
+# (`FAIL  test-x.sh  0.01s  rc=78`), so the refusal is visible and greppable
+# where a reader already looks, while remaining RED — because coverage really
+# was lost and a SKIP would hide that (`#568` A6). 77 was not reused for
+# exactly that reason: this is not "this host cannot run the case", it is
+# "the environment handed me an address that cannot exist".
+#
+# The measurement itself lives in `monitor/_tmux_socket.sh` — ONE
+# implementation, because a second copy of a rule is a rule that drifts.
+#
+# SOURCED CONDITIONALLY, AND THE FALLBACK REFUSES RATHER THAN DEGRADES.
+# `test-helper-honesty.sh` copies THIS FILE ALONE into a fixture tree
+# (`monitor/watcher/_test_helpers.sh`, no sibling `monitor/_tmux_socket.sh`), so
+# an unconditional `.` prints `No such file or directory` on stderr for every
+# such fixture — and a suite that then CALLED the helper would find
+# `tmux_socket_verdict` undefined and get whatever `command_not_found_handle`
+# does with it. Measured before this guard: source rc 0, one stderr line, the
+# function silently half-defined.
+#
+# So: source it when it is there, and otherwise define a stand-in that exits
+# 78 the moment anybody relies on it. Quiet at source time — a fixture that
+# never asks a socket question is not broken by the absence — and LOUD at the
+# only point where the absence can produce a wrong answer.
+if [ -r "$(dirname "${BASH_SOURCE[0]}")/../_tmux_socket.sh" ]; then
+    . "$(dirname "${BASH_SOURCE[0]}")/../_tmux_socket.sh"
+else
+    _th_tmux_socket_lib_missing=1
+fi
+
+# Reserved rc for an environment that cannot host a tmux socket.
+TH_RC_TMUX_SOCKET_REFUSED=78
+
+# th_require_tmux_socket <socket-name> [<tmux-tmpdir>]
+#
+# Call this BEFORE the first `tmux -L <socket-name>` in a suite. Returns
+# silently when the path fits; otherwise prints the refusal and exits 78.
+#
+# TAKES THE SOCKET NAME because the ceiling is a property of the WHOLE path,
+# not of the directory: two suites inheriting the same `TMUX_TMPDIR` can
+# straddle the limit purely on how long they made their socket name. A
+# directory-only check would pass one and mis-blame the other.
+#
+# THE SECOND ARGUMENT IS NOT OPTIONAL DECORATION. A suite that PINS its own
+# `TMUX_TMPDIR` (`env … TMUX_TMPDIR="$TT" tmux -L …`) is immune to the ambient
+# value, and checking the ambient one for it would produce a FALSE REFUSAL —
+# the same class of wrong answer, pointing the other way. Pass the directory
+# the suite actually uses; omit it only when the suite genuinely inherits.
+# th_require_fixture_repo <dir> [<label>] — REFUSE a fixture path that would
+# aim git at the ENCLOSING repository (your-org/nexus-code#1429). `git -C ""`
+# is documented as "do nothing" and `cd ""` returns 0 without moving, so a
+# fixture path variable that expanded EMPTY — a `local a="$1" b="$a"`
+# expansion-order slip, an unset var under no `set -u`, a `mktemp` whose rc
+# nobody read — does not make the next git command fail: it runs it against
+# the CURRENT repository, which in a nexus is the shared clone or the nexus
+# itself, and WRITES there at rc 0. The walk-up trap's empty-string cousin.
+# Three refusals, each named: empty, not a directory, not ITS OWN repository
+# root (monitor/repo-root.sh, the fail-closed three-valued predicate — a
+# subdirectory of the nexus answers `no`, and "could not tell" is not `yes`).
+# Exit 97 so the reader cannot mistake it for an assertion failure.
+TH_RC_FIXTURE_REPO_REFUSED=97
+th_require_fixture_repo() {
+    local dir="${1-}" label="${2:-fixture repo}"
+    local rr; rr="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../repo-root.sh"
+    if [ -z "$dir" ]; then
+        printf '  REFUSED: %s path is EMPTY — `git -C ""` and `cd ""` are no-ops, so every\n           git command after this would run against the ENCLOSING repository\n           at rc 0 (your-org/nexus-code#1429). Exiting %s.\n' "$label" "$TH_RC_FIXTURE_REPO_REFUSED" >&2
+        exit "$TH_RC_FIXTURE_REPO_REFUSED"
+    fi
+    if [ ! -d "$dir" ]; then
+        printf '  REFUSED: %s path is not a directory: %s (your-org/nexus-code#1429). Exiting %s.\n' "$label" "$dir" "$TH_RC_FIXTURE_REPO_REFUSED" >&2
+        exit "$TH_RC_FIXTURE_REPO_REFUSED"
+    fi
+    local verdict; verdict=$(bash "$rr" "$dir" 2>/dev/null) || true
+    case "$verdict" in
+        verdict=yes*) return 0 ;;
+        *) printf '  REFUSED: %s path is not its OWN repository root: %s\n           repo-root.sh says: %s\n           A probe here would read or WRITE the enclosing repository (your-org/nexus-code#1429, #1196). Exiting %s.\n' \
+               "$label" "$dir" "${verdict:-<no verdict>}" "$TH_RC_FIXTURE_REPO_REFUSED" >&2
+           exit "$TH_RC_FIXTURE_REPO_REFUSED" ;;
+    esac
+}
+
+th_require_tmux_socket() {
+    local name="${1:?th_require_tmux_socket: socket name required}"
+    local dir="${2-}"
+    if [ "${_th_tmux_socket_lib_missing:-0}" = 1 ]; then
+        printf '  REFUSED: monitor/_tmux_socket.sh is unreachable from %s, so the socket\n' \
+               "$(dirname "${BASH_SOURCE[0]}")" >&2
+        printf '           path CANNOT BE MEASURED. Proceeding would mean asserting on a\n' >&2
+        printf '           precondition nobody checked, which is the defect this helper\n' >&2
+        printf '           exists to remove (your-org/nexus-code#991). Exiting %s.\n' \
+               "$TH_RC_TMUX_SOCKET_REFUSED" >&2
+        exit "$TH_RC_TMUX_SOCKET_REFUSED"
+    fi
+    local verdict rc measured sockpath
+    if [ -n "$dir" ]; then verdict=$(tmux_socket_verdict "$name" "$dir")
+    else                   verdict=$(tmux_socket_verdict "$name"); fi
+    rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    measured="${verdict#* }"; measured="${measured%% *}"
+    sockpath="${verdict#* }"; sockpath="${sockpath#* }"
+    {
+        printf '  REFUSED: tmux socket path is %s bytes; the usable maximum is %s.\n' \
+               "${measured%%/*}" "$TMUX_SUN_PATH_MAX"
+        printf '           path        : %s\n' "$sockpath"
+        printf '           TMUX_TMPDIR : %s\n' "${dir:-${TMUX_TMPDIR:-<unset> (tmux falls back to /tmp)}}"
+        printf '           This is NOT a failure of the code under test — tmux was never\n'
+        printf '           asked to do anything; the address could not be formed\n'
+        printf '           (sun_path is 108 bytes; 107 is the most a NUL-terminating\n'
+        printf '           caller can bind). your-org/nexus-code#991.\n'
+        # THE REMEDY MUST NAME THE VARIABLE THAT ACTUALLY DECIDED THE PATH. When a
+        # caller passes an explicit directory, `TMUX_TMPDIR` is NOT what produced
+        # it — `test-cc-harness-socket-isolation.sh` derives its socket root from
+        # `mktemp -d -t`, i.e. from `$TMPDIR` — and telling that reader to shorten
+        # `TMUX_TMPDIR` sends them to change a variable with no effect on the
+        # failure. A remedy that does not work is worse than none: it costs a
+        # round of "I did what it said and it still fails".
+        if [ -n "$dir" ]; then
+            printf '           The directory measured was passed explicitly by the caller, so\n' >&2
+            printf '           TMUX_TMPDIR is NOT what produced it. Here TMPDIR=%s\n' \
+                   "${TMPDIR:-<unset>}" >&2
+            printf '           Remedy: shorten whatever produces that directory (for a\n' >&2
+            printf '           `mktemp -d -t` root that means TMPDIR), e.g.\n' >&2
+            printf '                   export TMPDIR=%s && mkdir -p "$TMPDIR"\n' \
+                   "$(tmux_socket_short_tmpdir "$$")" >&2
+        else
+            printf '           Remedy: export TMUX_TMPDIR=%s && mkdir -p "$TMUX_TMPDIR"\n' \
+                   "$(tmux_socket_short_tmpdir "$$")"
+        fi
+        printf '           No assertions ran. Exiting %s (NOT 77/SKIP: coverage was lost).\n' \
+               "$TH_RC_TMUX_SOCKET_REFUSED"
+    } >&2
+    exit "$TH_RC_TMUX_SOCKET_REFUSED"
 }
 
 # th_fork_headroom
@@ -800,6 +1229,30 @@ th_tmux_wait_pane() {
     local -a cmd=()
     while (( $# )); do [[ "$1" == "--" ]] && { shift; break; }; cmd+=("$1"); shift; done
     local target="$1" needle="$2" timeout="${3:-30}"
+    # EMPTY NEEDLE (your-org/nexus-code#1038). Same `grep -qF ""` hazard as
+    # assert_contains, but the consequence here is worse in kind: this is a
+    # HAPPENS-BEFORE primitive, and an empty needle makes it return 0 on the
+    # FIRST poll — so the caller is told "tmux has already processed the
+    # earlier escape sequence" when tmux may not have processed anything. The
+    # sleep-free ordering guarantee in the comment above becomes a sleep-free
+    # guarantee of nothing, and every assertion the caller sequences after it
+    # inherits the lie.
+    #
+    # DECLARED HONESTLY: this is HARDENING, not a live bug fix. At `3458180`
+    # this primitive has exactly ONE caller (`test-paste-bracketed.sh:84`,
+    # `git grep -n th_tmux_wait_pane 3458180 -- '*.sh'`) and it passes the
+    # LITERAL `RDY`, so no reachable empty path exists today. The guard is for
+    # the next caller, which will pass a captured sentinel.
+    #
+    # It refuses IMMEDIATELY rather than falling through to the poll loop: a
+    # malformed call should not also cost the full timeout before failing.
+    if [[ -z "$needle" ]]; then
+        printf 'th_tmux_wait_pane: EMPTY needle — refusing (your-org/nexus-code#1038).\n' >&2
+        printf '  An empty needle matches the first capture unconditionally, so this\n' >&2
+        printf '  would report a happens-before edge that was never established.\n' >&2
+        printf '  Fix the CALLER: check the rc of whatever produced the sentinel.\n' >&2
+        return 2
+    fi
     local deadline=$(( SECONDS + timeout ))
     while (( SECONDS < deadline )); do
         grep -qF -- "$needle" \
@@ -817,17 +1270,60 @@ th_tmux_wait_pane() {
 # nothing. That is the very defect class this issue is about: a check that cannot
 # fail is believed.
 #
-# Scoped deliberately to `assert_*` / `th_*` names: any OTHER missing command
-# keeps stock bash behaviour (127 + the usual message), so no existing suite that
+# Scoped deliberately to the names below: any OTHER missing command keeps stock
+# bash behaviour (127 + the usual message), so no existing suite that
 # deliberately invokes an absent binary changes behaviour. The sentinel file
 # closes the subshell hole — an increment inside `$( )` would be discarded, but
 # the file survives, and th_summary_and_exit reads it.
-_TH_MISSING_ASSERT_SENTINEL="${TMPDIR:-/tmp}/.th-missing-assert.$$"
+#
+# ── your-org/nexus-code#922: THE PREFIX WAS A NARROWER BOUNDARY THAN THE RULE ──
+#
+# The rule this guard states is "a missing assertion helper must fail the
+# suite". What it IMPLEMENTED was a NAME PREFIX. A misspelled `assert_eqq` is
+# caught (it matches `assert_*` — MEASURED, not assumed); a bare `ok` is not,
+# because `ok` is an assertion helper by FUNCTION and not by spelling. It fell
+# to the default arm, printed `ok: command not found`, returned 127, and was
+# counted by nothing.
+#
+# Not hypothetical, and not a small case: the reporter of `#922` wrote the
+# HEADLINE ASSERTION of `#881` as a bare `ok`/`bad` during `#907`. The suite
+# went 222 -> 251 passed, 0 failed, with the one check the whole issue rested on
+# silently absent. The assertion-count floor could not catch it either — a 127
+# leaves no trace in the verdict OR the count, so the total is simply one lower
+# than the author believes, with no baseline to compare against.
+#
+# THE ADDED NAMES ARE MEASURED, NOT GUESSED. They are exactly the
+# assertion-shaped names that some helper-sourcing suite DEFINES LOCALLY and
+# this file does not export — which is the mechanism by which a name "looks
+# available" to somebody moving between suites. At e256d4a, across the 143
+# suites that source this file (`git ls-files -- 'monitor/**/*.sh' 'monitor/*.sh'
+# | xargs grep -l _test_helpers.sh | wc -l`, cross-checked by shebang):
+#
+#     pass  14 suites      ok    5 suites
+#     fail  14 suites      bad   4 suites
+#
+# `pass` and `fail` are nearly three times as common as the two the issue
+# named, and none of the four is a real command on this host, so all four reach
+# this handler rather than executing something.
+#
+# WHAT THIS STILL DOES NOT CATCH, stated because a boundary drawn narrower than
+# its mechanism is exactly the defect above: a helper name that is neither
+# `assert_*`, `th_*`, nor one of these four — a suite-local `expect`, `check`,
+# `verify`. This handler can only fire for names somebody enumerated. The
+# general case is not solvable at call time (an unknown missing name is
+# indistinguishable from a deliberately-absent binary), and is answered
+# statically instead by `monitor/watcher/undefined-helper-lint.sh`, which
+# derives the whole cross-suite name population from the corpus rather than from
+# a list.
+_TH_MISSING_ASSERT_SENTINEL="${TMPDIR:-/tmp}/.th-missing-assert.$_TH_KEY"
 command_not_found_handle() {
     case "${1:-}" in
-        assert_*|th_*)
+        assert_*|th_*|ok|bad|pass|fail)
             printf '  FAIL: MISSING TEST HELPER `%s` — this assertion did NOT run.\n' "$1" >&2
-            printf '        A suite that calls an undefined assert_* silently passes; failing loudly instead.\n' >&2
+            printf '        An undefined helper exits 127 counted by NOTHING, so the suite would\n' >&2
+            printf '        otherwise report success for a check that never executed. Define it,\n' >&2
+            printf '        or use one this file exports (assert_eq/contains/not_contains/empty/\n' >&2
+            printf '        file_exists/no_file/rc). your-org/nexus-code#922.\n' >&2
             _th_fail_missing
             : > "$_TH_MISSING_ASSERT_SENTINEL" 2>/dev/null || true
             return 127
@@ -979,6 +1475,29 @@ if [[ -z "${_TH_PORTS_INIT:-}" ]]; then
     : > "$_TH_PORTS_FILE" 2>/dev/null || true
 fi
 
+# REAP THIS PROCESS'S OWN FILES ON EXIT, WHATEVER ROAD IT LEAVES BY
+# (your-org/nexus-code#1423, #1474). `th_summary_and_exit` removes the ledger
+# and the ports file, but most suites never call it — they carry their own
+# tally — and a suite that dies on a timeout calls nothing. Measured on the
+# operator's node: 37,727 ledgers + 21,537 ports files live, all zero bytes,
+# one pair per process. A sourced library must not CLOBBER the suite's EXIT
+# trap, so this installs one only when none exists at source time, and
+# `th_trap_exit` below chains for suites that want both. run-tests.sh closes
+# the rest of the gap by giving every suite a private TMPDIR it deletes.
+_th_reap_own_tmp() {
+    rm -f "${_TH_LEDGER:-}" "${_TH_PORTS_FILE:-}" 2>/dev/null || true
+}
+# th_trap_exit <command> — append <command> to the EXIT trap without losing
+# whatever handler is already installed (the helper's reaper, or the suite's).
+th_trap_exit() {
+    local _prev
+    _prev=$(trap -p EXIT | sed -n "s/^trap -- '\(.*\)' EXIT\$/\1/p" | sed "s/'\\\\''/'/g")
+    if [[ -n "$_prev" ]]; then trap -- "$_prev; $1" EXIT; else trap -- "$1" EXIT; fi
+}
+if [[ -z "$(trap -p EXIT)" ]]; then
+    trap -- '_th_reap_own_tmp' EXIT
+fi
+
 # th_alloc_port <base> [<extra-exclude-csv>] [<bind-addr>]
 #
 # Print a port in [base, base+899] that `bind()` — not `connect()` — reports as
@@ -1066,85 +1585,19 @@ sys.exit(1)
 #      mis-parsed, so it discards its own output, emits the file UNCHANGED, and
 #      says so on stderr. The lint then over-reports (its old behaviour) instead
 #      of under-reporting. Loud and conservative beats silent and permissive.
-_TH_QUOTES_AWK="$(dirname "${BASH_SOURCE[0]}")/_shell_quotes.awk"
+_TH_SHF_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/shell-files.sh"
+# MOVED to monitor/shell-files.sh as `shf_strip_heredocs` (your-org/nexus-code#1227).
+# It is needed by `shf_strip_comments`, and a PRODUCTION predicate must not
+# source a TEST helper — which is what `undefined-helper-lint.sh:260` currently
+# has to do. This forwarder keeps the six existing `th_strip_heredocs` callers
+# byte-identical, and keeps ONE implementation: a second copy here would be the
+# `#838`/`#842` two-wrong-machines mistake this function's own header names.
 th_strip_heredocs() {
-    local f="$1"
-    [[ -r "$f" ]] || return 1
-    # The quote state machine is SHARED with uncounted-abort-lint.sh
-    # (`_shell_quotes.awk`). It used to be inline here and a second, wrong copy
-    # lived in the lint — a `sed` pair that paired any two apostrophes and ate
-    # real code between them. One machine, two callers, is the point.
-    local _q; _q="$(cat "$_TH_QUOTES_AWK" 2>/dev/null)" || return 1
-    [[ -n "$_q" ]] || return 1
-    awk "$_q"'
-    function push(d, dash_) { n++; delim[n] = d; dsh[n] = dash_ }
-    function scan(s,   i, L, j, d, dash_, q, arith, c2, c1, qm) {
-        L = length(s); i = 1; arith = 0
-        # Quote state from the SHARED machine. A `<<` inside a quoted string is
-        # TEXT, not a redirection operator — monitor/test-conflict-marker-lint.sh
-        # passes a single-quoted literal [cat <<EOF] to a helper as an argument.
-        # The mask is consulted rather than a strip applied, because a heredoc
-        # delimiter is usually QUOTED (<<[EOF]) and stripping quoted text would
-        # delete the very delimiter this function exists to capture.
-        qm = quote_mask(s)
-        while (i <= L) {
-            c1 = substr(s, i, 1)
-            if (substr(qm, i, 1) == "1") { i++; continue }
-            if (c1 == "#") break        # rest of the line is a comment
-            c2 = substr(s, i, 2)
-            # Track arithmetic context so a left shift is never read as a
-            # heredoc. Both `$(( … ))` and a bare `(( … ))` command count.
-            if (c2 == "((") { arith++; i += 2; continue }
-            if (c2 == "))" && arith > 0) { arith--; i += 2; continue }
-            if (c2 == "<<") {
-                if (substr(s, i + 2, 1) == "<") { i += 3; continue }   # herestring
-                if (arith > 0) { i += 2; continue }                    # left shift
-                j = i + 2; dash_ = 0
-                if (substr(s, j, 1) == "-") { dash_ = 1; j++ }
-                while (substr(s, j, 1) == " " || substr(s, j, 1) == "\t") j++
-                q = substr(s, j, 1); d = ""
-                if (q == "\"" || q == "'"'"'") {
-                    j++
-                    while (j <= L && substr(s, j, 1) != q) { d = d substr(s, j, 1); j++ }
-                    j++
-                } else {
-                    if (q == "\\") j++
-                    while (j <= L && substr(s, j, 1) ~ /[A-Za-z0-9_]/) { d = d substr(s, j, 1); j++ }
-                }
-                # Letter-or-underscore initial: rejects the numeric delimiter a
-                # left shift like `(o1 << 24)` would otherwise manufacture.
-                if (d ~ /^[A-Za-z_][A-Za-z0-9_]*$/) push(d, dash_)
-                i = j; continue
-            }
-            i++
-        }
-    }
-    { raw[NR] = $0 }
-    {
-        if (n > 0) {
-            t = $0
-            if (dsh[1]) sub(/^\t+/, "", t)
-            if (t == delim[1]) {
-                for (k = 1; k < n; k++) { delim[k] = delim[k+1]; dsh[k] = dsh[k+1] }
-                n--
-            }
-            out[NR] = ""        # body AND terminator are data, never code
-            next
-        }
-        c = $0; sub(/^[ \t]+/, "", c)
-        if (substr(c, 1, 1) != "#") scan($0)   # a comment cannot open a heredoc
-        out[NR] = $0
-    }
-    END {
-        if (n > 0) {
-            printf("th_strip_heredocs: %s: heredoc `%s` unterminated at EOF — ", FILENAME, delim[1]) > "/dev/stderr"
-            printf("mis-parse suspected, emitting the file UNSTRIPPED\n") > "/dev/stderr"
-            for (k = 1; k <= NR; k++) print raw[k]
-            exit 0
-        }
-        for (k = 1; k <= NR; k++) print out[k]
-    }
-    ' "$f"
+    if ! declare -F shf_strip_heredocs >/dev/null 2>&1; then
+        # shellcheck source=monitor/shell-files.sh
+        . "$_TH_SHF_LIB" || return 1
+    fi
+    shf_strip_heredocs "$@"
 }
 
 th_summary_and_exit() {
@@ -1176,11 +1629,25 @@ th_summary_and_exit() {
     (( _lp > ${PASS:-0} )) && { _lost_pass=$(( _lp - PASS )); PASS=$_lp; }
     (( _ls > ${SKIP:-0} )) && SKIP=$_ls
     rm -f "$_TH_LEDGER" 2>/dev/null || true
+    # The ports file had no removal anywhere: 33,786 zero-byte `.th-ports.<pid>`
+    # files under /tmp on 2026-09-03, one per suite process, beside 71,766
+    # ledgers left by suites that never reached this line. Both are dirents in a
+    # tmpfs — RAM — and both are now also reaped by monitor/tmpfs-guard.sh,
+    # which is what covers the early-death paths this line cannot.
+    rm -f "$_TH_PORTS_FILE" 2>/dev/null || true
 
     if [[ -f "$_TH_MISSING_ASSERT_SENTINEL" ]]; then
         rm -f "$_TH_MISSING_ASSERT_SENTINEL"
         (( FAIL >= 1 )) || FAIL=1     # the increment may have been lost in a subshell
-        echo "  (at least one assertion helper was MISSING — see the FAIL lines above)" >&2
+        # your-org/nexus-code#939 F1. This used to say "see the FAIL lines above".
+        # When the sentinel is genuine those lines are there; the message is
+        # still wrong to promise them unconditionally, because the reader who
+        # finds none is sent to doubt their own eyes rather than the harness.
+        # Say what is known — a sentinel was found — and where to look.
+        echo "  (a MISSING TEST HELPER was recorded during this run: an assertion did NOT execute.)" >&2
+        echo "  Look for a \`FAIL: MISSING TEST HELPER\` line above. If there is NONE, the" >&2
+        echo "  helper fired in a subshell whose output was captured or discarded — grep the" >&2
+        echo "  suite for calls to helpers it neither defines nor sources." >&2
     fi
 
     # NOTHING WAS ASSERTED (your-org/nexus-code#805, variant 1). Checked AFTER
@@ -1335,8 +1802,18 @@ setup_fake_nexus() {
     # fallback would reinstate exactly the defect. A fixture that copies
     # `ng` alone therefore produces an `ng` that cannot run at all, so
     # every library `ng` sources must be copied alongside it.
+    # `_merge_ref_base.sh` joined this list with `ng pr merge --verify-base`
+    # (your-org/nexus-code#880): that flag SOURCES the library, and a fixture
+    # missing it makes the verb refuse every merge. The refusal is correct —
+    # absence of the checker is not evidence the base is fine — but it is a
+    # fixture defect masquerading as a verdict, which is the shape this whole
+    # branch is about. `test-ng-pr.sh` covers the genuinely-missing case by
+    # deleting the file from a fixture ON PURPOSE.
     local _th_lib
-    for _th_lib in _bookkeeping.sh; do
+    # `_nexus-root.sh` joins the list for the same reason (your-org/nexus-code#1077):
+    # `ng` refuses to start without the primary-root resolver, because a silent
+    # un-pinning of reports and assets from the primary is worse than a refusal.
+    for _th_lib in _bookkeeping.sh _merge_ref_base.sh _nexus-root.sh; do
         [[ -f "$_th_dir/../$_th_lib" ]] && cp "$_th_dir/../$_th_lib" "$FAKE_NEXUS/monitor/$_th_lib"
     done
 
@@ -1389,6 +1866,18 @@ STUB
 # `--paginate` is 1-arg; bare `/path` positional is the endpoint;
 # other tokens are skipped. Closes your-org/nexus-code#38.
 make_gh_stub() {
+    # ONE LINE OF DELEGATION (your-org/nexus-code#932). The template this
+    # function used to carry CAPTURED `--jq` into `jq_expr` and never APPLIED
+    # it, so every suite built here was blind to the run/job selection layer
+    # that lives inside those expressions; the shared builder was the single
+    # row of the stub-contract guard's blind-list ratchet. `_gh_stub.sh`'s
+    # walker is a superset (`--jq=`, the jq-absent refusal, `ghs_emit` for an
+    # arm that wants the expression evaluated) and `--no-autostate` pins the
+    # state layer OFF in the generated file, so the callers that pre-digest
+    # keep exactly what they had: same capture line, same `$endpoint` /
+    # `$method` / `$jq_expr` in scope, same `--with-body-capture` semantics
+    # (the body on `--input -`/`--input FILE`, TRUNCATED on a bodiless call),
+    # stdin untouched unless a body was announced (#921).
     local stub_path="$1" capture_path="$2"; shift 2
     local body_capture=""
     while (( $# > 0 )); do
@@ -1400,60 +1889,9 @@ make_gh_stub() {
                 ;;
         esac
     done
-
-    local cases_body
-    cases_body=$(cat)
-
-    # Quoted-literal limiter ('STUB') keeps every $... and backslash
-    # in the template literal; placeholders are substituted afterward.
-    local template
-    template=$(cat <<'STUB'
-#!/usr/bin/env bash
-printf '%s\n' "$*" >> @@CAPTURE@@
-if [[ "${1:-}" != "api" ]]; then exit 0; fi
-shift
-method="GET"
-endpoint=""
-while (( $# > 0 )); do
-    case "$1" in
-        -X)            method="$2"; shift 2 ;;
-        -H|-f|--input) shift 2 ;;
-        --paginate)    shift ;;
-        --)            shift; break ;;
-        /*)            endpoint="$1"; shift ;;
-        -*)            shift ;;
-        *)             shift ;;
-    esac
-done
-@@STDIN@@
-case "$endpoint" in
-@@CASES@@
-esac
-exit 0
-STUB
-)
-
-    local stdin_block
-    if [[ -n "$body_capture" ]]; then
-        stdin_block=$(printf 'if ! [ -t 0 ]; then cat > %q 2>/dev/null || true; else : > %q; fi' \
-            "$body_capture" "$body_capture")
-    else
-        stdin_block='if ! [ -t 0 ]; then cat >/dev/null 2>&1 || true; fi'
-    fi
-
-    # Quote the capture path so paths with spaces survive.
-    local capture_quoted
-    capture_quoted=$(printf '%q' "$capture_path")
-
-    # ${VAR//PAT/REP} doesn't process backslashes inside REP for
-    # literal substitution; safe for the case body the caller passes.
-    template=${template//@@CAPTURE@@/$capture_quoted}
-    template=${template//@@STDIN@@/$stdin_block}
-    template=${template//@@CASES@@/$cases_body}
-
-    mkdir -p "$(dirname "$stub_path")"
-    printf '%s\n' "$template" > "$stub_path"
-    chmod +x "$stub_path"
+    local _mgs_dir; _mgs_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    declare -F ghs_make_stub >/dev/null 2>&1 || . "$_mgs_dir/_gh_stub.sh"
+    ghs_make_stub "$stub_path" "$capture_path" --no-autostate ${body_capture:+--with-body-capture "$body_capture"}
 }
 
 # Run a command with hermetic env. Unsets the five operator-side
@@ -1556,4 +1994,172 @@ th_require_stub_claude() {
     echo "   short-circuits monitor/_claude-bin.sh before PATH is consulted.)" >&2
     echo "  your-org/nexus-code#746" >&2
     exit 1
+}
+
+# th_pin_ng_state <ng-path> <state-dir>
+#
+# ESTABLISH the state directory every `ng` this suite starts will write to, and
+# REFUSE TO CONTINUE if the pin did not take (your-org/nexus-code#1306, #833).
+#
+# ── WHY A PER-CALL `--state-dir` IS NOT A PIN ──────────────────────────────
+#
+# `--state-dir` is parsed by the VERB. `ng`'s process-level `STATE_DIR` is
+# resolved once at startup by `_resolve_state_dir`, whose order is
+# `$NEXUS_STATE_DIR` -> inherited `$NEXUS_ROOT/monitor/.state` -> config
+# `nexus.root` -> script-relative. Its usage tap fires BEFORE dispatch and
+# appends to that process-level path, so a suite that passes `--state-dir` at
+# every call site has pinned the LEDGER and pinned NOTHING ELSE. Measured on
+# this host at `0b82ffb2`, one `ng skeptic-evidence` against a nonexistent key
+# with `--state-dir` supplied:
+#
+#     NEXUS_ROOT=<decoy>                        -> <decoy>/monitor/.state/ng-usage.jsonl  WRITTEN
+#     NEXUS_ROOT=<decoy> NEXUS_STATE_DIR=<pin>  -> <decoy> untouched, row lands in <pin>
+#
+# In an agent shell the inherited `NEXUS_ROOT` is the operator's PRIMARY, so the
+# first row is a write into live canonical state, at rc 0, with every assertion
+# passing. No PASS/FAIL diff can see it; `monitor/nexus-root-sensitivity.sh`
+# is the instrument that can.
+#
+# ── AND `env -u NEXUS_ROOT` IS NOT A FIX FOR THIS CLASS ────────────────────
+#
+# `nexus-root-sensitivity.sh`'s own remediation text says *"scrub it (unset /
+# env -u) or pin it to the fixture at every spawn call site"*. That is right for
+# the SPAWN class (#655) and WRONG here, because `_resolve_state_dir` does not
+# stop when `NEXUS_ROOT` is gone — its THIRD arm reads config `nexus.root`, and
+# on an operator's primary clone that key IS the primary. Measured on this host,
+# `ng help` with NEXUS_ROOT unset and `nexus.root` pointed at a decoy:
+#
+#     env -u NEXUS_ROOT                      -> 1 row in <decoy>/monitor/.state
+#     env -u NEXUS_ROOT NEXUS_STATE_DIR=<pin> -> 0 rows in decoy, 1 row in <pin>
+#
+# and, separately measured, the primary's `config/load.sh nexus.root` answers
+# `/shared/.../nexus` — the primary itself.
+#
+# The direction is the bad one: `config/nexus.yml` is GITIGNORED, so it is
+# absent from the probe's decoy (tracked files only) and `nexus.root` there
+# answers the example file's placeholder, whose `monitor/.state` does not exist,
+# so the tap no-ops. A scrub-fixed suite therefore reports HERMETIC under the
+# probe and still writes into the operator's tree at home — a false negative
+# produced by following the gate's own advice. Arm 1 is unconditional; use it.
+#
+# ── WHY THE CHECK IS BEHAVIOURAL, AND WHY IT CANNOT LEAK WHILE CHECKING ────
+#
+# Asserting `$NEXUS_STATE_DIR == <dir>` would test the SPELLING of the export,
+# not the PROPERTY that `ng` honours it — the distinction
+# `nexus-root-sensitivity.sh`'s own header is built on. So this runs a real
+# `ng` and looks at where the row landed.
+#
+# The negative arm needs somewhere for a FAILED pin to land, and that place must
+# not be the operator's tree: the probe therefore runs with `NEXUS_ROOT` pointed
+# at a throwaway decoy carrying a `monitor/.state` directory. That decoy is both
+# the containment and the POSITIVE CONTROL — it is a place a leak genuinely
+# would appear (the tap is `[[ -n "$verb" && -d "$STATE_DIR" ]]`, so an ABSENT
+# directory makes the tap a no-op and the check would pass by never exercising
+# the write path at all). Both arms are asserted: the row must be IN the pin and
+# ABSENT from the decoy. One arm alone is satisfiable by a broken `ng` that
+# writes nowhere.
+#
+# COVERAGE BOUNDARY, stated because a check's silence is worth exactly its
+# coverage: this speaks for processes that resolve state through
+# `_resolve_state_dir` — `ng` and the scripts that mirror its order
+# (`retire-preflight.sh`, `obligations.sh`, `pane-state.sh`). A helper that
+# hardcodes a path, or a child launched with `env -u NEXUS_STATE_DIR`, is
+# outside it. It is also silent about READS of the inherited root, which is the
+# residual blind spot `nexus-root-sensitivity.sh` names in its own header.
+# ADOPTION HAZARD, stated because it bit this helper's own first use: a suite
+# that does NOT source this file gets `command not found` — rc 127, a line on
+# stderr nobody reads, no counter moved, and a green summary that still leaks.
+# `test-ng-wrap-up.sh` is exactly that shape (it defines its own assertion
+# vocabulary), so it carries the same check written inline. Before adopting
+# this helper, confirm the suite sources `_test_helpers.sh`; the probe is what
+# tells you either way, not the diff.
+th_pin_ng_state() {
+    local ng="$1" dir="$2"
+    [[ -n "$ng" && -n "$dir" ]] || th_abort "th_pin_ng_state: need <ng-path> <state-dir>"
+    [[ -x "$ng" ]] || th_abort "th_pin_ng_state: ng not executable at $ng"
+
+    mkdir -p "$dir" || th_abort "th_pin_ng_state: could not create $dir"
+    export NEXUS_STATE_DIR="$dir"
+
+    local decoy
+    decoy=$(mktemp -d "${TMPDIR:-/tmp}/th-pin-XXXXXX") \
+        || th_abort "th_pin_ng_state: mktemp failed — the pin is NOT CHECKED"
+    mkdir -p "$decoy/monitor/.state"
+
+    # `help` because the tap logs BEFORE dispatch, so the cheapest verb in the
+    # file exercises the same write path as the expensive ones. NG_USAGE_LOG is
+    # forced on: an operator with it set to 0 would otherwise make both arms
+    # below read clean for a reason that has nothing to do with the pin.
+    env NEXUS_ROOT="$decoy" NEXUS_STATE_DIR="$dir" NG_USAGE_LOG=1 \
+        "$ng" help >/dev/null 2>&1
+
+    local pinned=0 leaked=0
+    [[ -s "$dir/ng-usage.jsonl"                 ]] && pinned=1
+    [[ -e "$decoy/monitor/.state/ng-usage.jsonl" ]] && leaked=1
+    rm -rf "$decoy"
+
+    if (( leaked )); then
+        th_abort "th_pin_ng_state: NEXUS_STATE_DIR did NOT contain ng's writes — a probe row reached the decoy root's monitor/.state. Running this suite would write into the inherited NEXUS_ROOT (your-org/nexus-code#1306)."
+    fi
+    if (( ! pinned )); then
+        th_abort "th_pin_ng_state: NOT CHECKED — the probe wrote no usage row into $dir, so the pin is UNVERIFIED in both directions. Refusing to continue rather than reporting an unmeasured green (your-org/nexus-code#1306)."
+    fi
+    return 0
+}
+
+# th_assert_stub_reached <label> <tool> <want-path> -- <child-invocation...>
+#
+# ALARM for the BASH_ENV/PATH force-front class (your-org/nexus-code#1188,
+# #1105, #746). Ask, from inside THE SUITE'S OWN child invocation, which
+# binary a bare <tool> actually resolves to, and fail loudly naming what it
+# reached instead.
+#
+# THE CONTRACT THAT MAKES IT WORTH HAVING: it must OBSERVE what the child
+# reached, never RE-DERIVE the condition it is guarding. So the caller passes
+# its own env-builder as the trailing argv — `-- env $(helper_env)`, `--
+# env NEXUS_PATH_FRONT=off`, whatever the suite really uses — and this helper
+# appends only `bash -c 'command -v <tool>'`. A probe that hardcoded the
+# isolation instead would exercise a COPY of the belt and stay GREEN with the
+# belt removed; that shipped once (your-org/nexus-code#1212, fixed 6565041)
+# and is the reason this signature takes the invocation rather than building
+# one.
+#
+# WHY IT IS NOT nx_assert_tmux_pinned. That one asserts the SOCKET the child
+# reaches, and the socket SURVIVES delegation: monitor/tmuxwrap/tmux is a
+# measured pass-through — it resolves the fixture's stub as "the real tmux"
+# and execs it, so the pin holds while the recorder log gains one extra
+# `show -s command-alias` per child shell. The socket assertion is the right
+# alarm for the BOARD-SAFETY hazard (#1105) and is blind to the RECORDER
+# FIDELITY hazard (#1188). This asserts the BINARY. A suite that needs both
+# calls both.
+th_assert_stub_reached() {
+    local label="$1" tool="$2" want="$3"; shift 3
+    [ "${1:-}" = "--" ] && shift
+    local got
+    got=$("$@" bash -c "command -v $tool" 2>/dev/null) || got=""
+    if [ "$got" = "$want" ]; then
+        printf '  PASS: %s\n' "ISOLATION CONTROL — a child reaches $want"
+        _th_pass
+        return 0
+    fi
+    printf '  FAIL: %s\n' "ISOLATION CONTROL — the code under test would reach ${got:-<nothing>}, not this fixture's stub $want; every assertion about recorded $tool calls below is about THAT binary (your-org/nexus-code#1188)" >&2
+    _th_fail
+    return 1
+}
+
+# ── CLAUDE.md BLOCK COVERAGE BOUNDARY (your-org/nexus-code#1239) ────────────
+#
+# th_claude_md_block_coverage MARKER...
+#
+# Print, in THIS suite's own output, how much of the CLAUDE.md entry the
+# named block(s) sit in is actually executed by a fenced block — and how much
+# is UNCHECKED prose. One line per marker, asserting nothing: its job is to
+# stop a green from being read as coverage of the paragraph a reader acts on.
+# The arithmetic lives in `claude-md-block-coverage.sh` (shared with the
+# aggregate report in `test-claude-md-block-coverage.sh` §3), so the two
+# cannot drift apart. Call it AFTER `gp_handle "$@"` in a suite that declares
+# a population — `gp_handle` exits on `--population` and anything printed
+# before it is read as a population row.
+th_claude_md_block_coverage() {
+    bash "$(dirname "${BASH_SOURCE[0]}")/claude-md-block-coverage.sh" "$@" 2>/dev/null || true
 }

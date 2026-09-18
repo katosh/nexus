@@ -20,7 +20,7 @@ set -uo pipefail
 _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 PASS=0; FAIL=0
-assert_contains()     { if grep -qF -- "$3" <<<"$2"; then printf '  PASS: %s\n' "$1"; PASS=$((PASS+1)); else printf '  FAIL: %s\n         expected: %s\n         in:\n%s\n' "$1" "$3" "$2" >&2; FAIL=$((FAIL+1)); fi; }
+assert_contains()     { [[ -n "$3" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2; if [[ -n "$3" ]] && grep -qF -- "$3" <<<"$2"; then printf '  PASS: %s\n' "$1"; PASS=$((PASS+1)); else printf '  FAIL: %s\n         expected: %s\n         in:\n%s\n' "$1" "$3" "$2" >&2; FAIL=$((FAIL+1)); fi; }
 assert_not_contains() { if ! grep -qF -- "$3" <<<"$2"; then printf '  PASS: %s\n' "$1"; PASS=$((PASS+1)); else printf '  FAIL: %s\n         did NOT expect: %s\n         in:\n%s\n' "$1" "$3" "$2" >&2; FAIL=$((FAIL+1)); fi; }
 assert_eq()           { if [[ "$2" == "$3" ]]; then printf '  PASS: %s\n' "$1"; PASS=$((PASS+1)); else printf '  FAIL: %s — got %q want %q\n' "$1" "$2" "$3" >&2; FAIL=$((FAIL+1)); fi; }
 

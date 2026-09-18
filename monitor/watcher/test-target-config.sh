@@ -106,7 +106,17 @@ tmux() {
             fi
             return 0
             ;;
-        send-keys|load-buffer|paste-buffer|delete-buffer|rename-window|set-window-option|kill-window|new-window)
+        new-window)
+            printf '%s %s\n' "$sub" "$*" >> "$ACTIONS"
+            # `-P -F '#{window_id}'` prints the created window's id; the rc=3
+            # contract in `_respawn_spawn_window` reads that handle rather than
+            # a presence-by-NAME probe (your-org/nexus-code#1327). This arm's
+            # `list-windows` sibling above already synthesises `@<n>` ids, so
+            # the vocabulary is not new to this stub — only this arm was silent.
+            printf '@1\n'
+            return 0
+            ;;
+        send-keys|load-buffer|paste-buffer|delete-buffer|rename-window|set-window-option|kill-window)
             printf '%s %s\n' "$sub" "$*" >> "$ACTIONS"
             return 0
             ;;

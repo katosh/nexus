@@ -1,0 +1,16 @@
+{
+  "name": "nexus-longjob",
+  "version": "0.1.0",
+  "description": "nexus long-job watch dispatcher: one host-armed monitor per session that polls this session's watch spool (monitor/longjob-watch.sh) and wakes the agent on every terminal state of a Slurm job, an async-run token, a pid, a file predicate or a command probe. your-org/nexus-code#1535",
+  "author": { "name": "nexus (your-org/nexus-code)" },
+  "experimental": {
+    "monitors": [
+      {
+        "name": "longjob-dispatch",
+        "description": "nexus longjob-watch dispatcher: wakes this session when a watched long job (Slurm / async-run / pid / file / command) reaches ANY terminal state; see monitor/longjob-watch.sh",
+        "command": "bash \"${CLAUDE_PLUGIN_ROOT}/dispatch.sh\"",
+        "when": "always"
+      }
+    ]
+  }
+}

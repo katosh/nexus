@@ -158,6 +158,17 @@ build_case() {
     # nexus#202) — copy it so the engaged-capture is real, not the
     # degraded active-only fallback.
     cp "$_real_test_dir/_idle_probe.sh" "$ROOT/monitor/watcher/_idle_probe.sh"
+    # …and _idle_probe.sh now REFUSES TO LOAD without the window-key encoder
+    # (your-org/nexus-code#941): its top-of-file guard `return 2`s when
+    # ../_bookkeeping.sh is unreadable, so EVERY function in that file —
+    # `_openg_marked` included — silently fails to be defined and the
+    # engaged-capture degrades to the active-only fallback. Measured: with the
+    # encoder absent `declare -F _openg_marked` is empty; with it staged the
+    # function is defined; at the pre-#941 _idle_probe.sh it was defined
+    # either way. Same class as the _log-mode.sh / _version_restart.sh gaps
+    # above — a helper that a fixture forgot to stage degrades to something
+    # counted by nothing.
+    cp "$_real_test_dir/../_bookkeeping.sh" "$ROOT/monitor/_bookkeeping.sh"
     # bootstrap-recover.sh sources ../_log-mode.sh for `_ensure_service_log`
     # (your-org/nexus-code#484). Without it the staged tree would run the
     # launcher with the helper UNDEFINED — service logs silently created
@@ -179,6 +190,22 @@ build_case() {
     # gap above: a missing helper degrades to rc 127, which is counted by
     # nothing.
     cp "$_real_test_dir/_version_restart.sh" "$ROOT/monitor/watcher/_version_restart.sh"
+    # bootstrap-recover.sh's `_recover_worker_last_report` no longer greps
+    # filenames: it shells out to `$NEXUS_ROOT/monitor/ng reports-for-window`,
+    # which keys on the frontmatter `window:` field (your-org/nexus-code#1195,
+    # merged as #1303). `ng` was never staged here, so that call hit
+    # `[[ -x "$ng" ]] || return 2` and EVERY manifest entry rendered the
+    # "COULD NOT LOOK" arm — the cold-boot manifest's last-report field, the
+    # one an orchestrator reads to decide whether a dropped worker had already
+    # finished, degraded to "I could not look" for every worker and the suite
+    # said so in three assertions at once. Stage the real `ng` (with the
+    # primary-root resolver it refuses to start without) so this exercises the
+    # real resolver rather than a stub of it — same rule as _log-mode.sh and
+    # _version_restart.sh above. `_bookkeeping.sh`, `ng`'s other hard
+    # dependency, is already staged.
+    cp "$_real_test_dir/../ng" "$ROOT/monitor/ng"
+    chmod +x "$ROOT/monitor/ng"
+    cp "$_real_test_dir/../_nexus-root.sh" "$ROOT/monitor/_nexus-root.sh"
     RECOVER="$ROOT/monitor/bootstrap-recover.sh"
     REG="$ROOT/monitor/services.registry"
     BIN="$ROOT/bin"
@@ -1172,7 +1199,18 @@ seed_snapshot w-alpha w-beta
 log_event spawn w-alpha
 log_event spawn w-beta
 mkdir -p "$ROOT/reports"
-: > "$ROOT/reports/nexus_2026-07-30_120000_w-alpha-notes.md"
+# REAL frontmatter, not an empty file: `ng reports-for-window` matches the
+# `window:` key inside a leading `---` fence and ignores the filename
+# entirely (your-org/nexus-code#1195). An empty file is invisible to it, so
+# the assertions below would pass or fail on the wrong mechanism.
+cat > "$ROOT/reports/nexus_2026-07-30_120000_w-alpha-notes.md" <<'RPT'
+---
+window: w-alpha
+session-id: sid-w-alpha
+---
+
+Notes filed by w-alpha before the crash.
+RPT
 snap_before=$(cat "$ROOT/monitor/.state/last-snapshot.txt")
 seed_boot_intent fresh
 run_recover
@@ -1264,6 +1302,31 @@ if grep -q "workers: cold boot — resurrected none; 2 snapshot candidate(s)" "$
     pass "cold boot: loud summary on stderr with the dropped-vs-still-alive split, exit 0"
 else
     fail "rc=$RC err=$(cat "$ROOT/err")"
+fi
+cleanup_case
+
+# --- Case 25b: the THIRD last-report arm — "could not look" ------------------
+# The arm that has no other coverage, and the one that silently ate case 25's
+# three assertions when `ng` went unstaged: `_recover_worker_last_report`
+# propagates rc 2 rather than folding it into "none", because on the
+# resumption surface "I could not look" and "there is none" send an
+# orchestrator in opposite directions (your-org/nexus-code#1195, #813, #618).
+# Here the reports corpus is ABSENT, so the real `ng` really returns 2.
+echo '=== case 25b: cold boot, reports corpus not enumerable — manifest says COULD NOT LOOK, never "(none found)" ==='
+build_case 25b
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha
+log_event spawn w-alpha
+rm -rf "$ROOT/reports"
+seed_boot_intent fresh
+run_recover
+man=$(manifest_path)
+if grep -qxF -- '- last report: COULD NOT LOOK — the reports corpus was not enumerable' "$man" \
+   && ! grep -qF -- '- last report: (none found under reports/)' "$man"; then
+    pass "cold boot: an unenumerable corpus renders COULD NOT LOOK, NOT the positive negative"
+else
+    fail "could-not-look arm wrong: $(grep 'last report' "$man" 2>/dev/null)"
 fi
 cleanup_case
 

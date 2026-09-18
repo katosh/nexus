@@ -6,6 +6,10 @@
 # Usage:  bash monitor/watcher/count-fallback-lint.sh [<repo-root>]
 #   prints one `<file>:<line>\t<text>` row per site; exit 1 if any, 0 if none.
 #
+# Usage:  bash monitor/watcher/count-fallback-lint.sh --files [<repo-root>]
+#   prints the POPULATION — one repo-relative path per line, every file the
+#   scan above reads. Same selection predicate, one implementation.
+#
 # ---------------------------------------------------------------------------
 # THE DEFECT
 #
@@ -106,6 +110,15 @@
 # "No member found" is a claim about THIS SEARCH, not about the population.
 set -uo pipefail
 
+# `--files` prints the POPULATION — one path per line, every file this lint
+# reads — so the guard's `gp_population` can forward to it instead of keeping a
+# second copy (your-org/nexus-code#1494, #1301 item 2). A copy is a second
+# implementation of the population and it drifts, at which point the index
+# reports with total confidence that this lint does not read a file it does
+# read.
+_CFL_FILES=0
+if [[ "${1:-}" == --files ]]; then _CFL_FILES=1; shift; fi
+
 ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 [[ -d "$ROOT/monitor" ]] || { printf 'count-fallback-lint: no monitor/ under %s\n' "$ROOT" >&2; exit 2; }
 
@@ -125,24 +138,40 @@ ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 roots=( "$ROOT/monitor" )
 [[ -d "$ROOT/.github" ]] && roots+=( "$ROOT/.github" )
 
+# THE SELECTION, factored out so `--files` and the scan cannot disagree. It is
+# ONE predicate with two consumers, which is the whole point: a `gp_population`
+# that re-stated this `case` would be a second implementation.
+_cfl_selected0() {   # -> NUL-separated selected paths
+    local f
+    while IFS= read -r -d '' f; do
+        case "$f" in
+            */.git/*) continue ;;
+        esac
+        # A shell file: by name for the `*.sh` + extensionless executables this
+        # repo ships, plus workflow YAML under `.github/`, whose `run:` blocks
+        # are shell. The YAML arm is scoped to `.github/` deliberately — see
+        # axis item 1.
+        case "${f##*/}" in
+            *.sh|ng|sandbox-notify) ;;
+            *.yml|*.yaml)
+                case "$f" in
+                    "$ROOT"/.github/*) ;;
+                    *) continue ;;
+                esac
+                ;;
+            *) continue ;;
+        esac
+        printf '%s\0' "$f"
+    done < <(find "${roots[@]}" -type f -print0)
+}
+
+if (( _CFL_FILES )); then
+    _cfl_selected0 | while IFS= read -r -d '' f; do printf '%s\n' "${f#"$ROOT"/}"; done
+    exit 0
+fi
+
 hits=0
 while IFS= read -r -d '' f; do
-    case "$f" in
-        */.git/*) continue ;;
-    esac
-    # A shell file: by name for the `*.sh` + extensionless executables this repo
-    # ships, plus workflow YAML under `.github/`, whose `run:` blocks are shell.
-    # The YAML arm is scoped to `.github/` deliberately — see axis item 1.
-    case "${f##*/}" in
-        *.sh|ng|sandbox-notify) ;;
-        *.yml|*.yaml)
-            case "$f" in
-                "$ROOT"/.github/*) ;;
-                *) continue ;;
-            esac
-            ;;
-        *) continue ;;
-    esac
     while IFS= read -r row; do
         printf '%s:%s\n' "$f" "$row"
         hits=$(( hits + 1 ))
@@ -152,7 +181,7 @@ while IFS= read -r -d '' f; do
             | grep -vE 'grep[[:space:]]+-[A-Za-z]*q' \
             || true
     )
-done < <(find "${roots[@]}" -type f -print0)
+done < <(_cfl_selected0)
 
 if (( hits > 0 )); then
     printf '\ncount-fallback-lint: %d site(s). `grep -c` already prints 0 on no match —\n' "$hits" >&2

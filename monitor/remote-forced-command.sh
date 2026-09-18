@@ -407,7 +407,7 @@ fi
 case "$CMD" in
     *$'\n'*) refuse 12 "newline in command (argument smuggling)";;
 esac
-if printf '%s' "$CMD" | LC_ALL=C grep -q '[^[:print:][:space:]]'; then
+if LC_ALL=C grep -q '[^[:print:][:space:]]' <<<"$CMD"; then
     refuse 12 "non-printable byte in command"
 fi
 # `read -ra` performs ONLY IFS word-splitting: it does NOT expand $(…),

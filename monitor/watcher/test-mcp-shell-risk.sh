@@ -140,10 +140,24 @@ n_pred=$(grep -c '^_pane_comm_is_shell() {' "$PS")
 assert_eq "the predicate is defined exactly once" "$n_pred" "1"
 # Exactly ONE occurrence of the allow-list in the whole file — the one inside
 # the predicate. A second copy is how the walk and the probe would drift.
-n_lists=$(grep -c 'bash|sh|zsh|dash|ksh|fish' "$PS")
+# _occurrences <pattern> <file> — OCCURRENCES, not lines (your-org/nexus-code
+# `#1026`). `grep -c` counts matching LINES, so two constructs sharing one line
+# read as 1 and an `== N` assertion stays green with the construct duplicated.
+# `-F` because every caller passes a LITERAL. On no match grep prints nothing
+# and exits 1, yielding 0 — a replacement, never an appended second value, so
+# no `|| echo 0` belongs here (your-org/nexus-code#725).
+_occurrences() { grep -oF -- "$1" "$2" 2>/dev/null | wc -l | tr -d ' '; }
+
+n_lists=$(_occurrences 'bash|sh|zsh|dash|ksh|fish' "$PS")
 assert_eq "the allow-list literal appears exactly once (no inline copy)" "$n_lists" "1"
-assert_contains "the /proc walk asks through the shared predicate" \
-    "$(grep -c '_pane_comm_is_shell "\$comm"' "$PS")" "1"
+# assert_EQ, not assert_contains: the haystack is a NUMBER, and containment
+# on a number is satisfied by 1, 10, 11 alike.
+# TWO /proc walkers since bundle-2609 (f755a3e8): `_pane_background_shells`
+# (the root census) and `_pane_longjob_root` (the identity walk from the
+# longjob dispatcher's pid up to claude). Both ask the SAME predicate; an
+# inline copy in either would still be caught by the allow-list count above.
+assert_eq "both /proc walks ask through the shared predicate" \
+    "$(_occurrences '_pane_comm_is_shell "$comm"' "$PS")" "2"
 # And the predicate itself still recognises the login-shell comm forms that
 # only the /proc side ever sees.
 for c in bash sh zsh dash ksh fish -bash -zsh -sh; do
@@ -174,7 +188,11 @@ assert_contains "…and the gap is pointed at its guard" \
     "$mcp_comment" "_pane_mcp_shell_risk"
 # The refuted phrasing may survive ONLY as a quotation being retracted —
 # never as a claim the file still makes. Pin both halves.
-n_claim=$(grep -ci 'never through a shell' "$PS")
+# Case-INSENSITIVE, so `_occurrences` (-oF) is NOT a drop-in here — the
+# assertion has always read `-ci`, and silently dropping the `i` would change
+# what is counted rather than how it is counted (your-org/nexus-code#1026).
+_occurrences_i() { grep -oiF -- "$1" "$2" 2>/dev/null | wc -l | tr -d ' '; }
+n_claim=$(_occurrences_i 'never through a shell' "$PS")
 assert_eq "the refuted phrase survives at most once (as a quotation)" "$n_claim" "1"
 assert_contains "…and that one occurrence is explicitly labelled false" \
     "$mcp_comment" "which is false as written"

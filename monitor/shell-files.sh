@@ -167,37 +167,90 @@ _SHF_PRUNE_DIRS=( .git node_modules .state .venv __pycache__ )
 # The interpreter a shebang names, reduced to a basename. Empty (rc 1) when the
 # file has no shebang.
 #
-# `read -n 200` rather than `head -c 200`: this is called once per file over a
-# ~500-file tree by several consumers, and a subprocess apiece is what turned a
-# sibling classifier into a 26-second run (early-exit-readers.sh:113). `-n`
-# stops at the first newline OR 200 chars, so a binary file with no newline
-# cannot make this read a gigabyte.
+# NO `head -c 200`: this is called once per file over a ~500-file tree by
+# several consumers, and a subprocess apiece is what turned a sibling
+# classifier into a 26-second run (early-exit-readers.sh:113).
+#
+# AND NO `read -n 200` EITHER (your-org/nexus-code#1338). `-n` is a BASH
+# spelling. Under zsh it is accepted, succeeds at rc 0, and yields an EMPTY
+# string — so the shebang test below fails and this function reports "no
+# shebang" for a file that has one. Measured on this host:
+#
+#     bash -c 'IFS= read -r -n 200 f < probe.sh; echo "rc=$? [$f]"'
+#       -> rc=0 [#!/usr/bin/env bash]
+#     zsh  -c 'IFS= read -r -n 200 f < probe.sh; echo "rc=$? [$f]"'
+#       -> rc=0 []                      <-- rc 0. SILENT. Not an error.
+#
+# The victims are precisely the safety surface: the extension arm still finds
+# every `*.sh`, so only the shebang arm fails, and every EXTENSIONLESS shell
+# file in this repo is a PATH-front shim or a default-deny guard — `monitor/ng`,
+# `ghwrap/gh`, `pipwrap/pip`, `tmuxwrap/tmux`, `proc-kill-authorized`,
+# `proc-exists-authorized`, `git-https-setup`, `notifywrap/sandbox-notify` and
+# the two `client/` entry points. `shf_is_shell monitor/ng` measured rc 0 under
+# bash and rc 1 under zsh.
+#
+# zsh's equivalent is `-k`, which bash rejects (rc 2), so there is no shared
+# flag. A plain line read is correct in BOTH and needs no flag at all; the
+# 200-char bound is then re-imposed by parameter expansion. What that trades
+# away is the guarantee that a binary file with no newline cannot make the read
+# large — `read` still stops at the first newline, so the exposure is one
+# pathological FIRST LINE rather than a whole file. Measured over the 724 files
+# under `monitor/` at `bbf8985b`, the longest first line is 297 bytes.
 shf_interpreter() {   # <path>
-    local first='' word rest
-    IFS= read -r -n 200 first < "$1" 2>/dev/null
+    local first='' word='' tok rest saw_env=0
+    IFS= read -r first < "$1" 2>/dev/null
+    first=${first:0:200}
     case "$first" in '#!'*) ;; *) return 1 ;; esac
     first=${first#'#!'}
     # Strip a leading CR so a CRLF file does not yield an interpreter of
     # `bash<CR>`, which would match nothing and silently exclude the file.
     first=${first%$'\r'}
-    # shellcheck disable=SC2086
-    set -- $first
-    (( $# )) || return 1
-    word=${1##*/}
-    if [[ "$word" == env ]]; then
-        shift
-        # `env` may carry its own options and VAR=value assignments before the
-        # command. Skip them; `#!/usr/bin/env -S bash -e` is the shape that
-        # matters and it is why this is a loop rather than a single shift.
-        while (( $# )); do
-            case "$1" in
-                -*|*=*) shift ;;
-                *)      break ;;
+
+    # Tokenise WITHOUT relying on unquoted-parameter word splitting. This used
+    # to be `set -- $first`, carrying an explicit `# shellcheck disable=SC2086`
+    # because the split was deliberate — and it is a BASH-only split. Measured:
+    #
+    #     first="/usr/bin/env bash"; set -- $first
+    #       bash -> argc 2, $1=/usr/bin/env, $2=bash
+    #       zsh  -> argc 1, $1="/usr/bin/env bash"
+    #
+    # so under zsh `${1##*/}` yields `env bash`, which matches no vocabulary and
+    # excludes the file — a DIFFERENT silent under-count from the one the read
+    # above used to cause. Fixing only the read would therefore have swapped one
+    # confident wrong answer for another, which is the whole lesson of `#1338`:
+    # hardening one site is not hardening the file. zsh's `${=first}` is a
+    # syntax error under bash, so there is no one-token fix; this loop is the
+    # form that is identical in both shells.
+    rest=${first//$'\t'/ }
+    while [ -n "$rest" ]; do
+        tok=${rest%% *}
+        if [ "$tok" = "$rest" ]; then rest=''; else rest=${rest#* }; fi
+        [ -n "$tok" ] || continue          # collapse runs of blanks
+        if [ "$saw_env" = 1 ]; then
+            # `env` may carry its own options and VAR=value assignments before
+            # the command. Skip them; `#!/usr/bin/env -S bash -e` is the shape
+            # that matters and it is why this is a loop rather than one shift.
+            #
+            # TWO SPELLINGS OF THAT SAME SHAPE CARRY THE COMMAND INSIDE THE
+            # OPTION TOKEN (your-org/nexus-code#1409): GNU env accepts
+            # `--split-string=bash -e` and the attached short form `-Sbash -e`.
+            # A bare `-*|*=*` skip swallowed the command WITH the option, ran
+            # out of tokens, and returned rc 1 — EXCLUDING the file, the unsafe
+            # direction for a kill-guard population. Peel the command out of
+            # the token first; the detached `-S bash` and `--split-string bash`
+            # forms still take the skip-then-read path below.
+            case "$tok" in
+                --split-string=?*) tok=${tok#--split-string=} ;;
+                -S?*)              tok=${tok#-S} ;;
+                -*|*=*)            continue ;;
             esac
-        done
-        (( $# )) || return 1
-        word=${1##*/}
-    fi
+            word=${tok##*/}
+            break
+        fi
+        word=${tok##*/}
+        if [ "$word" = env ]; then saw_env=1; word=''; continue; fi
+        break
+    done
     [[ -n "$word" ]] || return 1
     printf '%s' "$word"
 }
@@ -345,3 +398,276 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
               | LC_ALL=C sort ;;
     esac
 fi
+
+# ---------------------------------------------------------------------------
+# shf_strip_heredocs <file> — the file's source with heredoc BODIES blanked.
+# MOVED here from monitor/watcher/_test_helpers.sh (your-org/nexus-code#806,
+# rehomed for #1227). The header there is the authority on WHY; this is the
+# same function, in the shared predicate rather than in a test helper, because
+# `shf_strip_comments` below needs it and a PRODUCTION predicate must not
+# depend on a TEST helper. `th_strip_heredocs` is now a forwarder, so there is
+# still exactly ONE implementation — the `#838`/`#842` "second, wrong copy"
+# mistake is what a COPY here would have been.
+#
+# Blanked, not deleted: line numbers must survive, because every consumer
+# reports `file:line`.
+#
+# THE FAIL-SAFE IS PART OF THE CONTRACT. On an UNTERMINATED heredoc at EOF it
+# concludes it mis-parsed, discards its own output, emits the file UNSTRIPPED
+# and says so on STDERR at rc 0. Callers that must not go quietly blind check
+# stderr, not just rc (undefined-helper-lint.sh:382 does; copy that shape).
+_SHF_QUOTES_AWK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/watcher/_shell_quotes.awk"
+shf_strip_heredocs() {
+    local f="$1"
+    [[ -r "$f" ]] || return 1
+    # The quote state machine is SHARED with uncounted-abort-lint.sh
+    # (`_shell_quotes.awk`). It used to be inline here and a second, wrong copy
+    # lived in the lint — a `sed` pair that paired any two apostrophes and ate
+    # real code between them. One machine, two callers, is the point.
+    local _q; _q="$(cat "$_SHF_QUOTES_AWK" 2>/dev/null)" || return 1
+    [[ -n "$_q" ]] || return 1
+    awk "$_q"'
+    function push(d, dash_) { n++; delim[n] = d; dsh[n] = dash_ }
+    function scan(s,   i, L, j, d, dash_, q, arith, c2, c1, qm) {
+        L = length(s); i = 1; arith = 0
+        # Quote state from the SHARED machine. A `<<` inside a quoted string is
+        # TEXT, not a redirection operator — monitor/test-conflict-marker-lint.sh
+        # passes a single-quoted literal [cat <<EOF] to a helper as an argument.
+        # The mask is consulted rather than a strip applied, because a heredoc
+        # delimiter is usually QUOTED (<<[EOF]) and stripping quoted text would
+        # delete the very delimiter this function exists to capture.
+        qm = quote_mask(s)
+        while (i <= L) {
+            c1 = substr(s, i, 1)
+            if (substr(qm, i, 1) == "1") { i++; continue }
+            if (c1 == "#") break        # rest of the line is a comment
+            c2 = substr(s, i, 2)
+            # Track arithmetic context so a left shift is never read as a
+            # heredoc. Both `$(( … ))` and a bare `(( … ))` command count.
+            if (c2 == "((") { arith++; i += 2; continue }
+            if (c2 == "))" && arith > 0) { arith--; i += 2; continue }
+            if (c2 == "<<") {
+                if (substr(s, i + 2, 1) == "<") { i += 3; continue }   # herestring
+                if (arith > 0) { i += 2; continue }                    # left shift
+                j = i + 2; dash_ = 0
+                if (substr(s, j, 1) == "-") { dash_ = 1; j++ }
+                while (substr(s, j, 1) == " " || substr(s, j, 1) == "\t") j++
+                q = substr(s, j, 1); d = ""
+                if (q == "\"" || q == "'"'"'") {
+                    j++
+                    while (j <= L && substr(s, j, 1) != q) { d = d substr(s, j, 1); j++ }
+                    j++
+                } else {
+                    if (q == "\\") j++
+                    while (j <= L && substr(s, j, 1) ~ /[A-Za-z0-9_]/) { d = d substr(s, j, 1); j++ }
+                }
+                # Letter-or-underscore initial: rejects the numeric delimiter a
+                # left shift like `(o1 << 24)` would otherwise manufacture.
+                if (d ~ /^[A-Za-z_][A-Za-z0-9_]*$/) push(d, dash_)
+                i = j; continue
+            }
+            i++
+        }
+    }
+    { raw[NR] = $0 }
+    {
+        if (n > 0) {
+            t = $0
+            if (dsh[1]) sub(/^\t+/, "", t)
+            if (t == delim[1]) {
+                for (k = 1; k < n; k++) { delim[k] = delim[k+1]; dsh[k] = dsh[k+1] }
+                n--
+            }
+            out[NR] = ""        # body AND terminator are data, never code
+            next
+        }
+        c = $0; sub(/^[ \t]+/, "", c)
+        if (substr(c, 1, 1) != "#") scan($0)   # a comment cannot open a heredoc
+        out[NR] = $0
+    }
+    END {
+        if (n > 0) {
+            printf("shf_strip_heredocs: %s: heredoc `%s` unterminated at EOF — ", FILENAME, delim[1]) > "/dev/stderr"
+            printf("mis-parse suspected, emitting the file UNSTRIPPED\n") > "/dev/stderr"
+            for (k = 1; k <= NR; k++) print raw[k]
+            exit 0
+        }
+        for (k = 1; k <= NR; k++) print out[k]
+    }
+    ' "$f"
+}
+
+# ---------------------------------------------------------------------------
+# shf_strip_comments <file>  — the file's CODE, with comment text removed.
+# (your-org/nexus-code#1106)
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. A predicate keyed on a STRING cannot tell the THING from the
+# DESCRIPTION of the thing (`#1073`). Every lint in this tree that greps a file
+# for a construct is enrolling files on the strength of text that may be a
+# COMMENT — and a comment NAMING the construct is the most natural thing a
+# maintainer writes, especially the comment explaining why the file
+# deliberately does NOT use it. `#1106` is exactly that: `early-exit-readers.sh`
+# put a file on the pipefail axis because a comment mentioned the option.
+#
+# `#1106` records that there was no shared primitive to reuse, which is why the
+# defect was left open rather than folded into an unrelated PR. This is it.
+#
+# TWO THINGS IT MUST GET RIGHT, both of which the obvious one-liner does not:
+#
+#  1. `sed 's/#.*$//'` deletes a `#` INSIDE A STRING. `grep -qF "#N"` becomes
+#     `grep -qF "`, so the remedy corrupts the very code it is filtering.
+#     Comment detection needs the shell's quoting state, so this reuses the ONE
+#     state machine (`_shell_quotes.awk`) rather than writing a second, wrong
+#     one — which is the mistake `#842` made and `#838` is about.
+#
+#  2. `#` only starts a comment at the START OF A WORD. `echo a#b` prints
+#     `a#b`; `${x#y}` is a parameter expansion. So the `#` must be at column 1
+#     or preceded by whitespace or a command separator.
+#
+# AND THE CALLER MUST NOT PIPE INTO AN EARLY-EXITING READER. `#1106`'s own
+# first measurement was wrong this way: `sed 's/#.*$//' "$f" | grep -qE '…'`
+# under `pipefail` gives `grep -q` an early exit, `sed` takes SIGPIPE, and the
+# pipeline returns 141 — reintroducing, inside the classifier, the early-exit
+# defect the classifier exists to find. It reported 115 -> 81 rows, which reads
+# as a large real effect and is an artefact. This function therefore returns
+# the text on stdout for the caller to put in a VARIABLE, and every call site
+# in this repo uses a herestring.
+shf_strip_comments() {   # <file>  -> code-only text on stdout
+    local f="$1" qawk _rc
+    qawk=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/watcher/_shell_quotes.awk
+    if [[ ! -r "$qawk" ]]; then
+        printf 'shf_strip_comments: missing %s — refusing to fall back to a\n' "$qawk" >&2
+        printf '  matcher that cannot tell a comment from a string.\n' >&2
+        return 2
+    fi
+    # HEREDOC BODIES ARE BLANKED FIRST (your-org/nexus-code#1227).
+    #
+    # A heredoc body is DATA the file emits, not shell source, and feeding it to
+    # `quote_mask` lets its prose set the quote state — the commonest apostrophe
+    # in English is the one in a contraction, so one `orchestrator's` inside a
+    # `<<MSG` opens a phantom string and every later `#` is read as quoted text
+    # and EMITTED AS CODE. Measured at `0b82ffb2`: 589 of 2,057 leaked comment
+    # lines across the corpus stop leaking when the bodies are blanked first,
+    # `monitor/svc.sh` 57 -> 0 and `monitor/watcher/entry.sh` 82 -> 0. Quoted and
+    # unquoted delimiters leak identically, so "a quoted delimiter is safe" does
+    # not help.
+    #
+    # DIRECTION, measured rather than assumed. Restricted to lines that are NOT
+    # heredoc bodies — the only population any consumer of this function can
+    # legitimately want — blanking loses 541 lines, ALL of them comment lines,
+    # and gains exactly 1 (`test-launcher-empty-target.sh:398`, a `# read the
+    # status line` inside a quoted string that this function used to DELETE, so
+    # the gain is a false negative repaired). ZERO lines of real code change.
+    #
+    # THE FAIL-SAFE PASSES THROUGH. When `shf_strip_heredocs` cannot parse a
+    # file it emits it UNSTRIPPED and warns on stderr at rc 0; this function
+    # then behaves exactly as it did before, which is the conservative
+    # direction, and the warning reaches the caller's stderr rather than being
+    # swallowed. Exactly one file trips it at `0b82ffb2`, and it is the one
+    # already pinned in watcher/strip-heredocs-failsafe.manifest.
+    local _view
+    _view=$(mktemp) || {
+        printf 'shf_strip_comments: mktemp failed — refusing to scan %s with\n' "$f" >&2
+        printf '  heredoc bodies unblanked.\n' >&2
+        return 2
+    }
+    if ! shf_strip_heredocs "$f" > "$_view"; then
+        rm -f "$_view"
+        printf 'shf_strip_comments: shf_strip_heredocs could not read %s\n' "$f" >&2
+        return 2
+    fi
+
+    # CONCATENATED, not a second `-f`: `awk -f lib.awk '{prog}' file` treats the
+    # program string as a DATA FILE and silently emits nothing.
+    awk "$(cat "$qawk")"'
+    {
+        # CARRY THE QUOTE STATE ACROSS THE NEWLINE. Without this the mask is
+        # computed per line, so a line that begins INSIDE an open string and
+        # starts with `#` is read as a comment and DELETED — taking any real
+        # code after the string closes with it. Measured before the fix:
+        #     msg="hello
+        #     # world" ; set -o pipefail
+        # is `pipefail` ON in bash, matched in the raw text, and MISSED after
+        # stripping. That is a FALSE NEGATIVE this helper introduced, which the
+        # bare `grep` it replaced did not have (your-org/nexus-code#1127).
+        #
+        # AND THE CARRY MUST COME FROM THE CODE, NOT FROM THE WHOLE LINE
+        # (your-org/nexus-code#1130). Taking `QM_END` from the full line lets
+        # COMMENT PROSE change the quote state, and the commonest apostrophe in
+        # English is the one in a contraction:
+        #     # it doesn'"'"'t matter what the author says here
+        #     # THIS LINE IS THEN INSIDE A STRING AND SURVIVES
+        # Measured on this host: the second comment line is EMITTED AS CODE, and
+        # every line after it until the apostrophe is balanced. The stripper
+        # then leaks exactly the comment text it exists to remove, so `#1106`s
+        # comment-blindness fix is silently defeated for any file whose comments
+        # contain a contraction — which is most of them. Text after an unquoted
+        # `#` is not shell input and cannot open a string, so the state is
+        # recomputed over the retained CODE only. The `#1127` cross-line-string
+        # case above is unaffected: there the `#` IS inside a string, nothing is
+        # cut, and the code portion is the whole line.
+        # CARRY THE `$( … )` NESTING TOO, NOT JUST THE QUOTE STATE
+        # (your-org/nexus-code#1227). A line ending inside an open `$(`
+        # continues as code, which `QM_END` already said — but the STACK that
+        # tells the next line'"'"'s `)` what it closes was a function-local and
+        # reset. `monitor/ng:1129` is exactly that shape, and the consequence
+        # is not a lost `)`: the next `"` then OPENS a string instead of
+        # closing one, so every later line reads as quoted, `#` is skipped as
+        # text, and the rest of the file'"'"'s comments are EMITTED AS CODE.
+        #
+        # TWO ARRAY PAIRS, and this is load-bearing rather than tidiness. The
+        # block scans twice — once over `$0` to place the cut, once over the
+        # retained `code` to compute the state to carry — and awk passes arrays
+        # BY REFERENCE. One pair would let the throwaway `$0` scan mutate the
+        # nesting that the `code` scan must start from, so a `)` in COMMENT
+        # PROSE could pop a real open substitution. The `$0` scan gets a
+        # SCRATCH COPY (`_ss`/`_sd`); only the `code` scan touches the
+        # persistent pair (`_ps`/`_pd`).
+        for (_k in _ss) delete _ss[_k]
+        for (_k in _sd) delete _sd[_k]
+        for (_k = 1; _k <= carrysp; _k++) { _ss[_k] = _ps[_k]; _sd[_k] = _pd[_k] }
+        m = quote_mask($0, carry, carrysp, _ss, _sd)
+        cut = 0
+        for (i = 1; i <= length($0); i++) {
+            if (substr($0, i, 1) != "#")   continue
+            if (substr(m,   i, 1) == "1")  continue     # inside a string
+            if (i > 1) {
+                p = substr($0, i - 1, 1)
+                # `#` starts a comment only at the start of a WORD.
+                #
+                # `(` IS NOT A WORD SEPARATOR FOR THIS PURPOSE
+                # (your-org/nexus-code#1227). It was in this class, and every
+                # site it fired on at `0b82ffb2` was REAL CODE DESTROYED, not a
+                # comment found — 8 cuts across 4 files, 7 of them an issue
+                # reference `(#781)` inside a quoted `printf`, and the eighth
+                # the ERE `^[[:space:]]*(#|$)` at labsh-supervised.sh:247, where
+                # the `#` is genuinely UNQUOTED and genuinely NOT a comment.
+                # bash parses that line; this function output does not, which is
+                # how it was found. A real `( #comment` carries the SPACE and is
+                # still caught by the space arm, so nothing is lost.
+                #
+                # DIRECTION: this trades a guaranteed FALSE NEGATIVE (real code
+                # deleted, silently) for a possible FALSE POSITIVE (a comment
+                # retained, loudly). Measured cost at `0b82ffb2`, alone: leaked
+                # comment lines 2,057 -> 2,064 (+7, same 63 files), and one of
+                # the six files whose stripped output no longer parses is
+                # repaired. It is NOT free and is not claimed to be: not cutting
+                # at `(#` moves the cut, which moves the carried state. The
+                # trade is still right, because +7 retained comments is a
+                # louder failure than one deleted `[[ =~ ]]` operand.
+                if (p !~ /[ \t;&|]/) continue
+            }
+            cut = i; break
+        }
+        if (cut > 0) code = substr($0, 1, cut - 1); else code = $0
+        # Recompute over the RETAINED CODE only, from the same start state,
+        # then carry BOTH halves. Order matters: `carry`/`carrysp` are the
+        # INPUTS here, so they are reassigned only after the call.
+        quote_mask(code, carry, carrysp, _ps, _pd); carry = QM_END; carrysp = QM_SP
+        print code
+    }' "$_view"
+    _rc=$?
+    rm -f "$_view"
+    return $_rc
+}

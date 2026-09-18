@@ -212,8 +212,13 @@ Three pieces:
      pattern documented in `skills/nexus.tmux-spawn/SKILL.md`.
      Retries once on transient failure, then gives up and relies
      on the archive.
-   - Touches `monitor/.state/watcher-heartbeat` (PID + ISO
-     timestamp) so agents can detect staleness.
+   - Bumps `monitor/.state/watcher-progress` as it advances and
+     `monitor/.state/watcher-cycle` at each completed compose cycle.
+     Liveness itself lives in `monitor/.state/watcher-heartbeat`
+     (`pid=` / `ts=` / `target=`), beaten by a separate
+     constant-cadence background ticker — see "Watcher liveness:
+     UP / BUSY / WEDGED / DOWN" below for why the three are separate
+     signals and why a fresh heartbeat alone is not liveness.
    - On observing the target window absent in tmux, launches a
      fresh orchestrator session (the `claude` CLI) in the target
      window after `monitor.agent_missing_respawn_delay` confirming polls
@@ -241,7 +246,7 @@ Three pieces:
    Startup sweep emits any eligible comments / standing bells
    immediately on launch.
 
-   **Single-instance contract — one cockpit per `NEXUS_ROOT`.** Two
+   **Single-instance contract — one cockpit per `NEXUS_ROOT`.** Three
    guards keep a second watcher off a shared `monitor/.state/`:
    - A PID-based lock at `monitor/.state/watcher.lock` (+ the
      `watcher.pid` file) — same-pid-namespace, same-host. It records
@@ -254,28 +259,47 @@ Three pieces:
      cockpit runs under `bwrap --unshare-pid`, so a peer sandbox's
      watcher pid is invisible in this namespace's `/proc` and every
      pid-based check reads a live peer as *dead*. flock keys on the
-     inode, not the pid — it crosses the pid-namespace boundary, and
-     on the NFSv3 state mount (`local_lock=none`) the host boundary
-     too (forwarded to the server's NLM). A second watcher that finds
-     a live holder **refuses loudly and exits non-zero** (launcher
-     fast-fails before spawn; `main.sh` is the authoritative gate). The
-     refusal is built from the holder's recorded metadata (`host`,
-     `boot_id`, `pid`, `sandbox`, `tmux`, `started_at`, …) and spells
-     out both the normal resolution (use / close / `--replace` the
-     other instance) and the false-positive resolution (clear a stale
-     lock). A same-host flock auto-releases on holder death — even on
-     SIGKILL — so the only stale class is a cross-host NFS lock whose
-     client died, or a same-host lock whose machine rebooted (detected
-     by `boot_id` mismatch); inspect a holder before deciding with
-     `monitor/watcher/launcher.sh --instance-status` or `ng
-     watcher-status`. The blessed succession paths (`launcher.sh
-     --replace`, the version-restart self-restart, `bootstrap-recover`)
-     all terminate the prior watcher *before* the successor starts, so
-     the guard blocks **coexistence**, never **succession**. To run a
-     second instance, point it at a **different `NEXUS_ROOT`**; true
-     two-cockpits-one-root is unsupported and guarded. Stale-lock case
-     analysis + resolve guidance: `docs/operating/watcher.md`
-     ("Single-instance contract").
+     inode, not the pid, so it crosses the pid-namespace boundary —
+     but **not** the host boundary (next bullet). A second watcher
+     that finds a live holder **refuses loudly and exits non-zero**
+     (launcher fast-fails before spawn; `main.sh` is the authoritative
+     gate). The refusal is built from the holder's recorded metadata
+     (`host`, `boot_id`, `pid`, `sandbox`, `tmux`, `started_at`, …)
+     and spells out both the normal resolution (use / close /
+     `--replace` the other instance) and the false-positive resolution
+     (clear a stale lock). A same-host flock auto-releases on holder
+     death — even on SIGKILL — so same-host decisions need no
+     staleness logic at all, except after a *reboot*, detected by a
+     `boot_id` mismatch against the recorded holder; inspect a holder
+     before deciding with `monitor/watcher/launcher.sh
+     --instance-status` or `ng watcher-status`.
+   - A **cross-host heartbeat beacon** at
+     `monitor/.state/nexus-instance.heartbeat`, because **flock does
+     not reliably arbitrate across HOSTS, and the code does not assume
+     it does**. `flock(2)` over NFS is implementation-dependent, and
+     empirically it did not block a second cockpit on another host
+     sharing this NFS state dir — a remote starter can see the lock as
+     free (`monitor/watcher/_lib.sh`, "Cross-host instance
+     heartbeat"). So the live watcher also rewrites a beacon atomically
+     (tmp + rename, and a separate file from the flock target so a
+     refresh never renames the locked inode) on every loop iteration.
+     A starter whose flock probe came back free classifies that beacon
+     and **refuses at exit `4` while a remote record is fresh**, taking
+     over only once it has aged past
+     `monitor.instance_heartbeat_staleness_seconds` (default 600 s —
+     generous against the ≤ 10 s refresh cadence, so a cc-update
+     restart gap never triggers a false takeover). A dead remote holder
+     therefore needs no intervention: the beacon ages out and the next
+     start wins. The running watcher also self-fences, standing down
+     rather than overwriting a *different* instance's fresh beacon.
+
+   The blessed succession paths (`launcher.sh --replace`, the
+   version-restart self-restart, `bootstrap-recover`) all terminate the
+   prior watcher *before* the successor starts, so the guards block
+   **coexistence**, never **succession**. To run a second instance,
+   point it at a **different `NEXUS_ROOT`**; true two-cockpits-one-root
+   is unsupported and guarded. Stale-lock case analysis + resolve
+   guidance: `docs/operating/watcher.md` ("Single-instance contract").
 
    Mid-dirty hash bumps and
    `*-interim*.md` report additions are classified as noise and
@@ -925,7 +949,15 @@ otherwise forced to supply a `--skeptic-verdict` on its own diff — a
 self-review indistinguishable downstream from an independent clearance.
 The flag takes the ordinary producer path and records the reason (which
 must be substantive, >=20 chars, like `--skeptic-rearm`). It **clears no
-skeptic marker**: a verdict the window owes is still owed. It is mutually
+skeptic marker — including the opting-out window's OWN**: a verdict the
+window owes is still owed, and it still cannot retire. That promise was
+false when first written (`#879` F1): the producer path clears
+`pending/<window>` in three branches (`denied-spawn`, `denied-auto`, the
+operator waive), so a window could discharge a real obligation by
+declaring this hand-off not a verdict — turning a *forced false verdict*,
+which is visible, into a *silent absent* one, in the gate
+`retire-preflight.sh` reads. All three are now guarded and print
+`SKEPTIC MARKER KEPT` when they suppress a removal. It is mutually
 exclusive with `--skeptic-role` and `--skeptic-verdict`.
 
 ### Comms channel
@@ -973,7 +1005,11 @@ reuses `paste-followup.sh`, resolves the window NAME → tmux INDEX before
 probing `pane-state.sh` (fail-safe skip if unresolvable), skips panes
 that are busy or user-typing (so it never interrupts active work), and is
 rate-limited (default 120 s between nudges) so a polling skeptic can't
-spam the pane.
+spam the pane. The commonest reason a worker stops re-entering is a launch
+that cannot re-invoke it: `await` runs under the Bash tool's
+`run_in_background` (or a `Monitor`), never `monitor/async-run.sh`, which
+retains the rc and wakes nobody (`#1523`; canonical statement in the worker
+floor, `skills/nexus.worker-defaults/SKILL.md`).
 
 **Parked-awaiting-skeptic (watcher exemption).** A worker parked in
 `await` reads `busy` (the await tool's spinner) or `working-background`
@@ -1005,7 +1041,20 @@ which classify independently — treat a protocol-wait-only child set as the
 benign prescribed shape rather than an inconsistency, bounded by the same
 absolute ceiling as case (a).
 (A *foreground* `await` — what `ng wrap-up` prints — renders the pane `busy`
-and never reaches the background-children path, so it was never affected.) The watcher auto-respawns only the
+and never reaches the background-children path, so it was never affected.)
+
+`pane-state.sh` also reports `bg_stale=<n>` on the same line
+(<your-org>/nexus-code#1208): how many of those roots are waiting on an
+`async-run` job the AUTHORITY (`async-run.sh --status-line`) reports **`died`**
+— pid gone AND no status file, so no future event can clear it. Those roots do
+not count toward `working-background`; when every root is stale the state is no
+longer `working-background` at all. It is reported even at `0`, so *"asked, none
+stale"* stays distinguishable from *"never asked"* — which is the distinction
+`#1208` is about. A root is stale only if its OWN argv names a job, EVERY job in
+its subtree is `died`, and the subtree holds nothing but shells and `sleep`;
+every unresolvable outcome (`running`, `terminal`, unparseable, capped) leaves
+the root live. Consumers read these fields BY KEY
+(`_idle_pane_line_field`), so the field order on this line is not load-bearing. The watcher auto-respawns only the
 orchestrator; worker windows are flagged, never auto-respawned on
 staleness, so this exemption plus retire-preflight's marker gate is the
 complete worker-side hardening.
@@ -1327,7 +1376,25 @@ through `_watcher_handle_graphql_failure`:
   polls short-circuit via `_graphql_backoff_active` until
   `now >= reset + 30 s`. Sentinel + log dedup via flag file
   `graphql-alert-emitted-<surface>-<reset>` — one alert per
-  bucket-exhaustion event, not one per poll. Deliveries-path
+  bucket-exhaustion event, not one per poll. **That flag dedups
+  GENERATION, and until <your-org>/nexus-code#966 nothing dedup'd
+  DELIVERY** — the sentinel is written into the `github_poll.out`
+  staging file, which `_compose_gh_now` re-reads on every
+  `comment_surface` fire (15 s, or 5 s under the nudge) for the full
+  600 s until `github_poll` next refreshes it. Every hop of
+  `_gh_filter_dedup_pipeline` dispatches on the recognised emit-header
+  shapes `^(issue|pr|pr_review|issue_new|mention|cross_repo)=`, which a
+  sentinel matches none of, so every hop took its DEFAULT ARM and
+  forwarded it — a permissive-default failure, not an id-keying one.
+  (Only the five damping hops key on `id=`; `_filter_to_user_author`,
+  `_filter_skip_marker` and `_filter_cross_repo_surface` key on
+  `author=`, on body content and on the mention shapes, and would have
+  forwarded a sentinel that DID carry an id.) Measured on the
+  2026-08-17 GraphQL 503: one escalation, 62 pastes in ten minutes,
+  every one carrying the same frozen `held_s=2403`. `_filter_alert_cooldown`
+  now supplies the missing per-surface identity, so the sentence above
+  is true end-to-end rather than only at the generator.
+  Deliveries-path
   (App-JWT, separate bucket) is unaffected and keeps surfacing
   comments during the backoff window.
 - **Unknown failure** (non-rate-limit JSON or empty stderr): no
@@ -1418,9 +1485,23 @@ never the whole ingest.
 **Sustained failure escalates** (`#595`, "also required"): a surface
 failing continuously past `monitor.graphql.degraded_escalate_seconds`
 (default 1800) emits `watcher_alert=ingest-degraded` out-of-band,
-re-nagging on `degraded_remind_seconds` (3600), and announces its own
+re-nagging on `degraded_remind_seconds` (900), and announces its own
 recovery. No fetch on the operator-communication path may fail on the
 strength of a log line alone.
+
+That re-nag carries the weight, and it was 3600 until
+<your-org>/nexus-code#966. **Silence and recovery look identical from the
+operator's side** — a recovery is announced once and then quiet, so an
+escalation that is also announced once and then quiet for an hour reads
+as resolved. The restatement is the only thing distinguishing them, so it
+runs on a human timescale and carries a LIVE `held_s` (recomputed from
+`first` each time). Note the effective period is this window rounded UP
+to a multiple of the 600 s `github_poll` interval — the escalation is
+only evaluated on that path — so 900 restates every second poll, and
+anything below 600 changes nothing. The delivery side is damped
+separately by `_filter_alert_cooldown`; a restatement's changed `held_s`
+is exactly what carries it through that damper, which is why a frozen
+one would be silently swallowed.
 
 ## Compact GitHub helper (`ng`)
 
@@ -1439,12 +1520,12 @@ instead of eight.
 | `ng close <issue> [--comment <text>]` | Optional comment, then close. | `CLOSED` |
 | `ng issue <issue>` | One-line issue summary. | `#<n> state=<STATE> title=<title>` |
 | `ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin\|latest] [--message <msg>]` | Thin shim over `monitor/upload-asset.sh` — commit a local file (image or report markdown) to the asset repo's `main` branch under `assets/...` and print a SHA-pinned URL suitable for embedding. `--issue N` routes under `assets/N/`; sources under `reports/` auto-cluster to `assets/reports/`; everything else lands at `assets/general/`. `.md`/`.ipynb` get a `blob/<sha>/` URL (renderable page); other extensions get `raw/<sha>/` (embed-friendly). | asset URL pinned to post-push SHA |
-| `ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--comment-body-file <path> \| --no-comment] [--retain <reason> \| --no-retain]` | The universal end-of-task hand-off, folded into one verb: (1) upload the report via `ng upload --issue N`; (2) post a comment on `<issue>` — templated body by default (title from H1, one-sentence summary from `## Summary` or first 200 chars), bespoke when `--comment-body-file` is set (substitutes `{{REPORT_URL}}` token, else appends `Full report: <URL>` footer), skipped when `--no-comment` is set; (3) rocket-react `--trigger-comment` if supplied; (4) `log-action monitor --event wrap-up`; (5) `log-action monitor --event window-retain` for the source tmux window so the watcher mutes the wrapped row for `monitor.retain_ttl_seconds` (default 24 h) — auto-tagged `wrap-up-<YYYY-MM-DD>` unless `--retain <reason>` overrides; `--no-retain` opts out (close-immediately). Step 5 is silently skipped off-tmux and its failure does not flip exit. (6) when the source window carries a live operator-engagement mark, prints the interactive-wrap clarification: staying engaged is the DEFAULT (follow-up inquiries expected); `ng engaged-done` is the explicit finished-signal. Exit 0 only when every attempted hand-off step (1–4) succeeds; on partial failure, prints which steps ok/failed on stderr so the caller can retry. | per-step status lines on stdout |
+| `ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--comment-body-file <path> \| --no-comment] [--retain <reason> \| --no-retain]` | The universal end-of-task hand-off, folded into one verb: (1) upload the report via `ng upload --issue N`; (2) post a comment on `<issue>` — templated body by default (title from H1, one-sentence summary from `## Summary` or first 200 chars), bespoke when `--comment-body-file` is set (substitutes `{{REPORT_URL}}` token, else appends `Full report: <URL>` footer), skipped when `--no-comment` is set; (3) rocket-react `--trigger-comment` if supplied; (4) `log-action monitor --event wrap-up`; (5) `log-action monitor --event window-retain` for the source tmux window so the watcher mutes the wrapped row for `monitor.retain_ttl_seconds` (default 24 h) — auto-tagged `wrap-up-<YYYY-MM-DD>` unless `--retain <reason>` overrides; `--no-retain` opts out (close-immediately). Step 5 is silently skipped off-tmux and its failure does not flip exit. (6) when the source window carries a live operator-engagement mark, prints the interactive-wrap clarification: staying engaged is the DEFAULT (follow-up inquiries expected); `ng engaged-done` is the explicit finished-signal. Exit 0 only when every attempted hand-off step (1–4) succeeds; on partial failure exits **1** and prints which steps ok/failed on stderr so the caller can retry. **Exit 3 (<your-org>/nexus-code#862) is NOT a partial failure and must not be retried**: every step succeeded and nothing was published — the report changed (its asset link moved) while the composed body, which quotes `## Summary` alone, is byte-identical to the comment already posted. Re-running reproduces it exactly; only the caller can resolve it (edit `## Summary` in place, pass `--comment-body-file`, or post it manually). The action log records `comment=nothing-published` for this case. | per-step status lines on stdout |
 | `ng engaged-done [--window <name>]` | The interactive session's explicit FINISHED-signal (the <your-org>/<your-nexus>#205 state-machine follow-up). Appends an `engaged-done` action-log event for the calling pane's window (or `--window`); the watcher treats it as the engagement-mark invalidation, dropping the window back to the typical wrapped-window cleanup path. A later operator prompt re-engages — the release is never a lock-out. | confirmation line |
 | `ng dashboard get` | Fetch the overview issue body and emit only the content between `<!-- NEXUS_DASHBOARD_START -->` / `<!-- NEXUS_DASHBOARD_END -->`. Caches to `.state/dashboard.md`. | dashboard middle |
-| `ng dashboard put [--body-file <path>]` | Re-fetch the body, splice the new middle in (preserving the static prose around the markers), PATCH. Updates the cache on success. Runs the section-schema check in **warn-only** mode — prints missing required sections to stderr but never blocks the push. | issue URL |
+| `ng dashboard put [--body-file <path>\|-]` | Re-fetch the body, splice the new middle in (preserving the static prose around the markers), PATCH, then **verify with an INDEPENDENT GET** (the PATCH response echoes what you SENT, so it cannot see a server-side swallow; it is compared separately to catch corruption on our side). Refuses a body containing a marker (`#959`), a live body without exactly one marker pair (`#1118`/`#1058`), and anything over GitHub's 262,144-byte cap. Cache + freshness stamp are written **only after verification**. rc 4 = could not verify (distinct from failed). Section-schema check stays **warn-only**, now searched across the whole issue body. | issue URL |
 | `ng dashboard scaffold` | Print the canonical dashboard skeleton (the six required sections — `## Identity` · `## Infra` · `## Services` · `## In-flight` · `## Awaiting operator` · `## Recent landings` — each with a one-line hint). Seed a new dashboard by piping into `dashboard put`. | section skeleton |
-| `ng dashboard validate [--body-file <path>]` | **Strict** schema gate: exit 0 if every required section heading is present, exit 1 (listing the missing ones) otherwise. The hard-failure counterpart to `put`'s warn-only check. Reads `--body-file` or stdin. | OK line / missing list |
+| `ng dashboard validate [--body-file <path>\|-]` | **Strict** schema gate: exit 0 if every required section heading is present **exactly once**, exit 1 (listing missing/duplicated ones) otherwise. With **no `--body-file` it validates the LIVE dashboard** (`#958`); `-` is explicit stdin. Also checks marker uniqueness and reports near-miss headings + body size. | OK line / missing + duplicate list |
 | `ng nexus-identity [--upsert-overview] [--dry-run] [--repo <owner/name>]` | Render the auto-generated **Nexus identity** block — working-directory headline plus host, asset+issue repo, implementation-clone remote/branch, and watcher pidfile/log — and idempotently upsert it into the overview issue body between `<!-- nexus-identity:start -->` / `<!-- nexus-identity:end -->`. Every field is DERIVED from `$NEXUS_ROOT` / `github.repo` / hostname / the clone's git origin, so it's generic across operators. `--dry-run` renders without the PATCH. | identity block / issue URL |
 | `ng watcher-status` | One-shot liveness summary: heartbeat age, PID + alive/dead, target window, lock state, tmux presence, archived-diffs count. | key=value block |
 | `ng log-action <agent> --event <name> [--note <t>] [--extra k=v]...` | Append one JSONL line to `monitor/.state/action-log.jsonl`. Structured trace of meaningful actions (processed comments, dashboard updates, agent spawns). Reserved keys: `ts`, `agent`, `event`, `note`. | (silent) |
@@ -1842,7 +1923,7 @@ neither detection nor any gate; the gate lives in the autonomous routine
 `cc_auto_update.enabled` off, the signal file is still recorded but nothing
 acts on it.
 
-### Autonomous daily cc-update (opt-in)
+### Autonomous daily cc-update (code default off, shipped template on)
 
 Detection alone only *informs*. With `monitor.cc_auto_update.enabled:
 true`, the watcher additionally **drives** the gated loop end-to-end:
@@ -1865,8 +1946,18 @@ branches through `monitor/cc-auto-update-apply.sh`:
 - **block / any uncertainty** → never bumps; records + surfaces.
 
 Every decision lands in the append-only audit trail
-`monitor/.state/cc-auto-update/decisions.tsv`. Default **disabled**;
-enabling it is a deliberate per-operator config change.
+`monitor/.state/cc-auto-update/decisions.tsv`.
+
+**Two defaults, and they differ — code default off, shipped template on**
+(<your-org>/nexus-code#1476). The code fallback in `monitor/watcher/_config.sh`
+is `false` when the key is absent from the config file in use;
+`config/nexus.example.yml` ships `enabled: true`; and `config/load.sh`
+reads ONE file whole (`$NEXUS_CONFIG`, else `config/nexus.yml`, else the
+example). So a tree with **no** `config/nexus.yml` — a fresh clone, CI, a
+copied template — runs with it **ON**, while an existing `nexus.yml` that
+never gained the key runs with it **OFF**. Neither value is changed by a
+`git pull`; whichever you rely on, state the key explicitly in your
+`nexus.yml` so the answer does not depend on which file `load.sh` picked.
 
 ### Precedence for a given value
 
@@ -2250,7 +2341,7 @@ object; substitute your `NEXUS_ROOT`):
 
 ```bash
 # snippet: monitor/boot-recover.session-start-hook.json
-# command: "<NEXUS_ROOT>/monitor/boot-recover.sh", "async": true
+# command: "<YOUR_NEXUS_ROOT>/monitor/boot-recover.sh", "async": true
 ```
 
 This converts the previously *manual* "orchestrator runs recovery on
@@ -2266,8 +2357,8 @@ within. Pick one, edited from outside the sandbox:
 
   ```sh
   # nexus cold-boot recovery (idempotent, debounced, non-blocking)
-  [ -x /shared/your-lab-m/user/<operator>/nexus/monitor/boot-recover.sh ] && \
-      /shared/your-lab-m/user/<operator>/nexus/monitor/boot-recover.sh >/dev/null 2>&1 || true
+  [ -x <YOUR_NEXUS_ROOT>/monitor/boot-recover.sh ] && \
+      <YOUR_NEXUS_ROOT>/monitor/boot-recover.sh >/dev/null 2>&1 || true
   ```
 
 - Or a `sandbox.conf` on-start entry that runs the same one-liner when
@@ -2278,6 +2369,31 @@ work; the *hook that calls it at reboot* is the operator's to install
 outside the writable area. `boot-recover.sh` is idempotent and
 debounced, so wiring more than one trigger is safe — they collapse to
 a single recovery attempt via the `.state/boot-recover.stamp` window.
+
+**`boot-recover-hook-check.sh` does NOT cover this snippet, and that is a
+scope statement rather than an oversight.** It reads `settings.json` and
+answers about the *SessionStart hook*; an operator who armed cold-boot
+recovery with the belt-and-suspenders trigger **instead of** the hook gets
+`rc 4 ABSENT` from it and is not thereby unarmed. Extending it to read the
+login-shell surface was considered and declined
+(<your-org>/nexus-code#1275): the two install surfaces offered above are not
+equally visible from inside the sandbox. Measured on this host,
+`~/.config/agent-sandbox/` does not exist from within - `ls` reports *No
+such file or directory* - so a checker arm could read the login-shell
+option and could **not** read the `sandbox.conf` option, and would answer a
+confident "not armed" for an operator who picked the second one. That is
+the false negative the checker exists to prevent, regenerated inside the
+checker.
+
+Verify this trigger the way it actually fails instead. The placeholder is
+necessary but NOT sufficient - `monitor/boot-recover.session-start-hook.json`
+carries the measurement - so check both that you replaced it and that the
+path resolves:
+
+```sh
+grep -n boot-recover ~/.zprofile                                       # the snippet is present
+sh -c '[ -x <YOUR_NEXUS_ROOT>/monitor/boot-recover.sh ]'; echo "rc=$?"  # rc=0 => path resolves
+```
 
 ## Manual watcher use (debugging)
 
@@ -2470,7 +2586,9 @@ as with any server restart).
 the tokened access URL while the service is UP.
 Agent-facing usage and the foolproof default behavior:
 `skills/nexus.jupyter/SKILL.md`; labsh primitives: the `<yourlab>.labsh`
-skill and `work/labsh/doc/labsh.md`.
+skill and, **if this nexus has a `labsh` checkout**,
+`work/labsh/doc/labsh.md` — an operator-local path outside this repo,
+so it will not resolve in a fresh clone.
 
 Tests: `bash monitor/watcher/test-jupyter-service.sh` (unit, stubbed
 labsh) and `RUN_INTEGRATION=1 bash
@@ -2518,7 +2636,7 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `install-claude-local.sh`    | Installs the project-local Claude Code into `node_modules/.bin/claude` at the EFFECTIVE version (local pin if present — installed via `npm install --no-save <pkg>@<ver>` so the shared floor is untouched — else the package.json floor via bare `npm install`). Idempotent; fail-loud verify that the binary runs and reports the effective version. | yes |
 | `paste-followup.sh`          | THE canonical follow-up paste into a worker window (issue #201): stamps `.state/machine-input.tsv` BEFORE pasting (so the watcher attributes the submitted prompt — the paste fires the worker's `UserPromptSubmit` hook — to the orchestrator, not the operator), performs the VI-safe `i BSpace` → `set-buffer` → `paste-buffer` → `Enter` sequence, appends a `paste-followup` action-log audit event, and persists its own confirmation verdict to `.state/paste-verdicts/<window>.<epoch>` so the watcher's `paste-unconfirmed` detector reads what the sender established rather than re-deriving it from a possibly-rotated session-id (issue #665). Raw `tmux paste-buffer` follow-ups falsely mark the window `operator-engaged` and mute its stall-nag — always use this helper. | yes |
 | `mint-token.sh`              | Mints / caches the bot's installation token | yes |
-| `git-https-setup`            | **Opt-in per-repo helper** (niche). Configures a single clone for bot-identity git commit + push via a fresh installation token on every challenge. Use only where the user's `gh auth setup-git` path isn't available (e.g. inside agent-sandbox with a read-only `~/.gitconfig`) — note that bot-authored commits make later attribution of work back to a human harder, which matters for projects intended to go public. Not auto-invoked. | yes |
+| `git-https-setup`            | **Opt-in per-repo helper** (niche). Configures a single clone for bot-identity git commit + push via a fresh installation token on every challenge. Use only where the bot, not the user's gh OAuth identity, must own both the credentials and the commit author — `gh auth setup-git` configures a credential helper ONLY (it never writes `user.name`/`user.email`) and delegates to the user's OAuth token. NOT because `~/.gitconfig` is read-only: it is writable (`-rw-rw-rw-`, measured 2026-09-01 inside agent-sandbox), and that false premise is <your-org>/nexus-code#1244 — note that bot-authored commits make later attribution of work back to a human harder, which matters for projects intended to go public. Not auto-invoked. | yes |
 | `ng`                         | Compact GitHub / watcher helper (`process`, `react`, `reply`, `close`, `dashboard get|put|scaffold|validate`, `nexus-identity`, `issue`, `upload`, `watcher-status`, `log-action`) | yes |
 | `upload-asset.sh`            | Commits a local file (image or report markdown) into the asset repo's `main` branch under `assets/...`; prints a SHA-pinned `github.com/{owner}/{asset-repo}/{raw\|blob}/<sha>/...` URL that renders in any browser logged into github.com | yes |
 | `notify.sh`                  | Tiered Pushover / ntfy / SMTP fan-out  | yes      |
@@ -2528,7 +2646,7 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `hooks/decision-mark-unresolved.sh` | Stop-hook handler: per turn-end, walks `.state/decisions/<window>.*.json` and adds `unresolved: true` to lingering files (the orchestrator removed any answered ones). Idempotent; tombstones (`*.handled.json`) skipped. | yes |
 | `README.md`                  | This file                              | yes      |
 | `.state/diffs/`              | Archived watcher emits, `<ts>_<shortid>.md`, pruned at `monitor.diff_retention_days` | no |
-| `.state/watcher-heartbeat`   | PID + ISO timestamp; mtime-bumped every poll cycle | no |
+| `.state/watcher-heartbeat`   | `pid=` / `ts=` / `target=`; **liveness only** — beaten by a constant-cadence background ticker (`monitor.watcher.heartbeat_tick_seconds`, default 20 s), NOT once per poll cycle. Fresh ≠ alive-and-advancing: the verdict is the UP/BUSY/WEDGED/DOWN trichotomy over the heartbeat/progress/cycle triple (see "Watcher liveness") | no |
 | `.state/orchestrator-heartbeat` | Empty file; mtime touched by the orchestrator's `Stop` hook in `monitor/orchestrator-settings.json` at every turn-end (issue #164). The `_orchestrator_liveness_decide` state machine compares this against `orchestrator-last-paste.ts` to decide whether the orchestrator has reacted to a paste. Missing file (settings predate the hook, fresh state dir) is benign — the state machine falls back to the paste-received signal, then jsonl-mtime. The touch runs asynchronously via `(... &) >/dev/null 2>&1` so the hook returns instantly. | no |
 | `.state/orchestrator-paste-received` | Empty file; mtime touched by the orchestrator's `UserPromptSubmit` hook the moment its input queue picks up a watcher paste. Strictly weaker than the heartbeat (paste-received fires the moment the input lands; Stop fires at turn-end). Covers the mid-tool-turn case where the heartbeat is stale because Stop hasn't fired yet but the orchestrator is demonstrably processing the prompt. Same async touch pattern as the heartbeat. | no |
 | `.state/orchestrator-unresponsive-since` | Empty file; mtime stamped by the liveness state machine on first entry into the pasted-without-response phase, cleared on any healthy decision. Anchors the `unstick_window_seconds` budget — detect_and_unstick has from this moment to bump the heartbeat before the watcher escalates to the re-submit rescue. | no |
@@ -2566,6 +2684,7 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `.state/settings/<name>.effective.json` | Generated merge of `monitor/<name>.json` with the untracked operator overlay `monitor/<name>.local.json` (`#614`); this is the path handed to `claude --settings`. Absent when no overlay exists (the tracked file is passed directly) | no |
 | `.state/version/drift-clone` | Deployment-drift ask record: the primary clone is behind the remote branch, or its state could not be determined (`#614`). Rendered by `_version_emit_section` | no |
 | `.state/graphql-alert-emitted-<surface>-<epoch>` | Flag file: `watcher_alert=rate-limit ...` sentinel already emitted for this (surface, reset) pair — one alert per exhaustion event, not per poll | no |
+| `.state/alert-history/alert-<surface>.meta` | Per-surface delivery stamp for `watcher_alert=` blocks (`ts=` / `kind=` / `sha=`), written by `_filter_alert_cooldown` on every alert it lets through (<your-org>/nexus-code#966). Note this is the DELIVERY side: the flag files above stop a generator re-announcing, and they worked — during the 2026-08-17 GraphQL 503 one escalation produced 62 pastes because `_compose_gh_now` re-reads the staged `github_poll.out` on every `comment_surface` fire, and no hop in `_gh_filter_dedup_pipeline` could express an alert — every hop dispatches on the recognised emit-header shapes `^(issue\|pr\|pr_review\|issue_new\|mention\|cross_repo)=` and takes its default arm on anything else. (Not "all eight key on `id=<N>`": only the five damping hops do, and the author / skip-marker / cross-repo hops would forward an alert carrying an id anyway.) A kind change or a content change passes immediately, so a state edge is never delayed; only replays of one edge collapse. Bounded by the number of surfaces (3), so it needs no GC — unlike `emit-history/`, which is keyed by comment id and is pruned by `prune_archive` | no |
 | `.state/deliveries-queue.lines` | Durable queue of deliveries-channel emit blocks. Each `_v2_task_deliveries_poll` fire (15 s cadence) appends new blocks under flock; `compose_emit` (`MONITOR_INTERVAL` cadence, default 60 s) drains via rename + read + rm. Decouples the producer's 15 s ticks from the consumer's drain reads so a delivery emitted at tick T is not wiped by the empty tick T+1 — pre-fix, the scheduler's atomic-replace of `<stage>/deliveries_poll.out` overwrote the previous tick's output, losing three of every four ticks' events to the 600 s GraphQL backstop. Mtime advances on every append; `_compose_emit_nudge_check` reads it to pull compose_emit forward (see "Compose-emit nudge" below). | no |
 | `.state/deliveries-queue.lock` | flock target serializing appenders against the drainer of `.state/deliveries-queue.lines`. Append/drain hold an exclusive lock; the rename-then-read drain ensures concurrent appenders write to a fresh file after rename. | no |
 | `.state/cc-version-local`    | The **operator-local Claude Code pin** (floor-plus-local-pin, #226): a single line holding the version this operator has validated via the gated cc-update routine. Written by the cc-update APPLY step; read by `_cc-version.sh` (`effective = this else package.json floor`). Absent on a fresh install ⇒ the install + gate baseline fall back to the package.json floor. Gitignored (`monitor/.gitignore` `.state/`); never committed. | no |
@@ -2679,6 +2798,22 @@ Each env var, if set, overrides the corresponding key in
 `config/nexus.yml`. The "Config key" column points at the source of
 truth.
 
+This table is a CURATED SUBSET, not the full set, and **so is every
+other document** — `config/nexus.example.yml` and
+`docs/reference/config.md` are wider but neither is exhaustive
+either. Measured at `a3177ef6`: `monitor/watcher/_config.sh` reads
+**146** distinct config keys and at least **31** of them have no entry
+in `config/nexus.example.yml` at all (a lower bound — the probe matches
+on the key's LEAF, so a key whose leaf name is shared with a present
+key, such as every `monitor.version_restart.*`, reads as present when
+it is absent; the whole `version_restart` family is missing). **The
+CODE is the only complete surface.** Derive its set:
+
+```bash
+bash -c "grep -ohE '\\\$\\{MONITOR[A-Z0-9_]*:-' monitor/watcher/_config.sh | sort -u"   # env overrides
+bash -c "grep -ohE '\"\\\$_cfg\" [a-z][a-z0-9_.]+' monitor/watcher/_config.sh | sed 's/.* //' | sort -u"   # config keys
+```
+
 | Env var                       | Config key                                | Purpose                                |
 |-------------------------------|-------------------------------------------|----------------------------------------|
 | `NEXUS_ROOT`                  | `nexus.root`                              | nexus workspace root                   |
@@ -2716,4 +2851,3 @@ truth.
 | `NEXUS_EMAIL_TO`              | `notifications.email.address`             | emergency email recipient              |
 | `NEXUS_SMTP_HOST` / `NEXUS_SMTP_PORT` | `notifications.email.smtp_host` / `.smtp_port` | outbound SMTP relay  |
 | `NEXUS_ASSET_REPO`            | (upload-asset.sh only)                    | repo for `upload-asset.sh` commits     |
-| `NEXUS_ASSET_BRANCH`          | (upload-asset.sh only)                    | branch for `upload-asset.sh` commits   |

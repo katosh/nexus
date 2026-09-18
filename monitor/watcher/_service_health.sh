@@ -241,9 +241,32 @@ _sh_log() {
 # bootstrap-recover.sh / _version_restart.sh absorb-and-ignore the 6th
 # field so its presence can never corrupt their `logfile` (read's
 # trailing-remainder rule), keeping every registry reader lock-step.
+# Registry readability — the REPLICATED half of the contract documented in
+# bootstrap-recover.sh ("registry READABILITY: three states, not two",
+# your-org/nexus-code#1266). Replicated rather than sourced for the same
+# reason `_sh_service_healthy` is: the watcher must not source
+# bootstrap-recover.sh. The CONTRACT is identical; the BODY differs only in
+# how the path is resolved (`_sh_registry_path`, not a positional arg).
+# Keep in step.
+#   0  readable, or genuinely ABSENT (both are adjudications)
+#  79  exists and could not be read — no statement about contents available
+_sh_registry_readable() {
+    local file="$1"
+    [[ -e "$file" ]] || return 0
+    [[ -f "$file" ]] || return 79
+    # `2>/dev/null` FIRST — redirections apply left to right, so the other
+    # order leaks a bare "Permission denied" naming this line.
+    { : ; } 2>/dev/null < "$file" || return 79
+    return 0
+}
+
 _sh_parse_registry() {
     local file; file="$(_sh_registry_path)"
-    [[ -f "$file" ]] || return 0
+    if ! _sh_registry_readable "$file"; then
+        _sh_log "registry: NOT READABLE at $file — refusing to report its contents (rc 79)"
+        return 79
+    fi
+    [[ -e "$file" ]] || return 0
     local line name workdir launch health logfile policy
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
@@ -258,7 +281,10 @@ _sh_parse_registry() {
         logfile="${logfile//\$NEXUS_ROOT/${NEXUS_ROOT:-}}"
         policy="$(_sh_resolve_policy "$policy")"
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$workdir" "$launch" "$health" "$logfile" "$policy"
-    done < "$file"
+    # The probe and this redirection are two separate opens; a fault arriving
+    # between them yields a SHORT read, which is worse than a zero because it
+    # is plausible. The redirection's own rc is the only thing that sees it.
+    done < "$file" || return 79
 }
 
 # ---- per-service healthcheck (reuse of _recover_service_healthy:309) -----
@@ -275,16 +301,60 @@ _sh_parse_registry() {
 # tell the operator which one it was. Empty on the healthy path (and for any
 # healthcheck that stays silent on failure — most curl/pgrep checks).
 _SH_HEALTH_DETAIL=""
+# ---- FINDING payload, captured on the same single run (your-org/nexus-code
+# #1423). A FINDING is not a failure notice and the two need different
+# payloads, so they are captured into different variables rather than one
+# being made to serve both.
+#
+#   _SH_FINDING_KEY   the SUPPRESSION key, DECLARED by the service on a
+#                     `finding-key:` line. Keying dedupe on the rendered text
+#                     made the text do double duty, and the text carries live
+#                     counters: measured on tmpfs-guard, `14129` -> `14127`
+#                     re-fired the finding two minutes later while the state a
+#                     reader cares about — still over threshold — had changed
+#                     zero times. The framework cannot GUESS which part of a
+#                     message is stable, and a digit-stripping heuristic would
+#                     silently merge findings that differ only in a number
+#                     that matters. So the service declares it, exactly as it
+#                     already declares its own payload by what it writes to
+#                     stderr. ABSENT, the whole text is the key — the previous
+#                     behaviour, so a service that has not adopted the line is
+#                     unaffected.
+#   _SH_FINDING_BAND  an optional MONOTONE severity on a `finding-band:` line.
+#                     It exists for one job: a mute recorded at one band must
+#                     BREAK when the situation crosses into a worse one. A
+#                     service that declares no band gets the conservative rule
+#                     (any key change breaks the mute), which errs toward
+#                     EMITTING — the safe direction for a suppression feature.
+#   _SH_FINDING_BODY  the bounded full stderr. The 300-char verdict line above
+#                     exists so a DOWN emit stays a human section rather than a
+#                     log dump; for a finding the payload IS the product, since
+#                     the orchestrator is being asked to act and acting needs
+#                     the families, the owners and the magnitudes.
+_SH_FINDING_KEY=""
+_SH_FINDING_BAND=""
+_SH_FINDING_BODY=""
 _sh_service_healthy() {
     local workdir="$1" health="$2"
     _SH_HEALTH_DETAIL=""
+    _SH_FINDING_KEY=""; _SH_FINDING_BAND=""; _SH_FINDING_BODY=""
     # ONE run — no extra probe (the #431/#434 sshd-starvation history forbids
     # double-probing). Inside $(...), `2>&1 1>/dev/null` routes fd2 to the capture
     # pipe and then fd1 to /dev/null, so stdout is dropped exactly as before and
     # only stderr is retained. `local err; err=...; rc=$?` — NOT `local err=$(...)`,
     # which would mask the command's rc behind `local`'s own exit status.
+    # The health string is fed over a PIPE, never via argv (your-org/nexus-code
+    # #891). `bash -c "$health"` puts the whole string — pattern included — into
+    # a process's argv, and bash only EXECs (shedding it) for a BARE simple
+    # command: a mere `>/dev/null`, let alone `&&` or a subshell, leaves a
+    # `bash -c` alive holding the pattern for the duration of the scan. A
+    # `pgrep -f`/`ps` healthcheck then matches ITSELF and this function returns
+    # 0 forever — a boolean that is always true, so THIS module reads `healthy`,
+    # never restarts, and logs no fault. Measured on bash 4.4.20; the full shape
+    # matrix is in bootstrap-recover.sh's `_recover_service_healthy`, which
+    # carries the identical (deliberately replicated) call site. Keep in step.
     local err rc
-    err=$( ( cd "$workdir" 2>/dev/null && bash -c "$health" ) 2>&1 1>/dev/null )
+    err=$( ( cd "$workdir" 2>/dev/null && bash <(printf '%s' "$health") ) 2>&1 1>/dev/null )
     rc=$?
     if (( rc != 0 )) && [[ -n "$err" ]]; then
         # Select the VERDICT line by CONTENT, not by POSITION. The failing
@@ -300,9 +370,25 @@ _sh_service_healthy() {
         # line — the emit is a human section, not a log dump.
         local nb verdict
         nb=$(printf '%s\n' "$err" | grep -vE '^[[:space:]]*$')
-        verdict=$(printf '%s\n' "$nb" | grep -iE 'unhealthy|foreign|no listener|not sshd|refused|timed out|timeout|unreachable|no route|fatal' | head -n1)
+        # `finding` joins the keyword set because a FINDING's verdict line
+        # correctly does NOT say "unhealthy" — the service is not unhealthy.
+        # Without it the selector fell through to "first non-blank line",
+        # which for a multi-line finding is a coin flip.
+        verdict=$(printf '%s\n' "$nb" | grep -iE 'unhealthy|finding|foreign|no listener|not sshd|refused|timed out|timeout|unreachable|no route|fatal' | head -n1)
         [[ -n "$verdict" ]] || verdict=$(printf '%s\n' "$nb" | head -n1)
         _SH_HEALTH_DETAIL=$(printf '%s' "$verdict" | cut -c1-300)
+        _SH_FINDING_KEY=$(printf '%s\n' "$nb" \
+            | sed -n 's/^[[:space:]]*finding-key:[[:space:]]*//p' | head -n1)
+        _SH_FINDING_BAND=$(printf '%s\n' "$nb" \
+            | sed -n 's/^[[:space:]]*finding-band:[[:space:]]*//p' | head -n1)
+        [[ "$_SH_FINDING_BAND" =~ ^[0-9]+$ ]] || _SH_FINDING_BAND=""
+        # The protocol lines are machinery, not prose: they are stripped from
+        # the rendered body so the emit reads as a report rather than as a
+        # wire format.
+        _SH_FINDING_BODY=$(printf '%s\n' "$err" \
+            | grep -vE '^[[:space:]]*finding-(key|band):' \
+            | head -n "${MONITOR_SERVICE_HEALTH_FINDING_BODY_LINES:-60}" \
+            | cut -c1-400)
     fi
     return $rc
 }
@@ -521,6 +607,155 @@ _sh_write_state() {
     return 0
 }
 
+# ---- FINDINGS: a healthcheck that is ALIVE and reports a CONDITION ------
+# (your-org/nexus-code#1423). A healthcheck has two things to say and the
+# exit-code vocabulary had a word for only one of them. `exit 0` is "I am
+# healthy"; any other code is "I am DOWN" — grace, restart, escalation, and
+# an emit offering `svc.sh restart`. A MONITOR registered as a service
+# (tmpfs-guard `--check`) reports a fact about its ENVIRONMENT: /tmp is over
+# threshold. That is the monitor working correctly, and rendering it as
+# `service DOWN … restart now: svc.sh restart tmpfs-guard` sent readers to a
+# remedy that accomplishes nothing (it fired 2026-09-06 01:12 exactly so).
+#
+# The third word: `exit 100` == "I am alive; the condition I watch is
+# PRESENT; my stderr says which". Chosen above every code a real healthcheck
+# emits (curl stops at 99, pgrep at 3, this repo's own third outcomes are 77,
+# 69, 79) and below bash's 126+. A finding is carried as its OWN sidecar
+# (`<name>.finding`), never as a value of `status` — `status` SELECTS in this
+# module (grace/restart/escalate arms, re-nag keys, `ng service-incident`),
+# so a new token there would be a behavioural change every reader had to be
+# taught (#1050); a new file is read only by the code below. For the
+# incident machine a finding IS healthy: no incident, no grace, no restart.
+SH_RC_FINDING=100
+_sh_finding_file()         { printf '%s/%s.finding'         "$SERVICE_HEALTH_STATE_DIR" "$1"; }
+_sh_finding_cleared_file() { printf '%s/%s.finding-cleared' "$SERVICE_HEALTH_STATE_DIR" "$1"; }
+_sh_finding_body_file()    { printf '%s/%s.finding-body'    "$SERVICE_HEALTH_STATE_DIR" "$1"; }
+_sh_finding_mute_file()    { printf '%s/%s.finding-mute'    "$SERVICE_HEALTH_STATE_DIR" "$1"; }
+_sh_finding_hash() { printf '%s' "${1:-}" | cksum | awk '{print $1}'; }
+
+# ---- MUTES (your-org/nexus-code#1423, operator) ---------------------------
+# An operator may silence a finding they have judged and accepted — "that
+# memory is another user's", "we know, it is tracked". Four constraints, each
+# taken from something that bit this repo THIS WEEK, and the mechanism is
+# built out of them rather than around them:
+#
+#   1. IT MUST EXPIRE. An open-ended mute is an unowned exemption, which is
+#      your-org/nexus-code#1486 — where one row records, in its own note, that
+#      no rationale is on file. So a mute carries the SAME ownership rule
+#      #1482 already applies to a `none` positive-control row: a tracker ref
+#      (`#NNNN` / `owner/repo#NNNN`) or an `until:YYYY-MM-DD` date.
+#   2. IT MUST CARRY A REASON AND AN OWNER, for the same reason.
+#   3. IT MUST BREAK WHEN THE CONDITION MATERIALLY WORSENS. A mute keyed on
+#      "over threshold" would sit silently through 10% -> 77%, which would
+#      make the mute the mechanism by which the incident this tool exists to
+#      catch goes unreported — the defect class this whole change is about,
+#      built deliberately. So it is keyed on the BAND: crossing into a worse
+#      one re-fires regardless of the mute, and the emit says the mute broke.
+#   4. `muted` AND `cleared` MUST BE DISTINGUISHABLE IN THE RECORD. This
+#      module has already produced `recovered, CAUSE UNKNOWN` firing beside
+#      `condition PRESENT` for one service in one second; that is what
+#      conflating two facts looks like. They are different files, different
+#      events and different words.
+#
+# AN INVALID OR EXPIRED MUTE IS IGNORED LOUDLY, NEVER OBEYED QUIETLY. A
+# suppression feature that fails OPEN (mute anyway) hides the thing it was
+# asked to hide for a reason nobody stated; failing CLOSED (emit, and say the
+# mute was refused) costs one message. File format, all `key=value`:
+#
+#     service=<name>
+#     owner=<who accepted it>
+#     reason=<why>
+#     until=YYYY-MM-DD          # this or tracker= (or both)
+#     tracker=#1423
+#     band=<the numeric band it was accepted at>
+#
+# _sh_mute_state <name> <current-band> -> `active|none|invalid:<why>|expired:<date>|broken:<from>-><to>`
+_sh_mute_state() {
+    local name="$1" band="${2:-}" mf owner reason until_d tracker mband today
+    mf="$(_sh_finding_mute_file "$name")"
+    [[ -f "$mf" ]] || { printf 'none'; return 0; }
+    owner=$(_sh_field "$mf" owner 2>/dev/null || echo '')
+    reason=$(_sh_field "$mf" reason 2>/dev/null || echo '')
+    until_d=$(_sh_field "$mf" until 2>/dev/null || echo '')
+    tracker=$(_sh_field "$mf" tracker 2>/dev/null || echo '')
+    mband=$(_sh_field "$mf" band 2>/dev/null || echo '')
+    [[ -n "$owner" ]]  || { printf 'invalid:no owner= field'; return 0; }
+    [[ -n "$reason" ]] || { printf 'invalid:no reason= field'; return 0; }
+    # The #1482 ownership rule, same predicate, same words.
+    if [[ ! "$until_d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ && ! "$tracker" == *\#[0-9]* ]]; then
+        printf 'invalid:needs an until:YYYY-MM-DD date or a tracker ref (#NNNN) — an exemption must be re-justified, not inherited'
+        return 0
+    fi
+    if [[ "$until_d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        today=$(date +%F 2>/dev/null || echo '')
+        # String compare is correct and total for zero-padded ISO dates.
+        if [[ -n "$today" && "$until_d" < "$today" ]]; then printf 'expired:%s' "$until_d"; return 0; fi
+    fi
+    # Constraint 3. A service that declares no band gets the CONSERVATIVE
+    # rule and that asymmetry is deliberate: with no severity to compare,
+    # "has anything changed at all" is the only honest question, and the
+    # answer errs toward EMITTING.
+    if [[ "$band" =~ ^[0-9]+$ && "$mband" =~ ^[0-9]+$ ]] && (( band > mband )); then
+        printf 'broken:%s->%s' "$mband" "$band"; return 0
+    fi
+    printf 'active'
+}
+
+# _sh_note_finding <name> <detail> <health-cmd> <key> <band> <body> [<superseded-status> <superseded-since>]
+# Records/refreshes the sidecar; a NEW or CHANGED KEY is an event, a repeat
+# only bumps the count.
+_sh_note_finding() {
+    local name="$1" detail="${2:-}" health="${3:-}" key="${4:-}" band="${5:-}" body="${6:-}" \
+          sup_status="${7:-}" sup_since="${8:-}"
+    local ff bf hash prev_hash first_iso count prev_sup prev_sup_since
+    [[ -n "$detail" ]] || detail="(the healthcheck exited ${SH_RC_FINDING} — a FINDING — but wrote nothing on stderr; the condition is unnamed)"
+    # THE DEDUPE KEY IS NOT THE MESSAGE. Falling back to the message is the
+    # pre-adoption behaviour, kept so an un-migrated service is unaffected.
+    [[ -n "$key" ]] || key="$detail"
+    ff="$(_sh_finding_file "$name")"; bf="$(_sh_finding_body_file "$name")"
+    hash="$(_sh_finding_hash "$key")"
+    prev_hash=$(_sh_field "$ff" finding_hash 2>/dev/null || echo '')
+    first_iso=$(_sh_field "$ff" first_iso 2>/dev/null || echo '')
+    count=$(_sh_field "$ff" count 2>/dev/null || echo 0); [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    # A supersession is a fact about how this finding BEGAN and stays true for
+    # its whole episode, so it is carried forward rather than blanked on the
+    # next tick (when the caller has nothing to pass).
+    prev_sup=$(_sh_field "$ff" superseded_status 2>/dev/null || echo '')
+    prev_sup_since=$(_sh_field "$ff" superseded_since 2>/dev/null || echo '')
+    [[ -n "$sup_status" ]] || { sup_status="$prev_sup"; sup_since="$prev_sup_since"; }
+    if [[ "$hash" != "$prev_hash" ]]; then
+        first_iso="$(_sh_iso)"; count=0
+        _sh_record_event "$name" finding "healthcheck exit ${SH_RC_FINDING} (alive, condition present): ${detail}"
+        _sh_log "service '$name' UP, reports a FINDING (not an outage): ${detail}"
+        rm -f "$(_sh_finding_cleared_file "$name")" 2>/dev/null || true
+    fi
+    count=$(( count + 1 ))
+    mkdir -p "$SERVICE_HEALTH_STATE_DIR" 2>/dev/null || true
+    if [[ -n "$body" ]]; then
+        printf '%s\n' "$body" > "$bf.tmp.$$" 2>/dev/null && mv "$bf.tmp.$$" "$bf" 2>/dev/null || rm -f "$bf.tmp.$$" 2>/dev/null
+    else
+        rm -f "$bf" 2>/dev/null || true
+    fi
+    { printf 'service=%s\nfinding=%s\nfinding_key=%s\nfinding_hash=%s\nfinding_band=%s\nfirst_iso=%s\nlast_iso=%s\ncount=%s\nhealth_cmd=%s\nsuperseded_status=%s\nsuperseded_since=%s\n' \
+        "$name" "$detail" "$key" "$hash" "$band" "$first_iso" "$(_sh_iso)" "$count" "$health" "$sup_status" "$sup_since"; } \
+        > "$ff.tmp.$$" 2>/dev/null && mv "$ff.tmp.$$" "$ff" 2>/dev/null || rm -f "$ff.tmp.$$" 2>/dev/null
+}
+# _sh_clear_finding <name> — the check went green: one breadcrumb, then gone.
+# CLEARED is not MUTED and the record must never conflate them: this path is
+# reached only by an actually-green healthcheck, and it says so.
+_sh_clear_finding() {
+    local name="$1" ff detail first_iso
+    ff="$(_sh_finding_file "$name")"
+    [[ -f "$ff" ]] || return 0
+    detail=$(_sh_field "$ff" finding 2>/dev/null || echo '')
+    first_iso=$(_sh_field "$ff" first_iso 2>/dev/null || echo '?')
+    _sh_record_event "$name" finding-cleared "healthcheck green again; was: ${detail} (since ${first_iso})"
+    _sh_log "service '$name' finding CLEARED: ${detail}"
+    printf 'service=%s\nfinding=%s\nfirst_iso=%s\ncleared_iso=%s\n' "$name" "$detail" "$first_iso" "$(_sh_iso)" \
+        > "$(_sh_finding_cleared_file "$name")" 2>/dev/null || true
+    rm -f "$ff" "$(_sh_finding_body_file "$name")" 2>/dev/null || true
+}
+
 # ---- restart action (reuse of svc.sh restart → recover_service) ---------
 # Delegate to `svc.sh restart <name>` (separate process: no log/global
 # clobber). It stops a live-but-wedged supervisor's process group, then
@@ -619,6 +854,21 @@ _service_health_check_tick() {
     [[ -n "${SERVICE_HEALTH_STATE_DIR%/service-health}" ]] || return 0
     mkdir -p "$SERVICE_HEALTH_STATE_DIR" 2>/dev/null || true
 
+    # your-org/nexus-code#1266. The row loop below reads the parser through
+    # PROCESS SUBSTITUTION, and `while … done < <(cmd)` DISCARDS cmd's exit
+    # status entirely — measured: a substituted command returning 79 leaves
+    # the loop at rc 0. So the parser's NOT-READABLE verdict is unobservable
+    # at the loop and MUST be taken here, before it. Without this, an
+    # unreadable registry supervised ZERO services, ticked rc 0, and emitted
+    # nothing: every registered service silently stopped being watched, with
+    # no artefact anywhere saying so.
+    local _sh_reg; _sh_reg="$(_sh_registry_path)"
+    if ! _sh_registry_readable "$_sh_reg"; then
+        _sh_log "registry NOT READABLE at $_sh_reg — service health NOT CHECKED this tick;" \
+                "supervising nothing would be a claim this module cannot make (rc 79)"
+        return 79
+    fi
+
     local grace="${MONITOR_SERVICE_HEALTH_GRACE_SECONDS:-30}"
     local cooldown="${MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS:-300}"
     local ceiling="${MONITOR_SERVICE_HEALTH_FLAP_CEILING:-3}"
@@ -661,10 +911,77 @@ _service_health_check_tick() {
         local sup_state; sup_state="$(_sh_supervisor_state "$name" "$launch")"
         local incon_file; incon_file="$(_sh_inconsistent_file "$name")"
 
-        if _sh_service_healthy "$workdir" "$health"; then
+        # THREE-VALUED (your-org/nexus-code#1423): 0 healthy; SH_RC_FINDING
+        # alive-and-reporting (a finding sidecar, then treated as healthy by
+        # the incident machine — no grace, no restart, no DOWN); else down.
+        local hrc=0 is_finding=0
+        _sh_service_healthy "$workdir" "$health" || hrc=$?
+        if (( hrc == SH_RC_FINDING )); then
+            is_finding=1
+            hrc=0
+        elif (( hrc == 0 )); then
+            _sh_clear_finding "$name"
+        fi
+        if (( hrc == 0 )); then
             # --- healthy ---
-            if [[ -n "$prev_status" && "$prev_status" != "healthy" && "$prev_status" != "recovered" \
-                  && "$prev_status" != "inconsistent" && "$prev_status" != "reconciled" ]]; then
+            # Was an INCIDENT open when this tick found the service healthy?
+            # Hoisted out of the arm below because a FINDING now needs the
+            # same answer, and for a different purpose.
+            local was_incident=0
+            [[ -n "$prev_status" && "$prev_status" != "healthy" && "$prev_status" != "recovered" \
+               && "$prev_status" != "inconsistent" && "$prev_status" != "reconciled" ]] && was_incident=1
+
+            # The finding is noted BEFORE the transition arms decide what to
+            # say, because the finding sidecar's existence is what tells a
+            # RECLASSIFICATION apart from a RECOVERY.
+            if (( is_finding )); then
+                local _sup_st="" _sup_since=""
+                if (( was_incident )); then _sup_st="$prev_status"; _sup_since="$first_iso"; fi
+                _sh_note_finding "$name" "$_SH_HEALTH_DETAIL" "$health" \
+                    "$_SH_FINDING_KEY" "$_SH_FINDING_BAND" "$_SH_FINDING_BODY" \
+                    "$_sup_st" "$_sup_since"
+            fi
+
+            # ---- unhealthy -> FINDING is a VOCABULARY TRANSITION, NOT A
+            # RECOVERY (your-org/nexus-code#1423).
+            #
+            # MEASURED, and both rows carry the SAME SECOND:
+            #   05:00:39  finding    healthcheck exit 100 ... /tmp over threshold
+            #   05:00:39  recovered  recovered with NO live supervisor ... cause UNKNOWN
+            #
+            # The condition never cleared. What changed was the healthcheck's
+            # exit code, 1 -> 100. The incident machine keys "recovered" on
+            # NO LONGER IN THE UNHEALTHY STATE, and that predicate cannot tell
+            # THE CONDITION CLEARED from THE CODE THAT REPORTS IT CHANGED
+            # MEANING — so one transition yielded `condition PRESENT` and
+            # `recovered, cause UNKNOWN` for one service in one emit.
+            #
+            # The consequence is worse than an odd log line: the recovered
+            # path's prescribed follow-up is `ng service-incident`, which
+            # generates an operator-facing OUTAGE template whose instruction is
+            # to restart the workspace — the precise action the finding path,
+            # three lines above it in the same emit, says explicitly not to
+            # take.
+            #
+            # No new `status` token is minted for this. `status` SELECTS in
+            # this module (grace/restart/escalate arms, re-nag keys,
+            # `ng service-incident`), so a new value would be a behavioural
+            # change every reader had to be taught (#1050) — the same argument
+            # that put the finding in a sidecar rather than in `status`. The
+            # incident is CLOSED, the durable `.events` history records
+            # `reclassified`, and the finding emit carries the supersession
+            # line. This generalises to EVERY service adopting SH_RC_FINDING,
+            # which is why it is fixed at the mechanism.
+            if (( was_incident )) && (( is_finding )); then
+                _sh_record_event "$name" reclassified \
+                    "healthcheck vocabulary changed (non-zero -> ${SH_RC_FINDING} FINDING) while the condition it reports is PRESENT; status was ${prev_status} since ${first_iso}. NOT a recovery: nothing was restored and no restart is indicated."
+                _sh_log "service '$name' incident RECLASSIFIED as a FINDING (was ${prev_status}) — the condition did not clear; the healthcheck's vocabulary did"
+                rm -f "$sf" "$SERVICE_HEALTH_STATE_DIR/$name-surfaced" "$incon_file" \
+                      "$(_sh_restart_marker "$name")" 2>/dev/null || true
+                continue
+            fi
+
+            if (( was_incident )); then
                 # Transition unhealthy → healthy. ATTRIBUTE the restore from
                 # evidence; never infer it by elimination. Three actors can
                 # take a service from red to green, and they need different
@@ -713,6 +1030,15 @@ _service_health_check_tick() {
                 if [[ "$attempts" -gt 0 ]]; then
                     recovered_by=watcher
                     recovered_via="held after ${attempts} watcher restart attempt(s)"
+                elif (( mk_fresh )) && [[ "$mk_actor" == version-restart ]]; then
+                    # The version-aware watcher restarted it because its launch
+                    # script drifted on disk (a deploy pull rewrote it). No
+                    # operator acted — and until your-org/nexus-code#1456 this
+                    # fell into the arm below and printed "RESTORED by operator
+                    # intervention", which sent the deployer looking for a
+                    # human who ran svc.sh restart and found none.
+                    recovered_by=version-restart
+                    recovered_via="restarted by version-restart at $(_sh_field "$mk" iso 2>/dev/null || echo '?') (its launch script changed on disk — source drift) — not a self-heal, and NOT an operator action"
                 elif (( mk_fresh )) && [[ "$mk_actor" != watcher ]]; then
                     recovered_by=operator
                     recovered_via="RESTORED by ${mk_actor} intervention ($(_sh_field "$mk" iso 2>/dev/null || echo '?') via svc.sh restart) — not a self-heal"
@@ -1121,6 +1447,9 @@ _service_health_emit_section() {
                     operator)
                         printf 'service %s RECOVERED BY INTERVENTION: unhealthy since %s, restored ~%s. %s\n' \
                             "'$name'" "$first_iso" "$recovered_iso" "$recovered_via" ;;
+                    version-restart)
+                        printf 'service %s RESTARTED BY VERSION-RESTART (source drift): unhealthy since %s, restored ~%s. %s\n' \
+                            "'$name'" "$first_iso" "$recovered_iso" "$recovered_via" ;;
                     unknown)
                         printf 'service %s RECOVERED, CAUSE UNKNOWN: unhealthy since %s, green again ~%s. %s\n' \
                             "'$name'" "$first_iso" "$recovered_iso" "$recovered_via" ;;
@@ -1132,7 +1461,9 @@ _service_health_emit_section() {
                         printf 'service %s RECOVERED (%s): unhealthy since %s, restored ~%s.\n' \
                             "'$name'" "$recovered_via" "$first_iso" "$recovered_iso" ;;
                 esac
-                if [[ "$recovered_by" == cold-build ]]; then
+                if [[ "$recovered_by" == version-restart ]]; then
+                    printf '  Expected consequence of a deploy pull: the launch script changed on disk and the version-aware watcher restarted the service (your-org/nexus-code#1456). No operator acted and none needs to. The downtime is the restart plus any cold rebuild it triggered; investigate only if the service did not come back on its own.\n'
+                elif [[ "$recovered_by" == cold-build ]]; then
                     printf '  Expected bring-up: a labsh cold build (uvx materialising the env) blocks the healthcheck for minutes; the watcher correctly DEFERRED to the supervisor and never restarted. No action needed.\n'
                 elif [[ ( "$recovered_by" == supervisor || "$recovered_by" == self-heal ) && "$escalated" != 1 ]]; then
                     printf '  Transient blip, self-resolved within grace. No action needed; file an incident if you want a record:\n'
@@ -1278,6 +1609,82 @@ _service_health_emit_section() {
                 emitted=0
                 ;;
         esac
+    done
+
+    # ---- FINDINGS (your-org/nexus-code#1423) — alive monitors reporting a
+    # condition. Separate loop, separate files, its own re-nag key (the text's
+    # hash: a CHANGED finding re-surfaces, a repeated one does not). The words
+    # are deliberately not the DOWN vocabulary: no "DOWN", no restart remedy.
+    local ff cf f_detail f_first f_health f_hash f_key f_surf f_band f_body f_sup f_sup_since f_mute _mb
+    for ff in "$state_dir"/*.finding; do
+        [[ -f "$ff" ]] || continue
+        name=$(basename "$ff" .finding)
+        f_detail=$(_sh_field "$ff" finding 2>/dev/null || echo '?')
+        f_first=$(_sh_field "$ff" first_iso 2>/dev/null || echo '?')
+        f_health=$(_sh_field "$ff" health_cmd 2>/dev/null || echo '?')
+        f_hash=$(_sh_field "$ff" finding_hash 2>/dev/null || echo '')
+        f_band=$(_sh_field "$ff" finding_band 2>/dev/null || echo '')
+        f_sup=$(_sh_field "$ff" superseded_status 2>/dev/null || echo '')
+        f_sup_since=$(_sh_field "$ff" superseded_since 2>/dev/null || echo '?')
+        f_body="$state_dir/$name.finding-body"
+        f_surf="$state_dir/$name-finding-surfaced"
+        # The re-nag key is the hash of the service's STABLE key, not of its
+        # rendered text (your-org/nexus-code#1423). Numbers inside the message
+        # may drift freely; only a change in the situation re-surfaces it.
+        f_key="finding:$f_hash"
+        # A MUTE is consulted here, at the surfacing step, and never at the
+        # recording step: the sidecar must keep tracking the condition while
+        # an operator is choosing not to be told about it, or lifting the mute
+        # would show a stale picture.
+        f_mute=$(_sh_mute_state "$name" "$f_band")
+        if [[ "$f_mute" == active ]]; then
+            printf '%s\n' "$f_key" > "$f_surf" 2>/dev/null || true
+            continue
+        fi
+        last=$(cat "$f_surf" 2>/dev/null || true)
+        [[ "$last" == "$f_key" && "$f_mute" == none ]] && continue
+        printf 'service %s is UP and reports a FINDING about its environment (since %s) — the monitor is working; this is NOT an outage.\n' \
+            "'$name'" "$f_first"
+        printf '  finding: %s\n' "$f_detail"
+        # SUPERSESSION — printed instead of a contradictory `recovered`
+        # breadcrumb, and it names the follow-up NOT to run.
+        if [[ -n "$f_sup" ]]; then
+            printf '  SUPERSEDES AN OPEN INCIDENT: this service was `%s` since %s. That incident is closed as RECLASSIFIED, NOT recovered — the condition did not clear, the healthcheck'"'"'s exit code did. Do NOT file `ng service-incident %s` for it: that generates an OUTAGE template whose remedy is a restart, which is the action this emit forbids.\n' \
+                "$f_sup" "$f_sup_since" "$name"
+        fi
+        case "$f_mute" in
+            invalid:*)
+                printf '  MUTE REFUSED (%s): %s. An exemption nobody had to justify is an omission with a row in front of it (your-org/nexus-code#1482, #1486), so an unusable mute is IGNORED LOUDLY rather than obeyed quietly — a suppression that fails open hides the thing it was asked to hide for a reason nobody stated.\n' \
+                    "$state_dir/$name.finding-mute" "${f_mute#invalid:}" ;;
+            expired:*)
+                printf '  MUTE EXPIRED on %s — it is no longer suppressing anything. Re-justify it or let this finding stand.\n' "${f_mute#expired:}" ;;
+            broken:*)
+                # `broken:<from>-><to>`. Strip BOTH ends for the first field:
+                # `${f_mute#broken:}` alone leaves `1->3`, which rendered as
+                # "from band 1->3 into band 3" — caught by its own assertion.
+                _mb="${f_mute#broken:}"
+                printf '  MUTE BROKEN: the condition crossed from band %s into band %s. A mute is keyed on the BAND precisely so it cannot sit silently through a situation getting worse — which would make the mute the mechanism by which the incident this monitor exists to catch goes unreported.\n' \
+                    "${_mb%%->*}" "${_mb##*->}" ;;
+        esac
+        if [[ -s "$f_body" ]]; then
+            printf '  details:\n'
+            sed 's/^/    /' "$f_body" 2>/dev/null
+        fi
+        printf '  healthcheck: %s   (exit %s = alive, condition PRESENT; its stderr is the finding)\n' "$f_health" "$SH_RC_FINDING"
+        printf '  A restart changes nothing here — do NOT svc.sh restart it. ACTION: act on the condition the finding names. It re-surfaces when its STABLE KEY changes — not on wording or counter drift — and clears itself when the check goes green.\n'
+        printf '  finding state: %s   (history: %s)\n' "$ff" "$state_dir/$name.events"
+        printf '\n'
+        printf '%s\n' "$f_key" > "$f_surf" 2>/dev/null || true
+        emitted=0
+    done
+    for cf in "$state_dir"/*.finding-cleared; do
+        [[ -f "$cf" ]] || continue
+        name=$(basename "$cf" .finding-cleared)
+        f_detail=$(_sh_field "$cf" finding 2>/dev/null || echo '?')
+        f_first=$(_sh_field "$cf" first_iso 2>/dev/null || echo '?')
+        printf 'service %s finding CLEARED: the healthcheck is GREEN again (this is a real clear, not a mute). Was (since %s): %s\n\n' "'$name'" "$f_first" "$f_detail"
+        rm -f "$cf" "$state_dir/$name-finding-surfaced" "$state_dir/$name.finding-body" 2>/dev/null || true
+        emitted=0
     done
     return $emitted
 }

@@ -45,7 +45,8 @@ assert_ge() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — missing %q\n' "$label" "$needle" >&2
@@ -68,11 +69,39 @@ mkdir -p "$STATE_DIR" "$SENTINEL_DIR" "$STUB_BIN"
 # its argv so we can assert --continue is used on respawns.
 CLAUDE_COUNTER="$WORK/claude-calls.txt"
 CLAUDE_ARGS_LOG="$WORK/claude-args.log"
+# A THIRD LEDGER, because `--help` IS NOT A SESSION LAUNCH
+# (your-org/nexus-code#1094). #1047 gave claude-loop.sh a capability probe —
+# `claude_supports_name_flag` runs `"$CLAUDE_BIN" --help` before deciding
+# whether to pass `--name` — and this stub counted every invocation, so every
+# count in this suite read one high and every "first call" assertion inspected
+# the PROBE instead of the first run. That is the whole of `dev`'s nine
+# failures here: `got 2 want 1`, `got 5 want 4`, `got 4 want 3`, and both
+# first-call argv checks. One cause, not nine.
+#
+# The probe is EXCLUDED, not HIDDEN: it gets its own counter and is asserted
+# to have happened. Silently dropping it would leave the suite unable to tell
+# "the probe ran and was discounted" from "the probe never ran", which is the
+# substitution this repo keeps paying for.
+CLAUDE_PROBE_COUNTER="$WORK/claude-probes.txt"
 : > "$CLAUDE_COUNTER"
 : > "$CLAUDE_ARGS_LOG"
+: > "$CLAUDE_PROBE_COUNTER"
 
 cat > "$STUB_BIN/claude" <<STUB
 #!/usr/bin/env bash
+# --help is a CAPABILITY PROBE, never a session launch (#1094 / #1047). It is
+# tallied separately and asserted below, so excluding it cannot hide it.
+# Deliberately does NOT advertise --name: this suite is about restart
+# accounting, and claude-loop.sh's --name path is asserted end-to-end by
+# test-session-name-from-window.sh section 12. Answering the probe at all
+# (rather than printing nothing) also stops _claude-bin.sh emitting its
+# "could not read --help" warning on every run.
+if [[ "\${1:-}" == "--help" ]]; then
+    printf '.' >> "$CLAUDE_PROBE_COUNTER"
+    echo "Usage: claude [options]"
+    echo "  --model <model>     Model for the session"
+    exit 0
+fi
 # Append one byte per call so wc -c is the call count.
 printf '.' >> "$CLAUDE_COUNTER"
 # Record argv (one line per call).
@@ -115,13 +144,15 @@ run_loop() {
 reset_state() {
     : > "$CLAUDE_COUNTER"
     : > "$CLAUDE_ARGS_LOG"
+    : > "$CLAUDE_PROBE_COUNTER"
     : > "$ACTION_LOG"
     rm -f "$SENTINEL_DIR/${WIN_DEFAULT}.flag"
     # Re-create prompt file (consumed by --no-cleanup-prompt absent)
     printf 'INITIAL_PROMPT_TOKEN_5d4e\n' > "$PROMPT_FILE"
 }
 
-calls() { wc -c <"$CLAUDE_COUNTER" | tr -d ' '; }
+calls()  { wc -c <"$CLAUDE_COUNTER" | tr -d ' '; }
+probes() { wc -c <"$CLAUDE_PROBE_COUNTER" | tr -d ' '; }
 
 # ---- Test 1: no retain event → exits after one run, code 10 ------------
 echo '=== no window-retain event ⇒ stops after first run with code 10 ==='
@@ -130,6 +161,8 @@ out=$(run_loop --max-restarts 5 --retain-ttl-seconds 60 2>&1)
 rc=$?
 assert_eq      "exit 10 (no-retain-event)"             "$rc"           "10"
 assert_eq      "claude invoked exactly once"           "$(calls)"      "1"
+assert_eq      "…and the #1047 capability probe ran (excluded from calls(), not hidden)" \
+               "$(probes)" "1"
 assert_contains "first call had no --continue"         "$(head -1 $CLAUDE_ARGS_LOG)" "INITIAL_PROMPT_TOKEN_5d4e"
 
 # ---- Test 2: retain event recent + max-restarts=3 → 4 runs, code 11 ----
@@ -140,6 +173,13 @@ out=$(run_loop --max-restarts 3 --retain-ttl-seconds 3600 2>&1)
 rc=$?
 assert_eq      "exit 11 (max-restarts)"                "$rc"           "11"
 assert_eq      "claude invoked 4 times"                "$(calls)"      "4"
+assert_eq      "…and the #1047 capability probe ran EXACTLY ONCE across 4 runs" \
+               "$(probes)" "1"
+# The probe caches per PROCESS (_CLAUDE_NAME_FLAG_CACHED), and claude-loop.sh
+# is one process however many times it respawns. That is what makes excluding
+# it from `calls()` sound rather than convenient: the exclusion is a constant
+# 1, not a quantity that drifts with restart count. Asserted at the 4-run case
+# precisely because a per-RUN probe would show up here as 4 and nowhere else.
 # Respawns must use --continue (first call did not).
 respawn_lines=$(tail -n +2 "$CLAUDE_ARGS_LOG")
 if grep -qF -- "--continue" <<<"$respawn_lines"; then
@@ -193,6 +233,19 @@ seed_retain -5 "$WIN_DEFAULT" >/dev/null
 
 cat > "$STUB_BIN/claude" <<STUB
 #!/usr/bin/env bash
+# --help is a CAPABILITY PROBE, never a session launch (#1094 / #1047). It is
+# tallied separately and asserted below, so excluding it cannot hide it.
+# Deliberately does NOT advertise --name: this suite is about restart
+# accounting, and claude-loop.sh's --name path is asserted end-to-end by
+# test-session-name-from-window.sh section 12. Answering the probe at all
+# (rather than printing nothing) also stops _claude-bin.sh emitting its
+# "could not read --help" warning on every run.
+if [[ "\${1:-}" == "--help" ]]; then
+    printf '.' >> "$CLAUDE_PROBE_COUNTER"
+    echo "Usage: claude [options]"
+    echo "  --model <model>     Model for the session"
+    exit 0
+fi
 printf '.' >> "$CLAUDE_COUNTER"
 printf '%s\n' "\$*" >> "$CLAUDE_ARGS_LOG"
 # Drop a sentinel after we've run once so the loop terminates.
@@ -218,6 +271,19 @@ echo '=== --settings <path> forwarded to claude invocations ==='
 # Restore the simple-counter stub for this test.
 cat > "$STUB_BIN/claude" <<STUB
 #!/usr/bin/env bash
+# --help is a CAPABILITY PROBE, never a session launch (#1094 / #1047). It is
+# tallied separately and asserted below, so excluding it cannot hide it.
+# Deliberately does NOT advertise --name: this suite is about restart
+# accounting, and claude-loop.sh's --name path is asserted end-to-end by
+# test-session-name-from-window.sh section 12. Answering the probe at all
+# (rather than printing nothing) also stops _claude-bin.sh emitting its
+# "could not read --help" warning on every run.
+if [[ "\${1:-}" == "--help" ]]; then
+    printf '.' >> "$CLAUDE_PROBE_COUNTER"
+    echo "Usage: claude [options]"
+    echo "  --model <model>     Model for the session"
+    exit 0
+fi
 printf '.' >> "$CLAUDE_COUNTER"
 printf '%s\n' "\$*" >> "$CLAUDE_ARGS_LOG"
 exit 0
@@ -272,6 +338,19 @@ CLAUDE_ENV_LOG="$WORK/claude-env.log"
 : > "$CLAUDE_ENV_LOG"
 cat > "$STUB_BIN/claude" <<STUB
 #!/usr/bin/env bash
+# --help is a CAPABILITY PROBE, never a session launch (#1094 / #1047). It is
+# tallied separately and asserted below, so excluding it cannot hide it.
+# Deliberately does NOT advertise --name: this suite is about restart
+# accounting, and claude-loop.sh's --name path is asserted end-to-end by
+# test-session-name-from-window.sh section 12. Answering the probe at all
+# (rather than printing nothing) also stops _claude-bin.sh emitting its
+# "could not read --help" warning on every run.
+if [[ "\${1:-}" == "--help" ]]; then
+    printf '.' >> "$CLAUDE_PROBE_COUNTER"
+    echo "Usage: claude [options]"
+    echo "  --model <model>     Model for the session"
+    exit 0
+fi
 printf '.' >> "$CLAUDE_COUNTER"
 printf '%s\n' "\$*" >> "$CLAUDE_ARGS_LOG"
 # Record one '<key>=<value>' line per resume-related env var, then a
@@ -315,6 +394,19 @@ fi
 # Restore the simple stub for any downstream tests.
 cat > "$STUB_BIN/claude" <<STUB
 #!/usr/bin/env bash
+# --help is a CAPABILITY PROBE, never a session launch (#1094 / #1047). It is
+# tallied separately and asserted below, so excluding it cannot hide it.
+# Deliberately does NOT advertise --name: this suite is about restart
+# accounting, and claude-loop.sh's --name path is asserted end-to-end by
+# test-session-name-from-window.sh section 12. Answering the probe at all
+# (rather than printing nothing) also stops _claude-bin.sh emitting its
+# "could not read --help" warning on every run.
+if [[ "\${1:-}" == "--help" ]]; then
+    printf '.' >> "$CLAUDE_PROBE_COUNTER"
+    echo "Usage: claude [options]"
+    echo "  --model <model>     Model for the session"
+    exit 0
+fi
 printf '.' >> "$CLAUDE_COUNTER"
 printf '%s\n' "\$*" >> "$CLAUDE_ARGS_LOG"
 exit 0

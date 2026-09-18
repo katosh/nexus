@@ -10,10 +10,42 @@
 #      config/nexus.yml (github.bot_git_name / .bot_git_email), so
 #      every commit's author is the bot, not the user.
 #
-# Why per-repo: ~/.gitconfig is read-only inside the agent-sandbox,
-# and `gh auth setup-git` (a) requires write access there and (b)
-# would delegate to the user's gh OAuth token — exactly what the
-# bot-only-identity guardrail forbids.
+# Why per-repo: `gh auth setup-git` is the wrong tool TWICE over, and
+# neither reason is the one this comment used to give.
+#   (a) It configures a CREDENTIAL HELPER and nothing else — measured
+#       against gh 2.89.0, `gh auth setup-git --help` mentions
+#       `user.name`/`user.email`/author ZERO times — so it cannot do
+#       step 2 above at all.
+#   (b) The credentials it delegates to are the user's cached gh OAuth
+#       token ("configures git to use GitHub CLI as a credential helper
+#       ... for all authenticated hosts") — exactly what the
+#       bot-only-identity guardrail forbids.
+#
+# NOT because ~/.gitconfig is unwritable. It IS writable, and the claim
+# that it is not was this comment's stated rationale (your-org/nexus-code#1244).
+# Measured 2026-09-01 on this host: `ls -la ~/.gitconfig` reports
+# `-rw-rw-rw-`, and `[ -w ~/.gitconfig ]` succeeds. Corrected rather than
+# deleted, because that is the half a future author would lean on when
+# deciding a global write "cannot happen here" — and a false premise that
+# argues for the RIGHT answer is still a trap, and a quieter one than a
+# premise that argues for the wrong one.
+#
+# THE HAZARD HAS FIRED TWICE, once silently. A stray global identity write
+# in a throwaway probe rewrote the operator's identity, and the next commit
+# carried the wrong author and was pushed before anyone noticed. Separately,
+# two commits authored `d@e` have been ancestors of `origin/dev` since
+# 2026-08-15 — re-verified after a fresh fetch at `989b888`:
+# `git merge-base --is-ancestor` returns rc 0 against `origin/dev` and rc 1
+# against `origin/main`, so a `dev` -> `main` promotion is what carries them
+# across. Nothing validates a commit's author: `git commit` does not, the
+# push succeeds, CI does not look, and `assert-bot-author.sh` checks GitHub
+# API writes rather than git commits — a reasonable scope that leaves this
+# surface unwatched.
+#
+# THERE IS NO TRACKED WRITER TO FIX. A repo-wide `git grep` for a global or
+# system `git config` write returns ZERO non-comment hits, so this is an
+# ad-hoc-probe hazard and guidance is the only defence available. Use
+# `git -c user.email=... ` or `--local` in probes; never write the global file.
 #
 # Usage:
 #   monitor/git-https-setup                  # configures the cwd's repo
@@ -41,10 +73,36 @@ if [[ ${1:-} == "--repo" ]]; then
     target="$2"
 fi
 
-[[ -d "$target/.git" ]] || git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
-    echo "git-https-setup: $target is not a git repo" >&2
-    exit 1
-}
+# BOTH ARMS OF THE OLD GUARD WERE UNSOUND, which is why removing either one
+# did not fix it (your-org/nexus-code#1080). It read:
+#
+#   [[ -d "$target/.git" ]] || git -C "$target" rev-parse --is-inside-work-tree …
+#
+#   * arm 1 tested for a DIRECTORY NAMED `.git`, not for a repository. An
+#     interrupted clone leaves `<dir>/.git/objects/` and passes — and that is
+#     not a synthetic worry: `work/kompot-milodesc-sk/.git/` on this host
+#     holds exactly `objects/` and nothing else.
+#   * arm 2 returns `true` when discovery WALKS UP. It answers "is this path
+#     somewhere inside some repo", never "is this path its own repo".
+#
+# Everything below is `git -C "$target" config --local …`, resolved through the
+# same walk. Measured: it wrote `user.name = nexus-bot[bot]` and the bot
+# credential helper into the ENCLOSING repository's `.git/config` for a
+# `$target` that was never a repository.
+#
+# The shared predicate refuses a LINKED WORKTREE too, which neither published
+# discriminator does: `git -C <wt> config --local` was measured writing into
+# the MAIN repository's `.git/config`, so configuring a worktree silently
+# configures its parent. 131 of the 881 directories under this nexus's `work/`
+# are linked worktrees.
+#
+# It is three-valued on purpose. "Could not determine" (rc 3) must not be read
+# as "not a repo" — a newer git refusing a repository for dubious ownership
+# exits 128 on a directory that IS a root, and a two-valued caller would
+# record that as "no" and move on.
+# shellcheck source=repo-root.sh
+. "$script_dir/repo-root.sh"
+rr_require_own_root "$target" "git-https-setup" || exit 1
 
 [[ -x "$mint_path" ]] || { echo "git-https-setup: $mint_path missing or not executable" >&2; exit 1; }
 
@@ -60,6 +118,37 @@ git -C "$target" config --local --unset-all credential.https://github.com.helper
 # `credential.helper = cache` in ~/.gitconfig) — without this, git
 # queries cache before our helper and a stale empty cache entry can
 # satisfy the credential request.
+#
+# AND THIS LINE ALSO BUYS IMMUNITY FROM A HOST-WIDE SHARED-STATE HAZARD, which
+# is worth stating because the reason above would not survive someone deciding
+# the reset is redundant (your-org/nexus-code#1213). That global helper is ONE
+# daemon, configured in `~/.gitconfig` with NO per-host scoping — measured on
+# this host, `git config --get-all credential.helper` -> `cache
+# --timeout=3600` — and it is shared by every spawned agent, every service that
+# fetches, and the operator's own interactive `git`. A 401 makes git issue
+# `credential reject`, which ERASES the entry. So a failing fetch in ONE
+# process destroys a `github.com` credential another process stored seconds
+# earlier, and the victim's symptom is an authentication failure it did nothing
+# to cause — close to undiagnosable from the victim's side. It is this
+# workspace's dominant failure shape arriving in shared infrastructure: the
+# process that OBSERVES the error is not the process that CAUSED it, and the
+# causing process succeeds at exiting.
+#
+# Bounded honestly: it is self-limiting (an empty cache has nothing left to
+# evict, and a VALID cached token makes the fetch succeed rather than evict),
+# the exposure is the window after a store that a later fetch finds rejected,
+# and nothing has been observed to break from it. A hazard with a measured
+# mechanism, not an incident.
+#
+# What matters here is that the reset below takes this repo OUT of that shared
+# cache entirely — every challenge mints a fresh token instead — as does
+# `monitor/upload-asset.sh`'s `git -c credential.helper=`. Both nexus paths
+# that authenticate to github.com are therefore immune BY CONSTRUCTION rather
+# than by luck. What remains exposed is an ad-hoc `git fetch`/`ls-remote`
+# in a repo this script never configured. The durable remedy is an ssh deploy
+# key, which removes the credential helper from the picture; a PAT under
+# `credential.helper=cache` inherits the hazard UNCHANGED and is the option
+# most people reach for first.
 git -C "$target" config --local --add credential.https://github.com.helper ""
 
 # Bot-token helper. The shell function form means the function body

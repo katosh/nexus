@@ -28,6 +28,35 @@ set -uo pipefail
 _dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LINT="$_dir/count-fallback-lint.sh"
 
+# ---------------------------------------------------------------------------
+# POPULATION DECLARATION (your-org/nexus-code#1494, #1301 item 2)
+# ---------------------------------------------------------------------------
+#
+# THIS SUITE WENT RED ON PR #1493 FOR A REAL DEFECT IN THAT DIFF — and
+# `guards-for-diff` had returned rc 0 with 28 guards SELECTED and green,
+# listing this one in NEITHER `SELECTED` nor `CONSIDERED AND EXCLUDED`. It
+# declared no population, so the index could not see it at all: invisible, not
+# excluded, and an absence in both blocks is indistinguishable from a
+# considered exclusion. The two guards the index could not see were precisely
+# the two that caught real defects.
+#
+# The population is the lint's OWN selection, forwarded via `--files`, never a
+# copy: a second implementation of a population drifts until the index reports,
+# with total confidence, that this guard does not read a file it does read.
+# The declaration is NOT the fixture tree — those live under $WORK and no diff
+# can touch them. What makes this suite routable is its LAST case, which runs
+# the lint over the REAL repo, so any file that lint scans can redden it.
+#
+# PLACED HERE, above the first thing this suite prints: `gp_handle` EXITS when
+# it handles the flag, and anything printed before it lands in the probe's
+# stdout and is read as a population row.
+. "$_dir/../_guard_population.sh"
+gp_population() {
+    bash "$LINT" --files "$(cd "$_dir/../.." && pwd)"
+    printf '%s\n' 'monitor/watcher/count-fallback-lint.sh'
+}
+gp_handle "$@"
+
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 

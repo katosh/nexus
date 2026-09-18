@@ -83,7 +83,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s\n           expected: %s\n           in: %s\n' \
@@ -103,6 +104,15 @@ assert_not_contains() {
 }
 assert_matches() {
     local label="$1" got="$2" re="$3"
+    if [[ -z "$re" ]]; then
+        printf '  FAIL: %s — EMPTY regex: `[[ $x =~ "" ]]` matches every string, so\n' "$label" >&2
+        printf '         this assertion could only have passed VACUOUSLY (your-org/nexus-code#1110).\n' >&2
+        printf '         Fix the CALLER, not the haystack: its expected pattern came back empty.\n' >&2
+        printf '         Check the rc of whatever produced it (a capture that failed prints\n' >&2
+        printf '         nothing, and an unconsulted rc turns that into a silent pass).\n' >&2
+        FAIL=$(( FAIL + 1 ))
+        return
+    fi
     if [[ "$got" =~ $re ]]; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
@@ -142,6 +152,13 @@ cleanup() {
     # bright line and caught the first cut of this file. Killing the fixture's
     # only session retires its private server anyway, so nothing leaks.
     env -u TMUX TMUX_TMPDIR="$PRIV" tmux kill-session -t s699 >/dev/null 2>&1 || true
+    # Part I adds a SECOND session on the same private server; retiring only
+    # the first would leave the server (and its socket) behind.
+    env -u TMUX TMUX_TMPDIR="$PRIV" tmux kill-session -t zz-944-other >/dev/null 2>&1 || true
+    # Part J adds a THIRD session (your-org/nexus-code#1318) — a cross-session
+    # name/index collision needs a session the collision is NOT in.
+    env -u TMUX TMUX_TMPDIR="$PRIV" tmux kill-session -t zz-1318-name >/dev/null 2>&1 || true
+    env -u TMUX TMUX_TMPDIR="$PRIV" tmux kill-session -t zz-1318-clean >/dev/null 2>&1 || true
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -310,10 +327,34 @@ FAKE="$WORK/nexus"
 build_tree() {
     rm -rf "$FAKE"
     mkdir -p "$FAKE/monitor/.state" "$FAKE/config" "$FAKE/reports"
+    # THE SUITE OWNS ARM 1 (your-org/nexus-code#1386). `ng` resolves its state
+    # dir NEXUS_STATE_DIR -> NEXUS_ROOT/monitor/.state -> …, and arm 1 is the
+    # only unconditional one — so an AMBIENT pin in the caller's shell (the
+    # very remedy #1349 prescribes for ad-hoc tooling) silently overrode the
+    # fixture this function builds: retire-window pruned the pin instead of
+    # $FAKE/monitor/.state, B3/B4 read "state was NOT pruned", and the red was
+    # indistinguishable from a defect in the reader's own diff (93/0 -> 91/2,
+    # one variable). A suite that arranges its own state dir names it in the
+    # variable that cannot be fallen past, so nothing ambient can win.
+    export NEXUS_STATE_DIR="$FAKE/monitor/.state"
     cp "$NG_REAL" "$FAKE/monitor/ng"
     cp "$MON/_bookkeeping.sh" "$FAKE/monitor/_bookkeeping.sh"
+    # your-org/nexus-code#1077 — `ng` refuses to start without the primary-root
+    # resolver, for the same reason it refuses without `_bookkeeping.sh`: a
+    # silent un-pinning of reports and assets from the primary clone is worse
+    # than a refusal. Omitting it here would test `ng`'s behaviour with a broken
+    # install, which is a different question from the one B1-B5 ask.
+    cp "$MON/_nexus-root.sh" "$FAKE/monitor/_nexus-root.sh"
     cp "$HELPER" "$FAKE/monitor/_tmux-window.sh"
-    chmod +x "$FAKE/monitor/ng"
+    # your-org/nexus-code#977 — `retire-window` now runs the preflight on the
+    # ABSENT path too (checks 1b/1c are obligation checks, not liveness
+    # checks), so the gate is a real dependency of every arm below rather
+    # than of the present-window arm only. Omitting it here made B3/B4 test
+    # `ng`'s behaviour when its own gate is missing, which is a different
+    # question and is now covered explicitly by that verb's own precondition.
+    cp "$MON/retire-preflight.sh" "$FAKE/monitor/retire-preflight.sh"
+    cp "$MON/_obligations.sh"     "$FAKE/monitor/_obligations.sh"
+    chmod +x "$FAKE/monitor/ng" "$FAKE/monitor/retire-preflight.sh"
     cat > "$FAKE/config/load.sh" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -378,6 +419,31 @@ if state_mentions "$VICTIM"; then
     printf '  FAIL: %s\n' "B4 --assume-absent: state was NOT pruned" >&2; FAIL=$(( FAIL + 1 ))
 else
     printf '  PASS: %s\n' "B4 --assume-absent: state was pruned"; PASS=$(( PASS + 1 ))
+fi
+
+# B5 — the GATE ITSELF IS MISSING (your-org/nexus-code#977). `retire-window`
+# is gate-then-prune, and since #977 the gate runs on the ABSENT path too. So
+# an unrunnable gate must refuse and say what is missing — not leak a bare
+# `rc 127` from a command substitution, and above all not prune.
+#
+# This arm exists because the omission was INVISIBLE before #977: the absent
+# path skipped the preflight entirely, so a fake tree without
+# `retire-preflight.sh` retired windows happily and nothing anywhere said the
+# gate had never been consulted. Same shape as the defect #977 fixes, one
+# level down — a check that is not run leaves the same trace as a check that
+# passed.
+build_tree "$VICTIM"
+rm -f "$FAKE/monitor/retire-preflight.sh"
+r=$(run3 srv env NEXUS_ROOT="$FAKE" NEXUS_WORKER_WINDOW="" bash "$FAKE/monitor/ng" retire-window "$VICTIM")
+assert_matches  "B5 missing gate: retire-window exits non-zero" "$(f_rc "$r")" '^[1-9]'
+assert_contains "B5 missing gate: names the script that is missing" \
+    "$(f_err "$r")" "retire-preflight.sh not found or not executable"
+assert_contains "B5 missing gate: says WHY that forbids the prune" \
+    "$(f_err "$r")" "no safe prune to perform"
+if state_mentions "$VICTIM"; then
+    printf '  PASS: %s\n' "B5 missing gate: state was NOT pruned"; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: %s\n' "B5 missing gate: state WAS pruned with no gate at all" >&2; FAIL=$(( FAIL + 1 ))
 fi
 
 # =====================================================================
@@ -507,10 +573,27 @@ echo '=== D: resolver manifest — a fifth copy must not appear silently ==='
 # `2state-failclosed` = conflates, but EVERY consumer's default arm refuses,
 # so the conflation cannot cause an action. That exemption is the finding,
 # not an oversight: the defect was never the two-valued rc on its own.
+# `resolve_window_key` (your-org/nexus-code#905) is `3state` on the axis this
+# manifest measures — it distinguishes could-not-look (rc 3, tmux would not
+# answer) from not-found (rc 1). It carries a FOURTH code, rc 4 AMBIGUOUS, for
+# a key that is both a window NAME and a different window's INDEX; that is a
+# refusal, so it fails closed in the same direction and does not weaken the
+# contract.
 # `not-a-resolver` = surfaced by the BEHAVIOURAL axis below (it touches
 # `list-windows` and a window id/index) but maps no name to one — a lister, a
 # consumer, or a prompt string. Declaring these is the price of the second
 # axis, and it is worth paying: see D5.
+#
+# `_respawn_spawn_window` is the newest member and the one that is the
+# OPPOSITE of a resolver, which is why it belongs here rather than under a
+# contract (your-org/nexus-code#1327). It joined the behavioural axis by
+# CEASING to key on a name: it now passes `-P -F '#{window_id}'` to
+# `new-window` and reads the handle back, so it maps no name to anything — it
+# MINTS an id for the window it just created and asks only "did I create one".
+# The axis found it because it mentions `list-windows` (the pre-kill probe) and
+# a `window_id` in the same body, which is the union working as designed: the
+# manifest is loud about a function whose relationship to window identity
+# changed, and the classification is what says which direction it changed in.
 EXPECTED_RESOLVERS=$(cat <<'EOF'
 _idle_list_worker_windows|monitor/watcher/_idle_probe.sh|not-a-resolver
 _over_limit_evaluate_row|monitor/watcher/_over_limit.sh|not-a-resolver
@@ -523,6 +606,7 @@ _resolve_window_index|monitor/skeptic-channel.sh|2state-failclosed
 _respawn_render_prompt_fresh|monitor/watcher/_respawn_prompts.sh|not-a-resolver
 _respawn_render_prompt_resume|monitor/watcher/_respawn_prompts.sh|not-a-resolver
 _respawn_resolve_target_index|monitor/watcher/_respawn.sh|2state-failclosed
+_respawn_spawn_window|monitor/watcher/_respawn.sh|not-a-resolver
 _respawn_verify_target_absent|monitor/watcher/_respawn.sh|not-a-resolver
 _target_window_present|monitor/watcher/_lib.sh|3state
 _version_emit_section|monitor/watcher/_version_restart.sh|not-a-resolver
@@ -534,8 +618,17 @@ render_full_state_snapshot|monitor/watcher/_idle_probe.sh|not-a-resolver
 render_pending_decisions|monitor/watcher/_idle_probe.sh|not-a-resolver
 resolve_window_id|monitor/_tmux-window.sh|3state
 resolve_window_index|monitor/_tmux-window.sh|3state
+resolve_window_key|monitor/_tmux-window.sh|3state
+_tmux_selection_rows|monitor/_tmux-window.sh|not-a-resolver
 EOF
 )
+# `_tmux_selection_rows` (your-org/nexus-code#1528) enumerates the whole
+# `session|window|name|active` table for the selection capture/restore across
+# an orchestrator restart; it answers about no NAME. Its two arms are rows
+# (rc 0) and could-not-look (rc 3, on a failed `list-windows -a` OR an
+# unparseable row), and both consumers honour the second by doing NOTHING —
+# the capture writes no file, the restore moves no window. The operation is
+# cosmetic, so "do nothing" is the fail-closed arm there.
 #
 # DISCOVERY RUNS ON TWO AXES AND TAKES THEIR UNION, because neither is
 # complete and `#700` shipped only the first (your-org/nexus-code#701 item B).
@@ -600,8 +693,27 @@ fi
 # D2 — the two exempt resolvers are exempt because their consumers refuse.
 # Pin the refusal, not the comment: if someone makes either consumer
 # permissive, the exemption silently becomes a live defect and this reddens.
-assert_contains "D2 skeptic-channel consumer still fails safe on unresolved" \
-    "$(sed -n '/_resolve_window_index "\$window"/,+3p' "$MON/skeptic-channel.sh")" "exit 5"
+# your-org/nexus-code#845 moved the refusal one level down, and this probe
+# had to follow it or it would have pinned a LOCATION rather than the
+# property. The rate-limit + pane-state precondition is now `_wake_gate`,
+# shared by `nudge` (skeptic wakes its target) and by the reverse-direction
+# `notify-delta` (target wakes its pinned skeptic) — one gate, two callers,
+# because a second transcription of a guard is how two copies of a rule
+# drift apart. So the unresolved arm now `return 1`s and each CALLER turns
+# that into `exit 5`, and BOTH halves are checked: a three-line window
+# around the resolver call alone would go green on a `_wake_gate` whose
+# callers dropped the rc on the floor.
+assert_contains "D2a skeptic-channel's shared wake gate refuses an unresolved index" \
+    "$(sed -n '/_resolve_window_index "\$window"/,+3p' "$MON/skeptic-channel.sh")" "return 1"
+_wg_total=$(command grep -c '^[[:space:]]*_wake_gate "' "$MON/skeptic-channel.sh")
+_wg_refusing=$(command grep -c '^[[:space:]]*_wake_gate ".*|| exit 5' "$MON/skeptic-channel.sh")
+assert_eq "D2b every _wake_gate call site turns that refusal into exit 5" \
+    "$_wg_refusing" "$_wg_total"
+# …and there must BE call sites. A rename that orphaned the gate would make
+# `0 == 0` above and report success for a guard that checks nothing — the
+# silent-zero class this repo keeps re-deriving.
+assert_eq "D2c …and there is at least one such call site" \
+    "$(( _wg_total >= 2 ? 1 : 0 ))" "1"
 assert_contains "D3 cc-auto-update consumer still aborts on unresolved" \
     "$(sed -n '/target_idx=\$(_resolve_target_index/,+4p' "$MON/cc-auto-update-apply.sh")" "ABORT restart"
 # D4 — `_respawn_resolve_target_index` was NOT in this suite's first hand
@@ -722,7 +834,7 @@ delim_violations() {
             _out=$(printf '%b' "$_body"; printf X); _out="${_out%X}"
             _dec="${_dec//"$_seg"/"$_out"}"
         done
-        if printf '%s' "$_dec" | LC_ALL=C command grep -q '[^ -~]'; then
+        if LC_ALL=C command grep -q '[^ -~]' <<<"$_dec"; then
             printf '%s\n' "$_line"
         fi
     done
@@ -918,11 +1030,289 @@ else
     FAIL=$(( FAIL + 1 ))
 fi
 
+# =====================================================================
+# Part I — a `session:window` key is judged against THAT session
+#          (your-org/nexus-code#944)
+# =====================================================================
+#
+# THE PROPERTY, stated so it does not depend on which session tmux considers
+# current: `resolve_window_key "S:K"` answers from session S's window list.
+#
+# That phrasing is deliberate and is what makes I3 a real discriminator. A
+# suite that pinned "the answer when session X is current" would be pinning an
+# ambient tmux fact this fixture does not control -- there is no attached
+# client here, so "current" is whichever session tmux last touched, and merely
+# CREATING the second session moves it. Instead the two sessions get DISJOINT
+# window names and BOTH keys are resolved: session-blind rows answer both keys
+# from the same session, so whichever one is current, at least one of I1/I2
+# must fail and I3 must fail. The property is checkable without controlling
+# the ambient fact.
+#
+# WHY IT MATTERS BEYOND A WRONG PASTE. `paste-followup.sh` consumes this
+# stdout, so the measured consequence was a paste into a window the key did not
+# name. But the same resolver backs `pane-state.sh`'s ambiguity refusal, and
+# `pane-state.sh`'s answer can authorise a kill -- `absent` is in
+# `_bookkeeping.sh`'s kill allowlist. I4 is the arm that matters there: a
+# session tmux cannot find must yield rc 3 COULD NOT LOOK, never a confident
+# answer about some other session's window.
+
+echo
+echo '=== I: a session:window key is judged against the NAMED session ==='
+
+# I6 FIRST, while s699 is still the only session. A key with NO session part
+# means "the session I am in", and that has to stay true -- the fix must scope
+# only what the caller scoped. Ordered before the second session exists
+# precisely because creating one changes which session is current, so asserting
+# it afterwards would be asserting an ambient fact rather than the contract.
+r=$(run3 srv bash "$HELPER" key "$PRESENT_WIN")
+assert_eq "I6 CONTROL bare name (single session): rc 0" "$(f_rc "$r")" 0
+assert_eq "I6 CONTROL bare name (single session): resolves to itself" "$(f_out "$r")" "$PRESENT_WIN"
+
+S944=zz-944-other
+srv tmux new-session -d -s "$S944" -n zz-944-alpha 2>/dev/null \
+    || { echo "SETUP FAILED: could not create the second fixture session" >&2; exit 1; }
+srv tmux set-window-option -t "$S944:" automatic-rename off >/dev/null 2>&1 || true
+srv tmux new-window -t "$S944:" -d -n zz-944-bravo >/dev/null 2>&1 || true
+
+# Derive the indices from tmux rather than assuming base-index=0. This fixture
+# runs where base-index is 1, and the first cut of this block hard-coded a
+# collision window named `1` that duly collided with the index it was NOT meant
+# to -- swallowing the clean arm instead of the collision arm. A fixture that
+# hard-codes an index it did not measure is one `base-index` setting away from
+# asserting something else.
+_widx() {
+    srv tmux list-windows -t "$1:" -F '#{window_index}|#{window_name}' 2>/dev/null \
+        | awk -F'|' -v n="$2" '$2==n{print $1; exit}'
+}
+I699=$(_widx s699 "$PRESENT_WIN")
+I944A=$(_widx "$S944" zz-944-alpha)
+I944B=$(_widx "$S944" zz-944-bravo)
+[[ -n "$I699" && -n "$I944A" && -n "$I944B" && "$I944A" != "$I944B" ]] || {
+    echo "SETUP FAILED: fixture window indices unusable (I699=$I699 I944A=$I944A I944B=$I944B) — every Part I assertion would be vacuous" >&2
+    exit 1
+}
+
+# The collision window is NAMED AFTER bravo's measured index, so the plant is
+# self-consistent at any base-index and cannot shadow alpha's key.
+srv tmux new-window -t "$S944:" -d -n "$I944B" >/dev/null 2>&1 || true
+_icol=$(_widx "$S944" "$I944B")
+[[ -n "$_icol" && "$_icol" != "$I944B" ]] || {
+    echo "SETUP FAILED: collision plant did not take (window named '$I944B' sits at index '$_icol') — I5 would assert nothing" >&2
+    exit 1
+}
+
+r=$(run3 srv bash "$HELPER" key "s699:$I699")
+assert_eq "I1 s699:<idx> resolves inside s699"  "$(f_out "$r")" "$PRESENT_WIN"
+r=$(run3 srv bash "$HELPER" key "$S944:$I944A")
+assert_eq "I2 <other>:<idx> resolves inside the OTHER session" "$(f_out "$r")" "zz-944-alpha"
+
+# I3 — the discriminator. Session-blind rows make these two keys answer with
+# the same window; they name different sessions, so they must not.
+_i3a=$(f_out "$(run3 srv bash "$HELPER" key "s699:$I699")")
+_i3b=$(f_out "$(run3 srv bash "$HELPER" key "$S944:$I944A")")
+if [[ -n "$_i3a" && -n "$_i3b" && "$_i3a" != "$_i3b" ]]; then
+    printf '  PASS: %s\n' "I3 two keys naming DIFFERENT sessions answer with different windows"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: %s — got %q and %q\n' \
+        "I3 two keys naming DIFFERENT sessions answer with different windows" "$_i3a" "$_i3b" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# I4 — the SAFETY arm. A session tmux cannot find is COULD NOT LOOK, never a
+# confident answer, and never rc 1 "absent" (which downstream reads as a dead
+# window and `_bookkeeping.sh` treats as kill-authorised).
+r=$(run3 srv bash "$HELPER" key "zz-944-nosuchsession:$I699")
+assert_eq       "I4 unknown session: rc 3 (could not look), NOT 0 and NOT 1" "$(f_rc "$r")" 3
+assert_contains "I4 unknown session: says UNKNOWN, not absent" "$(f_err "$r")" "UNKNOWN, not absent"
+assert_eq       "I4 unknown session: prints NO window name" "$(f_out "$r")" ""
+
+# I5 — the NAMED session's collision is refused. The un-scoped read could not
+# see a collision living in a session other than the current one, so the
+# refusal silently did not fire: the ANSWER was wrong and the SAFEGUARD was
+# absent, from the same one-line cause.
+r=$(run3 srv bash "$HELPER" key "$S944:$I944B")
+assert_eq       "I5 collision in the NAMED session: rc 4 (ambiguous)" "$(f_rc "$r")" 4
+assert_contains "I5 collision in the NAMED session: names both candidates" "$(f_err "$r")" "AMBIGUOUS key"
+
+# I7 — THE SECOND HALF OF #944, and without it the first half emits a FALSE
+#      DIAGNOSTIC. `resolve_window_key` now correctly resolves `sess:idx` to a
+#      NAME in that session — but a caller re-resolving that NAME to an @id got
+#      a session-BLIND lookup, rc 1, and `paste-followup.sh` rendered that as
+#      "it closed between the check above and now (race with a close)". The
+#      window had not closed. A wrong diagnosis is worse than none: it sends
+#      the reader to a mechanism that did not occur.
+# BOTH sessions are probed explicitly, and neither arm depends on which session
+# tmux considers current — there is no attached client here, so "current" is
+# ambient and the first cut of this arm asserted it by accident.
+_i7b=$(run3 srv bash -c "source '$HELPER'; resolve_window_id '$PRESENT_WIN' s699; printf 'rc=%s' \"\$?\"")
+assert_matches "I7 a name in s699 resolves when s699 is named" "$(f_out "$_i7b")" '@[0-9]+.*rc=0'
+_i7=$(run3 srv bash -c "source '$HELPER'; resolve_window_id zz-944-alpha '$S944'; printf 'rc=%s' \"\$?\"")
+assert_matches "I7 …and WITH the session it resolves to an @id at rc 0" "$(f_out "$_i7")" '@[0-9]+.*rc=0'
+
+# I8 — the same for resolve_window_index, asserted independently rather than
+#      assumed: it is a separate function body, and the defect class here is
+#      one copy being fixed while its twin is not.
+_i8=$(run3 srv bash -c "source '$HELPER'; resolve_window_index zz-944-bravo '$S944'; printf 'rc=%s' \"\$?\"")
+assert_matches "I8 index resolves inside the named session at rc 0" "$(f_out "$_i8")" '^[0-9]+.*rc=0'
+
+# I9 — the session a caller must carry is PUBLISHED by resolve_window_key, or
+#      the caller cannot pass it on. This is the whole linkage between the two
+#      halves, so it is asserted rather than assumed.
+_i9=$(run3 srv bash -c "source '$HELPER'; resolve_window_key '$S944:$I944A' >/dev/null; printf '%s' \"\${RESOLVED_WINDOW_SESSION:-UNSET}\"")
+assert_eq "I9 resolve_window_key publishes the session it parsed" "$(f_out "$_i9")" "$S944"
+_i9b=$(run3 srv bash -c "source '$HELPER'; resolve_window_key '$PRESENT_WIN' >/dev/null; printf '[%s]' \"\${RESOLVED_WINDOW_SESSION-UNSET}\"")
+assert_eq "I9 …and publishes EMPTY for a key with no session part" "$(f_out "$_i9b")" "[]"
+
+# =====================================================================
+# Part J — a bare key's AMBIGUITY check spans SESSIONS
+#          (your-org/nexus-code#1318)
+# =====================================================================
+#
+# ADJACENT TO `#1281`, NOT A REFUTATION OF IT, and that sentence is load-bearing
+# because the next reader will otherwise take this band as "the #1281 fix does
+# not work", which is measurably false. `#1281` closed a fail-open reached when
+# the resolver library is UNAVAILABLE. This is a fail-open reached while it is
+# present and working, found by varying an axis nobody had varied: the NUMBER
+# of tmux sessions.
+#
+# THE DEFECT. `resolve_window_key`'s collision check read ONE session's rows —
+# the current one, for a bare key, because no caller supplies a session and
+# none can see which session tmux considers current. A name/index collision
+# that SPANS sessions was therefore invisible: the resolver found no collision
+# and returned a confident answer about a window the key names in no sense.
+# Downstream, `pane-state.sh` classified THAT window, and the classification
+# measured on a private socket was `absent` — the one KILL-AUTHORISING state —
+# at rc 0 with an empty stderr. Which window you got depended on session FOCUS,
+# so the wrong answer was not even reproducible from the arguments.
+#
+# THE ARRANGEMENT. Part I left two sessions with DISJOINT window names. A third
+# session gets a window NAMED after an index that exists in s699, so the two
+# halves of the collision sit in different sessions and NEITHER session alone
+# shows one. J4 is the one-variable control: kill that third session and the
+# same key must resolve again.
+
+echo
+echo '=== J: a bare key collides across SESSIONS, and only the REFUSAL widens ==='
+
+S1318=zz-1318-name
+srv tmux new-session -d -s "$S1318" -n zz-1318-filler 2>/dev/null \
+    || { echo "SETUP FAILED: could not create the third fixture session" >&2; exit 1; }
+srv tmux set-window-option -t "$S1318:" automatic-rename off >/dev/null 2>&1 || true
+# The collision's NAME side: a window in the THIRD session named after
+# PRESENT_WIN's INDEX in s699.
+srv tmux new-window -t "$S1318:" -d -n "$I699" >/dev/null 2>&1 || true
+
+# PRECONDITIONS, asserted rather than assumed — each one, if false, makes every
+# assertion below pass or fail for a reason that is not the property. Part I
+# learned this the hard way with a hard-coded index at the wrong base-index.
+_jname_idx=$(_widx "$S1318" "$I699")
+[[ -n "$_jname_idx" ]] || {
+    echo "SETUP FAILED: the window named '$I699' was not created in $S1318 — J1 would assert nothing" >&2; exit 1; }
+# Nothing in s699 may be NAMED $I699, or the collision is single-session and
+# the PRE-EXISTING check would catch it — J1 would then prove nothing new.
+# HERESTRING, NOT A PIPE. `grep -q` exits on its first match and SIGPIPEs the
+# producer, so under `pipefail` the pipeline reports 141 — a FALSE FAILURE on
+# the very input that matched. `test-sigpipe-assertion-lint.sh` catches this
+# repo-wide and caught both of this band's first-cut instances.
+_j_s699_names=$(srv tmux list-windows -t 's699:' -F '#{window_name}' 2>/dev/null)
+if grep -qxF "$I699" <<<"$_j_s699_names"; then
+    echo "SETUP FAILED: s699 already holds a window NAMED '$I699' — the collision would not span sessions" >&2; exit 1
+fi
+
+# J1 — THE DEFECT. Bare key, the collision spanning two sessions: REFUSE.
+r=$(run3 srv bash "$HELPER" key "$I699")
+assert_eq       "J1 a bare key colliding ACROSS sessions is rc 4 AMBIGUOUS" "$(f_rc "$r")" 4
+assert_eq       "J1 …and prints NO window name"                            "$(f_out "$r")" ""
+assert_contains "J1 …and the diagnostic names both sessions"               "$(f_err "$r")" "$S1318:"
+assert_contains "J1 …and offers the session:window remedy"                 "$(f_err "$r")" "session:window"
+
+# J3 — THE SCOPING CONTROL, run while the collision is still standing. The
+# sweep is for BARE keys only: an explicit `session:window` key over the SAME
+# colliding number must still be judged against the session it names, at rc 0.
+# `#944`'s I1-I5 hold by construction here, and this asserts that rather than
+# trusting the construction.
+r=$(run3 srv bash "$HELPER" key "s699:$I699")
+assert_eq "J3 an explicit session:window key over the same number still resolves" "$(f_rc "$r")" 0
+assert_eq "J3 …inside the session it NAMES"  "$(f_out "$r")" "$PRESENT_WIN"
+
+# J4 — THE ONE-VARIABLE POTENCY CONTROL. Remove the third session and nothing
+# else; the same key must stop being refused. Without this, J1 is satisfied by
+# any arrangement that refuses for any reason at all — which is precisely how
+# the fixture `#1282` had to replace passed for months.
+#
+# IT ASSERTS "NOT REFUSED", NOT "RESOLVES TO PRESENT_WIN". Which window a bare
+# key answers with depends on the CURRENT session, and killing a session moves
+# which session is current — so pinning the identity here would pin an ambient
+# fact rather than the property. A cut of this did exactly that and got
+# `zz-944-alpha`, a correct answer to a question the assertion had not asked.
+srv tmux kill-session -t "$S1318" >/dev/null 2>&1 || true
+r=$(run3 srv bash "$HELPER" key "$I699")
+assert_eq "J4 POTENCY: with the third session gone, the same key is NOT refused" "$(f_rc "$r")" 0
+if [[ -n "$(f_out "$r")" ]]; then
+    printf '  PASS: %s\n' "J4 POTENCY: …and names a window again"; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: %s\n' "J4 POTENCY: …and names a window again — got empty" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+# J2 — THE NON-WIDENING CONTROL, and the one that matters most. This suite's
+# own rule is that a change which only widens refusal is NOT a fix: it breaks
+# ordinary retirement, the far more common path. A bare numeric key with no
+# name-side anywhere on the server must still resolve, at rc 0, exactly as
+# before.
+#
+# IT RUNS LAST, IN A SESSION BUILT FOR IT, AND THAT ORDERING IS THE FIX FOR TWO
+# WRONG CUTS — both of them Part I's ambient-fact warning arriving in a new
+# band:
+#
+#   1. picking `zz-1318-filler`'s index chose a number that WAS somebody's
+#      name — J1's own plant, since `$I699` is `1` on this host and the filler
+#      sat at index 1 too. It would have measured the collision it exists to
+#      exclude.
+#   2. searching `list-windows -a` for a free index chose one that may live in
+#      a session that is not current — and the ANSWER path for a bare key
+#      reads the current session only, deliberately (`#944` I6). rc 1 "no such
+#      window" is then CORRECT and the assertion simply wrong.
+#   3. searching the CURRENT session found nothing free, because by then every
+#      index in it was also some window's name. A search that can come up empty
+#      is a fixture that skips, and a skipping fixture is how `#1282` happened.
+#
+# So the arrangement is CONSTRUCTED rather than found: a fresh session (which
+# becomes current by the act of creating it), widened with non-numeric window
+# names until one of its indices is nobody's name server-wide. Bounded, and a
+# loud abort if the bound is reached.
+srv tmux new-session -d -s zz-1318-clean -n zz-1318-solo 2>/dev/null \
+    || { echo "SETUP FAILED: could not create the J2 fixture session" >&2; exit 1; }
+srv tmux set-window-option -t 'zz-1318-clean:' automatic-rename off >/dev/null 2>&1 || true
+_jfree=""
+for _grow in 1 2 3 4 5 6; do
+    _jnames=$(srv tmux list-windows -a -F '#{window_name}' 2>/dev/null)
+    _jcur=$(srv tmux list-windows -t 'zz-1318-clean:' -F '#{window_index}' 2>/dev/null)
+    for _cand in $(printf '%s\n' "$_jcur" | sort -u); do
+        grep -qxF "$_cand" <<<"$_jnames" && continue
+        _jfree="$_cand"; break
+    done
+    [[ -n "$_jfree" ]] && break
+    srv tmux new-window -t 'zz-1318-clean:' -d -n "zz-1318-pad$_grow" >/dev/null 2>&1 || true
+done
+[[ -n "$_jfree" ]] || {
+    echo "SETUP FAILED: could not construct an index in the current session that is nobody's NAME — J2 would measure a collision, not a clean key" >&2; exit 1; }
+r=$(run3 srv bash "$HELPER" key "$_jfree")
+assert_eq "J2 CONTROL a bare index with NO name-side anywhere still resolves at rc 0" "$(f_rc "$r")" 0
+if [[ -n "$(f_out "$r")" ]]; then
+    printf '  PASS: %s\n' "J2 CONTROL …and names a window, so the sweep did not widen past its remit"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: %s\n' "J2 CONTROL …and names a window — got empty, so the sweep widened past its remit" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
 # ---- summary ------------------------------------------------------------
 #
 # Expected-count guard: an assert_* that never runs reports 0 failures and
 # reads as a pass — the defect class this whole suite is about.
-EXPECTED=72
+EXPECTED=103  # 78 + Part I x15 (#944) + Part J x10 (#1318: the collision check spans sessions)
 echo
 echo "=== summary: $PASS passed, $FAIL failed ($(( PASS + FAIL )) assertions; expected $EXPECTED) ==="
 if (( PASS + FAIL != EXPECTED )); then

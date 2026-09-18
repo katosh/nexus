@@ -764,9 +764,22 @@ _paste_line_to_window() {
     # sets `remain-on-exit` on all of them, and a retired worker is a
     # corpse. Returning 1 is the existing "paste failed" contract, so
     # every caller already handles it.
+    # THE REFUSAL IS UNCONDITIONAL; ONLY THE WORDING VARIES (#1020).
+    # `rc 0` means dead OR could-not-tell, and saying "is a dead pane" for the
+    # second is a positive verdict asserted from zero evidence — the same
+    # confusion `_bookkeeping.sh` calls an INDETERMINATE reading and refuses to
+    # speak as a liveness verdict. Note the `return 1` sits OUTSIDE the inner
+    # branch: gating it on `verdict == dead` is the exact mutant that re-opens
+    # the #1017 fail-open, and part E of test-paste-dead-pane-guard.sh catches
+    # it. Branch the message, never the refusal.
     if _tmux_pane_is_dead "$window"; then
-        printf '_unstick: window %q is a dead pane — refusing to paste (your-org/nexus-code#745: a paste into a dead pane kills the tmux server)\n' \
-            "$window" >&2
+        if [[ "${NEXUS_PANE_LIVE_VERDICT:-}" == "dead" ]]; then
+            printf '_unstick: window %q is a DEAD pane — refusing to paste (your-org/nexus-code#745: a paste into a dead pane kills the tmux server). Respawn it; a retry is another attempt to kill the server.\n' \
+                "$window" >&2
+        else
+            printf '_unstick: could NOT establish that window %q is a live pane (verdict=%s) — refusing to paste (your-org/nexus-code#745). This is NOT a corpse diagnosis: nobody looked successfully, the window may be healthy, and the refusal is RETRYABLE.\n' \
+                "$window" "${NEXUS_PANE_LIVE_VERDICT:-unset}" >&2
+        fi
         return 1
     fi
     local buf="nexus-unstick-$$-${RANDOM}-${RANDOM}"
@@ -776,7 +789,15 @@ _paste_line_to_window() {
     tmux send-keys -t "$window" i BSpace 2>/dev/null || true
     tmux load-buffer -b "$buf" "$tmpfile" 2>/dev/null || { rm -f "$tmpfile"; return 1; }
     rm -f "$tmpfile"
-    tmux paste-buffer -b "$buf" -t "$window" 2>/dev/null || {
+    # BRACKETED (`-p`), as main.sh's emit paste and paste-followup.sh are.
+    # Unbracketed, a REPL that reads this line and the Enter below in ONE chunk
+    # takes the Enter as part of the paste, and the line sits UNSUBMITTED in the
+    # input box. Nothing here checks for that, and the pane then reads
+    # `user-typing input=typed`, which the watcher treats as an operator draft.
+    # Measured on the real binary with a single line and no newline
+    # (your-org/nexus-code#1516). Bracketed, the Enter's CR arrives after
+    # ESC[201~ and is a keypress however the bytes are chunked.
+    tmux paste-buffer -p -b "$buf" -t "$window" 2>/dev/null || {
         tmux delete-buffer -b "$buf" 2>/dev/null
         return 1
     }

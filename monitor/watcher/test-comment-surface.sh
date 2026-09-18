@@ -49,7 +49,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then pass "$label"; else fail "$label" "expected to find: $needle"; fi
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then pass "$label"; else fail "$label" "expected to find: $needle"; fi
 }
 assert_not_contains() {
     local label="$1" hay="$2" needle="$3"
@@ -194,6 +195,223 @@ _v2_task_comment_surface
 PASTE_RC=0
 assert_eq "delivery-fail accounted" "$DELIVERY_FAIL_COUNT" "1"
 assert_eq "no record-emit on failed paste" "$RECORD_EMIT_COUNT" "1"
+
+echo '=== (5b) your-org/nexus-code#966: a staged watcher_alert must not re-emit every fire ==='
+# THE DEFECT. `_compose_gh_now` `cat`s `<stage>/github_poll.out` (main.sh
+# ~L3995) WITHOUT consuming it, and `github_poll` rewrites that file only
+# every 600 s. Every `comment_surface` fire in between therefore re-reads
+# the SAME bytes. For a comment that is harmless — the pipeline damps it. An
+# alert is forwarded by every hop instead, because each dispatches on the
+# recognised emit-header shapes `^(issue|pr|pr_review|issue_new|mention|
+# cross_repo)=` and takes its DEFAULT ARM on anything else. (Not "all eight
+# key on `id=<N>`" — only the five damping hops do; the author, skip-marker
+# and cross-repo hops key on other things and would forward an alert
+# carrying an id anyway.) So it passes all eight, and
+# `_v2_task_comment_surface` pastes unconditionally
+# (its dedup gate is bypassed by design for comment-bearing bodies). During
+# the 2026-08-17 GraphQL 503 that produced 20+ byte-identical pastes with a
+# FROZEN `held_s=2403` — frozen because the generator's announce-once
+# contract worked perfectly; only the replay was unbounded.
+#
+# The property under test is therefore NOT "the generator announces once"
+# (test-graphql-backoff-bound.sh already owns that, and it passed throughout
+# the incident). It is: **a staged alert survives an arbitrary number of
+# re-reads as ONE emit, while a genuine state change still gets through.**
+alert_hist="$STATE_DIR/alert-history"
+stage_alert() { printf '%s\n' "$1" > "$V2_STAGE_DIR/github_poll.out"; }
+# The literal block from the incident (monitor/.state/watcher-alerts.log,
+# 2026-08-17T10:45:41-07:00), truncated body — the header carries the
+# state-bearing tokens and is what the key + hash are computed over.
+DEGRADED_2403=$'watcher_alert=ingest-degraded surface=issue_comments kind=total held_s=2403 failures=5\n  body: The issue_comments fetch has failed on EVERY attempt for 40 min (5 consecutive failures).'
+DEGRADED_6003=$'watcher_alert=ingest-degraded surface=issue_comments kind=total held_s=6003 failures=11\n  body: The issue_comments fetch has failed on EVERY attempt for 100 min (11 consecutive failures).'
+
+# Count HEADER OCCURRENCES, not matching lines: `grep -c` counts lines and
+# would read 1 for a body that happened to quote the token twice.
+count_alerts() { grep -o "$2" <<<"$1" | wc -l | tr -d ' '; }
+
+# --- the storm itself: N re-reads of ONE staged generation -> ONE emit ---
+rm -rf "$alert_hist" "$STATE_DIR"/emit-history; mkdir -p "$STATE_DIR/emit-history"
+stage_alert "$DEGRADED_2403"
+storm=""
+for _i in 1 2 3 4 5 6; do storm+=$(_compose_gh_now)$'\n'; done
+n=$(count_alerts "$storm" 'watcher_alert=ingest-degraded')
+assert_eq "6 fires against one staged alert emit it exactly ONCE" "$n" "1"
+
+# --- but a real state change must still reach the operator ---
+stage_alert "$DEGRADED_6003"
+escalated=$(_compose_gh_now)
+assert_contains "a WORSENED alert (held_s advanced) bypasses the damper" \
+    "$escalated" "held_s=6003"
+again=$(_compose_gh_now)
+assert_not_contains "  and then damps at its own new value" "$again" "held_s=6003"
+
+# --- recovery is a DIFFERENT kind: it must not inherit the hold ---
+# An `ingest-recovered` swallowed by a degraded-alert cooldown is strictly
+# worse than the storm: the operator is left unable to tell "recovered"
+# from "watcher died", which is exactly what `#966` item 3 asks for.
+stage_alert $'watcher_alert=ingest-recovered surface=issue_comments\n  body: The issue_comments fetch is succeeding again after 100 min degraded.'
+recovered=$(_compose_gh_now)
+assert_contains "recovery surfaces immediately despite the degraded hold" \
+    "$recovered" "watcher_alert=ingest-recovered"
+
+# --- the SIBLING kinds `#966` flagged as unmeasured storm identically ---
+# `graphql-backoff` (_github.sh ~L339) and `rate-limit` (~L413) print from
+# the same stdout into the same staging file, so they are the same defect,
+# not two similar ones. Assert the fix is keyed on the CLASS.
+for kind_block in \
+    'watcher_alert=graphql-backoff surface=issue_comments held_s=900 ceiling_s=3600' \
+    'watcher_alert=rate-limit surface=pr_comments reset=1786990000'
+do
+    kind="${kind_block#watcher_alert=}"; kind="${kind%% *}"
+    stage_alert "$kind_block"$'\n  body: sibling alert body'
+    sib=""
+    for _i in 1 2 3 4; do sib+=$(_compose_gh_now)$'\n'; done
+    assert_eq "sibling '$kind' damped too (4 fires -> 1 emit)" \
+        "$(count_alerts "$sib" "watcher_alert=$kind")" "1"
+done
+
+# --- co-tenancy: damping alerts must not cost us the operator channel ---
+# The alert and a fresh operator comment share one staged file. The comment
+# must surface; the alert must surface once; neither may suppress the other.
+rm -rf "$alert_hist" "$STATE_DIR"/emit-history; mkdir -p "$STATE_DIR/emit-history"
+printf '%s\n%s\n' \
+    "$DEGRADED_2403" \
+    "$(printf 'issue=42 author=alice id=5150 title=Urgent\n  body: are you seeing my comments?')" \
+    > "$V2_STAGE_DIR/github_poll.out"
+both=""
+for _i in 1 2 3; do both+=$(_compose_gh_now)$'\n'; done
+assert_eq "operator comment still surfaces exactly once" \
+    "$(count_alerts "$both" 'id=5150')" "1"
+assert_eq "  alongside exactly one alert" \
+    "$(count_alerts "$both" 'watcher_alert=ingest-degraded')" "1"
+
+# --- NEGATIVE CONTROL: the knob at 0 reproduces `#966` verbatim ---
+# Without this, a passing suite cannot distinguish "the damper works" from
+# "something upstream happened to eat the block". Turning the damper OFF
+# must restore the storm; if it does not, the assertions above are not
+# witnessing the mechanism they name.
+rm -rf "$alert_hist" "$STATE_DIR"/emit-history; mkdir -p "$STATE_DIR/emit-history"
+MONITOR_ALERT_EMIT_COOLDOWN_SECONDS=0
+stage_alert "$DEGRADED_2403"
+unstormed=""
+for _i in 1 2 3 4 5 6; do unstormed+=$(_compose_gh_now)$'\n'; done
+assert_eq "damper disabled -> the #966 storm returns (6 fires, 6 emits)" \
+    "$(count_alerts "$unstormed" 'watcher_alert=ingest-degraded')" "6"
+unset MONITOR_ALERT_EMIT_COOLDOWN_SECONDS
+
+# --- and once more against the REAL generator, not a hand-written block ---
+# Everything above stages a block this file typed. That is a fixture agreeing
+# with itself: if the damper's kind/surface parse and the generator's actual
+# output format ever diverge, every assertion above still passes and the storm
+# comes back in production. So drive `_graphql_note_failure` (the real
+# `_github.sh` function, already sourced) to EMIT the block, stage exactly what
+# it produced, and re-run the replay.
+rm -rf "$alert_hist" "$STATE_DIR"/emit-history; mkdir -p "$STATE_DIR/emit-history"
+_ensure_service_log() { :; }   # the real one wants a service registry
+MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS=1800
+MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS=3600
+rm -f "$STATE_DIR/graphql-degraded-issue_comments"
+# Two failures far enough apart to cross the escalate window.
+real_gen=$(_graphql_note_failure issue_comments total)
+printf 'first=%s\ncount=2\nannounced=0\n' "$(( $(date +%s) - 2000 ))" \
+    > "$STATE_DIR/graphql-degraded-issue_comments"
+real_gen=$(_graphql_note_failure issue_comments total)
+if [[ -n "$real_gen" ]] && grep -q '^watcher_alert=' <<<"$real_gen"; then
+    pass "generator produced a real alert block to test against"
+    printf '%s\n' "$real_gen" > "$V2_STAGE_DIR/github_poll.out"
+    real_storm=""
+    for _i in 1 2 3 4 5; do real_storm+=$(_compose_gh_now)$'\n'; done
+    assert_eq "GENERATED alert damped identically (5 fires -> 1 emit)" \
+        "$(count_alerts "$real_storm" 'watcher_alert=ingest-degraded')" "1"
+    # The damper keys on `surface=`; prove the generator actually emits that
+    # token, or the key silently degrades to the kind and every surface
+    # shares one stamp.
+    assert_contains "  generator emits the surface= token the damper keys on" \
+        "$real_gen" "surface=issue_comments"
+else
+    fail "could not drive the real generator (got: ${real_gen:0:80})"
+fi
+unset -f _ensure_service_log
+
+echo '=== (5c) #966 + follow-up: ONE delivery per generator EDGE across a whole outage ==='
+# THE COMPOSITION THIS WHOLE CHANGE TURNS ON. `#966` has two halves and a fix
+# for one can deepen the other: a damper tight enough to collapse the storm
+# would, if it keyed on anything coarser than content, also swallow the
+# still-degraded restatements and leave the operator with one alert at minute
+# zero and silence through a multi-hour outage. Silence is NOT neutral, because
+# a real recovery DOES emit `ingest-recovered` — so quiet reads as resolved.
+#
+# Section (5b) proves replays collapse. This proves restatements survive. The
+# property is the conjunction, and it is the one an operator actually
+# experiences: across a simulated outage the emit stream must carry EXACTLY ONE
+# delivery per generator EDGE — escalate, restate, recover — no matter how many
+# times the pipeline re-reads the staging file in between.
+rm -rf "$alert_hist" "$STATE_DIR/emit-history" "$STATE_DIR/graphql-degraded-issue_comments"
+mkdir -p "$STATE_DIR/emit-history"
+_ensure_service_log() { :; }
+SIM_NOW=1785000000
+# Shim the clock for BOTH sides at once: the generator's `held_s` and the
+# damper's cooldown must advance on the same simulated timeline, or the test
+# would prove the two agree only about real time.
+date() {
+    if [[ "${1:-}" == "+%s" ]]; then printf '%s' "$SIM_NOW"; return 0; fi
+    command date "$@"
+}
+MONITOR_GRAPHQL_DEGRADED_ESCALATE_SECONDS=1800
+unset MONITOR_GRAPHQL_DEGRADED_REMIND_SECONDS   # exercise the SHIPPED default
+unset MONITOR_ALERT_EMIT_COOLDOWN_SECONDS       # ditto
+
+# Read the staged file the way `comment_surface` does — repeatedly, without
+# consuming it. Echoes how many alert blocks were actually DELIVERED.
+deliver() {  # <n_fires>
+    local n="$1" i acc=""
+    for (( i = 0; i < n; i++ )); do acc+=$(_compose_gh_now)$'\n'; done
+    count_alerts "$acc" 'watcher_alert='
+}
+
+# Edge 1 — escalation. Seed a `first` already past the escalate window.
+printf 'first=%s\ncount=3\nannounced=0\n' "$(( SIM_NOW - 2000 ))" \
+    > "$STATE_DIR/graphql-degraded-issue_comments"
+edge1=$(_graphql_note_failure issue_comments total)
+printf '%s\n' "$edge1" > "$V2_STAGE_DIR/github_poll.out"
+assert_eq "edge 1 (escalate): 4 fires deliver it ONCE" "$(deliver 4)" "1"
+
+# Edge 2 — restatement, two polls later, while the condition still holds.
+SIM_NOW=$(( SIM_NOW + 1200 ))
+edge2=$(_graphql_note_failure issue_comments total)
+if [[ -n "$edge2" ]]; then
+    pass "edge 2 (restate): the generator re-nagged while still degraded"
+    printf '%s\n' "$edge2" > "$V2_STAGE_DIR/github_poll.out"
+    assert_eq "edge 2 (restate): 4 more fires deliver it ONCE" "$(deliver 4)" "1"
+    # The damper keys on (kind, content). Identical kind — so the ONLY reason
+    # this restatement gets through is that `held_s` moved. Assert the thing
+    # the pass depends on, or a future frozen-held_s regression turns this
+    # section green while silencing the heartbeat.
+    # `[[ =~ ]]` rather than `grep … | head -1`: this file runs under
+    # `set -uo pipefail`, and `head` closes the pipe early, so the writer takes
+    # EPIPE and the pipeline rc goes non-zero. Harmless where the status is
+    # discarded, but `test-early-exit-reader-manifest.sh` tracks every such
+    # site as a population precisely because the next edit might consume it
+    # (`#622`). Not adding to that population is cheaper than justifying an
+    # addition to it — and BASH_REMATCH is what `_alert_cooldown_flush` uses.
+    h1=""; h2=""
+    [[ "$edge1" =~ held_s=([0-9]+) ]] && h1="${BASH_REMATCH[1]}"
+    [[ "$edge2" =~ held_s=([0-9]+) ]] && h2="${BASH_REMATCH[1]}"
+    assert_eq "  restatement carries a LIVE held_s (${h1:-?} -> ${h2:-?})" \
+        "$(( ${h2:-0} > ${h1:-0} ? 1 : 0 ))" "1"
+else
+    fail "edge 2: generator stayed silent while still degraded (the #966 silent half)"
+fi
+
+# Edge 3 — recovery. Different KIND, so it must not wait out any hold.
+SIM_NOW=$(( SIM_NOW + 600 ))
+edge3=$(_graphql_note_success issue_comments)
+printf '%s\n' "$edge3" > "$V2_STAGE_DIR/github_poll.out"
+assert_eq "edge 3 (recover): 3 fires deliver it ONCE" "$(deliver 3)" "1"
+assert_contains "  and it is the recovery, not a stale degraded repeat" \
+    "$edge3" "watcher_alert=ingest-recovered"
+
+unset -f date _ensure_service_log
 
 echo '=== (6) nudge lane split ==='
 # shellcheck source=_scheduler.sh

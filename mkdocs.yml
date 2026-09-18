@@ -87,6 +87,7 @@ nav:
       - Notifications: operating/notifications.md
       - Reports: operating/reports.md
       - Upgrading: operating/upgrading.md
+      - Rollback: operating/rollback.md
       - Troubleshooting: operating/troubleshooting.md
   - Admin:
       - GitHub App: admin/github-app.md
@@ -105,6 +106,7 @@ nav:
       - Files: reference/files.md
       - Dependency surface: reference/dependency-surface.md
   - Contributing:
+      - Design guidelines: contributing/design-guidelines.md
       - Development: contributing/development.md
       - Tests: contributing/tests.md
       - Adding a skill: contributing/adding-a-skill.md

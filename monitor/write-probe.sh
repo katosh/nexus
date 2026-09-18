@@ -53,6 +53,17 @@
 
 set -u
 
+# ARGUMENT-LOOP PROGRESS GUARD (your-org/nexus-code#924). Each argument loop
+# below asserts that every iteration consumes at least one argument. Without it
+# a value-taking flag given LAST spins forever — `shift 2` with `$#` == 1 is
+# refused, so the arm re-matches — and a hang here is worse than an error
+# because nothing on this board surfaces it. Full rationale: monitor/ng.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
+
 # Detect whether we're running inside agent-sandbox. The canonical
 # signal is SANDBOX_ACTIVE=1 together with a set SANDBOX_PROJECT_DIR —
 # the same markers monitor/bootstrap-install.sh and
@@ -81,7 +92,7 @@ EOF
 
 quiet=0
 targets=()
-while (( $# > 0 )); do
+_argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
     case "$1" in
         --quiet|-q) quiet=1; shift ;;
         --help|-h)  usage ;;

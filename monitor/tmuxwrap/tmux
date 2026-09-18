@@ -1,0 +1,956 @@
+#!/usr/bin/env bash
+# NEXUS-PATH-FRONT-WRAPPER-MARKER — do NOT remove, do NOT reword.
+# This exact token is how a SECOND COPY of this file recognises the first as a
+# wrapper rather than as "the real tmux" (your-org/nexus-code#1033). It is
+# matched literally by `_tw_is_nexus_wrapper` below; deleting it re-arms an
+# unbounded mutual re-exec that reached 7,705 processes and killed an agent.
+# monitor/tmuxwrap/tmux — PATH-FRONT guard against a BOARD-LETHAL tmux kill
+# (your-org/nexus-code#892; remedy for the session-surface gap named in #889).
+#
+# On 2026-08-09 the tmux server died and took the watcher, 17 worker windows,
+# every registered service and the operator's own session with it. bwrap is
+# PID 1 running tmux under `--die-with-parent`, so ending the server tears down
+# the whole sandbox: there is no in-sandbox recovery, and the notification path
+# dies with it, so nobody can even be told. `#644` is the same class — five
+# tear-downs in 33 minutes.
+#
+# WHY A SHIM WHEN A LINT ALREADY EXISTS. `cc-harness/lint-no-tmux-server-kill.sh`
+# is thorough over the repo CORPUS. The hazard is in the SESSION: a command an
+# agent types at the Bash tool, or one inside a script an agent writes at
+# runtime, is invisible to it. `hooks/bash-footgun-guard.sh` sees typed commands
+# but only WARNS, and only sees the Bash tool's own command string — not a kill
+# three levels down inside a test script. This is a real executable, so it covers
+# every child an agent spawns: bash subshells, `python subprocess`, Makefiles.
+# Same argument CLAUDE.md makes for ghwrap. Delivery is the established shim
+# mechanism (ghwrap/gh, notifywrap/sandbox-notify, pipwrap/pip).
+#
+# ===========================================================================
+# THE CRITICAL INVERSION — THE DEFAULT ARM IS PASS-THROUGH, NOT REFUSE.
+# DO NOT "FIX" THIS INTO SYMMETRY WITH ghwrap. Read this paragraph first.
+# ===========================================================================
+# ghwrap is fail-CLOSED: an unrecognised subcommand is treated as a WRITE. That
+# polarity is right for `gh`, because refusing a write costs nothing.
+#
+# It is WRONG HERE, and shipping it would be worse than shipping nothing.
+# `monitor/` issues 46 `kill-window` calls and ~200 tmux window operations; the
+# watcher, spawn-worker.sh, pane-state.sh, paste-followup.sh and _unstick.sh
+# call tmux constantly. A shim that refuses when confused does not fail safe —
+# it wedges the entire control surface, which is the outage this file exists to
+# prevent, delivered by the prevention.
+#
+# Therefore:
+#   * REFUSE ONLY ON POSITIVELY-IDENTIFIED LETHALITY.
+#   * Every unrecognised verb, every parse we are unsure of, every non-kill
+#     command, every failed probe: PASS THROUGH, untouched.
+#   * On any internal error or ambiguity: PASS THROUGH. Degrading to TODAY's
+#     behaviour is acceptable. Wedging is not.
+#
+# HOT-PATH COST. `list-windows` and `display-message` run on every watcher
+# cycle. The verb scan below is a pure argv walk — no subprocess, no server
+# query, no file read.
+#
+# BUT NON-KILL VERBS DO NOT EXEC FOR FREE ON THE AGENT PATH, and an earlier
+# revision of this block said they did ("only the four kill verbs ever consult
+# anything"). That is FALSE since command-alias resolution became unconditional:
+# `tmux list-windows` on the agent path issues ONE `show -s command-alias`,
+# counted directly. It is true only on the WATCHER path, which is exempt.
+#
+# Measured by the #897 skeptic, 50 calls x 3 rounds, medians, on a QUIET node:
+#
+#     direct `tmux list-windows`          3-4 ms/call
+#     a do-nothing `exec "$@"` bash shim  7-9 ms/call
+#     this shim, WATCHER path            11-12 ms/call
+#     this shim, AGENT path              25-27 ms/call
+#
+# So: bash startup ~+4ms, the argv walk essentially free (the watcher path is
+# indistinguishable from a no-op shim), and the alias round trip ~+18ms. The
+# agent-path delta is ~+22 ms, NOT the ~+9 ms this block used to claim.
+#
+# STATE THE RATIO, NOT THE DELTA. An earlier revision called the delta "the
+# stable part". It is not: +22 ms here versus +48 ms measured on a saturated
+# node. What holds across both is the RATIO — roughly 7x direct on the agent
+# path — which is harsher than either absolute pair suggests. Any millisecond
+# figure quoted without its conditions (node load, call count, rounds) is the
+# same liability as a bare count.
+#
+# The claim this block exists to make survives all of that, and was confirmed
+# independently: the WATCHER keeps essentially the old hot path, and everyone
+# else pays exactly one round trip for soundness. The floor is structural —
+# any real-executable shim costs one interpreter start, the price ghwrap and
+# pipwrap already pay. What IS avoidable is forking inside the shim, and the
+# hot path forks nothing.
+#
+# WHAT IS REFUSED (flag rules are the lint's policy, from _tmux_kill_scan.awk;
+# `test-tmuxwrap-lint-conformance.sh` pins the two to each other):
+#   1. `kill-server` resolving to the BOARD socket.
+#   2. kill-session/kill-window/kill-pane with no `-t` — untargeted acts on the
+#      CURRENT one, which can be the last.
+#   3. THE ONE A LINT CAN NEVER DO, and the reason a shim is worth building: a
+#      correctly-targeted kill that would EMPTY the board's server. Measured on
+#      this host (tmux 2.6): killing one of two windows leaves the server up;
+#      killing the last window of the last session leaves "no server running".
+#      A static lint cannot know that — the lint says so itself in its COVERAGE
+#      BOUNDARY. A shim can simply ask the running server. This matters because
+#      the orchestrator's own window-retirement loop issues targeted
+#      `kill-window` calls: the legitimate mechanism and the lethal one are the
+#      same command with different runtime state.
+#
+# PERMISSIVE FOR ISOLATED SOCKETS. A kill against a private socket is
+# legitimate and frequent — cc-harness and the tmux-touching suites depend on
+# it. Rather than REIMPLEMENT tmux's precedence (`-L`/`-S` > $TMUX >
+# TMUX_TMPDIR > compiled default) — getting which wrong in either direction is
+# how `#644` happened — we ASK TMUX ITSELF, replaying the caller's own global
+# flags:
+#
+#     <real tmux> <caller's global flags> display-message -p '#{socket_path}'
+#
+# Whatever tmux says the target socket is, is what it is. Not the board's ⇒
+# pass through. (`#{socket_path}` verified present on tmux 2.6.)
+#
+# ===========================================================================
+# WHAT THIS DOES NOT GUARANTEE. READ THIS BEFORE TRUSTING IT.
+# ===========================================================================
+# This shim is DEFENCE IN DEPTH, not a guarantee, and the distinction is not
+# modesty. A guard BELIEVED to be complete is worse than no guard, because it
+# licenses exactly the behaviour it cannot actually stop. An earlier revision of
+# this header read as a guarantee and was wrong on four counts at once, every
+# one of them found by executing commands rather than reading code
+# (your-org/nexus-code#892 skeptic, F2/F3/F6/F7).
+#
+# The verb-identification layer is the soft one. Known residuals, stated so the
+# next reader inherits the boundary rather than rediscovering it:
+#
+#   * `NEXUS_TMUX_RESOLVE_ALIASES=0` and the `WATCHER_WINDOW` exemption both
+#     skip command-alias resolution, so a user alias to a kill runs UNCHECKED on
+#     those paths. This residual GREW when the built-in fast path was removed:
+#     on a tmux where an alias can shadow a built-in (measured TRUE on 3.x,
+#     FALSE on 2.6), an alias could hijack a command the WATCHER ITSELF types —
+#     `list-windows` — and the watcher is exempt. It is exempt because
+#     resolution costs a round trip on a caller doing ~200 tmux operations per
+#     cycle: a latency judgement, NOT a safety argument. Stated plainly so
+#     nobody reads the exemption as "the watcher is safe".
+#   * Alias resolution reads the table at the moment of the query. An alias
+#     written concurrently, between the query and the exec, is not seen.
+#   * A failed `show -s command-alias` yields no table, and the call passes
+#     through — the pass-through policy above, applied honestly.
+#   * The `-t`/lethality layer is judged from a snapshot: a window created or
+#     destroyed between the probe and the exec changes the answer.
+#   * A PATH-front shim can silently fall out of PATH — the `gh` wrapper has
+#     been observed BROKEN on a live clone, five operator-authored writes in one
+#     day (`#497`).
+#
+# So this degrades to TODAY's protection, not to safety. It does NOT retire the
+# lint, `#889`'s hook-pattern work, or the worker-floor sentence; it is a fourth
+# layer. What it DOES do that nothing else can is the runtime last-window check.
+#
+# METHOD NOTE for whoever extends this. The four bypasses above were missed by
+# attacking VERB SPELLING; they were found by asking what the VERB-RESOLUTION
+# MECHANISM is. `command-alias` and `--` were one `show -s` away the whole time.
+# Enumerate from the mechanism, not from the shape of what you already found.
+#
+# Escape hatch, mirroring pipwrap's PIP_UNWRAPPED: TMUX_UNWRAPPED=1 is a loud,
+# audited opt-in. There is deliberately NO WATCHER_WINDOW blanket exemption
+# (ghwrap/pipwrap have one): the watcher is the highest-frequency issuer of
+# `kill-window`, so exempting it would open the hazard for exactly the caller
+# most able to trigger it. The watcher needs no exemption — every non-lethal
+# kill it makes passes through untouched, which is all of them.
+
+set -u
+
+# ---------------------------------------------------------------------------
+# (0a) RE-ENTRY BOUND — the backstop, and deliberately the FIRST thing here.
+# ---------------------------------------------------------------------------
+# The marker gate below closes the case where the other end of the cycle is a
+# COPY OF THIS FILE. It cannot close the case where the other end is somebody
+# else's `tmux` that itself calls `tmux` — and that is the shape that actually
+# fired: a test suite plants a stub `tmux` and binds REAL_TMUX=$(type -P tmux),
+# which under an agent PATH is THIS WRAPPER. The stub execs the wrapper, the
+# wrapper selects the stub (a different file, so every identity gate passes),
+# and the pair ping-pongs. Measured signature: the caller's `-L <sock>` is
+# re-prepended once per round trip, so argv grows without bound (observed
+# 22,370 chars). Fixing the stub is right and belongs in the suite; this bound
+# is what makes the failure LOUD AND SMALL rather than host-lethal in the
+# meantime, including for cycles nobody has enumerated yet.
+#
+# DECLARED BOUNDARY — THE BOUND DOES NOT SURVIVE AN ENVIRONMENT SCRUB. The
+# counter travels in the ENVIRONMENT, so anything that clears the environment
+# between hops resets it and the bound never accumulates. Measured (`#1037`
+# skeptic F2): with `env -i` inside the cycle the pair spins unbounded — rc 137
+# at 20 s, and **peak 0 wrapper processes**, so it is invisible to every
+# count-based check including the one in `test-tmux-shim.sh`. The CONTENT gate
+# above is unaffected and is what actually holds in that configuration; this
+# backstop is not a second independent guarantee, and must not be read as one.
+#
+# Forkless: one env read, one integer compare.
+#
+# THE RESET ARM DOES NOT FIRE ON THIS HOST, AND THE COUNTER COMPOUNDS. An
+# earlier draft of this paragraph claimed the counter "is RESET to 0 once a real
+# (non-script) binary is chosen, so it can never creep across legitimate
+# nesting". That is FALSE HERE and was measured so (`#1037` skeptic F1): the
+# first non-wrapper `tmux` on this PATH is
+# `…/agent-sandbox/bin/tmux`, which is `#! /bin/bash --` — a SCRIPT. The reset
+# at (1) keys on "the chosen candidate is not a script", so it never runs. A
+# tmux server started through this wrapper therefore leaks
+# NEXUS_TMUXWRAP_DEPTH=1 into every pane it spawns, and nested servers measure
+# 1 -> 2 -> 3. At an inherited depth of 4 every LEGITIMATE call refuses, rc 127.
+#
+# So state the margin truthfully: it is `4 - server-nesting-level`, not 4.
+# That is still ample — observed legitimate re-entry across this corpus is 0,
+# and reaching depth 4 needs four stacked tmux servers — but it is not what the
+# old sentence promised, and the gap between them is the whole point.
+#
+# WHY THIS PARAGRAPH IS WORTH ITS LENGTH. The `-ef` comment below made exactly
+# this mistake and it cost two defects three years apart: it argued a real
+# property (this loop must not fork) and, alongside it, assumed "the chosen real
+# is a binary". The first half is still true; the second half is what the reset
+# above keys on, and it is false. A comment that justifies a bound with a
+# premise nobody re-measures is the comment-vs-code defect this repo has filed
+# before — so the premise is named here, with the host that refutes it.
+#
+# THE BOUND IS 4, AND A "GENEROUS" BOUND IS NOT THE SAFE DIRECTION. That is the
+# counter-intuitive part and it was measured, not reasoned. The obvious worry is
+# process count, and by that measure a large bound looks affordable: peak live
+# processes grow only LINEARLY with depth (measured 3 / 9 / 13 / 18 at depths
+# 2 / 4 / 6 / 8), because the recursion is depth-FIRST — each level forks one
+# alias probe and WAITS for it. But that same shape makes TOTAL WORK
+# exponential: every level both probes and execs onward, so the number of leaf
+# visits is 2^depth. Measured on this host with two mutually-selecting copies:
+#
+#     NEXUS_TMUXWRAP_MAX_DEPTH=4    refusal emitted, rc 127, 1 second
+#     NEXUS_TMUXWRAP_MAX_DEPTH=16   no refusal, still running at 60 seconds
+#
+# So a bound of 16 does not "allow more headroom" — it converts a loud, instant
+# refusal into a silent CPU burn that never reaches its own guard. Small is the
+# conservative choice here. Legitimate depth through this wrapper is 1 (wrapper
+# -> real tmux, counter reset) or 2 (a test stub in between); 4 leaves two spare
+# hops and still fails in about a second.
+# Where the audit logs (tmux-unwrapped.log, tmux-refused.log) go: the same
+# state resolver every other state-writing helper uses — NEXUS_STATE_DIR
+# first, then <NEXUS_ROOT>/monitor/.state, else nowhere (your-org/nexus-code
+# #1336 / #1453: a suite that pins NEXUS_STATE_DIR to a fixture must not have
+# the wrapper walk past it into the INHERITED root; the decoy band named
+# test-tmux-shim.sh and test-tmuxwrap-lint-conformance.sh as writers of these
+# two files into the source checkout for exactly this reason).
+_tw_state_dir() {
+    if [ -n "${NEXUS_STATE_DIR:-}" ]; then printf '%s' "$NEXUS_STATE_DIR"; return 0; fi
+    [ -n "${NEXUS_ROOT:-}" ] || return 0
+    printf '%s' "${NEXUS_ROOT}/monitor/.state"
+}
+
+_tw_depth="${NEXUS_TMUXWRAP_DEPTH:-0}"
+case "$_tw_depth" in ''|*[!0-9]*) _tw_depth=0 ;; esac
+if [ "$_tw_depth" -ge "${NEXUS_TMUXWRAP_MAX_DEPTH:-4}" ]; then
+    printf 'tmux shim: REFUSING — this wrapper has been re-entered %s times without reaching a real tmux binary. That is a resolution CYCLE (your-org/nexus-code#1033), not a slow call; continuing would fork without bound. PATH head: %s\n' \
+        "$_tw_depth" "$(printf '%s' "${PATH:-}" | cut -d: -f1-3)" >&2
+    exit 127
+fi
+export NEXUS_TMUXWRAP_DEPTH=$((_tw_depth + 1))
+
+# ---------------------------------------------------------------------------
+# (0) Locate this wrapper's own dir, to exclude it when resolving the real one.
+#     Byte-for-byte the shape of pipwrap/pip's `_pw_dir` + `_pw_rp`.
+# ---------------------------------------------------------------------------
+# NOTE ON FORKS. The sibling shims use `basename`/`dirname`/`cd`+`pwd` here.
+# Every one of those is a subprocess, and unlike `gh` or `pip` this shim sits in
+# front of a command the watcher runs several times per cycle — so the same code
+# that is free over there is a measurable tax here (measured on this host: the
+# fork-per-call version cost roughly twice as much again). Pure parameter
+# expansion gives the identical answer for the shapes that actually occur, so the
+# hot path forks NOTHING before its `exec`.
+_tw_name="${0##*/}"
+case "$0" in
+    */*) _tw_dir="${0%/*}" ;;
+    *)
+        # Bare-name invocation: only here do we pay a lookup.
+        _tw_cv=$(command -v "$0" 2>/dev/null || true)
+        case "$_tw_cv" in
+            */*) _tw_dir="${_tw_cv%/*}" ;;
+            *)   _tw_dir="" ;;
+        esac
+        ;;
+esac
+
+# Resolved-path helper. Forks, so it is used ONLY on the kill path (comparing
+# socket paths), never during PATH resolution — see the `-ef` note below.
+_tw_rp() {
+    _tw_rp_out=$(readlink -f "$1" 2>/dev/null) && [ -n "$_tw_rp_out" ] \
+        && { printf '%s\n' "$_tw_rp_out"; return 0; }
+    return 1
+}
+
+_tw_self="${_tw_dir:+$_tw_dir/}$_tw_name"
+
+# ---------------------------------------------------------------------------
+# IS THIS CANDIDATE A NEXUS WRAPPER? — capability, not identity.
+# ---------------------------------------------------------------------------
+# your-org/nexus-code#1033. The two gates below this ask "is this candidate the
+# same FILE as me?" — a directory-string compare and `-ef` (device+inode). Both
+# answer the ALIASING case (#568 A5: one file, two names), and `-ef` answers it
+# correctly. Neither can answer the INVERSE: two DIFFERENT files that are both
+# copies of this wrapper. A second clone, a `git worktree`, CLAUDE.md's own
+# `/tmp/devcheck` dev-in-isolation recipe — each is a distinct inode at a
+# distinct path, so it passes both gates, and copy A execs copy B as "the real
+# tmux" while B execs A. Measured uncontained: 7,705 processes, PID space
+# wrapped, one agent dead. Measured under `ulimit -u`: 354 processes in 5s.
+#
+# So ask what the candidate IS, not whether it is me. A real tmux is an ELF
+# binary; every copy of this wrapper is a shell script carrying the marker at
+# the top of this file. That discriminator is indifferent to how many inodes,
+# paths, symlinks or clones exist, which is what makes the two gates below
+# redundant rather than load-bearing. They are KEPT anyway: they are cheaper,
+# they still short-circuit the common self-hit, and a marker that someone
+# edits out should degrade to today's behaviour rather than to none.
+#
+# FORKLESS, because the `-ef` comment argues correctly that this loop must not
+# fork and that argument still binds. `read` is a builtin and a redirect on a
+# builtin does not fork. Cost on the normal path is ONE 2-byte read of the
+# first candidate: a real tmux is not `#!`, so the line scan never runs. Only a
+# script is ever scanned, and only its first 40 lines.
+#
+# TWO SIGNATURES, AND THE SECOND ONE IS THE LOAD-BEARING ONE.
+#
+# The first draft matched ONLY the marker introduced at the top of this file,
+# and it FAILED THE FIRST TIME IT WAS RUN — measured, not foreseen. A marker is
+# an OPT-IN: it identifies a copy that already carries the fix. The copy you
+# actually meet is the one that does NOT. During any rollout — and permanently,
+# for a fork that never pulls — the other end of the cycle is an OLDER wrapper
+# with no marker, so a marker-only gate looks straight past exactly the file it
+# was written to catch. Observed here: `BASH_ENV` (monitor/shellenv/bash_env.sh)
+# re-prepends the PRIMARY's wrapper dir to PATH for every non-interactive bash,
+# so the second copy is injected AUTOMATICALLY and unavoidably; this clone's
+# fixed copy selected the primary's unfixed copy and the pair still looped. Only
+# the re-entry bound stopped it, at 22 processes.
+#
+# So the gate also matches the file's own self-identifying path comment, which
+# is present at LINE 2 of every revision of this file in git history (checked
+# across the last six: first occurrence line 2 in all of them) and requires no
+# cooperation from the copy being examined. That is what makes this work
+# retroactively, against copies written before the fix existed.
+#
+# Both are checked within the first 40 lines, so the marker still does useful
+# work: it is explicit, greppable, and survives a rewrite of the header prose
+# that the path comment would not.
+_tw_is_nexus_wrapper() {
+    IFS= read -r -N 2 _tw_magic < "$1" 2>/dev/null || return 1
+    [ "$_tw_magic" = '#!' ] || return 1          # ELF / anything not a script
+    _tw_scan=0
+    while [ "$_tw_scan" -lt 40 ] && IFS= read -r _tw_line; do
+        case "$_tw_line" in
+            *NEXUS-PATH-FRONT-WRAPPER-MARKER*) return 0 ;;
+            *monitor/tmuxwrap/tmux*)            return 0 ;;
+        esac
+        _tw_scan=$((_tw_scan + 1))
+    done < "$1"
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# (1) Resolve the real binary: first PATH hit that is not THIS wrapper.
+#     Both gates (directory string AND resolved realpath) are required — a
+#     wrapper dir reachable under a second name (symlink, bind mount,
+#     /shared/... vs its automount alias) fails the string test alone and the
+#     wrapper would resolve ITSELF, re-exec'ing forever (your-org/nexus-code#568 A5).
+# ---------------------------------------------------------------------------
+_tw_real=""
+_tw_ifs="$IFS"; IFS=:
+for _tw_d in ${PATH:-}; do
+    [ -n "$_tw_d" ] || continue
+    [ "$_tw_d" = "$_tw_dir" ] && continue
+    [ -x "$_tw_d/$_tw_name" ] && [ ! -d "$_tw_d/$_tw_name" ] || continue
+    # Second gate — same file reached by a different path (symlink, bind mount,
+    # /shared/... vs its automount alias). Without it the wrapper can resolve
+    # ITSELF and re-exec forever (your-org/nexus-code#568 A5).
+    #
+    # The sibling shims spend a `readlink -f` fork per candidate here. `-ef`
+    # answers the identical question — same device AND inode — as a bash
+    # BUILTIN, with no fork, and it is immune to the one thing string-compared
+    # realpaths still get wrong (two different symlink chains landing on one
+    # inode). On the hot path that is the difference between forking twice per
+    # tmux call and forking not at all.
+    [ -n "$_tw_dir" ] && [ "$_tw_d/$_tw_name" -ef "$_tw_self" ] && continue
+    # THIRD gate, and the one that closes the class: a candidate carrying this
+    # wrapper's own marker is never "the real tmux", however many inodes exist.
+    _tw_is_nexus_wrapper "$_tw_d/$_tw_name" && continue
+    _tw_real="$_tw_d/$_tw_name"
+    break
+done
+IFS="$_tw_ifs"
+
+# A real binary terminates the chain, so the re-entry counter has done its job
+# and must not persist: a tmux SERVER spawns panes that themselves call tmux,
+# and a counter that survived into them would creep toward a false refusal —
+# the wedge direction this file exists to avoid. Reset only for a non-script,
+# which is exactly "we reached something that is not another shell hop".
+if [ -n "$_tw_real" ]; then
+    IFS= read -r -N 2 _tw_m2 < "$_tw_real" 2>/dev/null || _tw_m2=""
+    [ "$_tw_m2" = '#!' ] || export NEXUS_TMUXWRAP_DEPTH=0
+fi
+
+if [ -z "$_tw_real" ]; then
+    printf 'tmux shim: no real %s found on PATH (excluding the wrapper dir %s).\n' \
+        "$_tw_name" "${_tw_dir:-<unresolved>}" >&2
+    exit 127
+fi
+
+# ===========================================================================
+# (2) HOT PATH — pure argv walk. No subprocess. No server query. No file read.
+# ===========================================================================
+# Global options per tmux(1): `tmux [-2CluvV] [-c shell-command] [-f file]
+# [-L socket-name] [-S socket-path] [command [flags]]`. Only c/f/L/S take a
+# value, which may be attached (`-Lfoo`) or separate (`-L foo`), and boolean
+# flags may be bundled ahead of it (`-2L foo`). We walk the characters of each
+# option token so every one of those shapes lands on the same answer.
+#
+# The globals are collected VERBATIM so they can be replayed on the probe call
+# below: that is what makes tmux's own socket resolution — not ours — decide.
+_tw_argv=("$@")
+_tw_cmdline="$*"        # captured HERE: inside a function `$*` is the FUNCTION's args
+_tw_globals=()
+_tw_verb=""
+_tw_vi=0
+_tw_i=0
+_tw_parse_ok=1
+
+while [ "$_tw_i" -lt "${#_tw_argv[@]}" ]; do
+    _tw_a="${_tw_argv[$_tw_i]}"
+    case "$_tw_a" in
+        --)
+            # F7 (your-org/nexus-code#892 skeptic): `tmux -- kill-server` is
+            # ACCEPTED BY TMUX and killed a real server through this shim, because
+            # an earlier draft treated `--` as "not a tmux idiom, do not guess"
+            # and fell through to exec. `--` ends OPTION parsing; the verb is the
+            # next word. Two characters, total bypass. Bailing to exec on
+            # something tmux accepts is never safe — bail only on shapes tmux
+            # ALSO rejects.
+            _tw_i=$((_tw_i + 1))
+            [ "$_tw_i" -lt "${#_tw_argv[@]}" ] && { _tw_verb="${_tw_argv[$_tw_i]}"; _tw_vi=$_tw_i; }
+            break ;;
+        -?*)
+            _tw_rest="${_tw_a#-}"
+            _tw_takes_val=0
+            _tw_j=0
+            while [ "$_tw_j" -lt "${#_tw_rest}" ]; do
+                case "${_tw_rest:$_tw_j:1}" in
+                    c|f|L|S)
+                        # Value is the remainder of this token if there is one,
+                        # otherwise the NEXT argv element.
+                        [ $((_tw_j + 1)) -ge "${#_tw_rest}" ] && _tw_takes_val=1
+                        _tw_j="${#_tw_rest}"
+                        ;;
+                    *) _tw_j=$((_tw_j + 1)) ;;
+                esac
+            done
+            _tw_globals+=("$_tw_a")
+            _tw_i=$((_tw_i + 1))
+            if [ "$_tw_takes_val" = 1 ]; then
+                if [ "$_tw_i" -lt "${#_tw_argv[@]}" ]; then
+                    _tw_globals+=("${_tw_argv[$_tw_i]}")
+                    _tw_i=$((_tw_i + 1))
+                else
+                    _tw_parse_ok=0; break     # dangling flag — tmux will complain
+                fi
+            fi
+            ;;
+        *) _tw_verb="$_tw_a"; _tw_vi=$_tw_i; break ;;
+    esac
+done
+
+# ---------------------------------------------------------------------------
+# TMUX'S REAL COMMAND GRAMMAR — two features a verb allowlist does not model,
+# both CONFIRMED to kill a server through an earlier draft of this shim
+# (your-org/nexus-code#892, skeptic F2/F3; each executed against a private
+# server, which died).
+#
+#   F2. ABBREVIATION. tmux accepts any UNAMBIGUOUS PREFIX of a command name, so
+#       `tmux kill-ser` is `kill-server`. Comparing against full names lets every
+#       abbreviation of every kill verb walk straight through. Measured: with the
+#       full-name matcher, `kill-ser` -> SERVER DEAD.
+#
+#   F3. COMMAND SEQUENCES. tmux takes several commands in one invocation,
+#       separated by an argument that is exactly `;` (written `\;` so the shell
+#       does not eat it). Inspecting only the FIRST command word misses every
+#       later one. Measured: `list-windows \; kill-server` -> SERVER DEAD.
+#
+# Splitting argv on exact-`;` elements IS tmux's own rule, not a heuristic, so
+# this models the grammar rather than guessing at it: an argument that is
+# literally `;` is a separator to tmux no matter which command precedes it.
+# ---------------------------------------------------------------------------
+
+# Canonical kill verb for a (possibly abbreviated) word; empty if it is not a
+# prefix of any of them. An abbreviation matching SEVERAL kill verbs (`kill-s`)
+# is ambiguous to tmux and would be REFUSED BY TMUX ITSELF, so resolving it to
+# the strictest reading costs nothing: the command was never going to run.
+# Nothing else in tmux's command set begins with `k`, so no legitimate non-kill
+# command can be captured here — the over-refusal direction stays empty.
+_tw_kill_of() {
+    _tw_ko_w="${1:-}"; _tw_ko_hit=""; _tw_ko_n=0
+    [ -n "$_tw_ko_w" ] || { printf ''; return; }
+    # killp / killw are BUILT-IN SHORT FORMS, not command-aliases: `list-commands`
+    # prints them as `kill-pane (killp)` / `kill-window (killw)`, and the default
+    # `command-alias` table contains no kill mapping at all. They are separate
+    # names, NOT prefixes of the long ones (`killw` is not a prefix of
+    # `kill-window`), so a prefix rule over the long names alone misses them.
+    for _tw_ko_v in kill-server kill-session kill-window kill-pane killp killw; do
+        if [ "${_tw_ko_v:0:${#_tw_ko_w}}" = "$_tw_ko_w" ]; then
+            _tw_ko_hit="$_tw_ko_v"; _tw_ko_n=$((_tw_ko_n + 1))
+        fi
+    done
+    [ "$_tw_ko_n" -gt 1 ] && _tw_ko_hit=kill-server      # ambiguous -> strictest
+    case "$_tw_ko_hit" in                                # normalise short forms
+        killp) _tw_ko_hit=kill-pane ;;
+        killw) _tw_ko_hit=kill-window ;;
+    esac
+    printf '%s' "$_tw_ko_hit"
+}
+
+if [ "$_tw_parse_ok" != 1 ]; then exec "$_tw_real" "$@"; fi
+
+# Walk every command in the sequence and record where each begins. Pure argv
+# arithmetic — no subprocess, no server query — so the hot path pays only this.
+_tw_starts=()          # argv index of each command's verb
+_tw_kills=()           # canonical kill verb per command, "" when not a kill
+_tw_any_kill=0
+_tw_any_unknown=0      # any command word that did NOT resolve to a kill
+_tw_ci=$_tw_vi
+_tw_expect_verb=1
+_tw_k=$_tw_vi
+while [ "$_tw_k" -lt "${#_tw_argv[@]}" ]; do
+    _tw_w="${_tw_argv[$_tw_k]}"
+    if [ "$_tw_w" = ";" ]; then
+        _tw_expect_verb=1
+    elif [ "$_tw_expect_verb" = 1 ]; then
+        _tw_starts+=("$_tw_k")
+        _tw_kv=$(_tw_kill_of "$_tw_w")
+        _tw_kills+=("$_tw_kv")
+        if [ -n "$_tw_kv" ]; then _tw_any_kill=1; else _tw_any_unknown=1; fi
+        _tw_expect_verb=0
+    fi
+    _tw_k=$((_tw_k + 1))
+done
+
+_tw_g=(${_tw_globals[@]+"${_tw_globals[@]}"})
+
+# ---------------------------------------------------------------------------
+# COMMAND-ALIAS RESOLUTION — the one thing argv can never answer.
+# ---------------------------------------------------------------------------
+# `command-alias` is a SETTABLE SERVER OPTION, user-extensible at runtime:
+#
+#     tmux set -s 'command-alias[99]' 'nuke=kill-server'
+#     tmux nuke        # -> kill-server
+#
+# Executed against a private server pinned as the board: DEAD. So the mapping
+# from COMMAND WORD to COMMAND is runtime server state an agent can write, and
+# NO argv-only matcher can be complete — not incomplete, UNSOUNDABLE IN
+# PRINCIPLE (your-org/nexus-code#892, skeptic F6). Enumerating `^kill` plus the
+# killp/killw map closes F2; it cannot touch this.
+#
+# Two facts bound the problem, both measured on this host:
+#   * user aliases are EXACT-MATCH ONLY — `nuk` for `nuke` is `unknown
+#     command` — so unlike built-in verbs there is no prefix space to cover;
+#   * the table is one query away: `show -s command-alias`.
+#
+# So we do what this shim already does for socket precedence: ASK TMUX rather
+# than carry a vocabulary. The cost is real and is the reason for the one
+# exemption below — measured, ~30ms against a ~42ms baseline call.
+#
+# WHY THE WATCHER IS EXEMPT, and why this is not the blanket exemption refused
+# in the header. The watcher is the ~200-operations-per-cycle caller, and every
+# tmux command it issues is a LITERAL in this repo's own source, covered by
+# `lint-no-tmux-server-kill.sh`. It cannot type a user alias, so resolution buys
+# it nothing and costs it a query per operation. The LETHALITY check is NOT
+# skipped for the watcher — that exemption is still refused, because the
+# watcher is the highest-frequency issuer of `kill-window`.
+_tw_alias_done=0
+_tw_alias_tbl=""
+# SETS `_tw_ra_result` (canonical kill verb, or empty). It does NOT print, and
+# must NOT be called in a command substitution — your-org/nexus-code#892 skeptic
+# F9. It was `_tw_ak=$(_tw_resolve_alias …)`, and a `$( )` runs in a SUBSHELL, so
+# `_tw_alias_done=1` and the fetched table died with it: the "at most ONE round
+# trip" claim in this header was false, and measured 1/2/3/4 queries for 1/2/3/4
+# unknown words. No call site in `monitor/` chains commands, so nothing was
+# operationally broken — it was a false claim and a scaling trap.
+#
+# This is a HOUSE DEFECT CLASS, not a one-off: state set inside `( )` or `$( )`
+# is invisible to the caller, which is the same reason an `assert_*` inside a
+# subshell cannot fail this repo's suites. Audited the rest of this file for a
+# second instance: `_tw_kill_of` and `_tw_rp` ARE captured in `$( )`, but their
+# globals are scratch and only stdout matters, so they are correct;
+# `_tw_sessions_get` is invoked BARE, so its cache does reach the caller.
+_tw_resolve_alias() {
+    _tw_ra_result=""
+    _tw_ra_w="${1:-}"
+    [ -n "$_tw_ra_w" ] || return 0
+    if [ "$_tw_alias_done" = 0 ]; then
+        _tw_alias_done=1
+        _tw_alias_tbl=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} show -s command-alias 2>/dev/null)
+    fi
+    [ -n "$_tw_alias_tbl" ] || return 0
+    # Entries print as: command-alias[N] "name=target args". Pull this word's
+    # target, then canonicalise it the same way a typed verb is canonicalised —
+    # so an alias pointing at an ABBREVIATION (`x=kill-ser`) resolves too.
+    _tw_ra_t=$(printf '%s' "$_tw_alias_tbl" \
+        | tr ',' '\n' \
+        | sed -n 's/.*"\{0,1\}'"$_tw_ra_w"'=\([^"]*\)"\{0,1\}.*/\1/p' \
+        | head -1 | awk '{print $1}')
+    [ -n "$_tw_ra_t" ] || return 0
+    _tw_ra_result=$(_tw_kill_of "$_tw_ra_t")
+}
+
+# THE FAST PATH THAT WAS HERE IS GONE, AND THE REASON MATTERS.
+#
+# Resolving on EVERY invocation costs a full extra round trip: measured 50ms
+# direct -> 123ms through the shim. To avoid it, an earlier revision skipped the
+# alias query for any word resolving to a BUILT-IN, on the strength of a
+# measured fact: with `command-alias[99] "list-windows=kill-server"` set, a plain
+# `tmux list-windows` still LISTED WINDOWS and the server lived.
+#
+# THAT FACT IS VERSION-DEPENDENT, AND THIS SHIM SHIPS TO EVERY OPERATOR.
+# Measured on tmux 2.6 (this sandbox): a built-in is NOT shadowable.
+# Measured on CI's tmux 3.x: the SAME probe KILLED THE SERVER — a built-in IS
+# shadowable. So the fast path was sound on the host it was written on and
+# unsound everywhere else, which is the worst shape a guard can have. CI caught
+# it because the premise was ASSERTED against a real server rather than trusted
+# as a comment.
+#
+# YOU CANNOT CHECK THIS FROM THE SANDBOX, AND THAT IS THE TRAP. The hazard is
+# verified ONLY on CI's tmux 3.x; on this host's 2.6 the identical probe leaves
+# the server ALIVE. So anyone tempted to reinstate the fast path — it is worth
+# ~48ms/call, so somebody will be — will measure 2.6 saying "a built-in cannot be
+# hijacked", which is TRUE HERE and FALSE WHERE IT MATTERS. That is exactly how
+# it shipped wrong the first time. Do not re-derive this locally and conclude the
+# optimisation is safe; the local answer is the wrong one by construction.
+# `test-tmux-shim.sh` DETECTS the regime rather than asserting either answer, and
+# the 116-local / 118-CI assertion gap is the cheapest proof the 3.x path ran.
+#
+# It is NOT version-gated back in. Two data points do not locate a boundary, and
+# guessing one is precisely the error `NEXUS_GH_MIN_VERSION` exists to avoid
+# (that floor sits at the oldest version MEASURED correct, never at a plausible
+# major-version line). The conservative reading — assume any tmux may allow
+# shadowing — is the only one supported by what has actually been observed.
+#
+# THE PRICE, STATED: this OVER-REFUSES on a tmux that ignores the alias. With
+# `command-alias[98] "list-windows=kill-server"` set on 2.6, tmux runs
+# list-windows and the shim refuses it. That is a false refusal on the HOT path
+# — the wedge direction this file exists to avoid — and it is accepted
+# deliberately, because the alternative is a false PASS on a tmux that honours
+# the alias, which is fatal and unrecoverable. It costs a loud refusal naming
+# TMUX_UNWRAPPED=1; the other way costs the sandbox. It also requires somebody
+# to have set a pathological alias in the first place.
+#
+# MEASURED COST AS SHIPPED. Two independent measurements, and quoting BOTH is
+# the point — see the RATIO note in the header block. Conditions always, because
+# a bare millisecond figure is the same liability as a bare count:
+#
+#   saturated node, mine, 25 calls x 3 rounds, interleaved medians:
+#       direct ~24ms   agent ~72ms (+48)   watcher ~35ms (+10)
+#   quiet node, #897 skeptic, 50 calls x 3 rounds, medians:
+#       direct 3-4ms   agent 25-27ms (+22)  watcher 11-12ms   no-op shim 7-9ms
+#
+# The DELTA is NOT the stable part (+48 vs +22). The RATIO is: ~7x direct on the
+# agent path, on both. Quote the ratio; quote a delta only with its node.
+#
+# The claim survives both and was confirmed independently: the watcher keeps
+# essentially the old hot path — indistinguishable from a no-op `exec "$@"` shim,
+# i.e. the argv walk really is free — and everyone else pays exactly ONE round
+# trip for soundness. "One" is now COUNTED, not asserted: see F9 below and the
+# query-count assertions in test-tmux-shim.sh.
+#
+# The F8 gate change (resolve when a word is UNKNOWN, rather than when no kill
+# was found) does NOT widen this for the common case, which is worth stating
+# because the opposite was assumed: `list-windows` contains no kill, so it
+# queried under the OLD gate too. The only invocations that newly query are
+# sequences that contain BOTH a recognised kill and another word — rare, and
+# exactly the shape F8 was hiding.
+#
+# The REFUSAL path is much slower (~200ms for a bare kill-server on a saturated
+# node) because it also notifies and logs. Deliberate and not optimised: a
+# refusal is terminal and rare, so it may cost what it needs to be loud. Stated
+# so the hot-path figures above are not read as covering it.
+#
+# F9 (your-org/nexus-code#892 skeptic): the "at most ONE round trip" claim was
+# FALSE when first written. `_tw_resolve_alias` was called as `$( … )`, so the
+# `_tw_alias_done` flag and the fetched table died in the subshell — 1/2/3/4
+# unknown words cost 1/2/3/4 queries, measured. Nothing in `monitor/` chains
+# commands, so nothing broke operationally; it was a false claim with nothing
+# checking it. The function now ASSIGNS `_tw_ra_result` and must never be
+# captured in a command substitution.
+#
+# So: resolve unconditionally, and pay for it. The cost is why the
+# WATCHER_WINDOW exemption survives, and that exemption is now a REAL residual
+# rather than a free optimisation — see WHAT THIS DOES NOT GUARANTEE.
+# GATED ON `_tw_any_unknown`, NOT ON `_tw_any_kill != 1` — and that distinction
+# is your-org/nexus-code#892 skeptic F8, confirmed by execution. The gate used to
+# read "resolve only if NOTHING was already recognised as a kill", so ONE
+# recognised kill in a sequence suppressed alias resolution for every OTHER
+# command in it. Matched pair, one variable, same alias and socket:
+#
+#     tmux list-windows       \; nuke   -> REFUSED   (server alive)
+#     tmux kill-window -t a:2 \; nuke   -> SERVER DEAD
+#
+# Both orderings died. This was F6 surviving INSIDE F3's composition: the verb
+# scan and the flag scan were both segmented per command, the alias gate was not
+# — two of three layers got the fix, which is exactly the shape that reads as
+# done. On a tmux where an alias can shadow a built-in it also partially reopened
+# what this file was written to close, via
+# `kill-window -t safe \; list-windows` with `list-windows` aliased.
+#
+# The hot-path property survives: the table query is cached behind
+# `_tw_alias_done`, so this is at most ONE round trip, and a sequence in which
+# every word already resolved to a kill (`tmux kill-server`) sets no unknown and
+# pays nothing.
+if [ "$_tw_any_unknown" = 1 ] \
+   && [ -z "${WATCHER_WINDOW:-}" ] \
+   && [ "${NEXUS_TMUX_RESOLVE_ALIASES:-1}" != 0 ]; then
+    _tw_ai=0
+    while [ "$_tw_ai" -lt "${#_tw_starts[@]}" ]; do
+        # Resolve exactly the words that are still unidentified. Words already
+        # canonicalised to a kill need no query; words that are NOT kills are
+        # precisely what an alias can redefine — including ones that look like
+        # built-ins, since on tmux 3.x an alias CAN shadow a built-in (measured),
+        # so "it is a built-in" is not a safety argument.
+        if [ -z "${_tw_kills[$_tw_ai]}" ]; then
+            _tw_aw="${_tw_argv[${_tw_starts[$_tw_ai]}]}"
+            _tw_resolve_alias "$_tw_aw"        # sets _tw_ra_result; NOT $( )
+            _tw_ak="$_tw_ra_result"
+            if [ -n "$_tw_ak" ]; then
+                _tw_kills[$_tw_ai]="$_tw_ak"
+                _tw_any_kill=1
+            fi
+        fi
+        _tw_ai=$((_tw_ai + 1))
+    done
+fi
+
+# Anything with no kill verb ANYWHERE in the sequence leaves HERE. On the
+# watcher's path (and with resolution disabled) that is reached having touched
+# nothing at all; otherwise it has cost exactly one `show -s command-alias`.
+[ "$_tw_any_kill" = 1 ] || exec "$_tw_real" "$@"
+
+# ===========================================================================
+# (3) KILL PATH — from here on, correctness outranks speed. Kills are rare.
+# ===========================================================================
+
+# Loud, deliberate opt-in (mirrors pipwrap's PIP_UNWRAPPED). Audited, because a
+# silent hatch is how a counted exemption erodes into noise.
+if [ "${TMUX_UNWRAPPED:-}" = "1" ]; then
+    printf 'tmux shim: TMUX_UNWRAPPED=1 — running %s %s unchecked (your-org/nexus-code#892)\n' \
+        "$_tw_real" "$_tw_verb" >&2
+    _tw_state="$(_tw_state_dir)"
+    if [ -n "$_tw_state" ] && [ -d "$_tw_state" ]; then
+        printf '%s\tverb=%s\twindow=%s\targs=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown-ts)" \
+            "$_tw_verb" "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" "$_tw_cmdline" \
+            >> "$_tw_state/tmux-unwrapped.log" 2>/dev/null || true
+    fi
+    exec "$_tw_real" "$@"
+fi
+
+# --- (3a) Which socket does THIS command actually target? -------------------
+# Delegated to tmux, replaying the caller's own global flags. We never parse
+# -L/-S ourselves and never model the precedence chain.
+#
+# THE SENTINEL, and why it is not decoration. tmux expands an UNKNOWN format
+# variable to the EMPTY STRING — measured: `display-message -p '#{no_such_var}'`
+# prints nothing, and `'A#{no_such_var}B'` prints `AB`. So on a tmux too old for
+# `#{socket_path}` the probe returns exactly what "no server is running here"
+# returns, and a bare emptiness test would make this guard SILENTLY INERT on
+# that host. Silence used as proof of absence is this repo's own dominant defect
+# class; it does not get to live inside the guard.
+#
+# Prefixing a sentinel separates the three states:
+#   `NXSOCK:/path`  server present, format supported  -> decide
+#   `NXSOCK:`       server present, format UNSUPPORTED -> pass through, but SAY SO
+#   (no output)     no server on that socket           -> pass through, silently
+_tw_probe=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} display-message -p 'NXSOCK:#{socket_path}' 2>/dev/null | head -1)
+
+case "$_tw_probe" in
+    NXSOCK:?*) _tw_target_sock="${_tw_probe#NXSOCK:}" ;;
+    NXSOCK:)
+        # A server answered, but it cannot tell us which socket it is on.
+        # Fail OPEN per this file's policy — but LOUDLY, because an inert guard
+        # that nobody knows is inert is worse than a documented hazard.
+        printf 'tmux shim: WARNING — this tmux (%s) does not support the socket_path format, so the board-lethal-kill guard CANNOT identify its target and is INERT for this call. Allowing %s unchecked (your-org/nexus-code#892).\n' \
+            "$("$_tw_real" -V 2>/dev/null || echo 'version unknown')" "$_tw_verb" >&2
+        exec "$_tw_real" "$@" ;;
+    *)  # No server on the target socket: the kill is a no-op, or tmux will
+        # report its own error better than we would.
+        exec "$_tw_real" "$@" ;;
+esac
+
+# --- (3b) Which socket is the BOARD? ----------------------------------------
+# In order of directness. NEXUS_TMUX_SOCKET is exported by locals-env.sh from
+# the launcher's own $TMUX, so it survives `env -u TMUX` children — the shape
+# that defeats every other route. $TMUX is the direct answer for any agent
+# process (all of them run inside a pane). The last arm is the compiled default
+# for this uid, which is where the board lives by construction: a private server
+# always carries -L/-S or a TMUX_TMPDIR of its own, so it never collides.
+_tw_board="${NEXUS_TMUX_SOCKET:-}"
+[ -z "$_tw_board" ] && [ -n "${TMUX:-}" ] && _tw_board="${TMUX%%,*}"
+[ -z "$_tw_board" ] && _tw_board="/tmp/tmux-${UID:-$(id -u 2>/dev/null || echo 0)}/default"
+
+# Compare resolved paths too, so an automounted or symlinked /tmp cannot make
+# the board look like somebody else's socket.
+_tw_ts_rp=$(_tw_rp "$_tw_target_sock" 2>/dev/null || printf '%s' "$_tw_target_sock")
+_tw_bd_rp=$(_tw_rp "$_tw_board" 2>/dev/null || printf '%s' "$_tw_board")
+
+if [ "$_tw_target_sock" != "$_tw_board" ] && [ "$_tw_ts_rp" != "$_tw_bd_rp" ]; then
+    exec "$_tw_real" "$@"          # an isolated socket — not our business
+fi
+
+# ===========================================================================
+# From here: the target IS the board. Only now can a refusal be justified.
+# ===========================================================================
+
+_tw_refuse() {   # <what> <why>
+    # Name what the caller TYPED as well as what tmux would have run, so an
+    # abbreviation (`kill-ser`) is greppable in their own scrollback and the
+    # resolution is visible rather than mysterious.
+    _tw_shown="$_tw_verb"
+    [ -n "${_tw_typed:-}" ] && [ "$_tw_typed" != "$_tw_verb" ] \
+        && _tw_shown="$_tw_typed' (tmux resolves this to \`$_tw_verb')"
+    cat >&2 <<MSG
+tmux: REFUSING \`$_tw_shown\` — $1
+
+  $2
+
+  Ending this server ends the tmux session bwrap holds open under
+  --die-with-parent, so the ENTIRE SANDBOX is torn down: watcher, every worker
+  window, every registered service, the operator's session. There is no
+  in-sandbox recovery and the notification path dies with it, so nobody can
+  even be told. It happened on 2026-08-09 and five times in 33 minutes on
+  2026-07-30 (your-org/nexus-code#644, #892).
+
+  board socket: $_tw_board
+  your target:  $_tw_target_sock
+
+  If you meant a PRIVATE server, pin it and neutralise the ambient one:
+      env -u TMUX $_tw_name -L <your-socket> $_tw_verb ...
+  TMUX_TMPDIR alone is NOT containment — tmux resolves -L/-S > \$TMUX >
+  TMUX_TMPDIR, and \$TMUX is always set inside an agent pane.
+  Deliberate and unavoidable? TMUX_UNWRAPPED=1 (loud, and logged).
+MSG
+    command -v sandbox-notify >/dev/null 2>&1 \
+        && sandbox-notify "tmuxwrap REFUSED a board-lethal \`$_tw_verb\` (#892)" >/dev/null 2>&1 || true
+    _tw_state="$(_tw_state_dir)"
+    if [ -n "$_tw_state" ] && [ -d "$_tw_state" ]; then
+        printf '%s\tverb=%s\twindow=%s\treason=%s\targs=%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown-ts)" \
+            "$_tw_verb" "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" "$1" "$_tw_cmdline" \
+            >> "$_tw_state/tmux-refused.log" 2>/dev/null || true
+    fi
+    exit 1
+}
+
+# ===========================================================================
+# EVALUATE EVERY COMMAND IN THE SEQUENCE. `tmux list-windows \; kill-server` is
+# one invocation carrying two commands; a shim that judged only the first let
+# the second kill the server (skeptic F3, executed). Sessions/socket are shared
+# across the sequence, so they are resolved ONCE, above; only the per-command
+# flags are re-read here.
+# ===========================================================================
+
+# Shared counts, fetched lazily and at most once — a sequence of five kills must
+# not mean five `list-sessions` round-trips.
+_tw_sessions=""
+_tw_sessions_get() {
+    [ -n "$_tw_sessions" ] && return 0
+    _tw_sessions=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} list-sessions 2>/dev/null | wc -l | tr -d ' ')
+    printf ''
+}
+
+_tw_n=${#_tw_starts[@]}
+_tw_ix=0
+while [ "$_tw_ix" -lt "$_tw_n" ]; do
+    _tw_verb="${_tw_kills[$_tw_ix]}"
+    if [ -z "$_tw_verb" ]; then _tw_ix=$((_tw_ix + 1)); continue; fi   # not a kill
+    _tw_vi="${_tw_starts[$_tw_ix]}"
+    # This command's arguments end at the next command's verb, or at argv's end.
+    if [ $((_tw_ix + 1)) -lt "$_tw_n" ]; then
+        _tw_end="${_tw_starts[$((_tw_ix + 1))]}"
+    else
+        _tw_end=${#_tw_argv[@]}
+    fi
+    # The word the CALLER actually typed, for messages — `kill-ser`, not the
+    # canonical name, so the refusal names the command they will look for.
+    _tw_typed="${_tw_argv[$_tw_vi]}"
+
+    # --- Rule 1: kill-server on the board is unconditionally fatal -----------
+    if [ "$_tw_verb" = "kill-server" ]; then
+        _tw_refuse "it targets the board's own tmux server." \
+                   "There is no non-fatal form of this verb against this socket."
+    fi
+
+    # --- This command's own flags: -t <target>, and -a (all-BUT-target) ------
+    _tw_t=""
+    _tw_have_t=0
+    _tw_all=0
+    _tw_k=$((_tw_vi + 1))
+    while [ "$_tw_k" -lt "$_tw_end" ]; do
+        _tw_a="${_tw_argv[$_tw_k]}"
+        case "$_tw_a" in
+            -t)  _tw_have_t=1
+                 _tw_k=$((_tw_k + 1))
+                 [ "$_tw_k" -lt "$_tw_end" ] && _tw_t="${_tw_argv[$_tw_k]}"
+                 ;;
+            -t*) _tw_have_t=1; _tw_t="${_tw_a#-t}" ;;
+            -*a*) _tw_all=1 ;;
+            *) : ;;
+        esac
+        _tw_k=$((_tw_k + 1))
+    done
+
+    # `-a` means "all EXCEPT the target", which by construction leaves one
+    # behind and can never empty the server. This COMMAND is fine; keep going,
+    # because a later one in the sequence may not be.
+    if [ "$_tw_all" = 1 ]; then _tw_ix=$((_tw_ix + 1)); continue; fi
+
+    # --- Rule 2 (the lint's rule3): untargeted acts on the CURRENT one -------
+    if [ "$_tw_have_t" != 1 ] || [ -z "$_tw_t" ]; then
+        _tw_refuse "it names no \`-t\` target, so it acts on the CURRENT one." \
+                   "The current window/pane/session can be the last one, and the lint (rule3-untargeted-kill) bans this form repo-wide for that reason."
+    fi
+
+    # --- Rule 3: would this targeted kill EMPTY the server? ------------------
+    # The check no lint can make. Ask the running server.
+    _tw_info=$("$_tw_real" ${_tw_g[@]+"${_tw_g[@]}"} display-message -p -t "$_tw_t" \
+                  '#{session_windows}|#{window_panes}' 2>/dev/null | head -1)
+
+    # Unresolvable target: tmux itself will refuse it with a better message than
+    # ours. Judge no further on THIS command — but do not abandon the sequence.
+    if [ -z "$_tw_info" ]; then _tw_ix=$((_tw_ix + 1)); continue; fi
+
+    _tw_windows="${_tw_info%%|*}"
+    _tw_panes="${_tw_info##*|}"
+    _tw_sessions_get
+
+    # Any unreadable count means lethality cannot be established for this
+    # command. Per the pass-through policy, do not refuse on a guess.
+    case "${_tw_sessions:-x}${_tw_windows:-x}${_tw_panes:-x}" in
+        *[!0-9]*) _tw_ix=$((_tw_ix + 1)); continue ;;
+    esac
+    [ "$_tw_sessions" -ge 1 ] 2>/dev/null || { _tw_ix=$((_tw_ix + 1)); continue; }
+
+    _tw_lethal=0
+    case "$_tw_verb" in
+        kill-session)
+            [ "$_tw_sessions" -le 1 ] && _tw_lethal=1
+            _tw_why="it is the only session on this server ($_tw_sessions), and killing the last session exits it." ;;
+        kill-window)
+            [ "$_tw_sessions" -le 1 ] && [ "$_tw_windows" -le 1 ] && _tw_lethal=1
+            _tw_why="it is the last window ($_tw_windows) of the last session ($_tw_sessions). Verified on this host: killing one of two windows leaves the server up; killing the last leaves \"no server running\"." ;;
+        kill-pane)
+            [ "$_tw_sessions" -le 1 ] && [ "$_tw_windows" -le 1 ] && [ "$_tw_panes" -le 1 ] && _tw_lethal=1
+            _tw_why="it is the last pane ($_tw_panes) of the last window ($_tw_windows) of the last session ($_tw_sessions)." ;;
+    esac
+
+    if [ "$_tw_lethal" = 1 ]; then
+        _tw_refuse "target '$_tw_t' would EMPTY the board's server — $_tw_why" \
+                   "This form satisfies every static flag rule, which is why only a runtime check can catch it."
+    fi
+
+    _tw_ix=$((_tw_ix + 1))
+done
+
+# Every kill in the sequence is targeted, on the board, and provably non-lethal
+# — the orchestrator's ordinary window-retirement path. Run it.
+exec "$_tw_real" "$@"

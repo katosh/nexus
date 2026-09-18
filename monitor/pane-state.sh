@@ -6,10 +6,12 @@
 #   state=<idle|busy|user-typing|autosuggest-only|empty|blocked|absent|over-limit|
 #          working-background|working-self-paced|idle-orphan-async|unknown> \
 #     active=<0|1> window=<idx> name=<windowname> [input=<typed|ghost|blank|?>] \
-#     [queued=1] [reset_at=<token>] \
+#     [queued=1] [reset_at=<token>] [limit=<flavour>] \
 #     [evidence=<token>] [reason=<token> site=<label> [capture=failed]] \
 #     [orphan_kinds=<csv>] [bg_shells=<count> bg_reliable=<0|1> bg_cpu=<jiffies> \
-#      bg_oldest_start=<epoch> bg_infra=<count> bg_cmd=<comm:cmd-tail>]
+#      bg_oldest_start=<epoch> bg_infra=<count> bg_stale=<count> \
+#      bg_cmd=<comm:cmd-tail> bg_cpu_bp=<basis-points|-> bg_wedged=<0|1>
+#      bg_members=<digest> bg_quiesce=<count> bg_longjob=<0|1>]
 #
 # A background SHELL is detected from the kernel PROCESS TREE — claude's
 # live background-shell child subtrees (your-org/nexus-code#445, made the
@@ -17,8 +19,14 @@
 # only a fallback for when the process tree can't be read (no pane_pid,
 # /proc-restricted): it is presentation, so a user-customised/changed
 # status bar or a coincidental text match must never be the primary
-# detector. A Monitor handle lives inside claude's node process (not a
-# child), so it is still read from the footer/heartbeat.
+# detector. A Monitor handle was once assumed to live inside claude's node
+# process (not a child), so it is still read from the footer/heartbeat.
+# THAT ASSUMPTION IS FALSE on current Claude Code builds for a `command`
+# Monitor: its loop runs as a REAL zsh child of claude (measured 2026-09-11 on
+# 2.1.268, the orchestrator's watcher-supervisor `until ! …tick.sh; do sleep 15;
+# done` as pid 13599, ppid = claude), so the process-tree walk counts it as a
+# background shell and the line carries `bg_cpu=`. `bg_quiesce` (below) is
+# what lets a consumer tell such a pure wait loop from real work.
 #
 # `bg_cpu` is appended only when state=working-background AND the driver
 # is a background SHELL (a `run_in_background` job / `& disown`), not a
@@ -30,6 +38,16 @@
 # the shell is doing nothing and the window falls back to normal idle
 # classification. A Monitor-handle working-background carries NO bg_cpu
 # (it is self-waking) and is never capped.
+#
+# `bg_cpu_bp` / `bg_wedged` (your-org/nexus-code#1446) ride the same line:
+# the subtree's CPU share over its whole episode in BASIS POINTS
+# (jiffies * 100 / elapsed seconds; `-` when the episode start is unknown),
+# and a flag that the episode is older than NEXUS_BG_WEDGE_MIN_ELAPSED
+# (default 600 s) with a share under NEXUS_BG_WEDGE_CPU_BP (default 100 =
+# 1%). A child whose elapsed dwarfs its CPU is BLOCKED — an existence
+# query piped into `head`, a wait on a token the producer never writes —
+# not long-running; three >5h stalls and a 5h36m waiter all read
+# `working-background` here with nothing to tell them from real compute.
 #
 # `bg_shells` and `bg_reliable` accompany `bg_cpu` on a shell-driven
 # working-background line (your-org/nexus-code#455 refine). `bg_shells` is
@@ -56,10 +74,41 @@
 # case) and to NAME the child instead of demanding a decision on a bare
 # count.
 #
+# `bg_quiesce` (appended LAST on the same line) counts the `bg_shells` roots
+# that hold NO in-flight work at the sampled instant: a root whose WHOLE eval'd
+# payload is a nexus protocol wait loop (the strict whole-payload recogniser
+# `_pane_payload_is_pure_wait`, NOT `bg_infra`'s substring match) AND whose
+# live subtree is nothing but shells and `sleep`, or a #1208-stale waiter. It
+# is a NEW COLUMN on purpose: `bg_infra` already SELECTS in the idle probe, so
+# widening it would change reap behaviour, and `bg_infra` matches anywhere in a
+# subtree, so a compute child under an await loop still counts as infra. Its
+# ONE consumer is the cc-update restart gate (`_restart_eligible`), which may
+# kill the orchestrator between turns only when `bg_quiesce >= bg_shells`.
+# Errs toward 0 (not quiescent) on anything it cannot parse.
+#
+# COVERAGE BOUNDARY, narrower than a first reading suggests (w234sk F3). Two
+# things this count does not see:
+#   * The walk counts only SHELL children of claude as roots. A NON-shell
+#     direct child of claude is invisible to `bg_shells` and `bg_quiesce`
+#     alike. Examples: an `exec <compute>` from a background command, or an
+#     MCP server, which looks identical to it.
+#   * A descendant whose comm is a shell (bash, sh, zsh, …) is never "alien".
+#     So work done by shell SCRIPTS under a recognised wait root passes the
+#     descendant check, not only work done in shell builtins.
+#
 # `reset_at` is appended only when state=over-limit, and carries the
 # extracted reset-time string (spaces collapsed to `_`, parens stripped,
 # capped at 40 chars). Value is `unknown` when the canonical "resets
 # <time>" suffix wasn't extractable.
+#
+# `limit` is appended alongside it and names WHICH limit the banner says was
+# hit — `weekly_Opus`, `weekly_Fable`, … — or `unknown` (your-org/nexus-code
+# #1488). The banner regex always captured this and every consumer discarded it
+# and said "Opus": a worker's FABLE limit was reported as an Opus one, resumed
+# against an Opus reset, and refused again on arrival. The model tier is not a
+# constant of this codebase; it is written on the screen the detector already
+# matched. A FIELD rather than a state token, for the `throttled=1` reason
+# (#1340): consumers of `state=` are unaffected.
 #
 # `overlay` is appended only when state=blocked, and names WHICH overlay is
 # waiting on a human: `rate-limit` | `permission` | `bypass-permissions` |
@@ -147,7 +196,8 @@
 #                      `evidence=<pane_dead|pid-gone|
 #                      tree-empty-past-grace|fixture-no-process>` and
 #                      every refusal carries `reason=<live-claude|
-#                      live-descendant|proc-view-blind|boot-grace|
+#                      live-descendant|claude-identity-indeterminate|
+#                      proc-view-blind|boot-grace|
 #                      no-pane-pid> site=<label>`, plus
 #                      `capture=failed` when `tmux capture-pane`
 #                      itself failed. Two further sites reached
@@ -290,10 +340,11 @@
 # have emitted `idle`, we look at three async signals and pick the
 # more specific class. The signals, in priority order:
 #
-#   1. monitor_handles > 0 OR background_bash_count > 0
+#   1. a live Monitor handle (pane FOOTER) OR a live background shell
+#      (PROCESS TREE, footer as fallback)
 #      → `working-background` (worker has an in-flight async tool
 #      handle in claude's own process; they'll be woken when it
-#      completes).
+#      completes). Neither count is in the heartbeat — see #1374.
 #   2. scheduled_wakeup_at > now
 #      → `working-self-paced` (worker scheduled a /loop
 #      ScheduleWakeup; the harness will resume them then).
@@ -305,11 +356,11 @@
 #   4. None of the above → plain `idle`.
 #
 # Signal sources, by signal:
-#   - background_bash_count (the `bg` signal): the PROCESS TREE is the
+#   - the `bg` signal (background shells): the PROCESS TREE is the
 #     primary + authoritative source (your-org/nexus-code#455) — claude's
 #     live background-shell child subtrees, counted by
 #     _pane_background_shells. When that reading is reliable it overrides
-#     the footer both up and down. The footer/heartbeat is a FALLBACK for
+#     the footer both up and down. The footer is the ONLY fallback for
 #     when the tree can't be read (no pane_pid, /proc-restricted). Footer
 #     phrasings matched by the fallback: the status-line `N shell[s]` (the
 #     real Claude Code v2.1.204 form, e.g. `· 1 shell, 1 monitor ·`) and
@@ -317,11 +368,12 @@
 #     idling between turns with a live background shell showing ONLY the
 #     status line — was your-org/nexus-code#445; #455 removes the reliance
 #     on that presentation regex as primary.
-#   - monitor_handles (the `mon` signal): heartbeat when fresh, else the
+#   - the `mon` signal (Monitor handles): the pane footer, and ONLY the
 #     pane footer (`N monitor[s] still running` spinner-row or the
 #     `· N monitor ·` status-line form). Monitor handles run inside
 #     claude's node process, not as child processes, so the process tree
-#     cannot see them — the footer/heartbeat is their ONLY source.
+#     cannot see them; and the heartbeat has NEVER carried a count of them
+#     (your-org/nexus-code#1374 — the arm that read one had no writer).
 #   - `scheduled_wakeup_at` / `external_waits`: heartbeat only.
 #     `external_waits` has NO renderer fallback. A worker that
 #     hasn't run the PostToolUse hook AND hasn't called
@@ -384,11 +436,20 @@
 # Exit codes:
 #   0  classification produced (always — even `state=absent` exits 0)
 #   2  bad usage
-#   3  requested tmux window index does not exist (issue #140 — a
+#   3  the requested tmux window does not exist (issue #140 — a
 #      bogus index used to return `state=absent name=` and exit 0,
 #      which masked an orchestrator-side index-typo bug). Distinct
 #      from exit 2 so callers can tell "argv shape was wrong" from
-#      "argv shape was fine but the index isn't a live window".
+#      "argv shape was fine but it isn't a live window".
+#      BOTH SPELLINGS (your-org/nexus-code#1101). This used to be the
+#      INDEX spelling only: a NAME that resolved to nothing printed
+#      `usage` and exited 2, so `pane-state.sh 0:9999` and
+#      `pane-state.sh gone-window` — the same fact, two spellings —
+#      answered "not a live window" and "your argv was wrong". A
+#      caller keyed on names could therefore never establish that a
+#      window had vanished, only that it could not be looked at.
+#      "Could not ask tmux" stays OUT of 3 and keeps exit 2: it is
+#      not a claim about the window's existence.
 #
 # The dim-cursor regex `\x1b\[7m.\x1b\[0;2m` and the bright-text marker
 # `\x1b\[38;5;231m` are centralized in this file. If a future Claude
@@ -412,6 +473,17 @@
 # `✻ <Verb>ed for <dur>` = idle banner.
 
 set -u
+
+# ARGUMENT-LOOP PROGRESS GUARD (your-org/nexus-code#924). Each argument loop
+# below asserts that every iteration consumes at least one argument. Without it
+# a value-taking flag given LAST spins forever — `shift 2` with `$#` == 1 is
+# refused, so the arm re-matches — and a hang here is worse than an error
+# because nothing on this board surfaces it. Full rationale: monitor/ng.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
 
 # ---- the declared state vocabulary (your-org/nexus-code#790) -------------
 #
@@ -448,7 +520,7 @@ _PS_STATES=(
 
 usage() {
     cat <<'EOF' >&2
-usage: pane-state.sh <window-index|session:window>
+usage: pane-state.sh <window-index|session:window|window-name>
        pane-state.sh --all [<session>]
        pane-state.sh --fixture <path> [--window <idx>] [--name <s>] [--active 0|1]
                      [--heartbeat-file <path>] [--now <epoch>]
@@ -456,8 +528,12 @@ usage: pane-state.sh <window-index|session:window>
                      [--heartbeat-turn-end-staleness <seconds>]
                      [--heartbeat-async-staleness <seconds>]
                      [--over-limit-file <path>]
+                     [--orchestrator-heartbeat-file <path>]
+                     [--orchestrator-window <name>]
                      [--pane-pid <pid>] [--bg-cpu <jiffies>]
                      [--bg-shells <count>] [--bg-oldest-start <epoch>]
+                     [--bg-cmd <string>] [--bg-infra <0|1>] [--bg-members <digest>]
+                     [--bg-stale <count>] [--bg-quiesce <count>] [--bg-longjob <0|1>]
        pane-state.sh --mcp-shell-risk
        pane-state.sh --states
 
@@ -487,6 +563,7 @@ fix_name=fixture
 fix_active=0
 all_session=
 target=
+_PS_SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 mcp_risk_only=0
 hb_file_override=
 now_override=
@@ -494,6 +571,8 @@ staleness_override=
 turn_end_staleness_override=
 async_staleness_override=
 over_limit_file_override=
+orch_hb_file_override=
+orch_window_override=
 pane_pid_override=
 # tmux's `#{pane_dead}`; empty on the fixture path, where there is no pane.
 pane_dead=
@@ -518,8 +597,12 @@ bg_cpu_override=
 bg_shells_override=
 bg_oldest_start_override=
 bg_infra_override=
+bg_stale_override=
 bg_cmd_override=
-while (( $# > 0 )); do
+bg_members_override=
+bg_longjob_override=
+bg_quiesce_override=
+_argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
     case "$1" in
         --fixture) fixture="$2"; shift 2;;
         --window)  fix_window="$2"; shift 2;;
@@ -531,12 +614,18 @@ while (( $# > 0 )); do
         --heartbeat-turn-end-staleness) turn_end_staleness_override="$2"; shift 2;;
         --heartbeat-async-staleness)   async_staleness_override="$2"; shift 2;;
         --over-limit-file)             over_limit_file_override="$2"; shift 2;;
+        --orchestrator-heartbeat-file) orch_hb_file_override="$2"; shift 2;;
+        --orchestrator-window)         orch_window_override="$2"; shift 2;;
         --pane-pid)                    pane_pid_override="$2"; shift 2;;
         --bg-cpu)                      bg_cpu_override="$2"; shift 2;;
         --bg-shells)                   bg_shells_override="$2"; shift 2;;
         --bg-oldest-start)             bg_oldest_start_override="$2"; shift 2;;
         --bg-infra)                    bg_infra_override="$2"; shift 2;;
+        --bg-stale)                    bg_stale_override="$2"; shift 2;;
         --bg-cmd)                      bg_cmd_override="$2"; shift 2;;
+        --bg-members)                  bg_members_override="$2"; shift 2;;
+        --bg-longjob)                  bg_longjob_override="$2"; shift 2;;
+        --bg-quiesce)                  bg_quiesce_override="$2"; shift 2;;
         --all)
             shift
             if (( $# > 0 )) && [[ "$1" != -* ]]; then
@@ -690,11 +779,15 @@ _has_blocked_overlay() {
 #       possibility this guard is cheap insurance against, NOT something
 #       currently observed. What actually keeps live busy panes out is (c) — see
 #       the measurement recorded there.
-#   (b) A CHEVRON-SELECTED NUMBERED OPTION above that footer, plus at least one
-#       sibling option row — i.e. a menu with a highlighted choice, which is
-#       what makes it a DECISION rather than a notice. The chevron must be
-#       followed by an ASCII space; the REPL input row is `❯` + NBSP, so this
-#       cannot match a user who typed "1. foo" at the prompt.
+#   (b) A CHEVRON-SELECTED OPTION above that footer, plus at least one
+#       COLUMN-ALIGNED sibling option row — i.e. a menu with a highlighted
+#       choice, which is what makes it a DECISION rather than a notice. The
+#       chevron must be followed by an ASCII space; the REPL input row is `❯` +
+#       NBSP, so this cannot match a user who typed at the prompt. It used to
+#       additionally require `N.` ordinals on both rows; 2.1.248 dropped those
+#       from the trust dialog and reopened the whole blind spot, so the sibling
+#       test is now the layout invariant a select menu actually has — see the
+#       (b2) block in the body (your-org/nexus-code#1112).
 #   (c) LIVE, NOT QUOTED: no `❯<NBSP>` REPL input row below the footer. This is
 #       the same structural test `_has_bypass_permissions_modal` settled on
 #       under #776 adversarial review, and for the same reason — a live dialog
@@ -741,10 +834,12 @@ _has_blocked_overlay() {
 # job; answering it stays a human's.
 #
 # DECLARED COVERAGE BOUNDARY, stated rather than implied. Caught: any dialog
-# rendered in Claude Code's select idiom — numbered options, `❯` cursor,
-# Enter/Esc footer — whatever it asks about. NOT caught: a dialog with a
-# different footer literal, one with no numbered options (a free-text or
-# yes/no-keypress prompt), or one that leaves the REPL row painted underneath.
+# rendered in Claude Code's select idiom — a `❯` cursor on one option, at least
+# one sibling option in the same column, an Enter/Esc footer — whatever it asks
+# about, numbered or not. NOT caught: a dialog with a different footer literal,
+# one with a single option, one whose options are not column-aligned, one with
+# no `❯` cursor at all (a free-text or yes/no-keypress prompt), or one that
+# leaves the REPL row painted underneath.
 # For those the state stays `empty`, i.e. exactly as blind as before this change
 # — no regression, but no coverage either. Closing them needs a new capture from
 # the live binary, not a wider regex guessed at from here.
@@ -762,13 +857,61 @@ _has_menu_dialog_frame() {
     footer_ln=$(grep -nE "$footer_re" <<<"$plain" | tail -1 | cut -d: -f1)
     [[ -n "$footer_ln" ]] || return 1
 
-    # (b) a highlighted numbered option, plus a sibling, ABOVE the footer.
     local above
     above=$(head -n "$(( footer_ln - 1 ))" <<<"$plain")
-    grep -qE '^[[:space:]]*❯ +[0-9]+\.[[:space:]]' <<<"$above" || return 1
-    local options
-    options=$(grep -cE '^[[:space:]]*(❯ +)?[0-9]+\.[[:space:]]' <<<"$above")
-    (( options >= 2 )) || return 1
+
+    # (b1) a CHEVRON-SELECTED option row ABOVE the footer — a highlighted
+    # choice, which is what makes the frame a DECISION rather than a notice.
+    # `❯` + one-or-more ASCII spaces + a non-space; the REPL input row is
+    # `❯` + NBSP, so this cannot match a user who typed at the prompt.
+    #
+    # LITERAL SPACES, not `[[:space:]]`, and that is load-bearing rather than
+    # cosmetic: in a UTF-8 locale `[[:space:]]` can match NBSP, which would let
+    # the REPL input row itself satisfy the very condition (c) exists to
+    # exclude. It also makes the column arithmetic below exact — a TAB counts
+    # one character and displays as several, and only spaces are equal to
+    # themselves in both.
+    local sel_line
+    sel_line=$(grep -E '^ *❯ +[^ ]' <<<"$above" | tail -1)
+    [[ -n "$sel_line" ]] || return 1
+
+    # (b2) at least one COLUMN-ALIGNED SIBLING option row.
+    #
+    # WHY ALIGNMENT RATHER THAN `N.` NUMBERING (your-org/nexus-code#1112).
+    # Until 2.1.247 this asked for `❯ 1.` plus a second `N.` row. Claude Code
+    # 2.1.248 DROPPED THE ORDINALS from the workspace-trust dialog while
+    # changing nothing else about it — measured, one tree, binary the only
+    # variable:
+    #
+    #   2.1.246:  ' ❯ 1. Yes, I trust this folder' / '   2. No, exit'
+    #   2.1.248:  ' ❯ No, exit'                     / '   Yes, I trust this folder'
+    #
+    # Numbering was never the structural fact; it was a rendering detail that
+    # happened to be stable. Keying on it classified a LIVE trust dialog as
+    # `empty` — "don't know yet" — from 2.1.248 onward, which is the #896 blind
+    # spot reopened by a repaint, exactly the failure #896 set out to make
+    # impossible. A worker sitting at that dialog is invisible to the unstick
+    # machinery and reads to the orchestrator as a slow boot.
+    #
+    # What IS structural is that a select menu paints its options in a COLUMN:
+    # the cursor row's option text and every unselected sibling's text begin at
+    # the same character offset, the cursor occupying the gutter. That holds for
+    # BOTH renderings above — text at offset 3 in each — and it is a property of
+    # the LAYOUT, not of the wording or the list markers, so it survives a
+    # re-word, a re-order and an ordinal change alike. Note the deliberate
+    # non-answer: the prose rows of the trust dialog sit at offset 1 and the box
+    # rule at offset 0, so they are not siblings.
+    #
+    # The offset is derived from the cursor row rather than guessed: leading
+    # spaces + the chevron + the gap after it. `${#lead}` and `${#gap}` count
+    # only spaces, so byte- and character-length agree.
+    local lead rest gap opt_col sib_re
+    lead=${sel_line%%❯*}
+    rest=${sel_line#*❯}
+    gap=${rest%%[! ]*}
+    opt_col=$(( ${#lead} + 1 + ${#gap} ))
+    printf -v sib_re '^ {%d}[^ ]' "$opt_col"
+    grep -qE "$sib_re" <<<"$above" || return 1
 
     # (c) no REPL input row below the footer ⇒ the dialog replaced the REPL.
     if grep -qF "❯${NBSP}" <<<"$(tail -n +"$(( footer_ln + 1 ))" <<<"$plain")"; then
@@ -818,7 +961,179 @@ _name_menu_dialog_kind() {
        || grep -qE 'Is this a project you created or one you trust\?' <<<"$plain"; then
         printf 'workspace-trust'; return 0
     fi
+    if _dialog_is_login "$plain"; then
+        printf 'login'; return 0
+    fi
     printf 'dialog'
+}
+
+# THE `/login` FLOW (your-org/nexus-code#1518).
+#
+# Captured from the real binary at 2.1.268 through `monitor/cc-harness` against
+# the auth-free mock backend — no real `/login`, no credentials, no egress.
+# Step one (`blocked-login-method-realmodel-268.ansi`):
+#
+#        Login
+#
+#        Claude Code can be used with your Claude subscription or billed based …
+#
+#        Select login method:
+#
+#        ❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise
+#          2. Anthropic Console account · API usage billing
+#          3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, or Vertex AI
+#
+#        Esc to cancel
+#
+# and step two (`blocked-login-signin-realmodel-268.ansi`) is the same frame
+# with `Anthropic Console account` / `How do you want to sign in?`.
+#
+# WHY THIS ARM IS A REFINEMENT AND NOT THE GATE — and it is the whole reason
+# the string rot here is affordable. Both frames ALREADY classify
+# `state=blocked overlay=dialog` at `4f73e0e7`: they are select dialogs, and
+# `_has_menu_dialog_frame` keys on the frame, not on the wording. `blocked` is
+# in `_BK_ACTIVE_STATES` (never kill-authorised) and `paste-followup.sh:889`
+# has refused to paste into it since `#1200`. So what the watcher's emit hold
+# rests on is `state=blocked`, a STRUCTURAL property of a select dialog; this
+# function only says WHICH dialog, which is what the hold's log line, its
+# `sandbox-notify` text and its escape eligibility read.
+#
+# FAILURE DIRECTION, therefore: a vendor reword drops `overlay=login` back to
+# `overlay=dialog` and the hold STILL ENGAGES — the operator's login is still
+# not pasted over. What degrades is the diagnosis, not the protection. That is
+# the opposite of `_detect_auth_expired` below, whose miss is NOT safe, and the
+# two are deliberately documented apart rather than as one "login detector".
+#
+# THREE DISJUNCTS, each covering a different reword:
+#
+#   (a) a bare `Login` HEADER row. The frame's title, and it survives any
+#       rewording of the question below it. Anchored `^…$` on its own row so a
+#       transcript mentioning the word cannot reach it; the caller has already
+#       established a dialog frame, so the population here is dialog text.
+#   (b) `Select login method:`   — step one's question.
+#   (c) `How do you want to sign in?` — step two's.
+#
+# (b) and (c) carry the case where the title is reworded but the prompt is not.
+# Matched case-insensitively for `#1340`'s measured reason: a CAPITALISATION-
+# ONLY vendor change silently returned a throttled pane to `idle`, and the two
+# characters that remove that axis are free.
+_dialog_is_login() {
+    # ANCHORED TO THE BOTTOM 20 NON-BLANK ROWS, not the whole pane (skeptic
+    # w237sk F7). Disjunct (a) is a bare `Login` row, and over the whole pane
+    # that matched a `Login` row anywhere in the TRANSCRIPT — measured: the
+    # unnamed-dialog fixture plus one transcript row `Login` produced
+    # `overlay=login auth=login`. A dialog occupies the bottom of the pane
+    # because it REPLACES the REPL, so the bottom rows are where its own text
+    # is; 20 is chosen to clear the longest frame measured (the code-paste step
+    # runs ~13 non-blank rows including a four-line wrapped URL).
+    #
+    # `_bottom_rows` strips blanks BEFORE bounding, for `#568`'s measured reason:
+    # under the fullscreen renderer the gap above the dialog is blank padding, so
+    # a raw `tail` would count padding as rows.
+    #
+    # Post-F1 the cost of a false positive here is the LABEL only — the hold
+    # keys on `state=blocked`, so a mis-named dialog is still held and the
+    # notification says the kind is unknown. That is why this is an anchoring
+    # improvement rather than a correctness fix.
+    local region
+    region=$(_bottom_rows "$1" 20)
+    grep -qiE '^[[:space:]]*Login[[:space:]]*$' <<<"$region" && return 0
+    grep -qiF 'Select login method:' <<<"$region" && return 0
+    grep -qiF 'How do you want to sign in?' <<<"$region" && return 0
+    # (d) THE CODE-PASTE / BROWSER-AUTH STEP, added for w237sk F2 and the reason
+    # it is its own disjunct rather than folded into (a): it is the screen where
+    # a stray paste is WORST — the emit body lands in the auth-code field and the
+    # trailing Enter SUBMITS it, failing the login outright — and it is the one
+    # the menu-frame gate could never reach. Measured on the LIVE 2.1.268 pane:
+    #
+    #     Login
+    #     Browser didn't open? Use the url below to sign in (c to copy)
+    #     https://claude.com/cai/oauth/authorize?...
+    #     Hold Shift while selecting to use your terminal's native copy
+    #     Paste code here if prompted >
+    #     Esc to cancel
+    #
+    #     state=empty   <- NOT `blocked`: no `❯ ` option rows, so
+    #                      `_has_menu_dialog_frame` declines and the whole
+    #                      `_has_blocked_overlay` chain never reaches the namer
+    #
+    # So `state=` does not cover it and `auth=login` must. Two literals, either
+    # sufficient, both the harness's.
+    grep -qiF 'Paste code here if prompted' <<<"$region" && return 0
+    grep -qiF 'Use the url below to sign in' <<<"$region"
+}
+
+# THE AUTH FAILURE — the orchestrator is LOGGED OUT and says so
+# (your-org/nexus-code#1518, the pane-surface half of `#1517`).
+#
+# `#1517` measured 45 h of `Login expired · Please run /login` drawing 8
+# resubmits and 10 false `recovered` lines, and listed under *What is NOT
+# determined*: "Whether `pane-state.sh` or any other surface shows the
+# `Login expired` state. Not checked." It does not. Measured at 2.1.268,
+# mid-retry and then terminal once retries exhaust:
+#
+#   ✻ 401 OAuth token has expired. Please obtain a new token or refresh your …
+#     existing to… · Retrying in 16s · attempt 6/10
+#
+#   ● Please run /login · API Error: 401 OAuth token has expired. Please obtain
+#     a new token or refresh your existing token.
+#   ✻ Cooked for 0s · done 1:49 AM
+#
+# BOTH classify `state=idle active=0 input=blank`. There is no token counter and
+# no `esc to interrupt`, so neither `_detect_busy` nor `_detect_throttled` fires
+# — and `idle` is on `_bookkeeping.sh`'s KILL allowlist and is the canonical
+# paste-me state. Fixtures: `auth-expired-retrying-realmodel-268.ansi`,
+# `auth-expired-terminal-realmodel-268.ansi`.
+#
+# WHAT THIS FIELD IS FOR, AND WHAT IT IS NOT FOR. It does NOT hold the emit.
+# Pasting into a logged-out but idle REPL is harmless — the text lands in the
+# input box and at worst errors again — and the operator NEEDS the board state
+# waiting for them when they log back in. What `#1517` cost was the RESUBMIT
+# STORM and the false `recovered`: remedies that cannot work, reported as
+# working. So `auth=expired` gates `orchestrator-liveness` (no resubmit, no
+# respawn, and the word `auth` in the log, which `#1517` found absent from all
+# 1,648 lines) and fires one `sandbox-notify`. The emit HOLD is `auth=login`'s
+# job, on the `blocked` dialog, which is a different surface with a different
+# hazard.
+#
+# That split is what keeps this detector's error costs small, and it is worth
+# stating because the obvious design — one "login detector", one hold — makes
+# both directions expensive. Here a MISS returns us to `#1517` exactly and an
+# OVER-FIRE costs a redundant notification plus a liveness remedy declined for
+# one cycle.
+#
+# FAILURE DIRECTION, STATED PLAINLY AND IT IS NOT SAFE. `state=idle` is what
+# this pane reads, so unlike `_dialog_is_login` above there is NO structural
+# fallback underneath these strings: if they rot, the detector returns `none`
+# and `#1517`'s behaviour comes straight back. No claim is made that it fails
+# safe. The mitigation is breadth — three independent disjuncts, one per
+# measured render, any ONE sufficient — plus the entry on the collision list
+# `skills/nexus.cc-update/GUIDE.md` checks before a pin bump, beside `#1340`'s
+# `/low-priority` strings. Both string sets are the HARNESS's, not ours.
+#
+#   (a) `Please run /login`      — the terminal render, and `#1517`'s own text.
+#   (b) `Login expired`          — `#1517`'s transcript wording.
+#   (c) `401` + `token has expired` ON ONE ROW — the mid-retry render, whose
+#       text is the API's rather than the TUI's, so it rots on a different
+#       schedule. Both tokens required on the same row: `401` alone matches a
+#       transcript discussing HTTP, and `token has expired` alone matches an
+#       agent reading this comment.
+#
+# BOUNDED TO THE BOTTOM 15 NON-BLANK ROWS, via `_bottom_rows` and for `#568`'s
+# measured reason: a raw `tail` conflates the last rows of CONTENT with the last
+# rows of the GRID, and under the fullscreen renderer the gap above the input
+# box is blank padding — in the terminal fixture the auth row is 29 GRID rows
+# above the prompt and 6 CONTENT rows above it. The bound is also what keeps
+# this from going STICKY: the error is a transcript row, so without a bound an
+# hour-old failure the operator has already fixed would keep asserting
+# `auth=expired` out of scrollback. 15 matches `_detect_over_limit`'s window,
+# which is the already-exercised number rather than a fresh guess.
+_detect_auth_expired() {
+    local plain="$1" bottom
+    bottom=$(_bottom_rows "$plain" 15)
+    grep -qiF 'please run /login' <<<"$bottom" && return 0
+    grep -qiF 'login expired' <<<"$bottom" && return 0
+    grep -qiE '401.*token has expired|token has expired.*401' <<<"$bottom"
 }
 
 # Bypass Permissions warning modal (your-org/nexus-code#768).
@@ -1005,6 +1320,16 @@ _bottom_rows() {
     grep -v '^[[:space:]]*$' <<<"$1" | tail -n "${2:-15}"
 }
 
+# THE banner pattern. ONE definition, shared by the detector and by
+# `_over_limit_after_banner` (your-org/nexus-code#1171 R2-A).
+#
+# It was briefly two: the positional gate added for #1155 residual 1 carried its
+# own near-copy inside an `awk` program. Two patterns for one concept is the
+# #1143 defect this PR is about, and it bit immediately — see the AWK note below.
+# A second definition does not have to DRIFT to be wrong; it only has to be
+# evaluated by a different engine.
+_OVER_LIMIT_BANNER_RE='^[[:space:]]*(● API Error: Request rejected \([0-9]+\)[[:space:]]*·[[:space:]]*)?You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit[[:space:]]*(·[[:space:]]*)?resets[[:space:]]+[^[:space:]]'
+
 _detect_over_limit() {
     local plain="$1" bottom
     bottom=$(_bottom_rows "$plain" 15)
@@ -1016,8 +1341,75 @@ _detect_over_limit() {
     # folded onto the same line. The `·` separators are the literal
     # U+00B7 middot the TUI paints; the class after each keeps spacing
     # lenient without loosening adjacency.
-    grep -qE "^[[:space:]]*(● API Error: Request rejected \([0-9]+\)[[:space:]]*·[[:space:]]*)?You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit[[:space:]]*(·[[:space:]]*)?resets[[:space:]]+[^[:space:]]" <<<"$bottom" || return 1
+    grep -qE "$_OVER_LIMIT_BANNER_RE" <<<"$bottom" || return 1
     return 0
+}
+
+# The bottom rows that come AFTER the over-limit banner.
+#
+# your-org/nexus-code#1155 residual 1 releases the banner when the same capture
+# also shows live activity. WHICH SIDE of the banner that activity sits on is
+# the whole discrimination, and getting it wrong is a measured regression rather
+# than a theoretical one (`#1171` skeptic finding 3): a STALE `↓ N tokens` line
+# left ABOVE the banner by the turn that hit the limit flipped a genuinely
+# suspended pane from `over-limit` to `busy`. That pane is then never stamped
+# and never enters the resume path — the failure the subsystem exists to
+# prevent, arrived at from the other direction.
+#
+# Text painted BELOW the banner was painted AFTER it, so it is evidence the
+# session kept working. Text above it is the turn that hit the limit. Anchored
+# on the LAST banner match, so a banner quoted earlier in scrollback cannot
+# widen the window. Emits nothing when the banner is the final non-blank row —
+# a quiet suspended pane, which must hold.
+#
+# NOT `awk`, AND THAT IS MEASURED RATHER THAN STYLISTIC (#1171 R2-A). This
+# function first carried its own copy of the banner regex inside an awk program,
+# and it did not survive `mawk` — the default `awk` on Debian/Ubuntu, which any
+# operator cloning this repo may have.
+#
+# THE BOUNDARY, reproduced on this host (mawk 1.3.4 vs gawk 4.1.4). A counted
+# group PRECEDED BY A LITERAL, matching exactly ONE repetition whose token is
+# THREE OR MORE characters:
+#
+#     your ([[:alnum:]-]+ ){0,2}limit
+#       "your a limit"       mawk YES   gawk YES
+#       "your aa limit"      mawk YES   gawk YES
+#       "your aaa limit"     mawk NO    gawk YES     <- diverges
+#       "your weekly limit"  mawk NO    gawk YES     <- the production banner
+#     control, no preceding literal:
+#       ([[:alnum:]-]+ ){0,2}limit  on the same line -> mawk YES
+#
+# NO ENGINE-INTERNAL CAUSE IS CLAIMED; the reproducer is the finding. Two tidier
+# rules were tested and REFUTED: it is not "mawk lacks intervals" (`{1,2}` and
+# `{1,1}` behave the same, and 1- and 2-character tokens match fine), and it is
+# not the POSIX class or the dash (`[a-z]+` diverges identically).
+#
+# THAT MATTERS FOR THE FIX. Reading the first, broader explanation one might
+# reach for `mawk -W repetitions` or a different character-class spelling; the
+# divergence survives both. This remedy does not depend on the mechanism being
+# right, because it removes awk from banner recognition entirely.
+#
+# WHY THE GUARD COULD NOT SEE IT. `hit your limit` needs ZERO repetitions, so
+# the PLAIN banner matches under both engines. End to end, the WEEKLY banner with
+# a stale counter above it read `over-limit` under gawk and `busy` under mawk — a
+# real suspension never stamped and never resumed — while the single fixture then
+# exercising this path used the PLAIN form. Green under both awks, correct under
+# one. `over-limit-weekly-*` and `busy-overlimit-weekly-*` fixtures now pin both
+# arms.
+#
+# The remedy is not a relaxed second regex, it is NO second regex:
+# `_OVER_LIMIT_BANNER_RE` is now matched by the same `grep -E` engine that the
+# detector uses, so the two cannot disagree about what a banner is — by
+# construction rather than by both being written carefully.
+_over_limit_after_banner() {
+    local plain="$1" bottom last
+    bottom=$(_bottom_rows "$plain" 15)
+    # LAST match, so a banner quoted earlier in scrollback cannot widen the
+    # window. `grep` exiting 1 (no banner) leaves `last` empty and we emit
+    # nothing, which the caller reads as "no post-banner activity".
+    last=$(printf '%s\n' "$bottom" | grep -nE "$_OVER_LIMIT_BANNER_RE" | tail -1 | cut -d: -f1)
+    [[ "$last" =~ ^[0-9]+$ ]] || return 0
+    printf '%s\n' "$bottom" | tail -n +"$(( last + 1 ))"
 }
 
 # Extract a single-token reset_at value from the canonical notice.
@@ -1043,6 +1435,39 @@ _extract_over_limit_reset() {
               | sed -E 's/[[:space:]]*·.*$//; s/^resets[[:space:]]+//; s/[[:space:]]+$//')
     [[ -n "$raw" ]] || return 1
     raw=$(printf '%s' "$raw" | tr -d '()' | tr -s '[:space:]' '_' | sed 's/_*$//')
+    raw="${raw:0:40}"
+    [[ -n "$raw" ]] || return 1
+    printf '%s' "$raw"
+}
+
+# Extract WHICH LIMIT the banner names — the words the banner itself puts
+# between "your" and "limit" (your-org/nexus-code#1488).
+#
+# THE DEFECT THIS CLOSES. The banner regex has always CAPTURED this
+# (`your ([[:alnum:]-]+ ){0,2}limit`) and every consumer then DISCARDED it and
+# said "Opus". Measured 2026-09-07: a worker hit its FABLE limit, the watcher
+# classified it as "weekly Opus limit hit", scheduled a resume against an Opus
+# reset, and pasted a resume brief naming Opus. The worker was refused again on
+# arrival — 2 resume pastes, 3 rejections — and nothing in that path read the
+# pane message that names the real limit, so it could not learn from the
+# refusal.
+#
+# The model tier is not a constant of this codebase. It is written on the
+# screen, in the same row the detector already matched, and the honest thing is
+# to read it.
+#
+# Output: the flavour with whitespace collapsed to `_` (e.g. `weekly_Opus`,
+# `weekly_Fable`), or rc 1 and empty stdout when the banner names no flavour
+# ("You've hit your limit") — the caller substitutes `unknown`, which renders
+# as "usage" rather than as a model name nobody measured.
+_extract_over_limit_flavour() {
+    local plain="$1" bottom raw
+    bottom=$(_bottom_rows "$plain" 15)
+    raw=$(grep -oE 'You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit' <<<"$bottom" \
+              | tail -1 \
+              | sed -E 's/^You.{0,3}ve (hit|reached) your[[:space:]]*//; s/[[:space:]]*limit$//')
+    [[ -n "$raw" ]] || return 1
+    raw=$(printf '%s' "$raw" | tr -s '[:space:]' '_' | sed 's/_*$//')
     raw="${raw:0:40}"
     [[ -n "$raw" ]] || return 1
     printf '%s' "$raw"
@@ -1309,23 +1734,128 @@ _detect_user_typing() {
     grep -qP $'\x1b\\[38;5;231m' <<<"$input_row"
 }
 
-_detect_busy() {
-    # Active token counter (`↓ 15.2k tokens`, `↑ 480 tokens`) on the
-    # spinner row indicates the agent is mid-step. The idle banner
-    # uses a past-tense form (`✻ Brewed for 34m 45s`) with no token
-    # counter, so absence of this counter = idle.
-    #
-    # Constraint: scan only the 10 lines immediately preceding the
-    # input row. The captured scrollback often holds older
-    # `Cogitating… ↓ 5.7k tokens` lines from past steps that have
-    # since finished — they would false-trigger if we scanned the
-    # whole pane.
+# The 10-row slice immediately preceding the input row — the only region in
+# which spinner chrome is evidence about the CURRENT turn. The captured
+# scrollback often holds older `Cogitating… ↓ 5.7k tokens` lines from past
+# steps that have since finished; they would false-trigger if we scanned the
+# whole pane. Shared by every in-flight detector below so they cannot drift
+# apart about what "the spinner row" means.
+_pane_spinner_window() {
     local plain="$1" input_ln="$2"
     local start=$(( input_ln - 10 ))
     (( start < 1 )) && start=1
+    awk -v s="$start" -v e="$input_ln" 'NR>=s && NR<=e' <<<"$plain"
+}
+
+# A turn is IN FLIGHT but generating no tokens because the harness has
+# THROTTLED it — Claude Code's `/low-priority` mode
+# (your-org/nexus-code#1340). Measured on this board, two windows
+# independently, 2026-09-02:
+#
+#     ✻ Working at lower priority · waiting for capacity · next try in 3s · attempt 2 · esc to interrupt
+#     pane-state: state=idle active=0 window=5 name=wskl input=blank
+#
+# The worker is mid-turn with a retry counter visibly incrementing, and it
+# read `idle` — which `_bookkeeping.sh:bk_pane_kill_authorized` AUTHORISES a
+# kill on. That is the 2026-06-15 live-worker-retirement class arriving
+# through a NEW HARNESS CAPABILITY rather than through a hand-copied state
+# list: `_detect_busy`'s token counter is a PROXY for "a turn is running",
+# and `/low-priority` is the first regime in which the proxy and the
+# property come apart — a throttled turn is precisely the one not
+# generating.
+#
+# TWO CONDITIONS, both required, and each is holding off a different error:
+#
+#   (1) THE INTERRUPT AFFORDANCE, `esc to interrupt`, in the spinner window.
+#       This is the harness's own "a turn is running and you may stop it"
+#       chrome; it is what makes the row LIVE rather than QUOTED. Note the
+#       measurement recorded at `_has_menu_dialog_frame` condition (a): a
+#       live BUSY pane at 2.1.224 contains ZERO occurrences of `esc to …`,
+#       the row being `✻ Smooshing… (16s · ↓ 3 tokens)`. So this string is
+#       not a general busy marker on which the token counter is redundant —
+#       it is chrome the throttled render adds, which is why detecting the
+#       throttle needs its own arm rather than a widened token regex.
+#
+#   (2) THE CONDITION PHRASE, `waiting for capacity` or `lower priority`.
+#       Without it, (1) alone would fire on any pane quoting a spinner.
+#
+# NOT REQUIRED, deliberately: the `attempt N` / `next try in Ns` counter.
+# It is the most specific thing on the row and the most tempting key, and
+# keying on it would MISS the first attempt — the window before any retry
+# has happened, which is active and would read `idle`. A detector that
+# covers the retries and not the first attempt is the silent-zero shape:
+# it would look thoroughly tested and leave the opening case exposed.
+#
+# FAILURE DIRECTIONS, stated because both are real and they are not
+# symmetric:
+#
+#   * MISS (a throttled pane still reads `idle`)  → a live worker is
+#     kill-authorised. This is the hazard the whole entry exists for.
+#   * OVER-FIRE (a quiet pane reads `busy`)       → the window-cleanup loop
+#     declines to retire it and no follow-up paste is sent. Recoverable,
+#     and it clears the moment anything else paints.
+#
+# The reachable over-fire is a pane whose last 10 rows before the prompt
+# QUOTE both conditions — an agent displaying this very issue. Its cost is
+# a wedge, not a kill, and `idle-empty-synthetic.ansi` is the standing
+# negative control that a quiet pane is untouched.
+#
+# CC-VERSION-SENSITIVE: both strings are the HARNESS's, not ours. A reword
+# upstream returns this pane to `idle`, which is the dangerous direction —
+# so this belongs on the collision list `skills/nexus.cc-update/GUIDE.md`
+# checks before a pin bump.
+#
+# BOTH MATCHES ARE CASE-INSENSITIVE, and that is not cosmetic. The first cut
+# used `grep -qF` / `grep -qE`, and a CAPITALISATION-ONLY change to the vendor
+# render — `Waiting For Capacity`, `Esc to Interrupt`, nothing else altered —
+# put the pane back to `idle`, i.e. back to KILL-AUTHORISED. Measured, that one
+# variant end-to-end through the real authorizer:
+#
+#   esc to interrupt … waiting for capacity   -> busy  -> REFUSED
+#   Esc to Interrupt … Waiting For Capacity   -> idle  -> KILL AUTHORIZED
+#
+# A fix that a vendor capitalisation silently undoes has not closed the hazard,
+# it has postponed it — and the failure is invisible, because the pane simply
+# goes back to reading retirable. `-i` costs two characters and removes the
+# whole axis. `throttled-low-priority-capitalised-synthetic.ansi` pins it.
+#
+# NO COLLISION with `_has_menu_dialog_frame`'s deliberately case-SENSITIVE
+# footer test: that arm keys on `(Enter|Esc) to [a-z]` to separate overlay
+# chrome from a spinner hint, and this one additionally requires the word
+# `interrupt` plus a condition phrase, which no confirm/cancel footer carries.
+_detect_throttled() {
+    local plain="$1" input_ln="$2"
     local window
-    window=$(awk -v s="$start" -v e="$input_ln" 'NR>=s && NR<=e' <<<"$plain")
-    grep -qE '[↓↑] +[0-9]+(\.[0-9]+)?[kKmM]? +tokens' <<<"$window"
+    window=$(_pane_spinner_window "$plain" "$input_ln")
+    grep -qiF 'esc to interrupt' <<<"$window" || return 1
+    grep -qiE 'waiting for capacity|lower priority' <<<"$window"
+}
+
+_detect_busy() {
+    # POSITIVE EVIDENCE THAT A TURN IS IN FLIGHT. Two forms, and the second
+    # exists because the first is a proxy that `/low-priority` broke:
+    #
+    #   (a) an active token counter (`↓ 15.2k tokens`, `↑ 480 tokens`) on the
+    #       spinner row. The idle banner uses a past-tense form
+    #       (`✻ Brewed for 34m 45s`) with no token counter, so absence of
+    #       this counter used to mean idle;
+    #   (b) the THROTTLED-RETRY chrome — a turn that is running and
+    #       deliberately not generating (your-org/nexus-code#1340). See
+    #       `_detect_throttled` for the measurement and the failure
+    #       directions.
+    #
+    # The disjunction lives HERE, in the shared predicate, rather than at the
+    # call sites: `_detect_busy` has four callers — the menu-dialog frame's
+    # condition (d), the over-limit contradiction, the no-input-row ladder and
+    # the main decision — and every one of them is asking the same question,
+    # "is this pane demonstrably working". Adding the arm at one call site
+    # would have fixed the reported symptom and left three doors open, which
+    # is this repo's recurring shape.
+    local plain="$1" input_ln="$2"
+    local window
+    window=$(_pane_spinner_window "$plain" "$input_ln")
+    grep -qE '[↓↑] +[0-9]+(\.[0-9]+)?[kKmM]? +tokens' <<<"$window" && return 0
+    _detect_throttled "$plain" "$input_ln"
 }
 
 _detect_queued_message() {
@@ -1486,29 +2016,152 @@ _detect_empty_input() {
 # inserts intermediate `bash` / `bash -c` layers between the pane's
 # top-level pid and the `claude` exec. Limited depth=6 to avoid runaway
 # walks on pathological trees.
+# _pid_runs_claude <pid> -> 0 = yes | 1 = no | 2 = COULD NOT DETERMINE
+#
+# IDENTITY, NOT NAME (your-org/nexus-code#908). This used to be a `case` on
+# `comm` against exactly `claude|claude-code`. `comm` is the INVOCATION NAME —
+# argv[0]'s basename, truncated to 15 chars — so it answers "what was this
+# called", never "what is this". The SAME shipped binary answers differently
+# depending only on the path that reached it:
+#
+#     via node_modules/.bin/claude (a symlink) -> comm=claude       MATCHED
+#     via .../claude-code/bin/claude.exe       -> comm=claude.exe   MISSED
+#
+# Measured on this host: 17 `claude`, 2 `claude.exe`, and
+# `readlink -f /proc/<pid>/exe` IDENTICAL for both —
+# `.../@anthropic-ai/claude-code/bin/claude.exe`. The kernel's answer is
+# invocation-independent; `comm` is not. So ask the kernel.
+#
+# WHY THIS MATTERED MORE THAN A MISSED MATCH. A pane booted by real path has
+# the live claude as its ROOT process and therefore no descendants — so the
+# name miss at step (3) of `_absent_or_unknown_reason` fell through (4) with an
+# empty tree, passed (5) because `ps` genuinely works, and past the boot grace
+# resolved to `tree-empty-past-grace` = **absent**, the ONE kill-authorising
+# state. The ladder is sound and every conjunct was satisfied; it was fed a
+# wrong answer by a name comparison made before the walk began. A default-deny
+# gate is only as good as the classifier feeding it.
+#
+# ADDING `claude.exe` TO THE `case` WOULD BE THE SAME BUG ONE STRING WIDER
+# (`#915`), so the name test survives only as a FALLBACK for when the kernel
+# will not answer.
+#
+# WHAT THE FALLBACK RETURNS, AND THE RESIDUE IT LEAVES — stated here because an
+# earlier revision of this header promised the OTHER design ("a fallback that
+# cannot see returns 2 rather than no"), which is not what the code below does.
+# Prose documenting the safer behaviour while the code does something else is
+# this board's most common defect, and it is worse than silence because it
+# stops the next reader checking. So, precisely:
+#
+#   (b) returns 1 — "not claude" — for a pid whose exe link is unreadable but
+#       whose `comm` IS readable and does not match. That is a real negative
+#       observation, not an unanswerable question, and it is DELIBERATE.
+#   (c) returns 2 — genuinely unknown — only when NEITHER the exe link NOR
+#       `comm` will say anything and the pid still exists.
+#
+# WHY NOT RETURN 2 AT (b). The ladder DECLINES on 2, so widening 2 to cover
+# every unreadable-exe pid would make an ordinary process indeterminate on any
+# host where /proc is restricted — and `absent` would then never be reached
+# again. That trades `#908`'s false-DEAD for a permanent false-ALIVE that never
+# self-clears, which is the same trade the first draft of this function already
+# got wrong once with exited pids. A stated, bounded residue beats a live
+# regression across every ordinary walk.
+#
+# THE RESIDUE, NAMED: a LIVE agent whose `/proc/<pid>/exe` is unreadable AND
+# whose `comm` is not claude-shaped reads "not claude". Measured unreachable
+# here rather than argued: every visible process runs as the same uid, and a
+# process in a sibling PID namespace (we run inside bwrap) has no `/proc` entry
+# to walk at all — it is structurally unobservable, not merely absent. If this
+# ever runs somewhere those hold differently, THIS is the line to revisit.
+_pid_runs_claude() {
+    local pid="$1" exe comm
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 2
+    # (a) The kernel's own answer. Resolves the .bin symlink, so both
+    #     invocation styles land on the same real path.
+    # RAW `readlink`, NOT `readlink -f` (your-org/nexus-code#908 F1). A binary
+    # DELETED IN PLACE leaves `/proc/<pid>/exe` reading `<path> (deleted)`, and
+    # `readlink -f` cannot resolve that — it returns EMPTY, the identity test
+    # silently degrades to the name fallback, and the ladder answers `absent`.
+    # MEASURED: a live process whose binary was unlinked answered "not claude"
+    # and `_absent_evidence` returned `tree-empty-past-grace`. That is `#908`
+    # reopened through a different door, inside the fix for `#908` — and it is
+    # not exotic: an in-place upgrade puts EVERY live worker in this state at
+    # once (this host runs 2.1.224 with 2.1.232 available).
+    #
+    # NOT SOLVED BY device:inode, which is the tempting "compare the file, not
+    # the string" answer: an unlinked inode matches no on-disk file, so an
+    # inode test fails in exactly the upgrade case that makes this reachable.
+    # The kernel's suffix is a documented, stable part of the interface; strip
+    # it and match the path it decorates.
+    raw=$(readlink "/proc/$pid/exe" 2>/dev/null)
+    if [[ -n "$raw" ]]; then
+        exe="${raw% (deleted)}"
+        case "$exe" in
+            */@anthropic-ai/claude-code/*) return 0 ;;
+        esac
+        # A candidate installed outside node_modules — cc-harness stages one
+        # into a throwaway prefix (`gate.sh` sets CLAUDE_BIN to it), which is
+        # exactly the shape that produced `comm=claude.exe`.
+        case "${exe##*/}" in
+            claude|claude-code|claude.exe) return 0 ;;
+        esac
+        # An exe we could read but not classify still gets the NAME as a second
+        # chance rather than an immediate "no": on the kill axis a missed
+        # identity costs a destroyed worker, a spurious one costs a stranded
+        # slot, so the tie breaks toward "alive".
+    fi
+    # (b) No exe link. A ZOMBIE has none by construction (it has exited; only
+    #     the unreaped table entry lingers) and so does a pid whose /proc this
+    #     process may not read. Opposite meanings, identical symptom — so fall
+    #     back to the name, and let the caller apply the zombie test.
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]')
+    if [[ -n "$comm" ]]; then
+        case "$comm" in
+            claude|claude-code|claude.exe) return 0 ;;
+        esac
+        return 1
+    fi
+    # (c) Neither /proc nor ps would say anything about this pid. TWO CAUSES
+    #     WITH OPPOSITE MEANINGS, and conflating them was a defect in the first
+    #     draft of this fix: a pid that EXITED between the tree walk and this
+    #     lookup is simply GONE (it is not a live claude, and saying so is a
+    #     real observation), while a pid that still EXISTS but will not be read
+    #     is genuinely indeterminate. Measured: transient children exit mid-walk
+    #     constantly, so treating (c) as indeterminate wholesale made an
+    #     ordinary `zsh` tree report indeterminate and would have turned every
+    #     `absent` into a permanent `unknown` — trading #908's false-dead for a
+    #     false-alive that never self-clears.
+    kill -0 "$pid" 2>/dev/null || return 1
+    return 2
+}
+
+# Walk the pane's process tree for a live claude. Returns 0 if one is found.
+# Sets `_PHLC_INDETERMINATE=1` when any pid in the tree could not be
+# identified, so the caller can decline to assert death rather than reading an
+# unanswerable question as a negative observation.
 _pane_has_live_claude() {
     local pane_pid="$1"
+    _PHLC_INDETERMINATE=0
     [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 1
-    command -v pgrep >/dev/null 2>&1 || return 1
+    command -v pgrep >/dev/null 2>&1 || { _PHLC_INDETERMINATE=1; return 1; }
     local depth queue next pid
     queue="$pane_pid"
     for depth in 0 1 2 3 4 5; do
         [[ -n "$queue" ]] || return 1
-        # If any pid in this layer IS itself a claude, we're done —
-        # unless it's a zombie. A zombie claude has EXITED (only the
-        # unreaped table entry lingers, e.g. while tmux is slow to
-        # collect a remain-on-exit pane's child); counting it as live
-        # would hold the pane out of `absent` for as long as the reap
-        # is delayed, exactly the stale-bytes failure this gate exists
-        # to prevent.
+        # If any pid in this layer IS itself a claude, we're done — unless it's
+        # a zombie. A zombie claude has EXITED (only the unreaped table entry
+        # lingers, e.g. while tmux is slow to collect a remain-on-exit pane's
+        # child); counting it as live would hold the pane out of `absent` for
+        # as long as the reap is delayed, exactly the stale-bytes failure this
+        # gate exists to prevent.
         for pid in $queue; do
-            local comm pstate
-            comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]')
-            case "$comm" in
-                claude|claude-code)
+            local pstate _rc
+            _pid_runs_claude "$pid"; _rc=$?
+            case "$_rc" in
+                0)
                     pstate=$(ps -o state= -p "$pid" 2>/dev/null | tr -d '[:space:]')
                     [[ "$pstate" == Z* ]] || return 0
                     ;;
+                2) _PHLC_INDETERMINATE=1 ;;
             esac
         done
         next=""
@@ -1893,17 +2546,162 @@ if (( ${mcp_risk_only:-0} )); then
     exit 0
 fi
 
+# ---- async-run liveness: ESTABLISH, do not infer (nexus-code#1208) --------
+#
+# `_pane_background_shells` below counts a shell child of claude as work in
+# flight. That is an INFERENCE from a proxy ("a shell exists"), and it is wrong
+# for the single most common background-shell shape in this workspace: the wait
+# wrapper an agent leaves behind around an `async-run` job.
+#
+#     T=<state>/async-run/<window>/<token>
+#     until [ -s "$T/status" ]; do sleep 60; done
+#
+# When that job is SIGKILLed it writes no status file BY CONSTRUCTION, so the
+# `until` loop waits forever. `pane-state` then reports `working-background`
+# and `retire-preflight` — correctly default-deny — refuses to retire the
+# window, with NO FUTURE EVENT LEFT TO ARRIVE. Measured 2026-08-30 on window
+# `olayingestsk2`, token `ar-abdb92e13667`, killed ~3h earlier.
+#
+# ── WHY THIS CALLS OUT INSTEAD OF REIMPLEMENTING ────────────────────────
+#
+# `async-run.sh` ALREADY owns the authoritative three-verdict model —
+# `terminal` / `running` / `died` — including the pid-IDENTITY check (pid
+# alive AND `/proc` start-time matching) that stops a recycled pid reading as
+# a confident `running`. #1208 is precisely the failure of ONE fact having TWO
+# answerers, where the second answerer is the one every consumer reads. Growing
+# a second `died` detector here would reproduce the defect inside its own fix,
+# so this asks the existing authority.
+# How many async-run jobs one background-shell root may name before the walk
+# stops trying to resolve it. Exceeding this makes the root NOT stale, never
+# stale — the cap bounds work, it must never manufacture a retirement.
+_PANE_ASYNCRUN_MAX_REFS="${NEXUS_PANE_ASYNCRUN_MAX_REFS:-16}"
+[[ "$_PANE_ASYNCRUN_MAX_REFS" =~ ^[0-9]+$ ]] && (( _PANE_ASYNCRUN_MAX_REFS > 0 )) \
+    || _PANE_ASYNCRUN_MAX_REFS=16
+
+_pane_asyncrun_refs() {
+    local c="${1:-}" rest out="" re
+    # Read the cap DEFENSIVELY rather than relying on the file-scope
+    # assignment: these helpers are lifted out by name and sourced in
+    # isolation by test-pane-state-asyncrun-liveness.sh, and a bare
+    # reference would be an unset-variable error there under `set -u` —
+    # i.e. the instrument would fail for a reason that has nothing to do
+    # with the property under test.
+    local cap="${_PANE_ASYNCRUN_MAX_REFS:-16}"
+    [[ "$cap" =~ ^[0-9]+$ ]] && (( cap > 0 )) || cap=16
+    # Bash-native, no subprocess: this runs inside the /proc walk on the
+    # watcher's hot path, and it must not depend on any PATH-resolved `grep`.
+    re='(/[^[:space:]"'"'"']*/async-run/[A-Za-z0-9._@:+-]+/ar-[0-9a-f]+)'
+    rest="$c"
+    # Hard iteration bound. `rest` provably shrinks each pass (the match is
+    # non-empty by construction), so this cannot spin — but this runs on the
+    # watcher's hot path inside a /proc walk, and a loop whose termination
+    # rests on a regex being non-empty is one edit away from not terminating.
+    local guard=0
+    while [[ "$rest" =~ $re ]]; do
+        out+="${BASH_REMATCH[1]}"$'\n'
+        rest="${rest#*"${BASH_REMATCH[1]}"}"
+        guard=$(( guard + 1 ))
+        if (( guard >= cap )); then
+            # TRUNCATION MUST DISQUALIFY, and this is not a nicety — it is the
+            # #1208 defect class reappearing inside its own fix, and the
+            # differential cap case in
+            # test-pane-state-asyncrun-liveness.sh caught it.
+            #
+            # Staleness requires EVERY ref under a root to be `died`. So
+            # silently dropping refs can only make a root MORE likely to be
+            # called stale: the ref that would have been `running` is the one
+            # that never gets looked at. A bound that quietly shortens the
+            # evidence therefore fails toward RETIRING LIVE WORK — the exact
+            # direction everything else here is built to avoid.
+            #
+            # Emitting a sentinel keeps the disqualification in the SAME
+            # channel as the evidence, so no caller can forget to ask: it is
+            # not a valid ref, `_pane_asyncrun_ref_is_died` refuses it like
+            # any other unresolvable input, and the root drops out.
+            out+='!truncated'$'\n'
+            break
+        fi
+    done
+    printf '%s' "$out"
+}
+
+# rc 0 ⇒ THE AUTHORITY POSITIVELY SAYS `died`: the pid is gone AND no status
+# file was written, so no future event can clear it. EVERY other outcome
+# returns rc 1 — `running`, `terminal`, `unknown`, an unparseable line, a
+# missing/non-executable `async-run.sh`, a timeout, a ref whose window or
+# state dir cannot be derived. rc 1 means "NOT ESTABLISHED DEAD", which leaves
+# the caller's pre-#1208 live verdict exactly as it was. Default-DENY: the only
+# way to lose the `working-background` exemption is a positive `died`.
+_pane_asyncrun_ref_is_died() {
+    local ref="${1:-}" tok win sd ar line
+    tok="${ref##*/}"
+    win="${ref%/*}"; win="${win##*/}"
+    sd="${ref%/async-run/*}"
+    [[ "$tok" == ar-* ]] || return 1
+    [[ -n "$win" && -n "$sd" && "$sd" != "$ref" ]] || return 1
+    ar="$_PS_SCRIPT_DIR/async-run.sh"
+    [[ -x "$ar" ]] || return 1
+    line=$(NEXUS_WORKER_WINDOW="$win" NEXUS_STATE_DIR="$sd" \
+             timeout 5 "$ar" --status-line "$tok" 2>/dev/null) || return 1
+    # Compare the VERDICT WORD by equality, never a substring: the detail half
+    # of a `terminal` or `running` line is free text and could contain the
+    # word `died`.
+    [[ "${line%%|*}" == "died" ]]
+}
+
+# A background-shell root is STALE iff its own argv names at least one
+# async-run job, EVERY async-run job named anywhere in its subtree is
+# `died`, and the subtree contains nothing but shells and `sleep`.
+#
+# All three conjuncts are load-bearing, and each fails toward LIVE:
+#   * `died` alone is not enough — a root holding one dead and one RUNNING
+#     token is still doing work;
+#   * a token found only on a DESCENDANT does not make the root a wait
+#     wrapper, so the root's own argv must name one;
+#   * the comm allowlist (shell | sleep, default-DENY on anything else) is
+#     what stops a root that happens to wait on a dead token while a real
+#     child computes underneath it from being called finished. `sleep` is
+#     admitted because it is exactly what the `until … do sleep 60; done`
+#     loop forks, and nothing else.
 _pane_background_shells() {
-    local pane_pid="$1"
+    # $2 (optional): `<pid>:<start-ticks>` of ONE root to leave out of the
+    # census entirely — the longjob dispatcher's wrapper, as identified by
+    # `_pane_longjob_root` (bundle-2609sk2 F1). Skipped WHOLE: not counted, not
+    # a member, no cpu, not the oldest, never named, and its children are never
+    # enqueued — so every field below is about the work and nothing downstream
+    # subtracts. Keyed on pid AND start ticks, so a recycled pid is never
+    # skipped; empty → nothing skipped, the exact pre-existing walk.
+    local pane_pid="$1" excl="${2:-}"
     if ! [[ "$pane_pid" =~ ^[0-9]+$ ]] || ! command -v pgrep >/dev/null 2>&1; then
-        printf '0 0 0 0 0 -'; return 0
+        printf '0 0 0 0 0 0 0 - -'; return 0
     fi
     local total=0 count=0 proc_ok=0 claude_found=0
+    # MEMBERSHIP (your-org/nexus-code#1460): every pid this walk visits, keyed
+    # `pid:starttime` so a recycled pid is a different member. The watcher
+    # compares the digest across ticks — a `#1446` wedge has STATIC
+    # membership; a sequential driver blocked in wait() has children coming
+    # and going while its own CPU stays at zero, which is exactly the shape
+    # that made `bg_wedged` fire on every worker running the prescribed
+    # pre-push battery. Selected by ANCESTRY, never by argv: a cwd-relative
+    # grandchild carries no clone path, so a string match cannot see it.
+    local members=""
     # #590 bookkeeping, keyed on the ROOT pid of each background-shell subtree:
     #   infra_roots  space-delimited " pid " list of roots proven to be nexus
     #                protocol wait loops (matched anywhere in their subtree)
     #   root_descs   newline-delimited "<pid>\t<descriptor>" for every root
     local infra_roots=" " root_descs=""
+    # #1208 staleness bookkeeping, also keyed on the bg-shell subtree ROOT:
+    #   root_has_token  " pid " list of roots whose OWN argv names an async-run job
+    #   subtree_refs    newline "<root-pid>\t<async-run-ref>" for every ref found
+    #                   ANYWHERE in that root's subtree
+    #   alien_roots     " pid " list of roots with a descendant that is neither
+    #                   a shell nor `sleep` — default-DENY, never stale
+    local root_has_token=" " subtree_refs="" alien_roots=" "
+    # Restart-quiescence bookkeeping (see `bg_quiesce` in the header):
+    #   wait_roots   " pid " list of roots whose OWN eval'd payload is, as a
+    #                whole, a nexus protocol wait loop (_pane_payload_is_pure_wait)
+    #   stale_roots  " pid " list of roots #1208 resolved as waiting on a died job
+    local wait_roots=" " stale_roots=" "
     # Oldest background-shell subtree ROOT start time, in clock ticks since
     # boot (`/proc/<pid>/stat` field 22). Converted to an epoch by the caller
     # side of this function. This is what makes the with-children episode age
@@ -1942,6 +2740,10 @@ _pane_background_shells() {
             # after[] is 0-indexed from `state`: utime=idx11, stime=idx12,
             # starttime (stat field 22) = idx19.
             local utime="${f[11]:-}" stime="${f[12]:-}" starttime="${f[19]:-}"
+            if [[ -n "$excl" && "$pid:${starttime:-?}" == "$excl" ]]; then
+                continue    # the dispatcher's root: neither it nor anything below it is visited
+            fi
+            members="${members}${pid}:${starttime:-?} "
             local is_shell=0 is_claude=0 in_bg=0
             # Shared predicate — see _pane_comm_is_shell. Kept in one place so
             # the MCP-config probe cannot certify a `command` this walk would
@@ -1977,12 +2779,62 @@ _pane_background_shells() {
                 # which would stop at the first argument) is what yields the
                 # whole command. A pid that exits mid-walk just yields empty.
                 local cmdl=""
-                cmdl=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | head -c 4096)
+                # GROUPED, and the ungrouped form 44 lines above at the
+                # `/proc/$pid/stat` read is the one that was already right —
+                # same function, same race, same author, opposite outcome
+                # (your-org/nexus-code#1305). Redirections are performed left
+                # to right, so `< "/proc/$pid/cmdline"` was attempted while
+                # stderr was still the terminal and the `2>/dev/null` took
+                # effect afterwards, on a command that never ran. Found by
+                # RUNNING the merged code on the live board, not by reading
+                # it: one ordinary orchestration command printed
+                # `line 2391: /proc/27901/cmdline: No such file or directory`.
+                cmdl=$( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null | head -c 4096)
                 if [[ -n "$cmdl" ]] && _pane_cmd_is_protocol_wait "$cmdl"; then
                     case "$infra_roots" in
                         *" $bgroot "*) : ;;
                         *) (( bgroot > 0 )) && infra_roots="${infra_roots}${bgroot} " ;;
                     esac
+                fi
+                # Restart quiescence: asked of the ROOT'S OWN argv only. A wait
+                # command found on a descendant says nothing about what the root
+                # runs before or after it.
+                if (( is_root == 1 )) && [[ -n "$cmdl" ]]; then
+                    local _payload
+                    if _payload=$(_pane_root_payload "$cmdl") \
+                       && _pane_payload_is_pure_wait "$_payload"; then
+                        wait_roots="${wait_roots}${pid} "
+                    fi
+                fi
+                # #1208: harvest every async-run ref this node names, attributed
+                # to the root that owns the subtree. A ref on the ROOT's own argv
+                # additionally marks the root as a candidate wait wrapper.
+                if [[ -n "$cmdl" ]] && (( bgroot > 0 )); then
+                    local _ref _refs
+                    _refs=$(_pane_asyncrun_refs "$cmdl")
+                    if [[ -n "$_refs" ]]; then
+                        while IFS= read -r _ref; do
+                            [[ -n "$_ref" ]] || continue
+                            subtree_refs+="${bgroot}"$'\t'"${_ref}"$'\n'
+                        done <<< "$_refs"
+                        if (( is_root == 1 )); then
+                            case "$root_has_token" in
+                                *" $bgroot "*) : ;;
+                                *) root_has_token="${root_has_token}${bgroot} " ;;
+                            esac
+                        fi
+                    fi
+                fi
+                # #1208 default-DENY: any DESCENDANT of a bg root that is
+                # neither a shell nor `sleep` is real work, and disqualifies
+                # that root from ever being called stale.
+                if (( is_root == 0 )); then
+                    if (( is_shell == 0 )) && [[ "$comm" != "sleep" ]]; then
+                        case "$alien_roots" in
+                            *" $bgroot "*) : ;;
+                            *) (( bgroot > 0 )) && alien_roots="${alien_roots}${bgroot} " ;;
+                        esac
+                    fi
                 fi
                 if (( is_root == 1 )); then
                     root_descs+="${pid}"$'\t'"$(_pane_cmd_descriptor "$comm" "$cmdl")"$'\n'
@@ -2016,6 +2868,41 @@ _pane_background_shells() {
     # preferred — that is the child an operator has to make a decision about;
     # naming an await loop while a stray `sbatch` hides behind it would defeat
     # the point of naming anything.
+    # #1208: resolve staleness AFTER the walk, so the (bounded, external)
+    # async-run calls happen at most once per candidate root and never for a
+    # root already disqualified by an alien descendant.
+    local stale=0 sr_root sr_ref
+    local cand cands="" seen_roots=" "
+    while IFS=$'\t' read -r sr_root sr_ref; do
+        [[ -n "$sr_root" ]] || continue
+        case "$root_has_token" in *" $sr_root "*) : ;; *) continue ;; esac
+        case "$alien_roots"    in *" $sr_root "*) continue ;; esac
+        case "$seen_roots"     in *" $sr_root "*) : ;;
+            *) seen_roots="${seen_roots}${sr_root} "; cands+="${sr_root} " ;;
+        esac
+    done <<< "$subtree_refs"
+    for cand in $cands; do
+        [[ "$cand" =~ ^[0-9]+$ ]] || continue
+        local all_died=1 resolved=0
+        local cap="${_PANE_ASYNCRUN_MAX_REFS:-16}"
+        [[ "$cap" =~ ^[0-9]+$ ]] && (( cap > 0 )) || cap=16
+        while IFS=$'\t' read -r sr_root sr_ref; do
+            [[ "$sr_root" == "$cand" ]] || continue
+            [[ -n "$sr_ref" ]] || continue
+            # Bound the external calls. Each is a `timeout 5` subprocess and
+            # the cmdline this came from can be 4 KB, so an argv naming many
+            # jobs could otherwise stall the walk for minutes. Exceeding the
+            # cap abandons the root as NOT stale — the same direction as every
+            # other thing we could not establish.
+            resolved=$(( resolved + 1 ))
+            if (( resolved > cap )); then all_died=0; break; fi
+            _pane_asyncrun_ref_is_died "$sr_ref" || { all_died=0; break; }
+        done <<< "$subtree_refs"
+        if (( all_died == 1 )); then
+            stale=$(( stale + 1 ))
+            stale_roots="${stale_roots}${cand} "
+        fi
+    done
     local infra=0 desc="-" first_infra_desc="" rp rd
     while IFS=$'\t' read -r rp rd; do
         [[ -n "$rp" ]] || continue
@@ -2029,8 +2916,159 @@ _pane_background_shells() {
     done <<< "$root_descs"
     [[ "$desc" == "-" && -n "$first_infra_desc" ]] && desc="$first_infra_desc"
     [[ -n "$desc" ]] || desc="-"
-    printf '%d %d %d %d %d %s' "$count" "$total" "$reliable" "$oldest_epoch" \
-        "$infra" "$desc"
+    # Restart quiescence, one count per ROOT (a union, so a root that is both a
+    # pure wait and #1208-stale is counted once). A pure wait with ANY descendant
+    # that is neither a shell nor `sleep` is NOT quiescent at this instant: that
+    # is a supervisor tick mid-flight at best and real work at worst, and one
+    # sample cannot tell them apart, so it errs toward "work in flight".
+    local quiesce=0
+    while IFS=$'\t' read -r rp rd; do
+        [[ -n "$rp" ]] || continue
+        case "$stale_roots" in *" $rp "*) quiesce=$(( quiesce + 1 )); continue ;; esac
+        case "$alien_roots" in *" $rp "*) continue ;; esac
+        case "$wait_roots"  in *" $rp "*) quiesce=$(( quiesce + 1 )) ;; esac
+    done <<< "$root_descs"
+    local members_digest="-"
+    if [[ -n "$members" ]]; then
+        members_digest=$(printf '%s\n' $members | sort | cksum | cut -d' ' -f1)
+        [[ "$members_digest" =~ ^[0-9]+$ ]] || members_digest="-"
+    fi
+    # Field 7 (quiesce) sits BEFORE members/desc so `desc`, which a `read` takes
+    # as the remainder, stays last.
+    printf '%d %d %d %d %d %d %d %s %s' "$count" "$total" "$reliable" "$oldest_epoch" \
+        "$infra" "$stale" "$quiesce" "$members_digest" "$desc"
+}
+
+# _pane_root_payload <cmdline> — the command a Claude Code tool/Monitor shell
+# was asked to run. Such a shell's argv is
+#     zsh -c source <snapshot> … && eval '<PAYLOAD>' < /dev/null && pwd …
+# with every `'` inside PAYLOAD written as `'\''`. rc 1 (no output) when the
+# wrapper shape is absent — including a cmdline truncated before its trailer —
+# so an unrecognised shell is never classified by a guess.
+_pane_root_payload() {
+    local c="${1:-}" p
+    # THE READ CAP (w234sk F2). The walk keeps at most 4096 bytes of a cmdline
+    # (`head -c 4096`), and a TRUNCATED one can still end in a `' < /dev/null`
+    # that belongs to the PAYLOAD. The peel below then yields a clean pure-wait
+    # PREFIX of a command that goes on to do work. Measured: a 5262-byte argv
+    # cut to 4096 classified quiescent. So a cmdline at or over the cap is
+    # refused as unrecognisable. A genuine 4096-byte command is refused too,
+    # which errs toward "not quiescent". The length is taken in BYTES under
+    # LC_ALL=C, because the cap is in bytes and ${#c} counts characters in a
+    # UTF-8 locale.
+    local LC_ALL=C
+    (( ${#c} < 4096 )) || return 1
+    case "$c" in *"eval '"*"' < /dev/null"*) : ;; *) return 1 ;; esac
+    p="${c#*eval \'}"
+    p="${p%\' < /dev/null*}"
+    p="${p//\'\\\'\'/\'}"
+    [[ -n "$p" ]] || return 1
+    printf '%s' "$p"
+}
+
+# _pane_payload_is_pure_wait <payload> — rc 0 iff the payload, AS A WHOLE, is a
+# nexus protocol wait loop: nothing in it but recognised waits, `sleep N`, loop
+# keywords, `cd`, `echo`/`printf`, `exit`/`return` and plain assignments, with at
+# least one recognised wait. It exists for ONE decision — may the cc-update
+# restart kill this shell between turns — so it answers "does killing this
+# destroy work, or work not yet started", not "does this mention a wait".
+#
+# WHY WHOLE-PAYLOAD AND NOT `_pane_cmd_is_protocol_wait`. That predicate is a
+# substring match, right for its job (naming an await) and wrong for this one:
+# `skeptic-channel.sh await x && python post.py` matches it, and killing that
+# shell during the await destroys a job that has not started yet.
+#
+# ERROR DIRECTION, stated because this is a predicate over SOURCE TEXT for a
+# RUNTIME property. It errs toward NOT QUIESCENT (keep waiting) on: any
+# command it does not know, command substitution, backticks, pipes, redirects,
+# backgrounding, subshells and braces, a heredoc, a quoted separator (naive
+# splitting leaves fragments that fail to parse), a bare `sleep` timer, and the
+# `until [ -s "$T/status" ]` waiter #1208 already handles by resolving the job.
+# It can err toward QUIESCENT only if a word that NAMES a recognised wait runs
+# something else: a shell function or alias of that name defined in the shell
+# snapshot, or a same-named script that is not the nexus's. Both are bounded by
+# the caller's second conjunct: every live descendant must be a shell or
+# `sleep`. So the residual is work done by SHELLS themselves, builtins or
+# shell scripts alike, since a descendant whose comm is a shell is never
+# alien. Beyond that, a non-shell direct child of claude is never counted as a
+# root at all (w234sk F3; see `bg_quiesce` in the header).
+_pane_payload_is_pure_wait() {
+    local p="${1:-}"
+    [[ -n "$p" ]] || return 1
+    p="${p//&&/;}"
+    p="${p//||/;}"
+    p="${p//$'\n'/;}"
+    case "$p" in
+        *'$('*|*'`'*|*'|'*|*'&'*|*'>'*|*'<'*|*'('*|*')'*|*'{'*|*'}'*) return 1 ;;
+    esac
+    local -a frags words
+    IFS=';' read -r -a frags <<< "$p"
+    local frag w0 base saw_wait=0
+    for frag in "${frags[@]}"; do
+        read -r -a words <<< "$frag"
+        (( ${#words[@]} > 0 )) || continue
+        # Loop keywords and `!` prefix a command; they are not one.
+        while (( ${#words[@]} > 0 )); do
+            case "${words[0]}" in
+                until|while|do|'!') words=("${words[@]:1}") ;;
+                *) break ;;
+            esac
+        done
+        (( ${#words[@]} > 0 )) || continue
+        # Leading NAME=value assignment words (`rc=$?`, `T=/path`).
+        while (( ${#words[@]} > 0 )) && [[ "${words[0]}" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do
+            words=("${words[@]:1}")
+        done
+        (( ${#words[@]} > 0 )) || continue
+        w0="${words[0]//\"/}"; w0="${w0//\'/}"
+        base="${w0##*/}"
+        # `cd`, and the loop's own `exit $rc` / `return`, at most one argument.
+        # Tested with `[[ == ]]` rather than a `cd|exit|return)` case arm: that
+        # spelling reads, to test-subshell-exit-guards.sh (#1339), as an exit
+        # site — which it is not; it is a word being compared.
+        if [[ "$base" == "cd" || "$base" == "exit" || "$base" == "return" ]]; then
+            (( ${#words[@]} <= 2 )) || return 1
+            continue
+        fi
+        case "$base" in
+            done|true|:)
+                (( ${#words[@]} == 1 )) || return 1 ;;
+            sleep)
+                (( ${#words[@]} == 2 )) && [[ "${words[1]}" =~ ^[0-9]+(\.[0-9]+)?[smhd]?$ ]] || return 1 ;;
+            echo|printf)
+                : ;;
+            watcher-supervise-tick.sh)
+                saw_wait=1 ;;
+            proc-exists-authorized)
+                case " ${words[*]:1} " in
+                    *" --until-gone "*|*" --until-present "*) saw_wait=1 ;;
+                    *) return 1 ;;
+                esac ;;
+            async-run.sh)
+                # `[[ == ]]`, not a nested `case` with `--await)` arms: a case
+                # arm spelled like a flag reads, to
+                # test-ng-usage-flag-coverage.sh (#906 A), as a flag THIS script
+                # parses and does not document.
+                if [[ "${words[1]:-}" == "--await" ]]; then
+                    saw_wait=1
+                elif [[ "${words[1]:-}" != "--status" && "${words[1]:-}" != "--status-line" ]]; then
+                    return 1
+                fi ;;
+            skeptic-channel.sh)
+                case "${words[1]:-}" in await|poll) saw_wait=1 ;; *) return 1 ;; esac ;;
+            request-channel.sh)
+                [[ "${words[1]:-}" == await ]] || return 1
+                saw_wait=1 ;;
+            ng)
+                case "${words[1]:-} ${words[2]:-}" in
+                    "skeptic await"|"skeptic await-answer"|"request await") saw_wait=1 ;;
+                    *) return 1 ;;
+                esac ;;
+            *)
+                return 1 ;;
+        esac
+    done
+    (( saw_wait == 1 ))
 }
 
 # Does this command line belong to a NEXUS PROTOCOL WAIT LOOP rather than to
@@ -2155,8 +3193,7 @@ _HEARTBEAT_STALENESS_DEFAULT=30
 _HEARTBEAT_TURN_END_STALENESS_DEFAULT=1800
 
 # Async-signal staleness: how long after `last_activity` the
-# heartbeat's `monitor_handles` / `background_bash_count` /
-# `scheduled_wakeup_at` / `external_waits` fields are trusted for
+# heartbeat's `scheduled_wakeup_at` / `external_waits` fields are trusted for
 # the idle-refinement path (issue #183). Independent of the
 # top-level state-classification staleness so the heartbeat can
 # remain authoritative for refinement even when the renderer takes
@@ -2164,6 +3201,46 @@ _HEARTBEAT_TURN_END_STALENESS_DEFAULT=1800
 # tool call between PostToolUse fires; short enough that a wedged
 # worker doesn't keep its async signals indefinitely.
 _HEARTBEAT_ASYNC_STALENESS_DEFAULT=60
+
+# `external_waits` is SPLIT OFF from that 60 s (your-org/nexus-code#1220).
+#
+# THE ASYMMETRY, which is the whole reason this constant exists separately.
+# The 60 s horizon above is written to stop a WEDGED worker keeping its async
+# signals -- and so its EXEMPTION -- indefinitely. That rationale is exactly
+# right for the other field in the group: `scheduled_wakeup_at` resolves to
+# `working-self-paced`, which is in
+# `_bookkeeping.sh`'s `_BK_ACTIVE_STATES` -- states that REFUSE a kill. Left
+# to run forever they would hold a window open forever, so expiring them is
+# the safe direction.
+#
+# `external_waits` is the one field in that group the rationale does not
+# cover. It resolves to `idle-orphan-async`, which is in
+# `_BK_KILL_OK_STATES` alongside plain `idle` -- it grants no exemption and
+# blocks no retirement. So expiring it does not withdraw a privilege; it
+# DELETES A DECLARATION, and the thing declared is precisely that work is
+# outstanding.
+#
+# And the proxy contradicts the thing it stands for. Quiet is read as evidence
+# of no outstanding waits, but a worker BLOCKED on an external wait emits no
+# activity -- which is why it is quiet. The signal is weakest exactly where it
+# is needed. Measured on window `olayingestsk2`: `last_activity` 68071 s old
+# (18.9 h) against a 60 s horizon, with 10 `external_waits` entries that were
+# invisible for the whole of it.
+#
+# 48 h, matching the background-children EPISODE CEILING
+# (`background_children_grace_ceiling_seconds`, default 172800) -- the repo's
+# existing statement of how long a legitimate background episode may run. It
+# is a horizon rather than no horizon so an abandoned heartbeat file cannot
+# declare a wait forever, but it is sized to the WAIT, not to the gap between
+# two PostToolUse fires.
+#
+# THIS CANNOT CHANGE KILL AUTHORIZATION IN EITHER DIRECTION: both the state it
+# withholds (`idle`) and the state it produces (`idle-orphan-async`) are in
+# `_BK_KILL_OK_STATES`, so a window is exactly as retirable either way. What
+# it changes is whether the declared wait is ever RESOLVED, reaped and
+# reported -- `_orphan_async.sh` records a row only for a window reading
+# `idle-orphan-async`.
+_HEARTBEAT_EXTERNAL_WAITS_STALENESS_DEFAULT=172800
 
 _resolve_heartbeat_dir() {
     # Mirrors monitor/ng's STATE_DIR resolver but lighter — no
@@ -2251,8 +3328,8 @@ _classify_from_heartbeat() {
 
 # ---- async-signal refinement helpers (issue #183) -----------------------
 #
-# These extract the four async signals (monitor_handles,
-# background_bash_count, scheduled_wakeup_at, external_waits) used
+# These extract the async signals (the footer's handle counts, the
+# heartbeat's scheduled_wakeup_at and external_waits) used
 # to refine the `idle` verdict into one of:
 #   working-background / working-self-paced / idle-orphan-async / idle.
 #
@@ -2260,34 +3337,26 @@ _classify_from_heartbeat() {
 #   - Each helper writes a single key=value to stdout, or exits
 #     non-zero / empty stdout when it has nothing to say.
 #   - The signals come from two sources: the heartbeat JSON (when
-#     fresh enough) and the pane-ANSI capture (footer parsing).
-#     Heartbeat is authoritative when both have a value; footer
-#     fills in only when heartbeat is missing the field.
+#     fresh enough) for the two wakeup/wait fields, and the pane-ANSI
+#     capture (footer parsing) for the handle counts. No field is read
+#     from both (#1374).
 
-# Read `monitor_handles` and `background_bash_count` directly from
-# the heartbeat JSON. Returns space-separated `<monitor> <bg>` on
-# stdout; missing / corrupt / stale heartbeat ⇒ "0 0".
-_heartbeat_handle_counts() {
-    local hb_file="$1" now="$2" staleness="$3"
-    local result="0 0"
-    [[ -n "$hb_file" ]] || { printf '%s' "$result"; return; }
-    [[ -f "$hb_file" ]] || { printf '%s' "$result"; return; }
-    [[ -r "$hb_file" ]] || { printf '%s' "$result"; return; }
-    command -v jq >/dev/null 2>&1 || { printf '%s' "$result"; return; }
-
-    local last_activity mon bg
-    last_activity=$(jq -r '.last_activity // empty' "$hb_file" 2>/dev/null) || last_activity=""
-    [[ "$last_activity" =~ ^[0-9]+$ ]] || { printf '%s' "$result"; return; }
-    local age=$(( now - last_activity ))
-    (( age >= 0 )) || age=0
-    (( age <= staleness )) || { printf '%s' "$result"; return; }
-
-    mon=$(jq -r '.monitor_handles // 0' "$hb_file" 2>/dev/null) || mon=0
-    bg=$(jq -r '.background_bash_count // 0' "$hb_file" 2>/dev/null) || bg=0
-    [[ "$mon" =~ ^[0-9]+$ ]] || mon=0
-    [[ "$bg" =~ ^[0-9]+$ ]] || bg=0
-    printf '%d %d' "$mon" "$bg"
-}
+# THERE IS NO HEARTBEAT ARM FOR THE HANDLE COUNTS (your-org/nexus-code#1374).
+# `_heartbeat_handle_counts` used to read `monitor_handles` and
+# `background_bash_count` from the heartbeat JSON and `max()` them with the
+# footer parse below. Nothing has ever WRITTEN those fields: the only
+# production writer, monitor/worker-heartbeat.sh, emits exactly
+# state · last_activity · event · last_tool · session_id · window ·
+# external_waits · dismissed_waits (+ last_turn_end, scheduled_wakeup_at), and
+# they were present in 0 of 1,882 live heartbeats. A `max()` with a dead
+# operand cannot fail, cannot log and cannot go red — so four documents
+# asserted a defence in depth that was one mechanism wearing two names. The
+# arm is deleted rather than fed: a PostToolUse hook cannot introspect
+# claude's internal handle list, so it could never have been the primary.
+# The footer regex IS the `mon` signal and the process tree IS the `bg`
+# signal (footer as its fallback); their fragility is now visible where it
+# lives. monitor/watcher/test-heartbeat-schema-agreement.sh asserts that
+# every heartbeat field this file reads is one the writer emits.
 
 # Pane-footer parse. Claude Code surfaces async-handle counts in
 # two places: the spinner row above the input (`✻ Cooked for 4s ·
@@ -2374,7 +3443,10 @@ _heartbeat_scheduled_wakeup_at() {
 # comma-separated `<kind>:<id>[,<kind>:<id>…]` summary on stdout
 # (capped at 80 chars; longer lists are truncated with `…`).
 # Returns 1 with empty stdout when the array is missing, empty, or
-# the heartbeat is stale — i.e. there's no orphan-async signal.
+# the heartbeat is older than the EXTERNAL-WAITS horizon — which is
+# deliberately not the async-signal horizon its three sibling fields use.
+# See `_HEARTBEAT_EXTERNAL_WAITS_STALENESS_DEFAULT` for why a declaration
+# and an exemption cannot share an expiry.
 _heartbeat_external_waits_summary() {
     local hb_file="$1" now="$2" staleness="$3"
     [[ -n "$hb_file" ]] || return 1
@@ -2421,28 +3493,230 @@ _heartbeat_external_waits_summary() {
 # heartbeat path (either may be empty), and the process-tree
 # background-shell reading (`pt_bg` count + `pt_reliable`) measured
 # once by the caller via _pane_background_shells.
+# THE FOOTER DISCOUNT for the longjob dispatcher — applied in the refiner below
+# from the ONE verdict `_longjob_dispatcher_verdict` reads (armed AND active==0).
+#
+# How many of the footer's `N monitor` handles belong to the longjob-watch
+# DISPATCHER (your-org/nexus-code#1535) with NOTHING to wait for. Every nexus
+# session is launched with that plugin monitor armed, so without this every
+# idle worker would read `· 1 monitor ·` → `working-background`, which is
+# never aged out and never kill-authorised: window cleanup would stop
+# board-wide. Measured on the hermetic control (fixture
+# fixtures/idle-longjob-dispatcher-armed-realmodel-272.ansi): an idle REPL
+# with the dispatcher armed classifies `working-background`.
+#
+# THIS IS A KILL-DECISION INPUT, so it demands a POSITIVE liveness verdict
+# from the ONE reader that has one — `longjob-watch.sh ledger-verdict`, the
+# same function `status` prints — never a freshness proxy re-derived here
+# (skeptic F2: a fresh ledger with a DEAD pid used to discount, i.e. read
+# `idle`, kill-authorised, while `status` said `dead`). The gates, each
+# erring toward KEEPING the handle:
+#   - no heartbeat / no ledger / unreadable ledger            → 0
+#   - a `win-<name>` ledger whose own `window` field is not
+#     this heartbeat's window (a foreign dispatcher's file)  → 0
+#   - verdict not `armed` (dead pid, start-time mismatch, stale poll,
+#     NOT SERVING — the kill switch — or muted)               → 0
+#   - `active` > 0, COUNTED from the spool by the verb (a
+#     worker IS parked on a watch; the cached field lags)    → 0
+#   - armed and active == 0                                   → 1
+# A footer reading of 2 with one discounted is a model-armed Monitor plus the
+# dispatcher, and stays `working-background`; the discount is at most 1.
+# _longjob_dispatcher_ledger <hb_file> → prints "<state-dir>\t<ledger-path>" for THIS
+# session's dispatcher (sid- key first, then a win- key that names this window),
+# or nothing. Shared by the footer discount and the process-tree walk below so
+# the two channels can never consult two different ledgers.
+_longjob_dispatcher_ledger() {
+    local hb="$1" sd sid win key ledger=""
+    [[ -n "$hb" && -f "$hb" ]] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+    sd=$(cd "$(dirname "$hb")/.." 2>/dev/null && pwd) || return 1
+    sid=$(jq -r '.session_id // empty' "$hb" 2>/dev/null) || sid=""
+    win=$(jq -r '.window // empty' "$hb" 2>/dev/null) || win=""
+    for key in "${sid:+sid-$sid}" "${win:+win-$win}"; do
+        [[ -n "$key" && -f "$sd/longjob/$key/dispatcher.json" ]] && { ledger="$sd/longjob/$key/dispatcher.json"; break; }
+    done
+    [[ -n "$ledger" ]] || return 1
+    if [[ "$key" == win-* ]]; then
+        # A window-keyed ledger must name THIS window, or it is somebody else's.
+        [[ "$(jq -r '.window // empty' "$ledger" 2>/dev/null)" == "$win" ]] || return 1
+    fi
+    # Newline-terminated: a `read` at EOF without one returns 1 with the
+    # variables ASSIGNED, and every caller here treats 1 as "no ledger".
+    printf '%s\t%s\n' "$sd" "$ledger"
+    return 0
+}
+
+# _pane_longjob_root <pane_pid> <hb_file> → "<root_pid>:<root_start>" | nothing
+#
+# WHICH background-shell root of this pane is the longjob dispatcher's own
+# wrapper — so `_pane_background_shells` can EXCLUDE that root's whole subtree
+# from the census. The host launches the plugin monitor as
+# `zsh -c … bash dispatch.sh` (measured live: claude → zsh → bash
+# longjob-watch.sh dispatch → sleep), a real shell child of claude, and the
+# process tree is AUTHORITATIVE over the footer.
+#
+# HISTORY, because the first repair was the wrong shape (bundle-2609sk2 F1).
+# f755a3e8 answered 0|1 here and the refiner subtracted ONE from the count.
+# The root stayed in the census, so every OTHER tree-derived field described
+# the dispatcher instead of the work, for every armed session: `bg_shells` +1
+# (idle-probe's `task_shells = bg_shells - bg_infra` left case (b0) and
+# surfaced `wrapped-with-children` each cycle, naming the dispatcher);
+# `bg_quiesce` never reached `bg_shells` (cc-update's `_restart_bg_all_quiescent`
+# rc 0 → rc 1, the restart waits to its cap); `bg_members` changed on every
+# sample because the dispatcher forks a `sleep` per poll (the #1460 wedge
+# detector read a real static wedge as "a sequential driver"); `bg_oldest_start`
+# was the SESSION's start (the 48 h ceiling and `bg_cpu_bp` measured session
+# age); `bg_cmd` named the dispatcher. All measured by the skeptic's rigs 1–2.
+# Excluding the subtree at the source makes every field clean at once and
+# leaves the refiner nothing to subtract.
+#
+# IDENTITY, NEVER ARGV: the dispatcher is the ledger's `pid` whose /proc
+# start-time (stat field 22, ticks) equals the ledger's `pid_start` — a
+# recycled pid fails here. A string match on `dispatch.sh` would match a
+# SIBLING session's dispatcher, whose argv is byte-identical (CLAUDE.md, "a
+# predicate keyed on a STRING…").
+#
+# THE ROOT IS FOUND THE WAY THE CENSUS DEFINES ONE (sk2 F2): walk PARENT pids
+# from the dispatcher up to the NEAREST `claude` comm and STOP there; the root
+# is the first SHELL strictly BELOW that claude on the chain — exactly the node
+# the census would count. f755a3e8 walked on to <pane_pid> and let ANY shell on
+# the way satisfy it, so a launcher shell ABOVE claude vouched for a non-shell
+# "dispatcher" that was a direct child of claude, and the verdict was `idle`
+# over a real background shell (sk2 K4; unreachable in production today,
+# reachable the day the host execs monitor commands without a shell). That
+# claude must itself sit at or below <pane_pid>, or it is somebody else's.
+#
+# FAILURE DIRECTION: every doubt (no ledger, no jq, a mismatched start-time, no
+# claude within 16 hops, no shell below it, a claude outside this pane) →
+# NOTHING printed → nothing excluded → the shell stays counted →
+# working-background: the direction that keeps a handle rather than retiring a
+# live worker. And an exclusion can only ever remove the ONE root that owns the
+# identified dispatcher: a second, real root is untouched (sk2 K2, kept as a
+# suite case).
+_pane_longjob_root() {
+    local pane_pid="$1" hb="$2" sd ledger pid ps cur ppid stat comm after hop start
+    local claude_pid="" i ok=0
+    local -a chain_pid=() chain_start=() chain_shell=() f=()
+    [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 0
+    IFS=$'\t' read -r sd ledger < <(_longjob_dispatcher_ledger "$hb") || return 0
+    [[ -n "$ledger" ]] || return 0
+    pid=$(jq -r '.pid // empty' "$ledger" 2>/dev/null); ps=$(jq -r '.pid_start // empty' "$ledger" 2>/dev/null)
+    [[ "$pid" =~ ^[0-9]+$ && "$ps" =~ ^[0-9]+$ ]] || return 0
+    cur="$pid"
+    for hop in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+        { IFS= read -r stat < "/proc/$cur/stat"; } 2>/dev/null || return 0
+        after="${stat##*) }"; comm="${stat%) *}"; comm="${comm#*(}"
+        f=($after); ppid="${f[1]:-}"; start="${f[19]:-}"
+        if (( hop == 1 )); then [[ "$start" == "$ps" ]] || return 0; fi
+        case "$comm" in
+            claude|claude.exe|claude-code) claude_pid="$cur"; break ;;
+        esac
+        if _pane_comm_is_shell "$comm"; then chain_shell+=(1); else chain_shell+=(0); fi
+        chain_pid+=("$cur"); chain_start+=("$start")
+        [[ "$ppid" =~ ^[0-9]+$ ]] && (( ppid > 1 )) || return 0
+        cur="$ppid"
+    done
+    [[ -n "$claude_pid" ]] || return 0
+    cur="$claude_pid"
+    for hop in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+        if (( cur == pane_pid )); then ok=1; break; fi
+        { IFS= read -r stat < "/proc/$cur/stat"; } 2>/dev/null || return 0
+        after="${stat##*) }"; f=($after); ppid="${f[1]:-}"
+        [[ "$ppid" =~ ^[0-9]+$ ]] && (( ppid > 1 )) || return 0
+        cur="$ppid"
+    done
+    (( ok == 1 )) || return 0
+    for (( i=${#chain_pid[@]}-1; i>=0; i-- )); do
+        if (( ${chain_shell[i]} == 1 )) && [[ "${chain_start[i]}" =~ ^[0-9]+$ ]]; then
+            printf '%s:%s' "${chain_pid[i]}" "${chain_start[i]}"
+            return 0
+        fi
+    done
+    return 0
+}
+
+# _longjob_dispatcher_verdict <hb_file> <now> → "armed <active>" | nothing
+#
+# ONE reading of the ledger verdict per pane-state call, consumed three ways:
+# the census excludes the dispatcher's root only when ARMED (a stale, disabled
+# or dead dispatcher stays a counted shell — "a stopped dispatcher is not one
+# with nothing to say"); the footer's `N monitor` count is discounted by one
+# only when armed AND active==0; and armed AND active>0 HOLDS the pane as a
+# self-waking Monitor-style wait even when the footer cannot be read (see the
+# refiner). Anything else prints nothing: not discounted, not excluded, not held.
+_longjob_dispatcher_verdict() {
+    local hb="$1" now="$2" sd ledger lj
+    lj="$(dirname "${BASH_SOURCE[0]}")/longjob-watch.sh"
+    [[ -x "$lj" ]] || return 0
+    IFS=$'\t' read -r sd ledger < <(_longjob_dispatcher_ledger "$hb") || return 0
+    [[ -n "$ledger" ]] || return 0
+    local verdict active
+    verdict=$(NEXUS_STATE_DIR="$sd" "$lj" ledger-verdict "$ledger" --now "$now" 2>/dev/null) || return 0
+    [[ "${verdict%%|*}" == armed ]] || return 0
+    # `active=` as COUNTED from the spool by the verb, never the ledger's
+    # cached field: that field is published only by a completed pass, so
+    # between an `add` and the next write it read 0 → `idle` → kill-authorised
+    # over a worker parked on a 4-hour job (skeptic C2).
+    active="${verdict##*|active=}"
+    [[ "$active" =~ ^[0-9]+$ ]] || return 0
+    printf 'armed %s' "$active"
+}
+
 _refine_idle_with_async_signals() {
     local pane_plain="$1" hb_file="$2" now="$3" async_staleness="$4"
-    local pt_bg="${5:-0}" pt_reliable="${6:-0}"
-    [[ "$pt_bg" =~ ^[0-9]+$ ]] || pt_bg=0
-
-    local hb_mon=0 hb_bg=0
-    if [[ -n "$hb_file" ]] && [[ -f "$hb_file" ]]; then
-        read -r hb_mon hb_bg < <(_heartbeat_handle_counts \
-            "$hb_file" "$now" "$async_staleness")
+    local pt_bg="${5:-0}" pt_reliable="${6:-0}" pt_stale="${7:-0}"
+    # 9th arg: the longjob ledger verdict, `armed <active>` or empty, as read
+    # ONCE by the caller (_longjob_dispatcher_verdict). An older caller that
+    # passes no 9th arg gets it read here instead — never assumed.
+    local lj_v="${9-__unread__}"
+    [[ "$lj_v" == __unread__ ]] && lj_v=$(_longjob_dispatcher_verdict "$hb_file" "$now")
+    local lj_armed=0 lj_active=0
+    if [[ "$lj_v" == armed\ * ]]; then
+        lj_active="${lj_v#armed }"
+        if [[ "$lj_active" =~ ^[0-9]+$ ]]; then lj_armed=1; else lj_active=0; fi
     fi
+    # 8th arg: the external-waits horizon (your-org/nexus-code#1220). Defaulted
+    # rather than required so an older caller degrades to the CONSTANT, never
+    # to 0 — a 0 horizon would make every wait stale and reproduce the defect
+    # silently, which is the failure mode this whole change is about.
+    local ew_staleness="${8:-$_HEARTBEAT_EXTERNAL_WAITS_STALENESS_DEFAULT}"
+    [[ "$ew_staleness" =~ ^[0-9]+$ ]] || ew_staleness=$_HEARTBEAT_EXTERNAL_WAITS_STALENESS_DEFAULT
+    [[ "$pt_bg" =~ ^[0-9]+$ ]] || pt_bg=0
+    [[ "$pt_stale" =~ ^[0-9]+$ ]] || pt_stale=0
+
     local foot_mon=0 foot_bg=0
     if [[ -n "$pane_plain" ]]; then
         read -r foot_mon foot_bg < <(_footer_handle_counts "$pane_plain")
     fi
     # Monitor handles run INSIDE claude's node process (async tool
     # handles, not child processes), so the process tree can't see them
-    # — the footer/heartbeat remains their only source. Heartbeat takes
-    # precedence when it reports a positive count; else fall back to the
-    # footer. A heartbeat that reports 0 is "no signal" not "definitely
-    # zero" (the hook can't introspect claude's internal handle list),
-    # so we OR the two sources.
-    local mon=$(( hb_mon > foot_mon ? hb_mon : foot_mon ))
+    # — the footer is their ONLY source (#1374: the heartbeat never
+    # carried them; the arm that pretended otherwise is gone). A harness
+    # build that rewords the spinner row, or a pane whose footer is
+    # scrolled or truncated, removes this exemption: that fragility is
+    # real and it is now stated here rather than hidden behind a max().
+    local mon="$foot_mon"
+    # Discount the idle longjob-watch dispatcher's own handle (#1535): armed AND
+    # active==0, from the ledger verdict (see _longjob_dispatcher_verdict for
+    # the gates and their failure direction). The process-tree channel needs
+    # nothing here any more — the census excluded the dispatcher's root at the
+    # source (bundle-2609sk2 F1), so `pt_bg` is already about the work.
+    if (( mon > 0 )) && (( lj_armed == 1 )) && (( lj_active == 0 )); then
+        mon=$(( mon - 1 ))
+    fi
+    # A LIVE watch is a self-waking wait — Monitor-handle semantics: claude is
+    # re-invoked the instant it fires, so it must NEVER be aged out. With the
+    # dispatcher's root out of the census the FOOTER is the only thing holding
+    # such a pane, and the footer is the fragile channel (a reworded spinner
+    # row, a scrolled or truncated pane — stated above). The armed ledger with
+    # active>0 is the same fact from a source that cannot scroll away, so it
+    # holds the pane on its own. Before the exclusion this pane read
+    # working-background through the dispatcher's SHELL root — i.e. as a
+    # fire-and-forget shell under the bg_cpu orphan-grace, which would
+    # eventually age out a worker parked on a four-hour job.
+    if (( mon == 0 )) && (( lj_armed == 1 )) && (( lj_active > 0 )); then
+        mon=1
+    fi
     # Background SHELLS are live child processes of claude, so the
     # process tree is GROUND TRUTH for them (your-org/nexus-code#455).
     # When the tree reading is reliable it is AUTHORITATIVE — it
@@ -2453,11 +3727,18 @@ _refine_idle_with_async_signals() {
     # trustworthy (fixtures, empty pane_pid, /proc-restricted, no claude
     # found). Any residual footer false-positive on the fallback path is
     # still backstopped by the bg_cpu orphan-grace.
+    # #1208: subtract the roots the AUTHORITY (async-run) says are waiting on
+    # a job that already `died`. Those are not work in flight — no future event
+    # can clear them — so they must not hold the `working-background` exemption
+    # open forever. Only applied on the RELIABLE path: on the footer fallback
+    # there is no process tree to attribute staleness to, and a stale count
+    # measured against a count we did not measure would be a subtraction
+    # between two different populations.
     local bg
     if (( pt_reliable == 1 )); then
-        bg="$pt_bg"
+        bg=$(( pt_bg > pt_stale ? pt_bg - pt_stale : 0 ))
     else
-        bg=$(( hb_bg > foot_bg ? hb_bg : foot_bg ))
+        bg="$foot_bg"
     fi
 
     if (( mon > 0 )) || (( bg > 0 )); then
@@ -2483,7 +3764,7 @@ _refine_idle_with_async_signals() {
     fi
 
     local waits_summary
-    if waits_summary=$(_heartbeat_external_waits_summary "$hb_file" "$now" "$async_staleness"); then
+    if waits_summary=$(_heartbeat_external_waits_summary "$hb_file" "$now" "$ew_staleness"); then
         if [[ -n "$waits_summary" ]]; then
             printf 'idle-orphan-async\torphan_kinds=%s' "$waits_summary"
             return 0
@@ -2503,14 +3784,174 @@ if [[ -n "$fixture" ]]; then
     win_name="$fix_name"
 else
     [[ -z "$target" ]] && usage
-    if [[ "$target" =~ ^[0-9]+$ ]]; then
-        win="0:$target"
-        win_index="$target"
-    elif [[ "$target" =~ ^[^:]+:[0-9]+$ ]]; then
-        win="$target"
-        win_index="${target##*:}"
+    # ONE KEY VOCABULARY WITH paste-followup.sh (your-org/nexus-code#905).
+    # This used to accept ONLY an index or `session:window`, while the sibling
+    # accepted ONLY a name — so `pane-state.sh 9` and `paste-followup.sh 9`,
+    # typed in adjacent commands against the same window, disagreed. A NAME is
+    # now resolved to its index through the SHARED resolver, so the two tools
+    # cannot drift apart; an index and `session:window` keep working exactly as
+    # before, which is what every existing caller passes.
+    #
+    # THE AMBIGUOUS KEY IS REFUSED, NOT ANSWERED. A key that is both a window
+    # NAME and a DIFFERENT window's index used to be answered silently on the
+    # index side — a confident answer about the wrong window, which is the
+    # failure `#905` exists to prevent and is worse here than in the paste
+    # tool, because this answer can authorise a kill.
+    if [[ -r "$_PS_SCRIPT_DIR/_tmux-window.sh" ]]; then
+        # shellcheck disable=SC1091
+        . "$_PS_SCRIPT_DIR/_tmux-window.sh"
+    fi
+    # ------------------------------------------------------------------
+    # THE RESOLVER IS A PRECONDITION, NOT AN OPTIONAL ENRICHMENT
+    # (your-org/nexus-code#1281)
+    # ------------------------------------------------------------------
+    #
+    # The source above is CONDITIONAL, and both consumers below used to
+    # degrade differently when it did not take:
+    #
+    #   * the NAME arm already failed CLOSED — no `resolve_window_index`
+    #     means `_ps_resolve_rc=3`, "we could not look", exit 2;
+    #   * the NUMERIC arm failed OPEN — no `resolve_window_key` left
+    #     `_ps_key_rc=0`, which is the value that means NOT AMBIGUOUS.
+    #
+    # So the one arm that can be handed a colliding key read "I could not
+    # run the ambiguity check" as "I ran it and there is no ambiguity",
+    # and then answered about the INDEX-side window. That is #603's
+    # conflation — a definite verdict emitted for a condition the emitter
+    # could not distinguish — sitting in front of the state resolver
+    # rather than inside it.
+    #
+    # MEASURED, and the mitigating sentence attached to the original
+    # finding ("a wrong-window answer, not a wrong-window kill") is
+    # REFUTED. Fixture: two windows, index 0 NAMED `1` with a live
+    # descendant, index 1 named `livework` whose pane pid is reaped.
+    # Key `1` is ambiguous by construction.
+    #
+    #   library readable   -> rc 2, empty stdout, 169 B stderr  (refusal)
+    #   library UNREADABLE -> rc 0, `state=absent ... name=livework`
+    #   positive control (index 0, direct) -> `state=unknown
+    #                                          reason=live-descendant`
+    #
+    # The key names a LIVE window; the fail-open answered `absent` about a
+    # DIFFERENT one. `absent` is on `_bookkeeping.sh`'s
+    # `_BK_KILL_OK_STATES` — this repo's own "the state that positively
+    # asserts a dead agent" — so that is not a wrong-window ANSWER, it is
+    # a wrong-window KILL AUTHORISATION. `idle` is reachable the same way
+    # by construction, and it is on the allowlist too.
+    #
+    # THE GATE IS HOISTED ABOVE THE BRANCH ON PURPOSE. Repairing only the
+    # numeric arm would leave the next arm to rediscover this, which is
+    # exactly how the `session:window` spelling survived the first pass at
+    # `#905` (the sk907 F2 residue noted below). One precondition, checked
+    # once, before anything dispatches on the key's shape.
+    #
+    # IT IS ALSO A NARROWING, NEVER A WIDENING: the only new outcome is a
+    # REFUSAL (exit 2, nothing on stdout), and the kill gate default-denies
+    # every state it is not given. A caller that used to receive a
+    # confident wrong answer now receives none.
+    if ! declare -F resolve_window_key >/dev/null 2>&1 \
+        || ! declare -F resolve_window_index >/dev/null 2>&1; then
+        printf 'pane-state.sh: the window-key resolver (%s) is unavailable, so the AMBIGUITY CHECK COULD NOT RUN. This is NOT a claim that %s is unambiguous, and it is NOT a claim about the window. Refusing to classify: a wrong-window answer here can be a kill authorisation. This is a broken install, not a supported configuration.\n' \
+            "$_PS_SCRIPT_DIR/_tmux-window.sh" "$target" >&2
+        exit 2
+    fi
+    if [[ "$target" =~ ^[0-9]+$ || "$target" =~ ^[^:]+:[0-9]+$ ]]; then
+        # THE AMBIGUITY CHECK COVERS BOTH NUMERIC FORMS (sk907 F2 residue).
+        # The first version of this fix guarded only the BARE index and left
+        # `session:window` a straight passthrough — so `pane-state.sh 0:1`
+        # silently answered about the index-side window while
+        # `paste-followup.sh 0:1` refused, i.e. the two helpers still
+        # disagreed, on the form CLAUDE.md documents and orchestrators
+        # actually type. That closed the demonstrated repro and left the
+        # mechanism live one form over. `resolve_window_key` strips the
+        # session itself, so ONE call covers both spellings and there is no
+        # second code path to forget next time.
+        # CALLED DIRECTLY, not behind a `declare -F` guard
+        # (your-org/nexus-code#1281). The precondition hoisted above the
+        # branch already established the resolver is present, and a second
+        # existence guard here would re-create the exact fail-open it
+        # removes: `_ps_key_rc=0` is the value that means NOT AMBIGUOUS, so
+        # a skipped check and a passed check would once again be spelled
+        # identically. There must be ONE place in this file where that
+        # question is answered.
+        _ps_key_rc=0
+        resolve_window_key "$target" >/dev/null 2>&1 || _ps_key_rc=$?
+        if (( _ps_key_rc == 4 )); then
+            printf 'pane-state: AMBIGUOUS window key %s — its window part is both a window NAME and a different window'"'"'s INDEX. Refusing to answer about either; pass the unambiguous name.\n' \
+                "$target" >&2
+            exit 2
+        fi
+        # rc 3 IS NOT "NOT AMBIGUOUS" (your-org/nexus-code#1318).
+        #
+        # Only rc 4 used to be consulted, and `_ps_key_rc=0` is the value that
+        # MEANS not-ambiguous — so an rc 3 ("tmux would not answer, the check
+        # did not run") reached the same downstream code as a check that ran
+        # and passed. That is the `#1281` mechanism one layer inward, in the
+        # runtime rc of the very call `#1281`'s precondition was hoisted to
+        # protect: the precondition establishes the resolver EXISTS, and says
+        # nothing about whether its answer arrived.
+        #
+        # It matters more now than it did, because `#1318` gave the check a
+        # new way to fail: the collision sweep spans SESSIONS, so it makes a
+        # second tmux call, and a server that answers the first and not the
+        # second is an ordinary transient. Landing that in the permissive arm
+        # would put a fresh fail-open inside the fix for a fail-open.
+        if (( _ps_key_rc == 3 )); then
+            printf 'pane-state.sh: the AMBIGUITY CHECK for %s COULD NOT RUN — tmux would not answer. This is NOT a claim that %s is unambiguous and NOT a claim about the window. Refusing to classify: a wrong-window answer here can be a kill authorisation.\n' \
+                "$target" "$target" >&2
+            exit 2
+        fi
+        if [[ "$target" =~ ^[0-9]+$ ]]; then
+            win="0:$target"
+            win_index="$target"
+        else
+            win="$target"
+            win_index="${target##*:}"
+        fi
     else
-        usage
+        # A NAME. Resolve it through the shared vocabulary.
+        #
+        # THE RESOLVER'S rc IS KEPT, and that is the whole point of this arm
+        # (your-org/nexus-code#1101). It used to be discarded — every failure
+        # printed `usage` and exited 2 — so a name that is simply NOT A LIVE
+        # WINDOW was reported as "your argv was wrong". That is precisely the
+        # distinction this file's own header says exit 3 exists to make: exit 2
+        # is "argv shape was wrong", exit 3 is "argv shape was fine but it is
+        # not a live window". The INDEX spelling has always honoured it
+        # (`0:9999` → exit 3); the NAME spelling did not, so no caller could
+        # tell a vanished window from a typo, and a watcher loop holding a row
+        # for an unobservable pane had no way to learn the pane was GONE.
+        #
+        #   resolve_window_index: 0 index | 1 no such window | 2 empty key
+        #                         3 tmux would not answer
+        #
+        # Only rc 1 is a POSITIVE claim that the window is not there, so only
+        # rc 1 becomes exit 3. rc 3 is "we could not look", which must never
+        # wear the same code as "it is gone" — that conflation is the #603 /
+        # #699 class this repo keeps paying for — so it keeps exit 2 with a
+        # diagnostic that says which fact it saw, instead of the usage block
+        # that used to misdiagnose it.
+        _ps_resolved=
+        _ps_resolve_rc=0
+        if declare -F resolve_window_index >/dev/null 2>&1; then
+            _ps_resolved=$(resolve_window_index "$target" 2>/dev/null) || _ps_resolve_rc=$?
+        else
+            _ps_resolve_rc=3
+        fi
+        if [[ -n "$_ps_resolved" ]]; then
+            win="0:$_ps_resolved"
+            win_index="$_ps_resolved"
+        elif (( _ps_resolve_rc == 1 )); then
+            # Same contract as the bogus-index arm below: stderr, exit 3,
+            # NOTHING on stdout, so a grep-style probe cannot false-match.
+            echo "pane-state.sh: no such tmux window: ${target}" >&2
+            exit 3
+        elif (( _ps_resolve_rc == 3 )); then
+            echo "pane-state.sh: could not ask tmux to resolve window name '${target}' — this is NOT a claim that the window is absent." >&2
+            exit 2
+        else
+            usage
+        fi
     fi
     if ! command -v tmux >/dev/null 2>&1; then
         # `absent` is a DEFINITE claim — "the window exists and no live
@@ -2603,6 +4044,115 @@ emit() {
         local IFS=' '
         extra=" $*"
     fi
+    # `auth=<login|expired>` — computed HERE, in the emitter, rather than at the
+    # arms that happen to care (your-org/nexus-code#1518). Three reasons, and
+    # the third is the load-bearing one:
+    #
+    #   * `auth=expired` rides on whatever verdict the pane produces. Measured,
+    #     that is `idle`; but a logged-out orchestrator that is ALSO mid-render,
+    #     ALSO holding a background shell, ALSO drawing a ghost suggestion
+    #     reaches a different arm each time, and "this session cannot reach the
+    #     API" is true of all of them.
+    #   * THERE ARE TWO CLASSIFICATION ROUTES, not one. `_classify_from_heartbeat`
+    #     emits and `exit 0`s some 50 lines before the renderer path's own
+    #     `pane_plain` / `pane_content_hash` assignments are ever reached, so a
+    #     field computed only at the renderer site is ABSENT from every
+    #     heartbeat-classified pane — and the orchestrator carries hooks, so the
+    #     heartbeat route is the one it normally takes.
+    #   * a field added at N arms is a field MISSING from arm N+1. `#788`'s
+    #     lesson is this shape one axis over: three independent sites
+    #     re-deriving one contract, the class regenerating each time, until the
+    #     derivation moved to the single door every path goes through.
+    #
+    # So the only way to emit a state without its `auth=` reading is to bypass
+    # `emit` entirely, which nothing does. `${pane_auth+set}` — not `:-` — so a
+    # value an arm has DELIBERATELY set, including the empty string, is honoured
+    # and not recomputed over; only an entirely unset variable is derived here.
+    # Omitted when neither surface is present, exactly as `queued=1` /
+    # `throttled=1` / `limit=` are, so no consumer parsing a fixed token set is
+    # disturbed.
+    if [[ -z "${pane_auth+set}" ]]; then
+        pane_auth=""
+        if [[ -n "${pane_plain:-}" ]]; then
+            # `login` FIRST and INDEPENDENTLY OF THE MENU FRAME (skeptic w237sk
+            # F2). `auth=login` used to be set at exactly one place — the
+            # `_has_blocked_overlay` arm — which is gated on
+            # `_has_menu_dialog_frame` and therefore requires a MULTI-OPTION
+            # SELECT MENU. Measured on the live 2.1.268 pane, the browser-auth /
+            # code-paste step classifies `state=empty` and carried NO `auth=`:
+            # the one login screen where a stray paste is worst was the one
+            # screen neither axis covered.
+            #
+            # THE LIVE-vs-QUOTED DISCRIMINATOR IS STRUCTURAL, not a margin: a
+            # live dialog has REPLACED the REPL, so no `❯<NBSP>` input row can
+            # appear; a pane merely DISCUSSING a login screen is a running REPL
+            # and keeps its row. That is the same test
+            # `_has_bypass_permissions_modal` documents, and it is what stops an
+            # agent reading #1518 from labelling its own pane. Verified on the
+            # live capture: no `❯<NBSP>`, and `state=empty` is precisely the
+            # no-input-row branch.
+            # AN ACTIVELY-WORKING PANE IS NOT SITTING ON A LOGIN SCREEN
+            # (skeptic w237sk D2). The live-vs-quoted discriminator moved from
+            # structural (`state=blocked`) to textual when F2 widened the label
+            # arm, and its precondition — no `❯<NBSP>` row — COINCIDES with a
+            # reading `#603` measured on a pane 4m38s into a verification pass.
+            # Measured on this corpus: **11 real `busy` captures lack that row**,
+            # including `busy-dialog-quoted-midrender-synthetic.ansi`, which
+            # exists specifically as the live-vs-quoted control for the dialog
+            # family. Splice one quoted row into it — the literal as an
+            # orchestrator reading `GUIDE.md` or `#1518` would render it — and it
+            # was labelled `auth=login`, so the watcher HELD on a working pane.
+            #
+            # DIRECTION, MEASURED RATHER THAN ARGUED, because the cost of getting
+            # it wrong is a MISSED login and that is unbounded where a delayed
+            # emit is not. The states a real login frame actually reaches are
+            # `blocked` (both menus), `empty` (the live code-paste step),
+            # `absent` (that capture in fixture mode) and `idle` (the heartbeat
+            # route) — every one of them outside this list. And on a heartbeat
+            # route reporting `busy`, a login capture already carries NO label at
+            # all, because that branch emits before `pane_plain` is populated: so
+            # excluding `busy` removes nothing that exists today. Verified on all
+            # three login captures plus the heartbeat `busy`/`user_prompt` arms.
+            #
+            # THE LIST IS THE TWO GENERATING STATES ONLY (w239sk F1, correcting
+            # D2's overshoot). D2 first excluded `working-background` and
+            # `working-self-paced` too. Both are REFINEMENTS OF AN IDLE BASE
+            # VERDICT — the turn has ended and only a pending wake mechanism
+            # differs — so the structural discriminator (no `❯<NBSP>` row) is
+            # as sound for them as for `idle`: an idle-based pane with no input
+            # row and a login frame IS sitting on a login screen. Excluding them
+            # made the veto in cc-auto-update-apply.sh's `_restart_eligible`
+            # INERT on exactly the route that matters: the orchestrator holds
+            # the supervisor Monitor and so reads `working-background` on the
+            # heartbeat route, and both states are restart-eligible — a login
+            # frame there read eligible, unlabelled, and the restart killed the
+            # login (driven on the real emitter by w239sk). `busy` stays out
+            # because D2's measurement stands for it — eleven real busy
+            # captures lack the row — and `over-limit` stays out because it is
+            # never restart-eligible and its paste hazard is already held by
+            # `_over_limit_orchestrator_paused`, so excluding it costs nothing
+            # and keeps the banner-heavy pane out of the label arm. Cost of the
+            # narrowing, stated: a heartbeat-idle pane mid-render that QUOTES a
+            # login literal with no row visible gets a bounded emit hold and a
+            # bounded restart abort instead of a paste or a kill.
+            #
+            # Equality over a fixed list, not a glob — `#1121`: a pattern is
+            # where "no input matches two arms" quietly stops being true, and
+            # this predicate decides whether the operator's pane gets written to.
+            local _ps_active=0 _ps_s
+            for _ps_s in busy over-limit; do
+                [[ "$state" == "$_ps_s" ]] && _ps_active=1
+            done
+            if (( _ps_active == 0 )) \
+               && ! grep -qF "❯${NBSP}" <<<"$pane_plain" \
+               && _dialog_is_login "$pane_plain"; then
+                pane_auth=login
+            elif _detect_auth_expired "$pane_plain"; then
+                pane_auth=expired
+            fi
+        fi
+    fi
+    [[ -n "$pane_auth" ]] && extra+=" auth=$pane_auth"
     [[ -n "$pane_content_hash" ]] && extra+=" content_hash=$pane_content_hash"
     printf 'state=%s active=%s window=%s name=%s%s\n' \
         "$state" "$win_active" "$win_index" "$win_name" "$extra"
@@ -2694,6 +4244,17 @@ _absent_evidence() {
     #     the agent has not started" is not a dead agent.
     if _pane_has_live_descendant "$pid"; then
         printf 'live-descendant'; return 1
+    fi
+
+    # (4b) A pid in the tree could not be IDENTIFIED (your-org/nexus-code#908).
+    #      `_pid_runs_claude` separates "this is not claude" from "I could not
+    #      tell", and only the first is a negative observation. Reading the
+    #      second as a negative is how `#908` put a live worker in the one
+    #      kill-authorising state — so decline here, on the same reasoning as
+    #      (2), (5) and (7). Weighted deliberately: mistaking a live worker for
+    #      dead destroys work, mistaking a dead one for live strands a slot.
+    if [[ "${_PHLC_INDETERMINATE:-0}" == 1 ]]; then
+        printf 'claude-identity-indeterminate'; return 1
     fi
 
     # (5) Can this process even SEE processes? `ps`/`pgrep` answering "no" and
@@ -2827,8 +4388,66 @@ elif [[ -n "${NEXUS_ROOT:-}" ]] && [[ -n "$win_name" ]]; then
     ol_file="$NEXUS_ROOT/monitor/.state/over-limit/$win_name.json"
 fi
 
+# The ORCHESTRATOR's activity marker, and whether THIS pane is that window
+# (your-org/nexus-code#1155 residual 2). See
+# `_over_limit_stamp_superseded_by_activity` for why a marker MTIME is
+# admissible evidence here and a per-window heartbeat is not available.
+#
+# The window name is resolved from the same inputs the orchestrator's own
+# settings and the watcher's config use, most authoritative first:
+#   --orchestrator-window        an explicit caller. `_idle_probe.sh` passes it
+#                                (the caller whose verdict gates the emit path).
+#   $MONITOR_TARGET              how every OTHER caller under the watcher gets
+#                                it: `_config.sh` EXPORTS the resolved target, so
+#                                the whole watcher process tree inherits it.
+#
+#                                That export exists because per-call-site
+#                                threading was the wrong shape and was measured
+#                                so (#1171 R2-C): a first pass enumerated the
+#                                executors, found ONE, and shipped a comment
+#                                naming three non-passing callers. There are SIX
+#                                under `monitor/watcher/` at this ref, and the
+#                                miss came from a `| head` on the enumeration
+#                                itself. Re-derive rather than trust this number:
+#                                  git grep -nE 'pane_state_script|pane-state\.sh' -- monitor \
+#                                    | grep -vE '/test-|\.md:'
+#                                Callers OUTSIDE the watcher tree (`ng`,
+#                                `retire-preflight.sh`, `cc-auto-update-apply.sh`,
+#                                `skeptic-channel.sh`) inherit the export only if
+#                                run under it, and otherwise fall back below.
+#   $MONITOR_TARGET              the watcher's env override for that config key
+#   $NEXUS_ORCHESTRATOR_WINDOW   what the orchestrator launcher exports
+#   orchestrator                 the default `monitor.target_window` resolves to,
+#                                and the literal fallback inside
+#                                orchestrator-settings.json's own clear
+#
+# A board that customises `monitor.target_window` WITHOUT setting either env
+# var resolves the wrong name here — and the failure is fail-closed rather than
+# unsafe. Reasoned on both directions, because only one of them would matter:
+# for the REAL orchestrator the fallback simply never fires, which is exactly
+# today's behaviour; and for a WORKER that happens to bear the default name the
+# fallback is structurally unreachable, because it is consulted ONLY when the
+# per-window heartbeat is unusable and every worker writes one
+# (`worker-settings.json` registers `worker-heartbeat.sh`). So the dangerous
+# direction is closed by the ordering, not by the name being right.
+orch_window="${orch_window_override:-${MONITOR_TARGET:-${NEXUS_ORCHESTRATOR_WINDOW:-orchestrator}}}"
+orch_hb_file=""
+if [[ -n "$orch_hb_file_override" ]]; then
+    orch_hb_file="$orch_hb_file_override"
+elif [[ -n "${NEXUS_STATE_DIR:-}" ]]; then
+    orch_hb_file="$NEXUS_STATE_DIR/orchestrator-heartbeat"
+elif [[ -n "${NEXUS_ROOT:-}" ]]; then
+    orch_hb_file="$NEXUS_ROOT/monitor/.state/orchestrator-heartbeat"
+fi
+# Passed to the rule only for the orchestrator's own pane; empty for every
+# other window, so no worker's stamp can ever be invalidated by the
+# orchestrator's activity.
+if [[ -z "$win_name" ]] || [[ "$win_name" != "$orch_window" ]]; then
+    orch_hb_file=""
+fi
+
 _emit_over_limit_from_stamp() {
-    local f="$1" reset_at=unknown v
+    local f="$1" reset_at=unknown flavour=unknown v
     if command -v jq >/dev/null 2>&1; then
         v=$(jq -r '.reset_at // empty' "$f" 2>/dev/null)
         if [[ -n "$v" ]] && [[ "$v" != "null" ]]; then
@@ -2838,8 +4457,19 @@ _emit_over_limit_from_stamp() {
             v="${v:0:40}"
             [[ -n "$v" ]] && reset_at="$v"
         fi
+        # WHICH limit, read from the hook payload rather than assumed
+        # (your-org/nexus-code#1488). The StopFailure hook records the
+        # harness's own message; "weekly Opus limit" was being asserted for a
+        # worker whose payload said Fable.
+        v=$(jq -r '.error_message // empty' "$f" 2>/dev/null)
+        if [[ -n "$v" ]] && [[ "$v" != "null" ]]; then
+            v=$(grep -oE 'your ([[:alnum:]-]+ ){0,2}limit' <<<"$v" \
+                    | tail -1 | sed -E 's/^your[[:space:]]*//; s/[[:space:]]*limit$//')
+            v=$(printf '%s' "$v" | tr -s '[:space:]' '_' | sed 's/_*$//')
+            [[ -n "$v" ]] && flavour="${v:0:40}"
+        fi
     fi
-    emit over-limit "reset_at=$reset_at"
+    emit over-limit "reset_at=$reset_at" "limit=$flavour"
 }
 
 # Anti-latch TTL on the hook-written stamp. The stamp's cleanup
@@ -2871,6 +4501,212 @@ _over_limit_stamp_expired() {
     (( now - ts > ttl ))
 }
 
+# POST-STAMP MODEL ACTIVITY INVALIDATES THE STAMP (your-org/nexus-code#1141).
+#
+# The stamp's documented cleanup contract is "the Stop hook on the next
+# successful turn removes it". That contract is INTACT and correctly wired —
+# and it is the defect. A `Stop` may be tens of minutes away, because a pane
+# can service a single turn for that long; meanwhile 1b below short-circuits
+# to `over-limit` and exits BEFORE any liveness inspection, so every consumer
+# reads a suspended pane that is demonstrably working.
+#
+# Measured on the production board, window `devred`, 2026-08-28:
+#
+#     stamp written (StopFailure, rate_limit)   12:42:52   reset_at 1:40pm
+#     watcher observed alive (state=busy)       12:56:05
+#     watcher pasted a resume brief             12:56:07
+#     heartbeat: event=PostToolUse              13:06:00   (still that turn)
+#     pane-state STILL emitting over-limit      13:02+
+#
+# The Stop hook did not fire once in that window and was not supposed to: the
+# turn had not ended. Independently confirmed by a sibling command in the SAME
+# Stop block — monitor/.state/decisions/devred.031312e9c5c4.json, written
+# 12:43:52, carries neither `unresolved` nor `resolved`, and
+# decision-mark-unresolved.sh stamps one at every turn end. Removing the stamp
+# by hand at 13:05 returned `state=busy` on the very next read.
+#
+# THE RULE. If the heartbeat records activity STRICTLY NEWER than the stamp's
+# own `ts`, and that activity is of a kind reachable only AFTER the model
+# responded, then this session has served a request since the limit was
+# recorded — so the limit has lifted, whatever the stamp says. devred:
+# last_activity 1787947560 vs stamp ts 1787946172, newer by 1387 s.
+#
+# WHY NOT THE CLOCK. `_over_limit_stamp_expired` below compares against a TTL,
+# and the row's `reset_at` states 1:40pm. The operator lifted this limit an
+# hour early by signing into a different account, so the stamp was false in
+# fact while unexpired by every wall-clock measure. A stated reset time is a
+# claim about a plan, not an observation of the pane. This rule reads no clock
+# at all: it compares two RECORDED epochs, so an early reset is visible to it
+# and a late one cannot fool it.
+#
+# WHY STEP 0 DOES NOT ALREADY COVER THIS. Step 0 asks a different question —
+# "is the heartbeat fresh enough to CLASSIFY the pane right now" — and answers
+# it with a 30 s window, which is correct for classification and useless here:
+# a heartbeat twenty minutes stale but twenty minutes NEWER THAN THE STAMP is
+# decisive evidence. Guarding a 27-hour stamp with a 30-second liveness horizon
+# is the whole gap. So this check has no freshness requirement, by design.
+#
+# THE EXCLUSIONS, WHICH ARE THE WHOLE RULE. Both were established by COUNTING
+# what these events are on this board, not by reasoning about what their names
+# suggest. The second one was missed by exactly that reasoning and caught by a
+# skeptic who counted the population.
+#
+# `UserPromptSubmit` writes the heartbeat with `state=user_prompt`, and pasting
+# into a still-frozen pane produces exactly that — a record of the OPERATOR
+# acting, never of the model responding. Counting it would invalidate a
+# genuinely suspended pane's stamp on the watcher's own wake paste.
+#
+# `Notification` is NOT admissible on its own, and this is the trap: it sounds
+# like it follows a model turn and overwhelmingly does not. Measured on this
+# board 2026-08-28 — `monitor/.state/notification-raw-captures.jsonl`, 6791
+# payloads: **6766 `idle_prompt`, 25 `permission_prompt`**. `idle_prompt` is
+# Claude Code's "Claude is waiting for your input", which fires from IDLENESS
+# roughly 60 s after the pane goes quiet. A suspended pane is quiet, so it
+# emits one WHILE SUSPENDED. Verified on the very episode this fix was built
+# from: `devred`'s stamp `ts=1787946172` (12:42:52) is followed at
+# `1787946232` — **+60 s** — by `notification_type=idle_prompt`, and the
+# watcher did not observe that pane alive until 12:56:05. All four surviving
+# `turn-failure/*.json` stamps (windows that by construction never completed
+# another turn) are likewise followed by one `idle_prompt` at +60/+60/+59/+46 s.
+#
+# Admitting it would have DESTROYED the structured stamp ~60 s into every
+# genuine suspension and dropped the hold onto the 1c scrape — the path this
+# rule's own coverage boundary disclaims. So `Notification` qualifies ONLY as
+# `permission_prompt`: a permission modal presupposes a tool call the model
+# emitted.
+#
+# Qualifying, then, and only these: `PostToolUse` (a tool call the model
+# emitted actually ran), `PermissionRequest` (same, one step earlier),
+# `Notification` gated on `state=permission_prompt`, and `Stop` (a turn that
+# ended SUCCESSFULLY — a rate-limited turn ends in `StopFailure`, which is a
+# different event and writes no heartbeat).
+#
+# `PreToolUse` was in this list and has been REMOVED as structurally dead: no
+# hook in this repo writes a heartbeat on it (`worker-settings.json` registers
+# `worker-heartbeat.sh` on PostToolUse / Notification / UserPromptSubmit /
+# PermissionRequest / Stop only), so the arm could never fire and could never
+# be reviewed. An unreachable allow-arm is not defence in depth; it is an
+# unfalsifiable claim sitting in an allowlist.
+#
+# WHOSE PANES THIS COVERS. Workers, via the per-window heartbeat — and, since
+# your-org/nexus-code#1155 residual 2, the ORCHESTRATOR, via a different file.
+#
+# `monitor/orchestrator-settings.json` never invokes `worker-heartbeat.sh` at
+# all (its hooks touch marker files and notification-record.sh), so there is no
+# `heartbeat/orchestrator.json` — measured: 0 of 1842 heartbeat files carry
+# `"window":"orchestrator"`. This rule therefore used to fail closed for the
+# orchestrator pane in EVERY case, while that pane IS over-limit stamped
+# (`StopFailure -> over-limit-emit.sh` is registered there; three rate_limit
+# StopFailures on 2026-08-28 alone). For that key the watcher-side post-resume
+# gate was not defence in depth, it was the only cover there is — and it is the
+# key whose emit gate produced the incident's 63 held emits in an hour.
+#
+# THE EVIDENCE THAT EXISTS FOR THAT PANE, and why it is admissible. The
+# orchestrator's hooks touch `monitor/.state/orchestrator-heartbeat`, and they
+# touch it on EXACTLY TWO events: `PostToolUse` and `Stop`. Both are already in
+# the qualifying set above. The two events that would have poisoned it are
+# routed to DIFFERENT files by the same settings block — `UserPromptSubmit`
+# touches `orchestrator-paste-received`, and `Notification` goes to
+# `notification-record.sh` — so the `idle_prompt` finding that shaped the
+# allowlist cannot reach this marker at all.
+#
+# That is a property of the settings file rather than of this rule, so it is
+# not assumed: `watcher/test-settings-json.sh` already asserts that the Stop
+# hook AND the PostToolUse hook touch `orchestrator-heartbeat`, and
+# `watcher/test-over-limit-orchestrator-activity.sh` asserts the complement —
+# that no OTHER event does. If someone adds a third toucher on an event that is
+# not model activity, that suite reddens, which is what makes an mtime usable
+# here at all.
+#
+# WHY AN MTIME IS ACCEPTABLE WHERE IT NORMALLY IS NOT. An mtime carries no
+# event name, so it cannot be filtered after the fact — the filtering has to
+# have happened at WRITE time, and here it did, by construction. The comparison
+# is otherwise identical to the heartbeat path: one recorded epoch against the
+# stamp's own `ts`, strictly newer, no clock and no freshness horizon.
+#
+# WHAT IT STILL DOES NOT COVER. The marker is touched asynchronously
+# (`( … & ) >/dev/null 2>&1`), so its mtime can trail the event by a moment;
+# that shifts the comparison in the SAFE direction (a stamp is held very
+# slightly longer, never released early). And a board whose orchestrator has
+# never completed a tool call or a turn since the state dir was created has no
+# marker at all — which fails closed, exactly as a missing heartbeat does.
+#
+# FAIL CLOSED. No stamp `ts`, no heartbeat, unparseable JSON, or a heartbeat
+# with no `event` field (the jq-less writer in worker-heartbeat.sh omits it)
+# ⇒ return 1, stamp honoured. Absent evidence of recovery is not evidence of
+# recovery; the polarity is deliberately the opposite of the emit gate's,
+# because here the cheap error is holding a stamp one cycle too long and the
+# expensive one is retiring a live suspension.
+#
+# Returns 0 when the stamp is contradicted by post-stamp model activity.
+_over_limit_stamp_superseded_by_activity() {
+    local f="$1" hb="$2" orch_hb="${3:-}" stamp_ts hb_activity hb_event hb_state
+    command -v jq >/dev/null 2>&1 || return 1
+
+    stamp_ts=$(jq -r '.ts // empty' "$f" 2>/dev/null) || return 1
+    [[ "$stamp_ts" =~ ^[0-9]+$ ]] || return 1
+
+    # ORCHESTRATOR FALLBACK (your-org/nexus-code#1155 residual 2). Reached only
+    # when the per-window heartbeat is ABSENT — not merely unusable — AND the
+    # caller supplied the marker, which it does for the orchestrator's own pane
+    # and no other.
+    #
+    # ABSENT, AND THE WORD IS LOAD-BEARING (#1171 F3b). This comment said
+    # "unusable" while the condition below tested `! -f`, which is a claim the
+    # code does not implement — the same defect as R2-B's docstring and the
+    # `--orchestrator-window` comment, and the third instance of it in this PR.
+    # Narrowed to what the code does rather than broadened to what it said,
+    # deliberately: widening the trigger restructures the function that decides
+    # whether a pane is suspended, and that is not a change to rush.
+    #
+    # The residual is bounded and currently unreachable: a heartbeat that EXISTS
+    # but is malformed (unparseable, or missing `last_activity`/`event`) makes
+    # this arm fail closed even though the marker could have answered. For the
+    # orchestrator no such file exists at all — measured, 0 of 1842 heartbeat
+    # files carry `"window":"orchestrator"` — so the gap needs someone to start
+    # writing a malformed one before it can fire. F3b, carried, not fixed here.
+    #
+    # The
+    # marker's mtime is post-model-response activity by construction; see the
+    # header. Its own failures all fall through to the heartbeat path below and
+    # thence to `return 1`, so this arm can only ever RELEASE a stamp that
+    # recorded activity contradicts, never manufacture one.
+    if [[ -n "$orch_hb" ]] && [[ ! -f "$hb" ]]; then
+        local orch_mtime=""
+        if [[ -f "$orch_hb" ]] && [[ -r "$orch_hb" ]]; then
+            orch_mtime=$(stat -c %Y "$orch_hb" 2>/dev/null)                 || orch_mtime=$(stat -f %m "$orch_hb" 2>/dev/null)                 || orch_mtime=""
+        fi
+        if [[ "$orch_mtime" =~ ^[0-9]+$ ]] && (( orch_mtime > stamp_ts )); then
+            return 0
+        fi
+        return 1
+    fi
+
+    [[ -n "$hb" ]] || return 1
+    [[ -f "$hb" ]] || return 1
+    [[ -r "$hb" ]] || return 1
+
+    hb_activity=$(jq -r '.last_activity // empty' "$hb" 2>/dev/null) || return 1
+    [[ "$hb_activity" =~ ^[0-9]+$ ]] || return 1
+    (( hb_activity > stamp_ts )) || return 1
+
+    # The event that produced this heartbeat, plus its mapped state — the
+    # state alone is not enough (it cannot separate an idle_prompt raised by
+    # Notification from one raised by Stop's turn_end token, which map to the
+    # same value), and the event alone is not enough either, which is the
+    # `Notification` finding above. The pair is what the rule needs.
+    hb_event=$(jq -r '.event // empty' "$hb" 2>/dev/null) || return 1
+    hb_state=$(jq -r '.state // empty' "$hb" 2>/dev/null) || hb_state=""
+    case "$hb_event" in
+        PostToolUse|PermissionRequest|Stop) return 0 ;;
+        Notification)
+            # ONLY the permission variant. See the measured counts above.
+            [[ "$hb_state" == "permission_prompt" ]] && return 0
+            return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
 # 0. Heartbeat substrate (issue #74). When the per-window heartbeat
 #    file is fresh, claude's own hook signal is authoritative — it
 #    cuts through renderer ambiguity (paste re-render, mid-spinner,
@@ -2891,6 +4727,12 @@ hb_turn_end_staleness="${turn_end_staleness_override:-$_HEARTBEAT_TURN_END_STALE
 [[ "$hb_turn_end_staleness" =~ ^[0-9]+$ ]] || hb_turn_end_staleness=$_HEARTBEAT_TURN_END_STALENESS_DEFAULT
 hb_async_staleness="${async_staleness_override:-$_HEARTBEAT_ASYNC_STALENESS_DEFAULT}"
 [[ "$hb_async_staleness" =~ ^[0-9]+$ ]] || hb_async_staleness=$_HEARTBEAT_ASYNC_STALENESS_DEFAULT
+# The external-waits horizon rides the same override flag when one is given —
+# a caller that deliberately narrows the async window is entitled to narrow
+# this too, and the suites depend on being able to — but its DEFAULT is the
+# separate, longer constant rather than 60 s (your-org/nexus-code#1220).
+hb_ew_staleness="${async_staleness_override:-$_HEARTBEAT_EXTERNAL_WAITS_STALENESS_DEFAULT}"
+[[ "$hb_ew_staleness" =~ ^[0-9]+$ ]] || hb_ew_staleness=$_HEARTBEAT_EXTERNAL_WAITS_STALENESS_DEFAULT
 
 # Wrapper that refines `idle` into the four-way async classifier.
 # Other states pass through unchanged. The renderer fallback
@@ -2918,26 +4760,50 @@ _finalize_idle_verdict() {
     #                    bg (preserves pre-#455 fixture semantics).
     #   --bg-oldest-start EPOCH → inject the oldest background-shell start
     #                    epoch (the DERIVED episode start) for fixtures.
-    local pt_count=0 pt_cpu=0 pt_reliable=0 pt_oldest=0 pt_infra=0 pt_desc="-"
+    local pt_count=0 pt_cpu=0 pt_reliable=0 pt_oldest=0 pt_infra=0 pt_stale=0 pt_quiesce=0 pt_members="-" pt_desc="-" pt_lj=0
+    # The longjob ledger verdict, read ONCE; and, only when ARMED and the tree
+    # is really walked, the dispatcher's root for the census to leave out.
+    local lj_v="" lj_root=""
+    lj_v=$(_longjob_dispatcher_verdict "$hb_file" "$hb_now")
+    if [[ "$lj_v" == armed\ * && -z "$bg_shells_override" && -z "$bg_cpu_override" ]]; then
+        lj_root=$(_pane_longjob_root "${pane_pid:-}" "$hb_file")
+    fi
     if [[ -n "$bg_shells_override" ]]; then
         pt_count="$bg_shells_override"; pt_reliable=1
         pt_cpu="${bg_cpu_override:-0}"
         pt_oldest="${bg_oldest_start_override:-0}"
         pt_infra="${bg_infra_override:-0}"
+        pt_stale="${bg_stale_override:-0}"
+        pt_quiesce="${bg_quiesce_override:-0}"
+        pt_members="${bg_members_override:--}"
         pt_desc="${bg_cmd_override:--}"
     elif [[ -n "$bg_cpu_override" ]]; then
         pt_cpu="$bg_cpu_override"; pt_reliable=0
         pt_oldest="${bg_oldest_start_override:-0}"
         pt_infra="${bg_infra_override:-0}"
+        pt_stale="${bg_stale_override:-0}"
+        pt_quiesce="${bg_quiesce_override:-0}"
+        pt_members="${bg_members_override:--}"
         pt_desc="${bg_cmd_override:--}"
     else
-        read -r pt_count pt_cpu pt_reliable pt_oldest pt_infra pt_desc \
-            < <(_pane_background_shells "${pane_pid:-}")
+        read -r pt_count pt_cpu pt_reliable pt_oldest pt_infra pt_stale pt_quiesce pt_members pt_desc \
+            < <(_pane_background_shells "${pane_pid:-}" "$lj_root")
     fi
+    [[ -n "$pt_members" ]] || pt_members="-"
+    # `bg_longjob=1` is the RECORD that a root was excluded from every bg_*
+    # field on this line (bundle-2609sk2 F1) — nothing reads it to subtract.
+    # `--bg-longjob` injects the record for fixtures: there `--bg-shells N` is
+    # the census AFTER the exclusion, as it is live.
+    if [[ -n "$bg_longjob_override" ]]; then
+        pt_lj="$bg_longjob_override"
+    elif [[ -n "$lj_root" ]]; then
+        pt_lj=1
+    fi
+    [[ "$pt_lj" =~ ^[0-9]+$ ]] || pt_lj=0
     local out
     out=$(_refine_idle_with_async_signals \
         "${pane_plain:-}" "$hb_file" "$hb_now" "$hb_async_staleness" \
-        "$pt_count" "$pt_reliable")
+        "$pt_count" "$pt_reliable" "$pt_stale" "$hb_ew_staleness" "$lj_v")
     # Split on the first TAB. Refinement output is either
     # `<state>` or `<state>\t<extra>`.
     local raw_extra=""
@@ -2993,8 +4859,70 @@ _finalize_idle_verdict() {
         # protocol-prescribed await loop an "inconsistency", and to NAME the
         # child in the emit instead of reporting a bare count.
         [[ "$pt_infra" =~ ^[0-9]+$ ]] || pt_infra=0
+        # `bg_stale` (your-org/nexus-code#1208): how many of the counted roots
+        # are waiting on an async-run job the AUTHORITY reports `died`. Additive
+        # and reported even when 0, so a consumer can tell "asked, none stale"
+        # apart from "never asked" — the same distinction #1208 is about. When
+        # bg_stale reaches bg_shells the state is no longer working-background,
+        # so THIS branch does not run; the `elif` below then emits a reduced
+        # `bg_shells=` + `bg_stale=` pair so the demotion still carries its
+        # reason. This comment used to end "and this line is not emitted at
+        # all", which was true when written and was left FALSE by F1's own fix
+        # twenty lines below — the same defect F1 was about, in F1's repair
+        # (your-org/nexus-code#1214 D3).
+        [[ "$pt_stale" =~ ^[0-9]+$ ]] || pt_stale=0
         [[ -n "$pt_desc" ]] || pt_desc="-"
-        refined_extra="${refined_extra:+$refined_extra }bg_shells=$pt_count bg_reliable=$pt_reliable bg_cpu=$pt_cpu bg_oldest_start=$pt_oldest bg_infra=$pt_infra bg_cmd=$pt_desc"
+        # `bg_cpu_bp` / `bg_wedged` (your-org/nexus-code#1446): a child whose
+        # ELAPSED greatly exceeds its CPU time is BLOCKED, not computing — that
+        # is exactly what separated three >5h `grep -r … | head` stalls and a
+        # 5h36m `until grep -q` waiter (428 jiffies of CPU) from a real compute
+        # job, and nothing else in this line does: every one of them read
+        # `working-background` throughout. `bg_cpu` is jiffies (100 per CPU
+        # second on every Linux this runs on), so jiffies / elapsed_seconds IS
+        # the percentage; `bg_cpu_bp` carries it in BASIS POINTS (1% = 100) so
+        # the 0.02% instance is a 2 rather than a 0 that reads as "not
+        # measured". `bg_wedged=1` when the episode is at least
+        # NEXUS_BG_WEDGE_MIN_ELAPSED seconds old (default 600) AND below
+        # NEXUS_BG_WEDGE_CPU_BP (default 100, i.e. 1%). Not a kill signal — a
+        # slow shared-filesystem walk can look like this too — but a signal
+        # the watcher can NAME instead of reporting healthy-with-a-job. Both
+        # fields are emitted whenever the episode start is known, so
+        # "measured, not wedged" is distinguishable from "not measured".
+        local bg_cpu_bp="-" bg_wedged=0 _bg_elapsed=0
+        if (( pt_oldest > 0 )) && (( hb_now > pt_oldest )); then
+            _bg_elapsed=$(( hb_now - pt_oldest ))
+            bg_cpu_bp=$(( pt_cpu * 100 / _bg_elapsed ))
+            local _wedge_min="${NEXUS_BG_WEDGE_MIN_ELAPSED:-600}" _wedge_bp="${NEXUS_BG_WEDGE_CPU_BP:-100}"
+            [[ "$_wedge_min" =~ ^[0-9]+$ ]] || _wedge_min=600
+            [[ "$_wedge_bp" =~ ^[0-9]+$ ]] || _wedge_bp=100
+            if (( _bg_elapsed >= _wedge_min )) && (( bg_cpu_bp < _wedge_bp )); then
+                bg_wedged=1
+            fi
+        fi
+        # `bg_quiesce` (see the header): APPENDED LAST so no existing reader
+        # that matches a contiguous run of the fields above is disturbed.
+        [[ "$pt_quiesce" =~ ^[0-9]+$ ]] || pt_quiesce=0
+        refined_extra="${refined_extra:+$refined_extra }bg_shells=$pt_count bg_reliable=$pt_reliable bg_cpu=$pt_cpu bg_oldest_start=$pt_oldest bg_infra=$pt_infra bg_stale=$pt_stale bg_cmd=$pt_desc bg_cpu_bp=$bg_cpu_bp bg_wedged=$bg_wedged bg_members=$pt_members bg_quiesce=$pt_quiesce bg_longjob=$pt_lj"
+    elif (( pt_reliable == 1 )) && [[ "$pt_stale" =~ ^[0-9]+$ ]] && (( pt_stale > 0 )); then
+        # THE VERDICT MUST NOT DESTROY THE EVIDENCE THAT PRODUCED IT
+        # (your-org/nexus-code#1214 skeptic F1). The block above rides on the
+        # `working-background` branch, so when staleness reaches `bg_shells` the
+        # state stops being `working-background` and every `bg_*` field
+        # disappears — INCLUDING `bg_stale`, whose whole documented purpose is to
+        # keep "asked, none stale" distinguishable from "never asked". The field
+        # was therefore absent in precisely the one case this fix exists to
+        # change, and the two readings became indistinguishable again exactly
+        # where the distinction matters. Measured on the live reproducer: the
+        # base classifier printed `bg_cmd=zsh:T=…/async-run`; the fixed one
+        # printed a bare `state=idle`, with nothing to say why.
+        #
+        # So a demotion carries its own reason. Only the two fields that carry
+        # it — the population and how much of it was resolved dead — because the
+        # rest (`bg_cpu`, `bg_oldest_start`) key the orphan-grace machinery,
+        # which is scoped to `working-background` and must NOT be handed a
+        # reading for a state it does not govern.
+        [[ "$pt_count" =~ ^[0-9]+$ ]] || pt_count=0
+        refined_extra="${refined_extra:+$refined_extra }bg_shells=$pt_count bg_stale=$pt_stale"
     fi
 }
 
@@ -3095,6 +5023,22 @@ if _has_blocked_overlay "$pane_plain"; then
     # a security prompt). The kind is what turns "something is blocked" into a
     # diagnosis. Appended as an extra field, so consumers reading `state=`
     # are unaffected (your-org/nexus-code#768).
+    # `auth=login` rides ALONGSIDE `overlay=login`, not instead of it
+    # (your-org/nexus-code#1518). They answer different questions and are read
+    # by different consumers: `overlay=` names which dialog is up, for the
+    # unstick cascade and for the operator; `auth=` is the axis the watcher's
+    # emit hold keys on, so the hold never has to enumerate overlay kinds — a
+    # new login-flow step whose `overlay=` naming has rotted still carries
+    # `auth=login` as long as `_dialog_is_login` recognises one of its three
+    # disjuncts, and still reads `state=blocked` even if none of them do.
+    #
+    # Set here rather than left to `emit`'s lazy derivation, and it OVERRIDES an
+    # `expired` reading: a `/login` dialog raised in response to an expiry shows
+    # both, and `login` is the one that decides whether to paste. The dialog is
+    # the LIVE surface; the expiry is the scrollback reason it is up.
+    if [[ "${BLOCKED_OVERLAY_KIND}" == "login" ]]; then
+        pane_auth=login
+    fi
     emit blocked "overlay=${BLOCKED_OVERLAY_KIND}"
     exit 0
 fi
@@ -3115,6 +5059,16 @@ if [[ -n "$ol_file" ]] && [[ -f "$ol_file" ]]; then
         # through — the renderer scrape below re-detects a genuine
         # ongoing suspension; a recovered pane classifies normally.
         rm -f "$ol_file" 2>/dev/null || true
+    elif _over_limit_stamp_superseded_by_activity "$ol_file" "$hb_file" "$orch_hb_file"; then
+        # CONTRADICTED, not expired (your-org/nexus-code#1141). The session has
+        # run the model since this stamp was written, so the limit it records
+        # has lifted. Deleting is safe and not merely an optimisation: the
+        # condition is monotone — no future read can make a stamp older than
+        # observed activity true again — so leaving it would re-pose the same
+        # question every 60 s for as long as the turn lasts, which is the loop
+        # this closes. Fall through; the renderer scrape below still catches a
+        # genuine ongoing suspension from the live pane text.
+        rm -f "$ol_file" 2>/dev/null || true
     else
         _emit_over_limit_from_stamp "$ol_file"
         exit 0
@@ -3126,11 +5080,66 @@ fi
 #     input row; detected before the input-row search because the
 #     chevron is absent in this state. Now serves as a fallback for
 #     panes that didn't fire the StopFailure hook under our watch.
+#
+#     CONTRADICTED BY LIVE ACTIVITY IN THE SAME CAPTURE
+#     (your-org/nexus-code#1155 residual 1). `#1147` taught the STRUCTURED
+#     stamp at 1b to yield to post-stamp model activity; this scrape had no
+#     `ts` to compare against and so kept classifying a working pane from a
+#     stale banner sitting in the bottom rows.
+#
+#     THE ASYMMETRY THAT WAS THE BUG. This branch emitted and EXITED — while
+#     the block ~10 lines below, reached only because this one did not fire,
+#     asks TWO questions of the very same `$pane_plain` and treats either as
+#     decisive proof the pane is alive: a queued-message placeholder (input
+#     pending AND a turn in flight) and an active token counter on the spinner
+#     row. Its own comment calls the counter "a strong `claude is alive and
+#     generating` marker independent of chevron presence". So the same bytes
+#     that read `over-limit` here read `busy` six lines later, and which
+#     verdict a live-but-stale-bannered pane got was decided purely by
+#     evaluation order.
+#
+#     NOTHING NEW IS RECOGNISED HERE. Both probes are the file's existing
+#     detectors, called on the same text with the same bottom anchor the
+#     no-input-row branch uses — deliberately, because inventing a third
+#     renderer heuristic to adjudicate the other two is how a classifier
+#     acquires a rule nobody can falsify. The fall-through lands in exactly
+#     that branch (the banner has replaced the input row, so `_find_input_row`
+#     finds none) and it re-asks these questions itself, so the pane is
+#     classified by one code path rather than two disagreeing ones.
+#
+#     THE POLARITY IS DELIBERATE AND IT IS THE CONSERVATIVE ONE. A genuinely
+#     suspended pane is QUIET — that is the property `#1147`'s `Notification`
+#     analysis already rests on (`idle_prompt` fires FROM IDLENESS ~60 s after
+#     a pane goes quiet, which is why a suspended pane emits one). It paints no
+#     advancing token counter, because a rate-limited turn is precisely the one
+#     that is not generating. So the evidence required to release is evidence a
+#     real suspension cannot produce, and absence of it holds the verdict —
+#     leaving the expensive error (retiring a live suspension) guarded and the
+#     cheap one (holding one cycle longer) as the default.
 if _detect_over_limit "$pane_plain"; then
-    reset_at=$(_extract_over_limit_reset "$pane_plain") || reset_at=unknown
-    [[ -n "$reset_at" ]] || reset_at=unknown
-    emit over-limit "reset_at=$reset_at"
-    exit 0
+    # Only what was painted BELOW the banner counts — see
+    # `_over_limit_after_banner`. Scanning the whole capture reads the dying
+    # turn's own spinner as proof of life and releases a real suspension.
+    _ol_after=$(_over_limit_after_banner "$pane_plain")
+    _ol_after_ln=$(wc -l <<<"$_ol_after")
+    if [[ -n "${_ol_after//[[:space:]]/}" ]] \
+        && { _detect_queued_message "$_ol_after" \
+             || _detect_busy "$_ol_after" "$_ol_after_ln"; }; then
+        : # contradicted — fall through to the shared live-pane classifier
+    else
+        reset_at=$(_extract_over_limit_reset "$pane_plain") || reset_at=unknown
+        [[ -n "$reset_at" ]] || reset_at=unknown
+        # `limit=` is a FIELD, not a new state token, and that is deliberate:
+        # every consumer already treats `over-limit` as never-kill, so a field
+        # needs no consumer audit while a brand-new state token can be dropped
+        # by a permissive default arm (the `throttled=1` argument, #1340).
+        # NOT `local` — this branch is in the script BODY, not a function, and
+        # `local` there is an error that surfaces only as a mis-shaped emit.
+        ol_flavour=$(_extract_over_limit_flavour "$pane_plain") || ol_flavour=unknown
+        [[ -n "$ol_flavour" ]] || ol_flavour=unknown
+        emit over-limit "reset_at=$reset_at" "limit=$ol_flavour"
+        exit 0
+    fi
 fi
 
 # 2. Locate the Claude input row (line containing `❯<NBSP>`). Use the
@@ -3166,7 +5175,14 @@ if [[ -z "$input_row" ]]; then
         exit 0
     fi
     if _detect_busy "$pane_plain" "$bottom_ln"; then
-        emit busy
+        # `throttled=1` follows the `queued=1` precedent exactly (#603/#607):
+        # a SUB-CONDITION of busy carried as a FIELD, not as a new state
+        # token. See the note at the main decision ladder for why.
+        if _detect_throttled "$pane_plain" "$bottom_ln"; then
+            emit busy throttled=1
+        else
+            emit busy
+        fi
         exit 0
     fi
     if [[ -n "$pane_pid" ]] && _pane_has_live_claude "$pane_pid"; then
@@ -3250,7 +5266,11 @@ fi
 # never trample), and before the busy/idle ladder so the queued fact
 # cannot be lost to an idle-looking box.
 if _detect_queued_message "$pane_plain" && (( has_bright == 0 )); then
-    emit busy queued=1
+    if _detect_throttled "$pane_plain" "$input_ln"; then
+        emit busy queued=1 throttled=1
+    else
+        emit busy queued=1
+    fi
     exit 0
 fi
 
@@ -3267,7 +5287,36 @@ fi
 if (( has_bright )); then
     emit user-typing "$input_field"
 elif (( busy )); then
-    emit busy "$input_field"
+    # WHY `busy throttled=1` AND NOT A NEW STATE TOKEN (your-org/nexus-code
+    # #1340 asked for one, e.g. `working-throttled`; this is the deliberate
+    # deviation, and the requirement the issue actually states — the pane
+    # must not read `idle`, and `bk_pane_kill_authorized` must refuse it —
+    # is met either way).
+    #
+    # The argument is already written down twelve lines into
+    # `_detect_queued_message`, for the identical shape: every existing
+    # consumer already treats `busy` as never-kill and never-paste, so a
+    # sub-condition carried as a FIELD needs no consumer audit AND "no
+    # permissive default can be inherited by a brand-new state token."
+    #
+    # That last clause is the whole point, and it is this bundle's own
+    # subject. A new token is not free: `_idle_probe.sh` counts idle states
+    # through an exact-token allowlist, and CLAUDE.md records that a state
+    # nobody enumerated is exactly how a live worker got retired on
+    # 2026-06-15. Introducing a token to FIX a kill-authorisation defect,
+    # by a mechanism whose documented failure mode is kill-authorisation
+    # defects, is the wrong trade when a field carries the same
+    # information.
+    #
+    # `throttled` is nevertheless PRE-REGISTERED in `_bookkeeping.sh`'s
+    # `_BK_ACTIVE_STATES`, exactly as `queued` is and for the same stated
+    # reason: if a future revision promotes the field to a state, the gate
+    # already REFUSES instead of inheriting a permit.
+    if _detect_throttled "$pane_plain" "$input_ln"; then
+        emit busy "$input_field" throttled=1
+    else
+        emit busy "$input_field"
+    fi
 elif (( has_autosuggest )); then
     # An autosuggest ghost is a RENDERING of the input row. It says nothing
     # about whether the process tree has live children, and ghost text renders

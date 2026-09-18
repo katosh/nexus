@@ -1,0 +1,6 @@
+# your-org/nexus-code#1264 R1. Every PR appends to CHANGELOG.md, so two PRs
+# merged in sequence conflict on adjacent lines with no semantic conflict at
+# all. `merge=union` (a built-in git merge driver) keeps both sides' lines.
+# It is ONLY correct for an append-only ledger; do not widen it to a file
+# whose lines carry order-dependent meaning.
+CHANGELOG.md merge=union

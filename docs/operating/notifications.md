@@ -49,7 +49,7 @@ monitor/notify.sh "<title>" "<body>"
                   [--require-delivery] [--quiet]
 ```
 
-Round-trip ~0.4 s per channel; `--max-time 5|6` caps per request. Silent no-op when nothing is configured, so callers in the monitor loop need no conditional.
+Round-trip ~0.4 s per channel; each request carries its own `curl --max-time` cap — 10 s for Pushover, 15 s for an ntfy upload with `--image`, 5 s for a plain ntfy post (`monitor/notify.sh:145,177,181`). Silent no-op when nothing is configured, so callers in the monitor loop need no conditional.
 
 Pass `--require-delivery` for manual probes; the helper then exits nonzero on total failure. Exit codes: `0` ok or silently-skipped, `1` usage, `2` `--require-delivery` set with no configured backend, `3` `--require-delivery` set and every backend failed, `4` missing `curl` / `python3`.
 

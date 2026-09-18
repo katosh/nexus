@@ -31,6 +31,10 @@
 #                `!=`/`==`, so a VANISHED assertion reddens (#807).
 #   count=floor  compares with `-lt`/`-gt`. Catches a collapse below the floor;
 #                a suite can clear the floor and still under-assert.
+#   count=subset an exact comparison, but against a NAMED SUBSET of the
+#                suite's assertions (`EXPECTED_SURVIVAL_ASSERTIONS=4` over 58):
+#                a vanished assertion OUTSIDE the subset reddens nothing.
+#                Credited below exact on purpose (your-org/nexus-code#1365).
 #   count=none   nothing pins how much ran.
 #
 # A file is omitted from this manifest only when it is `ledger=yes` AND
@@ -75,10 +79,23 @@
 # Checked by monitor/watcher/test-summary-honesty-manifest.sh
 #
 # <path>::ledger=<yes|no>::count=<exact|floor|none>
+#
+# THE 17 HAND-ROLLED-TALLY ROWS (your-org/nexus-code#915) are interleaved below
+# in sorted position. They were NOT newly written and did NOT arrive by merge:
+# they were always here and always unguarded, and the guard could not SEE them
+# because its selector matched footer STRINGS while theirs read
+# `passed=$PASS failed=$FAIL`. #915 removed the proxy — every tracked
+# *test-*.sh is now in the population unless declared a non-suite — and these
+# appeared at their true level. Recording them is not an exemption; it is the
+# first time their deficiency has been on the record. Each still needs helper
+# adoption plus an EXPECTED-count guard, its own author's work.
+#
 monitor/test-ci-head-attempts.sh::ledger=no::count=none
 monitor/test-ci-signal-step-contract.sh::ledger=no::count=none
 monitor/test-ci-trigger-audit.sh::ledger=no::count=none
+monitor/test-coldbuild-guard.sh::ledger=no::count=none
 monitor/test-conflict-marker-lint.sh::ledger=no::count=none
+monitor/test-interactive-sessions.sh::ledger=no::count=none
 monitor/test-interpreter-parity.sh::ledger=no::count=none
 monitor/test-lint-citations.sh::ledger=no::count=none
 monitor/test-lint-errexit-branch.sh::ledger=no::count=none
@@ -90,10 +107,15 @@ monitor/test-public-mirror-scrub.sh::ledger=no::count=none
 monitor/test-retire-preflight.sh::ledger=no::count=none
 monitor/test-service-log-mode.sh::ledger=no::count=none
 monitor/test-slow-band-drift.sh::ledger=no::count=none
+monitor/test-slow-band-step-contract.sh::ledger=no::count=none
 monitor/watcher/test-administrative-paste.sh::ledger=no::count=none
-monitor/watcher/test-assert-bot-author.sh::ledger=no::count=none
+monitor/watcher/test-agent-delivery-address-space.sh::ledger=yes::count=none
+monitor/watcher/test-assert-bot-author.sh::ledger=no::count=exact
 monitor/watcher/test-assert-shims-wrapped.sh::ledger=no::count=none
-monitor/watcher/test-async-launch-detect.sh::ledger=no::count=none
+monitor/watcher/test-assertion-accounting.sh::ledger=yes::count=none
+# arrived on w223 from your-org/nexus-code#1458 unrecorded; recorded at its
+# measured level by #1464's enrolment — its author owns raising it to count=exact
+monitor/watcher/test-assets-untracked.sh::ledger=yes::count=none
 monitor/watcher/test-bash-env-chain-guard.sh::ledger=no::count=none
 monitor/watcher/test-bash-env-cnf-handler.sh::ledger=no::count=none
 monitor/watcher/test-bash-footgun-guard.sh::ledger=no::count=exact
@@ -111,11 +133,19 @@ monitor/watcher/test-bot-mentions.sh::ledger=no::count=none
 monitor/watcher/test-calibrate-pressure-thresholds.sh::ledger=yes::count=none
 monitor/watcher/test-case-skip-propagation.sh::ledger=yes::count=none
 monitor/watcher/test-cause-classify.sh::ledger=no::count=none
+monitor/watcher/test-cc-auto-update.sh::ledger=no::count=none
 monitor/watcher/test-cc-gate.sh::ledger=no::count=none
 monitor/watcher/test-cc-harness-waitfor-diagnostic.sh::ledger=no::count=none
+monitor/watcher/test-cc-restart-watchdog-loop.sh::ledger=no::count=none
+monitor/watcher/test-cc-restart-watchdog-verify.sh::ledger=no::count=none
+monitor/watcher/test-cc-update.sh::ledger=no::count=none
+monitor/watcher/test-cc-version.sh::ledger=no::count=none
+monitor/watcher/test-ci-diag-budget.sh::ledger=yes::count=none
 monitor/watcher/test-claude-loop.sh::ledger=no::count=none
 monitor/watcher/test-claude-md-618-remedies.sh::ledger=no::count=exact
+monitor/watcher/test-claude-md-block-coverage.sh::ledger=no::count=exact
 monitor/watcher/test-claude-md-lstree-pathspec.sh::ledger=no::count=none
+monitor/watcher/test-claude-md-window-key-vocabulary.sh::ledger=no::count=exact
 monitor/watcher/test-clone-drift.sh::ledger=yes::count=none
 monitor/watcher/test-cold-boot-manifest.sh::ledger=no::count=none
 monitor/watcher/test-comment-surface.sh::ledger=no::count=none
@@ -144,6 +174,10 @@ monitor/watcher/test-emit-suppression.sh::ledger=no::count=none
 monitor/watcher/test-engage-long-exchange.sh::ledger=no::count=none
 monitor/watcher/test-engage-statemachine.sh::ledger=no::count=none
 monitor/watcher/test-engage-stress.sh::ledger=no::count=none
+# arrived on w223 from your-org/nexus-code#1445 unrecorded; recorded at its
+# measured level by #1464's enrolment — its author owns raising it to count=exact
+monitor/watcher/test-entry-signals.sh::ledger=yes::count=none
+monitor/watcher/test-entry.sh::ledger=no::count=none
 monitor/watcher/test-filter-skip-marker.sh::ledger=no::count=none
 monitor/watcher/test-filter-to-user-author.sh::ledger=no::count=none
 monitor/watcher/test-flock-fd-cloexec.sh::ledger=no::count=none
@@ -154,7 +188,9 @@ monitor/watcher/test-full-state-clock-only-change.sh::ledger=no::count=none
 monitor/watcher/test-full-state-emit-noise.sh::ledger=no::count=none
 monitor/watcher/test-full-state-idle-backoff.sh::ledger=no::count=none
 monitor/watcher/test-full-state-suppression.sh::ledger=no::count=none
+monitor/watcher/test-functional-check.sh::ledger=no::count=none
 monitor/watcher/test-gh-capable.sh::ledger=no::count=exact
+monitor/watcher/test-gh-identity.sh::ledger=no::count=none
 monitor/watcher/test-gh-shim.sh::ledger=no::count=none
 monitor/watcher/test-gh-wrapper.sh::ledger=no::count=none
 monitor/watcher/test-graphql-backoff-bound.sh::ledger=yes::count=none
@@ -162,6 +198,7 @@ monitor/watcher/test-graphql-gate.sh::ledger=no::count=none
 monitor/watcher/test-graphql-search-paged.sh::ledger=yes::count=none
 monitor/watcher/test-guard-closure-boundary.sh::ledger=yes::count=none
 monitor/watcher/test-guards-for-diff.sh::ledger=yes::count=none
+monitor/watcher/test-hosting-migration.sh::ledger=no::count=none
 monitor/watcher/test-idle-classification.sh::ledger=no::count=none
 monitor/watcher/test-idle-probe-interrupted.sh::ledger=no::count=none
 monitor/watcher/test-idle-probe.sh::ledger=no::count=none
@@ -183,6 +220,7 @@ monitor/watcher/test-integration/test-wrapup-retain-close.sh::ledger=yes::count=
 monitor/watcher/test-jupyter-service.sh::ledger=yes::count=none
 monitor/watcher/test-jupyter-up-refusal.sh::ledger=no::count=none
 monitor/watcher/test-jupyter-up-timeout.sh::ledger=yes::count=none
+monitor/watcher/test-known-local-red.sh::ledger=yes::count=none
 monitor/watcher/test-lab-context.sh::ledger=no::count=none
 monitor/watcher/test-labsh-phantom-adopt.sh::ledger=yes::count=none
 monitor/watcher/test-labsh-reap-stale-builds.sh::ledger=no::count=none
@@ -233,16 +271,18 @@ monitor/watcher/test-ng-wrap-up-reply-to.sh::ledger=no::count=none
 monitor/watcher/test-ng-wrap-up.sh::ledger=no::count=none
 monitor/watcher/test-no-sandbox-gate.sh::ledger=no::count=none
 monitor/watcher/test-notification-record.sh::ledger=no::count=none
+monitor/watcher/test-orchestrator-liveness-probe.sh::ledger=no::count=none
+monitor/watcher/test-orchestrator-liveness.sh::ledger=no::count=none
+monitor/watcher/test-orchestrator-session-pin.sh::ledger=no::count=none
 monitor/watcher/test-over-limit-emit.sh::ledger=no::count=none
 monitor/watcher/test-over-limit-reset-clock.sh::ledger=yes::count=none
 monitor/watcher/test-over-limit.sh::ledger=yes::count=none
 monitor/watcher/test-pane-cache.sh::ledger=no::count=none
 monitor/watcher/test-pane-state-boot-absent.sh::ledger=no::count=exact
-monitor/watcher/test-pane-state-wrapped-idle.sh::ledger=no::count=none
 monitor/watcher/test-pane-state.sh::ledger=no::count=none
 monitor/watcher/test-paste-bracketed.sh::ledger=no::count=none
 monitor/watcher/test-paste-content-marker.sh::ledger=no::count=none
-monitor/watcher/test-paste-dead-pane-guard.sh::ledger=no::count=none
+monitor/watcher/test-paste-dead-pane-guard.sh::ledger=no::count=subset
 monitor/watcher/test-paste-epoch-granularity.sh::ledger=no::count=none
 monitor/watcher/test-paste-epoch-prepaste.sh::ledger=no::count=none
 monitor/watcher/test-paste-followup.sh::ledger=no::count=none
@@ -258,6 +298,7 @@ monitor/watcher/test-reemit-two-tier.sh::ledger=no::count=none
 monitor/watcher/test-reemit-until-acked.sh::ledger=no::count=none
 monitor/watcher/test-remote-bind-guard.sh::ledger=yes::count=none
 monitor/watcher/test-remote-carrier-authline.sh::ledger=yes::count=none
+monitor/watcher/test-remote-connect-bound.sh::ledger=yes::count=none
 monitor/watcher/test-remote-enroll.sh::ledger=yes::count=none
 monitor/watcher/test-remote-forced-command.sh::ledger=yes::count=none
 monitor/watcher/test-remote-identity-health.sh::ledger=yes::count=none
@@ -268,6 +309,7 @@ monitor/watcher/test-remote-self-enroll.sh::ledger=yes::count=none
 monitor/watcher/test-remote-service-log.sh::ledger=yes::count=none
 monitor/watcher/test-remote-service.sh::ledger=yes::count=none
 monitor/watcher/test-remote-source-enforcement.sh::ledger=yes::count=none
+monitor/watcher/test-remote-sshd-keys-gone.sh::ledger=yes::count=none
 monitor/watcher/test-reports-autoroll.sh::ledger=no::count=none
 monitor/watcher/test-reports-cache-stable.sh::ledger=no::count=none
 monitor/watcher/test-reports-roll.sh::ledger=no::count=none
@@ -275,7 +317,10 @@ monitor/watcher/test-request-channel.sh::ledger=no::count=none
 monitor/watcher/test-requests-delivery-stamp.sh::ledger=no::count=none
 monitor/watcher/test-requests-inbox.sh::ledger=no::count=none
 monitor/watcher/test-respawn-async.sh::ledger=no::count=none
+monitor/watcher/test-respawn-loop-guard.sh::ledger=no::count=none
+monitor/watcher/test-respawn-loop-integration.sh::ledger=no::count=none
 monitor/watcher/test-respawn.sh::ledger=no::count=none
+monitor/watcher/test-root-pinning-residuals.sh::ledger=yes::count=none
 monitor/watcher/test-run-tests-bounded.sh::ledger=no::count=none
 monitor/watcher/test-scheduler-priority-queue.sh::ledger=no::count=none
 monitor/watcher/test-secondary-clone-state.sh::ledger=no::count=none
@@ -291,11 +336,13 @@ monitor/watcher/test-snapshot-github.sh::ledger=no::count=none
 monitor/watcher/test-snapshot-mentions.sh::ledger=no::count=none
 monitor/watcher/test-snapshot-tmux-filter.sh::ledger=no::count=none
 monitor/watcher/test-spawn-fresh-orchestrator.sh::ledger=no::count=none
+monitor/watcher/test-spawn-freshness-reconcile.sh::ledger=yes::count=none
 monitor/watcher/test-spawn-pathfront.sh::ledger=no::count=none
 monitor/watcher/test-spawn-shape-manifest.sh::ledger=no::count=exact
 monitor/watcher/test-spawn-worker-cwd.sh::ledger=no::count=exact
 monitor/watcher/test-spawn-worker-reply-to.sh::ledger=no::count=none
 monitor/watcher/test-spawn-worker-resume.sh::ledger=no::count=none
+monitor/watcher/test-spawn-worker-trust-seed.sh::ledger=no::count=exact
 monitor/watcher/test-spawn-worker.sh::ledger=no::count=none
 monitor/watcher/test-startup-window-signal.sh::ledger=no::count=none
 monitor/watcher/test-stub-claude-manifest.sh::ledger=no::count=none
@@ -304,6 +351,7 @@ monitor/watcher/test-svc.sh::ledger=no::count=none
 monitor/watcher/test-target-absent.sh::ledger=no::count=none
 monitor/watcher/test-target-window-live.sh::ledger=no::count=none
 monitor/watcher/test-task-registration-table.sh::ledger=no::count=none
+monitor/watcher/test-textguard-lint.sh::ledger=yes::count=none
 monitor/watcher/test-tmux-lookup-sigpipe.sh::ledger=no::count=none
 monitor/watcher/test-tmux-window-resolver.sh::ledger=no::count=exact
 monitor/watcher/test-trash-install.sh::ledger=no::count=none
@@ -362,3 +410,40 @@ monitor/watcher/test-watcher-liveness-trichotomy.sh::ledger=yes::count=none
 monitor/watcher/test-watcher-singleton-groups.sh::ledger=yes::count=none
 monitor/watcher/test-watcher-supervise.sh::ledger=yes::count=none
 monitor/watcher/test-write-probe.sh::ledger=yes::count=none
+monitor/watcher/test-heartbeat-schema-agreement.sh::ledger=no::count=none
+monitor/watcher/test-ng-close-set.sh::ledger=yes::count=none
+monitor/watcher/test-ng-stranded-branches.sh::ledger=no::count=none
+monitor/watcher/test-worker-floor-content.sh::ledger=no::count=none
+# DELIBERATELY EMPTY — and that is the deliverable, not a gap.
+#
+# summary-honesty.manifest's own header states the rule for a suite being ADDED
+# by the author who is adding it:
+#
+#     YOU ARE ADDING THE SUITE. Route it through `th_summary_and_exit` and give
+#     it an exact count guard. Do NOT append a line — appending is opting your
+#     own new code out of the standard, which is the whole thing this file
+#     exists to stop.
+#
+# monitor/watcher/test-gh-stub-contract.sh does both:
+#
+#   ledger=yes    it sources _test_helpers.sh and ends in `th_summary_and_exit`,
+#                 so a FAIL counted inside a subshell cannot be swallowed.
+#   count=exact   `EXPECTED_ASSERTIONS=28`, compared with `==` immediately
+#                 before the summary, so a VANISHED assertion reddens rather
+#                 than shrinking the total in silence (your-org/nexus-code#807).
+#
+# A file is omitted from that manifest ONLY when it is ledger=yes AND
+# count=exact. This suite is, so it must not appear — and if a later edit
+# weakens either axis, the correct response is to restore the axis, never to
+# add a row here.
+#
+# VERIFIED, not asserted: with the suite present and unlisted,
+# `bash monitor/watcher/test-summary-honesty-manifest.sh` is GREEN. The run and
+# its counts are recorded in legC-VERIFY.md §4.
+# ARRIVED BY MERGE (your-org/nexus-code#1445, w222 @ 741191c8): recorded at its
+# measured protection level so the corpus and this record agree; its author
+# raises it to count=exact.
+monitor/watcher/test-integration/test-realmodel-longjob-wake.sh::ledger=no::count=none
+monitor/watcher/test-longjob-plugin-arming.sh::ledger=no::count=none
+monitor/watcher/test-longjob-watch.sh::ledger=no::count=none
+monitor/watcher/test-pane-state-longjob-discount.sh::ledger=no::count=none

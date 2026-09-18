@@ -289,10 +289,37 @@ classify_ssh_rc() {
 already_emitted() { [ -n "${sentinel:-}" ] && [ -e "$sentinel" ]; }
 mark_emitted()    { [ -n "${sentinel:-}" ] && : > "$sentinel"; }
 
+# emit_already_emitted <kind> — THE SENTINEL IS A RESULT, NOT A SILENCE.
+#
+# This used to log one line to STDERR and exit 0 with EMPTY STDOUT. That is
+# correct once-only-event semantics and an unreadable signal: an agent that
+# re-watches an id it already consumed sees `exit 0, no output`, which is
+# byte-identical to what a LOST reply would look like. A success shaped exactly
+# like a loss is the failure class this whole toolchain is built to avoid,
+# arriving from the other side — so make the state REPORTABLE:
+#
+#   * a terminal `state=already-emitted` line on STDOUT, so the two cases are
+#     separable by a machine and not only by a human reading a log;
+#   * a DISTINCT exit code (4), so they are separable without parsing at all;
+#   * the sentinel PATH in the line, so the operator can see what to remove;
+#   * `note=` naming which terminal kind was already delivered.
+#
+# To deliberately re-deliver: pass --re-emit (nexus-reply-watch), or remove the
+# named sentinel file. Neither re-runs the request; both re-read the reply that
+# is already on the server.
+emit_already_emitted() {
+    _k="${1:-terminal}"
+    log "$_k for id=$id already emitted (sentinel present) — not re-emitting"
+    printf '%s: state=already-emitted id=%s note=%s-already-delivered sentinel=%s ts=%s\n' \
+        "$PROG" "$id" "$_k" "${sentinel:-none}" "$(utc_now)"
+    printf '%s: re-deliver with --re-emit, or remove the sentinel above.\n' "$PROG" >&2
+    exit 4
+}
+
 # ---- shared terminal emitters (compose → sentinel → deliver → exit) ----
 # emit_replied <bodyfile> — length-framed reply body, exit 0.
 emit_replied() {
-    if already_emitted; then log "terminal reply for id=$id already emitted — no re-emit"; exit 0; fi
+    if already_emitted; then emit_already_emitted reply; fi
     compose_reply replied "$1"
     mark_emitted
     deliver
@@ -300,7 +327,7 @@ emit_replied() {
 }
 # emit_failed <reason> <detail> — status line, no body, exit 2.
 emit_failed() {
-    if already_emitted; then log "terminal failure for id=$id already emitted — no re-emit"; exit 2; fi
+    if already_emitted; then emit_already_emitted failure; fi
     compose_status failed "reason=$1" "detail=\"$2\""
     mark_emitted
     deliver

@@ -13,6 +13,39 @@
 # the human verdict. `test-stub-claude-manifest.sh` fails when 1-4 drift from the
 # classifier, so a NEW fixture that stubs `claude` lands here unclassified and red.
 #
+# COLUMN 5 IS NOT FREE-FORM — IT IS ENTAILED BY COLUMNS 2-3 (your-org/nexus-code#1076).
+# The verdict used to be checked for MEMBERSHIP in the set above and nothing more,
+# so a recognised-but-WRONG verdict passed — and the blind direction was the
+# permissive one: relabelling `test-integration/_harness.sh` from `exposed` to
+# `pinned` deleted the only rule enforced about the repo's single genuinely
+# exposed site while every assertion still passed. The closure now asserted:
+#
+#   exposed      => path + no-claude-bin + guarded
+#   no-resolver  => path + no-claude-bin, AND a dated `reach=0` (its whole evidence)
+#   pinned       => local OR claude-bin  — `pinned` is structurally impossible
+#                   for a path+no-claude-bin fixture
+#   selftest     => this suite's own row, and no other. The exemption is pinned to
+#                   one path so it cannot become an escape hatch that re-opens
+#                   `#1076` by another spelling.
+#   anything else => REFUSED (default-deny, not a permissive fall-through)
+#
+# COLUMN 6: A STATED MEASUREMENT MUST NAME THE BLOB IT WAS TAKEN ON
+# (your-org/nexus-code#1241). `reach` is a property of a BLOB, so a bare
+# `reach=N` asserts something about a tree nobody named and rots silently — a
+# stated `reach=25` measured 29 ten commits later, and nothing noticed. Required
+# form, enforced:
+#
+#   reach=<N> @blob <sha>          as in the test-spawn-worker.sh row below.
+#
+# The shas below were DERIVED FROM THIS FILE'S OWN HISTORY — for each row, the
+# blob its path had at the commit that first stated that row's current `reach`
+# value — not invented and not back-filled with today's blob, which would have
+# asserted measurements nobody took. Consequently many rows are HONESTLY STALE
+# today; the suite names them on every run rather than failing, because this repo
+# ships no instrument that re-derives `reach`, all 36 listed files were touched in
+# the last 90 days (293 commits), and a red whose cheapest resolution is to bump a
+# sha without re-measuring manufactures false provenance. Re-measure, then re-date.
+#
 # THE AXIS. `monitor/_claude-bin.sh` resolves `$CLAUDE_BIN` -> then
 # `$NEXUS_ROOT/node_modules/.bin/claude` -> then PATH. The `#746` hazard
 # (`locals-env.sh` re-fronting `$NEXUS_LOCALS/bin` via BASH_ENV) can only bite at
@@ -41,33 +74,45 @@
 # it is absent below. The two genuinely exposed sites are the one `#759` already
 # fixed and `test-integration/_harness.sh`, which the list does not contain.
 #
-monitor/watcher/test-bootstrap-claude-install.sh	local	claude-bin	unguarded	pinned	Passes CLAUDE_BIN explicitly per run and drives the resolver's fail-loud arm; reach=0 (bootstrap stubbed).
-monitor/watcher/test-cc-auto-update.sh	path	no-claude-bin	unguarded	no-resolver	Creates $root/claude for the cc-auto-update version probe, selected via CC_AUTO_CLAUDE_BIN, not _claude-bin.sh; reach=0.
-monitor/watcher/test-cc-restart-watchdog-loop.sh	local	no-claude-bin	unguarded	pinned	Stub at $root/node_modules/.bin/claude under its own root; step 2 beats PATH; reach=0.
-monitor/watcher/test-cc-restart-watchdog-verify.sh	local	no-claude-bin	unguarded	pinned	Stub at $root/node_modules/.bin/claude under its own root; step 2 beats PATH; reach=0.
-monitor/watcher/test-claude-loop.sh	path	claude-bin	unguarded	pinned	Passes CLAUDE_BIN=$STUB_BIN/claude on every invocation; measured reach=10, all resolving to that stub via step 1.
-monitor/watcher/test-entry.sh	path	no-claude-bin	unguarded	no-resolver	Stub exists so a pane process is NAMED claude for entry.sh's liveness walk; nothing spawns it through the resolver; reach=0.
-monitor/watcher/test-gh-identity.sh	local	no-claude-bin	unguarded	pinned	Empty node_modules/.bin/claude only so a link-nexus-tools precondition holds; step 2; reach=0.
-monitor/watcher/test-install-claude-local.sh	local	no-claude-bin	unguarded	pinned	The npm symlink IS the artifact under test; step 2 path by definition; reach=0.
-monitor/watcher/test-install-shell-hook.sh	path	no-claude-bin	unguarded	no-resolver	Fake locals/bin/claude proves the rc hook puts `claude` on PATH by name; asserts PATH resolution directly, never _claude-bin.sh; reach=0.
-monitor/watcher/test-instance-heartbeat.sh	local	no-claude-bin	unguarded	pinned	Stub at node_modules/.bin/claude as a spawn precondition; step 2; reach=0.
-monitor/watcher/test-instance-lock.sh	local	no-claude-bin	unguarded	pinned	Stub at node_modules/.bin/claude as a spawn precondition; step 2; reach=0.
+monitor/watcher/test-agent-delivery-address-space.sh	path	claude-bin	unguarded	pinned	Passes CLAUDE_BIN=$WORK/bin/claude on every spawn (the single spawn() helper is the only invocation path), so step 1 decides before PATH is consulted and the #746 re-fronting cannot bite; the stub exists only because CI has no claude and spawn-worker.sh refuses without one.
+monitor/watcher/test-bootstrap-claude-install.sh	local	claude-bin	unguarded	pinned	Passes CLAUDE_BIN explicitly per run and drives the resolver's fail-loud arm; reach=0 @blob f47ba02 @127ff1f (bootstrap stubbed).
+monitor/watcher/test-cc-auto-update.sh	local	no-claude-bin	unguarded	pinned	Since #1002 (w239 bundle) make_root plants a pin-following stub at $root/node_modules/.bin/claude under its own fixture root (the drift assertion needs the resolver's own answer), so step 2 beats PATH; the older $root/claude via CC_AUTO_CLAUDE_BIN remains for the verbs that pass it. Was path/no-resolver before #1002; re-classified local/pinned at the bundle head.
+monitor/watcher/test-cc-gate.sh	local	no-claude-bin	unguarded	pinned	Since #1002 (w239 bundle) the --keep-prefix and cch_stage_candidate cases plant a stub claude under the fixture's own prefix/node_modules/.bin (the helper verifies the staged binary IS the candidate), so step 2 beats PATH; a stub npm on a private PATH does the install. Enrolled at the bundle head.
+monitor/watcher/test-cc-restart-watchdog-loop.sh	local	no-claude-bin	unguarded	pinned	Stub at $root/node_modules/.bin/claude under its own root; step 2 beats PATH; reach=0 @blob c8528f7 @127ff1f.
+monitor/watcher/test-cc-restart-watchdog-verify.sh	local	no-claude-bin	unguarded	pinned	Stub at $root/node_modules/.bin/claude under its own root; step 2 beats PATH; reach=0 @blob fe4f074 @127ff1f.
+monitor/watcher/test-claude-loop.sh	path	claude-bin	unguarded	pinned	Passes CLAUDE_BIN=$STUB_BIN/claude on every invocation; measured reach=10 @blob 3d47231 @127ff1f, all resolving to that stub via step 1.
+monitor/watcher/test-entry.sh	path	no-claude-bin	unguarded	no-resolver	Stub exists so a pane process is NAMED claude for entry.sh's liveness walk; nothing spawns it through the resolver; reach=0 @blob 6a55170 @127ff1f.
+monitor/watcher/test-gh-identity.sh	local	no-claude-bin	unguarded	pinned	Empty node_modules/.bin/claude only so a link-nexus-tools precondition holds; step 2; reach=0 @blob 81516e9 @127ff1f.
+monitor/watcher/test-install-claude-local.sh	local	no-claude-bin	unguarded	pinned	The npm symlink IS the artifact under test; step 2 path by definition; reach=0 @blob 903c537 @127ff1f.
+monitor/watcher/test-install-shell-hook.sh	path	no-claude-bin	unguarded	no-resolver	Fake locals/bin/claude proves the rc hook puts `claude` on PATH by name; asserts PATH resolution directly, never _claude-bin.sh; reach=0 @blob a9b799b @127ff1f.
+monitor/watcher/test-instance-heartbeat.sh	local	no-claude-bin	unguarded	pinned	Stub at node_modules/.bin/claude as a spawn precondition; step 2; reach=0 @blob 132b505 @127ff1f.
+monitor/watcher/test-instance-lock.sh	local	no-claude-bin	unguarded	pinned	Stub at node_modules/.bin/claude as a spawn precondition; step 2; reach=0 @blob 3c0ed61 @127ff1f.
 monitor/watcher/test-integration/_harness.sh	path	no-claude-bin	guarded	exposed	Shared harness for 5 scenarios: fronts $HARNESS_BIN on PATH, exports NEXUS_ROOT=$HARNESS_DIR, pins NOTHING. In ambient env it resolved to the operator's real locals/bin/claude. Guarded here, once, for every caller.
-monitor/watcher/test-link-nexus-tools.sh	local	no-claude-bin	unguarded	pinned	Symlink farm under test; the link is the subject, never executed; step 2; reach=0.
-monitor/watcher/test-notify-gate.sh	path	no-claude-bin	unguarded	no-resolver	Invokes $WORK/fakebin/claude by ABSOLUTE path; no resolution occurs; reach=0.
-monitor/watcher/test-pane-state.sh	path	no-claude-bin	unguarded	no-resolver	Stub is backgrounded by absolute path purely so the pane's comm reads claude; reach=0. (The issue guessed this one correctly.)
+monitor/watcher/test-link-nexus-tools.sh	local	no-claude-bin	unguarded	pinned	Symlink farm under test; the link is the subject, never executed; step 2; reach=0 @blob 436f946 @127ff1f.
+monitor/watcher/test-notify-gate.sh	path	no-claude-bin	unguarded	no-resolver	Invokes $WORK/fakebin/claude by ABSOLUTE path; no resolution occurs; reach=0 @blob e0b1492 @127ff1f.
+monitor/watcher/test-pane-state.sh	path	no-claude-bin	unguarded	no-resolver	Stub is backgrounded by absolute path purely so the pane's comm reads claude; reach=0 @blob 8aa1e14 @127ff1f. (The issue guessed this one correctly.)
 monitor/watcher/test-respawn-loop-integration.sh	path	no-claude-bin	guarded	exposed	The site #746 reported and #759 fixed. Measured: resolved to the decoy locals copy, not its own stub, and the guard refused.
-monitor/watcher/test-respawn.sh	local	claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude; measured reach=34, every one resolving there via step 2.
-monitor/watcher/test-secondary-clone-state.sh	local	no-claude-bin	unguarded	pinned	Three fixture roots, each with its own node_modules stub; measured reach=6, each resolving to the matching root.
-monitor/watcher/test-spawn-fresh-orchestrator.sh	local	no-claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude; measured reach=30, all step 2.
-monitor/watcher/test-spawn-worker-cwd.sh	path	claude-bin	unguarded	pinned	Deliberately omits the node_modules stub and passes CLAUDE_BIN per invocation; measured reach=4, all resolving to $STUB_BIN/claude via step 1.
-monitor/watcher/test-spawn-worker-reply-to.sh	local	no-claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude; measured reach=8, all step 2.
-monitor/watcher/test-spawn-worker-resume.sh	local	no-claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude; measured reach=34, all step 2.
-monitor/watcher/test-spawn-worker.sh	local	no-claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude; measured reach=25, all step 2.
+monitor/watcher/test-respawn.sh	local	claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude; measured reach=34 @blob 757966d @127ff1f, every one resolving there via step 2.
+monitor/watcher/test-secondary-clone-state.sh	local	no-claude-bin	unguarded	pinned	Three fixture roots, each with its own node_modules stub; measured reach=6 @blob 7695e11 @127ff1f, each resolving to the matching root.
+monitor/watcher/test-session-name-from-window.sh	local	claude-bin	unguarded	pinned	Every fixture either passes CLAUDE_BIN explicitly (the gate probes) or builds its own node_modules/.bin/claude under its own NEXUS_ROOT (make_fake_nexus, loop_argv); resolution is decided at step 1 or 2, so PATH is never consulted and the #746 re-fronting hazard cannot bite.
+monitor/watcher/test-skeptic-arm-recording.sh	local	claude-bin	unguarded	pinned	Two stub sources, and column 3 is claude-bin because of the SECOND. (a) $fn/node_modules/.bin/claude built by _mk_nexus per fake nexus, under the fixture's OWN NEXUS_ROOT -- step 2, three _run_spawn invocations (5a default, 5b recursive, 5c no-r) at :432/:450/:461. (b) NEW (your-org/nexus-code#1356): the #1251 BEHAVIOURAL block at :764 runs the real spawn-worker.sh with CLAUDE_BIN pinned to $_sb1251/claude -- step 1, decided before node_modules or PATH. measured reach=4 @blob 709d1c4d @42e3dba9, and `pinned` stays entailed twice over (vstep==local AND vpin==claude-bin). NOTE this row was ALREADY STALE before #1356: commit 82c66dbe added the :753 invocation on 2026-09-01 and did not teach this manifest, so the previously-stated count of three described a tree that no longer existed. Why the pin exists: spawn-worker.sh:773 sources _claude-bin.sh unconditionally, far above the -r check at :2020, so on a runner with no node_modules and no claude on PATH the assertion measured CLAUDE RESOLUTION (rc 1) instead of the -r gate (rc 9) -- red in every CI band since 82c66dbe.
+monitor/watcher/test-skeptic-self-spawn.sh	local	no-claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude (and in each mutant copy); measured reach=10 @blob 1e7c969 @066d514, all step 2 — PATH is never consulted, so the #746 re-fronting hazard cannot bite.
+monitor/watcher/test-spawn-fresh-orchestrator.sh	local	no-claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude; measured reach=30 @blob 0f9b3ba @127ff1f, all step 2.
+monitor/watcher/test-spawn-worker-cwd.sh	path	claude-bin	unguarded	pinned	Deliberately omits the node_modules stub and passes CLAUDE_BIN per invocation; measured reach=4 @blob fcc25eb @127ff1f, all resolving to $STUB_BIN/claude via step 1.
+monitor/watcher/test-spawn-worker-reply-to.sh	local	no-claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude; measured reach=8 @blob 64624ab @127ff1f, all step 2.
+monitor/watcher/test-spawn-worker-resume.sh	local	no-claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude; measured reach=34 @blob e796e71 @127ff1f, all step 2.
+monitor/watcher/test-spawn-worker.sh	local	no-claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude; measured reach=25 @blob 86a5620 @127ff1f, all step 2.
+monitor/watcher/test-spawn-worker-state-dir.sh	local	no-claude-bin	unguarded	pinned	Stub at $F/node_modules/.bin/claude built by mk_fixture for both the fixture AND the decoy; measured reach=3 @blob 6af8cc6 @f6e015d, all step 2. Four spawn invocations, three reach the resolver — the fail-closed case exits 19 at the STATE_DIR guard, upstream of the _claude-bin.sh source.
+monitor/watcher/test-spawn-worker-trust-seed.sh	path	claude-bin	unguarded	pinned	Passes CLAUDE_BIN=$STUB_BIN/claude on every invocation via spawn(); measured reach=3 @blob c9700e1 @8392a04, all resolving to that stub via step 1 — three spawn calls, three reaches, PATH never consulted.
+monitor/watcher/test-spawn-worker-trust-verify.sh	path	claude-bin	unguarded	pinned	Passes CLAUDE_BIN=$STUB_BIN/claude on every invocation via spawn(), as the trust-seed suite does; measured reach=14 @blob 201e0f5 @2e748861 (2026-09-05; the resolver copy was instrumented with a REACH_LOG line while the suite ran, then restored; re-measured after the suite gained arms J/K/R — it read reach=8 @blob 54e7261 @7309fdc5 before them), all step 1 — fourteen spawn calls, fourteen reaches, PATH never consulted.
 monitor/watcher/test-stub-claude-manifest.sh	local	no-claude-bin	guarded	selftest	This suite. Its stub-creating lines are planted CONTROL fixtures for the classifier plus a synthetic #746 hazard; it drives both the refuse and the accept arm of th_require_stub_claude on purpose.
-monitor/watcher/test-supervisor-liveness.sh	local	no-claude-bin	unguarded	pinned	Empty node_modules/.bin/claude as a spawn precondition; step 2; reach=0.
-monitor/watcher/test-trash-install.sh	local	no-claude-bin	unguarded	pinned	npm layout under test by the trash/install path; the symlink is the subject; step 2; reach=0.
-monitor/watcher/test-watcher-singleton-groups.sh	local	no-claude-bin	unguarded	pinned	Stub at node_modules/.bin/claude as a spawn precondition; step 2; reach=0.
-monitor/watcher/test-watcher-supervise.sh	local	no-claude-bin	unguarded	pinned	Empty node_modules/.bin/claude as a spawn precondition; step 2; reach=0.
-monitor/watcher/test-worker-nproc-bound.sh	local	no-claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude, and its header already documents the step order; measured reach=3, all step 2.
-monitor/watcher/test-pane-state-boot-absent.sh	path	no-claude-bin	unguarded	no-resolver	#788: copies a real binary to $CLAUDEBIN/claude so /proc/<pid>/comm reads `claude` (#554) and _pane_has_live_claude matches. MEASURED reach=0 with _claude-bin.sh instrumented across a full suite run: $CLAUDEBIN is a mktemp dir never added to PATH, both uses are ABSOLUTE paths inside a `tmux new-window` command string, and the file names neither CLAUDE_BIN nor _claude-bin.sh. The resolver is never sourced, so the #746 PATH re-fronting hazard cannot bite.
+monitor/watcher/test-supervisor-liveness.sh	local	no-claude-bin	unguarded	pinned	Empty node_modules/.bin/claude as a spawn precondition; step 2; reach=0 @blob c3736b6 @127ff1f.
+monitor/watcher/test-trash-install.sh	local	no-claude-bin	unguarded	pinned	npm layout under test by the trash/install path; the symlink is the subject; step 2; reach=0 @blob 1974bf7 @127ff1f.
+monitor/watcher/test-watcher-singleton-groups.sh	local	no-claude-bin	unguarded	pinned	Stub at node_modules/.bin/claude as a spawn precondition; step 2; reach=0 @blob 7ab2708 @127ff1f.
+monitor/watcher/test-watcher-supervise.sh	local	no-claude-bin	unguarded	pinned	Empty node_modules/.bin/claude as a spawn precondition; step 2; reach=0 @blob ffbab25 @127ff1f.
+monitor/watcher/test-worker-floor-content.sh	path	claude-bin	unguarded	pinned	Passes CLAUDE_BIN=$T/bin/claude on its single spawn-worker.sh --print-prompt invocation, so step 1 decides before PATH is consulted and the #746 re-fronting cannot bite; the stub exists only because CI has no claude and spawn-worker.sh refuses without one (your-org/nexus-code#1449 round 2). `unguarded` is deliberate: th_require_stub_claude guards a fixture that RELIES on PATH resolution, and this one never lets the resolver reach PATH. --print-prompt composes and exits; the stub is never executed.
+monitor/watcher/test-worker-nproc-bound.sh	local	no-claude-bin	unguarded	pinned	Stub at $FAKE_NEXUS/node_modules/.bin/claude, and its header already documents the step order; measured reach=3 @blob e500191 @127ff1f, all step 2.
+monitor/watcher/test-pane-state-boot-absent.sh	path	no-claude-bin	unguarded	no-resolver	#788: copies a real binary to $CLAUDEBIN/claude so /proc/<pid>/comm reads `claude` (#554) and _pane_has_live_claude matches. MEASURED reach=0 @blob 48431bb @36a6d4a with _claude-bin.sh instrumented across a full suite run: $CLAUDEBIN is a mktemp dir never added to PATH, both uses are ABSOLUTE paths inside a `tmux new-window` command string, and the file names neither CLAUDE_BIN nor _claude-bin.sh. The resolver is never sourced, so the #746 PATH re-fronting hazard cannot bite.
+monitor/watcher/test-pane-state-asyncrun-liveness.sh	path	no-claude-bin	unguarded	no-resolver	Copies /bin/bash to $WORK/claude and EXECS IT BY ABSOLUTE PATH so the /proc walk sees a node named `claude`; nothing is spawned through a resolver. _claude-bin.sh is sourced only by bootstrap-install / claude-loop / install-claude-local / nexus-root-sensitivity / spawn-worker / _respawn, none of which is in this suite call graph, and _test_helpers.sh names it only in comments and inside th_require_stub_claude, which this suite never calls. reach=0 @blob 302e947 @f40d348 by CALL-GRAPH, not by the instrumented run the header describes.
+monitor/watcher/test-pane-state-restart-quiescence.sh	path	no-claude-bin	unguarded	no-resolver	Copies /bin/bash to $WORK/claude only so the process-tree walk under test finds a node whose comm is claude; it execs that copy by absolute path and never spawns claude through the resolver; reach=0 @blob 845e087 @b6a3c4d (re-measured after round 1 with an entry trace prepended to monitor/_claude-bin.sh in a worktree at that commit: a direct source traced 1, the full suite run, 47 passed, traced 0; first measured reach=0 @blob 1e5996f @ead3632).
+monitor/watcher/test-pane-state-longjob-discount.sh	path	no-claude-bin	unguarded	no-resolver	A copy of bash run by absolute path purely so the pane's comm reads claude for the process-tree cases (bundle-2609 S3); nothing in the suite sources _claude-bin.sh or sets CLAUDE_BIN, so no resolver step is reached: reach=0 @blob b69a7c1 @a1d6a865 (the same shape as test-pane-state.sh's row).

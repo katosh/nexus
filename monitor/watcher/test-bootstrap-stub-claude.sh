@@ -40,7 +40,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" haystack="$2" needle="$3"
-    if [[ "$haystack" == *"$needle"* ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" && "$haystack" == *"$needle"* ]]; then printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else printf '  FAIL: %s — needle %q absent\n' "$label" "$needle" >&2
         printf '    haystack head: %s\n' "${haystack:0:400}" >&2
         FAIL=$(( FAIL + 1 )); fi
@@ -140,8 +141,22 @@ assert_contains "install-prompt body present: Phase 4 smoke tests header" \
     "$record" "## Phase 4 — smoke tests"
 assert_contains "install-prompt body present: Phase 5 overview seed header" \
     "$record" "## Phase 5 — seed the overview issue"
-assert_contains "install-prompt body present: Phase 6 Lab-specific addons" \
-    "$record" "## Phase 6 — Lab-specific addons"
+# Phase 6 is the ONE phase whose title is forked by the public-mirror
+# overlay (`monitor/public-mirror/overlay/install-prompt.phase6.md`
+# reframes the lab addons as general HPC skills), and this suite ships
+# to the mirror, so pinning the source title failed 1 on every built
+# tree (your-org/nexus-code#979 defect 1). Pin the phase MARKER, which
+# no variant may change, and recover the lost strength from the three
+# subsection headings — the overlay preserves 6.1/6.2/6.3, so an
+# actually-truncated Phase 6 still fails here.
+assert_contains "install-prompt body present: Phase 6 header" \
+    "$record" "## Phase 6 — "
+assert_contains "install-prompt body present: Phase 6.1 subsection" \
+    "$record" "### 6.1 — "
+assert_contains "install-prompt body present: Phase 6.2 subsection" \
+    "$record" "### 6.2 — "
+assert_contains "install-prompt body present: Phase 6.3 subsection" \
+    "$record" "### 6.3 — "
 assert_contains "install-prompt body present: Phase 7 hand-off header" \
     "$record" "## Phase 7 — hand off to the watcher"
 assert_contains "install-prompt body present: Recovery routines section" \

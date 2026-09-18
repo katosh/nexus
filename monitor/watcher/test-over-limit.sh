@@ -151,6 +151,12 @@ reset_state() {
     : > "$PASTE_LOG"
     : > "$LOG_LOG"
     rm -f "$STATE_DIR/over-limit-state.tsv"
+    # The post-resume suppression sidecar (your-org/nexus-code#1141) is state
+    # too: a resume actioned by an earlier scenario would otherwise sit here
+    # and refuse the next scenario's fresh stamp — which is the gate working
+    # as designed, in a helper whose whole job is to make scenarios
+    # independent.
+    rm -f "$STATE_DIR/over-limit-liveness.tsv"
     unset PASTE_RC
 }
 
@@ -813,5 +819,50 @@ assert_contains "brief points at snapshot path"    "$brief" "monitor/.state"
 
 brief=$(_over_limit_compose_resume_brief "3am" 120 "")
 assert_contains "no-workers brief omits queue line" "$brief" "No workers were suspended"
+
+WORK_OL_SIDECAR=$(mktemp -d)
+trap 'rm -rf "$WORK_OL_SIDECAR"' EXIT
+
+# ---- your-org/nexus-code#1488: the limit is READ, never assumed ------------
+echo '=== #1488: the wake brief names the REAL limit and never asserts an unknown reset ==='
+# MEASURED 2026-09-07. A worker hit its FABLE limit. The watcher classified it
+# as "weekly Opus limit hit", scheduled a resume against an Opus reset, and
+# pasted "Watcher resume: weekly Opus limit reset (unknown)" — asserting a
+# reset in the same sentence that admitted the time was unknown. The worker was
+# refused again on arrival: 2 resume pastes, 3 rejections. Nothing in that path
+# read the pane message naming the real limit, so it could not learn from the
+# refusal.
+brief=$(_over_limit_compose_worker_brief "3am_America/Los_Angeles" "weekly_Fable")
+assert_contains     "the brief names the limit the PANE named"            "$brief" "weekly Fable limit"
+assert_not_contains "…and does not assert Opus for a Fable limit"         "$brief" "Opus"
+assert_contains     "…and states the reset it was actually given"         "$brief" "3am (America/Los_Angeles)"
+
+# AN UNKNOWN RESET IS A PROBE, NOT A RESET. The wake paste is legitimately a
+# probe — _over_limit_bump_or_failopen says so — so the wording must not tell a
+# still-limited recipient that they are back.
+brief=$(_over_limit_compose_worker_brief "unknown" "weekly_Fable")
+assert_contains     "an UNKNOWN reset is announced as a PROBE"            "$brief" "PROBE"
+assert_not_contains "…and never claims the limit 'reset'"                 "$brief" "limit reset"
+assert_contains     "…while still naming the real limit"                  "$brief" "weekly Fable"
+assert_contains     "…and telling a still-limited worker what to do"      "$brief" "still limited, ignore this"
+
+# An unmeasured flavour renders as `usage`, never as a model tier nobody read.
+brief=$(_over_limit_compose_worker_brief "3am" "")
+assert_contains     "an unmeasured flavour degrades to 'usage'"           "$brief" "your usage limit"
+assert_not_contains "…never to an invented model name"                    "$brief" "Opus"
+brief=$(_over_limit_compose_worker_brief "3am" "unknown")
+assert_contains     "…and the literal token 'unknown' degrades the same way" "$brief" "your usage limit"
+
+# The sidecar round-trips, and refuses to store the absence of knowledge as if
+# it were knowledge.
+STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_set "wkey" "weekly_Fable"
+assert_eq "the flavour sidecar round-trips" \
+    "$(STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_get wkey)" "weekly_Fable"
+STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_set "ukey" "unknown"
+assert_eq "…and NEVER stores 'unknown' — an absent row and a stored unknown would be two spellings of one fact" \
+    "$(STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_get ukey)" ""
+STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_drop "wkey"
+assert_eq "…and drops cleanly, so dead keys cannot accumulate" \
+    "$(STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_get wkey)" ""
 
 th_summary_and_exit

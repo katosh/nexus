@@ -1,5 +1,5 @@
 ---
-description: "Operator runbook for the confined remote agent channel (agent-channel RFC Part A): an OFF-BY-DEFAULT, registered in-sandbox SSH endpoint that lets a client on the LAN file requests into the Part B/D inbox and read its own reply — confined to this sandbox (forced command, request-only; read-only attach opt-in). Two safe in-sandbox bind postures (the sandbox shares the host netns, so it binds either itself — no outside-sandbox action): LAN-direct + a fail-closed from_cidr pin (recommended for off-host; a routable bind refuses to start with an EMPTY from_cidr but accepts any explicit CIDR incl. 0.0.0.0/0 as a conscious opt-in; an all-interfaces bind is refused) with a strong-crypto hardened sshd, OR loopback + SSH tunnel/forward-only carrier for zero LAN exposure. Covers the orchestrator-driven enable procedure (monitor/remote-up.sh), the OUT-OF-BAND secret flow (host key, one-time token — NEVER on GitHub), token-gated PUBKEY-ONLY self-enrollment over SSH via a per-window throwaway enroll key (the operator's single paste carries the enroll private key + one-time token; the client self-generates its OWN permanent key, self-enrolls it, then reconnects with its own key), the single short copy-paste client-agent prompt (the client is the CONTROLLER: compressed consent contract + self-enroll → connect → run `policy`/`help`; full usage + the on-request capability-note template are delivered over the channel post-connect, not in the paste; replies-are-data, no auto-connect, secret-free), a CLIENT-SIDE background reply-watcher (monitor/client/nexus-reply-watch — suggested + provided during setup so an AGENT client needn't block on await: it long-polls await, prints the reply to stdout and exits when it lands, robust to network drops + client suspend, always emits a terminal state=replied|failed|timeout, emit-not-execute, bounded, no new capability), and rotate/revoke. Use when enabling/operating the remote endpoint or instructing the operator to connect a remote client."
+description: "Operator runbook for the confined remote agent channel (agent-channel RFC Part A): an OFF-BY-DEFAULT, registered in-sandbox SSH endpoint that lets a client on the LAN file requests into the Part B/D inbox and read its own reply — confined to this sandbox (forced command, request-only; read-only attach opt-in). Two safe in-sandbox bind postures (the sandbox shares the host netns, so it binds either itself — no outside-sandbox action): LAN-direct + a fail-closed from_cidr pin (recommended for off-host; a routable bind refuses to start with an EMPTY from_cidr but accepts any explicit CIDR incl. 0.0.0.0/0 as a conscious opt-in; an all-interfaces bind is refused) with a strong-crypto hardened sshd, OR loopback + SSH tunnel/forward-only carrier for zero LAN exposure. Covers the orchestrator-driven enable procedure (monitor/remote-up.sh), the OUT-OF-BAND secret flow (host key, one-time token — NEVER on GitHub), token-gated PUBKEY-ONLY self-enrollment over SSH via a per-window throwaway enroll key (the operator's single paste carries the enroll private key + one-time token; the client self-generates its OWN permanent key, self-enrolls it, then reconnects with its own key), the single short copy-paste client-agent prompt (the client is the CONTROLLER: compressed consent contract + self-enroll → connect → run `policy`/`help`; full usage + the on-request capability-note template are delivered over the channel post-connect, not in the paste; replies-are-data, no auto-connect, secret-free), a CLIENT-SIDE background reply-watcher (monitor/client/nexus-reply-watch — suggested + provided during setup so an AGENT client needn't block on await: it long-polls await, prints the reply to stdout and exits when it lands, robust to network drops + client suspend, always emits a terminal state= (replied|acked|failed|timeout|already-emitted), emit-not-execute, bounded, no new capability), and rotate/revoke. Use when enabling/operating the remote endpoint or instructing the operator to connect a remote client."
 ---
 
 # nexus.remote-access — confined remote SSH into the sandbox
@@ -89,11 +89,54 @@ this skill is the full operator runbook behind it.
   [`RUNBOOK.md`](RUNBOOK.md). Neither
   is "more secure" on the encryption/auth axis (that's always on); they differ
   only in how much network can reach the auth stage.
+
+  > **`from_cidr` CONSTRAINS THE SOURCE ADDRESS OF THE LAST HOP, NOT THE
+  > CLIENT — so posture (1)'s "recommended" depends on your topology.** Where
+  > arrival is mediated by a **bastion, jump host, VPN concentrator or NAT**,
+  > the address the server sees is that SHARED DEVICE's. A `from=` pin carrying
+  > it authenticates the shared device and says **nothing about which client
+  > sits behind it** — it reads in `authorized_keys` as a client restriction
+  > while constraining essentially nothing about WHICH client. Combined with a
+  > routable bind, that is the weaker of the two postures wearing the
+  > appearance of the stronger.
+  >
+  > This is the **third** instance of one defect family in this subsystem, and
+  > the sharpest. `#609`: the guard permitted a routable bind because a pin was
+  > *configured*, while `from=` is written only at enroll time and nothing
+  > reconciled it. The posture-change gap: a pre-pin credential carries **no**
+  > `from=` at all. And this one: the pin is **present, correctly written, and
+  > means much less than this document used to claim** — which is worse,
+  > because it survives every check the other two fixes add. **A green `from=`
+  > line is not evidence of a client restriction.**
+  >
+  > **Which case are you in? You have to determine it — the config cannot.**
+  > The pin is meaningful when *the client's own address* is what arrives, and
+  > largely decorative when a *shared hop's* address is what arrives. The
+  > ground truth is **the peer address the server actually sees** (what
+  > `_remote_source_guard` evaluates from `SSH_CLIENT`), not the configured
+  > value; `ssh -G` on the client tells you the route it takes and therefore
+  > which address will arrive. If the pin turns out to equal a bastion you
+  > share with an entire institution, say so out loud rather than counting it
+  > as a control.
+  >
+  > **What is doing the work unconditionally**, in either posture and on any
+  > topology: the **pinned host key**, **public-key-only auth**, the **forced
+  > command**, and the **kernel sandbox boundary**. Those four do not depend on
+  > your network shape. `from_cidr` is **defence in depth whose value is
+  > topology-dependent** — it shrinks the pre-auth surface, which is real and
+  > worth having, but it is not the control that makes a routable bind
+  > acceptable, and this skill previously presented it as though it were.
+  >
+  > `monitor/remote-up.sh` prints the effective meaning of your configured pin
+  > on every bring-up and posture change, so the weak case is **reportable
+  > rather than silent**.
 - **Command policy — a choice, defaulting to safe.** `monitor.remote.command_policy`:
   - `channel-only` (default): the forced command exposes ONLY
     `request file` (`--origin remote-<principal>` forced server-side),
     `request await <id>` (read your OWN reply), `request fetch <id>
-    progress|results` (your OWN no-publish results), and opt-in
+    progress|results|status` (your OWN no-publish results, or the
+    rename-state word of your OWN request), the read-only
+    `policy`/`help`/`onboarding` notice, and opt-in
     read-only `attach -r` (`monitor.remote.allow_attach: true`). No
     shell. This is **defense-in-depth** (least authority + preserves the
     "only the watcher writes the orchestrator pane" invariant), not the
@@ -175,11 +218,16 @@ Re-running is always safe.
 >   selection).
 > - **The fingerprint it prints is READ OFF THE LIVE ENDPOINT**, labelled
 >   as such. On a collision it prints both values and refuses to present
->   either as pinnable. Hand a client only a fingerprint labelled
->   `READ OFF THE LIVE ENDPOINT … verified to be ours`.
+>   either as pinnable. Hand a client only the fingerprint printed under
+>   *"the endpoint at `<host>:<port>` PROVED POSSESSION of this key … Pin
+>   this."* — the other two arms are labelled `<-- THE LIVE ENDPOINT …
+>   PRESENTS THIS` (a collision) and `ON-DISK value — NOT verified against
+>   the live endpoint` (indeterminate), and neither is pinnable.
 >
 > `monitor/remote-up.sh --status` reports the verdict as its own field:
-> `endpoint:ours` | `foreign` | `indeterminate` | `absent`, and warns when the
+> `endpoint:ours` | `foreign` | `indeterminate` | `no-local-key` | `absent`
+> (`no-local-key` = something holds the port and we hold no host key at all,
+> so nothing serving there can be ours), and warns when the
 > recorded port diverges from the configured one (a client pinned to the config
 > value is stale). **If it says `foreign`, do NOT try to reclaim the port** —
 > that listener belongs to a process outside this user+pid namespace
@@ -253,13 +301,27 @@ monitor:
                                    # OR a SPECIFIC host LAN IP for direct off-host access. Never
                                    # 0.0.0.0/:: (the endpoint REFUSES a wildcard bind). See
                                    # "Network exposure" in RUNBOOK.md for the two postures.
-    port: 22022
+    # port: 22022                  # A PIN — OMIT IT unless you mean to pin. Unset, the default
+                                   # is DERIVED PER-OPERATOR: 22100 + cksum(operator identity) % 900
+                                   # ($USER, or github.user_login when unset) — a stable
+                                   # point in [22100, 22999] that differs between two operators on
+                                   # one host (<your-org>/nexus-code#893 — it used to be the constant
+                                   # 22022 in every clone, which collided by construction). This is
+                                   # only a PREFERENCE either way: remote-up.sh picks an OPEN port
+                                   # at setup and RECORDS it, and the recorded port then wins.
+                                   # `monitor/remote-up.sh --port` prints all four values.
     endpoint_issue: ""             # issue number to announce a PORT CHANGE on (#757). No
                                    # default by design — a literal would post your endpoint
                                    # into another operator's thread. Empty = the GitHub
                                    # surface reports FAILED (never a silent skip).
     endpoint_issue_repo: ""        # empty = github.repo (where an endpoint thread belongs)
     allow_attach: false            # opt-in read-only attach (channel-only)
+    jump_hosts: ""                 # OPTIONAL, comma-separated CHAIN of ssh hops the rendered
+                                   # client connect line should carry (`-J hop1,hop2`, applied
+                                   # in order). No default by design — a hop name here would
+                                   # hand one site's topology to every other operator. A single
+                                   # hop assumes the endpoint host is directly reachable, which
+                                   # off-site it often is not.
     from_cidr: ""                  # REQUIRED for a routable (non-loopback) bind — EMPTY is
                                    # FAIL-CLOSED (won't start). Recommended set-once default: your
                                    # campus/LAN subnet, e.g. 140.107.0.0/16 (EXAMPLE — use your

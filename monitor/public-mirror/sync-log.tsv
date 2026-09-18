@@ -1,0 +1,38 @@
+# sync-log.tsv — one row per published public-mirror sync, newest LAST.
+#
+# WHY THIS FILE EXISTS (your-org/nexus-code#979 §5). Reconstructing the mirror
+# as a three-way merge is sound, but the MERGE BASE decides correctness and
+# fails silently in the LEAKIER direction. The correct base is
+# `scrub_old(source_old)` — the artifact the previous sync actually produced —
+# and computing that requires knowing which source commit the previous sync
+# shipped from. That fact lived in a report, or in somebody's memory.
+#
+# Measured on the sync this file was added for: the wrong base produced 2
+# conflicts and silently carried a denied token plus 19 occurrences of a URL for
+# a repository that does not exist. The right base produced 18 conflicts — the
+# extra 16 being exactly the decisions that would otherwise have been made
+# silently, in the direction of the older, leakier value.
+#
+# The dictionary is versioned in the same repository as the source, which is
+# what makes the correct base cheap to compute: `scrub_old(source_old)` is just
+# "check out source_old — dictionary and all — and run build.sh". You do not
+# need to reconstruct an old dictionary by hand; you need to not accidentally
+# use the CURRENT one. `sync-base.sh` does exactly that, reading the last row
+# here for the sha.
+#
+# Columns (TAB-separated):
+#   sync <TAB> ISO_DATE <TAB> SOURCE_SHA <TAB> MIRROR_HEAD_AFTER <TAB> NOTE
+#
+#     SOURCE_SHA         the source commit that sync was built from. This is
+#                        the one `sync-base.sh` needs; get it wrong and the
+#                        merge silently reverts every dictionary improvement
+#                        made since.
+#     MIRROR_HEAD_AFTER  the mirror commit the sync produced, so the base can
+#                        be checked against what actually landed.
+#     NOTE               free text; no internal identifiers (this file ships
+#                        nowhere, but the habit is cheap and the cost of the
+#                        exception is not).
+#
+# APPEND a row as part of every sync, before you consider it done. A sync that
+# did not record itself has handed the next one a guess.
+sync	2026-08-25	e256d4a	c696071	first sync recorded here; anchors recovered from the sync report on your-org/nexus-code#979

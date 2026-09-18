@@ -46,6 +46,12 @@
 #   RESPAWN_LOOP_LIMIT           config knob
 #   RESPAWN_TRIPPED              stamp file path
 #   _monitor_dir                 monitor/ dir (for ng log-action)
+#   STATE_DIR                    the watcher's resolved state dir — handed to
+#                                each `ng log-action` child as NEXUS_STATE_DIR
+#                                (your-org/nexus-code#1335: `ng` re-resolves
+#                                independently and reads only that name, so a
+#                                fixture-scoped STATE_DIR must be forwarded or
+#                                the audit row lands on the inherited root)
 #
 # Functions called (all from _respawn.sh / _respawn_async.sh / main.sh):
 #
@@ -96,7 +102,7 @@ _watcher_handle_target_absent_observation() {
                             >/dev/null 2>&1 || true
                     fi
                     if [[ -x "$_monitor_dir/ng" ]]; then
-                        "$_monitor_dir/ng" log-action watcher \
+                        NEXUS_STATE_DIR="${STATE_DIR:-${NEXUS_STATE_DIR:-}}" "$_monitor_dir/ng" log-action watcher \
                             --event respawn-slow-grind-tripped \
                             --note "$sg_reason" \
                             >/dev/null 2>&1 || true
@@ -143,7 +149,7 @@ _watcher_handle_target_absent_observation() {
                     >/dev/null 2>&1 || true
             fi
             if [[ -x "$_monitor_dir/ng" ]]; then
-                "$_monitor_dir/ng" log-action watcher \
+                NEXUS_STATE_DIR="${STATE_DIR:-${NEXUS_STATE_DIR:-}}" "$_monitor_dir/ng" log-action watcher \
                     --event respawn-loop-tripped \
                     --note "$guard_reason" \
                     >/dev/null 2>&1 || true
@@ -173,7 +179,7 @@ _watcher_handle_target_absent_observation() {
     if ! verify_reason=$(_respawn_verify_target_absent "$TARGET" "${missing_target_since:-0}"); then
         log "respawn aborted by re-verify: ${verify_reason} (streak=${missing_target_polls}, delay=${AGENT_MISSING_RESPAWN_DELAY})"
         if [[ -x "$_monitor_dir/ng" ]]; then
-            "$_monitor_dir/ng" log-action watcher \
+            NEXUS_STATE_DIR="${STATE_DIR:-${NEXUS_STATE_DIR:-}}" "$_monitor_dir/ng" log-action watcher \
                 --event respawn-aborted-reverify \
                 --note "$verify_reason" \
                 >/dev/null 2>&1 || true

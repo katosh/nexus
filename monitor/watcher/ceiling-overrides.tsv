@@ -1,0 +1,69 @@
+# ceiling-overrides.tsv — per-suite PER-TEST TIMEOUT ceilings, as DATA.
+#
+# Enforced by:  monitor/watcher/run-tests.sh  (run_one, _rt_ceiling_for)
+# Asserted by:  monitor/watcher/test-run-tests-accounting-verdict.sh
+#
+# WHY THIS FILE EXISTS (your-org/nexus-code#992). A suite whose wall time sits
+# just under the run's ceiling does not FAIL — it FLAPS, and a flap is worse
+# than a clean red on every axis that matters: it is non-deterministic, so it
+# does not reproduce on the first re-run and looks like it "went away"; it
+# carries NO diagnostic content, because `TIMEOUT at the ceiling` names no
+# assertion and no behaviour; and it is re-diagnosed from scratch every time it
+# fires, by someone with no reason to suspect the ceiling. Measured: roughly an
+# hour of one session, including a foreground probe that blew its own limit
+# before the cause was found.
+#
+# THE NUMBER IS A PROPERTY OF THE SUITE, NOT OF THE WORKFLOW. Raising the
+# workflow-level ceiling would hide the flap for every suite at once, including
+# suites that are slow because they are BROKEN. A per-suite ceiling says
+# "THIS suite legitimately takes this long", which is a claim someone can check
+# against the row's own measurement, and it leaves the global default free to
+# stay tight for everything else.
+#
+# COLUMNS   suite-basename <TAB> ceiling-seconds <TAB> measured-wall <TAB> why
+#
+# HOW TO PICK THE CEILING: at least 2x the MAXIMUM observed wall, never 2x a
+# single sample. Column 3 therefore records the max of a distribution, not one
+# measurement — #992's own reopen is the cautionary case, where a single 570.21s
+# sample sat 43s below a 613.23s member of the same distribution on byte-identical
+# code. A row whose ceiling is only a little above its measurement has not fixed
+# the flap, it has moved it.
+#
+# A ROW IS NOT A LICENCE TO BE SLOW. `run-tests.sh` still prints the
+# CEILING-ADJACENT census (>=NEXUS_CEILING_ADJACENT_PCT of the ceiling in use),
+# now measured against the OVERRIDDEN ceiling, so a suite that grows into its
+# new headroom says so on every run instead of going quiet.
+#
+# ── THE FAMILY, recorded because the fifth will otherwise be rediscovered from
+# scratch (fix 3 of #992). Only the first is given an override here; the other
+# three are load-sensitive under parallelism rather than ceiling-adjacent on
+# their own, and an unmeasured override would be a number nobody can check.
+#
+#   test-run-tests-bounded.sh      n=8 on BYTE-IDENTICAL code, from #992's
+#                                  2026-08-31 reopen: 524.85 / 570.21 / 574.53 /
+#                                  580.71 / 583.61 / 585 / 600.01 / 613.23 s.
+#                                  Range 524.85-613.23, TWO OF EIGHT over 600.
+#                                  Structurally the worst case: it is a test OF
+#                                  the bounded runner, so it works by RUNNING
+#                                  SUITES and inherits every one of their load
+#                                  sensitivities multiplied together.
+#
+#                                  NOT A FLAKE AND NOT A DETERMINISTIC OVERRUN,
+#                                  and the reopen refutes both readings with the
+#                                  same data: 580.71s at loadavg 37.66 PASSED
+#                                  where 600.01s at loadavg 37.08 TIMED OUT, so
+#                                  load does not predict the side. What is true
+#                                  is narrower — 600 is a ceiling set INSIDE the
+#                                  suite's own runtime distribution. That is why
+#                                  the remedy is to move the ceiling OUT of the
+#                                  distribution rather than to retry: a retry
+#                                  burns ten minutes to re-roll the same die.
+#   test-idle-probe.sh             310/0 standalone; flakes under --jobs 4 + load.
+#   test-proc-kill-authorized.sh   red under a parallel sweep, GREEN isolated.
+#   test-assertion-ledger.sh       `dev` ITSELF failed it while a bundle passed
+#                                  it in the same batch; 0/8 at both refs run
+#                                  sequentially. That one cannot be explained by
+#                                  anything the change did, which is the
+#                                  strongest evidence the class is LOAD.
+#
+test-run-tests-bounded.sh	1200	613.23	ceiling set INSIDE the suite's own runtime distribution (n=8, 524.85-613.23, two over 600); 1200 is ~2x the MAX observed, not 2x a single sample (#992 reopen 2026-08-31)

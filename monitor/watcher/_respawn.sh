@@ -52,6 +52,13 @@ _respawn_dir=${_respawn_dir:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/nu
 # SERVER. Fail LOUD instead.
 # shellcheck source=../_pane-live.sh
 [[ -r "$_respawn_dir/../_pane-live.sh" ]] && source "$_respawn_dir/../_pane-live.sh"
+# Window-selection restore across the respawn (your-org/nexus-code#1528).
+# Sourced explicitly for the same reason as `_pane-live.sh`: this module is
+# sourced standalone by suites and by entry.sh. UNLIKE the dead-pane guard it
+# is COSMETIC, so a missing helper disables the restore rather than refusing
+# anything — `_respawn_spawn_window` checks `declare -F` before calling it.
+# shellcheck source=../_tmux-window.sh
+[[ -r "$_respawn_dir/../_tmux-window.sh" ]] && source "$_respawn_dir/../_tmux-window.sh"
 if ! declare -F _tmux_pane_is_dead >/dev/null 2>&1; then
     # FAIL-CLOSED FALLBACK (#745). Without the real predicate we cannot
     # tell a live pane from a corpse, and a paste into a corpse kills the
@@ -137,7 +144,8 @@ _respawn_pid_tree_is_orchestrator() {
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     local _env_data
     if [[ -r "/proc/$pid/environ" ]]; then
-        _env_data=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) || _env_data=""
+        # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+        _env_data=$( { tr '\0' '\n' < "/proc/$pid/environ"; } 2>/dev/null ) || _env_data=""
         if [[ -n "$_env_data" ]] && grep -qxF 'NEXUS_IS_ORCHESTRATOR=1' <<<"$_env_data"; then
             return 0
         fi
@@ -180,8 +188,14 @@ _respawn_pid_tree_orchestrator_sid() {
     # SIGPIPEs its upstream, so with the caller's pipe-failure option
     # enabled the status is 141 even when the value was extracted fine.
     local _env_data=""
+    # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305). The
+    # outer brace here belongs to the `&&` arm, not to the redirection: the
+    # `2>/dev/null` still sits INSIDE it and still lands after the `<`. A first
+    # pass over this file scored the line CLEAN for exactly that reason and the
+    # awk classifier disagreed — which is why the predicate is the artefact and
+    # a hand sweep is not.
     [[ -r "/proc/$pid/environ" ]] \
-        && { _env_data=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) || _env_data=""; }
+        && { _env_data=$( { tr '\0' '\n' < "/proc/$pid/environ"; } 2>/dev/null ) || _env_data=""; }
     if [[ -n "$_env_data" ]] && grep -qxF 'NEXUS_IS_ORCHESTRATOR=1' <<<"$_env_data"; then
         local sid
         sid=$(sed -n 's/^NEXUS_ORCH_SESSION_ID=//p' <<<"$_env_data" | head -n 1)
@@ -189,8 +203,9 @@ _respawn_pid_tree_orchestrator_sid() {
             sid=""
             local -a argv=()
             local arg
-            while IFS= read -r -d '' arg; do argv+=("$arg"); done \
-                < "/proc/$pid/cmdline" 2>/dev/null
+            # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+            { while IFS= read -r -d '' arg; do argv+=("$arg"); done \
+                < "/proc/$pid/cmdline"; } 2>/dev/null
             local i
             for (( i = 0; i + 1 < ${#argv[@]}; i++ )); do
                 case "${argv[i]}" in
@@ -453,7 +468,8 @@ _respawn_verify_target_absent() {
             # the environ scan.
             if [[ -r "/proc/$pane_pid/cmdline" ]]; then
                 classified=1
-                occupant=$(tr '\0' ' ' < "/proc/$pane_pid/cmdline" 2>/dev/null | head -c 120)
+                # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+                occupant=$( { tr '\0' ' ' < "/proc/$pane_pid/cmdline"; } 2>/dev/null | head -c 120)
             fi
         done < <(tmux list-panes -a -F '#{pane_pid}|#{window_id}|#{window_name}|#{pane_dead}' 2>/dev/null)
 
@@ -668,6 +684,80 @@ _respawn_compose_launcher() {
     local sid_export=''
     [[ -n "$session_id" ]] \
         && printf -v sid_export 'export NEXUS_ORCH_SESSION_ID="%s"\n' "$session_id"
+    # Session MESSAGING name = the target window name (#1047). THIS is the site
+    # that repairs the driving case: #1043's worker->orchestrator escalation is
+    # addressed as "orchestrator", but that name was only ever a hand-typed
+    # label (measured: no nameSource, nameSince ~9h after startedAt, cwd
+    # basename "nexus"). Without this flag a respawned orchestrator returns as
+    # the derived "nexus-<xx>" and every escalation to "orchestrator" fails --
+    # precisely in the incident where escalation matters.
+    #
+    # SCOPE: this makes the LIVE orchestrator addressable by the window name the
+    # watcher already targets; it is NOT a durable task key, because the session
+    # name does NOT follow a later `tmux rename-window` (measured: window
+    # renamed, session name unchanged) and a stale name still resolves.
+    # If a respawn overlaps the dying session, two sessions briefly share the
+    # name; measured, SendMessage then REFUSES and names the refs rather than
+    # guessing, so escalation fails loudly instead of landing in the wrong pane.
+    #
+    # Deliberately NOT emitted into the launcher heredoc: every byte there ships
+    # into each generated /tmp launcher, and the literal text "--name" in a
+    # comment defeats any grep that asks whether the FLAG was passed.
+    #
+    # Gated on a capability probe. An
+    # unsupported --name is FATAL ("error: unknown option", rc 1), so an
+    # unconditional flag would kill the orchestrator respawn path itself on an
+    # older pin. Degrade to the derived name, loudly, rather than to no
+    # orchestrator. `declare -F` because this function is also called directly
+    # by tests, which do not necessarily source _claude-bin.sh first.
+    local name_flag=''
+    if ! declare -F claude_supports_name_flag >/dev/null 2>&1; then
+        # Source from the WATCHER'S OWN tree, not $NEXUS_ROOT: a re-rooted
+        # NEXUS_ROOT (#577) must not relocate the probe away from the code that
+        # needs it, and callers of this function do not all set NEXUS_ROOT —
+        # under `set -u` a bare "$NEXUS_ROOT/..." would abort the caller.
+        #
+        # Gated on CLAUDE_BIN already being set: _claude-bin.sh calls `exit 1`
+        # when it cannot resolve a binary, and `exit` from a SOURCED file kills
+        # the CALLER. With CLAUDE_BIN non-empty that branch is unreachable —
+        # but this gate is what makes it unreachable, rather than a caller
+        # contract we would merely be trusting.
+        local _cb="$_respawn_dir/../_claude-bin.sh"
+        if [[ -r "$_cb" && -n "${CLAUDE_BIN:-}" && -n "${NEXUS_ROOT:-$nexus_root}" ]]; then
+            # shellcheck disable=SC1091
+            NEXUS_ROOT="${NEXUS_ROOT:-$nexus_root}" . "$_cb" >/dev/null 2>&1 || true
+        fi
+    fi
+    if declare -F claude_supports_name_flag >/dev/null 2>&1 \
+       && claude_supports_name_flag; then
+        printf -v name_flag -- '--name %q ' "$target_window"
+    fi
+    # longjob-watch dispatcher arming (your-org/nexus-code#1535): `--plugin-dir
+    # <dir> ` or EMPTY. The helper is FAIL-OPEN by construction — every reason
+    # not to arm is one stderr line plus a row in .state/longjob/arming.log and
+    # an unchanged launcher — because THIS is the watcher's own revival path:
+    # a respawn that could refuse to launch over a plugin is an unrecoverable
+    # board. Sourced from the watcher's own tree for the same reason the name
+    # probe is (a re-rooted NEXUS_ROOT must not relocate it); absent helper =
+    # no flag, said once.
+    local plugin_flag=''
+    if ! declare -F longjob_plugin_flag >/dev/null 2>&1; then
+        local _lp="$_respawn_dir/../_longjob-plugin.sh"
+        if [[ -r "$_lp" ]]; then
+            # shellcheck disable=SC1090
+            . "$_lp" >/dev/null 2>&1 || true
+        fi
+    fi
+    if declare -F longjob_plugin_flag >/dev/null 2>&1; then
+        # The state dir THIS respawn resolved — the same expression the
+        # selection-restore files use below — so a fixture respawn logs into
+        # its fixture, never into the agent shell's inherited NEXUS_ROOT
+        # (measured: fixture rows in the operator's live arming.log).
+        plugin_flag=$(longjob_plugin_flag "$target_window" "${NEXUS_STATE_DIR:-$nexus_root/monitor/.state}") || plugin_flag=''
+        [[ -n "$plugin_flag" ]] && plugin_flag="$plugin_flag "
+    else
+        echo "_respawn: note: monitor/_longjob-plugin.sh not found beside the watcher, or found and failed to source — NOT passing --plugin-dir; the respawned orchestrator will have no longjob-watch dispatcher (your-org/nexus-code#1535)." >&2
+    fi
     # Shim precondition, from the SINGLE SOURCE shared with spawn-worker.sh
     # (monitor/guard-block.sh.in). Read as DATA, never sourced — this file is
     # itself sourced by the watcher, and adding a sourced dependency here is
@@ -706,7 +796,7 @@ export NEXUS_ORCHESTRATOR_WINDOW="$target_window"
 # soft back to hard), so the helper only OBSERVES propagation rather than
 # requiring a specific ceiling.
 ${_respawn_guard_block}
-${sid_export}exec "$CLAUDE_BIN" --dangerously-skip-permissions $continue_flag $settings_flag
+${sid_export}exec "$CLAUDE_BIN" --dangerously-skip-permissions ${name_flag}${plugin_flag}$continue_flag $settings_flag
 LAUNCHER
     chmod +x "$launcher"
 }
@@ -757,11 +847,104 @@ _respawn_spawn_window() {
             *) printf 'respawn pre-kill verify: %s\n' "$_verify_reason" >&2 ;;
         esac
     fi
-    if grep -qxF "$target" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"; then
-        tmux kill-window -t "$target" 2>/dev/null || true
+    # WINDOW SELECTION ACROSS THE RESPAWN (your-org/nexus-code#1528). The kill
+    # below moves a session's selection when the target is its ACTIVE window
+    # (measured on tmux 2.6), and `new-window -d` never selects, so the
+    # operator would be left wherever tmux put them. Capture the selection
+    # before the kill, note tmux's choice after it, and restore once the new
+    # window's id is in hand (below). When the target is ALREADY absent — the
+    # cc-update path, whose `restart-orchestrator` verb did the kill — the
+    # capture file was written there and is consumed here; that is what makes
+    # this the SINGLE restore site for the crash, version and cc-update paths.
+    # Cosmetic and best-effort throughout: nothing in it can change this
+    # function's rc or its 3/5 contract. Contract, rules and measurements:
+    # `monitor/_tmux-window.sh`, "WINDOW SELECTION ACROSS AN ORCHESTRATOR
+    # RESTART".
+    local _sel_file=""
+    if declare -F tmux_selection_restore >/dev/null 2>&1; then
+        _sel_file=$(tmux_selection_capture_file "${NEXUS_STATE_DIR:-$nexus_root/monitor/.state}")
     fi
-    tmux new-window -d -n "$target" -c "$nexus_root" "$launcher" 2>/dev/null || return 3
-    tmux set-window-option -t "$target" remain-on-exit on 2>/dev/null || true
+    if grep -qxF "$target" <<<"$(tmux list-windows -F '#{window_name}' 2>/dev/null)"; then
+        if [[ -n "$_sel_file" ]]; then
+            tmux_selection_capture "$target" "$_sel_file" >/dev/null 2>&1 || true
+        fi
+        tmux kill-window -t "$target" 2>/dev/null || true
+        if [[ -n "$_sel_file" ]]; then
+            tmux_selection_note_post_kill "$_sel_file" >/dev/null 2>&1 || true
+        fi
+    fi
+    # `remain-on-exit` is armed ATOMICALLY WITH CREATION, in ONE tmux command
+    # list, not as a follow-up round trip. A launcher that exits IMMEDIATELY —
+    # and the #589 shim-precondition refusal is exactly that shape, `exit 78`
+    # on the first line it reaches — closes its window before a SEPARATE
+    # `set-window-option` can land. The refusal then erases the very pane an
+    # operator would post-mortem, `tmux new-window` still returns 0 so the log
+    # says `spawned new '<target>' window`, and the next poll re-detects
+    # `absent` and respawns again: a loop whose only evidence is an absence.
+    #
+    # Measured on test-slow-grind-respawn.sh at 703483b5: the watcher logs the
+    # successful spawn, while a 200 ms window-list sampler running across the
+    # whole phase never observes the window ONCE — and the assertion passed in
+    # 2 of 6 runs, which is the race showing through.
+    #
+    # One tmux command LIST is one server round trip executed in order with no
+    # client hop between the commands, so the option is applied before the
+    # freshly forked pane process can finish exec'ing and exit.
+    #
+    # WHICH HALF FAILED IS ANSWERED BY AN OWNED HANDLE, NOT BY A NAME
+    # (your-org/nexus-code#1327). The chained form reports ONE status for TWO
+    # commands, and the rc=3 contract belongs to `new-window` alone — the
+    # caller counts it toward the slow-grind consecutive-failure guard, and
+    # `spawn-fresh-orchestrator.sh` marks the cold-boot dropped-worker
+    # manifest DELIVERED on helper rc 0, so a manufactured success
+    # permanently swallows the record of everything the cold boot dropped
+    # (the `#651` finding-2 catastrophe).
+    #
+    # This used to be answered by asking whether a window NAMED $target is
+    # present afterwards. `#1324` narrowed that by first recording whether a
+    # same-named window survived the kill — which closes the route where the
+    # KILL DID NOT TAKE, and leaves open the route where it did: `new-window`
+    # creates nothing, a concurrent creator refills the slot between the
+    # post-kill re-check and the final probe, and the name probe answers
+    # `present` for a window this call did not create. The concurrent
+    # creators are named in this function's own neighbouring comment —
+    # "window rename heal, operator relaunch, a successor watcher's own
+    # respawn" — so the precondition was documented one line from the defect.
+    # A finer name-keyed proxy is still a proxy: measured on this host's tmux
+    # 2.6, tmux PERMITS DUPLICATE WINDOW NAMES, so no name predicate can
+    # distinguish the thing from a description of it (`#1073`, `#1042`,
+    # `#851`).
+    #
+    # `-P -F '#{window_id}'` emits the id of the window THIS CALL created, on
+    # stdout, from the command already being run. Measured on tmux 2.6:
+    #
+    #   both commands succeed          -> stdout=[@1] rc=0
+    #   the OPTION arm fails           -> stdout=[@2] rc=1   (id still emitted)
+    #   `new-window` itself fails      -> stdout=[]   rc=1
+    #   ids are NOT reused             -> @4,@5 after killing @2,@3
+    #
+    # So the discriminator is free: non-empty stdout means created, empty
+    # means not. No second round trip, no name matching, no probe to race
+    # against — and the `_stale_survived` bookkeeping the name probe needed
+    # is gone with it, because the handle does not care what survived.
+    #
+    # The option arm keeps targeting by NAME: tmux does not substitute
+    # `#{window_id}` in a later command's `-t` inside the same list (measured:
+    # `no such window: #{window_id}`). The id is EVIDENCE, not a target.
+    #
+    # The SHAPE is validated, not merely the emptiness — an emptiness check is
+    # a presence test wearing a validity test's name, and a wedged tmux or a
+    # stub emitting garbage must fail CLOSED rather than pass it.
+    #
+    # This is the established form here rather than a novelty:
+    # `monitor/spawn-worker.sh` has used exactly this discriminator on the
+    # worker spawn path since `#323`. `_respawn.sh` was the outlier.
+    local _wid
+    _wid=$(tmux new-window -d -n "$target" -c "$nexus_root" -P -F '#{window_id}' "$launcher" \
+               \; set-window-option -t "$target" remain-on-exit on 2>/dev/null)
+    if [[ ! "$_wid" =~ ^@[0-9]+$ ]]; then
+        return 3
+    fi
     # Pin the window name (issue 209). Without both knobs, tmux's own
     # rename loop or an OSC escape from inside the pane can rename the
     # window away from $target, making the watcher's name-based
@@ -769,6 +952,31 @@ _respawn_spawn_window() {
     # trips. Mirrors the worker pin in monitor/spawn-worker.sh:383-384.
     tmux set-window-option -t "$target" automatic-rename off 2>/dev/null || true
     tmux set-window-option -t "$target" allow-rename off 2>/dev/null || true
+    # (#1528) Restore the operator's selection now that the new window EXISTS
+    # and is addressable by the id this call owns. rc 1 is the NO-CAPTURE
+    # POLICY (nothing to do, nothing to say); every other outcome is logged to
+    # stderr (the watcher log) so a wrong landing is auditable. The rc of this
+    # function is decided above and is not touched here.
+    if [[ -n "$_sel_file" ]]; then
+        local _sel_out="" _sel_rc=0
+        _sel_out=$(tmux_selection_restore "$_wid" "$_sel_file" 2>/dev/null) || _sel_rc=$?
+        if (( _sel_rc != 1 )); then
+            printf '_respawn: window selection after respawn of %s (%s, rc %d): %s\n' \
+                "$target" "$_wid" "$_sel_rc" "${_sel_out//$'\n'/; }" >&2
+        fi
+        # Rule 4 (#1528, operator decision): no usable capture -> the watcher's
+        # last-seen snapshot decides, and with none the orchestrator is the
+        # default. rc 1 = no capture; rc 3 = stale/unreadable capture (already
+        # consumed) or tmux would not answer — the fallback then fails the
+        # same way and moves nothing.
+        if (( _sel_rc == 1 || _sel_rc == 3 )) && declare -F tmux_selection_restore_fallback >/dev/null 2>&1; then
+            local _snap_file _snap_out="" _snap_rc=0
+            _snap_file=$(tmux_selection_snapshot_file "${NEXUS_STATE_DIR:-$nexus_root/monitor/.state}")
+            _snap_out=$(tmux_selection_restore_fallback "$_wid" "$_snap_file" 2>/dev/null) || _snap_rc=$?
+            printf '_respawn: window selection after respawn of %s (%s, no capture; snapshot arm rc %d): %s\n' \
+                "$target" "$_wid" "$_snap_rc" "${_snap_out//$'\n'/; }" >&2
+        fi
+    fi
     return 0
 }
 
@@ -788,14 +996,23 @@ _respawn_resolve_target_index() {
 # Empty stdout (rc=1) on any failure: helper missing/non-executable,
 # window absent, or parse failure. Callers treat empty as "unknown".
 _respawn_probe_state() {
+    local out
+    out=$(_respawn_probe_raw "$1" "$2") || return 1
+    sed -n 's/.*state=\([a-z-]*\).*/\1/p' <<<"$out"
+}
+
+# _respawn_probe_raw <target> <pane_state_bin>
+#
+# The whole pane-state line for <target>, for a caller that needs more than
+# `state=` (the typed-retry below reads `input=`). Same failure contract as
+# _respawn_probe_state: empty stdout, rc 1.
+_respawn_probe_raw() {
     local target="$1" pane_state_bin="$2"
     [[ -x "$pane_state_bin" ]] || return 1
     local idx
     idx=$(_respawn_resolve_target_index "$target")
     [[ -n "$idx" ]] || return 1
-    local out
-    out=$("$pane_state_bin" "$idx" 2>/dev/null) || return 1
-    sed -n 's/.*state=\([a-z-]*\).*/\1/p' <<<"$out"
+    "$pane_state_bin" "$idx" 2>/dev/null
 }
 
 # _respawn_wait_for_input_ready <target> <budget_s> <poll_s> <pane_state_bin> [<max_dismiss>] [<log_fn>]
@@ -847,9 +1064,28 @@ _respawn_wait_for_input_ready() {
 
 # _respawn_wait_for_submit_evidence <target> <budget_s> <pane_state_bin>
 #
-# Poll pane-state.sh until <target> reports `busy` or `user-typing`
-# (the paste's Enter actually submitted a turn). Polls every 0.5s.
-# Returns 0 on success, 1 on budget exhaustion. Stdout: final state.
+# Poll pane-state.sh until <target> reports `busy` (the paste's Enter
+# actually submitted a turn). Polls every 0.5s. Returns 0 on success, 1 on
+# budget exhaustion. Stdout: final state.
+#
+# `user-typing` IS NOT SUBMIT EVIDENCE, AND IT USED TO BE. It was accepted
+# from #158 onward (lifted verbatim into this helper by #166), with no
+# rationale recorded anywhere. What it actually means is the OPPOSITE: text is
+# in the input box. pane-state gives bright input-row text precedence over
+# every other reading ("bright user text supersedes everything"), so after a
+# paste it is exactly the signature of a brief that LANDED and was NOT
+# submitted. Measured 2026-09-11: watcher.log 04:28:06 logged
+# "post-paste verify (after retry): state=user-typing — turn submitted"; the
+# pane then read `state=user-typing input=typed` with the recovery brief still
+# in the box for ~5.5 minutes, and the transcript holds no user record until
+# 04:33:43, when the cc-restart-watchdog sent one Enter by hand. That also made
+# #1470's UNDELIVERED arm unreachable for this shape: this predicate passed
+# before the exhaustion branch could run.
+#
+# ERROR DIRECTION of `busy` alone: a brief whose whole turn finishes inside
+# one 0.5 s poll gap reads as UNDELIVERED (rc 4 → the caller re-arms delivery).
+# That is the recoverable direction; the old predicate's was manufactured
+# success.
 _respawn_wait_for_submit_evidence() {
     local target="$1" budget_s="$2" pane_state_bin="$3"
     local deadline state
@@ -857,7 +1093,7 @@ _respawn_wait_for_submit_evidence() {
     while (( $(date +%s) < deadline )); do
         state=$(_respawn_probe_state "$target" "$pane_state_bin" 2>/dev/null || true)
         case "$state" in
-            busy|user-typing)
+            busy)
                 printf '%s' "$state"
                 return 0
                 ;;
@@ -883,9 +1119,16 @@ _respawn_paste_prompt_file() {
     # normally live; the guard covers the case where the spawned
     # launcher died between `new-window` and here, which is exactly the
     # crash-loop this module exists to survive.
+    # Message branches on the verdict, refusal does not (#1020). See the
+    # matching note in _unstick.sh::_paste_line_to_window.
     if _tmux_pane_is_dead "$target"; then
-        printf '_respawn: target %q is a dead pane — refusing to paste the recovery prompt (your-org/nexus-code#745: a paste into a dead pane kills the tmux server)\n' \
-            "$target" >&2
+        if [[ "${NEXUS_PANE_LIVE_VERDICT:-}" == "dead" ]]; then
+            printf '_respawn: target %q is a DEAD pane — refusing to paste the recovery prompt (your-org/nexus-code#745: a paste into a dead pane kills the tmux server). Respawn it; a retry is another attempt to kill the server.\n' \
+                "$target" >&2
+        else
+            printf '_respawn: could NOT establish that target %q is a live pane (verdict=%s) — refusing to paste the recovery prompt (your-org/nexus-code#745). Nobody looked successfully; this is RETRYABLE and is NOT a finding that the target is a corpse.\n' \
+                "$target" "${NEXUS_PANE_LIVE_VERDICT:-unset}" >&2
+        fi
         return 1
     fi
     buf="nexus-respawn-$$-$(date +%s%N)"
@@ -894,7 +1137,35 @@ _respawn_paste_prompt_file() {
         rc=1
     elif ! tmux load-buffer -b "$buf" "$prompt_file" 2>/dev/null; then
         rc=1
-    elif ! tmux paste-buffer -b "$buf" -t "$target" 2>/dev/null; then
+    # BRACKETED (`-p`), as `main.sh`'s emit paste and `_unstick.sh`'s line paste
+    # are on this base (your-org/nexus-code#1516, #1518). THE THIRD AND LAST
+    # unbracketed `paste-buffer` in the tree — `#1514`'s branch was believed to
+    # cover it and does not: measured `paste-buffer -p` count in this file is
+    # **0** at `origin/dev` 4f73e0e7, `origin/main` 0a76c4d5, at this branch's
+    # base 81c38b39, AND at `operator/w234-restart-boundary` da1b54c3 (two
+    # `paste-buffer` occurrences in the file, of which one is the comment above
+    # and one is this call). Skeptic `w236sk` F3.
+    #
+    # Unbracketed, the REPL can only infer a paste from bytes that arrive
+    # together, so a REPL that reads the paste and the Enter 0.1 s below in ONE
+    # chunk takes the Enter's CR as part of the paste — a line break, not the
+    # submit — and the text sits UNSUBMITTED in the input box. Bracketed, that CR
+    # arrives after `ESC[201~` and is a keypress however the bytes are chunked.
+    # `-p` is inert on a pane that never requested mode ?2004.
+    #
+    # WHY THIS SITE IS THE WORST OF THE THREE. It pastes the RESPAWN PROMPT into
+    # a window `_respawn_spawn_window` has just created, and this function's only
+    # failure signal is a tmux rc — there is no content check here at all. So a
+    # strand is an orchestrator that was respawned, never briefed, and reported
+    # respawned: it comes up, sits holding an unsubmitted prompt, and nothing
+    # downstream disagrees. That is the 11-hour-silence shape of `#1518` reached
+    # by a different road, and it is a MANUFACTURED SUCCESS rather than a masked
+    # failure — every visible artefact says the respawn worked.
+    #
+    # The `#745` dead-pane guard above is untouched and still precedes this call:
+    # `-p` does not change that hazard (`_pane-live.sh` measured
+    # `paste-buffer -p -d` killing the server 20/20, same as the plain form).
+    elif ! tmux paste-buffer -p -b "$buf" -t "$target" 2>/dev/null; then
         rc=1
         tmux delete-buffer -b "$buf" 2>/dev/null || true
     else
@@ -1195,10 +1466,29 @@ _respawn_orchestrator() {
     local paste_rc=0
     _respawn_paste_prompt_file "$target" "$prompt_file" || paste_rc=1
 
-    # Post-paste verify: state=busy or state=user-typing confirms the
-    # Enter submitted. If still empty after the budget, retry Enter
-    # once (don't busy-loop — a wedged claude won't be unstuck by
-    # hammering Enter).
+    # Post-paste verify: state=busy confirms the Enter submitted. If not
+    # busy after the budget, retry Enter once (don't busy-loop — a wedged
+    # claude won't be unstuck by hammering Enter).
+    #
+    # The ONE exception is positive evidence that the brief is sitting in the
+    # input box unsubmitted: `state=user-typing` with `input=typed`. That is an
+    # ALLOWLIST (w234sk F8): `input=?` is undecidable and is read as a draft,
+    # and `ghost`, `blank` or a line with no `input=` field at all say nothing
+    # typed is there, so none of them gets an Enter. Then Enter is the remedy, not hammering — it submits exactly the
+    # text that is there. A freshly `--resume`d orchestrator replaying a large
+    # transcript was measured ignoring Enter for longer than the 3 s verify
+    # window (2026-09-11: both the first Enter and the retry 2 s later left the
+    # brief in the box; an Enter ~5.5 min later submitted it). So while that
+    # evidence holds, Enter is re-sent every
+    # FRESH_SPAWN_SUBMIT_TYPED_RETRY_INTERVAL_SECONDS (default 5) until
+    # FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS (default 60) runs out. Both
+    # defaults are CHOSEN, not measured: the incident shows 2 s was too short
+    # and gives no upper bound, because nobody pressed Enter in between. 0
+    # disables the typed-retry.
+    #
+    # RESIDUAL: `input=typed` cannot tell the brief from an operator typing into
+    # the freshly respawned window within that minute; an Enter then submits
+    # both. Stated, not solved.
     if (( paste_rc == 0 )) && [[ -x "$pane_state_bin" ]]; then
         local submit_state
         if submit_state=$(_respawn_wait_for_submit_evidence "$target" "$post_paste_verify" "$pane_state_bin"); then
@@ -1206,11 +1496,67 @@ _respawn_orchestrator() {
         else
             "$log_fn" "post-paste verify: no submit-evidence after ${post_paste_verify}s (last state='${submit_state:-unknown}'); retrying Enter once"
             if tmux send-keys -t "$target" Enter 2>/dev/null; then
-                local retry_state
-                if retry_state=$(_respawn_wait_for_submit_evidence "$target" "$post_paste_verify" "$pane_state_bin"); then
+                local retry_state typed_submitted=0 typed_n=0
+                if ! retry_state=$(_respawn_wait_for_submit_evidence "$target" "$post_paste_verify" "$pane_state_bin"); then
+                    local typed_budget="${FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS:-60}"
+                    local typed_interval="${FRESH_SPAWN_SUBMIT_TYPED_RETRY_INTERVAL_SECONDS:-5}"
+                    [[ "$typed_budget" =~ ^[0-9]+$ ]] || typed_budget=60
+                    [[ "$typed_interval" =~ ^[0-9]+$ ]] && (( typed_interval > 0 )) || typed_interval=5
+                    local typed_deadline=$(( $(date +%s) + typed_budget ))
+                    local typed_raw typed_input
+                    while (( $(date +%s) < typed_deadline )); do
+                        typed_raw=$(_respawn_probe_raw "$target" "$pane_state_bin" 2>/dev/null || true)
+                        retry_state=$(sed -n 's/.*state=\([a-z-]*\).*/\1/p' <<<"$typed_raw")
+                        [[ "$retry_state" == busy ]] && { typed_submitted=1; break; }
+                        [[ "$retry_state" == user-typing ]] || break
+                        typed_input=$(sed -n 's/.*[[:space:]]input=\([a-z?]*\).*/\1/p' <<<"$typed_raw")
+                        [[ "$typed_input" == typed ]] || break
+                        typed_n=$(( typed_n + 1 ))
+                        "$log_fn" "post-paste verify: state=user-typing input=${typed_input:-<absent>} — the brief is IN the input box, unsubmitted; re-sending Enter (typed-retry ${typed_n}, budget ${typed_budget}s)"
+                        tmux send-keys -t "$target" Enter 2>/dev/null || break
+                        if retry_state=$(_respawn_wait_for_submit_evidence "$target" "$typed_interval" "$pane_state_bin"); then
+                            typed_submitted=1; break
+                        fi
+                    done
+                fi
+                if [[ "$retry_state" == busy ]] && (( typed_n == 0 )); then
                     "$log_fn" "post-paste verify (after retry): state=${retry_state} — turn submitted"
+                elif (( typed_submitted )); then
+                    "$log_fn" "post-paste verify (after ${typed_n} typed-retr$( ((typed_n == 1)) && echo y || echo ies )): state=${retry_state} — turn submitted"
                 else
-                    "$log_fn" "post-paste verify (after retry): still no submit-evidence (last state='${retry_state:-unknown}')"
+                    # your-org/nexus-code#1470: EXHAUSTING THE RETRIES IS A
+                    # FAILURE, NOT A STATE TO PASS THROUGH. This used to log
+                    # and fall out to `return 0`, so the function reported
+                    # success when the TRANSPORT succeeded and the OUTCOME
+                    # failed -- it verified that the keystroke was sent, never
+                    # that a turn began, and only the second is the thing it
+                    # exists to establish. Fired twice (watcher.log 2026-09-03
+                    # 12:00:13 and 2026-09-05 04:35:28); on the second the
+                    # brief sat unsubmitted in the input buffer, the caller
+                    # proceeded to routine polling, and the orchestrator went
+                    # idle at 04:37 having never received the instruction it
+                    # was respawned to act on. It was recovered only because
+                    # the cc-restart-watchdog happened to be watching.
+                    #
+                    # This is the MANUFACTURED-SUCCESS direction, not the
+                    # masked-failure one: every artefact says the brief was
+                    # delivered (window exists, claude running, paste
+                    # succeeded, rc 0) and the only evidence is an absence --
+                    # an idle agent, indistinguishable from one with nothing
+                    # to do. Both instances read `last state='unknown'`, the
+                    # state that means "could not look at all"; resolving THAT
+                    # as delivered is the permissive-default arm CLAUDE.md
+                    # singles out for kill decisions, applied to a delivery
+                    # decision.
+                    #
+                    # rc 4 is already the documented code for exactly this --
+                    # "paste step failed (window spawned, prompt not
+                    # delivered)" -- so no new code is minted. The retry
+                    # comment above stays: the fix is not more retries, it is
+                    # that exhausting them must be REPORTED. (#1073: verify the
+                    # property, not the mechanism.)
+                    "$log_fn" "post-paste verify (after retry): still no submit-evidence (last state='${retry_state:-unknown}'); reporting UNDELIVERED (rc 4)"
+                    paste_rc=1
                 fi
             else
                 "$log_fn" "post-paste verify: Enter retry failed (tmux send-keys rc!=0)"

@@ -35,11 +35,16 @@ monitor/.state/<cron-purpose>.state
 
 e.g., `monitor/.state/watcher-health-cron.state`. Beside it, the recovery marker (next section): `monitor/.state/<cron-purpose>.state.recreate-note.md`.
 
-## Recovery marker — workaround for `CronCreate durable: true`
+## Recovery marker — because a harness cron is SESSION-ONLY
 
-The Claude Code harness's `CronCreate` accepts a `durable: true` flag that documents "this cron survives an orchestrator session reset." Empirically (verified on <other-operator>'s 24h watcher-health monitor, 2026-05-26→27) **the flag is silently ignored**: a session that respawns mid-window loses the cron registration and never re-fires.
+The Claude Code harness's `CronCreate` still accepts a `durable` flag, and the flag **does nothing**. This was first established empirically (<other-nexus>'s 24h watcher-health monitor, 2026-05-26→27): a session that respawned mid-window lost the cron registration and never re-fired. It is no longer an undocumented quirk — the tool's own schema now says so in as many words, `durable`: *"Has no effect — durable persistence is not available. All jobs are session-only (in-memory, gone when this Claude session ends)"*, and the tool description adds *"nothing is written to disk."* Read the live schema rather than this paragraph before relying on either.
 
-This is an upstream harness bug, not a nexus issue (see memory rule `[[upstream-quirks-not-nexus]]`). The workaround pattern that does work:
+**Two harness bounds this pattern has to live inside, and neither is negotiable from the nexus side:**
+
+- **Session-only.** An orchestrator respawn loses the registration. That is what the recovery marker below exists for.
+- **Recurring jobs auto-expire after 7 days** — they fire one final time, then are deleted. So `target_fires` cannot exceed what fits in seven days at your interval, and a window longer than that needs a deliberate re-instantiation, not a bigger number in the TSV.
+
+The workaround pattern that does work:
 
 1. **Write a recovery-marker file** alongside the state TSV at instantiation time:
 
@@ -57,7 +62,7 @@ This is an upstream harness bug, not a nexus issue (see memory rule `[[upstream-
 
 ## Worked example — `watcher-health-cron`
 
-Operator on `<your-org>/<other-nexus>#9` ran a 24h monitoring window over `<other-nexus>` watcher health. State TSV at `monitor/.state/watcher-health-cron.state`:
+Operator on `<your-org>/<other-nexus>#9` ran a 24h monitoring window over `<other-nexus>-nexus` watcher health. State TSV at `monitor/.state/watcher-health-cron.state`:
 
 ```
 created_at	fire_count	cron_id	target_fires
@@ -71,7 +76,7 @@ Per-fire prompt logic (paraphrased — the literal prompt was the cron's `prompt
 3. Otherwise: do the per-fire work (in their case, "check the watcher's most recent emit and verify the bot reacted within 7 minutes; flag if not").
 4. Increment `fire_count`, rewrite row 2 atomically (tmp + rename).
 
-The empirical case study from fire 22 (per the operator's report on `<other-nexus>#9`): the cron's functional check caught a stale comment (`4567434094` on `<other-nexus>#10`) approximately 7 minutes after posting, and the orchestrator forwarded it to its `he-embeddings` worker before the (then-unfixed) staleness regression would have surfaced it via the watcher. That's the load-bearing value of a cron-state TSV: a periodic external check whose own bookkeeping survives the orchestrator's lifecycle.
+The empirical case study from fire 22 (per the operator's report on `<other-nexus>-nexus#9`): the cron's functional check caught a stale comment (`4567434094` on `<other-nexus>-nexus#10`) approximately 7 minutes after posting, and the orchestrator forwarded it to its `he-embeddings` worker before the (then-unfixed) staleness regression would have surfaced it via the watcher. That's the load-bearing value of a cron-state TSV: a periodic external check whose own bookkeeping survives the orchestrator's lifecycle.
 
 ## When to use this pattern vs. just sticking the cadence in a worker
 

@@ -141,9 +141,40 @@ PROJECT_DIR=$(CDPATH= cd "$_ju_project_arg" 2>/dev/null && pwd) \
 _sanitize() { printf '%s' "$1" | tr -cs 'A-Za-z0-9_.-' '-' | sed 's/^-*//; s/-*$//'; }
 _path_hash() { printf '%s' "$1" | cksum | awk '{printf "%04x", $1 % 65536}'; }
 
+# your-org/nexus-code#1266. Both lookups below read the parser through
+# PROCESS SUBSTITUTION, which DISCARDS its rc — so an unreadable registry
+# reaches them as ZERO ROWS and they answer "not registered". That answer is
+# acted on: `service_name_for` then believes the name is free and registers a
+# DUPLICATE, and `--down`/`--status` believe there is nothing to stop. This
+# is an interactive operator command, so the honest move is to refuse rather
+# than to guess. `_recover_registry_readable` comes from the sourced
+# bootstrap-recover.sh; the contract is documented there.
+# CALL THIS FROM THE MAIN SHELL, NEVER RELY ON IT INSIDE `$( )`.
+#
+# `die` is `exit 1`, and every caller of the two lookups below invokes them in
+# a COMMAND SUBSTITUTION — `name=$(_registry_name_for_workdir …) || { … }`. An
+# `exit` inside `$( )` terminates the SUBSHELL, not the script, so the caller's
+# `||` arm simply runs and execution continues. Measured on this file before
+# the entry-point gates were added: with an unreadable registry,
+# `jupyter-up.sh --down` printed "no jupyter-* registry row … stopping any bare
+# labsh server anyway" and exited **0** — i.e. the guard FIRED, wrote its
+# refusal to stderr, and the refusal was DISCARDED, leaving exactly the
+# your-org/nexus-code#1266 behaviour it was added to prevent.
+#
+# That is this issue's own defect class one level up: not a check that is
+# missing, but a check whose verdict no caller can observe. The in-function
+# calls below are retained as defence in depth; the LOAD-BEARING gates are the
+# ones at the top of cmd_up / cmd_down / cmd_status, which run in the main
+# shell where `die` actually exits.
+_registry_must_be_readable() {
+    _recover_registry_readable "$SERVICES_REGISTRY" && return 0
+    die "registry at $SERVICES_REGISTRY exists and could NOT be READ. Refusing: every lookup would answer 'not registered', which would register a duplicate row or silently skip a running service. Fix its readability and re-run."
+}
+
 # Look up the registered workdir for a name ('' if absent).
 _registry_workdir_of() {
     local name="$1" n w rest
+    _registry_must_be_readable
     while IFS=$'\t' read -r n w rest; do
         [[ "$n" == "$name" ]] && { printf '%s' "$w"; return 0; }
     done < <(_recover_parse_registry "$SERVICES_REGISTRY")
@@ -156,6 +187,7 @@ _registry_workdir_of() {
 # written by older code).
 _registry_name_for_workdir() {
     local dir="$1" n w rest
+    _registry_must_be_readable
     while IFS=$'\t' read -r n w rest; do
         [[ "$w" == "$dir" ]] || continue
         if [[ "$n" == jupyter-* || "$n" == "$ROOT_SERVICE_NAME" ]]; then
@@ -200,7 +232,27 @@ ensure_registry_row() {
     _registry_rewrite() {
         local tmp
         tmp=$(mktemp "$SERVICES_REGISTRY.XXXXXX") || die "mktemp failed"
-        awk -F'\t' -v name="$name" '$1 != name' "$SERVICES_REGISTRY" > "$tmp"
+    # your-org/nexus-code#1266 (rewrite half). `awk … "$REG" > "$tmp"` FAILS
+    # OPEN on an unreadable registry — rc 2, `$tmp` EMPTY — and the `mv` two
+    # lines down then COMMITS that empty file over the operator's registry.
+    # Nothing tests awk's rc (this script is `set -uo pipefail`, no `-e`), so
+    # the function prints its success line and returns 0. Measured against an
+    # 11-row registry at 85458bf8: `ensure` left 1 row, `remove` left 0, both
+    # at rc 0 announcing success. That is strictly worse than the READ half of
+    # this issue — it is permanent DATA DESTRUCTION, and afterwards every
+    # reader legitimately reports "no services" because there genuinely are
+    # none, so the manufactured success becomes self-consistent.
+    #
+    # The realistic driver is not chmod but a transient ESTALE/EIO on the
+    # NFS-backed tree, where the DIRECTORY stays writable while the file read
+    # fails — exactly the state in which `mv` succeeds.
+    #
+    # Read-then-write is not atomic here, so the rc of the READ is the only
+    # thing standing between a transient fault and a destroyed registry.
+        if ! awk -F'\t' -v name="$name" '$1 != name' "$SERVICES_REGISTRY" > "$tmp"; then
+            rm -f "$tmp"
+            die "registry at $SERVICES_REGISTRY exists and could not be READ (awk rc!=0) — REFUSING to rewrite it. Rewriting now would replace every existing row with just '$name'. Fix the registry's readability, then re-run."
+        fi
         printf '%s\n' "$row" >> "$tmp"
         mv "$tmp" "$SERVICES_REGISTRY"
     }
@@ -217,7 +269,27 @@ remove_registry_row() {
     local name="$1" tmp
     [[ -f "$SERVICES_REGISTRY" ]] || return 0
     tmp=$(mktemp "$SERVICES_REGISTRY.XXXXXX") || die "mktemp failed"
-    awk -F'\t' -v name="$name" '$1 != name' "$SERVICES_REGISTRY" > "$tmp"
+    # your-org/nexus-code#1266 (rewrite half). `awk … "$REG" > "$tmp"` FAILS
+    # OPEN on an unreadable registry — rc 2, `$tmp` EMPTY — and the `mv` two
+    # lines down then COMMITS that empty file over the operator's registry.
+    # Nothing tests awk's rc (this script is `set -uo pipefail`, no `-e`), so
+    # the function prints its success line and returns 0. Measured against an
+    # 11-row registry at 85458bf8: `ensure` left 1 row, `remove` left 0, both
+    # at rc 0 announcing success. That is strictly worse than the READ half of
+    # this issue — it is permanent DATA DESTRUCTION, and afterwards every
+    # reader legitimately reports "no services" because there genuinely are
+    # none, so the manufactured success becomes self-consistent.
+    #
+    # The realistic driver is not chmod but a transient ESTALE/EIO on the
+    # NFS-backed tree, where the DIRECTORY stays writable while the file read
+    # fails — exactly the state in which `mv` succeeds.
+    #
+    # Read-then-write is not atomic here, so the rc of the READ is the only
+    # thing standing between a transient fault and a destroyed registry.
+    if ! awk -F'\t' -v name="$name" '$1 != name' "$SERVICES_REGISTRY" > "$tmp"; then
+        rm -f "$tmp"
+        die "registry at $SERVICES_REGISTRY exists and could not be READ (awk rc!=0) — REFUSING to rewrite it. Rewriting now would TRUNCATE it to zero rows."
+    fi
     mv "$tmp" "$SERVICES_REGISTRY"
     say "registry: removed row '$name'"
 }
@@ -377,6 +449,9 @@ _await_health_or_converge() {
 # --- verbs -------------------------------------------------------------------
 
 cmd_up() {
+    # your-org/nexus-code#1266 — main-shell gate. See _registry_must_be_readable
+    # for why the in-function guard cannot carry this on its own.
+    _registry_must_be_readable
     command -v labsh >/dev/null 2>&1 \
         || die "labsh not on PATH — install via 'brew install operator/tools/labsh' or monitor/install-labsh.sh"
     command -v uv >/dev/null 2>&1 \
@@ -469,6 +544,9 @@ EOF
 }
 
 cmd_down() {
+    # your-org/nexus-code#1266 — main-shell gate. Without it, an unreadable
+    # registry reached the `||` arm below and exited 0 "no jupyter-* registry row".
+    _registry_must_be_readable
     local name
     name=$(_registry_name_for_workdir "$PROJECT_DIR") || {
         say "no jupyter-* registry row for $PROJECT_DIR — stopping any bare labsh server anyway"
@@ -485,6 +563,9 @@ cmd_down() {
 }
 
 cmd_status() {
+    # your-org/nexus-code#1266 — main-shell gate. Without it, status reported
+    # `(unregistered)` for a service it merely could not look up.
+    _registry_must_be_readable
     local name health sup
     name=$(_registry_name_for_workdir "$PROJECT_DIR") || name='(unregistered)'
     if "$HEALTH_BIN" "$PROJECT_DIR" >/dev/null 2>&1; then health=healthy; else health=unhealthy; fi

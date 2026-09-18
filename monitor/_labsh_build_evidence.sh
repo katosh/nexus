@@ -121,7 +121,8 @@ labsh_build_is_ours() {
     [[ -n "$cwd" && "$cwd" == "$wd_abs" ]] || return 1
 
     # (4) corroboration: it is a jupyterlab build at all.
-    cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || return 1
+    # `{ …; } 2>/dev/null` — redirection ORDER (your-org/nexus-code#1305).
+    cmd=$( { tr '\0' ' ' < "/proc/$pid/cmdline"; } 2>/dev/null ) || return 1
     [[ -n "$cmd" ]] || return 1
     [[ "$cmd" == *jupyter-lab* || "$cmd" == *jupyter_lab* ]] || return 1
 

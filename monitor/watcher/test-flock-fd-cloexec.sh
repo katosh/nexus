@@ -59,13 +59,28 @@ trap 'rm -rf "$WORK"' EXIT
 # under <root>. Pure grep/sed over source text — a lint, not a parser: it
 # can be fooled by pathological quoting, but it catches the idioms this
 # repo actually writes, and the fixture below keeps it honest.
-scan_tree() {
-    local root="$1" f line lineno text fd num tok start
-    while IFS= read -r f; do
+# THE POPULATION, AS ONE ENUMERATOR (your-org/nexus-code#1435): every
+# non-test shell file under <root> that mentions `flock`. `scan_tree` walks
+# exactly this, and `gp_population` below CALLS it rather than restating it.
+# APPLICABILITY-keyed (a file that acquires a flock), never conformance (a file
+# whose acquisition is already hardened): a diff that ADDS a flock joins it on
+# the same commit. The extensionless `monitor/ng` is in the walk on purpose —
+# it is shell by shebang alone and a `*.sh` find misses it (#803); it carries
+# `flock` and zero `exec`-fd acquisitions at 6df5d6b9, so admitting it changes
+# no verdict today and stops it being invisible tomorrow.
+_ffc_population() {   # <root>
+    find "$1" -type f \( -name '*.sh' -o -name ng \) | LC_ALL=C sort | while IFS= read -r f; do
         case "$f" in
             */test-*|*/_test_helpers.sh|*/test-integration/*) continue ;;
         esac
-        grep -q 'flock' "$f" 2>/dev/null || continue
+        grep -q 'flock' "$f" 2>/dev/null && printf '%s\n' "$f"
+    done
+    return 0   # the loop's status is the LAST grep's, which is 1 for a non-member
+}
+
+scan_tree() {
+    local root="$1" f line lineno text fd num tok start
+    while IFS= read -r f; do
         while IFS= read -r line; do
             lineno="${line%%:*}"; text="${line#*:}"
             # comment lines are not acquisitions
@@ -87,8 +102,22 @@ scan_tree() {
             grep -q '# flock-fd:' <<<"$(sed -n "${start},${lineno}p" "$f")" && continue
             printf '%s:%s fd=%s\n' "$f" "$lineno" "$tok"
         done < <(grep -nE 'exec [0-9]+[<>]|exec \{[A-Za-z_][A-Za-z0-9_]*\}[<>]' "$f" 2>/dev/null)
-    done < <(find "$root" -name '*.sh' -type f | LC_ALL=C sort)
+    done < <(_ffc_population "$root")
 }
+
+# ── DECLARE WHAT THIS GUARD READS (your-org/nexus-code#1435, #803) ──────────
+#
+# This lint caught a real O_CLOEXEC defect in #1425 in all five unit bands and
+# was invisible to `ng guards-for-diff --run` for that very diff, because it
+# declared nothing: absent from SELECTED and from CONSIDERED AND EXCLUDED
+# alike, so its absence read as a considered exclusion (#1078). `gp_handle`
+# EXITS when it handles the flag, so it stands above the first line of output.
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_guard_population.sh"
+gp_population() {
+    ( cd "$MON_DIR/.." && _ffc_population monitor )
+}
+gp_handle "$@"
 
 # --- self-proof: the scanner catches synthetic bad sites --------------------
 

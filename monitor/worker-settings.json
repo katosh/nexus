@@ -8,88 +8,129 @@
       {
         "matcher": "Bash|Write|Edit|NotebookEdit",
         "hooks": [
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/pending-tool-record.sh" }
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/pending-tool-record.sh"
+          }
         ]
       },
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Monitor",
         "hooks": [
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/gh-write-guard.sh" },
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/bash-footgun-guard.sh" }
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/gh-write-guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|Monitor",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/bash-footgun-guard.sh"
+          }
         ]
       }
     ],
     "PostToolUse": [
       {
         "hooks": [
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/worker-heartbeat.sh busy" },
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/pending-tool-record.sh --clear" }
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/worker-heartbeat.sh busy"
+          },
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/pending-tool-record.sh --clear"
+          }
         ]
       },
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Monitor",
         "hooks": [
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/async-launch-detect.sh" }
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/async-launch-detect.sh"
+          }
         ]
       }
     ],
     "Notification": [
       {
         "hooks": [
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/worker-heartbeat.sh notify" },
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/notification-record.sh" },
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/decision-emit.sh" },
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/notify-permission.sh" }
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/worker-heartbeat.sh notify"
+          },
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/notification-record.sh"
+          },
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/decision-emit.sh"
+          },
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/notify-permission.sh"
+          }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/worker-heartbeat.sh user_prompt" }
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/worker-heartbeat.sh user_prompt"
+          }
         ]
       }
     ],
     "PermissionRequest": [
       {
         "hooks": [
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/worker-heartbeat.sh permission_prompt" }
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/worker-heartbeat.sh permission_prompt"
+          }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/decision-mark-unresolved.sh" },
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/worker-heartbeat.sh turn_end" },
-          { "type": "command",
-            "command": "rm -f $NEXUS_ROOT/monitor/.state/over-limit/$NEXUS_WORKER_WINDOW.json" },
-          { "type": "command",
-            "command": "rm -f $NEXUS_ROOT/monitor/.state/turn-failure/$NEXUS_WORKER_WINDOW.json" }
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/decision-mark-unresolved.sh"
+          },
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/worker-heartbeat.sh turn_end"
+          },
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/stamp-clear.sh over-limit"
+          },
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/stamp-clear.sh turn-failure"
+          }
         ]
       }
     ],
     "StopFailure": [
       {
         "hooks": [
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/over-limit-emit.sh" },
-          { "type": "command",
-            "command": "$NEXUS_ROOT/monitor/hooks/turn-failure-emit.sh" }
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/over-limit-emit.sh"
+          },
+          {
+            "type": "command",
+            "command": "$NEXUS_ROOT/monitor/hooks/turn-failure-emit.sh"
+          }
         ]
       }
     ]

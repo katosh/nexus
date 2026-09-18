@@ -74,16 +74,26 @@ set -u
 
 payload=$(cat 2>/dev/null || true)
 
-window="${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-}}"
-root="${NEXUS_ROOT:-}"
+# Window and state-dir resolution both live in `_stamp_path.sh`, which the
+# `Stop`-hook CLEAR (`stamp-clear.sh`) also sources. That sharing IS the fix
+# for your-org/nexus-code#1143: this writer honoured `NEXUS_STATE_DIR` while
+# the clear hardcoded `$NEXUS_ROOT/monitor/.state`, so under any override the
+# stamp was written where `pane-state.sh` reads it and cleared where nobody
+# wrote — and `rm -f` on a non-existent path is silent, so the clear reported
+# success for a stamp it never touched. Two string literals that merely agreed
+# today have been replaced by one function both sides call, so the clear cannot
+# be wrong without this writer being wrong in the same way.
+_self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || exit 0
+[[ -r "$_self_dir/_stamp_path.sh" ]] || exit 0
+# shellcheck source=/dev/null
+. "$_self_dir/_stamp_path.sh" || exit 0
 
-# Last-resort window resolution for panes launched without either env
-# var (operator-manual launches). Best-effort; a failure leaves
-# `window` empty and we bail exactly as before.
-if [[ -z "$window" ]] && [[ -n "${TMUX_PANE:-}" ]] \
-    && command -v tmux >/dev/null 2>&1; then
-    window=$(tmux display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null) || window=""
-fi
+# `stamp_window` is the same three-step resolution this file used inline:
+# worker env, orchestrator env, then a best-effort `$TMUX_PANE` lookup for
+# operator-manual launches. A failure leaves `window` empty and we bail
+# exactly as before.
+window=$(stamp_window) || window=""
+root="${NEXUS_ROOT:-}"
 
 if [[ -z "$window" ]] || [[ -z "$root" ]]; then
     exit 0
@@ -95,7 +105,8 @@ command -v jq >/dev/null 2>&1 || exit 0
 # order pane-state.sh already uses for READING the stamp — the writer
 # must agree or the two sides split-brain). Same convention as the
 # sibling hooks (turn-failure-emit.sh, async-launch-detect.sh, …).
-state_dir="${NEXUS_STATE_DIR:-$root/monitor/.state}"
+# Resolved by the shared helper so the CLEAR resolves it identically.
+state_dir=$(stamp_state_dir) || exit 0
 mkdir -p "$state_dir" 2>/dev/null || exit 0
 
 # Empirical-capture: write every StopFailure payload to a jsonl log

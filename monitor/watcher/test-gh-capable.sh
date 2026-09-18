@@ -51,7 +51,7 @@ SELF_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 MONITOR_DIR=$(CDPATH= cd "$SELF_DIR/.." && pwd)
 REPO_ROOT=$(CDPATH= cd "$MONITOR_DIR/.." && pwd)
 
-EXPECTED_ASSERTIONS=56
+EXPECTED_ASSERTIONS=60
 
 PASS=0; FAIL=0; RUN=0
 pass() { PASS=$((PASS + 1)); RUN=$((RUN + 1)); printf '  PASS: %s\n' "$1"; }
@@ -62,6 +62,10 @@ eq() { # eq <actual> <expected> <label>
     if [ "$1" = "$2" ]; then pass "$3"; else fail "$3 — expected '$2', got '$1'"; fi
 }
 contains() { # contains <haystack> <needle> <label>
+    if [[ -z "${2:-}" ]]; then
+        fail "$3 — EMPTY needle: \`*\"\"*\` matches any string, so this assertion could only have passed VACUOUSLY (your-org/nexus-code#1110). Fix the CALLER: its expected value came back empty; check the rc of whatever produced it."
+        return
+    fi
     case "$1" in *"$2"*) pass "$3" ;; *) fail "$3 — '$2' not in: $(printf '%s' "$1" | head -c 200)" ;; esac
 }
 lacks() {
@@ -98,8 +102,17 @@ mk_gh() { # mk_gh <dir> <version-or-BROKEN>
 # /usr/bin — makes the candidate set a property of the fixture instead of a
 # property of whoever is running it.
 CLEANBIN="$WORK/cleanbin"; mkdir -p "$CLEANBIN"
+# `ls`, `tail` and `ps` are needed by the frozen-snapshot leg added for
+# your-org/nexus-code#652/#654: it selects the snapshot with `ls -t … | head -1`,
+# reads the LAST `export PATH=` with `sed … | tail -1`, and walks its own
+# ancestry with `ps`. Without them the leg cannot look and returns NOT CHECKED
+# (79) — correct behaviour by the guard, but it makes every `gate_run` case below
+# read 79 instead of the RC they assert, for a reason unrelated to the version
+# floor they exist to test. That is how this suite went red on the #652 PR: the
+# fixture's utility set predated the leg's dependencies, and a MISSING UTILITY
+# and a REAL objection are indistinguishable in the exit code alone.
 for _u in sh bash env date stat readlink dirname basename cut mkdir mv rm cat \
-          awk sed tr head printf test expr sleep chmod ln touch grep wc sort id uname; do
+          awk sed tr head tail ls ps printf test expr sleep chmod ln touch grep wc sort id uname; do
     _p=$(command -v "$_u" 2>/dev/null) && [ -n "$_p" ] && ln -sf "$_p" "$CLEANBIN/$_u" 2>/dev/null
 done
 if [ -e "$CLEANBIN/gh" ]; then
@@ -143,6 +156,21 @@ echo "=== three-state _ghc_meets ==="
 _ghc_meets "$NEWER/gh"; eq "$?" "0" "meets → 0"
 _ghc_meets "$STALE/gh"; eq "$?" "1" "below floor → 1"
 _ghc_meets "$BROKEN/gh"; eq "$?" "2" "UNDETERMINABLE → 2, never folded into 0 or 1"
+
+echo "=== cache dir resolves like STATE: NEXUS_STATE_DIR before NEXUS_ROOT (#1453) ==="
+# The cache used to consult only NEXUS_ROOT, so a suite that pinned its state
+# dir — the prescribed hermeticity spelling — still wrote gh-capable.d/ into
+# the inherited root the moment a child reached `gh` through the wrapper.
+# Asked of the resolver directly, all four arms, one variable each.
+_cd_pin="$WORK/pin-state"; _cd_root="$WORK/pin-root"
+eq "$(env -u NEXUS_GH_CAPABLE_CACHE NEXUS_STATE_DIR="$_cd_pin" NEXUS_ROOT="$_cd_root" bash -c '. "$1"; _ghc_cache_dir' _ "$MONITOR_DIR/gh-capable.sh")" \
+   "$_cd_pin/gh-capable.d" "NEXUS_STATE_DIR set: the cache lives under the PIN, not under NEXUS_ROOT"
+eq "$(env -u NEXUS_GH_CAPABLE_CACHE -u NEXUS_STATE_DIR NEXUS_ROOT="$_cd_root" bash -c '. "$1"; _ghc_cache_dir' _ "$MONITOR_DIR/gh-capable.sh")" \
+   "$_cd_root/monitor/.state/gh-capable.d" "NEXUS_STATE_DIR unset: falls through to NEXUS_ROOT/monitor/.state"
+eq "$(env NEXUS_GH_CAPABLE_CACHE="$WORK/explicit" NEXUS_STATE_DIR="$_cd_pin" NEXUS_ROOT="$_cd_root" bash -c '. "$1"; _ghc_cache_dir' _ "$MONITOR_DIR/gh-capable.sh")" \
+   "$WORK/explicit" "an explicit NEXUS_GH_CAPABLE_CACHE still wins over both"
+env -u NEXUS_GH_CAPABLE_CACHE -u NEXUS_STATE_DIR -u NEXUS_ROOT bash -c '. "$1"; _ghc_cache_dir' _ "$MONITOR_DIR/gh-capable.sh" >/dev/null 2>&1
+ok "$([ $? -eq 1 ] && echo 0 || echo 1)" "with no root at all the resolver refuses (rc 1) rather than inventing a path"
 
 echo "=== cache correctness ==="
 rm -rf "$CACHE"
@@ -278,6 +306,31 @@ echo "=== spawn gate: the version-floor leg ==="
 # spawned probe shell, through whatever the shim resolution actually produces.
 # Fixture: a synthetic shim dir on PATH front, holding a stub of known version.
 GATE="$WORK/gate"; mkdir -p "$GATE/shims/ghwrap" "$GATE/root/monitor/.state"
+
+# The guard also examines the Claude Code shell SNAPSHOT — the frozen artifact
+# an agent's Bash tool sources, as opposed to the fresh shell this fixture
+# spawns (your-org/nexus-code#652/#654). `NEXUS_CC_HOME` is its exclusive seam,
+# and it is load-bearing here in BOTH directions:
+#
+#   - WITHOUT a seam the leg finds no snapshot inside this synthetic fixture and
+#     returns NOT CHECKED (79). That is the guard behaving correctly and this
+#     suite reading `RC=0`, so the gate cases fail for a reason that has nothing
+#     to do with the version floor they exist to test.
+#   - WITH `HOME` overridden but no seam it would instead read the REAL host's
+#     snapshot from inside a synthetic fixture, because a fixture that overrides
+#     `HOME` does not necessarily override `CLAUDE_CONFIG_DIR` — reporting on a
+#     surface this suite never built.
+#
+# So the seam is pointed at a snapshot containing NO guarded binary: the leg
+# resolves nothing, objects to nothing, and is a genuine no-op for these cases.
+# That is scoping, not silencing — the snapshot leg has its own dedicated cases
+# in test-assert-shims-wrapped.sh, which is where it is actually under test.
+# A snapshot naming the REPO's shim dirs would be wrong here, because this
+# fixture builds its OWN shim dir and a repo-rooted snapshot resolves outside it.
+GATE_CC="$WORK/gate-cc"; mkdir -p "$GATE_CC/shell-snapshots" "$WORK/gate-emptybin"
+printf 'export PATH=%s\n' "$WORK/gate-emptybin" \
+    > "$GATE_CC/shell-snapshots/snapshot-zsh-1-test.sh"
+
 gate_run() { # gate_run <version> [extra env assignments...]
     mk_gh "$GATE/shims/ghwrap" "$1"; shift
     env PATH="$GATE/shims/ghwrap:$CLEANBIN" \
@@ -285,6 +338,7 @@ gate_run() { # gate_run <version> [extra env assignments...]
         NEXUS_SHIMWRAP_GLOB="$GATE/shims/*wrap" \
         NEXUS_ASSERT_GH_SHELL=/bin/sh \
         NEXUS_ASSERT_SKIP_NPROC=1 \
+        NEXUS_CC_HOME="$GATE_CC" \
         "$@" \
         bash "$MONITOR_DIR/assert-shims-wrapped.sh" 2>&1
     printf 'RC=%s\n' "$?"

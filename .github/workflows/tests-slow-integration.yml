@@ -158,7 +158,12 @@ jobs:
 
       - name: install runtime deps (jq + tmux + zsh)
         run: |
-          sudo apt-get update
+          # <your-org>/nexus-code#1505: drop the runner image's unused third-party apt
+          # source before updating (its index outage fails `apt-get update` at exit 100
+          # for packages this build never installs), then retry a transient index
+          # failure a bounded number of times. NOT `|| true`: that hides a real failure.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          for i in 1 2 3; do sudo apt-get update && break; [ "$i" -lt 3 ] || exit 1; sleep 15; done
           sudo apt-get install -y --no-install-recommends jq tmux zsh
 
       - name: the tolerated-red set must parse before anything runs
@@ -314,7 +319,39 @@ jobs:
         # `::warning::` puts the qualification in the run summary and the checks
         # UI, where it travels with the result instead of living in one person's
         # memory.
-        run: bash monitor/slow-band-drift.sh "${{ steps.band.outputs.ledger }}"
+        #
+        # RC 4 IS ENV-UNPROVEN AND MUST NOT HARD-FAIL THIS STEP
+        # (<your-org>/nexus-code#1283). Without this arm the whole #1283 fix is
+        # INERT: a bare `run:` fails on any non-zero, so an honest environment
+        # decline would still red the blocking band — which is #1283's own
+        # complaint, reproduced one layer up, in the step that adjudicates it.
+        #
+        # It is NOT laundered into a pass. The qualification is emitted as a
+        # `::warning::` so it travels with the result into the run summary and
+        # the checks UI, on the same reasoning as the run_attempt warning above:
+        # a caveat that lives in one person's memory is not a caveat.
+        #
+        # A REAL RED IS UNAFFECTED, and that is a property of the checker rather
+        # than of this arm: rc 1 outranks rc 4 inside slow-band-drift.sh, so a
+        # NEW-RED sharing a ledger with an ENVSKIP still exits 1 and still lands
+        # in the `*)` arm below. The declining SUITE has the same precedence one
+        # level down (a product FAIL outranks its own ENV count), so an ENVSKIP
+        # cannot be reached by a suite that actually failed.
+        #
+        # KNOWN BOUNDARY, stated rather than left to be discovered: repetition is
+        # NOT escalated. A suite that declines on EVERY run reads green-with-
+        # warning indefinitely and covers nothing, exactly as an unre-confirmed
+        # toleration rots. The drift check names the rows on every run, which is
+        # what makes that visible, but nothing counts them across runs.
+        run: |
+          rc=0
+          bash monitor/slow-band-drift.sh "${{ steps.band.outputs.ledger }}" || rc=$?
+          case "$rc" in
+            0) ;;
+            4) echo "::warning::SLOW band is ENV-UNPROVEN (drift rc 4) — one or more suites RAN and declined on measured environment grounds. This is NOT a clearance: the band has no evidence either way about the rows named above. See <your-org>/nexus-code#1283."
+               ;;
+            *) exit "$rc" ;;
+          esac
 
       - name: upload SLOW-band ledger + logs
         if: always()
@@ -357,7 +394,12 @@ jobs:
         # not just a `command -v` shim as in the fast gate. jq + zsh
         # match tests.yml so the same tests behave identically.
         run: |
-          sudo apt-get update
+          # <your-org>/nexus-code#1505: drop the runner image's unused third-party apt
+          # source before updating (its index outage fails `apt-get update` at exit 100
+          # for packages this build never installs), then retry a transient index
+          # failure a bounded number of times. NOT `|| true`: that hides a real failure.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome*
+          for i in 1 2 3; do sudo apt-get update && break; [ "$i" -lt 3 ] || exit 1; sleep 15; done
           sudo apt-get install -y --no-install-recommends jq tmux zsh
 
       # --- Anti-vacuous-pass guard 1: the integration suite is actually

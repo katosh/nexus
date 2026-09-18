@@ -74,6 +74,16 @@
 # describe a scoping idiom that is a no-op regardless of author intent.
 #
 # COVERAGE BOUNDARY (one sentence, on the axis the mechanism varies on):
+#   A SECOND, HARDER LIMIT — VERB RESOLUTION (your-org/nexus-code#892, F6).
+#   `command-alias` is a SETTABLE SERVER OPTION: `set -s command-alias[99]
+#   'nuke=kill-server'` makes `tmux nuke` a server-killer, and the mapping is
+#   runtime state that exists only in a running server. A static lint cannot
+#   resolve it — not "has not yet", but CANNOT, because the fact is not in the
+#   text. This lint therefore covers the BUILT-IN vocabulary (including
+#   abbreviations and the `killp`/`killw` short forms) and is structurally blind
+#   to user aliases. The runtime shim `monitor/tmuxwrap/tmux` closes that case
+#   by asking the server; the split is deliberate and is why both exist.
+#
 #   This lint decides a tmux call by the SOCKET RESOLUTION PROVABLE AT ITS CALL
 #   SITE — `-L`/`-S` (not naming `default`) passes, `TMUX_TMPDIR`-only fails,
 #   and a wrapper-routed call needs a counted pragma — so it CANNOT decide
@@ -278,6 +288,36 @@ TMUX_TMPDIR="$T" tmux kill-window -t a:0'
     _expect 'a pin naming the DEFAULT socket' rule4-pins-default-socket \
 'tmux -L default kill-server'
 
+    # === 3b. tmux's REAL grammar (your-org/nexus-code#892, skeptic F2/F3) ==
+    #
+    # Both of these scanned CLEAN until now, and both were EXECUTED against a
+    # real server, which died. A verb allowlist does not model tmux: it accepts
+    # any unambiguous command PREFIX, and it takes several commands in one
+    # invocation separated by `\;`.
+    echo "=== abbreviations and command sequences ==="
+    _expect 'an ABBREVIATED kill-server (kill-ser)' rule1-killserver-unscoped \
+'tmux kill-ser'
+    _expect 'a one-letter abbreviation (k)' rule1-killserver-unscoped 'tmux k'
+    _expect 'an abbreviated kill-window is still untargeted' rule3-untargeted-kill \
+'tmux -L iso kill-wind'
+    _expect 'kill-server in the SECOND position of a \; sequence' \
+        rule1-killserver-unscoped 'tmux list-windows \; kill-server'
+    _expect 'an untargeted kill later in a pinned sequence' rule3-untargeted-kill \
+'tmux -L iso list-windows \; kill-window'
+    _expect 'an earlier -t does NOT satisfy a later untargeted kill' \
+        rule3-untargeted-kill 'tmux -L iso kill-window -t a:1 \; kill-pane'
+    # CONTROLS — the over-refusal direction. A prefix of a NON-kill command, and
+    # a fully-scoped sequence, must both stay clean.
+    _expect 'the killp short form' rule3-untargeted-kill 'tmux -L iso killp'
+    _expect 'the killw short form' rule3-untargeted-kill 'tmux -L iso killw'
+    _expect 'a targeted killw is fine' CLEAN 'tmux -L iso killw -t a:1'
+    _expect 'tmux -- kill-server (option terminator)' rule1-killserver-unscoped \
+'tmux -- kill-server'
+    _expect 'a non-kill abbreviation is not a kill' CLEAN 'tmux -L iso list-w'
+    _expect 'a fully targeted, pinned sequence' CLEAN \
+'tmux -L iso kill-window -t a:1 \; kill-pane -t a:2'
+    _expect 'a kill-free sequence' CLEAN 'tmux -L iso list-windows \; list-panes'
+
     # === 4. plain unscoped forms ===========================================
     echo "=== unscoped forms ==="
     _expect 'bare kill-server' rule1-killserver-unscoped 'tmux kill-server'
@@ -331,6 +371,54 @@ TMUX_TMPDIR="$T" tmux kill-window -t a:0'
     _expect 'full-line comment' CLEAN '    # never run tmux kill-server here'
     _expect 'tmux format string survives comment-stripping' CLEAN \
 'tmux -L iso list-windows -t live -F "#{window_name}"'
+
+    # === 6b. a JSON payload is data, even when it names a real command ======
+    #
+    # THE REGRESSION THIS PINS. Word-splitting runs before quote-stripping, so
+    # `"tmux kill-server"` reached `sub_verb` as `"tmux` + `kill-server"` and the
+    # decoration-stripper turned the second into a bare verb — promoting a
+    # string literal into a call site by deleting the very quote that proved it
+    # was a literal. It fired on THIRTEEN hook fixtures in
+    # `monitor/watcher/test-bash-footgun-guard.sh`, and since `gate.sh` runs
+    # this lint as a pre-flight, `test-cc-gate.sh` then lost five assertions
+    # that never executed (2 pass / 5 fail).
+    #
+    # These are asserted CLEAN rather than pragma-annotated on purpose. A
+    # pragma would record a false positive as a safety exemption and inflate
+    # the counted-hatch manifest by thirteen — the erosion the count exists to
+    # detect. The shapes below are verbatim from that corpus, including the
+    # ones where a `&&`/`;` INSIDE the payload splits the fragment so the
+    # command word is a bare `tmux` and only the verb carries the stray quote.
+    echo "=== a command named inside a JSON payload is not a call ==="
+    _expect 'a hook fixture naming kill-server' CLEAN \
+'run '\''{"tool_name":"Bash","tool_input":{"command":"tmux kill-server"}}'\'''
+    _expect 'a hook fixture naming an untargeted kill-window' CLEAN \
+'run '\''{"tool_name":"Bash","tool_input":{"command":"tmux kill-window"}}'\'''
+    _expect 'a payload whose && splits the fragment' CLEAN \
+'run '\''{"tool_name":"Bash","tool_input":{"command":"cd /tmp && tmux kill-server"}}'\'''
+    # Verbatim but for the leading verb: the corpus line reads `tmux new-window
+    # ; tmux kill-window`, and `new-window` inside this string would enrol the
+    # line in `test-spawn-shape-manifest.sh`'s call-site population — recording
+    # a lint fixture as a spawn shape, the same category error as annotating a
+    # false positive with a safety pragma. `list-windows` splits the fragment
+    # identically; the real corpus line is covered by the tree-wide scan.
+    _expect 'a payload whose ; splits the fragment' CLEAN \
+'run '\''{"tool_name":"Bash","tool_input":{"command":"tmux list-windows ; tmux kill-window"}}'\'''
+    _expect 'a payload carrying TMUX_TMPDIR does not trip rule2 either' CLEAN \
+'run '\''{"tool_name":"Bash","tool_input":{"command":"TMUX_TMPDIR=/tmp/x tmux kill-server"}}'\'''
+    # THE POTENCY CONTROL, inline. Every assertion above is absence-shaped, and
+    # an absence-shaped assertion is also satisfied by a scanner that has gone
+    # blind. These two say the same predicate still SEES a real kill, including
+    # the `\;` sequence and abbreviation support #892 added — so "clean" above
+    # means "read and acquitted", not "never read".
+    _expect 'a REAL kill on the next line is still caught (potency)' \
+        rule1-killserver-unscoped \
+'run '\''{"tool_name":"Bash","tool_input":{"command":"tmux kill-server"}}'\''
+tmux kill-server'
+    _expect 'a REAL \; sequence beside a payload is still caught (potency)' \
+        rule1-killserver-unscoped \
+'run '\''{"tool_input":{"command":"tmux kill-server"}}'\''
+tmux list-windows \; kill-ser'
 
     # === 7. WHICH FILES — the enumeration itself ===========================
     #

@@ -137,7 +137,8 @@ references live in the body alongside the claims they support.
 
 - Not an embedding/semantic-similarity search over your own library
   (that is `bip semantic`, which needs Ollama and is **not** required
-  here). `ng lit` discovery is content-relevance search against S2/ASTA.
+  here). `ng lit` discovery is content-relevance search against S2, ASTA and
+  OpenAlex — all three, per `--source all`, which is the default.
 - Not a replacement for reading the paper — it finds and catalogs;
   judgment about relevance and correctness stays with the worker.
 

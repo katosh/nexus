@@ -67,6 +67,20 @@
 #      well before the clearance `else` this check guards), so the renumber is
 #      purely an allocation fix and changes no control flow. Renumbering the
 #      NEWER, unmerged arm keeps `dev`'s shipped contract stable.
+#  10  DIVERGENT MERGE REF — every run at this head is green, and the runs
+#      DISAGREE about which base they tested (your-org/nexus-code#878, #882).
+#      Distinct from 9 because nothing here says the base MOVED: one of the
+#      bases may well be the live tip. What is established is that the head
+#      carries more than one answer, and the verb refuses to choose — newest
+#      -first ordering would systematically choose the freshest, which is the
+#      most `current`-looking answer available and the one direction that must
+#      never be a default. Reachable because `conclusion=="success"` does not
+#      identify the run that supplied the VERDICT: `ci-signal` and
+#      `conflict-markers` fire unconditionally, print the checkout line, and
+#      routinely succeed in a later round whose `tests` were SKIPPED. The
+#      resolution is the same as 9's — rebase or push, so one round exists
+#      against one base — but the DIAGNOSIS differs, and folding it into 9
+#      would tell the reader the base moved when that has not been shown.
 #   2  usage / lookup refusal — fail-closed, never a green by default
 #
 # WHY THE EXPECTED-BAND AUDIT LIVES HERE TOO (your-org/nexus-code#740).
@@ -107,6 +121,16 @@
 # how it stops being.
 set -uo pipefail
 
+# ARGUMENT-LOOP PROGRESS GUARD (your-org/nexus-code#924) — see monitor/ng for
+# the full rationale. Each iteration must consume at least one argument; a
+# value-taking flag given LAST otherwise spins forever, and a hang on this
+# board is worse than an error because nothing surfaces it.
+_argloop_stuck() {
+    printf '%s: option %s requires a value (argument loop made no progress)\n' \
+        "${0##*/}" "${1-}" >&2
+    exit 64
+}
+
 _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO=""
 REF=""
@@ -116,7 +140,7 @@ AUDIT="auto"
 
 die() { printf 'ci-attempts: %s\n' "$*" >&2; exit 2; }
 
-while (( $# )); do
+_argloop_prev_1=-1; while (( $# )); do (( $# != _argloop_prev_1 )) || _argloop_stuck "$1"; _argloop_prev_1=$#
     case "$1" in
         --repo) REPO="${2:-}"; shift 2 ;;
         --audit)    AUDIT=yes; shift ;;
@@ -510,6 +534,14 @@ provenance=0
 # that do not exist. Only POSITIVE evidence lands here; `unknown` (including an
 # absent column, the pre-#846 wire format) counts as a live red.
 unexecuted=0
+# your-org/nexus-code#884 — the OTHER member of the excluded set: a run that
+# COMPLETED with a conclusion that is neither `success` nor `failure`
+# (`skipped`, `cancelled`, `neutral`, `timed_out`, `action_required`). The rows
+# have always marked it `--  … — not a verdict`; nothing counted it, so the
+# summary quantified over it and asserted it was a success. Same tell as #762
+# below: the information was in the rows and only the SUMMARY contradicted it.
+nonverdict=0
+nonverdict_names=""
 # your-org/nexus-code#762. The per-row output has ALWAYS distinguished a run
 # that has not concluded (`.... still in_progress`), so the information was
 # present and only the SUMMARY contradicted it. That is the tell that the bug
@@ -570,6 +602,21 @@ while IFS= read -r line; do
         mark="RED";   note="concluded failure"; live_red=1
     elif [[ "$conclusion" != "success" ]]; then
         mark="--";    note="concluded $conclusion — not a verdict"
+        # your-org/nexus-code#884 — COUNTED, because it was not.
+        #
+        # This run is `completed`, so `concluded_n` below includes it, and every
+        # universal claim in this file is quantified over completed runs. It is
+        # not a `success`. So each of those claims was FALSE whenever this arm
+        # fired, and the contradiction printed in the same output: `--  wf
+        # concluded skipped — not a verdict` three lines above `VERDICT: every
+        # completed run at this head is a FIRST-PASS success.`
+        #
+        # The `unexecuted` member above already had this treatment. This one did
+        # not, so the five claim sites were qualified for one member of the
+        # excluded set and not the other — the defect is the ASYMMETRY, not the
+        # missing sentence.
+        nonverdict=$(( nonverdict + 1 ))
+        nonverdict_names="${nonverdict_names:+$nonverdict_names, }${wf} (${conclusion})"
     fi
     if [[ "$status" == "completed" ]]; then
         concluded_n=$(( concluded_n + 1 ))
@@ -601,12 +648,137 @@ fi
 # is told only "still in progress" fixes the wait and is ambushed by the billing
 # block, and one told only "this head is RED" fixes code that was never run.
 # One function so the arms cannot drift into three degrees of disclosure.
-_unexecuted_note() {
+# ---- THE EXCLUDED SET, DECIDED IN ONE PLACE (your-org/nexus-code#884) -------
+#
+# Five sentences in this file make a UNIVERSAL claim about the runs at this
+# head. Each one branched on `(( unexecuted ))` privately, and when a second
+# member of the excluded set appeared, four of five were never taught about it —
+# so at rc 0 the verb printed `every completed run at this head is a FIRST-PASS
+# success` underneath a row reading `--  wf  concluded skipped — not a verdict`.
+#
+# The fix is not five more `if`s. It is that MEMBERSHIP and its WORDING are
+# decided here, once, and the claim sites ask. A third member added later is
+# then qualified into all five by construction, which is the only version of
+# this that stays fixed. Same reasoning as `_excluded_note` below, which already
+# exists because three arms had drifted into three degrees of disclosure.
+#
+# `_excl_any` — is anything excluded at all.
+# `_excl_clause` — the clause that narrows the QUANTIFIER.
+# `_excl_count_phrase` — names what was excluded, for the parenthetical.
+#
+# WHAT IS PRESERVED, AND WHAT IS NOT (corrected, your-org/nexus-code#955
+# skeptic round 3). This block used to claim the `unexecuted`-only wording was
+# preserved "BYTE-FOR-BYTE … asserted differentially in
+# test-ci-head-attempts.sh". Both halves were false, and the sentence is exactly
+# the kind of over-claim the three fixes on this PR exist to remove — so it is
+# corrected rather than deleted, since the reader still needs to know the shape
+# of the change.
+#
+# Preserved: the WORDING — `that EXECUTED`, `%d ran nothing at all`, and the
+# absence of any non-verdict clause — on every head with `nonverdict == 0`.
+# NOT preserved: the LINE WRAPPING. Folding the count into `_excl_count_phrase`
+# moved the phrase into the first `printf`, so the break lands after it instead
+# of inside it. Measured across all 42 fixtures in test-ci-head-attempts.sh at
+# 423f92e vs 50d1621: 6 outputs changed, 5 of them the intended #884/#885 cases
+# and ONE — the rc-9 stale-merge-ref arm, `unexecuted`-only — a pure reflow:
+#     -  … is a first-pass success (1 ran
+#     -  nothing at all — see below), AND the merge ref …
+#     +  … is a first-pass success (1 ran nothing at all
+#     +  — see below), AND the merge ref …
+# Cosmetic, and unavoidable while the phrase is dynamic. It is written down
+# because an invariant nobody can check is the same liability as a silent zero.
+#
+# Asserted now, in test-ci-head-attempts.sh, at the level that is actually true:
+# T32 pins the zero-exclusion sentence, and the `unexecuted`-only WORDING is
+# pinned on the rc-9 arm (`that EXECUTED`, `ran nothing at all`, and NO
+# `RETURNED A VERDICT`). Byte-identity of the whole output is NOT asserted; it
+# would need a golden file, and no test in this suite compares bytes
+# (`grep -c 'diff <(' monitor/test-ci-head-attempts.sh` → 0).
+_excl_any()  { (( unexecuted || nonverdict )); }
+# BARE (no leading `that`): one call site reads `every run that EXISTS and
+# %s`, where a second `that` would be ungrammatical. Sites that need it prepend
+# their own — which also keeps the `unexecuted`-only output byte-identical.
+_excl_clause() {
+    if   (( unexecuted && nonverdict )); then printf 'EXECUTED and RETURNED A VERDICT'
+    elif (( unexecuted ));               then printf 'EXECUTED'
+    else                                      printf 'RETURNED A VERDICT'
+    fi
+}
+_excl_count_phrase() {
+    local _p=""
+    (( unexecuted )) && _p="${unexecuted} ran nothing at all"
+    (( nonverdict )) && _p="${_p:+$_p; }${nonverdict} concluded without a verdict"
+    printf '%s' "$_p"
+}
+
+# The #884 member's disclosure. Called from `_excluded_note` rather than from
+# the eight arms, for the reason that function already records: one function so
+# the arms cannot drift into different degrees of disclosure.
+_nonverdict_note() {
+    (( nonverdict )) || return 0
+    printf '\nALSO AT THIS HEAD: %d run(s) COMPLETED with a conclusion that is not a\n' "$nonverdict"
+    printf 'verdict (marked `--` above): %s. A non-verdict is not a\n' "$nonverdict_names"
+    printf 'success — it is the ABSENCE of one, which your-org/nexus-code#628 treats\n'
+    printf 'as red when the band was expected to gate. It is excluded from the\n'
+    printf 'claim above rather than counted into it.\n'
+}
+
+# ---- your-org/nexus-code#885: WHAT IT SAYS, PER ARM ------------------------
+#
+# This helper was audited by whether each arm CALLS it. That is a PRESENCE
+# test, and presence was never the property — the property is whether what it
+# SAYS is true in the arm that called it. Verified, on the audit arm:
+#
+#   fixture: `tests.yml` (a GATING band) concluded `failure` having executed
+#   ZERO steps, `docs.yml` still in progress (so `pending_n > 0` keeps the
+#   NOT-STARTED arm shut and this arm wins).
+#
+#   the audit says   : `UNEXECUTED-RUN: tests.yml … Reported as an ABSENCE of
+#                       verdict (exit 4)`
+#   the verdict says : `the expected-band audit above did NOT come back clean
+#                       (rc 4)`
+#   this note said   : `That does NOT drive the verdict above`
+#
+# All three in one output. The unexecuted run was the sole cause of the audit's
+# rc 4, which was the sole cause of the verdict — so the disclosure asserted the
+# opposite of what its own arm had just printed. A call-site census could never
+# have seen it: the call was there.
+#
+# So the causal claim is now the CALLER's to make, because causality is a
+# property of the arm and not of the helper:
+#
+#   independent — the excluded runs did not drive this verdict. Safe to say
+#                 "don't chase this"; true for provenance, UNGATED, conflicted,
+#                 pending and stale-ref, where the verdict has a different cause.
+#   drives      — they are the cause. Reserved; no arm currently claims it.
+#   unknown     — cannot be established here. The audit arm: its rc 4 may come
+#                 from an unexecuted run OR from a genuinely missing band, and
+#                 this helper cannot tell which. It therefore says NEITHER,
+#                 which is the honest answer and the fail-safe one. The audit's
+#                 own paragraph above already states the true cause.
+#
+# An absent or unrecognised argument resolves to `unknown` — a new call site
+# that forgets to decide gets silence about causality rather than a confident
+# sentence somebody else chose for it. That default is the whole point: the
+# previous default was a CLAIM.
+_excluded_note() {
+    local _cause="${1:-unknown}"
+    _nonverdict_note
     (( unexecuted )) || return 0
     printf '\nALSO AT THIS HEAD: %d run(s) concluded `failure` having executed ZERO\n' "$unexecuted"
     printf 'steps (marked NOT-STARTED above) — an account or runner-supply problem,\n'
-    printf 'not your code. That does NOT drive the verdict above, and it does not\n'
-    printf 'clear by waiting either: it needs the supply fixed and a re-run.\n'
+    case "$_cause" in
+        independent)
+            printf 'not your code. That does NOT drive the verdict above, and it does not\n'
+            printf 'clear by waiting either: it needs the supply fixed and a re-run.\n' ;;
+        drives)
+            printf 'not your code. That IS what drove the verdict above, and it does not\n'
+            printf 'clear by waiting either: it needs the supply fixed and a re-run.\n' ;;
+        *)
+            printf 'not your code. It does not clear by waiting: it needs the supply fixed\n'
+            printf 'and a re-run. Whether it is what drove the verdict above is stated by\n'
+            printf 'the audit output above, not here.\n' ;;
+    esac
 }
 
 if (( live_red )); then
@@ -624,16 +796,16 @@ elif (( provenance )); then
     # the condition this whole verb was changed to surface. Not an omission: a
     # claim of the opposite. Qualified rather than deleted, because the
     # provenance finding itself is still true and still the verdict.
-    if (( unexecuted )); then
-        printf 'VERDICT: every completed run that EXECUTED is green (%d ran nothing at\n' "$unexecuted"
-        printf 'all — see below), but at least one green is NOT a\n'
+    if _excl_any; then
+        printf 'VERDICT: every completed run that %s is green (%s\n' "$(_excl_clause)" "$(_excl_count_phrase)"
+        printf '— see below), but at least one green is NOT a\n'
     else
         printf 'VERDICT: every completed run is green, but at least one green is NOT a\n'
     fi
     printf 'first-pass green (or its provenance is unreadable). A red that was\n'
     printf 're-run is still a red that nobody adjudicated — decide whether it was\n'
     printf 'a flake or a real defect before treating this head as tested.\n'
-    _unexecuted_note
+    _excluded_note independent
     rc=6
 elif [[ "$AUDIT_RAN" == yes ]] && (( AUDIT_RC == 8 )); then
     # UNGATED (your-org/nexus-code#856). Handled BEFORE the generic
@@ -678,7 +850,7 @@ elif [[ "$AUDIT_RAN" == yes ]] && (( AUDIT_RC == 8 )); then
     # It is a DISCLOSURE gap. It still wants fixing, because a verdict chain
     # where one arm omits what its siblings disclose is what makes a reader
     # stop trusting all of them.
-    _unexecuted_note
+    _excluded_note independent
     rc=8
 # THE GUARDS ARE THE ORDERING (#846 / PR #854 skeptic F1). The arms below are
 # mutually exclusive on `AUDIT_RAN`/`AUDIT_RC`, so the effective precedence is
@@ -723,16 +895,16 @@ elif [[ "$AUDIT_RAN" == yes ]] && (( AUDIT_RC != 0 && AUDIT_RC != 3 )) \
     # concluded `failure`. It is exactly the vacuous-quantifier defect #762
     # fixed one arm over, so it gets the same treatment rather than a
     # disclaimer underneath.
-    if (( unexecuted == 0 )); then
+    if ! _excl_any; then
         printf 'VERDICT: every run that EXISTS is a first-pass success, but the\n'
     else
-        printf 'VERDICT: every run that EXISTS and EXECUTED is a first-pass success\n'
-        printf '(%d ran nothing at all — see below), but the\n' "$unexecuted"
+        printf 'VERDICT: every run that EXISTS and %s is a first-pass success\n' "$(_excl_clause)"
+        printf '(%s — see below), but the\n' "$(_excl_count_phrase)"
     fi
     printf 'expected-band audit above did NOT come back clean (rc %s). Bands that\n' "$AUDIT_RC"
     printf 'should have gated this change are missing or carry no verdict. The\n'
     printf 'absence of a verdict is RED — this head is NOT cleared.\n'
-    _unexecuted_note
+    _excluded_note unknown
     # The SECOND place a conflict changes the advice (#773). Runs exist here —
     # a manual dispatch, or runs from before the base moved — so this is not
     # the empty-set arm, but the missing bands still cannot arrive while the
@@ -773,7 +945,7 @@ elif [[ "$AUDIT_RAN" == yes ]] && (( AUDIT_RC == 3 )); then
     printf 'above reports bands still queued or in progress. An unfinished check\n'
     printf 'set is an ABSENCE of verdict, and #628 rules that RED, not amber.\n'
     printf 'Re-run this verb once those bands conclude.\n'
-    _unexecuted_note
+    _excluded_note independent
     rc=3
 elif [[ "$AUDIT_RAN" != yes ]] && (( pending_n > 0 )); then
     # Same state, reached WITHOUT the audit — so the quantifier is weaker and
@@ -790,7 +962,8 @@ elif [[ "$AUDIT_RAN" != yes ]] && (( pending_n > 0 )); then
         printf 'cleared (#762). There is no evidence yet, of any sign.\n'
     else
         printf 'PARTIAL and PROVISIONAL: %d run(s) have concluded and every one that\n' "$concluded_n"
-        printf 'EXECUTED is a first-pass success; %d have NOT (%s).\n' "$pending_n" "$pending_names"
+        printf '%s is a first-pass success; %d have NOT (%s).\n' \
+            "$( _excl_any && _excl_clause || printf 'EXECUTED' )" "$pending_n" "$pending_names"
         printf 'That green describes the runs that FINISHED. It is not a\n'
         printf 'description of this head, and the pending runs can still redden it.\n'
     fi
@@ -798,7 +971,7 @@ elif [[ "$AUDIT_RAN" != yes ]] && (( pending_n > 0 )); then
     printf 'audit did NOT run (%s), so a\n' "${AUDIT_SKIP:-not requested}"
     printf 'workflow that should have gated this change and never fired would be\n'
     printf 'INVISIBLE above, separately from the pending ones named here.\n'
-    _unexecuted_note
+    _excluded_note independent
     rc=3
 elif (( unexecuted )) && (( pending_n == 0 )); then
     # your-org/nexus-code#846, PLACED HERE AND NOT HIGHER — the skeptic pass on
@@ -840,6 +1013,89 @@ else
     # now this verb answered only the first while sounding like it answered
     # both.
     _merge_ref_base
+    # THE GATE IS ASKED, NOT ENUMERATED (your-org/nexus-code#878, #882). This
+    # used to be spelled `[[ "$_MRB_STATE" == stale ]]` — a DENYLIST with a
+    # permissive default arm, so any state the library grew afterwards would
+    # have fallen through to the clearance below and CLEARED the head while the
+    # summary line printed `NOT CHECKED`. The library now owns an ALLOWLIST with
+    # a default-DENY arm and the caller asks it, which is the only version of
+    # this that survives the next state being added. Same structural lesson as
+    # `bk_pane_kill_authorized`: a hand-enumerated denylist retires whatever its
+    # author did not think of.
+    _mrb_disp=$(_mrb_clearance_disposition "$_MRB_STATE")
+    if [[ "$_mrb_disp" == withhold && "$_MRB_STATE" != stale ]]; then
+        # Every withholding state EXCEPT `stale`, whose prose is the arm below
+        # (left exactly where it was — it is under a negative control that pins
+        # its text, and re-indenting it would silently retire that control).
+        if [[ "$_MRB_STATE" == divergent ]]; then
+            _mrb_exit=10
+            printf 'VERDICT: this head is NOT CLEARED — its runs disagree about which\n'
+            printf 'tree they tested.\n'
+            # THE SIXTH UNIVERSAL-CLAIM SITE (your-org/nexus-code#884).
+            # This arm used to test `unexecuted` PRIVATELY — qualified for one
+            # member of the excluded set and not the other, which is #884's
+            # defect verbatim, in the one arm #884's fix could not see. It is a
+            # MERGE SEAM, not an oversight: `8551eea` (the #884 fix) converted
+            # every site that existed on its base, and `41c9bf1` (#878) added
+            # this arm from a base predating it. `git merge-base --is-ancestor`
+            # is rc 1 in BOTH directions between them; git merged both cleanly
+            # and kept the old idiom. Same geometry as T6d's "THIRD MERGE-ORDER
+            # SEAM ON THIS BRANCH", one arm over.
+            #
+            # It asks the SAME helper as the `stale` sibling sixty lines below,
+            # so membership is decided in ONE place and a member added later is
+            # qualified into this arm by construction. The enrolment that keeps
+            # a SEVENTH site from arriving the same way is the population lint
+            # in test-ci-head-attempts.sh — every universal-claim emit in this
+            # file must sit within 8 lines of an `_excl_any`.
+            if _excl_any; then
+                printf 'Every run at this head that %s is a first-pass success (%s\n' \
+                    "$(_excl_clause)" "$(_excl_count_phrase)"
+                printf '— see below), AND they do not agree on a base: %s.\n' "$_MRB_DETAIL"
+            else
+                printf 'Every run at this head is a first-pass success, AND they do not agree\n'
+                printf 'on a base: %s.\n' "$_MRB_DETAIL"
+            fi
+            printf 'This is NOT a claim that the base moved — one of those bases may be\n'
+            printf 'the live tip. It is a claim that the head carries more than one answer,\n'
+            printf 'and that picking among them is not something this verb may do silently.\n'
+            printf 'WHY IT HAPPENS: a `success` conclusion does not identify the run that\n'
+            printf 'supplied the VERDICT. `ci-signal` and `conflict-markers` are cheap, fire\n'
+            printf 'unconditionally and DO print the checkout line, so a later round whose\n'
+            printf '`tests` were SKIPPED can be the freshest thing at this head. Reading it\n'
+            printf 'would report the newest base — the most `current`-looking answer\n'
+            printf 'available (your-org/nexus-code#878, #882).\n'
+            printf 'REMEDY: rebase (or push) so ONE round exists against ONE base, then\n'
+            printf 're-run this verb. Re-running CI at the SAME head does not fix it.\n'
+            # B1 BUNDLE SEAM. This arm is new in #878/#882 (your-org/nexus-code#903)
+            # and called `_unexecuted_note`, which #955 DELETED when it made
+            # causality the CALLER's to state (#885). The two PRs never saw each
+            # other, git merged both cleanly, and the result called a function that
+            # no longer exists. Caught by #955's own T6f.
+            #
+            # `independent`, matching the `stale` sibling below and the contract
+            # above, which names stale-ref as independent: this verdict is driven by
+            # SUCCESSFUL runs disagreeing about their base, a different cause from a
+            # run that executed nothing.
+            _excluded_note independent
+        else
+            # A withholding state the library grew and this verb has no sentence
+            # for. Refusing is the honest answer: a clearance printed beside a
+            # verdict nobody wrote prose for is a clearance nobody checked.
+            _mrb_exit=2
+            printf 'REFUSING: the merge-ref base check returned `%s`, a state this verb\n' "$_MRB_STATE"
+            printf 'has no sentence for and therefore cannot report honestly. It withholds\n'
+            printf 'the clearance rather than printing one beside a verdict it cannot\n'
+            printf 'explain. DETAIL: %s.\n' "$_MRB_DETAIL"
+            printf 'This is a defect in this verb, not in your branch: the library grew a\n'
+            printf 'state and this arm was not extended. File it.\n'
+            # `unknown`, NOT `independent`. This arm cannot say what drove the
+            # verdict — that is the whole reason it is refusing — so claiming the
+            # excluded runs did not is precisely the over-claim #885 removed.
+            _excluded_note unknown
+        fi
+        exit "$_mrb_exit"
+    fi
     if [[ "$_MRB_STATE" == stale ]]; then
         printf 'VERDICT: this head is NOT CLEARED — the green describes a tree that\n'
         printf 'would not land.\n'
@@ -861,9 +1117,10 @@ else
         # Reachable by the same argument the `else` below already records:
         # audit rc 0 keeps arms 3-5 shut, `pending_n > 0` keeps the `unexecuted`
         # arm shut, and what is left falls here.
-        if (( unexecuted )); then
-            printf 'Every run at this head that EXECUTED is a first-pass success (%d ran\n' "$unexecuted"
-            printf 'nothing at all — see below), AND the merge ref they were computed\n'
+        if _excl_any; then
+            printf 'Every run at this head that %s is a first-pass success (%s\n' \
+                "$(_excl_clause)" "$(_excl_count_phrase)"
+            printf '— see below), AND the merge ref they were computed\n'
             printf 'against is stale: %s.\n' "$_MRB_DETAIL"
         else
             printf 'Every run at this head is a first-pass success, AND the merge ref they\n'
@@ -885,15 +1142,15 @@ else
         # because it is the only arm that leaves by `exit` rather than by
         # falling to the bottom of the chain — so it is the one arm where a
         # disclosure added at the end of the function can never reach it.
-        _unexecuted_note
+        _excluded_note independent
         exit 9
     fi
     # Reachable with `unexecuted > 0`: audit rc 0 (the GATING set is clean) with
     # a non-gating run still pending routes here, and the sentence below is
     # quantified over COMPLETED runs — which includes the aborted one.
-    if (( unexecuted )); then
-        printf 'VERDICT: every completed run at this head that EXECUTED is a FIRST-PASS\n'
-        printf 'success (%d ran nothing at all — see below).\n' "$unexecuted"
+    if _excl_any; then
+        printf 'VERDICT: every completed run at this head that %s is a FIRST-PASS\n' "$(_excl_clause)"
+        printf 'success (%s — see below).\n' "$(_excl_count_phrase)"
     else
         printf 'VERDICT: every completed run at this head is a FIRST-PASS success.\n'
     fi
@@ -932,13 +1189,60 @@ else
     # this repo's dominant defect class and this verb's own subject, so the
     # sentence is unconditional on the cleared path rather than living inside
     # whichever branch happened to be edited last.
+    #
+    # AND IT CARRIES ITS OWN EXPIRY (your-org/nexus-code#880). `#823`'s lesson is
+    # that people read an enumeration as a DURABLE clearance; this check's own
+    # output is susceptible to the same reading one level up. The verdict is
+    # point-in-time — true as of the ref read a second ago — and nothing
+    # re-checks it between here and the merge. So the base sha is printed IN
+    # FULL rather than described, because a reader who must REMEMBER a condition
+    # will not, and a reader who can COMPARE one will.
+    #
+    # MEASURED, so this is a stated fact and not a caution. Ground truth is the
+    # base each run actually checked out versus the FIRST PARENT of the merge
+    # commit that landed. Over every merge into `dev` in
+    # `[2026-08-10T00:47:22Z, 2026-08-14T17:18:41Z]` — the merge that introduced
+    # this check to the last merge before CI failed repo-wide — measured
+    # 2026-08-14T18:53:54Z against `dev` e256d4a9865: 5 OF 17 landed on a base
+    # their green never tested (`#870`, `#871`, `#890`, `#869`, `#899`).
+    # Worked example: `#870` ran its suite against `a74805b5` at 01:44:41Z;
+    # `#854` merged at 02:31:41Z, moving `dev` to `4ed5aa1e`; `#870` merged onto
+    # `4ed5aa1e` at 02:36:41Z. Five minutes, a CLEAN merge, no conflict and no
+    # red — so nothing except this sentence would have told anybody. The
+    # shortest window measured was FOUR SECONDS (`#899` behind `#872`).
+    #
+    # (Benign in the event: the tree `#870` created was tested by `#842`'s runs,
+    # CREATED 2026-08-10T02:38:25Z — one minute forty-four seconds later. This
+    # clause has now been wrong twice, both times by reading `#842`'s MERGE date
+    # (2026-08-14) as the date its runs ran: first as "four days later", then
+    # "corrected" to the merge date itself, which is the same wrong fact
+    # re-expressed. The sentence asserts WHEN THE TREE WAS TESTED, and a run's
+    # `created_at` is what answers that — its PR's `merged_at` answers a
+    # different question. Adjusting the number twice without asking which field
+    # the claim rests on is how a wrong fact survives two corrections.
+    # That the cover was ~2 minutes rather than 4 days makes it luckier, not
+    # safer: nothing arranged it.)
+    #
+    # It does not BLOCK, and that is deliberate. A gate that fires on every
+    # clearance gets disabled by whoever is under time pressure, which removes
+    # the gate entirely. This states a scope; `ng pr merge --base-sha <sha>` is
+    # the opt-in enforcement for a caller who wants the window closed.
     case "$_MRB_STATE" in
-        current) printf 'Merge-ref base: VERIFIED — %s.\n' "$_MRB_DETAIL" ;;
+        current) printf 'Merge-ref base: VERIFIED — %s.\n' "$_MRB_DETAIL"
+                 printf 'EXPIRY: that verdict is point-in-time. It holds ONLY while %s'\''s tip is\n' "$_MRB_BASE_REF"
+                 printf '%s, and nothing re-checks it between here and\n' "$_MRB_BASE_SHA"
+                 printf 'your merge. A base advance that merges CLEANLY produces no conflict and\n'
+                 printf 'no red, so nothing else will warn you (#880 — measured on `#870`, which\n'
+                 printf 'landed on a base its green never tested, 5 minutes after dev moved).\n'
+                 printf 'RE-CHECK immediately before merging, or pin it:\n'
+                 printf '  git fetch -q origin %s && git rev-parse origin/%s   # must equal the sha above\n' \
+                        "$_MRB_BASE_REF" "$_MRB_BASE_REF"
+                 printf '  ng pr merge <n> --sha <verified-head> --base-sha %s\n' "$_MRB_BASE_SHA" ;;
         n/a)     printf 'Merge-ref base: NOT APPLICABLE — %s.\n' "$_MRB_DETAIL" ;;
         *)       printf 'Merge-ref base: NOT CHECKED — %s.\n' "$_MRB_DETAIL"
                  printf 'That is `not looked at`, NOT `looked at and current`. The runs above\n'
                  printf 'may have been computed against a base that has since moved (#823).\n' ;;
     esac
-    _unexecuted_note
+    _excluded_note independent
 fi
 exit "$rc"

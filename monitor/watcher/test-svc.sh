@@ -13,7 +13,9 @@
 #      $NEXUS_ROOT expanded, 5th <logfile> field carried separately.
 #   2. svc_logfile — default <workdir>/serve.log, relative resolved
 #      under workdir, absolute kept.
-#   3. svc_endpoint — URL for curl checks, pid for pgrep -f, '-' else;
+#   3. svc_endpoint — URL for curl checks, else the service's own
+#      <workdir>/.deploy/endpoint declaration (#1144), else pid for
+#      pgrep -f, else '-';
 #      localhost URLs rewritten to the FQDN iff the port's live listener
 #      binds beyond loopback (stubbed ss/hostname), untouched for
 #      loopback-only binds and down services.
@@ -275,6 +277,75 @@ ep=$(svc_endpoint 'curl -fsS http://localhost:8765/')
     || fail "endpoint port-mismatch: [$ep]"
 rm -f "$ROOT/ss.out"
 SVC_LISTEN_FRESH=0
+
+# --- #1144: the DETAIL cell stops being a property of how a healthcheck is
+# --- SPELLED, and becomes a property of the SERVICE.
+#
+# Before this, svc_endpoint derived the cell ENTIRELY from the healthcheck
+# COMMAND TEXT, so the better probe lost: an inline `curl … http://…` rendered a
+# copy-pasteable URL while a SCRIPT healthcheck — the one you must write when the
+# endpoint is auth-gated, or when one probe asserts several properties — rendered
+# `-`, indistinguishable from a service that has no endpoint at all. Both arms
+# are asserted here: the URL case must not regress, and the script case must work.
+EPWD="$ROOT/epsvc"; mkdir -p "$EPWD/.deploy"
+
+# (a) the pre-fix state, preserved where there is genuinely nothing to show.
+[[ "$(svc_endpoint './tools/healthcheck.sh' "$EPWD")" == '-' ]] \
+    && pass "endpoint: script healthcheck with NO declaration still shows '-'" \
+    || fail "endpoint script-nodecl: [$(svc_endpoint './tools/healthcheck.sh' "$EPWD")]"
+
+# (b) the fix: the service declares its own endpoint and the script probe keeps it.
+printf 'https://example.org:8443/app/\n' > "$EPWD/.deploy/endpoint"
+ep=$(svc_endpoint './tools/healthcheck.sh' "$EPWD")
+[[ "$ep" == 'https://example.org:8443/app/' ]] \
+    && pass "endpoint: script healthcheck reads <workdir>/.deploy/endpoint" \
+    || fail "endpoint declared: [$ep]"
+
+# (c) NO REGRESSION. A healthcheck that already names a URL still wins, so every
+#     cell that rendered correctly before this change is byte-identical after it.
+ep=$(svc_endpoint 'curl -fsS http://localhost:8765/' "$EPWD")
+[[ "$ep" == 'http://localhost:8765/' ]] \
+    && pass "endpoint: a healthcheck URL still wins over the declaration" \
+    || fail "endpoint precedence: [$ep]"
+
+# (d) the declaration goes through the SAME external-bind rewrite, or the cell is
+#     not copy-pasteable — which is the only reason the cell is worth anything.
+printf 'http://localhost:8767/ui\n' > "$EPWD/.deploy/endpoint"
+printf 'LISTEN 0 4096 0.0.0.0:8767 0.0.0.0:*\n' > "$ROOT/ss.out"
+SVC_LISTEN_FRESH=0
+ep=$(svc_endpoint './tools/healthcheck.sh' "$EPWD")
+[[ "$ep" == 'http://host.example.org:8767/ui' ]] \
+    && pass "endpoint: a declared endpoint gets the external-bind FQDN rewrite" \
+    || fail "endpoint declared-rewrite: [$ep]"
+rm -f "$ROOT/ss.out"; SVC_LISTEN_FRESH=0
+
+# (e) SHAPE, not non-emptiness. These bytes come from a file outside this repo
+#     and land in a terminal render; an emptiness check would pass ANSI escapes.
+bad_ok=1
+for bad in "$(printf '\033[31mEVIL\033[0m')" 'ftp://example.org/x' 'not a url' '' '   '; do
+    printf '%s\n' "$bad" > "$EPWD/.deploy/endpoint"
+    [[ "$(svc_endpoint './tools/healthcheck.sh' "$EPWD")" == '-' ]] || { bad_ok=0; break; }
+done
+(( bad_ok )) \
+    && pass "endpoint: a declaration that is not URL-shaped is REFUSED, not printed" \
+    || fail "endpoint bad-declaration accepted: [$bad]"
+
+# (f) read from the SERVICE's workdir, never the cockpit's cwd — a future
+#     refactor that reaches for \$PWD would render one service's URL for another.
+printf 'https://wrong.example.org/\n' > "$ROOT/.deploy-cwd-decoy"
+mkdir -p "$ROOT/.deploy" && printf 'https://cwd.example.org/\n' > "$ROOT/.deploy/endpoint"
+( cd "$ROOT" && [[ "$(svc_endpoint './tools/healthcheck.sh' "$EPWD")" == '-' ]] ) \
+    && pass "endpoint: the declaration is the SERVICE's, not the cockpit's cwd" \
+    || fail "endpoint cwd-leak: cockpit cwd .deploy/endpoint was used"
+rm -rf "$ROOT/.deploy" "$ROOT/.deploy-cwd-decoy"
+rm -f "$EPWD/.deploy/endpoint"
+
+# (g) the one-argument call form still behaves exactly as it did — the workdir
+#     parameter is additive, so nothing that calls svc_endpoint the old way moves.
+[[ "$(svc_endpoint 'curl -fsS http://localhost:8765/')" == 'http://localhost:8765/' ]] \
+ && [[ "$(svc_endpoint 'test -f x')" == '-' ]] \
+    && pass "endpoint: the 1-arg call form is unchanged (workdir is additive)" \
+    || fail "endpoint 1-arg regression"
 
 [[ "$(svc_supervisor ghost 'echo x')" == '-' ]] \
     && pass "supervisor: no pidfile -> '-'" \

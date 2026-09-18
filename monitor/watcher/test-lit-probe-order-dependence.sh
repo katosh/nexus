@@ -163,7 +163,8 @@ assert_eq() {
 }
 assert_contains() {
     local label="$1" hay="$2" needle="$3"
-    if grep -qF -- "$needle" <<<"$hay"; then
+    [[ -n "$needle" ]] || printf '  EMPTY needle — this assertion could only pass VACUOUSLY; fix the CALLER, whose expected value came back empty (your-org/nexus-code#1092).\n' >&2
+    if [[ -n "$needle" ]] && grep -qF -- "$needle" <<<"$hay"; then
         printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
     else
         printf '  FAIL: %s — expected to find: %s\n' "$label" "$needle" >&2
@@ -626,8 +627,16 @@ chmod +x "$DECANON"
 # rewritten and this sed silently no-ops, the control below would compare a
 # still-canonical binary against itself, "pass", and prove nothing — so
 # failing here is the correct, loud outcome. Fix: re-anchor the sed.
+# _occurrences <pattern> <file> — OCCURRENCES, not lines (your-org/nexus-code
+# `#1026`). `grep -c` counts matching LINES, so two constructs sharing one line
+# read as 1 and an `== N` assertion stays green with the construct duplicated.
+# `-F` because every caller passes a LITERAL. On no match grep prints nothing
+# and exits 1, yielding 0 — a replacement, never an appended second value, so
+# no `|| echo 0` belongs here (your-org/nexus-code#725).
+_occurrences() { grep -oF -- "$1" "$2" 2>/dev/null | wc -l | tr -d ' '; }
+
 assert_eq "control D: lit.sh has exactly one canonicalising sort" \
-          "$(grep -cF '| LC_ALL=C sort -u' "$LIT")" "1"
+          "$(_occurrences '| LC_ALL=C sort -u' "$LIT")" "1"
 assert_eq "control D: the copy has none" \
           "$(grep -cF '| LC_ALL=C sort -u' "$DECANON")" "0"
 
@@ -672,7 +681,7 @@ sed 's/t = tolower(\$i)/t = $i/' "$LIT" > "$DECASE"
 chmod +x "$DECASE"
 
 assert_eq "control E: lit.sh lowercases exactly once" \
-          "$(grep -cF 't = tolower($i)' "$LIT")" "1"
+          "$(_occurrences 't = tolower($i)' "$LIT")" "1"
 assert_eq "control E: the copy does not" \
           "$(grep -cF 't = tolower($i)' "$DECASE")" "0"
 
@@ -709,9 +718,9 @@ chmod +x "$CLAIMY"
 # Both halves asserted: if the message is reworded and this sed no-ops, the
 # control would run against the SOFTENED binary, pass, and prove nothing.
 assert_eq "control F: lit.sh carries the scoping clause once" \
-          "$(grep -cF 'Two limits on that:' "$LIT")" "1"
+          "$(_occurrences 'Two limits on that:' "$LIT")" "1"
 assert_eq "control F: the mutant carries the bare causal claim" \
-          "$(grep -cF 'is why your query returned nothing' "$CLAIMY")" "1"
+          "$(_occurrences 'is why your query returned nothing' "$CLAIMY")" "1"
 
 run_lit claimy_out claimy_rc "$CLAIMY" search "$NEG_CTL" --source openalex --limit 5
 assert_eq "control F: mutant still runs"        "$claimy_rc" "2"
