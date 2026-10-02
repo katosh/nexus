@@ -312,19 +312,66 @@ _emit_cooldown_flush_decide() {
     sha=$(printf '%s' "$body_line" | sha256sum 2>/dev/null | awk '{print $1}')
     meta_ts=0
     meta_sha=""
+    local meta_emits=0
     if [[ -f "$meta_path" ]]; then
         meta_ts=$(awk -F= '/^ts=/{print $2; exit}' "$meta_path" 2>/dev/null)
         meta_sha=$(awk -F= '/^body_sha=/{sub(/^body_sha=/, ""); print; exit}' "$meta_path" 2>/dev/null)
+        meta_emits=$(awk -F= '/^emits=/{print $2; exit}' "$meta_path" 2>/dev/null)
         [[ "$meta_ts" =~ ^[0-9]+$ ]] || meta_ts=0
+        [[ "$meta_emits" =~ ^[0-9]+$ ]] || meta_emits=0
     fi
-    if [[ -n "$sha" && "$sha" == "$meta_sha" ]] && (( now - meta_ts < cooldown )); then
+
+    # Same body as last time? An EDITED comment is new information: it
+    # resets the repeat counter, bypasses the cooldown as before, and
+    # revives the id if a previous cap had dropped it (issue #3 —
+    # otherwise an operator's only recourse for a dropped comment would
+    # be delete-and-repost).
+    local same_body=0
+    [[ -n "$sha" && "$sha" == "$meta_sha" ]] && same_body=1
+    if (( same_body == 0 )); then
+        meta_emits=0
+        if declare -F _resurface_clear_dropped >/dev/null 2>&1; then
+            _resurface_clear_dropped "$id"
+        fi
+    fi
+
+    # Resurface cap (issue #3). Past the repeat limit the block is
+    # dropped for good and recorded, rather than re-billed on every
+    # cooldown expiry forever. Degrades to the pre-#3 behaviour when
+    # _resurface_cap.sh isn't sourced.
+    if (( same_body == 1 )) && declare -F _resurface_is_capped >/dev/null 2>&1; then
+        if _resurface_is_dropped "$id" || _resurface_is_capped "$meta_emits"; then
+            _resurface_record_dropped "$id" "$meta_emits"
+            return
+        fi
+    fi
+
+    # Backoff between repeats: the effective cooldown doubles per
+    # repeat, so a stuck item costs a geometric rather than linear
+    # number of wakes before the cap ends it.
+    local eff_cooldown="$cooldown"
+    if declare -F _resurface_effective_cooldown >/dev/null 2>&1; then
+        eff_cooldown=$(_resurface_effective_cooldown "$cooldown" "$meta_emits")
+        [[ "$eff_cooldown" =~ ^[0-9]+$ ]] || eff_cooldown="$cooldown"
+    fi
+
+    if (( same_body == 1 )) && (( now - meta_ts < eff_cooldown )); then
         drop=1
     fi
     if (( drop == 0 )); then
         printf '%s\n' "$header"
         [[ -n "$body_line" ]] && printf '%s\n' "$body_line"
         if [[ -n "$sha" ]]; then
-            printf 'ts=%s\nbody_sha=%s\n' "$now" "$sha" > "$meta_path.tmp.$BASHPID" \
+            # `emits` is deliberately NOT incremented here. This filter
+            # runs upstream of the dedup gate, the over-limit hold, and
+            # the paste — counting here would burn the cap's budget on
+            # emits that were never delivered, permanently dropping a
+            # comment the operator never saw. `_resurface_commit_emitted`
+            # increments it AFTER a successful paste, matching the
+            # post-paste discipline main.sh already applies to
+            # `_compose_emit_record_emit`. Carry the current value
+            # through so it survives the rewrite.
+            printf 'ts=%s\nbody_sha=%s\nemits=%s\n' "$now" "$sha" "$meta_emits" > "$meta_path.tmp.$BASHPID" \
                 && mv "$meta_path.tmp.$BASHPID" "$meta_path" 2>/dev/null || true
         fi
     fi

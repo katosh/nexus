@@ -23,9 +23,13 @@
 #   echo "ack" | ng comment 7              # alias of `ng reply` (issue/PR comment)
 #   ng close   12 --comment "shipped"      # comment + close, prints CLOSED
 #   ng dashboard get                       # current dashboard middle
+#   ng dashboard get --stat                # size breakdown only — never the
+#                                          #   body. Safe to call from an agent
+#                                          #   on a dashboard of unknown size.
 #   ng dashboard put --body-file new.md    # splice + PATCH; prints issue URL
 #   ng dashboard scaffold                  # print the canonical section skeleton
-#   ng dashboard validate --body-file d.md # check required sections present
+#   ng dashboard validate --body-file d.md # strict gate: required sections
+#                                          #   present AND within size budget
 #   ng nexus-identity --dry-run            # render the identity block (no write)
 #   ng issue 1                             # one-line: #1 state=OPEN title=Nexus
 #   ng issue 1 --with-body --with-comments # full body + chronological comments
@@ -36,6 +40,18 @@
 #                # opt-out via --no-reviewer, override via --reviewer <login>
 #   ng pr edit   12 [--title t] [--body-file b.md]                   # print URL
 #   ng pr merge  12 [--squash|--merge|--rebase] [--sha <verified-head>] [--base-sha <verified-base>|--verify-base] [--delete-branch]  # print sha
+#                # Reads the `Skeptic-Verdict:` trailer on the PR body and
+#                # REFUSES (exit 5) when the validated head is not the head
+#                # it is about to merge (jacob-greene/nexus#155).
+#   ng pr merge  12 --require-verdict      # also refuse when NO verdict is recorded
+#   ng pr merge  12 --verdict-override "<why the delta is safe>"
+#                # merge past the gate; the reason is mandatory and the
+#                # override is audited to monitor/.state/verdict-override.log
+#   ng pr verdict set 12 --verdict credible [--head <sha>] [--depth N]
+#                                          [--findings N] [--skeptic <window>]
+#                # record the verdict + the commit it covers on the PR body;
+#                # --head defaults to the PR's current head
+#   ng pr verdict get 12 [--field head]    # read it back; exit 3 when absent
 #   ng pr view   12                        # #12 state=OPEN author=login title=...
 #   ng pr view   12 --json number,state,title   # scriptable JSON (bare --json = full object)
 #   ng ci-attempts <sha|branch|PR#>        # is this head green — and was it green
@@ -72,6 +88,7 @@
 #                                [--trigger-repo OWNER/REPO]
 #                                [--comment-body-file <path> | --no-comment]
 #                                [--allow-stub]
+#                                [--shape pin|latest]   # default latest
 #                                [--skeptic-decision require|deny --skeptic-rationale "<why>"]
 #                                [--skeptic-waive "<reason>"]
 #                                [--skeptic-rearm "<what changed>"]
@@ -79,6 +96,7 @@
 #                                 --skeptic-verdict credible|check|suspect|refuted
 #                                 --skeptic-depth N --skeptic-findings N
 #                                 --skeptic-orig <original-worker-window>]
+#                                [--skeptic-head <sha> --skeptic-pr <n>]   # with --skeptic-role
 #                                [--not-a-skeptic-verdict "<why this window
 #                                 did non-skeptic work>"]
 #                # one-shot end-of-task: upload report + post link
@@ -125,6 +143,11 @@
 #                # silently reverses an orchestrator decision and makes a
 #                # worker re-block itself by writing a report.
 #                # --skeptic-rearm "<what changed>" re-arms deliberately.
+#                # --skeptic-head <sha> binds the verdict to the commit it
+#                # covers; --skeptic-pr <n> publishes that binding as the
+#                # `Skeptic-Verdict:` trailer `ng pr merge` gates on
+#                # (jacob-greene/nexus#155). Without a head, a verdict
+#                # cannot stop a merge of a commit nobody reviewed.
 #   ng skeptic <ask|await|answer|await-answer|reconcile|close|poll|
 #               status|list|nudge|init|dir> ...
 #                # worker↔skeptic comms channel + nudge (delegates to
@@ -275,6 +298,7 @@
 #   ng obligation settle --debtor <w> --reason "…"   # discharge on the record
 #   ng pane-state <window-index>           # classify a worker pane
 #   ng write-probe <path>                  # pre-flight a deliverable path
+#   ng evidence-freeze <src> --task <slug>  # write-once freeze into evidence
 #   ng declare-wait <kind> <id> <desc>     # self-declare an async wait
 #   ng declare-no-wait <kind> <id>         # mark an async launch fire-and-forget
 #   ng paste-followup <window> ...         # canonical follow-up paste
@@ -493,6 +517,63 @@ DASH_REQUIRED_SECTIONS=(
 declare -A DASH_SECTION_ALIASES=(
     ["## Identity"]="$IDENTITY_HEADING"
 )
+# Size budget for the dashboard middle — the companion to the section
+# schema above, and the single place to retune it. The schema says WHICH
+# sections exist; these say HOW BIG they may get before the dashboard has
+# stopped being a glanceable status surface and become an append-only log.
+#
+# Why this exists: the dashboard grew to 213,381 bytes / 195 lines, with
+# `## In-flight` alone at 164 KB across 115 entries (single entries up to
+# 9.2 KB) while only 3 worker windows were live. Successive orchestrators
+# prepended prose and never pruned; nothing checked, so nothing stopped it.
+# An oversized dashboard is not merely untidy — it is unreadable to the
+# operator it exists for, and it blows out the context of any agent that
+# reads it.
+#
+# Calibration: a healthy dashboard for this nexus is ~4.5-7 KB / 74-90
+# lines (the hand-restored body, all six sections populated). The limits
+# sit ~2x above that, so ordinary variation never fires and genuine
+# runaway growth fires early — long before the surface is unusable.
+#
+# DASH_MAX_ENTRY_BYTES is calibrated against BOTH observed distributions,
+# not just a healthy snapshot — an entry budget set from healthy content
+# alone false-positives on the one section whose entries are supposed to
+# carry prose (800 was the first cut, and it red-lighted a NORMAL
+# `## Awaiting operator` decision item at 907 bytes).
+#
+# There is NO clean gap between the two populations. Measured per entry:
+#   legitimate, live dashboard   n=30   max 907, then 609, 565, 536, 461 …
+#   runaway, the 213 KB body     n=168  min 99, median 1058, max 9363
+#                                       >800: 111   >1500: 41   >2000: 19
+# The runaway body's entries are continuous across the whole range — 61 of
+# them sit between 907 and 1500 — so no threshold separates "healthy" from
+# "runaway" by inspection. Anyone retuning this needs to know that; picking
+# a number here is a sensitivity choice, not the discovery of a cliff.
+#
+# 1500 is therefore set from the LEGITIMATE side and sanity-checked against
+# the runaway side:
+#   floor  — must clear the observed legitimate maximum (907) with real
+#            margin, because a budget that fires on healthy content teaches
+#            every reader to route around it, and a check nobody trusts is
+#            exactly how the dashboard reached 213 KB unnoticed. This is the
+#            expensive error direction. 1500 gives ~65% headroom.
+#   bite   — at 1500 the rule still fires on 41 of the archive's 168 entries
+#            (24%), so the axis is not decorative. (Nor would 2000 be: 19
+#            entries still breach there. The 1500-vs-2000 choice is
+#            sensitivity, not on/off.)
+# The other direction is cheaper here because this axis targets one shape —
+# a single item that grew into an essay. Bulk accumulation is caught by
+# DASH_MAX_SECTION_BYTES and DASH_MAX_BYTES, which is why this one can
+# afford to sit on the no-false-positive side.
+#
+# Enforcement is deliberately asymmetric (see `cmd_dashboard_put`):
+#   `ng dashboard validate` — HARD failure (exit 1). The strict gate.
+#   `ng dashboard put`      — LOUD warning, still pushes. The operator
+#                             must be able to update in a hurry.
+DASH_MAX_BYTES=12000            # whole dashboard middle
+DASH_MAX_SECTION_BYTES=4000     # any single `## ` section
+DASH_MAX_SECTION_ENTRIES=24     # top-level list items in one section
+DASH_MAX_ENTRY_BYTES=1500       # one list item incl. its continuation lines
 
 # EVERY line carries the `ng: ` prefix (your-org/nexus-code#858 C).
 # A multi-line diagnostic used to prefix only its first line, so the
@@ -561,13 +642,13 @@ _usage_for() {
         cmd_retire_window)  echo "usage: ng retire-window <window> [--reason <text>] [--dry-run] [--keep-window] [--assume-absent] [--strict]   # preflight + kill + prune the MANIFESTED state surfaces + verify, then report references the manifest does not name (--strict makes those a failure)" ;;
         cmd_decision_answer) echo "usage: ng decision-answer <window> <fp> allow|deny --nonce <nonce> [--reason <text>]   # ANSWER a forwarded dangerous-rm request (orchestrator-only, #1632)" ;;
         cmd_decision_ack)   echo "usage: ng decision-ack <window> <fingerprint> | <path-to-decision-json> | <window> --all [--reason <text>]   # DURABLE ack of a pending-decision row (\`rm\` does not stick)" ;;
-        cmd_wrap_up)        echo "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--comment-body-file <path>|--no-comment] [--dry-run] [--allow-stub] [--guards|--no-guards-preflight] [--strict-guards] [--retain <reason>|--no-retain]
+        cmd_wrap_up)        echo "usage: ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--trigger-repo <owner/name>] [--comment-body-file <path>|--no-comment] [--dry-run] [--allow-stub] [--guards|--no-guards-preflight] [--strict-guards] [--retain <reason>|--no-retain] [--shape pin|latest]
        ng wrap-up --reply-to <request-id> <report-path> [--issue <n>] [--answer-file <path>] [--repo <owner/name>] [--allow-stub] [--retain <reason>|--no-retain]   # channel delivery: no GitHub issue unless --issue
        ng wrap-up --last [<window>] | --explain [<window>]   # READ-ONLY: replay the last run's persisted output (+ ledger evidence); arms nothing, posts nothing (#1370)
    skeptic protocol (skills/nexus.skeptic) — producer side:
        [--skeptic-decision require|deny --skeptic-rationale <why>] [--skeptic-waive <reason>] [--skeptic-satisfied --skeptic-satisfied-by <report-path|sha256>] [--skeptic-contradicted <what>] [--skeptic-delta <what changed since a DECLINED prior request>] [--skeptic-rearm <what-changed>]
    skeptic protocol — the skeptic's OWN wrap-up:
-       [--skeptic-role --skeptic-verdict credible|check|suspect|refuted [--skeptic-target <window>] [--skeptic-depth <n>] [--skeptic-findings <n>] [--skeptic-orig <window>]]
+       [--skeptic-role --skeptic-verdict credible|check|suspect|refuted [--skeptic-target <window>] [--skeptic-depth <n>] [--skeptic-findings <n>] [--skeptic-orig <window>] [--skeptic-head <sha>] [--skeptic-pr <n>]]
        [--skeptic-subject <report-path|sha256>]   # WHAT YOU ACTUALLY READ. --skeptic-target is a SPAWN-TIME stamp and goes stale the moment a retained reviewer is re-tasked; this is the one field on the path that is your assertion rather than an inference (#963)
        [--not-a-skeptic-verdict <why>]   # a skeptic-STAMPED window wrapping up ORDINARY WORKER WORK: takes the producer path, asserts no verdict, clears no marker (#879)
    --skeptic-findings is OPTIONAL and an omitted count is recorded AS ABSENT, never as a measured 0 (#881)
@@ -590,14 +671,17 @@ _usage_for() {
         cmd_issue_view)     echo "usage: ng issue <n> [--repo <owner/name>] [--with-body] [--with-comments]" ;;
         cmd_issue_create)   echo "usage: ng issue create --title <t> [--body-file <path>] [--repo <owner/name>] [--label <l>]..." ;;
         cmd_issue_comment)  echo "usage: ng issue comment <n> [--repo <owner/name>] [--body-file <path>]" ;;
-        cmd_pr)             echo "usage: ng pr create|edit|merge|view ..." ;;
+        cmd_pr)             echo "usage: ng pr create|edit|merge|view|verdict ..." ;;
         cmd_pr_create)      echo "usage: ng pr create --head <branch> --title <t> [--body-file <path>] [--base main] [--repo <owner/name>] [--reviewer <login>|--no-reviewer]" ;;
         cmd_pr_edit)        echo "usage: ng pr edit <n> [--repo <owner/name>] [--title <t>] [--body-file <path>]" ;;
-        cmd_pr_merge)       echo "usage: ng pr merge <n> [--repo <owner/name>] [--squash|--merge|--rebase] [--sha <verified-head>] [--base-sha <verified-base>|--verify-base] [--delete-branch]" ;;
+        cmd_pr_merge)       echo "usage: ng pr merge <n> [--repo <owner/name>] [--squash|--merge|--rebase] [--sha <verified-head>] [--base-sha <verified-base>|--verify-base] [--delete-branch] [--require-verdict] [--verdict-override <reason>]   # refuses (exit 5) when the recorded Skeptic-Verdict head != the head to merge" ;;
         cmd_pr_view)        echo "usage: ng pr view <n> [--repo <owner/name>] [--json [field,...]]" ;;
+        cmd_pr_verdict)     echo "usage: ng pr verdict set|get <n> ..." ;;
+        cmd_pr_verdict_set) echo "usage: ng pr verdict set <n> --verdict <credible|check|suspect|refuted> [--head <sha>] [--depth N] [--findings N] [--skeptic <window>] [--issue N] [--repo <owner/name>]   # --head defaults to the PR's current head" ;;
+        cmd_pr_verdict_get) echo "usage: ng pr verdict get <n> [--repo <owner/name>] [--field verdict|head|depth|findings|skeptic|issue]   # exit 3 when no trailer" ;;
         cmd_preflight)      echo "usage: ng preflight <owner/repo>" ;;
         cmd_dashboard)      echo "usage: ng dashboard get|put|scaffold|validate [--body-file <path>]" ;;
-        cmd_dashboard_get)  echo "usage: ng dashboard get" ;;
+        cmd_dashboard_get)  echo "usage: ng dashboard get [--stat]   # --stat = size breakdown only, never the body" ;;
         cmd_dashboard_put)  echo "usage: ng dashboard put [--body-file <path>|-]   # takes the INNER region, NOT a full issue body (#959); refuses over GitHub's 262144-byte cap and verifies the write landed (#1118)" ;;
         cmd_dashboard_scaffold) echo "usage: ng dashboard scaffold" ;;
         cmd_dashboard_validate) echo "usage: ng dashboard validate [--body-file <path>|-]   # no flag = validate the LIVE dashboard; '-' = stdin (#958)" ;;
@@ -1754,7 +1838,7 @@ EOF
         die "report-init: --project must start with a letter and contain only [A-Za-z0-9._-] (got: '$project_arg') — pass a project name, not an issue number"
     fi
 
-    local project reports_dir session_id window trigger
+    local project reports_dir session_id window trigger trigger_line
     project=$(_report_project_slug "$project_arg")
     # Backstop for the one remaining fork on this path — the command
     # substitution above (your-org/nexus-code#638). _report_project_slug is
@@ -1769,6 +1853,21 @@ EOF
     [[ -n "$session_id" ]] || session_id="unknown"
     window=$(_report_tmux_window)
     [[ -n "$window" ]] || window="<unset>"
+    # `trigger` has no capture heuristic. session-id and window come from
+    # the environment; nothing in a worker's environment carries the
+    # issue or comment that started it (spawn-worker.sh exports
+    # NEXUS_ROOT + NEXUS_WORKER_WINDOW and nothing else), so an
+    # unsupplied trigger is genuinely unknown at init time. Pass
+    # `--issue` (and `--comment-id`) and it is filled correctly.
+    #
+    # When it IS unknown, emit the key with an EMPTY VALUE rather than
+    # the `<unset>` placeholder this used to write. Nothing rejected
+    # `<unset>` — `report-check` does not read this field at all, and
+    # 149 of the 670 reports on disk carry it — but it reads as an
+    # unfilled slot, so workers hand-edit it before wrap-up for no
+    # reason. An empty value is the honest encoding of "not supplied",
+    # and it asks nothing of the worker. This is a papercut fix, not a
+    # bug fix.
     if [[ -n "$issue_arg" ]]; then
         if [[ -n "$comment_id_arg" ]]; then
             trigger="#${issue_arg} (comment ${comment_id_arg})"
@@ -1776,7 +1875,14 @@ EOF
             trigger="#${issue_arg}"
         fi
     else
-        trigger="<unset>"
+        trigger=""
+    fi
+    # Built as a whole line so the unknown case emits a bare `trigger:`
+    # rather than `trigger: ` with a trailing space.
+    if [[ -n "$trigger" ]]; then
+        trigger_line="trigger: ${trigger}"
+    else
+        trigger_line="trigger:"
     fi
 
     # Loudly flag a write OUTSIDE the corpus (your-org/nexus-code#577). A report
@@ -1854,7 +1960,7 @@ project: ${project}
 date: ${date_part}
 session-id: ${session_id}
 window: ${window}
-trigger: ${trigger}
+${trigger_line}
 status: partial
 disposition: TODO
 ---
@@ -4806,7 +4912,7 @@ _skeptic_spawn_cmd() {
 # config monitor.skeptic.enforce_auto_decision is truthy.
 # Args: issue source_window repo
 #       role decision rationale waive verdict target depth findings orig
-#       contradicted rearm not_verdict
+#       contradicted rearm not_verdict satisfied satisfied_by head pr
 # Remove a window's OWN skeptic-pending marker — UNLESS this wrap-up
 # declared itself not a skeptic verdict (your-org/nexus-code#879 F1).
 #
@@ -4862,6 +4968,10 @@ _wrapup_skeptic_step() {
     # #879 F1 — set when the opt-out fires; read by _sk_keep_own_marker to
     # refuse every removal of this window's OWN pending marker downstream.
     local _sk_optout=0
+    # jacob-greene/nexus#155 — the commit a verdict covers, and the pull
+    # request to publish the Skeptic-Verdict trailer on. Appended and
+    # defaulted, like the arguments above.
+    local f_head="${18:-}" f_pr="${19:-}"
 
     # Request-intent signal for cmd_wrap_up's "Step 2b" (spawn-skeptic
     # request filing, your-org/nexus-code#545). Default cleared here so a
@@ -5355,6 +5465,44 @@ _wrapup_skeptic_step() {
         # (And the comment lives HERE, not inside the argument list: a comment
         # between `\`-continued lines silently TRUNCATES the arguments after
         # it. Measured — the row still emitted, without `repo` or `issue`.)
+        #
+        # The `head=` and `pr=` fields below (jacob-greene/nexus#155) are
+        # that missing link when the skeptic passes `--skeptic-pr <n>`.
+        #
+        # The commit this verdict covers (jacob-greene/nexus#155). A verdict
+        # that names no commit cannot gate a merge: on 2026-09-11 `#175` was
+        # validated at `ab2fd5f`, the worker pushed `4a284a6` afterwards, and
+        # the merge landed the unreviewed commit because nothing compared the
+        # two. Resolution order:
+        #   1. --skeptic-head <sha>, the explicit statement of what was read;
+        #   2. the CURRENT head of --skeptic-pr <n>, which is what a skeptic
+        #      finishing right now has been reviewing;
+        #   3. HEAD of this working tree, when one is a git checkout.
+        # Whatever resolves is recorded in the action-log event AND, when a
+        # pull request is named, published as a `Skeptic-Verdict:` trailer on
+        # the pull-request body, where a merge on any host can read it.
+        local head_sha="$f_head" head_src="flag" pr_raw="" pr_repo=""
+        if [[ -n "$f_pr" ]]; then
+            # Both calls are subshell-guarded: `_resolve_repo` and `api` can
+            # exit, and a failed head lookup must degrade to a loud warning,
+            # never abort the wrap-up that carries the report.
+            pr_repo=$( _resolve_repo write "$repo" 2>/dev/null ) || pr_repo=""
+            [[ -n "$pr_repo" ]] \
+                && { pr_raw=$( api "/repos/$pr_repo/pulls/$f_pr" 2>/dev/null ) || pr_raw=""; }
+        fi
+        if [[ -z "$head_sha" && -n "$pr_raw" ]]; then
+            head_sha=$(jq -r '.head.sha // empty' <<<"$pr_raw" 2>/dev/null || true)
+            [[ -n "$head_sha" ]] && head_src="pr-$f_pr"
+        fi
+        if [[ -z "$head_sha" ]]; then
+            head_sha=$(git rev-parse HEAD 2>/dev/null || true)
+            [[ -n "$head_sha" ]] && head_src="worktree"
+        fi
+        if [[ -n "$head_sha" && ! "$head_sha" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+            echo "ng wrap-up: --skeptic-head must be a 7-40 character commit sha, got '$head_sha'" >&2
+            return 1
+        fi
+
         ( cmd_log_action monitor --event skeptic-verdict \
             --extra "window=${source_window:-skeptic}" \
             --extra "target-window=$reviewed" \
@@ -5365,7 +5513,28 @@ _wrapup_skeptic_step() {
             --extra "subject-armed-sha=${_sk_subj_sha:--}" \
             --extra "subject-asserted-sha=${_sk_asserted:--}" \
             --extra "repo=${repo:--}" \
+            --extra "head=${head_sha:-unknown}" \
+            --extra "head-source=${head_sha:+$head_src}" \
+            --extra "pr=$f_pr" \
             --extra "issue=$issue" ) 2>/dev/null || true
+
+        # Publish the trailer. The action log is per-host and untracked, so a
+        # verdict recorded only there is invisible to a merge run anywhere
+        # else. The trailer travels with the pull request.
+        if [[ -n "$f_pr" ]]; then
+            if [[ -z "$head_sha" ]]; then
+                echo "ng wrap-up: no head resolved for pull request $f_pr — trailer NOT published" >&2
+            elif ( cmd_pr_verdict_set "$f_pr" --verdict "$verdict" --head "$head_sha" \
+                       --depth "$depth" --findings "$findings" \
+                       --skeptic "${source_window:-skeptic}" --issue "$issue" \
+                       ${pr_repo:+--repo "$pr_repo"} ) >/dev/null 2>&1; then
+                printf 'Skeptic-Verdict trailer published on pull request %s at %s\n' \
+                    "$f_pr" "${head_sha:0:7}" >&2
+            else
+                echo "ng wrap-up: failed to publish the Skeptic-Verdict trailer on pull request $f_pr" >&2
+                echo "  record it by hand:  ng pr verdict set $f_pr --verdict $verdict --head $head_sha" >&2
+            fi
+        fi
 
         # A returned verdict SATISFIES the first-pass require-gate, so clear
         # EVERY blocking marker this validation touches: the immediately
@@ -5608,6 +5777,13 @@ _wrapup_skeptic_step() {
                  printf '                  the path, then re-run this wrap-up.\n' ;;
             *)   printf 'ledger          : not recorded — no reviewed target to key on\n' ;;
         esac
+        if [[ -n "$head_sha" ]]; then
+            printf 'validated head  : %s (%s)\n' "$head_sha" "$head_src"
+        else
+            printf 'validated head  : UNKNOWN — pass --skeptic-head <sha>\n'
+            printf '                  A verdict with no head cannot gate a merge.\n'
+        fi
+        [[ -n "$f_pr" ]] && printf 'pull request    : %s\n' "$f_pr"
 
         # Bounded recursion. A second-pass skeptic is warranted only when
         # this pass found SUBSTANTIVE NEW issues (suspect/refuted verdict,
@@ -9556,6 +9732,67 @@ EOF
 # The asset repo is always taken from config (github.asset_repo) by
 # upload-asset.sh.
 #
+# Link shape (jacob-greene/nexus#83). Step 1 passes `--shape latest`,
+# so the published link is `blob/main/<path>` and always serves the
+# CURRENT report. `ng upload`'s own default stays `pin` — the two verbs
+# publish different classes of artefact and want opposite shapes:
+#
+#   figure/notebook posted as inline evidence  → pin
+#       The comment describes those exact bytes. A later revision gets
+#       its own comment and its own pin.
+#   report linked at wrap-up                   → latest
+#       Reports are append-only living documents by convention, and
+#       skeptic rounds correct them IN PLACE. The link must follow.
+#
+# A pinned wrap-up link cannot be repaired once posted.
+#
+# Figures below are read from the CORRECTED audit at `main`:
+# asset-repo `assets/48/stale-pinned-links_2026-08-24_164546_
+# pinned-link-audit.md`, sections `## Correction` and `## Correction 2`.
+# Do NOT take them from issue #83's body, which still carries the
+# pre-correction 29/28 and was never updated.
+#
+# Mind the denominators — the audit uses two, and they are easy to
+# conflate (25 + 4 = 29, not 30, and that is not an error):
+#   - P1 links serving superseded content:        30
+#   - carrying comments matched against the log:  29, split 25 posted
+#     by `ng wrap-up` / 4 posted by hand. The 30th P1 item was added by
+#     the same correction (req-002) and is not in that split.
+#   - over all 30, the split is 26 wrap-up / 4 hand. The item req-002
+#     added is wrap-up-posted, so it joins the 25, not the 4. Use THIS
+#     split for any claim about what a verb-keyed fix reaches.
+#   - 29 of the 30 P1 items are reports; the remaining one is a figure.
+#     That figure is inside the 29-row table, and is one of the 4 posted
+#     by hand. It is NOT the item req-002 added, which is a report.
+#
+# A later `ng wrap-up` does NOT reliably repair such a link. Three
+# distinct paths leave it stale, and only the first involves `ng
+# upload` — the earlier claim that ALL of them did was wrong:
+#   - the correction arrives via `ng upload`, which cannot reach a
+#     comment it never wrote;
+#   - a later wrap-up REUSED the prior comment without re-pointing it
+#     (`comment=reused`, 27 events 2026-07-09..2026-07-29 in
+#     monitor/.state/action-log.jsonl). That build predates the
+#     re-point path, which landed 2026-07-31 — already fixed, not a
+#     live defect;
+#   - a later wrap-up ran `--no-comment` (`comment=skipped`, 17).
+# An independent depth-1 classification split 28 wrap-up-carried links
+# 18 / 7 / 3 across those three paths. Its 28 is that reviewer's own
+# audit, not the 29-row 25 above; the two audits do not share a
+# method, so the denominators are not interchangeable.
+#
+# KNOWN COVERAGE GAP: this fix keys on the VERB, so it reaches the 26
+# wrap-up cases and not the 4 posted by hand — 3 of which link a `.md`
+# report, the class this rationale says wants `latest`. The corrected
+# audit's proposal is to key on the ARTEFACT inside upload-asset.sh
+# (`.md` -> latest, everything else -> pin, holding `.ipynb` at pin
+# because every stale notebook pin was republished in-thread). That
+# moves coverage from 26 of 30 to 29 of 30. Deliberately NOT
+# pre-empted here — it is a separate design decision on #83.
+#
+# `--shape pin` opts a single wrap-up back into the frozen shape, for
+# the rare report that must stay quotable verbatim.
+#
 # Retain-by-default (step 5): a successful wrap-up auto-logs a
 # `window-retain` event for the source tmux window so the watcher's
 # idle-worker probe suppresses the wrapped row into a footer for the
@@ -10141,6 +10378,9 @@ cmd_wrap_up() {
     local dry_run=0   # your-org/nexus-code#1608 — compose and SHOW, write nothing
     local guards_mode="" guards_strict=0
     local retain_reason="" no_retain=0
+    # Asset-link shape for the report upload. `latest` here, unlike
+    # `ng upload`'s `pin` — see the "Link shape" block above.
+    local shape="latest"
     # Skeptic-protocol flags (skills/nexus.skeptic). All optional and
     # backward-compatible: a wrap-up with none of these falls back to
     # the worker's spawn-stamped mode (provenance record) or `auto`.
@@ -10149,6 +10389,7 @@ cmd_wrap_up() {
     local sk_satisfied=0 sk_satisfied_by=""
     local sk_subject=""
     local sk_not_verdict=""
+    local sk_head="" sk_pr=""
     _argloop_prev_12=-1; while (( $# > 0 )); do (( $# != _argloop_prev_12 )) || _argloop_stuck "$1"; _argloop_prev_12=$#
         case "$1" in
             --trigger-comment)  _need_val --trigger-comment "$#" "${2:-}"; trigger_comment="$2";   shift 2 ;;
@@ -10163,6 +10404,11 @@ cmd_wrap_up() {
             --strict-guards)     guards_strict=1;            shift   ;;
             --retain)           _need_val --retain "$#" "${2:-}"; retain_reason="$2";     shift 2 ;;
             --no-retain)        no_retain=1;                shift   ;;
+            # --shape pin: freeze THIS wrap-up's link at the upload-time
+            # SHA. For the rare report that must stay quotable verbatim —
+            # a decision record, or a report cited as evidence for the
+            # exact bytes it contained at hand-off.
+            --shape)            _need_val --shape "$#" "${2:-}"; shape="$2"; shift 2 ;;
             --skeptic-decision)  _need_val --skeptic-decision "$#" "${2:-}"; sk_decision="$2";      shift 2 ;;
             --skeptic-rationale) _need_val --skeptic-rationale "$#" "${2:-}"; sk_rationale="$2";     shift 2 ;;
             --skeptic-waive)     _need_val --skeptic-waive "$#" "${2:-}"; sk_waive="$2";         shift 2 ;;
@@ -10218,6 +10464,14 @@ cmd_wrap_up() {
             # here is what keeps the class shut across the merge seam; the lint
             # is what would have caught it had it not been.
             --not-a-skeptic-verdict) _need_val --not-a-skeptic-verdict "$#" "${2:-}"; sk_not_verdict="$2"; shift 2 ;;
+            # --skeptic-head <sha>: the commit this verdict covers
+            # (jacob-greene/nexus#155). Recorded in the skeptic-verdict event
+            # and, with --skeptic-pr, published as the Skeptic-Verdict
+            # trailer that `ng pr merge` gates on.
+            --skeptic-head)      _need_val --skeptic-head "$#" "${2:-}"; sk_head="$2";         shift 2 ;;
+            # --skeptic-pr <n>: publish the trailer on this pull request. The
+            # head defaults to that pull request's current head.
+            --skeptic-pr)        _need_val --skeptic-pr "$#" "${2:-}"; sk_pr="$2";           shift 2 ;;
             # Channel-delivery flags (your-org/nexus-code remote-reply).
             # --reply-to was already read by the pre-scan; consume it here
             # so it doesn't fall through to the unknown-flag arm.
@@ -10298,6 +10552,10 @@ cmd_wrap_up() {
         [[ -z "$sk_verdict" ]] \
             || die "wrap-up: --not-a-skeptic-verdict contradicts --skeptic-verdict '$sk_verdict' (you supplied a verdict and declared this is not one). Pass exactly one."
     fi
+    case "$shape" in
+        pin|latest) ;;
+        *) die "wrap-up: --shape must be pin|latest, got: $shape" ;;
+    esac
     [[ -f "$report_path" ]] || die "wrap-up: report not found: $report_path"
     # A report cited from OUTSIDE the corpus still uploads fine (the GitHub link
     # works), but it is invisible to every corpus reader — skeptic
@@ -10605,14 +10863,15 @@ EOF
         "$sk_role" "$sk_decision" "$sk_rationale" "$sk_waive" \
         "$sk_verdict" "$sk_target" "$sk_depth" "$sk_findings" "$sk_orig" \
         "$sk_contradicted" "$sk_rearm" "$sk_not_verdict" \
-        "$sk_satisfied" "$sk_satisfied_by" \
+        "$sk_satisfied" "$sk_satisfied_by" "$sk_head" "$sk_pr" \
         || return $?
 
     # Step 1: upload the report. Stdout = URL; stderr = progress + errors.
     # Skipped entirely in channel-only mode (no issue ⇒ no asset thread).
     if [[ -z "$issue" ]]; then
         : # upload_st already `skipped`
-    elif asset_url=$("$_script_dir/upload-asset.sh" "$report_path" --issue "$issue" 2>"$err_buf"); then
+    elif asset_url=$("$_script_dir/upload-asset.sh" "$report_path" --issue "$issue" \
+                       --shape "$shape" 2>"$err_buf"); then
         # Trim trailing newline (`$()` already strips it, but be explicit).
         asset_url="${asset_url%$'\n'}"
         if [[ -n "$asset_url" ]]; then
@@ -12011,11 +12270,12 @@ cmd_pr() {
     _help_check_first "$@"
     local sub="${1:-}"; shift || true
     case "$sub" in
-        create) cmd_pr_create "$@" ;;
-        edit)   cmd_pr_edit   "$@" ;;
-        merge)  cmd_pr_merge  "$@" ;;
-        view)   cmd_pr_view   "$@" ;;
-        *)      die "usage: ng pr create|edit|merge|view ..." ;;
+        create)  cmd_pr_create  "$@" ;;
+        edit)    cmd_pr_edit    "$@" ;;
+        merge)   cmd_pr_merge   "$@" ;;
+        view)    cmd_pr_view    "$@" ;;
+        verdict) cmd_pr_verdict "$@" ;;
+        *)       die "usage: ng pr create|edit|merge|view|verdict ..." ;;
     esac
 }
 
@@ -12116,6 +12376,406 @@ cmd_pr_edit() {
           | jq -r '.html_url // empty')
     [[ -n "$url" ]] || die "pr edit failed"
     printf '%s\n' "$url"
+}
+
+# ---- skeptic verdict trailer (jacob-greene/nexus#155) --------------------
+#
+# A skeptic's verdict used to live in two places, and neither could gate a
+# merge. The action log (`monitor/.state/action-log.jsonl`) is host-local
+# and untracked, so no other clone and no reader on GitHub can see it. The
+# prose section in a pull-request body is reachable but unparseable, and
+# two merges 39 seconds apart on 2026-09-10 used two different conventions.
+#
+# Neither record named the commit the verdict covered. On 2026-09-11 that
+# cost a merge: `#175` was validated at `ab2fd5f`, the worker then pushed
+# `4a284a6`, and `ng pr merge` landed the unreviewed commit.
+#
+# The fix is one machine-readable line in the pull-request body:
+#
+#     Skeptic-Verdict: credible head=<sha> depth=1 findings=0 skeptic=<win> issue=155
+#
+# It travels with the pull request, so any host and any fresh clone reads
+# the same record. `verdict` and `head=` are load-bearing; the rest is
+# provenance. `ng pr verdict set|get` writes and reads it, and
+# `ng pr merge` compares `head=` against the head it is about to merge.
+#
+# EVERY parse failure is fail-OPEN: no record found means `ng pr merge`
+# warns and merges. So each rule below is written to make a HIDDEN record
+# impossible, not merely to make a visible one readable. The read-back in
+# `cmd_pr_verdict_set` is the other half: it refuses to report success for
+# a trailer that does not parse back out of the body it just published.
+#
+# Parse rules, and why each one exists:
+#   * The line must start at column 0. An indented (four-space) code block
+#     therefore cannot supply one.
+#   * Lines inside a fenced code block are skipped. A pull request that
+#     DOCUMENTS this format (this one does) must not be read as carrying a
+#     verdict.
+#   * The LAST surviving trailer wins. Re-validating after a new push
+#     appends a second trailer, so the newest record is authoritative and
+#     the earlier ones stay visible as history.
+
+# Accepted verdict values, shared with `ng wrap-up --skeptic-verdict`.
+_VERDICT_VALUES='credible|check|suspect|refuted'
+
+# Render one trailer line. Empty optional fields are omitted, so a
+# minimal record is `Skeptic-Verdict: credible head=<sha>`.
+_verdict_render() {
+    local verdict="$1" head="$2" depth="${3:-}" findings="${4:-}" skeptic="${5:-}" issue="${6:-}"
+    local line="Skeptic-Verdict: $verdict head=$head"
+    [[ -n "$depth"    ]] && line+=" depth=$depth"
+    [[ -n "$findings" ]] && line+=" findings=$findings"
+    # Whitespace in a window name would break the single-line field split,
+    # so squash it rather than emit an unparseable record.
+    [[ -n "$skeptic"  ]] && line+=" skeptic=${skeptic//[[:space:]]/_}"
+    [[ -n "$issue"    ]] && line+=" issue=$issue"
+    printf '%s' "$line"
+}
+
+# Reduce a pull-request body (stdin) to its single authoritative trailer
+# line, or nothing. Fence-aware; last match wins.
+#
+# Fence tracking follows the CommonMark rule, because the naive "toggle on
+# any fence-looking line" version desynchronises and that failure is
+# fail-open in both directions:
+#   * a NESTED fence (a ``` line inside a ```` block) closed the block
+#     early, so a DOCUMENTED example read as a real verdict;
+#   * an UNCLOSED fence left every later line inside it, so a real trailer
+#     appended to the end of the body became invisible and the gate
+#     silently switched off.
+# So: remember the fence character and its length. Only a fence of the SAME
+# character and AT LEAST the same length closes the block. Anything else
+# inside an open block is content.
+#
+# HTML comments are skipped for the same reason in the other direction: a
+# trailer inside `<!-- -->` is invisible to every human reader of the pull
+# request, so it must not be able to assert a verdict to the gate.
+#
+# Interval expressions (`{0,3}`) are avoided so the program does not need
+# `--re-interval` on a mawk/busybox awk.
+_verdict_trailer_line() {
+    tr -d '\r' | awk '
+        # --- HTML comment blocks: invisible to a reader, so invisible here.
+        {
+            line = $0
+            if (!in_fence) {
+                if (in_comment) {
+                    if (line ~ /-->/) { in_comment = 0 }
+                    next
+                }
+                # `<!--` ANYWHERE on the line opens the block, not just at
+                # the start of one. A comment opened after other text hid
+                # the trailer from every human reader while still feeding
+                # the gate a verdict. A comment that also closes on the
+                # same line opens nothing.
+                if (line ~ /<!--/ && line !~ /-->/) {
+                    in_comment = 1; next
+                }
+            }
+        }
+        # --- fenced code blocks, CommonMark-style open/close matching.
+        {
+            if (match(line, /^ ? ? ?(```+|~~~+)/)) {
+                tok = substr(line, RSTART, RLENGTH)
+                sub(/^[[:space:]]+/, "", tok)
+                ch = substr(tok, 1, 1)
+                len = length(tok)
+                if (!in_fence) {
+                    in_fence = 1; f_ch = ch; f_len = len; next
+                }
+                if (ch == f_ch && len >= f_len) { in_fence = 0; next }
+                # a different or shorter fence inside an open block is content
+            }
+        }
+        in_fence { next }
+        /^Skeptic-Verdict:[ \t]/ { last = line }
+        END { if (last != "") print last }
+    '
+}
+
+# Parse a body (stdin) into TSV: verdict, head, depth, findings, skeptic,
+# issue. Exit 3 when the body carries no well-formed trailer. A line that
+# names a verdict but no `head=` is NOT well-formed — binding the head is
+# the whole point, so a headless record must not read as a valid verdict.
+_verdict_parse() {
+    local line
+    line=$(_verdict_trailer_line)
+    [[ -n "$line" ]] || return 3
+    # The verdict word is positional: it follows the colon. Everything else
+    # is a `key=value` token read from ANYWHERE on the line. `head=` was
+    # positional in the first version, which meant
+    # `Skeptic-Verdict: credible depth=1 head=<sha>` parsed as nothing and
+    # the gate silently switched off. A field-order mistake must not be a
+    # fail-open.
+    local re="^Skeptic-Verdict:[[:blank:]]+($_VERDICT_VALUES)([[:blank:]]|\$)"
+    [[ "$line" =~ $re ]] || return 3
+    local verdict="${BASH_REMATCH[1]}"
+    local head="" depth="" findings="" skeptic="" issue="" tok
+    # `read -ra` splits on IFS without globbing. An unquoted `for tok in
+    # $line` expanded a `skeptic=*` value against the working directory.
+    local -a toks=()
+    read -ra toks <<<"$line"
+    for tok in "${toks[@]}"; do
+        case "$tok" in
+            # FIRST head= wins, not the last. `_verdict_render` always emits
+            # head= immediately after the verdict, so the first token is the
+            # canonical one. Last-wins let trailing prose that happens to
+            # contain a `head=` token silently rebind the record to another
+            # commit — the gate would then compare the wrong head.
+            head=*)     [[ -n "$head" ]] || head="${tok#head=}" ;;
+            depth=*)    depth="${tok#depth=}" ;;
+            findings=*) findings="${tok#findings=}" ;;
+            skeptic=*)  skeptic="${tok#skeptic=}" ;;
+            issue=*)    issue="${tok#issue=}" ;;
+        esac
+    done
+    # A record with no well-formed head is NOT a verdict. Binding the head
+    # is the point; a headless record must not read as a valid one.
+    [[ "$head" =~ ^[0-9a-fA-F]{7,40}$ ]] || return 3
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$verdict" "$head" "$depth" "$findings" "$skeptic" "$issue"
+}
+
+# Do two commit identifiers name the same commit? A trailer may carry an
+# abbreviated sha (`ab2fd5f`) while the API reports the full 40. Match
+# when the shorter is a case-insensitive prefix of the longer, with a
+# 7-character floor so a stray short token cannot match half the repo.
+_verdict_head_match() {
+    local a="${1,,}" b="${2,,}"
+    [[ -n "$a" && -n "$b" ]] || return 1
+    (( ${#a} >= 7 && ${#b} >= 7 )) || return 1
+    if (( ${#a} <= ${#b} )); then
+        [[ "$b" == "$a"* ]]
+    else
+        [[ "$a" == "$b"* ]]
+    fi
+}
+
+# Append an audit line for a merge that overrode the head-binding gate.
+# Mirrors the GH_IMPERSONATE trail in monitor/gh-shim.sh: an override
+# nobody can see afterwards is not an override, it is a disabled gate.
+_verdict_audit_override() {
+    local repo="$1" n="$2" recorded="$3" actual="$4" kind="$5" reason="$6"
+    local log_file="$STATE_DIR/verdict-override.log"
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    # Explicit mode at creation, same rationale as impersonate.log: a
+    # group-writable audit trail is one anybody in the group can rewrite.
+    if ! command -v _ensure_service_log >/dev/null 2>&1; then
+        # shellcheck source=_log-mode.sh
+        . "$_script_dir/_log-mode.sh" 2>/dev/null || true
+    fi
+    command -v _ensure_service_log >/dev/null 2>&1 \
+        && _ensure_service_log "$log_file" || true
+    printf '%s\tpid=%s\twindow=%s\trepo=%s\tpr=%s\tkind=%s\trecorded-head=%s\tmerged-head=%s\treason=%s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown-ts)" \
+        "$$" "${NEXUS_WORKER_WINDOW:-${NEXUS_ORCHESTRATOR_WINDOW:-unknown}}" \
+        "$repo" "$n" "$kind" "${recorded:-none}" "$actual" "$reason" \
+        >> "$log_file" 2>/dev/null || true
+    ( cmd_log_action monitor --event verdict-override \
+        --extra "repo=$repo" --extra "pr=$n" --extra "kind=$kind" \
+        --extra "recorded-head=${recorded:-none}" \
+        --extra "merged-head=$actual" \
+        --extra "reason=$reason" ) 2>/dev/null || true
+}
+
+# The gate itself. Returns 0 to let the merge proceed. Exits 5 to refuse.
+# Split out of cmd_pr_merge so the unit suite can drive it directly AND
+# through its real caller.
+#
+# Refusal cases:
+#   (a) the recorded head differs from the head about to be merged;
+#   (b) no verdict is recorded AND --require-verdict was passed.
+# A missing verdict without --require-verdict warns and proceeds: most
+# pull requests on this repo never had a skeptic, and turning every one
+# of them into a hard failure would make the verb unusable.
+_pr_merge_verdict_gate() {
+    local repo="$1" n="$2" head_sha="$3" body="$4"
+    local require_verdict="$5" have_override="$6" override_reason="$7"
+    local parsed verdict recorded depth findings skeptic issue
+    if parsed=$(printf '%s' "$body" | _verdict_parse); then
+        IFS=$'\t' read -r verdict recorded depth findings skeptic issue <<<"$parsed"
+    else
+        verdict=""; recorded=""
+    fi
+
+    if [[ -z "$recorded" ]]; then
+        if (( require_verdict == 1 )); then
+            if (( have_override == 1 )); then
+                _verdict_audit_override "$repo" "$n" "" "$head_sha" missing-verdict "$override_reason"
+                echo "ng pr merge: OVERRIDE — no Skeptic-Verdict trailer, merging anyway" >&2
+                echo "ng pr merge: reason: $override_reason" >&2
+                return 0
+            fi
+            echo "ng pr merge: REFUSED — pull request $n carries no Skeptic-Verdict trailer." >&2
+            echo "  --require-verdict was passed, so an unrecorded verdict is a hard stop." >&2
+            echo "  Record one:  ng pr verdict set $n --verdict <credible|check|suspect|refuted> --repo $repo" >&2
+            echo "  Or override: ng pr merge $n --verdict-override \"<why this merge is safe>\"" >&2
+            exit 5
+        fi
+        echo "ng pr merge: no Skeptic-Verdict trailer on pull request $n — head not checked." >&2
+        return 0
+    fi
+
+    if _verdict_head_match "$recorded" "$head_sha"; then
+        [[ "$verdict" == "credible" ]] \
+            || echo "ng pr merge: recorded verdict is '$verdict', not 'credible' — merging anyway." >&2
+        printf 'ng pr merge: verdict %s validated at %s, matches head %s\n' \
+            "$verdict" "$recorded" "${head_sha:0:7}" >&2
+        return 0
+    fi
+
+    if (( have_override == 1 )); then
+        _verdict_audit_override "$repo" "$n" "$recorded" "$head_sha" head-mismatch "$override_reason"
+        echo "ng pr merge: OVERRIDE — head mismatch, merging anyway" >&2
+        printf '  verdict %s covers %s; the head is %s\n' "$verdict" "$recorded" "$head_sha" >&2
+        echo "  reason: $override_reason" >&2
+        echo "  audited to: $STATE_DIR/verdict-override.log" >&2
+        return 0
+    fi
+
+    echo "ng pr merge: REFUSED — the recorded verdict does not cover this head." >&2
+    printf '  recorded verdict : %s\n' "$verdict" >&2
+    printf '  validated head   : %s\n' "$recorded" >&2
+    printf '  head to merge    : %s\n' "$head_sha" >&2
+    echo "  The branch moved after the verdict. Review the new commits, then either" >&2
+    echo "  re-record the verdict at the current head:" >&2
+    echo "      ng pr verdict set $n --verdict <verdict> --repo $repo" >&2
+    echo "  or state why the delta is safe and merge with an audited override:" >&2
+    echo "      ng pr merge $n --verdict-override \"<why the delta is safe>\"" >&2
+    exit 5
+}
+
+# `ng pr verdict set|get <n>` — write and read the Skeptic-Verdict trailer.
+cmd_pr_verdict() {
+    _help_check_first "$@"
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        set) cmd_pr_verdict_set "$@" ;;
+        get) cmd_pr_verdict_get "$@" ;;
+        *)   die "usage: ng pr verdict set|get <n> ..." ;;
+    esac
+}
+
+# Append a trailer to the pull-request body. --head defaults to the pull
+# request's CURRENT head, which is the commit a skeptic finishing right
+# now has been reviewing. Pass --head explicitly when recording a verdict
+# for an earlier commit.
+cmd_pr_verdict_set() {
+    _help_check "$@"
+    local n=""
+    local verdict="" head="" depth="" findings="" skeptic="" issue="" repo_arg=""
+    # Positionals are collected inside the loop, so flags and the PR number
+    # interleave in any order (your-org/nexus-code#906 C).
+    _argloop_prev_39=-1; while (( $# > 0 )); do (( $# != _argloop_prev_39 )) || _argloop_stuck "$1"; _argloop_prev_39=$#
+        case "$1" in
+            --verdict)  _need_val --verdict "$#" "${2:-}";  verdict="$2";  shift 2 ;;
+            --head)     _need_val --head "$#" "${2:-}";     head="$2";     shift 2 ;;
+            --depth)    _need_val --depth "$#" "${2:-}";    depth="$2";    shift 2 ;;
+            --findings) _need_val --findings "$#" "${2:-}"; findings="$2"; shift 2 ;;
+            --skeptic)  _need_val --skeptic "$#" "${2:-}";  skeptic="$2";  shift 2 ;;
+            --issue)    _need_val --issue "$#" "${2:-}";    issue="$2";    shift 2 ;;
+            --repo)     _need_val --repo "$#" "${2:-}";     repo_arg="$2"; shift 2 ;;
+            --*) die "unknown flag: $(_arg_excerpt "$1")" ;;
+            *)  if [[ -z "$n" ]]; then n="$1"
+                else die "unexpected POSITIONAL argument $(_arg_excerpt "$1"). Flags must start with --; positionals are matched in order."; fi
+                shift ;;
+        esac
+    done
+    [[ -n "$n" ]] || die "usage: ng pr verdict set <n> --verdict <credible|check|suspect|refuted> [--head <sha>] [--depth N] [--findings N] [--skeptic <window>] [--issue N] [--repo <owner/name>]"
+    [[ "$verdict" =~ ^($_VERDICT_VALUES)$ ]] \
+        || die "pr verdict set: --verdict must be credible|check|suspect|refuted, got '$verdict'"
+    local target raw
+    target=$(_resolve_repo write "$repo_arg") || exit $?
+    raw=$(api "/repos/$target/pulls/$n" 2>/dev/null)
+    [[ -n "$raw" ]] && jq -e '.number' <<<"$raw" >/dev/null 2>&1 \
+        || die "pr verdict set: could not fetch pull $n"
+    if [[ -z "$head" ]]; then
+        head=$(jq -r '.head.sha // empty' <<<"$raw")
+        [[ -n "$head" ]] || die "pr verdict set: could not resolve the head of pull $n; pass --head"
+    fi
+    [[ "$head" =~ ^[0-9a-fA-F]{7,40}$ ]] \
+        || die "pr verdict set: --head must be a 7-40 character commit sha, got '$head'"
+    local trailer body new_body resp url returned_body got_head
+    trailer=$(_verdict_render "$verdict" "$head" "$depth" "$findings" "$skeptic" "$issue")
+    body=$(jq -r '.body // ""' <<<"$raw")
+    # Append. The parser takes the LAST trailer, so an earlier record stays
+    # readable as history instead of being silently rewritten.
+    new_body="${body%$'\n'}"$'\n\n'"$trailer"$'\n'
+    resp=$(jq -n --arg b "$new_body" '{body:$b}' \
+           | api -X PATCH "/repos/$target/pulls/$n" --input -)
+    url=$(jq -r '.html_url // empty' <<<"$resp")
+    [[ -n "$url" ]] || die "pr verdict set: body patch failed"
+
+    # READ BACK what was actually published, and fail LOUD when it does not
+    # parse to the head just recorded.
+    #
+    # Every failure on the read path is fail-open: a body the parser cannot
+    # read means `ng pr merge` reports "no verdict" and merges. Without this
+    # check, a publish that silently failed to land the trailer — an append
+    # that went nowhere, a trailer swallowed by an unclosed fence earlier in
+    # the body — still exited 0 and printed the trailer. The skeptic would
+    # believe the verdict was recorded and the gate was on, when it was off.
+    #
+    # The check runs against the PATCH RESPONSE, not against the string this
+    # function built, so it pins the published artefact rather than the
+    # intent.
+    returned_body=$(jq -r '.body // empty' <<<"$resp")
+    if [[ -z "$returned_body" ]]; then
+        echo "ng pr verdict set: the API did not return the patched body — the" >&2
+        echo "  published record was NOT verified. Confirm with:" >&2
+        echo "      ng pr verdict get $n --repo $target" >&2
+    else
+        got_head=$(printf '%s' "$returned_body" | _verdict_parse | cut -f2) || got_head=""
+        if [[ -z "$got_head" ]]; then
+            die "pr verdict set: the trailer was published but does not parse back out of the body. The record is NOT readable by \`ng pr merge\`, so the gate is OFF. Check the body for an unclosed code fence before the trailer."
+        fi
+        if ! _verdict_head_match "$got_head" "$head"; then
+            die "pr verdict set: the body parses back to head '$got_head', not the '$head' just recorded. An earlier trailer is winning; the gate would compare the wrong commit."
+        fi
+    fi
+    printf '%s\n' "$trailer"
+    printf '%s\n' "$url"
+}
+
+# Print the recorded trailer. Exit 3 when the pull request has none, so a
+# caller can branch on "no verdict" without parsing prose.
+cmd_pr_verdict_get() {
+    _help_check "$@"
+    local n="" repo_arg="" field=""
+    _argloop_prev_40=-1; while (( $# > 0 )); do (( $# != _argloop_prev_40 )) || _argloop_stuck "$1"; _argloop_prev_40=$#
+        case "$1" in
+            --repo)  _need_val --repo "$#" "${2:-}";  repo_arg="$2"; shift 2 ;;
+            --field) _need_val --field "$#" "${2:-}"; field="$2";    shift 2 ;;
+            --*) die "unknown flag: $(_arg_excerpt "$1")" ;;
+            *)  if [[ -z "$n" ]]; then n="$1"
+                else die "unexpected POSITIONAL argument $(_arg_excerpt "$1"). Flags must start with --; positionals are matched in order."; fi
+                shift ;;
+        esac
+    done
+    [[ -n "$n" ]] || die "usage: ng pr verdict get <n> [--repo <owner/name>] [--field verdict|head|depth|findings|skeptic|issue]"
+    local target raw body parsed
+    target=$(_resolve_repo read "$repo_arg") || exit $?
+    raw=$(api "/repos/$target/pulls/$n" 2>/dev/null)
+    [[ -n "$raw" ]] && jq -e '.number' <<<"$raw" >/dev/null 2>&1 \
+        || die "pr verdict get: could not fetch pull $n"
+    body=$(jq -r '.body // ""' <<<"$raw")
+    if ! parsed=$(printf '%s' "$body" | _verdict_parse); then
+        echo "ng: pull request $n carries no Skeptic-Verdict trailer" >&2
+        exit 3
+    fi
+    local verdict head depth findings skeptic issue
+    IFS=$'\t' read -r verdict head depth findings skeptic issue <<<"$parsed"
+    case "$field" in
+        "")         printf 'verdict=%s head=%s depth=%s findings=%s skeptic=%s issue=%s\n' \
+                        "$verdict" "$head" "$depth" "$findings" "$skeptic" "$issue" ;;
+        verdict)    printf '%s\n' "$verdict" ;;
+        head)       printf '%s\n' "$head" ;;
+        depth)      printf '%s\n' "$depth" ;;
+        findings)   printf '%s\n' "$findings" ;;
+        skeptic)    printf '%s\n' "$skeptic" ;;
+        issue)      printf '%s\n' "$issue" ;;
+        *) die "pr verdict get: --field must be verdict|head|depth|findings|skeptic|issue" ;;
+    esac
 }
 
 # Merge a PR via the REST API. Prints the merge commit SHA. Optional
@@ -12224,10 +12884,16 @@ _need_val() {
     [[ -n "${3:-}" ]] || _die_usage "$1 requires a non-empty value"
 }
 
+# Head-binding gate (jacob-greene/nexus#155): the verb reads the
+# `Skeptic-Verdict:` trailer in the pull-request body and refuses (exit 5)
+# when the validated head differs from the head it is about to merge.
+# `--verdict-override "<reason>"` merges anyway, with an audit line in
+# `monitor/.state/verdict-override.log`. The reason is mandatory.
 cmd_pr_merge() {
     _help_check "$@"
     local n=""
     local method="squash" delete_branch=0 repo_arg="" pin_sha="" pin_base="" verify_base=0
+    local require_verdict=0 have_override=0 override_reason=""
     _argloop_prev_20=-1; while (( $# > 0 )); do (( $# != _argloop_prev_20 )) || _argloop_stuck "$1"; _argloop_prev_20=$#
         case "$1" in
             --squash) method="squash"; shift ;;
@@ -12241,6 +12907,8 @@ cmd_pr_merge() {
             --base-sha) _need_val --base-sha "$#" "${2:-}"; pin_base="$2"; shift 2 ;;
             --verify-base) verify_base=1; shift ;;
             --delete-branch) delete_branch=1; shift ;;
+            --require-verdict) require_verdict=1; shift ;;
+            --verdict-override) _need_val --verdict-override "$#" "${2:-}"; override_reason="$2"; have_override=1; shift 2 ;;
             --repo)   _need_val --repo "$#" "${2:-}"; repo_arg="$2"; shift 2 ;;
             --*) die "unknown flag: $(_arg_excerpt "$1")" ;;
             *)  if [[ -z "$n" ]]; then n="$1"
@@ -12248,12 +12916,27 @@ cmd_pr_merge() {
                 shift ;;
         esac
     done
-    [[ -n "$n" ]] || die "usage: ng pr merge <n> [--repo <owner/name>] [--squash|--merge|--rebase] [--sha <verified-head>] [--base-sha <verified-base>|--verify-base] [--delete-branch]"
+    [[ -n "$n" ]] || die "usage: ng pr merge <n> [--repo <owner/name>] [--squash|--merge|--rebase] [--sha <verified-head>] [--base-sha <verified-base>|--verify-base] [--delete-branch] [--require-verdict] [--verdict-override <reason>]"
+    # A reason is what makes the override auditable. An empty one, or a
+    # bare flag that swallowed the next flag as its argument, is a silent
+    # override — refuse both.
+    if (( have_override == 1 )); then
+        [[ -n "${override_reason//[[:space:]]/}" ]] \
+            || die "pr merge: --verdict-override requires a non-empty reason"
+        [[ "$override_reason" != --* ]] \
+            || die "pr merge: --verdict-override requires a reason, got the flag '$override_reason'"
+    fi
     local head_ref head_sha sha target pr_json verify_sha body resp err_txt err_tmp
     target=$(_resolve_repo write "$repo_arg") || exit $?
     pr_json=$(api "/repos/$target/pulls/$n" 2>/dev/null)
     head_ref=$(jq -r '.head.ref // empty' <<<"$pr_json")
     head_sha=$(jq -r '.head.sha // empty' <<<"$pr_json")
+    # Head-binding gate (jacob-greene/nexus#155): compare the head the
+    # recorded Skeptic-Verdict covers against the head this merge pins
+    # (the --sha the caller verified, else the freshly fetched head).
+    local pr_body; pr_body=$(jq -r '.body // ""' <<<"$pr_json" 2>/dev/null)
+    _pr_merge_verdict_gate "$target" "$n" "${pin_sha:-$head_sha}" "$pr_body" \
+        "$require_verdict" "$have_override" "$override_reason"
     # `--verify-base` — the sha-free form, and the one to reach for
     # (your-org/nexus-code#880). `--base-sha` makes the CALLER carry a sha from
     # whenever `ci-attempts` last ran; measured, the window between that verdict
@@ -13069,6 +13752,129 @@ _dashboard_duplicate_headings() {
     '
 }
 
+# Per-section size measurements for the dashboard body in file $1.
+# Emits one TSV row per section, in document order:
+#
+#     <heading>\t<bytes>\t<lines>\t<entries>\t<largest-entry-bytes>
+#
+# Content before the first `## ` heading is reported as `(preamble)` so
+# nothing escapes accounting. Bytes include the heading line itself and
+# each line's newline, so the section byte totals sum to the file size.
+# (Exactly, for a file with a trailing newline — which markdown bodies from
+# the GitHub API have. On a file whose last line is unterminated the sum
+# reads one high, since awk still charges that line a newline. Cosmetic:
+# the total-bytes rule uses `wc -c`, not this sum.)
+#
+# "Entry" = one row of the section's list of things. Two shapes count,
+# because the dashboard uses both:
+#   - a top-level list item (`- `, `* `, `+ `, `1. `, `1) `)
+#   - a markdown table row (`| ... |`), excluding the `|---|` separator
+# Counting table rows matters: `## In-flight` is written as a table, so a
+# bullet-only heuristic would leave the entry rules dead on the very
+# section that ran away. The header row counts as an entry, so a table's
+# count reads one high — immaterial against a budget of two dozen.
+#
+# An entry runs until the next entry or the next `## ` heading, so a
+# multi-line bullet is charged its full weight — that is the shape the
+# runaway growth actually took (prose blocks hanging off one bullet), and
+# charging only the marker line would have missed it. This is a heuristic
+# feeding a warning, not a markdown parser: indentation and lazy list
+# continuation are not modelled.
+#
+# LC_ALL=C makes awk's length() count BYTES, not characters, so the
+# numbers agree with `wc -c` on a dashboard containing status emoji.
+# Pure text measurement, no network — shared by validate, put and
+# `get --stat`.
+_dashboard_stats_tsv() {
+    LC_ALL=C awk '
+        function close_entry() {
+            if (cur > maxentry) maxentry = cur
+            cur = 0
+        }
+        function flush_section() {
+            if (name != "")
+                printf "%s\t%d\t%d\t%d\t%d\n", name, bytes, lines, entries, maxentry
+        }
+        BEGIN { name = ""; bytes = 0; lines = 0; entries = 0; maxentry = 0; cur = 0 }
+        {
+            n = length($0) + 1
+            if ($0 ~ /^## /) {
+                close_entry(); flush_section()
+                name = $0; bytes = n; lines = 1; entries = 0; maxentry = 0; cur = 0
+                next
+            }
+            if (name == "") name = "(preamble)"
+            bytes += n; lines++
+            is_entry = ($0 ~ /^[-*+][ \t]/ || $0 ~ /^[0-9]+[.)][ \t]/)
+            if ($0 ~ /^[ \t]*\|/) {
+                # Table row — but a `|---|:--:|` separator is formatting,
+                # not a row, so it neither starts nor extends an entry.
+                if ($0 !~ /^[ \t]*\|[ \t:|-]*$/) is_entry = 1
+            }
+            if (is_entry) {
+                close_entry(); entries++; cur = n
+            } else if (cur > 0) {
+                cur += n
+            }
+        }
+        END { close_entry(); flush_section() }
+    ' "$1"
+}
+
+# Report which size budgets the dashboard body in file $1 BREACHES.
+# Prints one human-readable finding per line to stdout; empty output ==
+# within budget. Same contract as _dashboard_missing_sections, so the
+# strict gate (`validate`) and the warn path (`put`, `get`) can share it
+# and differ only in what they do with a non-empty result.
+_dashboard_oversize_report() {
+    local file="$1" total sec bytes lines entries maxentry
+    total=$(wc -c < "$file")
+    total=${total//[[:space:]]/}
+    if (( total > DASH_MAX_BYTES )); then
+        printf 'whole dashboard is %s bytes (budget %s)\n' "$total" "$DASH_MAX_BYTES"
+    fi
+    while IFS=$'\t' read -r sec bytes lines entries maxentry; do
+        [[ -n "$sec" ]] || continue
+        if (( bytes > DASH_MAX_SECTION_BYTES )); then
+            printf '%s is %s bytes (budget %s)\n' "$sec" "$bytes" "$DASH_MAX_SECTION_BYTES"
+        fi
+        if (( entries > DASH_MAX_SECTION_ENTRIES )); then
+            printf '%s has %s entries (budget %s)\n' "$sec" "$entries" "$DASH_MAX_SECTION_ENTRIES"
+        fi
+        if (( maxentry > DASH_MAX_ENTRY_BYTES )); then
+            printf '%s has a single entry of %s bytes (budget %s)\n' "$sec" "$maxentry" "$DASH_MAX_ENTRY_BYTES"
+        fi
+    done < <(_dashboard_stats_tsv "$file")
+    return 0
+}
+
+# Print the remedy for an oversize dashboard to stderr. Every caller that
+# surfaces _dashboard_oversize_report findings follows them with this, so
+# the operator is never told only that a number is large — the whole point
+# of the check is that the fix ("prune to live windows, archive the rest")
+# is not obvious from the numbers alone.
+_dashboard_oversize_advice() {
+    cat >&2 <<'ADVICE_EOF'
+  The dashboard is a glanceable status surface, not a log. Match the remedy
+  to the rule that fired above:
+    - too many entries in `## In-flight` — it mirrors LIVE worker windows
+      only; reconcile against `tmux list-windows` and DELETE rows for
+      windows that no longer exist.
+    - one entry too large — that item has grown into an essay. Move the
+      detail to the issue or report it belongs to and leave a one-line ask
+      with a link. This is the usual shape in `## Awaiting operator`, where
+      the fix is a shorter statement of the decision, NOT dropping the item.
+    - a section or the whole body too large — narrative history belongs in
+      a report (`ng report-init <slug>`), not here; `## Recent landings`
+      keeps the most recent handful, so trim the tail.
+  Archive the current body before pruning, so nothing is lost:
+    ng dashboard get > /tmp/dashboard-archive.md
+    ng upload /tmp/dashboard-archive.md --repo-path general/dashboard-archive.md
+  Retune the budgets in one place: DASH_MAX_* near DASH_REQUIRED_SECTIONS
+  in monitor/ng.
+ADVICE_EOF
+}
+
 # `ng dashboard scaffold` — print the canonical skeleton.
 cmd_dashboard_scaffold() {
     _help_check "$@"
@@ -13076,12 +13882,44 @@ cmd_dashboard_scaffold() {
     _dashboard_template
 }
 
-# `ng dashboard validate [--body-file <path>]` — check a candidate
-# dashboard body (file or stdin) against DASH_REQUIRED_SECTIONS.
-# Exit 0 = all required headings present; exit 1 = one or more missing
-# (listed on stderr). This is the STRICT gate for CI / pre-commit use;
-# the `dashboard put` path runs the same check in WARN-only mode so the
-# operator is never blocked from pushing in a hurry.
+# Render the size breakdown for the dashboard body in file $1 (issue
+# number in $2, optional) to stdout: a header line, one aligned row per
+# section flagged `!` when it breaches a budget, and a pointer to the
+# cache file. Deliberately does NOT print the body — this is what makes
+# `ng dashboard get --stat` safe for an agent to call on a dashboard of
+# unknown size.
+_dashboard_stat_render() {
+    local file="$1" issue="${2:-}" total lines sections
+    total=$(wc -c < "$file"); total=${total//[[:space:]]/}
+    lines=$(wc -l < "$file"); lines=${lines//[[:space:]]/}
+    sections=$(grep -cE '^## ' "$file" || true)
+    printf 'dashboard%s: %s bytes, %s lines, %s sections (budget %s bytes)\n' \
+        "${issue:+ #$issue}" "$total" "$lines" "$sections" "$DASH_MAX_BYTES"
+    printf '\n  %7s %6s %8s %8s  %s\n' bytes lines entries largest section
+    local sec sbytes slines entries maxentry flag
+    while IFS=$'\t' read -r sec sbytes slines entries maxentry; do
+        [[ -n "$sec" ]] || continue
+        flag=' '
+        if (( sbytes > DASH_MAX_SECTION_BYTES \
+              || entries > DASH_MAX_SECTION_ENTRIES \
+              || maxentry > DASH_MAX_ENTRY_BYTES )); then
+            flag='!'
+        fi
+        printf '%s %7s %6s %8s %8s  %s\n' \
+            "$flag" "$sbytes" "$slines" "$entries" "$maxentry" "$sec"
+    done < <(_dashboard_stats_tsv "$file")
+    printf '\n  budgets: %s per section, %s entries per section, %s per entry\n' \
+        "$DASH_MAX_SECTION_BYTES" "$DASH_MAX_SECTION_ENTRIES" "$DASH_MAX_ENTRY_BYTES"
+    printf '  body NOT printed (the point of --stat); full text cached at %s\n' "$DASH_CACHE"
+}
+
+# `ng dashboard validate [--body-file <path>|-]` — check the live
+# dashboard (no flag), a candidate file, or stdin (`-`) against
+# DASH_REQUIRED_SECTIONS, heading uniqueness, and the DASH_MAX_* size
+# budget. Exit 1 = a required section is missing, a heading is duplicated,
+# or the body is over budget (detail on stderr). This is the STRICT gate
+# for CI / pre-commit use; the `dashboard put` path runs the same checks in
+# WARN-only mode so the operator is never blocked from pushing in a hurry.
 cmd_dashboard_validate() {
     _help_check "$@"
     local body_file="" have_body_file=0
@@ -13141,6 +13979,9 @@ cmd_dashboard_validate() {
     local exact_dupes near_dupes
     exact_dupes=$(printf '%s\n' "$dupes" | awk -F'\t' '$1=="EXACT"')
     near_dupes=$(printf '%s\n' "$dupes"  | awk -F'\t' '$1=="NEAR"')
+
+    local oversize total
+    oversize=$(_dashboard_oversize_report "$tmp")
 
     if [[ -n "$missing" ]]; then
         rc=1
@@ -13232,6 +14073,15 @@ cmd_dashboard_validate() {
                  | grep -cvxF -- "$_schema_re" 2>/dev/null || true)
     [[ "$_nonschema" =~ ^[0-9]+$ ]] || _nonschema=0
 
+    if [[ -n "$oversize" ]]; then
+        rc=1
+        {
+            printf 'ng dashboard validate: over size budget:\n'
+            while IFS= read -r _s; do printf '  - %s\n' "$_s"; done <<<"$oversize"
+        } >&2
+        _dashboard_oversize_advice
+    fi
+
     if (( rc == 0 )); then
         # A checker that found something must not print an unqualified pass.
         #
@@ -13254,8 +14104,8 @@ cmd_dashboard_validate() {
                    "${#DASH_REQUIRED_SECTIONS[@]}"
         fi
     fi
-    printf 'dashboard validate: %s bytes, %s top-level sections (%s outside the schema).\n' \
-           "$_bytes" "$_h2" "$_nonschema" >&2
+    printf 'dashboard validate: %s bytes (budget %s), %s top-level sections (%s outside the schema).\n' \
+           "$_bytes" "$DASH_MAX_BYTES" "$_h2" "$_nonschema" >&2
     if (( _bytes > GH_ISSUE_BODY_WARN_BYTES )); then
         printf '  NOTE: GitHub caps a whole issue body at %s bytes, and the dashboard\n' \
                "$GH_ISSUE_BODY_MAX_BYTES" >&2
@@ -13377,8 +14227,25 @@ _dashboard_fetch_middle() {
     rm -f "$tmp_full"
 }
 
+# `ng dashboard get [--stat]` — fetch the dashboard middle.
+#
+# Default mode prints the body to stdout and caches it. It also WARNS
+# to stderr when the body is over the DASH_MAX_* size budget; stdout
+# is untouched, so existing callers are unaffected.
+#
+# `--stat` prints only the size breakdown, never the body. It guards
+# against an agent pulling a very large dashboard into its context;
+# `--stat` lets it learn the shape first and read the cache file if it
+# still needs the text.
 cmd_dashboard_get() {
     _help_check "$@"
+    local stat_only=0
+    _argloop_prev_41=-1; while (( $# > 0 )); do (( $# != _argloop_prev_41 )) || _argloop_stuck "$1"; _argloop_prev_41=$#
+        case "$1" in
+            --stat) stat_only=1; shift ;;
+            *)      die "unknown flag: $(_arg_excerpt "$1")" ;;
+        esac
+    done
     local tmp; tmp=$(mktemp)
     trap "rm -f '$tmp'" RETURN
     _dashboard_fetch_middle "$tmp"
@@ -13408,7 +14275,21 @@ cmd_dashboard_get() {
     fi
     mkdir -p "$STATE_DIR"
     cp "$tmp" "$DASH_CACHE"
+    if (( stat_only )); then
+        _dashboard_stat_render "$tmp" "$(_overview_number_cheap 2>/dev/null || true)"
+        return 0
+    fi
     cat "$tmp"
+    local oversize; oversize=$(_dashboard_oversize_report "$tmp")
+    if [[ -n "$oversize" ]]; then
+        {
+            printf 'ng dashboard get: WARNING — the dashboard you just read is over size budget:\n'
+            while IFS= read -r _s; do printf '  - %s\n' "$_s"; done <<<"$oversize"
+            printf '  (use `ng dashboard get --stat` for the breakdown without the body)\n'
+        } >&2
+        _dashboard_oversize_advice
+    fi
+    return 0
 }
 
 cmd_dashboard_put() {
@@ -13476,6 +14357,24 @@ cmd_dashboard_put() {
             done <<<"$_dupes"
             printf '  (pushing anyway; `ng dashboard validate` is the strict gate)\n'
         } >&2
+    fi
+
+    # Size budget, WARN-only for the same reason and deliberately so.
+    # This is the write-time check that the 213 KB runaway needed and did
+    # not have: every `put` now states the growth out loud. It stays
+    # permissive because a hard block here would be the exact footgun the
+    # warn-only schema check already avoids — an operator triaging an
+    # incident must be able to push a status update whose shape is wrong.
+    # A ceiling that can refuse an urgent write trades a rare, recoverable
+    # cosmetic problem for a rare, unrecoverable operational one.
+    local _oversize; _oversize=$(_dashboard_oversize_report "$tmp_new")
+    if [[ -n "$_oversize" ]]; then
+        {
+            printf 'ng dashboard put: WARNING — body is over size budget:\n'
+            while IFS= read -r _s; do printf '  - %s\n' "$_s"; done <<<"$_oversize"
+            printf '  (pushing anyway; `ng dashboard validate` is the hard gate)\n'
+        } >&2
+        _dashboard_oversize_advice
     fi
 
     local num
@@ -15434,8 +16333,16 @@ cmd_guards_for_diff()  { _facade guards-for-diff.sh   "$@"; }
 # orchestrator: resolve a window's session-id from RECORDED state, never
 # from a workdir-derived project slug (your-org/nexus-code#647)
 cmd_session_id()       { _facade window-session-id.sh "$@"; }
+# any agent: read a session's CURRENT context size in tokens
+# (monitor/context-usage.sh).
+# Exit 10 = at/over the rotation threshold, 0 = under, 1 = unresolved —
+# so a caller can branch without parsing. Bare `ng context` reads the
+# CALLER's own session.
+cmd_context()          { _facade context-usage.sh    "$@"; }
 # worker: pre-flight that a deliverable path is writable before compute
 cmd_write_probe()      { _facade write-probe.sh      "$@"; }
+# worker: freeze an artefact into durable evidence, write-once + read-only
+cmd_evidence_freeze()  { _facade evidence-freeze.sh   "$@"; }
 # maintenance: roll pre-buffer reports into monthly reports/YYYY-MM/ dirs
 cmd_reports_roll()     { _facade reports-roll.sh     "$@"; }
 # worker: self-declare an async external wait (slurm/CI/long curl)
@@ -15511,6 +16418,7 @@ Window & worker ops:
   spawn-decision <window>        spawn/skeptic decision read
   engaged-done                   mark an engaged worker done
   pane-state <window-index>      classify a worker pane
+  context [--window W]           context size in tokens (exit 10 = rotate)
   paste-followup <window>        canonical follow-up paste into a window
   retire-preflight <window>      synchronous go/no-go gate before kill
   retire-window <window>         preflight + kill + prune every state surface + verify
@@ -15537,6 +16445,8 @@ State queries & infra:
                                  exit 3 = nothing selected; 4 = green but
                                  UNVERIFIED (untracked file invisible to a
                                  selected guard, #1054); 2 = REFUSED
+  evidence-freeze <src> --task <slug>   write-once freeze into durable evidence
+  evidence-freeze --verify --task <slug>   check one evidence dir, write nothing
   declare-wait <kind> <id> <desc>   self-declare an async external wait
   declare-no-wait <kind> <id>    mark an async launch fire-and-forget
 
@@ -15677,7 +16587,9 @@ main() {
         ci-attempts)           cmd_ci_attempts           "$@" ;;
         guards-for-diff)       cmd_guards_for_diff       "$@" ;;
         session-id)            cmd_session_id            "$@" ;;
+        context)               cmd_context               "$@" ;;
         write-probe)           cmd_write_probe           "$@" ;;
+        evidence-freeze)       cmd_evidence_freeze       "$@" ;;
         declare-wait)          cmd_declare_wait          "$@" ;;
         declare-no-wait)       cmd_declare_no_wait       "$@" ;;
         paste-followup)        cmd_paste_followup        "$@" ;;

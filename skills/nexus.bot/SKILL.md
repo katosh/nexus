@@ -22,6 +22,56 @@ The only GitHub interactions that may still use the user's identity
 are `git commit` and `git push` (commit authorship stays the user's
 on the commit graph).
 
+### Sandbox exception — push transport when there is no user credential
+
+Inside `agent-sandbox` there is frequently **no user git credential at
+all**: `gh auth status` reports not logged in and no credential helper
+is configured, so a plain `git push` to an HTTPS remote dies with
+
+```
+fatal: could not read Username for 'https://github.com'
+```
+
+Push through the bot's installation token in the URL form instead:
+
+```bash
+TOK=$("$NEXUS_ROOT"/monitor/mint-token.sh)
+git -C <clone> push \
+  "https://x-access-token:${TOK}@github.com/<owner>/<repo>.git" <branch>
+```
+
+This does **not** violate the rule above, because it separates two
+things that are easy to conflate:
+
+- **Commit authorship** — what `%an`/`%ae` record on the commit graph,
+  set by `user.name`/`user.email` at `git commit` time.
+- **Push transport** — the credential authenticating the network push.
+
+The token is *only* the transport. It does not touch authorship, so an
+agent that sees a token in a push command and reports a bot-identity
+violation has misread which of the two is in play.
+
+Authorship is a separate question, and on a sandboxed clone it may also
+land on the bot — not by policy but by **absence of config**. Check
+before you commit:
+
+```bash
+git config --get user.email || echo "NO IDENTITY CONFIGURED"
+```
+
+If nothing is configured, `git commit` either fails outright or invents
+an implicit `user@host` identity. Don't invent an operator identity you
+cannot verify: set the worktree-local identity to whatever the repo's
+recent history already uses (`git log -5 --format='%an <%ae>'`) and say
+so in your report. Configuring an operator git identity in the sandbox
+is the real fix; until then, bot-authored self-fix commits are the
+expected state, not a violation to be corrected in passing.
+
+Keep the token inline — never `git remote set-url` it into `.git/config`,
+and filter it out of any captured output. The URL form itself is
+documented in `<yourlab>.sandbox-gotchas` rule 3; this note only records
+which identity it carries and why it is legitimate here.
+
 ## The bot is the DEFAULT — the `gh` wrapper is a BACKSTOP
 
 A bare `gh <write>` normally runs as the bot. **Do not rely on that.**
@@ -217,7 +267,10 @@ Run from the nexus root (`monitor/ng <verb> ...` or
 | `ng pr create --head <branch> [--base main] --title "…" --body-file b.md` | Open a PR | PR URL |
 | `ng pr edit <n> [--title "…"] [--body-file b.md]` | Edit a PR | PR URL |
 | `ng pr merge <n> [--squash\|--merge\|--rebase] [--sha <head>] [--base-sha <base>\|--verify-base] [--delete-branch]` | Merge a PR. `--sha` pins the head you verified (#628); `--verify-base` re-checks the BASE inside the verb, ms before the PUT — prefer it, the verdict→merge window has been measured at 4s (#880) | merge SHA |
+| `ng pr merge <n> ... --require-verdict` / `--verdict-override "<reason>"` | The head-binding gate (`jacob-greene/nexus#155`): refuses (exit 5) when the recorded `Skeptic-Verdict:` trailer covers a different head; `--require-verdict` also refuses with no trailer; `--verdict-override` merges past a refusal, reason mandatory and audited | merge SHA |
 | `ng pr view <n>` | Brief PR summary | `#<n> state=… author=… title=…` |
+| `ng pr verdict set <n> --verdict credible [--head <sha>]` | Record a verdict and the commit it covers, on the PR body | the trailer, then the PR URL |
+| `ng pr verdict get <n> [--field head]` | Read that record back; exit 3 when absent | `verdict=… head=… …` |
 | `ng issue create --title "…" --body-file b.md [--label foo]…` | Create an issue | issue URL |
 | `ng issue comment <n> --body-file b.md` | Comment on an issue | comment URL |
 | `ng issue close <n> [--comment "…"]` | Optional comment, then close | `CLOSED` |
@@ -394,8 +447,8 @@ in). Cross-repo writes to **uninstalled** repos return:
 If you hit either on a <your-org> repo, the bot is not yet installed
 there. Surface it as a blocker:
 
-1. Push your branch under the user's identity (`git push`) so the
-   work isn't lost.
+1. Push your branch so the work isn't lost (`git push`; in the
+   sandbox, via the token URL form — see "Sandbox exception" above).
 2. Record it in your final report's `## Infrastructure Issues`
    section with the repo name and command that failed.
 3. The user / org admin expands the App's repo scope (one click in
@@ -447,6 +500,112 @@ is REST; `gh api graphql ...` and `gh pr view --json` /
 REST shape unless you genuinely need a deeply nested traversal or a
 search query (full-text/`is:issue`/`mentions:`) that REST can't
 express.
+
+**On `gh` 1.13.0 many `gh issue` and `gh pr` verbs are BROKEN — use
+REST.** The sandbox base image ships that version. Its lookup for an
+issue or a pull request still asks for Projects (classic), which
+GitHub removed, so the verb aborts:
+
+```
+GraphQL error: Projects (classic) is being deprecated in favor of the new Projects experience, see: https://github.blog/changelog/2024-05-23-sunset-notice-projects-classic/.
+```
+
+**The predictor: a verb aborts with that error if, and only if, its
+outgoing GraphQL query selects `projectCards`.** Do not work from a
+list of verbs — test the verb you are about to use:
+
+```bash
+DEBUG=api gh <verb> <n> --repo <owner>/<repo> 2>&1 | grep -c projectCards
+```
+
+A non-zero count means the verb is broken on 1.13.0. Pass the verb
+its required flags. Without them `gh` exits 1 on argument
+validation before it ever calls the API, which reads the same as a
+pass and is not one.
+
+The split is not read versus write, and it is not `issue` versus
+`pr`. The table below illustrates the predictor. The predictor is
+the claim. Measured 2026-09-10 on this nexus:
+
+| Verb | `projectCards` | Exit | Wrote anything |
+|---|---|---|---|
+| `gh issue view <n>` | 2 | 1 | not a write |
+| `gh issue comment <n> --body …` | 2 | 1 | no |
+| `gh issue edit <n> --title …` | 2 | 1 | no |
+| `gh issue close <n>` | 2 | 1 | no |
+| `gh issue reopen <n>` | 2 | 1 | no |
+| `gh pr view <n>` | 2 | 1 | not a write |
+| `gh pr edit <n> --title …` | 2 | 1 | no |
+| `gh pr diff <n>` | 0 | 0 | not a write |
+| `gh pr checkout <n>` | 0 | 0 | local git only |
+| `gh issue create` | 0 | 0 | yes |
+| `gh pr comment <n>` | 0 | 0 | yes |
+| `gh issue list`, `gh pr list` | 0 | 0 | not a write |
+
+`gh pr checks <n>` selects no `projectCards` and is not broken. It
+can still exit 1, with `no checks reported on the 'main' branch`.
+An exit code alone does not identify this failure. Read the error.
+
+These failures write nothing, so a retry cannot double-post. The
+reason is structural: the verb dies in its lookup and never issues
+a mutation. Verified on `gh issue comment`, which left the comment
+count unchanged, and on `gh issue reopen`, which left the state
+`closed`. Check that per verb before you retry any failed CLI
+write. A call that already wrote turns a retry into a double-post.
+
+The REST replacements:
+
+```bash
+gh api repos/<owner>/<repo>/issues/<n>/comments -F body=@body.md
+gh api -X PATCH repos/<owner>/<repo>/issues/<n> -f title='…'
+gh api -X PATCH repos/<owner>/<repo>/issues/<n> \
+    -f state=closed -f state_reason=completed
+gh api repos/<owner>/<repo>/issues/<n> --jq '.body'
+```
+
+The first line reads a file, so it uses capital `-F`. The other
+write lines pass inline strings, so lowercase `-f` is correct
+there. This is the rule stated above under "`gh api` body-from-file
+gotcha — `-F`, never `-f`". Lowercase `-f body=@body.md` sends the
+literal text `@body.md` and publishes your file path. Measured on
+this host against `POST /markdown`, which renders its input and
+writes nothing:
+
+| Form | Rendered output |
+|---|---|
+| `-f text=@probe.md` | `<p>@probe.md</p>` |
+| `-F text=@probe.md` | `<p>HELLO_FROM_FILE</p>` |
+
+After any raw `gh api` write, read the posted body back and confirm
+it is what you intended.
+
+`ng reply`, `ng comment`, `ng close` and `ng issue create` call REST
+directly, so they are unaffected. Prefer them. `gh search` does not
+exist in 1.13.0 at all; use `gh api -X GET search/issues`.
+
+## Correcting a filed issue — patch the body, and date the patch
+
+A comment that corrects the body leaves the wrong text first on the
+page. Every later reader meets the error before the correction. When
+a filed issue states something false, patch the body in place with
+the `PATCH` form above.
+
+A patch destroys the original claim, so the body must carry its own
+record of the change. Add a short provenance section to the patched
+body:
+
+```markdown
+## Provenance of the corrections in this body
+
+Corrected in place on <date>, at <sha>, by <which pass>. Corrected:
+<what changed>. The measurements the issue was filed on were
+re-derived and held.
+```
+
+GitHub keeps prior versions, but an agent reading `.body` never sees
+them. The in-body note is the only record an API reader gets. A
+worked example on this nexus grew a corrected body from 16,032 to
+21,066 bytes and added exactly that section.
 
 ## The fail-loud rule (security boundary)
 

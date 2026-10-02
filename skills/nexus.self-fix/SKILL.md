@@ -30,16 +30,40 @@ triage budget and pollutes the tracker. Run these five checks
 before opening an issue on `<your-org>/nexus-code` or authoring a
 self-fix PR.
 
-1. **Pull before you claim.** `git fetch origin && git pull
-   --rebase origin dev` on the clone you're diagnosing from,
-   then cite the SHA (`git rev-parse HEAD`) in the issue body.
-   `dev` is the nexus-code integration branch — diagnose
-   against it, and base self-fixes on it, not `main` (which is
-   promoted from `dev` separately, on an operator-gated soak).
+1. **Pull before you claim.** Sync the clone you're diagnosing
+   from to the remote's **default branch**, then cite the SHA
+   (`git rev-parse HEAD`) in the issue body. Resolve that
+   branch — don't hard-code it. This skill ships to every
+   operator's nexus and forks differ: most run `main`, some run
+   a `dev` integration branch.
+
+   ```bash
+   BASE=$(git ls-remote --symref origin HEAD \
+            | awk '/^ref:/ {sub("refs/heads/","",$2); print $2}')
+   BASE=${BASE:-main}                    # fallback
+   git fetch origin
+   git merge --no-edit origin/"$BASE"
+   ```
+
+   Use `git ls-remote --symref`, **not** `git symbolic-ref
+   refs/remotes/origin/HEAD` — the latter fails with *"not a
+   symbolic ref"* on any clone or worktree where `git remote
+   set-head` was never run, which is the usual case.
+
+   **Merge; don't `--ff-only` or `--rebase`.** A clone that
+   adopted a fork carries local-only commits — resolved template
+   placeholders, operator-specific doc substitutions — that are
+   deliberately never pushed. Its local default branch has
+   therefore diverged **by construction** and can never
+   fast-forward, so `git pull --ff-only` fails outright and
+   `--rebase` would try to replay those local-only commits onto
+   the remote. `git merge --no-edit` is the correct form, and
+   the local default branch must never be pushed.
+
    A repro against a stale checkout proves nothing about
    current behavior — "filed against already-fixed code" is a
-   recurring false-positive when an agent's clone lags
-   `dev`.
+   recurring false-positive when an agent's clone lags the
+   default branch.
 
 2. **Substantiate the repro.** The issue body must carry:
    - Exact command(s), copy-pasteable.
@@ -168,20 +192,95 @@ self-fix PR.
    (c) probe above against a purpose-built fixture, so that block
    is checked, not asserted.*
 
+   **A close is not a ruling.** When (a) finds a CLOSED issue,
+   read its closing comment and test it against source. Then read
+   the body, and count what it ENUMERATES, not what it mentions in
+   passing. A body can carry a second, separately headed defect
+   that the close never mapped onto a surviving issue. On one
+   operator's nexus, eleven issues closed inside 102 seconds in one
+   bulk action, and four of their closing comments said "nothing is
+   lost by closing this". For all four that was false
+   (source: `jacob-greene/nexus#164`). Check each closed body on its own:
+   one mechanism does not explain a set of closes.
+
+   **Say what a live mechanism now costs.** "Still live" alone is
+   true and incomplete. A refile needs a live mechanism, no home
+   issue, *and* a consequence the source does not already accept.
+
 Each check is a verifiable action (run the command, paste the
 SHA, name the file, cite the search). Pass all five before
 opening the issue or the PR — not posture, output.
 
-## Opening the self-fix PR — base `dev`, gated merge
+## Closing an issue — enumerate what the close settles
+
+The same defect seen from the filing side. A multi-defect body
+gets closed on its primary defect, and the secondary defects
+vanish, because nothing points at them any more.
+
+Before you close, list the distinct defects in the body. For each
+one, say where it now lives: fixed by a named PR, or carried over
+to the surviving issue. Never write "nothing is lost" unless you
+checked every defect in the body.
+
+Carrying over is the step that is skipped. One good close in the
+bulk action above found a symptom missing from the surviving
+issue, added it there, and said so. That is the shape to copy.
+
+## Opening the self-fix PR — base the default branch, gated merge
+
+### Pushing the branch first — the bot token carries the transport
+
+You cannot open the PR until the branch is on the remote, and in a
+fresh sandbox clone a plain push fails. There is no user git
+credential: the remote is HTTPS, no credential helper is
+configured, and `gh` is not logged in. The push dies with
+
+```
+fatal: could not read Username for 'https://github.com': No such device or address
+```
+
+Push through the bot's installation token in the URL instead:
+
+```bash
+TOK=$("$NEXUS_ROOT"/monitor/mint-token.sh)
+git -C <clone> push \
+  "https://x-access-token:${TOK}@github.com/<owner>/<repo>.git" <branch>
+```
+
+Keep the token inline. Never `git remote set-url` it into
+`.git/config`, and filter it out of any output you capture.
+
+The token is the **transport** only. Commit authorship comes from
+`user.name` and `user.email` at `git commit` time, so the token does
+not touch it. This is therefore not a breach of the bot-identity
+rule. `nexus.bot`, section "Sandbox exception — push transport when
+there is no user credential", carries the full reasoning and the
+authorship check to run before you commit.
+
+### Opening the PR — base the default branch
 
 Once the five checks pass and you have a fix, open the PR
-against **`dev`** (`--base dev`), never `main`. `dev` is the
-integration branch where self-fixes soak; `main` is promoted
-from `dev` separately, on an operator-gated soak, so a self-fix
-that targets `main` directly jumps the integration step.
+against the **remote's default branch** — the `$BASE` resolved
+in check 1 — never a branch you assumed:
+
+```bash
+ng pr create --base "$BASE" …        # or: gh pr create --base "$BASE" …
+```
+
+Guessing the base is not a cosmetic error. `--base dev` against
+a fork that has no `dev` branch makes the PR **unopenable**, and
+every agent that follows the instruction burns a cycle
+rediscovering that. Confirm the branch exists before you rely on
+it: `git ls-remote --heads origin`.
+
+On a fork whose default is an integration branch (`dev`, and
+`main` promoted from it on a separate operator-gated soak),
+basing on the default branch is also what keeps a self-fix from
+jumping the integration step. Either way the rule is the same —
+resolve, don't assume.
 
 **Do NOT merge your own self-fix PR.** The merge is gated, not
-autonomous. After opening the PR (base `dev`), wait for an
+autonomous. After opening the PR, wait for an
 explicit OK from the current code owner OR a direct
 confirmation from the operator before merging. A self-fix
 touches the very machinery every operator runs — letting the

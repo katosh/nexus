@@ -203,12 +203,28 @@ trap '_on_signal TERM 143' TERM
 trap '_on_signal INT 130' INT
 trap '_on_signal HUP 129' HUP
 
+# Resolve the claude binary through the SHARED resolver (CLAUDE_BIN env →
+# config `nexus.claude_bin` → node_modules → PATH) instead of hard-coding
+# the npm path. On a nexus pinned to a native install the npm path does
+# not exist, so the hard-coded form measured nothing and the baseline
+# died with an empty `candidate` (jacob-greene/nexus#219).
+# CC_AUTO_CLAUDE_BIN pre-seeds CLAUDE_BIN so this loop and
+# cc-auto-update-apply.sh can never disagree on which binary they are
+# talking about. The helper exits on failure, so it runs in a subshell;
+# a resolver that answers nothing falls back to the historical npm path,
+# so a nexus with no pin behaves exactly as before.
+CLAUDE_BIN="${CLAUDE_BIN:-${CC_AUTO_CLAUDE_BIN:-}}"
+# shellcheck disable=SC1091
+CLAUDE_BIN=$( . "$NEXUS_ROOT/monitor/_claude-bin.sh" >/dev/null 2>&1 \
+    && printf '%s' "$CLAUDE_BIN" ) || CLAUDE_BIN=""
+[[ -n "$CLAUDE_BIN" ]] || CLAUDE_BIN="$NEXUS_ROOT/node_modules/.bin/claude"
+
 # The version the installed binary reports. ONE definition: both modes derive
 # it, and a second copy of the pipeline would be a second early-closing reader
 # for test-early-exit-reader-manifest.sh to account for. Its status is not
 # consumed; each caller checks the value is non-empty.
 _binary_candidate() {
-    "$NEXUS_ROOT/node_modules/.bin/claude" --version \
+    "$CLAUDE_BIN" --version \
         | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
 }
 

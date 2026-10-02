@@ -259,6 +259,7 @@ SITES=(
     "cc-auto-update-apply.sh"       # apply.log + detached-restart.log
     "node-forensics.sh"             # node-forensics.log (incl. post-rotation)
     "gh-shim.sh"                    # impersonate.log  (audit)
+    "ng"                            # verdict-override.log (audit, #155)
     "hooks/gh-write-guard.sh"       # gh-bypass-warnings.log (audit)
     "guard-block.sh.in"             # guard-unverified.log (audit, #589 F2) —
                                     # a TEMPLATE, not a script: emitted into

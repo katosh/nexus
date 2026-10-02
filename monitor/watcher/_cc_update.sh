@@ -300,6 +300,18 @@ _cc_update_emit_section() {
     printf 'Case A/D, VI-mode, hooks/settings, CLI flags) -> cc-harness gate\n'
     printf '  monitor/cc-harness/gate.sh --version %s\n' "$candidate"
     printf '%s\n' '-> decide safe-to-bump / needs-review / block.'
+    # The routing invariant travels WITH the emit on purpose. The guide
+    # carries it ("The routing invariant: surface to the implementation
+    # repo, never the asset repo"), but a hand-composed spawn prompt does
+    # not read the guide, and one drifted to the asset repo. Naming the
+    # repo here removes the chance to guess. Same default as the
+    # autonomous routine's SURFACE_REPO (_cc_auto_update.sh).
+    printf 'ROUTING (invariant): the tracking issue and EVERY write in this\n'
+    printf 'flow go to the implementation repo %s, never the\n' \
+        "${CC_AUTO_SURFACE_REPO:-your-org/nexus-code}"
+    printf 'asset repo. Each ng/gh write MUST carry --repo %s\n' \
+        "${CC_AUTO_SURFACE_REPO:-your-org/nexus-code}"
+    printf 'explicitly — a bare ng write defaults to the asset repo.\n'
     # When the autonomous daily routine is enabled, the watcher itself
     # will spawn the evaluator at the configured fire time — the
     # orchestrator must NOT also spawn a manual one (duplicate work,

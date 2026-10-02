@@ -99,7 +99,7 @@ project: <slug>          # ENFORCED — `work/` subdir, or `nexus` for workspace
 date: <YYYY-MM-DD>       # ENFORCED — ISO date
 session-id: <uuid>       # ENFORCED — Claude Code session id; must NOT be the literal "unknown"
 window: <tmux-window>    # conventional — written by report-init from live tmux; else "<unset>"
-trigger: <issue#> [comment-id]   # conventional — what kicked this off
+trigger: <issue#> [comment-id]   # conventional — what kicked this off; report-init leaves the value EMPTY when no --issue is given
 status: completed | partial | blocked   # ENFORCED — exactly one of these three
 disposition: no-further-pass | second-pass   # REQUIRED whenever the wrap-up runs with
                          # a REQUIRED skeptic — spawned `--skeptic require`, or
@@ -151,6 +151,22 @@ fanout: <N> spawned / <M> returned   # optional; validated only when present, M 
   what you expected.
 - Omit the section entirely if nothing came up. No placeholders.
 ```
+
+**The `trigger` field — use `--issue`.** Pass `--issue <n>` (and
+`--comment-id <id>` when a comment started the work) to `ng
+report-init`. It fills the field for you:
+
+```bash
+monitor/ng report-init <slug> --issue 83 --comment-id 5403194620
+```
+
+Nothing in a worker's environment carries the issue number, so
+`report-init` cannot infer it. Pass the flag and you never touch
+the field by hand. When you do not pass it, `report-init` writes
+the key with an EMPTY value. That is the correct encoding of "no
+external trigger" — a context rotation or an operator side-quest
+has none. `report-check` does not read this field, so an empty
+value blocks nothing.
 
 The five content sections (`Summary`, `What Was Done`, `Current
 State`, `What Remains`, `How to Resume`) are mandatory.
@@ -408,6 +424,10 @@ the evidence backing it.
 - `nexus.worker-defaults` — every-worker safety floor that points
   at this skill for the report convention. Workers land here from
   there at task end.
+- `nexus.writing` — how the report is written, as opposed to how
+  it is structured. Sentences under 20 words, one idea each,
+  stats and results in tables, internal terms defined on first
+  use from the shared `GLOSSARY.md`.
 - `nexus.bot` — the GitHub-write rules; needed when uploading the
   report to the wiki or referencing it from a PR/issue.
 - `nexus.skeptic` — the full skeptic protocol the wrap-up decision

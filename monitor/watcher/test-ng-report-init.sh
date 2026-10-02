@@ -434,6 +434,80 @@ assert_contains  "malformed env sid ignored → falls through to jsonl" "$body" 
 
 # ---- summary ------------------------------------------------------------
 
+# ---- trigger field: a truthful default when --issue is omitted ----------
+#
+# `report-init` used to write `trigger: <unset>` when no --issue was
+# passed. NOTHING rejected that value — `report-check` does not read the
+# field, and 149 of the 670 reports on disk carry it. It is a papercut,
+# not a bug: it reads as an unfilled slot, so workers hand-edited it for
+# no reason. The contract now: unknown trigger → the key with an EMPTY
+# value. The `--issue` path (asserted in test 1 above) is the real fix.
+
+echo '=== trigger: --issue omitted → bare key, no placeholder ==='
+run_ng path err rc "$FAKE_NEXUS" report-init notrigger --project sample \
+       --reports-dir "$FAKE_NEXUS/reports"
+assert_eq        "exit 0 without --issue"              "$rc" "0"
+body=$(<"$path")
+assert_not_contains "no '<unset>' placeholder"         "$body" "trigger: <unset>"
+# grep -F treats a multi-line needle as alternatives (and an empty line
+# matches everything), so the exact-line shape is asserted with grep -x
+# on the file rather than through assert_contains.
+assert_eq "emits the trigger key as a bare line" \
+          "$(grep -cx 'trigger:' "$path")" "1"
+assert_eq "no trailing whitespace after the key" \
+          "$(grep -cE '^trigger:[[:space:]]+$' "$path")" "0"
+
+# ---- report-init → report-check round trip (regression guard) -----------
+#
+# A freshly `report-init`ed report, with its BODY filled in and its
+# FRONTMATTER untouched, passes `report-check`. Filling the body is the
+# worker's job by definition; touching the frontmatter should never be.
+# No `sed` on the frontmatter below — that is the point of the test.
+#
+# HONEST LABEL: this passed before the trigger change too, because
+# `report-check` never read the trigger field. It is a guard against a
+# future frontmatter edit breaking the round trip, not evidence that
+# anything was broken.
+
+echo '=== round trip: report-init → fill body only → report-check passes ==='
+run_ng path err rc "$FAKE_NEXUS" report-init acceptance --project sample \
+       --reports-dir "$FAKE_NEXUS/reports"
+assert_eq        "report-init exits 0"                 "$rc" "0"
+
+# Body-only edit: replace every `_(fill in)_` marker with prose long
+# enough to clear the 500-char body minimum. Frontmatter untouched.
+FILLER='Real prose stands in for the skeleton marker here. It is long enough that the finished report clears the body-length minimum that report-check enforces, so the length rule cannot mask the frontmatter result.'
+python3 - "$path" "$FILLER" <<'PY'
+import sys
+p, filler = sys.argv[1], sys.argv[2]
+text = open(p).read()
+head, sep, body = text.partition('\n---\n')   # split off the frontmatter
+assert sep, 'frontmatter fence not found'
+body = body.replace('_(fill in)_', filler)
+body = body.replace(
+    '_(one or two sentences — ng wrap-up quotes this into the link comment)_',
+    'This report exists to prove that report-init and report-check agree.')
+open(p, 'w').write(head + sep + body)
+PY
+
+# Assert the frontmatter really was left alone.
+assert_eq "frontmatter untouched by the body fill" \
+          "$(awk 'NR==1&&/^---$/{f=1;next} f&&/^---$/{exit} f' "$path" | md5sum | cut -d' ' -f1)" \
+          "$(printf 'project: sample\ndate: %s\nsession-id: %s\nwindow: %s\ntrigger:\nstatus: partial\ndisposition: TODO\n' \
+                 "$TODAY" \
+                 "$(awk -F': ' '/^session-id:/{print $2;exit}' "$path")" \
+                 "$(awk -F': ' '/^window:/{print $2;exit}' "$path")" \
+             | md5sum | cut -d' ' -f1)"
+
+# report-init seeds `disposition: TODO`, a sentinel report-check refuses
+# by design (#1095). The documented fill for a report that needs no
+# skeptic is to delete the line, so the round trip does exactly that.
+sed -i '/^disposition: TODO$/d' "$path"
+
+run_ng out err rc "$FAKE_NEXUS" report-check "$path"
+assert_eq        "round trip: report-check exits 0"    "$rc" "0"
+assert_contains  "round trip: reports OK"              "$out" "OK ("
+
 echo
 echo "=== summary: $PASS passed, $FAIL failed ==="
 if (( FAIL == 0 )); then

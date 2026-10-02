@@ -146,6 +146,9 @@
 #       was violated (survivors of the old watcher group, or duplicate
 #       watcher groups). The orchestrator restart is NOT handed off into
 #       a duplicated-watcher world; operator inspection required.
+#   32  safe: REFUSED — this nexus runs a claude OUTSIDE the npm tree
+#       (config `nexus.claude_bin`). The npm installer cannot apply a
+#       bump here and would re-create node_modules. NOTHING was applied.
 #   40  record-outcome: REFUSED by the context guard — NEXUS_WORKER_WINDOW
 #       names an agent window other than the evaluator's, and
 #       --allow-context was not given. NEITHER file was touched
@@ -236,7 +239,7 @@
 #   CC_AUTO_WATCHER_RESTART_CMD   monitor/svc.sh restart watcher
 #   CC_AUTO_SPAWN_CMD             monitor/spawn-worker.sh
 #   CC_AUTO_PANE_STATE_CMD        monitor/pane-state.sh
-#   CC_AUTO_CLAUDE_BIN            node_modules/.bin/claude
+#   CC_AUTO_CLAUDE_BIN            whatever monitor/_claude-bin.sh resolves
 #   CC_AUTO_TMUX                  tmux
 #   CC_AUTO_GH                    gh
 #   CC_AUTO_MINT_CMD              monitor/mint-token.sh
@@ -598,7 +601,43 @@ GATE_DEFECT_REFILE_SECONDS="${CC_AUTO_GATE_DEFECT_REFILE_SECONDS:-$("$NEXUS_ROOT
 INSTALL_CMD="${CC_AUTO_INSTALL_CMD:-$NEXUS_ROOT/monitor/install-claude-local.sh}"
 SPAWN_CMD="${CC_AUTO_SPAWN_CMD:-$NEXUS_ROOT/monitor/spawn-worker.sh}"
 PANE_STATE_CMD="${CC_AUTO_PANE_STATE_CMD:-$NEXUS_ROOT/monitor/pane-state.sh}"
-CLAUDE_BIN="${CC_AUTO_CLAUDE_BIN:-$NEXUS_ROOT/node_modules/.bin/claude}"
+# The claude binary this routine measures. Resolved through the SHARED
+# resolver (CLAUDE_BIN env → config `nexus.claude_bin` → node_modules →
+# PATH) rather than hard-coded at the npm path: on a nexus pinned to a
+# native install the npm path does not exist, so the hard-coded form made
+# the post-install verify read an empty version and roll the pin back.
+# CC_AUTO_CLAUDE_BIN stays the test-injection seam and still wins.
+CLAUDE_BIN="${CC_AUTO_CLAUDE_BIN:-${CLAUDE_BIN:-}}"
+if [[ -z "$CLAUDE_BIN" ]]; then
+    # Soft: this file is also sourced by tests with no binary present, and
+    # several verbs never touch it. A missing binary must not kill the
+    # script here — the `safe` verb checks explicitly before it needs one.
+    # shellcheck disable=SC1091
+    CLAUDE_BIN=$( . "$NEXUS_ROOT/monitor/_claude-bin.sh" >/dev/null 2>&1 \
+        && printf '%s' "$CLAUDE_BIN" ) || CLAUDE_BIN=""
+fi
+# A resolver that answered nothing (absent in a minimal root, or failed)
+# falls back to the historical default, so a nexus with no pin behaves
+# exactly as before: the live-tree assertion reads the npm path.
+[[ -n "$CLAUDE_BIN" ]] || CLAUDE_BIN="$NEXUS_ROOT/node_modules/.bin/claude"
+# Is this nexus pinned to a claude install OUTSIDE the npm tree? If so the
+# npm installer cannot apply a version bump here — see the `safe` verb's
+# refusal (exit 32).
+#
+# Read the CONFIG KEY, not $CLAUDE_BIN. Those are different questions:
+# CC_AUTO_CLAUDE_BIN is this script's documented test-injection seam and
+# routinely points at a stub outside the tree, which is not an operator
+# declaring "I run a native install". Only `nexus.claude_bin` says that.
+CC_NATIVE_PINNED=0
+_cc_pin=""
+if [[ -x "$NEXUS_ROOT/config/load.sh" ]]; then
+    _cc_pin=$("$NEXUS_ROOT/config/load.sh" nexus.claude_bin "" 2>/dev/null) || _cc_pin=""
+fi
+_cc_pin="${_cc_pin#"${_cc_pin%%[![:space:]]*}"}"
+_cc_pin="${_cc_pin%"${_cc_pin##*[![:space:]]}"}"
+if [[ -n "$_cc_pin" && "$_cc_pin" != "$NEXUS_ROOT/node_modules/"* ]]; then
+    CC_NATIVE_PINNED=1
+fi
 TMUX_CMD="${CC_AUTO_TMUX:-tmux}"
 GH_CMD="${CC_AUTO_GH:-gh}"
 MINT_CMD="${CC_AUTO_MINT_CMD:-$NEXUS_ROOT/monitor/mint-token.sh}"
@@ -3247,6 +3286,19 @@ cmd_safe() {
     fi
 
     # Guards — every refusal leaves the pin untouched.
+    #
+    # Native-install pin. When `nexus.claude_bin` points at a claude
+    # OUTSIDE the npm tree, this routine's whole apply mechanism is
+    # inapplicable: $INSTALL_CMD is the npm installer, so it would
+    # RE-CREATE node_modules (silently undoing the operator's switch),
+    # while the post-install verify reads the still-unchanged native
+    # binary, mismatches, and rolls the pin back. Refuse up front — the
+    # native install updates itself, and it is not this routine's to bump.
+    if (( CC_NATIVE_PINNED == 1 )); then
+        note "REFUSED: config nexus.claude_bin pins a claude OUTSIDE the npm tree ($_cc_pin). The npm installer cannot apply a bump here and would re-create node_modules. Update that install itself, then re-run the gate."
+        record_outcome "$candidate" "safe-refused" "native-claude-bin"
+        exit 32
+    fi
     if (( surfaces_clear != 1 )); then
         note "REFUSED: --surfaces-clear attestation missing. Pass it ONLY after the changelog review cleared the non-gate surfaces (GUIDE 2c VI-mode / 2d hooks+settings / 2e CLI flags)."
         record_outcome "$candidate" "safe-refused" "no-surfaces-clear"

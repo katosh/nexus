@@ -262,9 +262,16 @@ EOF
 
 # 2. If the brief names a worktree/clone, create it FIRST so the
 #    worker can land in its own working tree (not the nexus root).
+#    Always name the base ref. With no base ref the branch starts
+#    at the local HEAD, which carries unpushed commits into a
+#    public pull request. A PUBLIC pull-request target means a
+#    fresh clone instead — see CLAUDE.md, "Independent clones for
+#    parallel work".
+git -C "$NEXUS_ROOT" fetch origin
 git -C "$NEXUS_ROOT" worktree add \
     work/<project>-TASKNAME \
-    -b <user>/<task>
+    -b <user>/<task> \
+    origin/main
 
 # 3. Single call: floor injection + launcher + tmux window. -c MUST
 #    point at the work dir the worker will actually edit in.

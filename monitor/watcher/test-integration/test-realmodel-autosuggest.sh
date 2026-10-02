@@ -44,9 +44,24 @@ cch_setup
 
 FIX_DIR="$_self_dir/../fixtures"
 # Real captured autosuggest frames (grey ghost text on the input row).
+# Two RENDERER GENERATIONS, deliberately — the classifier must accept
+# both, and the list is the place a third generation gets added:
+#   * `-win4` / `-win6` — cc ~2.1.147: reverse-video cursor on the
+#     suggestion's first char, then `\x1b[0;2m` for the rest.
+#   * `-bare-dim-cc2.1.220` — cc 2.1.220 (jacob-greene/nexus#50): a BARE `\x1b[2m`
+#     run after the chevron, no reverse-video anywhere on the row. The
+#     drift that silently disabled `_detect_autosuggest` — every ghost
+#     fell through to `state=empty`, and with it the pane lost
+#     `_finalize_idle_verdict` refinement (so a ghost-bearing worker
+#     holding a live background shell read `empty` instead of
+#     `working-background`, and `retire-preflight.sh` lost its veto).
+# ON THE NEXT DRIFT: capture the new frame, add it here, and add the
+# matching alternative to `_detect_autosuggest` — do not replace an
+# older shape; inherited panes and captured fixtures still carry them.
 AUTOSUGGEST_FIXTURES=(
     "$FIX_DIR/autosuggest-why-win4.ansi"
     "$FIX_DIR/autosuggest-review-win6.ansi"
+    "$FIX_DIR/autosuggest-bare-dim-cc2.1.220.ansi"
 )
 
 # Run the production pane-state.sh in fixture mode against a real

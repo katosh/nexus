@@ -144,6 +144,7 @@ of a usage line.
 | `ng pr edit <n>` | patch a PR title or body | [→](#ng-pr-edit) |
 | `ng pr merge <n>` | merge a PR via REST | [→](#ng-pr-merge) |
 | `ng pr view <n>` | one-line PR summary | [→](#ng-pr-view) |
+| `ng pr verdict set\|get <n>` | record or read the `Skeptic-Verdict:` trailer | [→](#ng-pr-verdict) |
 | `ng preflight <repo>` | is the bot installed on this repo? | [→](#ng-preflight) |
 | `ng stranded-branches` | pushed branches that never got a PR | [→](#ng-stranded-branches) |
 | `ng guards-for-diff` | which guards read the files you changed (pre-push) | [→](#ng-guards-for-diff) |
@@ -162,17 +163,17 @@ of a usage line.
 | `ng report-check <path>` | validate a report against the schema | [→](#ng-report-check) |
 | `ng report-grep <pattern>` | search the reports corpus without a silent zero | [→](#ng-report-grep) |
 | `ng fetch-asset <url>` | fetch a `user-attachments/...` URL via user PAT | [→](#ng-fetch-asset) |
-| `ng dashboard get` | read the overview-issue dashboard middle | [→](#ng-dashboard-get) |
+| `ng dashboard get [--stat]` | read the dashboard middle; `--stat` = size breakdown, never the body | [→](#ng-dashboard-get) |
 | `ng dashboard put` | splice + PATCH the dashboard middle | [→](#ng-dashboard-put) |
 | `ng dashboard scaffold` | print the canonical dashboard section skeleton | [→](#ng-dashboard-scaffold) |
-| `ng dashboard validate` | strict check: required sections present? | [→](#ng-dashboard-validate) |
+| `ng dashboard validate` | strict check: sections present, not duplicated, within size budget | [→](#ng-dashboard-validate) |
 | `ng nexus-identity` | render + upsert the auto-generated identity block | [→](#ng-nexus-identity) |
 | `ng watcher-status` | heartbeat age + target + liveness | [→](#ng-watcher-status) |
 | `ng decision-ack <w> <fp>` | durably ack a `--- pending decisions ---` row | [→](#ng-decision-ack) |
 | `ng log-action <agent>` | append a JSONL event to the action log | [→](#ng-log-action) |
 | `ng mint-jwt` | print an App-level JWT (for `/app/*` endpoints) | [→](#ng-mint-jwt) |
-| `ng lit search "<q>"` | content-relevance paper discovery (S2 + ASTA + OpenAlex) | [→](#ng-lit) |
-| `ng lit add <doi>` | fetch metadata + add a paper to the library | [→](#ng-lit) |
+| `ng lit search "<q>"` | content-relevance paper discovery (S2 + ASTA + OpenAlex; PubMed opt-in) | [→](#ng-lit) |
+| `ng lit add <doi\|pmid>` | fetch metadata + add a paper to the library | [→](#ng-lit) |
 | `ng lit status` | keys / library / setup readiness | [→](#ng-lit) |
 
 ---
@@ -557,6 +558,7 @@ Merge a PR via REST. Prints the merge commit SHA.
 ng pr merge <n> [--squash|--merge|--rebase] [--sha <verified-head>]
                 [--base-sha <verified-base>|--verify-base]
                 [--delete-branch] [--repo <owner>/<name>]
+                [--require-verdict] [--verdict-override <reason>]
 ```
 
 Default merge method is `--squash`. `--delete-branch` removes the
@@ -591,6 +593,40 @@ A missing flag value is refused, not defaulted — `ng pr merge 42 --sha`
 exits **`64`** (EX_USAGE) rather than merging unpinned, and so does
 `--sha ""`: an empty value is the same user-visible condition as a
 missing one (`<your-org>/nexus-code#990`).
+
+**Skeptic-verdict head binding** (`jacob-greene/nexus#155`). Before the
+PUT, the verb reads the LAST `Skeptic-Verdict:` trailer in the PR body
+(see [`ng pr verdict`](#ng-pr-verdict)). It compares that trailer's
+`head=` against the head this merge pins (`--sha`, else the fetched
+head).
+
+| Situation | Result |
+|---|---|
+| Trailer head matches the head to merge | merges; prints the matched verdict |
+| Trailer head differs | **refuses, exit 5** |
+| No trailer | warns and merges |
+| No trailer, `--require-verdict` | **refuses, exit 5** |
+| Any refusal, `--verdict-override "<reason>"` | merges; the reason is audited to `monitor/.state/verdict-override.log` and the action log |
+
+### `ng pr verdict`
+
+Record or read the machine-readable skeptic verdict on a pull request.
+
+```
+ng pr verdict set <n> --verdict credible|check|suspect|refuted
+                      [--head <sha>] [--depth N] [--findings N]
+                      [--skeptic <window>] [--issue N] [--repo <owner>/<name>]
+ng pr verdict get <n> [--field verdict|head|depth|findings|skeptic|issue]
+                      [--repo <owner>/<name>]
+```
+
+`set` appends one line to the PR body:
+`Skeptic-Verdict: <verdict> head=<sha> [depth=N] [findings=N] [skeptic=W] [issue=N]`.
+`--head` defaults to the PR's current head. `set` reads the patched body
+back and fails loud when the trailer does not parse to the head just
+recorded. `get` exits `3` when no well-formed trailer exists. The parser
+skips fenced code blocks and HTML comments, and the last trailer wins.
+`ng wrap-up --skeptic-role --skeptic-pr <n>` calls `set` for you.
 
 ### `ng pr view`
 
@@ -1005,6 +1041,7 @@ ng wrap-up <issue> <report-path>
           [--allow-stub]
           [--guards | --no-guards-preflight] [--strict-guards]
           [--retain <reason> | --no-retain]
+          [--shape pin|latest]
           <skeptic flags — see below>
 
 ng wrap-up --reply-to <request-id> <report-path>
@@ -1033,6 +1070,7 @@ ng wrap-up --explain [<window>]
 [--skeptic-role --skeptic-verdict credible|check|suspect|refuted
  [--skeptic-target <window>] [--skeptic-depth <n>]
  [--skeptic-findings <n>] [--skeptic-orig <window>]]
+[--skeptic-head <sha>] [--skeptic-pr <n>]
 [--skeptic-subject <report-path|sha256>]
 [--not-a-skeptic-verdict <why>]
 ```
@@ -1152,12 +1190,36 @@ A run that exits from inside a parse refusal leaves a record without an
    `NG_WRAPUP_GUARDS_TIMEOUT` expiry, a missing binary) prints
    **UNMEASURED / not a clearance** and returns 0 — it never converts
    "could not look" into "looked and it was fine".
+
+   `--skeptic-head <sha>` and `--skeptic-pr <n>` (skeptic side) bind a
+   verdict to the commit it covers (`jacob-greene/nexus#155`). The head
+   resolves from `--skeptic-head`, else the current head of
+   `--skeptic-pr`, else `git rev-parse HEAD` in the working tree. It is
+   logged as `head=` / `head-source=` / `pr=` on the `skeptic-verdict`
+   event. With `--skeptic-pr`, wrap-up also publishes a
+   `Skeptic-Verdict: <verdict> head=<sha> …` trailer on the pull-request
+   body via `ng pr verdict set`. `ng pr merge` reads that trailer and
+   refuses (exit 5) when the recorded head is not the head it merges;
+   `--require-verdict` also refuses when no trailer exists, and
+   `--verdict-override "<reason>"` merges anyway with an audit line in
+   `monitor/.state/verdict-override.log`.
+
 1. **Upload the report** via `monitor/upload-asset.sh` →
-   `assets/<issue>/<basename>` on the asset repo.
+   `assets/<issue>/<basename>` on the asset repo. Passes `--shape
+   latest`, so the published link is `blob/main/<path>` and serves the
+   current report rather than the bytes uploaded at hand-off time. `ng
+   upload`'s own default stays `pin` — see the shape table below.
+   `--shape pin` freezes a single wrap-up's link.
+
+   | Artefact | Shape | Why |
+   |---|---|---|
+   | Figure or notebook posted inline as evidence (`ng upload`) | `pin` | The comment describes those exact bytes. A revision gets its own comment and its own pin. |
+   | Report linked at hand-off (`ng wrap-up`) | `latest` | Reports are corrected in place. The link must follow the correction. |
+
 2. **Post the link comment** on `<issue>` in `--repo`:
    - `--comment-body-file <path>` supplies the prose. `{{REPORT_URL}}`
-     is substituted with the SHA-pinned asset URL; if no token is
-     present, a `Full report: <URL>` footer is appended.
+     is substituted with the asset URL; if no token is present, a
+     `Full report: <URL>` footer is appended.
    - `--no-comment` skips this step (caller will `ng reply` later).
    - Default: a templated body built from the report's H1 + Summary.
 3. **Rocket-react the trigger comment** on `--trigger-repo` (defaults
@@ -1547,12 +1609,34 @@ Fetch the overview-issue dashboard middle. Caches to
 **Usage**
 
 ```
-ng dashboard get
+ng dashboard get            # the body
+ng dashboard get --stat     # the size breakdown, and NEVER the body
 ```
 
 **Output** — the content between the `<!-- NEXUS_DASHBOARD_START -->`
 and `<!-- NEXUS_DASHBOARD_END -->` markers in the overview issue's
 body.
+
+**`--stat` — use this one from an agent.** It reports total bytes,
+per-section bytes / lines / entry counts and the largest single entry,
+flags any row over budget with `!`, and does not print the body at all.
+The dashboard has previously reached 213 KB; reading that in full is a
+context blowout, and the 120-second "timeout" it produced was the body
+being streamed into a tool result, not a slow API. `--stat` still writes
+the cache, so you can read `monitor/.state/dashboard.md` deliberately if
+you decide you need the text.
+
+```
+dashboard #1: 4550 bytes, 74 lines, 6 sections (budget 12000 bytes)
+
+    bytes  lines  entries  largest  section
+      171      5        0        0  ## Identity
+     1412     21        5      690  ## Infra
+      ...
+```
+
+Plain `get` is unchanged — same stdout, same exit code. It additionally
+warns on **stderr** when the body it just fetched is over budget.
 
 **Overview-issue resolution** — three layers of robustness against
 the GitHub labelled-issue index's eventual consistency:
@@ -1609,11 +1693,19 @@ Prints the overview issue's HTML URL, and only when the write is verified.
 
 On any non-zero rc no cache is written and no freshness stamp is advanced.
 
-`put` runs the section-schema check in **warn-only** mode: if the body
-is missing any required section (see
-[`ng dashboard validate`](#ng-dashboard-validate)) it prints the gaps
-to stderr but still PATCHes — the operator must never be blocked from
-updating the dashboard in a hurry.
+`put` runs three checks in **warn-only** mode — missing required
+sections, duplicated section headings, and the `DASH_MAX_*` size budget
+(see [`ng dashboard validate`](#ng-dashboard-validate)). Each prints to
+stderr, with the remedy, and still PATCHes: the operator must never be
+blocked from updating the dashboard in a hurry, least of all mid-incident
+when the dashboard is how status gets published. Use `validate` when you
+want a hard failure.
+
+`put` measures the middle **you passed in**, not the merged body — that
+is the thing you can act on, and the merged body also carries prose
+outside the markers that is not part of the budget. A duplicated
+`<!-- NEXUS_DASHBOARD_START -->` marker, which would write the middle
+more than once, is refused by the marker-uniqueness check above.
 
 ### `ng dashboard scaffold`
 
@@ -1641,10 +1733,18 @@ in `monitor/ng`:
 
 ### `ng dashboard validate`
 
-Strict schema gate: exit `0` if every required section heading is present
-**exactly once**, exit `1` otherwise (missing and duplicated sections listed
-on stderr). The hard-failure counterpart to `put`'s warn-only check — use it
-for CI, pre-commit, or a deliberate conformance check.
+Strict gate: exit `0` only if the body passes on **all three** axes;
+exit `1` otherwise, listing every problem on stderr with how to fix it.
+The hard-failure counterpart to `put`'s warn-only checks — use it for
+CI, pre-commit, or a deliberate conformance check.
+
+1. **Required sections present**, each **exactly once** — the six
+   `DASH_REQUIRED_SECTIONS`.
+2. **Marker uniqueness** — exactly one START and one END marker, when
+   given a whole body.
+3. **Within the size budget** — the `DASH_MAX_*` constants below.
+
+Note that (3) means a schema-complete body can still exit `1`.
 
 **Usage**
 
@@ -1677,6 +1777,33 @@ dashboard failed that way, and the message's obvious consequent action
 
 Given only a region it says so, rather than asserting a section is absent
 when it cannot see the rest of the body.
+**The size budget** (`DASH_MAX_*`, declared next to
+`DASH_REQUIRED_SECTIONS` in `monitor/ng` — retune them there, in one
+place):
+
+| Constant | Default | Bounds |
+|---|---|---|
+| `DASH_MAX_BYTES` | 12000 | the whole dashboard middle |
+| `DASH_MAX_SECTION_BYTES` | 4000 | any single `## ` section |
+| `DASH_MAX_SECTION_ENTRIES` | 24 | entries in one section |
+| `DASH_MAX_ENTRY_BYTES` | 1500 | one entry incl. its continuation lines |
+
+An "entry" is a top-level list item **or** a markdown table row
+(`## In-flight` is written as a table), separator rows excluded; a
+multi-line entry is charged its continuation lines.
+
+The thresholds are calibrated against both observed distributions, which
+**do not separate cleanly**: legitimate entries top out around 900 bytes,
+while the 213 KB runaway body's 168 entries run continuously from 99 to
+9,363 (median 1,058), 61 of them between those two figures. No threshold
+divides the two populations by inspection, so each value is a sensitivity
+choice rather than a discovered cliff. They are set from the legitimate
+side — clear the observed healthy maximum with margin — and sanity-checked
+against the runaway side, where `DASH_MAX_ENTRY_BYTES = 1500` still fires
+on 41 of those 168 entries. That direction matters most: a budget that
+fires on normal content is one everybody learns to ignore. The full
+reasoning lives beside `DASH_MAX_*` in `monitor/ng`; read it before
+retuning.
 
 ---
 
@@ -1949,17 +2076,20 @@ convention: [Literature research](literature.md) and the
 
 ```console
 $ ng lit status                                          # readiness
-$ ng lit search "<query>" [--source s2|asta|openalex|both|all] [--limit N] [--year A:B] [--human]
-$ ng lit add <DOI|S2-id|openalex:Wid> [--human]          # grow the library
+$ ng lit search "<query>" [--source s2|asta|openalex|pubmed|both|all[,...]] [--limit N] [--year A:B] [--human]
+$ ng lit add <DOI|PMID|S2-id|openalex:Wid> [--human]     # grow the library
 $ ng lit setup                                           # key-acquisition refs
 ```
 
 - **`search`** queries Semantic Scholar, ASTA, and OpenAlex by relevance
   (default `--source all` — the three are complementary, not redundant),
-  dedups against the reference library, and annotates each hit
-  `in_library`. A keyed backend (S2/ASTA) with no key is **skipped with a
-  note** (never a hang); OpenAlex needs no key so it's never skipped for
-  that reason. Default output is JSON; `--human` is readable.
+  dedups against the reference library by DOI and PMID, and annotates each
+  hit `in_library`. **PubMed** (NCBI E-utilities, keyless) is a fourth
+  backend and is **opt-in**: `--source pubmed`, a comma list such as
+  `--source all,pubmed`, or `lit.default_source: "all,pubmed"`. A keyed
+  backend (S2/ASTA) with no key is **skipped with a note** (never a hang);
+  OpenAlex and PubMed need no key. Default output is JSON; `--human` is
+  readable.
   Every response leads with **`status`** — `ok` (every requested backend
   searched; a `count` of 0 means nothing matched the query as asked, which
   is not the same as a verified absence), `partial` (a backend failed
@@ -1967,17 +2097,19 @@ $ ng lit setup                                           # key-acquisition refs
   failed — exit 2, and **no `count`/`results` key at all**, so a broken
   search can never be read as an empty literature). See
   [Literature research](literature.md#the-three-result-states).
-- **`add`** fetches a paper by DOI, S2 id, or OpenAlex work id and appends a
-  schema-compatible record to the library (`<nexus.root>/.bipartite/refs.jsonl`
-  by default, or `lit.library_path`). Dedup-checked by DOI. Works with zero
-  keys configured via the OpenAlex DOI fallback; an S2 key is only needed
-  for non-DOI ids.
+- **`add`** fetches a paper by DOI, PMID, S2 id, or OpenAlex work id and
+  appends a schema-compatible record to the library
+  (`<nexus.root>/.bipartite/refs.jsonl` by default, or `lit.library_path`).
+  Dedup-checked by DOI and PMID. A PMID resolves through PubMed. Works with
+  zero keys configured via the OpenAlex DOI fallback; an S2 key is only
+  needed for S2 ids.
 - **`status` / `setup`** report configured backends (env / `config/nexus.yml`
-  `lit.*` / legacy `bip` config — never the key itself). OpenAlex always
-  reports available (no key required), so the tool is never fully
-  "unconfigured"; `status` prints key-acquisition references as a hint when
-  S2/ASTA are both unconfigured, but only exits non-zero when a specific
-  `--source` request (`s2`/`asta`/`both`) has no matching key.
+  `lit.*` / legacy `bip` config — never the key itself), including the
+  PubMed rate limit. OpenAlex always reports available (no key required),
+  so the tool is never fully "unconfigured"; `status` prints
+  key-acquisition references as a hint when S2/ASTA are both unconfigured,
+  but only exits non-zero when a specific `--source` request
+  (`s2`/`asta`/`both`) has no matching key.
 
 ---
 

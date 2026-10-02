@@ -38,6 +38,34 @@ nexus:
   # See <your-org>/<other-nexus>#41.
   node_module: nodejs
 
+  # Absolute path to a Claude Code binary OUTSIDE this repo — the escape
+  # hatch for an operator who runs the NATIVE Claude Code install rather
+  # than the npm one. LEAVE UNSET (the default) to use the npm install
+  # managed by monitor/install-claude-local.sh; the whole npm path below
+  # is untouched when this key is absent.
+  #
+  # When set, monitor/_claude-bin.sh resolves $CLAUDE_BIN to this path
+  # for EVERY spawn surface (workers, the orchestrator respawn, the
+  # watcher, claude-loop, the cc-harness), and locals/bin/claude is
+  # linked to it so PATH-based resolution agrees. It outranks
+  # node_modules/.bin/claude on purpose: a re-appearing npm tree must not
+  # be able to silently take the workspace back off the operator's
+  # choice. Only the CLAUDE_BIN env var wins over it.
+  #
+  # Two consequences worth knowing before you set it:
+  #   - monitor/install-claude-local.sh REFUSES to run (it would leave an
+  #     unused node_modules behind). Override: CLAUDE_INSTALL_ALLOW_PINNED=1.
+  #   - the autonomous cc-update routine (monitor/cc-auto-update-apply.sh)
+  #     REFUSES to apply a bump (exit 32): it bumps by npm install, which
+  #     cannot move a native binary. Keep the native install current
+  #     yourself; the cc-harness gate still runs against whatever this
+  #     names.
+  # A path that is set but not executable is a FATAL error at every spawn
+  # surface — deliberately, so a typo cannot degrade into "quietly ran a
+  # different claude than you asked for". `~` expands to $HOME.
+  # Env var CLAUDE_BIN wins over this key.
+  # claude_bin: ~/.local/bin/claude
+
 github:
   # GitHub login of the single authorised user. Every script treats
   # comments by this user as directives; nobody else can drive the bot.
@@ -136,8 +164,10 @@ lit:
   # default) queries every usable one and unions the dedup'd results.
   # S2/ASTA keys are OPTIONAL: an unconfigured keyed backend is skipped
   # with a note (never a hang). OpenAlex needs NO key at all, so it is
-  # never "unconfigured" and is always part of the default set. Full
-  # setup + key-acquisition walkthrough: docs/reference/literature.md.
+  # never "unconfigured" and is always part of the default set. PubMed
+  # (NCBI E-utilities) is a fourth keyless backend, OPT-IN: select it with
+  # `--source pubmed` / `--source all,pubmed`, or via default_source below.
+  # Full setup + key-acquisition walkthrough: docs/reference/literature.md.
   #
   # config/nexus.yml is gitignored, so inlining the keys here is safe; you
   # may also export S2_API_KEY / ASTA_API_KEY in the environment (env wins).
@@ -150,6 +180,18 @@ lit:
   # (higher, more reliable rate limit; see https://docs.openalex.org).
   # Falls back to notifications.email.address if left blank.
   openalex_mailto: ""
+  # The --source used when none is given. Default: all (S2 + ASTA +
+  # OpenAlex). Set "all,pubmed" to add PubMed to every default search.
+  # default_source: all
+  # PubMed (NCBI E-utilities). All three are optional; env vars win.
+  # NCBI API key (NCBI_API_KEY): raises the NCBI limit from 3 to 10
+  # requests/s. Free, from https://account.ncbi.nlm.nih.gov/settings/
+  ncbi_api_key: ""
+  # Contact address sent as `email=` (NCBI_EMAIL). NCBI asks E-utilities
+  # callers for one so it can reach you before blocking abusive traffic.
+  ncbi_email: ""
+  # Sent as `tool=` (NCBI_TOOL). Default: nexus-lit.
+  # ncbi_tool: nexus-lit
   # Reference library (JSONL). Default: <nexus.root>/.bipartite/refs.jsonl.
   # Point this at a path inside your asset repo to version the library.
   # library_path: ~/path/to/refs.jsonl
@@ -508,6 +550,139 @@ monitor:
     # when the live query is empty (tmux transient) so a real decision is
     # never lost. Env: MONITOR_PENDING_SKIP_DEAD_WINDOWS.
     skip_dead_windows: true
+
+  # Bounded comment resurfacing (issue #3). `emit_cooldown_seconds`
+  # above is a RATE, not a cap: an eligible-but-unprocessed comment
+  # re-emits once per cooldown forever. On 2026-07-31 one comment
+  # (id=5147150803) was re-emitted 54 times in a day, another 13; ~120
+  # of the day's 208 emits were `poll-resurface`. Each one landing on a
+  # live orchestrator is a full-price wake — 1-7M tokens at the
+  # contexts orchestrators actually reach — carrying nothing the
+  # orchestrator had not already seen.
+  #
+  # Worse, each repeat also BYPASSED the content-hash dedup gate: that
+  # bypass fires for any body with an `id=` row in the eligible-comments
+  # section, on the assumption such a row is always genuinely new. True
+  # for a first emit, false for every resurface — so the one gate that
+  # could have collapsed the repeat was switched off by the repeat.
+  #
+  # After this many emits of the SAME comment body without the comment
+  # being processed, the watcher stops re-emitting it, records it to
+  # `monitor/.state/resurface-dropped.tsv` + `watcher-unstick.log`, and
+  # surfaces it once in the next emit as `--- resurface dropped ---`.
+  # Editing the comment resets the count and revives it. 0 restores the
+  # unbounded pre-#3 behaviour. Env: MONITOR_RESURFACE_MAX_REPEATS.
+  resurface_max_repeats: 4
+
+  # Ceiling for the doubling backoff between repeats. The effective
+  # cooldown for the Nth repeat is
+  # `emit_cooldown_seconds * 2^(N-1)`, capped here — 300s, 600s,
+  # 1200s, 2400s, 3600s, … So a stuck item costs a geometric rather
+  # than linear number of wakes before the cap ends it. 0 disables the
+  # backoff (flat `emit_cooldown_seconds` between repeats, still
+  # capped by resurface_max_repeats). Env:
+  # MONITOR_RESURFACE_BACKOFF_MAX_SECONDS.
+  resurface_backoff_max_seconds: 3600
+
+  # Context-budget session rotation (issue #1). Every assistant message
+  # re-reads the whole conversation, so the price of an IDENTICAL action
+  # grows monotonically with session age: an orchestrator at 998k context
+  # pays ~10x per wake what the same orchestrator paid at 100k. The
+  # 2026-07-31 token audit measured one 36 h orchestrator session at
+  # ~1,540M cache-read tokens — ~40% of all spend in the workspace — with
+  # a single routine `poll-full-state` wake costing 31.7M tokens and
+  # producing no work.
+  #
+  # The fix is to ROTATE at a threshold instead of drifting to the
+  # ceiling: write the standard hand-off report, then COLD-spawn a
+  # fresh session seeded with it —
+  #   monitor/watcher/spawn-fresh-orchestrator.sh --target <window> \
+  #       --rotation <report-path>
+  # Nothing is lost: the report is already the designed resumption
+  # surface, and `--rotation` refuses to run without one. Per-wake cost
+  # drops roughly 4x at the default threshold.
+  #
+  # NOT `ng respawn`. That verb routes to `spawn-worker.sh --resume`,
+  # which RESUMES the session — it carries the accumulated context
+  # forward and rotates nothing, costing a wake and saving zero. It is
+  # the right tool for reviving a dead worker and the wrong one here.
+  #
+  # The watcher reads the orchestrator's live context each compose cycle
+  # (monitor/context-usage.sh, which reads the transcript's
+  # `message.usage`) and renders a `--- rotate session ---` directive
+  # once it is at or over `orchestrator_tokens`. The section is
+  # RENDER-ONLY: it never triggers an emit of its own, it rides the
+  # emits the orchestrator was already being woken by. Rotations are
+  # auditable via `ng log-action monitor --event rotate-session`.
+  context_rotation:
+    # Master switch. false → the watcher renders no rotate directive and
+    # `ng context` still works as a manual read. Env override:
+    # MONITOR_CONTEXT_ROTATION_ENABLED.
+    enabled: true
+
+    # Orchestrator rotation threshold, in context tokens. At or above
+    # this, the next wake is spent rotating instead of processing.
+    # Suggested 250000 (~4x cheaper per wake than the 1M ceiling).
+    # 0 disables the orchestrator directive. Nexuses with heavier
+    # per-wake work want this LOWER, not higher — the whole point is
+    # that late-session work is billed at a multiple. Env override:
+    # MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS.
+    orchestrator_tokens: 250000
+
+    # The model's context ceiling, used only to render the `pct=` figure
+    # (and the percentage in the emit). Bump when the pinned model's
+    # window changes. Env: MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS.
+    limit_tokens: 1000000
+
+    # Cadence of the orchestrator context probe, in seconds. The
+    # MEASUREMENT is an async scheduler task, never the compose path:
+    # it is a bounded `tail`+`jq` over the orchestrator's transcript,
+    # which is the LARGEST in the workspace — measured at 0.63 s on the
+    # bounded read and 1.69 s when the tail window misses and the full
+    # scan slurps a 59 MB file, against compose's ~100 ms synchronous
+    # budget. The emit section only reads the small state file the
+    # probe writes. 0 disables the probe (the section then finds no
+    # file and stays silent). Env:
+    # MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS.
+    probe_interval_seconds: 120
+
+    # How old a probe reading may be before the emit section ignores
+    # it. Guards the case that matters most: a reading taken before a
+    # rotation that has already happened must not nag the fresh session
+    # into rotating again. Keep it a few multiples of
+    # probe_interval_seconds. 0 disables the check. Env:
+    # MONITOR_CONTEXT_PROBE_STALE_SECONDS.
+    probe_stale_seconds: 600
+
+    # Worker threshold (issue #2). Two consumers, deliberately sharing
+    # one number: the worker floor (skills/nexus.worker-defaults, which
+    # monitor/spawn-worker.sh injects into every spawn prompt) tells a
+    # worker to file its report and stop at this size, and the watcher's
+    # `context_scan` task flags workers past it so the orchestrator can
+    # wrap-up + respawn the ones that didn't.
+    #
+    # A strong default, NOT a hard cap: some tasks genuinely need one
+    # long session (a stateful kernel, a long debug thread). Those opt
+    # out explicitly in the spawn prompt — see the worker floor text.
+    # 0 disables both halves. Env:
+    # MONITOR_CONTEXT_ROTATION_WORKER_TOKENS.
+    worker_tokens: 250000
+
+    # Cadence of the worker context scan, in seconds. Each fire costs
+    # one bounded `tail` + `jq` per worker window, so it runs as an
+    # async/expensive scheduler task well off the compose hot path.
+    # Worker context does not move fast enough to justify tightening
+    # this. 0 disables the scan entirely (the emit section then finds
+    # no state file and stays silent). Env:
+    # MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS.
+    scan_interval_seconds: 300
+
+    # How stale the scan's TSV may be before the `--- workers over
+    # context ---` section ignores it. Guards against nagging about a
+    # worker that has since rotated or been retired. Should be a few
+    # multiples of scan_interval_seconds. 0 disables the check. Env:
+    # MONITOR_CONTEXT_SCAN_STALE_SECONDS.
+    scan_stale_seconds: 1800
 
   # Claude Code update-detection (GATED self-update, detect→inform
   # half). The `cc_version_check` watcher task compares the

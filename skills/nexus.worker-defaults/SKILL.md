@@ -474,6 +474,19 @@ a hook or your task prompt points you there.
   presented as convention is re-derived by nobody downstream, human or
   agent, so the one number nobody chose deliberately is also the one
   number nobody checks.
+- **Stop at ~250k context** (`monitor/ng context`; exit 10 = past
+  it). Every message re-reads the whole conversation, so a worker
+  at 600k pays ~6x per tool call for identical work. Finish the
+  current step, then wrap up per the next bullet and let the
+  orchestrator respawn you. A number, not a judgement call —
+  unless your task prompt says it needs one long session.
+- **Write so a reader outside your task can follow.** Sentences
+  under 20 words, one idea each, active voice. Put every stat or
+  result in a table, not in prose. Define each internal term on
+  first use in every artefact. Copy the definition from
+  `$NEXUS_ROOT/skills/nexus.writing/GLOSSARY.md`. Add a row there
+  if your term is missing. A report, an issue comment and a
+  caption each circulate alone, so each needs its own definition.
 - **Before you finish, idle, or run low on context: file a
   report and wrap up.** `monitor/ng report-init <slug>` writes a
   five-section skeleton at the canonical reports path (captures
@@ -501,7 +514,10 @@ a hook or your task prompt points you there.
 Deeper skills, consulted only when the above is insufficient:
 `skills/nexus.bot/SKILL.md` (verb table, cross-repo `GH_TOKEN`,
 push-author verify), `skills/nexus.report/SKILL.md` (section
-semantics, append-only, Infrastructure Issues loop). Resolve by
+semantics, append-only, Infrastructure Issues loop),
+`skills/nexus.writing/SKILL.md` (the Simplified Technical English
+rules behind the writing bullet, the shared `GLOSSARY.md` of
+approved definitions, required table columns). Resolve by
 absolute path via the spawn prompt.
 
 ## Reply-to wrap-up override
@@ -648,6 +664,9 @@ skips them).
   push-author verify, fail-loud token guard.
 - `nexus.report` — report sections, append-only convention,
   Infrastructure Issues feedback loop.
+- `nexus.writing` — how every agent writes: the ASD-STE100
+  writing rules the floor bullet condenses, the shared
+  `GLOSSARY.md`, and the required table columns.
 - `nexus.tmux-spawn` — the spawn-worker.sh launcher pattern that
   injects the `## Worker floor` section above into every prompt.
 - workspace `CLAUDE.md` — the cross-cutting workspace contract.

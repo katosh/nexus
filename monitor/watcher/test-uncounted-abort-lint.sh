@@ -488,11 +488,17 @@ _nfiles=$(find "$_dir/test-integration" -name 'test-realmodel-*.sh' -type f | wc
 # line, so `dev` @ 049b31d6 was red here (got 15 want 14, reproduced in isolation).
 # Its failure lines do not match the `FAIL:` announcement pattern this census
 # counts, so only the file count moves. `neither` is still 0.
-assert_eq "manifest: 15 realmodel files are enumerated"  "$_nfiles"          "15"
-assert_eq "manifest: 68 realmodel FAIL announcements"    "$(echo "$_c" | cut -d' ' -f1)" "68"
+# 15 -> 18 files, 68 -> 71 announcements, 51 -> 54 by-count, by-exit unchanged:
+# the jacob-greene/nexus port added three gated scenarios,
+# `test-realmodel-hooks.sh`, `test-realmodel-permission-dialog.sh` and
+# `test-realmodel-vipaste.sh`. Each adds one `FAIL:` announcement disposed by
+# a counter bump, so the counter-bumped column moves by exactly the
+# announcement column. `neither` is still 0.
+assert_eq "manifest: 18 realmodel files are enumerated"  "$_nfiles"          "18"
+assert_eq "manifest: 71 realmodel FAIL announcements"    "$(echo "$_c" | cut -d' ' -f1)" "71"
 assert_eq "manifest: 17 are disposed by \`exit\`, NOT by a counter" \
     "$(echo "$_c" | cut -d' ' -f2)" "17"
-assert_eq "manifest: 51 are disposed by a counter bump"  "$(echo "$_c" | cut -d' ' -f3)" "51"
+assert_eq "manifest: 54 are disposed by a counter bump"  "$(echo "$_c" | cut -d' ' -f3)" "54"
 # The load-bearing one: the carve-out's CONCLUSION.
 assert_eq "manifest: ZERO realmodel aborts neither exit nor count" \
     "$(echo "$_c" | cut -d' ' -f4)" "0"

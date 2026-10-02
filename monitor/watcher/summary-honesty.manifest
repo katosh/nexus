@@ -449,3 +449,26 @@ monitor/watcher/test-integration/test-realmodel-longjob-wake.sh::ledger=no::coun
 monitor/watcher/test-longjob-plugin-arming.sh::ledger=no::count=none
 monitor/watcher/test-longjob-watch.sh::ledger=no::count=none
 monitor/watcher/test-pane-state-longjob-discount.sh::ledger=no::count=none
+# ARRIVED BY MERGE (port of the jacob-greene/nexus fork, 2026-10-01): recorded
+# at the protection level the guard measured, so the corpus and this record
+# agree. These suites were written against the fork's older harness. Raising
+# each to `th_summary_and_exit` + an exact count is follow-up work for the
+# fork author.
+monitor/test-cch-launch-string.sh::ledger=no::count=none
+monitor/test-cch-permission-dialog.sh::ledger=no::count=none
+monitor/test-evidence-freeze.sh::ledger=no::count=none
+monitor/test-lit-pubmed.sh::ledger=no::count=none
+monitor/test-verdict-head-binding.sh::ledger=no::count=none
+monitor/watcher/test-claude-bin-resolver.sh::ledger=no::count=none
+monitor/watcher/test-context-rotate.sh::ledger=yes::count=none
+monitor/watcher/test-context-scan.sh::ledger=yes::count=none
+monitor/watcher/test-dead-window-pending.sh::ledger=yes::count=none
+monitor/watcher/test-full-state-staging-freshness.sh::ledger=no::count=none
+monitor/watcher/test-integration/test-realmodel-hooks.sh::ledger=no::count=none
+monitor/watcher/test-integration/test-realmodel-permission-dialog.sh::ledger=no::count=none
+monitor/watcher/test-integration/test-realmodel-vipaste.sh::ledger=no::count=none
+monitor/watcher/test-launcher-claude-install-gate.sh::ledger=no::count=none
+monitor/watcher/test-prelude-parked-count.sh::ledger=no::count=none
+monitor/watcher/test-resurface-cap.sh::ledger=yes::count=none
+monitor/watcher/test-skeptic-liveness-tristate.sh::ledger=no::count=none
+monitor/watcher/test-uv-cache-guard.sh::ledger=no::count=exact

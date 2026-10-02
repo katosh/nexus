@@ -1543,8 +1543,16 @@ cmd_reconcile() {
             return 0
         fi
         # Some still .open.md. Past the grace, nudge the worker.
+        # SUBSHELL, not a bare call: cmd_nudge terminates with `exit`
+        # (six sites) and with `die` (five more), and every one of those
+        # is an ORDINARY state — no open requests, rate-limited, a busy
+        # or user-typing pane, an unresolvable window. `|| true` traps a
+        # non-zero return; it cannot trap an exit, so a bare call kills
+        # THIS process mid-loop and reconcile dies silently instead of
+        # failing loud at exit 6. The subshell contains every
+        # termination path, including any added later.
         if (( do_nudge )) && (( elapsed >= grace )); then
-            cmd_nudge "$window" --task "$task" --min-interval "$min_interval" >/dev/null 2>&1 || true
+            ( cmd_nudge "$window" --task "$task" --min-interval "$min_interval" ) >/dev/null 2>&1 || true
         fi
         iter=$((iter+1))
     done

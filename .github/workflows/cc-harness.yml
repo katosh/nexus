@@ -110,6 +110,12 @@ on:
       - 'monitor/_node-bootstrap.sh'
       - 'monitor/_trash.sh'
       - 'monitor/link-nexus-tools.sh'
+      # jacob-greene/nexus#219: `install-claude-local.sh` now sources the
+      # `nexus.claude_bin` resolver. PF001 derives the edge.
+      - 'monitor/_claude-bin.sh'
+      # The ported `test-realmodel-vipaste.sh` sources the respawn paste
+      # path it pins. PF001 derives the edge.
+      - 'monitor/watcher/_respawn.sh'
       # <your-org>/nexus-code#1535: `test-realmodel-longjob-wake.sh` runs the
       # longjob dispatcher against the real binary; PF001 derives the edge.
       - 'monitor/longjob-watch.sh'

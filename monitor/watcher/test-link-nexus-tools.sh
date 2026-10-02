@@ -165,6 +165,69 @@ else
 fi
 rm -rf "$sb"
 
+echo "=== OUT-OF-TREE target gets an ABSOLUTE link ==="
+# An operator running the native Claude Code install points the nexus at
+# it. The linker must follow monitor/_claude-bin.sh to that binary — and
+# must write an ABSOLUTE symlink, because the relative ../../ form only
+# addresses paths inside the nexus tree.
+#
+# Driven here through the resolver's rank-1 lookup (CLAUDE_BIN), which
+# needs no python; the config-pin (rank-2) case below exercises the same
+# branch through the real operator-facing key when pyyaml is available.
+# The out-of-tree binary must live OUTSIDE the nexus root, or the linker
+# correctly writes a relative link and the case proves nothing.
+parent=$(mktemp -d); sb="$parent/nexus"; native="$parent/native/claude"
+make_fake_nexus "$sb" 1                       # npm install PRESENT on purpose
+cp "$_repo_root/monitor/_claude-bin.sh" "$sb/monitor/_claude-bin.sh"
+mkdir -p "$parent/native"
+printf '#!/bin/sh\necho native-claude %s\n' "\"\$@\"" > "$native"
+chmod +x "$native"
+CLAUDE_BIN="$native" run_linker "$sb"
+clink="$sb/locals/bin/claude"
+tgt=$(readlink "$clink" 2>/dev/null)
+if [[ "$tgt" == "$native" ]]; then
+    ok "claude links ABSOLUTELY to the out-of-tree binary"
+else
+    bad "out-of-tree target" "got: ${tgt:-<no link>} (wanted $native)"
+fi
+if [[ -x "$clink" ]] && out=$("$clink" n 2>/dev/null) && [[ "$out" == "native-claude n" ]]; then
+    ok "the link executes the OUT-OF-TREE binary, not the npm one"
+else
+    bad "out-of-tree identity" "exec via link gave: ${out:-<none>}"
+fi
+if [[ "$tgt" != *"node_modules"* ]]; then
+    ok "npm install present but NOT linked (the resolved target wins)"
+else
+    bad "out-of-tree precedence" "linked the npm install: $tgt"
+fi
+rm -rf "$parent"
+
+echo "=== config nexus.claude_bin drives the same absolute link ==="
+parent=$(mktemp -d); sb="$parent/nexus"; native="$parent/native/claude"
+make_fake_nexus "$sb" 1                       # npm install PRESENT on purpose
+cp "$_repo_root/monitor/_claude-bin.sh" "$sb/monitor/_claude-bin.sh"
+mkdir -p "$sb/config" "$parent/native"
+cp "$_repo_root/config/load.sh" "$sb/config/load.sh"; chmod +x "$sb/config/load.sh"
+: > "$sb/config/nexus.example.yml"
+printf '#!/bin/sh\necho native-claude %s\n' "\"\$@\"" > "$native"
+chmod +x "$native"
+printf 'nexus:\n  claude_bin: %s\n' "$native" > "$sb/config/nexus.yml"
+# The config leg needs a pyyaml-capable python3 on the SAME PATH the
+# linker runs with; without one the resolver is DESIGNED to warn and fall
+# through, so assert the pin only when this host can actually read it.
+if NEXUS_ROOT="$sb" "$sb/config/load.sh" nexus.claude_bin "" >/dev/null 2>&1; then
+    run_linker "$sb"
+    tgt=$(readlink "$sb/locals/bin/claude" 2>/dev/null)
+    if [[ "$tgt" == "$native" ]]; then
+        ok "config pin produces the absolute link, outranking node_modules"
+    else
+        bad "config pin target" "got: ${tgt:-<no link>} (wanted $native)"
+    fi
+else
+    printf '  SKIP: config-pin case — config/load.sh cannot read yaml on this host\n'
+fi
+rm -rf "$parent"
+
 echo "=== --check reports status without mutating ==="
 sb=$(mktemp -d); make_fake_nexus "$sb" 1
 # Before provisioning: --check is non-zero and creates nothing.

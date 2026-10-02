@@ -84,17 +84,39 @@ Four `ng` verbs cover the surface — `get`/`put` are the read/write pair; `scaf
 # Fetch the middle-of-markers content (cached to .state/dashboard.md).
 monitor/ng dashboard get
 
+# Size breakdown ONLY — never the body. Call this one from an agent.
+monitor/ng dashboard get --stat
+
 # Print the canonical six-section skeleton (one-line hint per section).
 monitor/ng dashboard scaffold
 
-# Strict gate: exit 1 if any required section is missing. For CI / pre-commit.
+# Strict gate: exit 1 on a missing/duplicated section OR an over-budget body.
 monitor/ng dashboard validate [--body-file new-dashboard-middle.md]
 
-# Re-fetch the body, splice the new middle in, PATCH. WARNS on missing sections, never blocks.
+# Re-fetch the body, splice the new middle in, PATCH. WARNS on all of the above, never blocks.
 monitor/ng dashboard put --body-file new-dashboard-middle.md
 ```
 
 `validate` and `put` share their section check — `_dashboard_missing_sections` in `monitor/ng`, reading `DASH_REQUIRED_SECTIONS`. (`scaffold` runs no check at all; it just prints `_dashboard_template`.) The split is deliberate: `validate` is the hard gate (exit 1 on a missing required section, and also on an exactly-duplicated one), while `put` runs the *same* missing-section check in warn-only mode — it prints which sections are missing to stderr but still pushes, so the operator can update the dashboard in a hurry without a footgun-y hard block. Seed a fresh dashboard by piping `scaffold` into `put`.
+
+### The dashboard is size-bounded
+
+The dashboard is a **glanceable status surface**, not a log, and every update is a REPLACE rather than an append. It once reached **213,381 bytes** — `## In-flight` alone at 166 KB across 115 entries, with 3 worker windows actually live — because successive orchestrators prepended session narrative and nothing ever measured it.
+
+`validate` now fails, and `put`/`get` warn, when the body breaches the `DASH_MAX_*` budget (total bytes, per-section bytes, entries per section, bytes per entry — declared next to `DASH_REQUIRED_SECTIONS` in `monitor/ng`, retune them there). Every breach prints the remedy alongside the number:
+
+- **`## In-flight` mirrors LIVE worker windows only.** Reconcile against `tmux list-windows` and delete rows for windows that no longer exist.
+- **Narrative history belongs in `reports/`.** Leave a one-line link, not the story.
+- **Archive before pruning**, so nothing is lost:
+
+  ```bash
+  monitor/ng dashboard get > /tmp/dashboard-archive.md
+  monitor/ng upload /tmp/dashboard-archive.md --repo-path general/dashboard-archive-$(date +%Y%m%d).md
+  ```
+
+Thresholds are calibrated against both real distributions, and the honest summary is that they **do not separate cleanly**: legitimate entries top out around 900 bytes, while the runaway body's 168 entries run continuously from 99 to 9,363 (median 1,058) — 61 of them land between those two figures. No threshold cleanly divides "healthy" from "runaway", so each value is a sensitivity choice. They are set from the legitimate side, with enough margin that a healthy dashboard passes cleanly. That is the point: a budget that red-lights normal content is one everybody learns to route around, which is how the dashboard grew unnoticed in the first place. If you retune one, read the reasoning next to `DASH_MAX_*` in `monitor/ng` first.
+
+**Agents: use `get --stat` first.** Plain `get` prints the whole body; on a sick dashboard that is a context blowout. (The "`ng dashboard get` times out at 120 s" once filed as an infra bug was exactly this — 213 KB streaming into a tool result, not a slow API. `get` returns in ~2.5 s.) `--stat` reports the shape and writes the body to the cache, so you can read it deliberately if you need it.
 
 `ng dashboard put` always re-reads the live body before splicing, so static prose around the markers (operator notes above the START marker, your own running scratchpad below the END marker) — and the identity block — is preserved across writes. The cache at `monitor/.state/dashboard.md` is for the orchestrator's diff-before-overwrite check, not the canonical state.
 

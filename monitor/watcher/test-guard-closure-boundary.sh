@@ -315,6 +315,7 @@ assert_eq "the jq population is non-empty (a zero here would vacuously green eve
 # LOUD — the gate refuses outright. Verified mechanically below.
 jq_loud=(
     monitor/ci-run-execution.sh
+    monitor/context-usage.sh
     monitor/declare-no-wait.sh
     monitor/declare-wait.sh
     monitor/ensure-workdir-trusted.sh
@@ -325,6 +326,10 @@ jq_loud=(
     monitor/watcher/_gh_stub.sh
     monitor/worker-health.sh
 )
+# `monitor/context-usage.sh` (`ng context`, ported from jacob-greene/nexus) —
+# ONE gate, ahead of every jq use, that exits 1 with `error=jq-missing`.
+# Its only caller that acts on the number (context rotation) treats a
+# non-zero exit as "no reading" and does nothing, so nothing degrades.
 # `monitor/skeptic-channel.sh` — a NEW jq dependency, recorded as a DECISION
 # (your-org/nexus-code#1536). Its one gate is `window <target>`, which reads the
 # spawn provenance records to say whether a skeptic window exists. LOUD: without

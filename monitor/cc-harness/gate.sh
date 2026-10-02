@@ -327,7 +327,17 @@ if [[ -n "$version" ]]; then
 fi
 
 if [[ -z "$claude_bin" ]]; then
-    claude_bin="$REPO_ROOT/node_modules/.bin/claude"
+    # No --claude-bin and no candidate install: gate whatever this nexus
+    # actually runs, via the shared resolver. Testing the npm path
+    # directly failed outright on a nexus pinned to a native install
+    # (config `nexus.claude_bin`), where that path does not exist.
+    claude_bin=$(
+        unset CLAUDE_BIN
+        NEXUS_ROOT="$REPO_ROOT"
+        # shellcheck disable=SC1091
+        . "$REPO_ROOT/monitor/_claude-bin.sh" >/dev/null 2>&1 && printf '%s' "$CLAUDE_BIN"
+    ) || claude_bin=""
+    [[ -n "$claude_bin" ]] || claude_bin="$REPO_ROOT/node_modules/.bin/claude"
 fi
 [[ -x "$claude_bin" ]] || { echo "gate.sh: no executable claude at $claude_bin" >&2; exit 1; }
 
@@ -793,6 +803,34 @@ gate_prod_scenarios=(
         # deny inside the countdown, and a non-rm Bash prompt and a Write prompt
         # still prompt with the hook wired (must not flip).
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-dangerous-rm-decide.sh"
+        # TOOL-PERMISSION DIALOG (jacob-greene/nexus#157, #158). Boots one
+        # worker WITHOUT --dangerously-skip-permissions (CCH_SKIP_PERMISSIONS=0),
+        # so the real binary paints its Write and Edit permission dialogs,
+        # and asserts pane-state classifies both `blocked` — never the
+        # retire-safe `empty`. A default-boot arm proves the knob changes
+        # nothing else. First shipped XFAIL-marked and left out of this list;
+        # the structural select-dialog arm now classifies both shapes, so it
+        # gates.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-permission-dialog.sh"
+        # VI-safe paste (GUIDE.md surface 2c). Boots with
+        # `editorMode: "vim"` and drops the input box to NORMAL mode FIRST
+        # (in insert mode any VI handling is inert and the scenario pins
+        # nothing), then drives two production paste call sites under
+        # cch_with_tmux_env — the respawn brief (`_respawn_paste_prompt_file`
+        # → `_paste-deliver.sh`) and the follow-up (`paste-followup.sh`),
+        # both bracketed — and pins delivery and submit for each. Their
+        # `i BSpace` guard is redundant on a bracketed paste, so it pins the
+        # PROPERTY instead: plain-pasted marker bytes do not land, a
+        # bracketed paste with no guard does. Measured; see the header.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-vipaste.sh"
+        # Hook + settings contract, beyond PreToolUse's payload (GUIDE.md
+        # surface 2d). Wires marker hooks through `--settings` and asserts
+        # UserPromptSubmit, PreToolUse and Stop still FIRE, that a matcher
+        # alternation still selects, and that a PreToolUse exit 2 still
+        # BLOCKS the tool call (no PostToolUse, asserted behind the Stop
+        # barrier). A silently disabled hook is the one breakage class the
+        # watcher cannot see.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-hooks.sh"
 )
 
 if [[ -n "${CCH_GATE_SCENARIOS:-}" ]]; then

@@ -7,22 +7,30 @@
 # nexus-wide toolchain dir and put `uv`/`uvx` there. This extends it to the
 # two tools an operator (or a manually-spawned tmux window — item 3) most
 # wants by name:
-#   - `claude` — the PROJECT-LOCAL Claude Code install. The real binary
-#     lives at `$NEXUS_ROOT/node_modules/.bin/claude` (npm-managed, version
-#     -bumped). We expose it via a STABLE indirection `locals/bin/claude`
-#     so PATH-based resolution lands on the pinned local binary, never a
-#     system/`$HOME` one.
+#   - `claude` — the Claude Code install this nexus runs, as resolved by
+#     `monitor/_claude-bin.sh` (CLAUDE_BIN env → config `nexus.claude_bin`
+#     → `$NEXUS_ROOT/node_modules/.bin/claude` → PATH). We expose it via a
+#     STABLE indirection `locals/bin/claude` so PATH-based resolution
+#     lands on the binary the nexus actually spawns, never an unrelated
+#     one that happens to sit earlier on someone's PATH.
 #   - `ng` + the `nexus`/`watcher` entrypoints — the nexus CLI + boot
 #     entry, so a manual window can drive the nexus by name.
 #
-# SURVIVES THE TRASH-ASIDE REINSTALL (#310/#312/#315). The link is a
-# RELATIVE symlink that lives in `locals/bin/` and points at the canonical
-# in-tree path (`../../node_modules/.bin/claude`). `install-claude-local.sh`
-# renames the OLD `node_modules/.bin/claude` into the trash and npm writes a
-# FRESH one at the same path — so our `locals/bin/claude` link dangles only
-# for the brief reinstall window and resolves again the instant the new
-# binary lands. The link itself is never touched by the install. Relative
-# (not absolute) so the whole nexus tree stays relocatable.
+# SURVIVES THE TRASH-ASIDE REINSTALL (#310/#312/#315). For an IN-TREE
+# target the link is a RELATIVE symlink that lives in `locals/bin/` and
+# points at the canonical in-tree path (`../../node_modules/.bin/claude`).
+# `install-claude-local.sh` renames the OLD `node_modules/.bin/claude` into
+# the trash and npm writes a FRESH one at the same path — so our
+# `locals/bin/claude` link dangles only for the brief reinstall window and
+# resolves again the instant the new binary lands. The link itself is never
+# touched by the install. Relative (not absolute) so the whole nexus tree
+# stays relocatable.
+#
+# An OUT-OF-TREE target (a native install pinned via config
+# `nexus.claude_bin`) gets an ABSOLUTE symlink instead: a relative path is
+# meaningless across the tree boundary, and that install does not relocate
+# with the nexus anyway. The trash-aside reasoning does not apply — no npm
+# install touches it.
 #
 # Idempotent: re-running only ever rewrites the symlinks to their canonical
 # targets (`ln -sfn`); safe to call on every launcher/bootstrap start. Pure
@@ -58,14 +66,39 @@ _bindir="$NEXUS_LOCALS/bin"
 note() { (( _quiet )) || printf 'link-nexus-tools: %s\n' "$*"; }
 warn() { printf 'link-nexus-tools: %s\n' "$*" >&2; }
 
-# The toolchain links: <name> <relative-target-from-locals/bin> <abs-target>
-# <abs-target> is what we test for existence (claude is only linked once the
-# project-local install is present; the entrypoints + ng always exist).
+# Resolve the claude target through the SHARED resolver rather than
+# hard-coding the npm path, so this link follows whatever the nexus
+# actually spawns. Soft: the resolver exits 1 when no binary exists
+# anywhere, and that is a normal state on a host that has not installed
+# one yet — fall back to the npm path so the "install absent, skipping
+# link" branch below still names the right thing to run.
+# CLAUDE_BIN_NO_PATH: this script WRITES locals/bin/claude, and locals/bin
+# leads every agent's PATH — so consuming the resolver's PATH lookup would
+# be circular and would point the link at itself.
+_claude_abs=$(
+    CLAUDE_BIN_NO_PATH=1
+    # shellcheck disable=SC1091
+    . "$NEXUS_ROOT/monitor/_claude-bin.sh" >/dev/null 2>&1 \
+        && printf '%s' "$CLAUDE_BIN"
+) || _claude_abs=""
+[[ -n "$_claude_abs" ]] || _claude_abs="$NEXUS_ROOT/node_modules/.bin/claude"
+
+# In-tree target → relative link (relocatable, survives the trash-aside
+# reinstall). Out-of-tree target → absolute link.
+if [[ "$_claude_abs" == "$NEXUS_ROOT/"* ]]; then
+    _claude_rel="../../${_claude_abs#"$NEXUS_ROOT/"}"
+else
+    _claude_rel="$_claude_abs"
+fi
+
+# The toolchain links: <name> <target-from-locals/bin> <abs-target>
+# <abs-target> is what we test for existence (claude is only linked once
+# the install is present; the entrypoints + ng always exist).
 #
 # `locals/bin/<name>` -> `../../<path>` resolves to `$NEXUS_ROOT/<path>`
 # because `locals/bin/..` is `locals/` and `../..` is `$NEXUS_ROOT`.
 _link_specs=(
-    "claude ../../node_modules/.bin/claude $NEXUS_ROOT/node_modules/.bin/claude"
+    "claude $_claude_rel $_claude_abs"
     "ng     ../../monitor/ng               $NEXUS_ROOT/monitor/ng"
     "nexus  ../../monitor/watcher/entry.sh $NEXUS_ROOT/monitor/watcher/entry.sh"
     "watcher ../../monitor/watcher/entry.sh $NEXUS_ROOT/monitor/watcher/entry.sh"

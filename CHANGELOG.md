@@ -10,6 +10,63 @@ for the current release convention.
 
 ## [Unreleased]
 
+### Added — changes ported from the `jacob-greene/nexus` fork
+
+These changes come from an operator fork. Issue numbers in this
+section and in the ported code comments refer to `jacob-greene/nexus`.
+Where upstream had already fixed the same problem, upstream's version
+was kept and the fork's version was dropped.
+
+- **Skeptic verdict bound to a commit** (`jacob-greene/nexus#155`).
+  `ng pr verdict set|get` records the commit a skeptic validated as a
+  `Skeptic-Verdict:` line in the pull-request body. `ng pr merge`
+  refuses (exit 5) when the head being merged differs from that
+  commit. `--require-verdict` also refuses when no verdict is
+  recorded. `--verdict-override <reason>` is the audited escape.
+  `ng wrap-up` gains `--skeptic-head` and `--skeptic-pr`.
+- **Dashboard size budget** (`jacob-greene/nexus#36`). `ng dashboard
+  validate` now FAILS (exit 1) when the body is over the size budget
+  (`DASH_MAX_*` in `monitor/ng`); it was advisory before. `ng dashboard get --stat` prints the
+  size without the body.
+- **Wrap-up report links default to the latest shape**
+  (`jacob-greene/nexus#83`). The link points at `blob/main/...`;
+  `--shape pin` restores the commit-pinned link.
+- **Context-budget rotation** (`monitor/watcher/_context_rotate.sh`,
+  `_context_scan.sh`, `monitor/context-usage.sh`, `ng context`). The
+  watcher rotates the orchestrator at a token threshold and surfaces
+  workers past the worker threshold to the orchestrator. Knobs: `monitor.context_rotation.*`.
+- **Resurface cap** (`monitor/watcher/_resurface_cap.sh`). A comment
+  that keeps resurfacing is capped by `monitor.resurface_max_repeats`
+  with a growing interval.
+- **Snapshot staleness disclosure** (`jacob-greene/nexus#14`). The
+  staged full-state snapshot is gated on age and row count, and the
+  emit says how old it is.
+- **`input_text=` on pane-state and retire-preflight**
+  (`jacob-greene/nexus#61`). The gate prints what the input box holds
+  before it authorizes a kill.
+- **Skeptic liveness is tri-state** (`jacob-greene/nexus#31`). A tmux
+  that cannot answer is "unknown" and keeps the retire gate closed.
+- **Over-limit notices with no reset time** (`jacob-greene/nexus#173`).
+  The cc 2.1.268 "team's shared budget." notice is detected, with
+  `reset_at=unknown`.
+- **Opt-in PubMed backend for `ng lit`**. `--source pubmed`, comma
+  lists (`--source all,pubmed`) and `lit.default_source`. `ng lit add`
+  accepts a PMID. Dedup matches on DOI or PMID.
+- **Native Claude Code pin** (`nexus.claude_bin`,
+  `jacob-greene/nexus#219`). `cc-auto-update-apply.sh` refuses with
+  exit 32 when the operator pinned a native install.
+- **Write-once evidence freeze** (`monitor/evidence-freeze.sh`,
+  `ng evidence-freeze`, `jacob-greene/nexus#144`).
+- **uv cache guard** (`monitor/uv-cache-guard.sh`,
+  `jacob-greene/nexus#98`). Repairs a dangling `locals/uv/cache` link
+  before labsh starts.
+- **cc-harness**: three new gated scenarios (`permission-dialog`,
+  `vipaste`, `hooks`); `CCH_SKIP_PERMISSIONS` on the launch builder.
+- **`nexus.writing` skill and `GLOSSARY.md`**, plus two worker-floor
+  bullets (stop near 250k tokens of context; the house writing style).
+- **Fresh-clone rule for public pull requests** in `CLAUDE.md` and the
+  primary-clone spawn warning.
+
 ### Changed — cc-auto-update deployment gate: the board arms are gone; the board is recorded, not gated on (w239 D13)
 
 `monitor/cc-auto-update-apply.sh` `_deployment_gate` no longer defers on the

@@ -1,0 +1,16 @@
+[38;5;231m⏺[39m Patch applied. Running the verification pass now.
+
+[38;5;114m⏺[39m [1mBash[0m[39m[49m(cd /tmp/workdir
+      python3 -c "…")
+[38;5;246m [39m [38;5;246m⎿[39m [38;5;246m [39m=== verify on disk ===
+     cells 21 | code w/ outputs 14 / 14
+     [2m…[0m[39m[49m [2m+19[0m[39m[49m [2mlines[0m[39m[49m [2m(ctrl+o[0m[39m[49m [2mto[0m[39m[49m [2mexpand)[0m[39m[49m
+
+[38;5;231m⏺[39m Done — 14/14 code cells carry outputs, 0 errors. Report updated; parked.
+
+[38;5;246m✻[39m [38;5;246mWorked for 3m 21s
+
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [7m [0m                                                                     
+[38;5;244m──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;211m⏵⏵ bypass permissions on[38;5;246m (shift+tab to cycle) · ⇈ 1 agent

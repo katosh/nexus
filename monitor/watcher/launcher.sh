@@ -38,12 +38,12 @@
 # "nexus" so the paste target has somewhere to live.
 #
 # Project-local Claude Code self-install: before spawning the watcher
-# window, this script invokes `monitor/install-claude-local.sh` if the
-# project-local install is absent. The orchestrator and every spawned
-# worker resolve `$CLAUDE_BIN` against `$NEXUS_ROOT/node_modules/.bin/
-# claude` when present; this step ensures it exists so all subsequent
-# spawns land on the pinned local binary instead of the
-# un-updateable system one. Install failures degrade gracefully (the
+# window, this script invokes `monitor/install-claude-local.sh` if NO
+# claude binary resolves at all. "At all" is decided by probing
+# `monitor/_claude-bin.sh`, so a nexus pinned to a native install via
+# config `nexus.claude_bin` is left alone — testing the npm path
+# directly would fire on every start there and re-create the very tree
+# the operator removed. Install failures degrade gracefully (the
 # `$CLAUDE_BIN` resolver falls back to PATH) and write a
 # `monitor/.state/local-claude-install-failed.<epoch>` flag the
 # watcher's first emit surfaces to the orchestrator.
@@ -508,14 +508,39 @@ if (( ${#_live_leader_groups[@]} > 0 )); then
     rm -f "$PIDFILE" 2>/dev/null || true
 fi
 
-# Self-install Claude Code if absent. The orchestrator + every spawned
-# worker resolves $CLAUDE_BIN against $NEXUS_ROOT/node_modules/.bin/
-# claude when present; this step ensures it exists. One-shot per
+# Self-install Claude Code if NO binary resolves at all. One-shot per
 # launcher invocation — no polling, no retry loop. Failures degrade
 # gracefully (spawn surfaces fall back to system claude on PATH) AND
 # get surfaced to the orchestrator via a flag file that main.sh
 # includes in its first paste.
-if [[ ! -x "$_nexus_root/node_modules/.bin/claude" ]]; then
+#
+# The question is asked by PROBING monitor/_claude-bin.sh, not by
+# testing the npm path. Those are different questions the moment an
+# operator pins a native install via config `nexus.claude_bin`: the npm
+# path is then permanently absent BY DESIGN, so the old test fired on
+# EVERY launcher start and re-created the 135 MB npm tree the operator
+# had just removed — silently taking the workspace back off its own
+# pin, because node_modules outranks PATH in the resolver. Probing the
+# resolver asks "can we start claude at all?", which is what this block
+# actually cares about.
+#
+# rc 2 (the pin is set but not executable) is NOT answered by
+# installing: npm-installing over a deliberate operator choice replaces
+# it rather than fixing it. Surface it like an install failure and let
+# the orchestrator see the diagnostic.
+_cb_probe_rc=0
+_cb_probe_err=$(
+    NEXUS_ROOT="$_nexus_root"
+    # shellcheck disable=SC1091
+    . "$_nexus_root/monitor/_claude-bin.sh" 2>&1 >/dev/null
+) || _cb_probe_rc=$?
+if (( _cb_probe_rc == 2 )); then
+    echo "launcher.sh: config nexus.claude_bin is set but does not resolve; NOT installing over it" >&2
+    flag_dir="$_nexus_root/monitor/.state"
+    mkdir -p "$flag_dir" 2>/dev/null || true
+    printf 'config nexus.claude_bin does not resolve to an executable:\n%s\n' \
+        "$_cb_probe_err" > "$flag_dir/local-claude-install-failed.$(date +%s)" 2>/dev/null || true
+elif (( _cb_probe_rc != 0 )); then
     echo "launcher.sh: local claude missing; running monitor/install-claude-local.sh" >&2
     install_stderr=$(mktemp /tmp/launcher-install-stderr.XXXXXX) || install_stderr=""
     if "$_nexus_root/monitor/install-claude-local.sh" 2> >(tee "$install_stderr" >&2); then

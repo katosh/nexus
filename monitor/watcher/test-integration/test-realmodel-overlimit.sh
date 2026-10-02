@@ -6,7 +6,12 @@
 # The motivating incident (2026-07-14): the account hit its weekly usage
 # limit for ~23 h; every turn the orchestrator attempted failed with
 #
-#     You've hit your weekly limit · resets 3am (America/Los_Angeles)
+#     "You've hit your weekly limit · resets 3am (America/Los_Angeles)"
+#
+# (Quoted on purpose. A bare notice in a shell comment carries no
+# gutter, no marker and no quote, so a `cat` of this file onto a pane
+# could classify over-limit off this header. Phase B3's repository
+# sweep holds that property.)
 #
 # yet the watcher pasted 63 emits into the frozen pane, because BOTH
 # detection channels were dead — the StopFailure hook filtered on a
@@ -69,6 +74,12 @@
 #     _detect_over_limit on the real bytes (logged as a note when the
 #     frame is blank). Wake-probe classification over every pane
 #     state is unit-covered in test-over-limit.sh.
+#   - Phase B2 asserts the renderer scrape on limit notices that carry
+#     NO reset time (jacob-greene/nexus#173). Those run against fixture
+#     bytes, never a live pane: the watcher classifies every real window
+#     in the workspace on its normal poll, so painting a limit notice
+#     onto a live pane to test the detector can arm a real hold against
+#     a real worker.
 #
 # Gated on RUN_CC_HARNESS=1 (+ node + a resolvable claude binary).
 # Self-skips cleanly (never a silent pass) where the real binary is
@@ -265,6 +276,259 @@ case "$RSC_VERDICT" in
             echo "              test-pane-state.sh — against a CAPTURED frame, never this binary's."
         } >&2 ;;
 esac
+
+# ---- phase B2: limit notices that carry NO reset time ---------------------
+# jacob-greene/nexus#173. Claude Code 2.1.268 ships a budget-exhaustion
+# family that the pre-#173 detector missed on BOTH of its halves: the
+# headline has no word "limit" and an apostrophe in "team's" that the
+# flavor-token class rejected, and the notice carries no reset time at
+# all, so the unconditional "resets <time>" companion also failed.
+#
+# These run against FIXTURE BYTES, not a live pane, on purpose. The
+# watcher polls every real window in the workspace on its normal cycle;
+# painting a limit notice onto a live pane to test the detector can arm
+# a real hold against a real worker.
+#
+# `--over-limit-file` points at a path that does not exist in every
+# case, so the StopFailure-stamp branch can never supply the verdict.
+# What passes here passed through the RENDERER scrape.
+echo
+echo "--- phase B2: renderer scrape on notices with NO reset time (jacob-greene/nexus#173) ---"
+B2_DIR="$CCH_DIR/b2"; mkdir -p "$B2_DIR"
+B2_ESC=$'\033'
+B2_FIXTURES="$REPO_ROOT/monitor/watcher/fixtures"
+
+# Build a pane whose only notice is the given line, wrapped in the same
+# chrome the synthetic fixtures use.
+b2_make() {
+    local name="$1" line="$2"
+    {
+        printf '%s\n\n' "${B2_ESC}[38;5;246m✻ Brewed for 41m${B2_ESC}[0m"
+        printf '%s\n' "${B2_ESC}[38;5;244m─${B2_ESC}[0m"
+        printf '%s\n' "${B2_ESC}[39m${line}${B2_ESC}[0m"
+        printf '%s\n' "${B2_ESC}[38;5;244m─${B2_ESC}[0m"
+    } > "$B2_DIR/$name.ansi"
+    printf '%s' "$B2_DIR/$name.ansi"
+}
+
+# state= that production pane-state assigns a fixture, stamp branch off.
+b2_state() {
+    "$CCH_PANE_STATE" --fixture "$1" --window 9 --name b2w --active 0 \
+        --over-limit-file "$CCH_DIR/no-such-stamp.json" 2>&1 \
+        | sed -n 's/.*state=\([^ ]*\).*/\1/p'
+}
+b2_reset() {
+    "$CCH_PANE_STATE" --fixture "$1" --window 9 --name b2w --active 0 \
+        --over-limit-file "$CCH_DIR/no-such-stamp.json" 2>&1 \
+        | grep -oE 'reset_at=[^ ]+' | sed 's/^reset_at=//'
+}
+
+# (1) The committed fixture for the new shape. Pins the apostrophe in
+#     "team's" and the absent word "limit" together.
+b2_budget_fixture="$B2_FIXTURES/over-limit-shared-budget-cc2.1.268-synthetic.ansi"
+assert_file_exists "2.1.268 budget fixture is committed" "$b2_budget_fixture"
+assert_eq "2.1.268 'team's shared budget. Switch to another model…' → over-limit" \
+    "$(b2_state "$b2_budget_fixture")" "over-limit"
+
+# (2) The slash-command variant of the same family.
+assert_eq "2.1.268 'team's shared budget. /model to switch models.' → over-limit" \
+    "$(b2_state "$(b2_make budget-model \
+        "You've hit your team's shared budget. /model to switch models.")")" \
+    "over-limit"
+
+# (3) The /usage-credits variant. Its line does NOT end in a full stop.
+#     This one pins WHERE the waiver looks: at the stop right after the
+#     limit/budget noun, not at the end of the line. A condition keyed on
+#     the line ending would pass (1) and (2) and fail here.
+assert_eq "2.1.268 '…shared budget. Run /usage-credits …' (no trailing stop) → over-limit" \
+    "$(b2_state "$(b2_make budget-credits \
+        "You've hit your team's shared budget. Run /usage-credits to raise it and keep using Opus 4.7 or switch models")")" \
+    "over-limit"
+
+# (4) A waived notice has no reset time to parse, so the emit must say
+#     so. reset_at=unknown is what drops the watcher's hold onto its
+#     bounded 6h fallback; a fabricated token would mis-time the wake.
+assert_eq "budget notice emits reset_at=unknown (6h fallback, not a fabricated token)" \
+    "$(b2_reset "$b2_budget_fixture")" "unknown"
+
+# (5) PRE-2.1.268 regression, pinned separately from the family above.
+#     "You've hit your monthly spend limit." always matched the headline;
+#     it was the unconditional companion that rejected it. It has been
+#     undetected on every release, not only on 2.1.268.
+assert_eq "'You've hit your monthly spend limit.' → over-limit (predates 2.1.268)" \
+    "$(b2_state "$(b2_make monthly-spend \
+        "You've hit your monthly spend limit.")")" \
+    "over-limit"
+
+# (6) The companion check must still do its job. A canonical headline
+#     caught mid-redraw ends with no terminator and no reset time. If
+#     the waiver had been a plain deletion of the companion check, this
+#     would now classify over-limit off half a frame.
+assert_eq "half-rendered canonical headline (no stop, no resets) → NOT over-limit" \
+    "$(b2_state "$(b2_make half-render \
+        "You've hit your weekly limit")")" \
+    "absent"
+
+# (7) Negative control. The widened headline must not be a pattern that
+#     matches everything — every positive assertion above would pass
+#     under one that did. This line carries "hit", "your", "team",
+#     "shared", "budget" and "limit", and must still not classify.
+assert_eq "prose carrying hit/your/team/shared/budget/limit → NOT over-limit" \
+    "$(b2_state "$(b2_make neg-prose \
+        "We hit your team's shared budget target, so the limit discussion can wait.")")" \
+    "absent"
+
+#     Two more arbitrary lines, so the negative control is not a single
+#     sample. Source code and conversational prose are the two shapes an
+#     agent pane carries most of the time.
+assert_eq "source code carrying budget/limit identifiers → NOT over-limit" \
+    "$(b2_state "$(b2_make neg-code \
+        "def compute_limit(team, budget): return team.shared_budget - budget.spent")")" \
+    "absent"
+assert_eq "conversational prose carrying reached/your/hit/team/shared/budget → NOT over-limit" \
+    "$(b2_state "$(b2_make neg-chat \
+        "I have reached your file and hit save; the team shared a budget spreadsheet.")")" \
+    "absent"
+
+# (8) The canonical path the widening must not disturb, asserted here so
+#     this phase stands alone: state AND the parsed reset token.
+b2_canon=$(b2_make canon-weekly \
+    "You've hit your weekly limit · resets 3am (America/Los_Angeles)")
+assert_eq "canonical weekly notice still over-limit" \
+    "$(b2_state "$b2_canon")" "over-limit"
+assert_eq "canonical weekly notice still parses its reset token" \
+    "$(b2_reset "$b2_canon")" "3am_America/Los_Angeles"
+
+# ---- phase B3: provenance — QUOTED SOURCE is not a painted notice ---------
+# The live false positive of 2026-09-10 23:15 PDT. The watcher armed a
+# real 20.7 h hold against a working window. Nothing was limited. The
+# window held an agent editing this detector, and the file-edit tool had
+# rendered its own diff onto the pane. The scrape read the diff line as
+# a notice.
+#
+# The stored token was `3am_America/Los_Angeles"`. The trailing double
+# quote is the source line's closing quote and is the byte-exact proof
+# of provenance — no rendered notice can produce it.
+#
+# A widened headline raises the false-positive rate on exactly this
+# input class, so these assertions carry the evidence that the widening
+# is safe. Every line below is copied VERBATIM from a real captured
+# pane, not written as prose approximating one.
+echo
+echo "--- phase B3: quoted source / diff renders must NOT detect ---"
+
+# (9) The committed fixture: five real captured shapes inside the scan
+#     window, with an idle input box below them. The positional anchor
+#     cannot reject these — they are in the window. Only the provenance
+#     filter can.
+b3_fixture="$B2_FIXTURES/idle-overlimit-quoted-source-in-window-synthetic.ansi"
+assert_file_exists "quoted-source fixture is committed" "$b3_fixture"
+assert_eq "pane of quoted source in the scan window → idle, not over-limit" \
+    "$(b2_state "$b3_fixture")" "idle"
+
+# (10) The incident's own emit must not appear at all. A `reset_at` on
+#      this pane means the detector fired; the empty string means it
+#      never did. This is the assertion that pins the 20.7 h hold shut.
+assert_eq "quoted-source pane emits no reset_at (the 2026-09-10 token)" \
+    "$(b2_reset "$b3_fixture")" ""
+
+# (11) The exact line that caused the latch, alone in a window.
+assert_eq "file-edit diff render of a test line → NOT over-limit" \
+    "$(b2_state "$(b2_make src-diff \
+'      334 +    "You'"'"'ve hit your weekly limit · resets 3am (America/Los_Angeles)")')")" \
+    "absent"
+
+# (12) The same render shape with NO quote before the headline — a
+#      diff of a COMMENT line. The quote rule alone cannot reject this
+#      one; the line-number gutter rule is what does.
+assert_eq "file-edit diff render of a comment line (unquoted) → NOT over-limit" \
+    "$(b2_state "$(b2_make src-diff-comment \
+'      551 +#     You'"'"'ve hit your team'"'"'s shared budget. Switch to another model to continue.')")" \
+    "absent"
+
+# (13) The shell-assertion shape, which is what a test for this detector
+#      looks like on a pane while it is being written.
+assert_eq "shell assertion carrying the notice → NOT over-limit" \
+    "$(b2_state "$(b2_make src-shell \
+'  ⎿  echo "You'"'"'ve hit your team'"'"'s shared budget. /model to switch models." \')")" \
+    "absent"
+
+# (14) `grep -n` output, the other gutter shape.
+#
+#      The row carries a COMPLETE canonical notice with its reset time
+#      and no quote, so the only thing standing between it and an
+#      over-limit verdict is the gutter rule. An earlier draft used a
+#      real captured `grep -n` row whose notice was truncated at the
+#      middle dot; that row has no reset time and no sentence-final
+#      stop, so `_detect_over_limit` rejected it at the companion check
+#      with or without the filter, and the assertion pinned nothing.
+#      The skeptic on jacob-greene/nexus#173 found that. This shape is
+#      what a `grep -n` over a fixture file actually emits.
+assert_eq "grep -n output carrying a complete notice → NOT over-limit" \
+    "$(b2_state "$(b2_make src-grep \
+"     557:You've hit your weekly limit · resets 3am (America/Los_Angeles)")")" \
+    "absent"
+
+# (15) A markdown bullet quoting the notice in backticks.
+assert_eq "markdown backtick quote of the notice → NOT over-limit" \
+    "$(b2_state "$(b2_make src-markdown \
+'     - `You'"'"'ve hit your team'"'"'s shared budget. /model to switch models.`')")" \
+    "absent"
+
+# (16) The filter must not eat a real notice. An INDENTED canonical
+#      notice has no gutter, no quote and no marker, so it still
+#      classifies. Without this the filter could be tightened into a
+#      detector that rejects everything and every assertion above would
+#      still pass.
+assert_eq "indented canonical notice still over-limit (filter is not a blanket reject)" \
+    "$(b2_state "$(b2_make canon-indented \
+"        You've hit your weekly limit · resets 3am (America/Los_Angeles)")")" \
+    "over-limit"
+
+# (17) The detector must not classify off this REPOSITORY's own source.
+#      Every line of every TRACKED file that matches the headline is
+#      rendered alone on a pane; none may classify over-limit.
+#
+#      This is not hypothetical. The doc comment added with the widened
+#      pattern first carried its three example notices UNQUOTED. Those
+#      rows have no gutter, no quote and no marker, so no provenance
+#      rule dropped them, and a `cat` of the file onto a pane
+#      classified over-limit off the comment block.
+#
+#      The sweep was single-file at first, over pane-state.sh only. The
+#      depth-1 skeptic on jacob-greene/nexus#173 swept the whole
+#      repository and found three more rows the narrow scope had
+#      hidden: the header of THIS file, and two rows in
+#      docs/reference/dependency-surface.md whose notice sits in SINGLE
+#      quotes, a character rule 2's `["`]` class does not carry. All
+#      four are now quoted with a character the filter does drop, and
+#      the sweep is repository-wide so the next one cannot hide the
+#      same way.
+#
+#      monitor/watcher/fixtures/ is the ONLY exclusion, and it is
+#      principled: a fixture that classifies over-limit is the entire
+#      point of that fixture.
+b3_bad=0 b3_n=0
+while IFS= read -r b3_file; do
+    [[ -f "$REPO_ROOT/$b3_file" ]] || continue
+    while IFS= read -r b3_row; do
+        b3_n=$(( b3_n + 1 ))
+        if [[ "$(b2_state "$(b2_make "self-$b3_n" "$b3_row")")" == "over-limit" ]]; then
+            b3_bad=$(( b3_bad + 1 ))
+            echo "        offending row: $b3_file: $b3_row" >&2
+        fi
+    done < <(grep -IE "You.{0,3}ve (hit|reached) your ([^[:space:]]+ ){0,2}(limit|budget)" \
+                "$REPO_ROOT/$b3_file" 2>/dev/null)
+done < <(git -C "$REPO_ROOT" ls-files 2>/dev/null | grep -v '^monitor/watcher/fixtures/')
+
+# Positive control on the absence claim above. A mis-scoped grep, or a
+# `git ls-files` that returns nothing because this is not a checkout,
+# scans zero rows and the offender count is then trivially 0 — which
+# reads exactly like a clean pass. This assertion makes that loud.
+assert_eq "repository self-source scan actually scanned rows (n=$b3_n)" \
+    "$( (( b3_n > 0 )) && echo yes || echo no )" "yes"
+assert_eq "no tracked line in this repository classifies over-limit off its own source" \
+    "$b3_bad" "0"
 
 # ---- phase C: the watcher's HOLD — gate closes on the detected status ------
 # Source the production _over_limit.sh at its unit seam: record what the

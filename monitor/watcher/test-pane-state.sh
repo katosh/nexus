@@ -3387,6 +3387,113 @@ if [[ -f "$_repo_root/monitor/watcher/_unstick.sh" ]]; then
 fi
 
 echo
+# === input_text: disclose WHAT the input box says, not just its shape ====
+#
+# Every other detector answers "what SHAPE is the input row?". None
+# answered "what does it SAY?", so a box holding a dim autosuggest ghost
+# and an empty box emitted lines differing by one token. `retire-preflight.sh`
+# authorizes an irreversible kill off that line, and the ghost — reliably a
+# paraphrase of the agent's own closing recommendation — was discarded
+# unlogged. Ten were caught 08-11 → 08-19 only by hand-run `cat -v`.
+#
+# The extractor is deliberately SHAPE-AGNOSTIC: it reads everything after
+# the chevron and parses no dim/bright markers, so unlike
+# `_detect_autosuggest` it cannot drift with the renderer (#50). These
+# tests pin that property — note the bare-`\x1b[2m` case below still
+# classifies `empty` on this branch (that is #50, fixed by #53) and yet
+# its text IS disclosed. (Ported from jacob-greene/nexus#61.)
+assert_input_text() {
+    local label="$1" fixture="$2" want="$3"; shift 3
+    local out got
+    out=$("$HELPER" --fixture "$fixture" --window 9 --name test --active 0 "$@" 2>&1)
+    got=$(sed -n 's/.*[[:space:]]input_text=\([^[:space:]]*\).*/\1/p' <<<"$out")
+    if [[ "$got" == "$want" ]]; then
+        printf '  PASS: %s\n' "$label"; PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %s — got %q want %q\n    line: %s\n' "$label" "$got" "$want" "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
+
+echo "=== input_text: input-box content disclosure ==="
+
+# Real captured ghosts. `merge the PR` is the 08-14 mutation-class one:
+# submitting it would have merged an open PR.
+assert_input_text "ghost 'merge the PR' disclosed" \
+    "$FIX_DIR/autosuggest-merge-win3.ansi" "merge%20the%20PR"
+assert_input_text "ghost 'review the PR diff myself' disclosed" \
+    "$FIX_DIR/autosuggest-review-win6.ansi" "review%20the%20PR%20diff%20myself"
+
+# Multi-segment ghost with UTF-8 (σ). Byte-wise encoding is required; a
+# character-wise encoder mangles this, and a mangled disclosure misleads.
+assert_input_text "multi-segment UTF-8 ghost round-trips" \
+    "$FIX_DIR/autosuggest-why-win4.ansi" \
+    "why%20exp%28-d%2F%CF%83%29%20instead%20of%20the%20Gaussian%3F"
+
+# The #50 shape: bare `\x1b[2m`, no reverse-video cursor. `_detect_autosuggest`
+# does NOT fire here on this branch, so the verdict is still `empty` — yet the
+# text is disclosed anyway, because the extractor never looks at dim codes.
+# This is the whole point of the shape-agnostic design, and it is why the
+# disclosure fix and #53 are independent: neither closes the other.
+assert_input_text "bare-\\x1b[2m ghost disclosed despite #50 misclassification" \
+    "$FIX_DIR/input-text-bare-dim-synthetic.ansi" \
+    "fix%20the%20METHODS%20%C2%A79%20prose%20now%20while%20you%20have%20context"
+# ...and the disclosure holds ACROSS the #53 boundary. Detection is #53's
+# job, not this fix's: on this branch the bare-dim shape classifies
+# `empty`; once #53 lands the same bytes classify `autosuggest-only`. The
+# text is disclosed either way, which IS the independence claim — neither
+# change closes the other. Asserting one fixed verdict here would encode a
+# pre-#53 fact and break on merge (verified against #53's branch: it does).
+_bd_state=$("$HELPER" --fixture "$FIX_DIR/input-text-bare-dim-synthetic.ansi" \
+    --window 9 --name test --active 0 2>&1 | sed -n 's/.*\(state=[a-z-]*\).*/\1/p')
+case "$_bd_state" in
+    state=empty|state=autosuggest-only)
+        printf '  PASS: bare-dim verdict is %s — disclosure holds either side of #53\n' "$_bd_state"
+        PASS=$(( PASS + 1 )) ;;
+    *)
+        printf '  FAIL: bare-dim verdict unexpected — %s\n' "$_bd_state" >&2
+        FAIL=$(( FAIL + 1 )) ;;
+esac
+
+# An empty box must emit NO field. The field's presence is the signal; a
+# bare `input_text=` on every line would train readers to ignore it, and it
+# would change the emitted line for the overwhelmingly common case.
+assert_input_text "empty input box → no input_text field" \
+    "$FIX_DIR/idle-empty-synthetic.ansi" ""
+
+# Bright operator text is disclosed too. It does not weaken anything —
+# `user-typing` is a hard veto in retire-preflight — but the operator
+# should still see what was sitting in the box.
+assert_input_text "user-typing row is disclosed as well" \
+    "$FIX_DIR/user-typing-with-autosuggest-tail-synthetic.ansi" "merge%20the%20PR"
+
+# No chevron ⇒ no input row ⇒ nothing to report (must not emit a garbage
+# field built from whatever the last captured line happened to be).
+assert_input_text "no chevron → no input_text field" \
+    "$FIX_DIR/busy-mid-render-no-chevron-synthetic.ansi" ""
+
+# The encoded value must always be a single space-free token containing no
+# literal `=`, so it can never forge a key=value field on the emit line
+# and can never confuse a greedy `s/.*state=…/` parse.
+_it_line=$("$HELPER" --fixture "$FIX_DIR/autosuggest-why-win4.ansi" \
+    --window 9 --name test --active 0 2>&1)
+_it_val=$(sed -n 's/.*[[:space:]]input_text=\([^[:space:]]*\).*/\1/p' <<<"$_it_line")
+if [[ "$_it_val" =~ ^[A-Za-z0-9._~%-]+$ ]]; then
+    printf '  PASS: encoded value is a safe space-free token (no literal =)\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: encoded value not safe — %q\n' "$_it_val" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+if [[ "$(sed -n 's/.*\(state=[a-z-]*\).*/\1/p' <<<"$_it_line")" == "state=autosuggest-only" ]]; then
+    printf '  PASS: greedy state= parse still resolves the real verdict\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: greedy state= parse disturbed — %s\n' "$_it_line" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
+
 echo "=== summary ==="
 printf '  %d pass / %d fail\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

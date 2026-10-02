@@ -15,6 +15,7 @@ watcher/test-gh-identity.sh	$1
 watcher/test-gh-identity.sh	$1
 watcher/test-inherited-root-guard.sh	$2
 watcher/test-inherited-root-guard.sh	$2
+watcher/test-launcher-claude-install-gate.sh	$2
 watcher/test-ng-dashboard.sh	$1
 watcher/test-ng-wrap-up.sh	$1
 watcher/test-ng-wrap-up.sh	$1
@@ -41,3 +42,7 @@ watcher/test-tmux-window-resolver.sh	$1
 watcher/test-tmux-window-resolver.sh	$1
 watcher/test-tmux-window-resolver.sh	$1
 watcher/test-tmux-window-resolver.sh	$1
+watcher/test-uv-cache-guard.sh	$1
+watcher/test-uv-cache-guard.sh	$1
+watcher/test-uv-cache-guard.sh	$1
+watcher/test-uv-cache-guard.sh	$1

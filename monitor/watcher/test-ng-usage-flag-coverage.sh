@@ -221,8 +221,13 @@ _drifts() {   # <ng-file> <drift-out> <checked-out> <skipped-out>
 # is its own header — so the property "every parsed flag is in the help it
 # prints" is exactly the one worth keeping true for a tool workers are told
 # to reach for from the floor.
+# `context-usage.sh` (`ng context`) and `evidence-freeze.sh`
+# (`ng evidence-freeze`) are enrolled for the same reason
+# (jacob-greene/nexus#10, #144): workers are told to reach for both.
 _WALKED_FACADES='send.sh
-longjob-watch.sh'
+longjob-watch.sh
+context-usage.sh
+evidence-freeze.sh'
 
 _delegated_scripts() {
     {   grep -oE '"\$_script_dir/[a-z-]+\.sh"' "$NG_SRC" | sed 's|.*/||; s|"||'

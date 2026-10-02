@@ -102,7 +102,9 @@ work:
 | `gate.sh` | Pre-update gate: run the scenarios against a candidate cc version in a throwaway prefix; green/red exit. Runs BOTH pre-flight lints below (`lint-no-mass-kill.sh` and `lint-no-tmux-server-kill.sh`), each `--selftest` first, at `gate.sh:211-234`. |
 | `lint-no-mass-kill.sh` | Safety lint: forbids cmdline-pattern process kills (`pkill -f`/`--full`, `pgrep -f`, `killall`) in harness code — they match the shared project-local claude binary across the sandbox's one PID namespace and wipe every agent (crash postmortem 2026-05-29). Allows PID-scoped `pkill -P`. Run by `gate.sh` and the CI workflow. |
 | `lint-no-tmux-server-kill.sh` | Safety lint on the tmux-**socket** axis (blast radius strictly worse than the above: killing the tmux server ends the session `bwrap` holds open, tearing down the whole sandbox — <your-org>/nexus-code#644). Requires `kill-server` to carry an explicit `-L`/`-S`, `kill-session` to carry `-t`, and flags a `TMUX_TMPDIR` isolation in any file that never does `unset TMUX` — socket precedence is `-L`/`-S` > `$TMUX` > `TMUX_TMPDIR` > default, and `$TMUX` is always set because every agent runs in a pane. Quoted occurrences are treated as data, not calls. Wrapper-routed calls may carry a `# tmux-scoped: <reason>` pragma; pragmas are **counted** and the count is pinned by `--selftest`, so an exemption cannot be added silently. `--selftest` is the negative control (asserts the lint fails on planted violations, including the #644 line verbatim, for the expected rule id); `--manifest` lists every destructive call site. Run by `gate.sh` and the CI workflow. |
-| `../watcher/test-integration/test-realmodel-*.sh` | The scenarios. **`paste-held`** (added by `<your-org>/nexus-code#1591`, not in the count that follows) is the first on the DELIVERY axis: it evals production `_paste_to_target_unlocked` out of `main.sh` and drives it, through `monitor/_paste-deliver.sh`, into the real binary with emit-shaped bodies, asserting the version- and flag-agnostic property `reported delivered ==> a request reached the mock AND the transcript recorded it` — arms: ASCII control, a body the 2.1.277 review step HOLDS, a body normalised before the paste, a paste into a BUSY pane, and a negative control with the Enter withheld. The review step is armed under this mock because its gating flag `tengu_tranquil_cloud` has a client default of TRUE. `CCH_SUBJECT_MON=<tree>/monitor` aims the driven code at another checkout, which is how it is shown RED on the pre-fix base. (Ten on disk at `a3177ef6`: `idle-busy`, `blocked-question`, `autosuggest`, `long-exchange`, **`apispoof`**, **`overlimit`**, **`pretooluse-hook`**, **`trust-dialog`**, **`trust-sandboxed-env`**, **`vimode`** — of which `long-exchange` and `apispoof` are the two `exempt` rows in `gate-coverage.tsv`; the other eight are `gated`). Auto-discovered by `run-tests.sh`; gated on `RUN_CC_HARNESS=1`. `apispoof` is the end-to-end stall-detection test: real claude → mock 529/404 → real StopFailure → real `turn-failure-emit.sh` marker → real watcher classifier → `interrupted` + recovery verb → real resume that completes when the mock recovers. `overlimit` is the usage-limit chain (2026-07-14 incident): real claude → mock 429 `rate_limit_error` (retries exhausted via `CLAUDE_CODE_MAX_RETRIES=1`) → real StopFailure `error="rate_limit"` → real `over-limit-emit.sh` stamp with the reset time parsed from the notice → production `pane-state.sh` `over-limit` → watcher emit-gate hold → real Stop-hook clear → wake flush. `pretooluse-hook` is the GUIDE-2d hook-contract test: real claude booted with a `--settings`-wired **PreToolUse** hook (via the `CCH_SETTINGS` override) → mock `tool_use` turn → real Bash tool call → assert `hook_event_name=PreToolUse`, `tool_name=Bash`, and an intact `.tool_input.command`, the exact fields `monitor/hooks/gh-write-guard.sh` and `bash-footgun-guard.sh` parse. It ships two negative controls (a hooks-stripped arm that must NOT fire, and a doctored-payload arm proving the field extractor is not vacuous) so a green result is not decorative. `trust-dialog` is the structural select-dialog arm (<your-org>/nexus-code#896): the workspace-trust dialog used to classify `state=empty` — "don't know yet" — so nothing unstuck a worker that would never proceed, and 2.1.232 made that every nested-repo spawn. It un-seeds `hasTrustDialogAccepted` (the ONE key `_lib.sh` seeds to skip the gate), asserts the production classifier reports `blocked` + `overlay=workspace-trust`, carries a trusted control arm that must reach idle, and re-derives `monitor/watcher/fixtures/blocked-workspace-trust-realmodel.ansi` from the live binary so the committed capture cannot rot into fiction. It exercises the pinned version, not just a staged candidate: 2.1.232 changed WHEN the dialog appears, not WHAT it renders. The error control-knob also accepts a `headers` map; note CC's subscription unified-rate-limit headers are OAuth-gated and inert under the harness's bearer auth (see the scenario header). |
+| `../test-cch-launch-string.sh` | Hermetic proof that `cch_launch_cmd` — the one launch-string builder, with the `CCH_SKIP_PERMISSIONS` knob — leaves the default launch string, and every pre-existing env knob, byte-for-byte unchanged against the pre-fold builder read from git, plus the whitelist of files allowed to build a launch string at all. No tmux, no binary. |
+| `../test-cch-permission-dialog.sh` | Hermetic suite for the permission-dialog assertion. Mostly negative controls: idle REPL, trust dialog, chip bar, prose, chevron-stripped frame. |
+| `../watcher/test-integration/test-realmodel-*.sh` | The scenarios. **`paste-held`** (added by `<your-org>/nexus-code#1591`, not in the count that follows) is the first on the DELIVERY axis: it evals production `_paste_to_target_unlocked` out of `main.sh` and drives it, through `monitor/_paste-deliver.sh`, into the real binary with emit-shaped bodies, asserting the version- and flag-agnostic property `reported delivered ==> a request reached the mock AND the transcript recorded it` — arms: ASCII control, a body the 2.1.277 review step HOLDS, a body normalised before the paste, a paste into a BUSY pane, and a negative control with the Enter withheld. The review step is armed under this mock because its gating flag `tengu_tranquil_cloud` has a client default of TRUE. `CCH_SUBJECT_MON=<tree>/monitor` aims the driven code at another checkout, which is how it is shown RED on the pre-fix base. (Ten on disk at `a3177ef6`: `idle-busy`, `blocked-question`, `autosuggest`, `long-exchange`, **`apispoof`**, **`overlimit`**, **`pretooluse-hook`**, **`trust-dialog`**, **`trust-sandboxed-env`**, **`vimode`** — of which `long-exchange` and `apispoof` are the two `exempt` rows in `gate-coverage.tsv`; the other eight are `gated`). Auto-discovered by `run-tests.sh`; gated on `RUN_CC_HARNESS=1`. `apispoof` is the end-to-end stall-detection test: real claude → mock 529/404 → real StopFailure → real `turn-failure-emit.sh` marker → real watcher classifier → `interrupted` + recovery verb → real resume that completes when the mock recovers. `overlimit` is the usage-limit chain (2026-07-14 incident): real claude → mock 429 `rate_limit_error` (retries exhausted via `CLAUDE_CODE_MAX_RETRIES=1`) → real StopFailure `error="rate_limit"` → real `over-limit-emit.sh` stamp with the reset time parsed from the notice → production `pane-state.sh` `over-limit` → watcher emit-gate hold → real Stop-hook clear → wake flush. `pretooluse-hook` is the GUIDE-2d hook-contract test: real claude booted with a `--settings`-wired **PreToolUse** hook (via the `CCH_SETTINGS` override) → mock `tool_use` turn → real Bash tool call → assert `hook_event_name=PreToolUse`, `tool_name=Bash`, and an intact `.tool_input.command`, the exact fields `monitor/hooks/gh-write-guard.sh` and `bash-footgun-guard.sh` parse. It ships two negative controls (a hooks-stripped arm that must NOT fire, and a doctored-payload arm proving the field extractor is not vacuous) so a green result is not decorative. `trust-dialog` is the structural select-dialog arm (<your-org>/nexus-code#896): the workspace-trust dialog used to classify `state=empty` — "don't know yet" — so nothing unstuck a worker that would never proceed, and 2.1.232 made that every nested-repo spawn. It un-seeds `hasTrustDialogAccepted` (the ONE key `_lib.sh` seeds to skip the gate), asserts the production classifier reports `blocked` + `overlay=workspace-trust`, carries a trusted control arm that must reach idle, and re-derives `monitor/watcher/fixtures/blocked-workspace-trust-realmodel.ansi` from the live binary so the committed capture cannot rot into fiction. It exercises the pinned version, not just a staged candidate: 2.1.232 changed WHEN the dialog appears, not WHAT it renders. The error control-knob also accepts a `headers` map; note CC's subscription unified-rate-limit headers are OAuth-gated and inert under the harness's bearer auth (see the scenario header). Ported from `jacob-greene/nexus` and gated: **`permission-dialog`** (a worker booted with `CCH_SKIP_PERMISSIONS=0` paints real Write and Edit permission dialogs; pane-state must classify both `blocked`), **`vipaste`** (VI-safe paste, GUIDE 2c: production respawn and follow-up pastes into a NORMAL-mode box) and **`hooks`** (GUIDE 2d: `UserPromptSubmit` / `PreToolUse` / `Stop` fire, matcher alternation selects, `PreToolUse` exit 2 blocks). |
 
 ## Injectable control — "a pipe we can inject text into"
 
@@ -148,6 +150,14 @@ fragility). Schema (all keys optional):
 RUN_CC_HARNESS=1 monitor/watcher/run-tests.sh --filter realmodel
 RUN_CC_HARNESS=1 bash monitor/watcher/test-integration/test-realmodel-idle-busy.sh
 
+# the hermetic suites (no tmux, no binary, no mock — run anywhere):
+bash monitor/test-cch-launch-string.sh
+bash monitor/test-cch-permission-dialog.sh
+
+# the permission-dialog scenario (boots a worker that PROMPTS):
+RUN_CC_HARNESS=1 \
+  bash monitor/watcher/test-integration/test-realmodel-permission-dialog.sh
+
 # live demo you can attach to and click through:
 monitor/cc-harness/demo.sh
 tmux -L ccdemo attach -t cc-demo      # ↑/↓ + Enter on the menu
@@ -155,8 +165,9 @@ monitor/cc-harness/demo.sh --stop
 ```
 
 Requirements: `node` (the real binary is a node program), `python3`,
-`tmux`, `jq`, and a resolvable claude binary (the project-local install,
-or `CLAUDE_BIN`). Missing any → the scenarios self-skip cleanly.
+`tmux`, `jq`, and a resolvable claude binary (`CLAUDE_BIN`, else whatever
+`monitor/_claude-bin.sh` resolves: config `nexus.claude_bin`, the
+project-local install, then `claude` on PATH). Missing any → the scenarios self-skip cleanly.
 
 **Isolation.** Every run uses its own tmux socket (`-L cch-…` / `-L
 ccdemo`), never the default session the live watcher scans. Test runs
@@ -295,6 +306,93 @@ If **red**: do not promote; inspect which scenario failed — a renderer
 regression means `pane-state.sh` needs a matching detector update (and a
 new fixture captured from the candidate) before the bump is safe.
 
+### The trusted-cwd blind spot (closed 2026-08-14)
+
+`cch_setup` pre-seeds `projects.<CCH_WORKDIR>.hasTrustDialogAccepted =
+true` for the exact cwd every scenario then boots in — a deliberate
+first-run-gate skip, but it also means no scenario could observe a
+release changing **which** directories are trusted. cc **2.1.232** did
+exactly that ("each repository now requires its own trust
+confirmation", ending trust inheritance for nested repositories), which
+strands every nexus worker: they all spawn into `work/<project>/`, a
+nested repo under the nexus root repo. The gate ran GREEN 4/4 on a
+candidate that could not start a single worker.
+
+`test-realmodel-trust-dialog.sh` closes it by un-seeding that key and
+asserting the dialog classifies `blocked` + `overlay=workspace-trust`
+(not the retire-safe `empty`), and `test-realmodel-trust-sandboxed-env.sh`
+pins the `CLAUDE_CODE_SANDBOXED=1` prevention every spawn launcher
+relies on.
+
+The general lesson for future scenarios: **anything the harness
+pre-seeds to skip a first-run gate is a surface the harness cannot
+regress-test.** When a changelog entry touches one of those gates,
+un-seed it in a purpose-built scenario.
+
+### The suppressed-dialog blind spot (closed 2026-09-10)
+
+The same lesson, one layer down. Every scenario booted with
+`--dangerously-skip-permissions`, and that flag is exactly what
+suppresses Claude Code's **tool-permission dialog**. So no scenario
+could paint one, and the detector that classifies one could not be
+regression-tested end to end. The flag also sat inside a single
+`printf -v` statement, so a scenario that wanted to drop it had to copy
+the whole launch string. Two agents did that on 2026-09-09.
+
+Three things close it (`jacob-greene/nexus#158`):
+
+| Piece | What it is |
+|---|---|
+| `CCH_SKIP_PERMISSIONS` | Env knob read by `cch_launch_cmd`. Set it to `0` and the launch string omits `--dangerously-skip-permissions`. Any other value, or unset, keeps the flag. `cch_boot_prompting_worker` is a one-line wrapper that sets it. |
+| `cch_boot_worker <name> [settings-file] [workdir]` | The workdir is now the third argument; pass `""` as the settings file to keep the renderer path. A fixed cwd was the other reason a scenario copied the launch string. |
+| `cch_has_permission_dialog` / `cch_assert_permission_dialog` / `cch_wait_permission_dialog` | The dialog assertion. Any scenario can use it. |
+
+**The default launch string does not change.**
+`monitor/test-cch-launch-string.sh` proves that by measurement, not by
+assertion: it reads the pre-fold builder (the inline `printf -v launch`
+in `cch_boot_worker`) out of git, feeds the old and new builders the
+same inputs — every pre-existing env knob included — and compares byte
+for byte. It also holds the whitelist of
+files allowed to build a launch string, so a new copy fails in the fast
+test loop.
+
+**What the dialog assertion keys on**, and why not the obvious thing. It
+ignores the option-2 text (`Yes, allow all edits during this session
+(shift+tab)`) because that literal moved between cc 2.1.220 and 2.1.267,
+and the same instability broke the trust detector at 2.1.260. It ignores
+the question literal too, because that is the thing under test:
+`pane-state.sh` once carried exactly one and therefore missed both
+file-edit shapes. It requires an option row `1. Yes`, a numbered decline row
+`N. No`, both footer phrases `Esc to cancel` and `Tab to amend` (matched
+separately, so a separator change cannot silently disable it), and a
+chevron on a numbered option row as the liveness leg. The `Tab to amend`
+leg is what separates it from the folder-trust dialog.
+
+The legs are **co-located**, not matched independently across the frame.
+`Esc to cancel` is the anchor; the option rows and the chevron must sit
+in the eight rows **above** it. Frame-wide matching was a false-positive
+hole, found by the skeptic on `jacob-greene/nexus#158`: a transcript quoting the dialog
+prose satisfies the option rows and both footer phrases on its own, so
+any unrelated live chevron row in the same 25-row capture — an
+AskUserQuestion menu, say — completed the match with no dialog present.
+Requiring the option rows above the anchor closes it, because a menu
+drawn below a quoted footer cannot lend its chevron. Both shapes are
+regression fixtures in the hermetic suite.
+
+`monitor/test-cch-permission-dialog.sh` is the hermetic suite for it.
+Most of it is negative: an idle REPL, the trust dialog, an
+AskUserQuestion chip bar, prose, and a dialog frame with the chevron
+stripped all have to be rejected. An assertion only ever run against
+frames that do carry the dialog is itself a vacuous control.
+
+**`test-realmodel-permission-dialog.sh` gates on it.** It paints both
+dialog shapes and reads `pane-state.sh`, which must answer `blocked`.
+It first shipped with an expected-fail marker, because pane-state then
+answered `empty` — the state `retire-preflight.sh` reads as safe to
+kill (`jacob-greene/nexus#157`). pane-state's structural select-dialog
+arm (`overlay=dialog`) now classifies both shapes, measured on Claude
+Code 2.1.280, so the marker is gone and the scenario is in `gate.sh`.
+
 ## What's NOT here yet (follow-ups)
 
 - **Sticky-state → unstick / respawn** end-to-end: the `hang` mode is the
@@ -306,11 +404,31 @@ new fixture captured from the candidate) before the bump is safe.
   so the harness also exercises the heartbeat path. PARTIALLY DONE:
   `cch_boot_worker` now honours a `CCH_SETTINGS` env override (plus
   `CCH_EXTRA_ENV`), and `test-realmodel-pretooluse-hook.sh` uses it to
-  pin the **PreToolUse** payload contract. Still hook-free by default,
-  and still uncovered: `PostToolUse`, `Notification`,
-  `PermissionRequest`, `UserPromptSubmit`, and the `Stop` heartbeat stamp
-  itself (`test-realmodel-overlimit.sh` covers `Stop`/`StopFailure` only
-  on the over-limit path).
+  pin the **PreToolUse** payload contract. `test-realmodel-hooks.sh`
+  wires marker hooks the same way and pins that `UserPromptSubmit`,
+  `PreToolUse` and `Stop` still FIRE and that a `PreToolUse` exit 2 still
+  blocks the call. Still hook-free by default, and still uncovered:
+  `PostToolUse` and `Notification` as events in their own right,
+  `PermissionRequest`, and the `Stop` heartbeat stamp itself — the hook
+  scenarios wire their own marker hooks rather than the production
+  settings file (`test-realmodel-overlimit.sh` covers `Stop`/`StopFailure`
+  only on the over-limit path).
+- **The follow-up path's insert-mode guard.** `test-realmodel-vipaste.sh`
+  drives `monitor/paste-followup.sh`, but it cannot pin that script's
+  `i BSpace` guard: `paste-buffer -p` wraps the bytes in bracketed-paste
+  markers and Claude Code 2.1.273 takes them as literal text in any VI
+  mode, so the guard is inert on that path and removing it leaves the
+  scenario green (measured). The scenario pins the PROPERTY instead —
+  a bracketed paste lands literally with no guard — so a release that
+  changes it turns the gate red. The guard itself is pinned hermetically
+  by `monitor/watcher/test-paste-followup.sh`, which asserts it is sent
+  and precedes the paste.
+- **The follow-up path's submission confirmation.**
+  `monitor/paste-followup.sh` confirms a submit against the target's
+  heartbeat and session transcript. A harness window has neither, so the
+  scenario drives the paste and asserts the submit itself, and the
+  script reports `unconfirmed` (rc 3). Seeding a heartbeat and a
+  transcript would let the gate cover that logic too.
 - **FIFO injection** mode for live byte-streaming, in addition to the
   control file.
 - **Live autosuggest emission.** `test-realmodel-autosuggest.sh` asserts the

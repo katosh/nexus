@@ -24,6 +24,24 @@
 #     issue body (preserves prefix + suffix); empty body input → die;
 #     missing markers → die; cache file mirrors new middle; freshness
 #     timestamp file written under $STATE_DIR.
+#
+# Size budget (jacob-greene/nexus, dashboard-bound): the dashboard grew
+# unbounded to 213 KB / 195 lines because nothing checked it at write
+# time. DASH_MAX_* in monitor/ng is the check; these tests pin its
+# asymmetry and its accounting:
+#   _dashboard_stats_tsv — per-section bytes/lines/entries/largest-entry;
+#     entries = top-level list items AND markdown table rows (the shape
+#     `## In-flight` is actually written in), separator rows excluded;
+#     a multi-line entry is charged its continuation lines.
+#   cmd_dashboard_validate — HARD failure (exit 1) on any budget breach,
+#     each DASH_MAX_* rule isolated by a fixture that trips only it.
+#   cmd_dashboard_put — LOUD warning, never blocks: an operator must be
+#     able to push a status update in a hurry. Body lands intact.
+#   cmd_dashboard_get — default stdout stays byte-compatible (warning is
+#     stderr-only); `--stat` prints the breakdown and NEVER the body,
+#     which is the context blowout the flag exists to prevent.
+#   Every breach message carries the REMEDY (prune to live windows,
+#     archive the old body), not merely the number.
 
 set -uo pipefail
 
@@ -1007,6 +1025,382 @@ assert_contains "#1136 …and RELAYS the client's own diagnostic" \
 assert_contains "#1136 CONTROL: a genuinely empty body is still called that" \
     "$_d1136_empty" "has empty body"
 
+# ---- size-budget fixtures ----------------------------------------------
+#
+# Each fixture carries all six required sections so the ONLY thing that
+# can fail is the size budget — that isolation is what makes the
+# assertions below meaningful. Each trips exactly one DASH_MAX_* rule.
+
+# (a) too many entries in one section: 30 > DASH_MAX_SECTION_ENTRIES (24),
+#     while section bytes stay well under DASH_MAX_SECTION_BYTES.
+many_entries_dash="$WORK/many-entries-dash.md"
+{
+    printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\n'
+    for _i in $(seq 1 30); do printf -- '- window w%02d · topic · busy\n' "$_i"; done
+    printf '## Awaiting operator\nx\n## Recent landings\nx\n'
+} > "$many_entries_dash"
+
+# (b) one bullet with a long prose tail: > DASH_MAX_ENTRY_BYTES (800),
+#     while entry COUNT (1) and section bytes stay in budget. This is the
+#     shape the real runaway took — narrative hanging off a single entry.
+big_entry_dash="$WORK/big-entry-dash.md"
+{
+    printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\n'
+    printf -- '- window w01 · topic · busy\n'
+    for _i in $(seq 1 40); do
+        printf '  narrative line %02d padding padding padding padding\n' "$_i"
+    done
+    printf '## Awaiting operator\nx\n## Recent landings\nx\n'
+} > "$big_entry_dash"
+
+# (c) death by a thousand cuts: every section under its own byte budget,
+#     but the total exceeds DASH_MAX_BYTES (12000). Prose only, so the
+#     entry rules cannot fire.
+total_bytes_dash="$WORK/total-bytes-dash.md"
+: > "$total_bytes_dash"
+for _s in "## Identity" "## Infra" "## Services" "## In-flight" \
+          "## Awaiting operator" "## Recent landings"; do
+    printf '%s\n' "$_s" >> "$total_bytes_dash"
+    for _i in $(seq 1 40); do
+        printf 'prose line %02d padding padding padding padding padding padding\n' \
+            "$_i" >> "$total_bytes_dash"
+    done
+done
+
+# ---- Test 20: validate — oversize body → exit 1 + actionable advice ----
+
+echo '=== ng dashboard validate (too many entries) → exit 1, names the rule ==='
+run_ng out err rc dashboard validate --body-file "$many_entries_dash"
+assert_eq        "exit 1 on entry-count breach"      "$rc" "1"
+assert_contains  "stderr names the size budget"      "$err" "over size budget"
+assert_contains  "names the offending section"       "$err" "## In-flight has 30 entries"
+# The warning must say what to DO, not merely that a number is large.
+assert_contains  "advice: prune to live windows"     "$err" "tmux list-windows"
+assert_contains  "advice: history belongs in reports" "$err" "ng report-init"
+assert_contains  "advice: archive before pruning"    "$err" "ng upload"
+assert_contains  "advice: where to retune"           "$err" "DASH_MAX_"
+# Schema is intact, so the missing-section path must NOT fire.
+assert_not_contains "no false missing-section report" "$err" "missing required section"
+
+echo '=== ng dashboard validate (one huge entry) → exit 1, entry-bytes rule ==='
+run_ng out err rc dashboard validate --body-file "$big_entry_dash"
+assert_eq        "exit 1 on entry-bytes breach"      "$rc" "1"
+assert_contains  "names single-entry byte breach"    "$err" "## In-flight has a single entry of"
+# Multi-line bullets are charged their full weight — the count rule must
+# not fire on a single bullet, proving the bytes came from continuation.
+assert_not_contains "entry COUNT rule stays quiet"   "$err" "entries (budget"
+
+echo '=== ng dashboard validate (sections small, total large) → exit 1 ==='
+run_ng out err rc dashboard validate --body-file "$total_bytes_dash"
+assert_eq        "exit 1 on total-bytes breach"      "$rc" "1"
+assert_contains  "names the whole-dashboard budget"  "$err" "whole dashboard is"
+# Per-section rules must stay quiet: this fixture is death by a thousand cuts.
+assert_not_contains "no per-section byte breach"     "$err" "is 4"
+
+# (d) ONE section over DASH_MAX_SECTION_BYTES (4000) while the whole body
+#     stays under DASH_MAX_BYTES (12000) and no entry rule can fire (prose
+#     only, no list items or table rows). Without this fixture the
+#     section-bytes axis is unasserted in the positive direction — raising
+#     the constant to 40000, or deleting its branch outright, left the
+#     suite green. Caught by the skeptic pass on jacob-greene/nexus#36.
+one_big_section_dash="$WORK/one-big-section-dash.md"
+{
+    printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\n'
+    # ~60 chars x 90 lines = ~5.4 KB in this section; total stays ~5.5 KB.
+    for _i in $(seq 1 90); do
+        printf 'prose line %02d padding padding padding padding padding\n' "$_i"
+    done
+    printf '## Awaiting operator\nx\n## Recent landings\nx\n'
+} > "$one_big_section_dash"
+
+echo '=== ng dashboard validate (one fat section, small total) → exit 1 ==='
+run_ng out err rc dashboard validate --body-file "$one_big_section_dash"
+assert_eq        "exit 1 on section-bytes breach"    "$rc" "1"
+assert_contains  "names the section byte breach"     "$err" "## In-flight is 4873 bytes (budget 4000)"
+# Isolation: the total is well under budget and there are no entries at all,
+# so no other rule may fire.
+assert_not_contains "total-bytes rule stays quiet"   "$err" "whole dashboard is"
+assert_not_contains "entry rules stay quiet"         "$err" "entries (budget"
+assert_not_contains "entry-bytes rule stays quiet"   "$err" "single entry of"
+
+# (e) the real format: `## In-flight` is written as a markdown TABLE, so
+#     the entry rules must count table rows or they are dead code on the
+#     one section that actually ran away. 30 data rows > 24.
+table_rows_dash="$WORK/table-rows-dash.md"
+{
+    printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\n'
+    printf '| Window | State | Work |\n|---|---|---|\n'
+    for _i in $(seq 1 30); do printf '| `w%02d` | busy | topic |\n' "$_i"; done
+    printf '## Awaiting operator\nx\n## Recent landings\nx\n'
+} > "$table_rows_dash"
+
+echo '=== ng dashboard validate (30-row In-flight table) → exit 1 on entries ==='
+run_ng out err rc dashboard validate --body-file "$table_rows_dash"
+assert_eq        "exit 1 on table-row entry breach"  "$rc" "1"
+# 30 data rows + 1 header row = 31; the `|---|` separator must NOT count.
+assert_contains  "counts table rows, not separator"  "$err" "## In-flight has 31 entries"
+
+echo '=== ng dashboard validate (3-row In-flight table) → exit 0 ==='
+small_table_dash="$WORK/small-table-dash.md"
+{
+    printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\n'
+    printf '| Window | State | Work |\n|---|---|---|\n'
+    for _i in 1 2 3; do printf '| `w%02d` | busy | topic |\n' "$_i"; done
+    printf '## Awaiting operator\nx\n## Recent landings\nx\n'
+} > "$small_table_dash"
+run_ng out err rc dashboard validate --body-file "$small_table_dash"
+assert_eq        "a live-windows-sized table passes" "$rc" "0"
+
+# ---- Test 20c: entry budget must not fire on legitimate content --------
+#
+# Calibration regression guard, BOTH directions. DASH_MAX_ENTRY_BYTES was
+# first set to 800 from a healthy-snapshot measurement alone, and fired on a
+# NORMAL `## Awaiting operator` item — a decision stated with enough context
+# for the operator to act (907 bytes observed live). A budget that fires on
+# legitimate content trains the reader to ignore the warning, which is the
+# exact failure that let the dashboard reach 213 KB.
+#
+# It now sits at 1500. There is NO clean gap between the two populations:
+# the 213 KB body's 168 entries run continuously from 99 to 9363 (median
+# 1058), with 61 of them between 907 and 1500. So the value is set from the
+# legitimate side — clear the observed max (907) with margin — and
+# sanity-checked from the runaway side, where it still fires on 41 of 168.
+# Both edges are pinned below, because the fix for a false positive is to
+# raise the number and the next person raising it should see both effects.
+
+echo '=== realistic operator-decision entry (~900 B) → NO breach ==='
+realistic_dash="$WORK/realistic-dash.md"
+{
+    printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\nx\n'
+    printf '## Awaiting operator\n'
+    printf -- '- **Decision needed** — whether to adopt the proposed threshold.\n'
+    for _i in $(seq 1 14); do
+        printf '  - context line %02d: the tradeoff, the evidence, the ask\n' "$_i"
+    done
+    printf '## Recent landings\nx\n'
+} > "$realistic_dash"
+# Sanity-check the fixture really is in the ~900-byte band it claims to model.
+realistic_entry=$(awk '/^- \*\*Decision/,/^## Recent/' "$realistic_dash" | grep -vc '^## Recent')
+realistic_bytes=$(awk '/^- \*\*Decision/{f=1} /^## Recent/{f=0} f' "$realistic_dash" | wc -c)
+if (( realistic_bytes >= 800 && realistic_bytes <= 1100 )); then
+    printf '  PASS: fixture entry is %s bytes (models the observed 907)\n' "$realistic_bytes"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: fixture entry %s bytes, outside the 800-1100 band it models\n' \
+        "$realistic_bytes" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+run_ng out err rc dashboard validate --body-file "$realistic_dash"
+assert_eq        "legitimate entry does NOT breach"  "$rc" "0"
+assert_not_contains "no entry-bytes false positive"  "$err" "single entry of"
+
+# The other edge: an entry the size of the largest in `## Recent landings`
+# (1710 bytes) must still trip the rule. That figure is the biggest entry in
+# that section of the runaway body, NOT a floor over runaway entries — the
+# archive's entries go down to 99 bytes. It is pinned here as a
+# representative case so a future false-positive fix cannot raise the
+# threshold past the range where real bloat lives.
+echo '=== bloated entry (~1710 B, `## Recent landings` max) → still breaches ==='
+bloated_entry_dash="$WORK/bloated-entry-dash.md"
+{
+    printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\nx\n'
+    printf '## Awaiting operator\nx\n'
+    printf '## Recent landings\n'
+    printf -- '- **PR #123** — landed; what follows is the narrative that should\n'
+    for _i in $(seq 1 27); do
+        printf '  have gone in a report instead of the dashboard, line %02d pad\n' "$_i"
+    done
+} > "$bloated_entry_dash"
+floor_bytes=$(awk '/^- \*\*PR #123/{f=1} f' "$bloated_entry_dash" | wc -c)
+if (( floor_bytes >= 1650 && floor_bytes <= 1900 )); then
+    printf '  PASS: fixture entry is %s bytes (models the 1710-byte case)\n' "$floor_bytes"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: fixture entry %s bytes, outside the 1650-1900 band it models\n' \
+        "$floor_bytes" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+run_ng out err rc dashboard validate --body-file "$bloated_entry_dash"
+assert_eq        "bloated entry still breaches"        "$rc" "1"
+assert_contains  "names the entry-bytes rule"        "$err" "single entry of"
+
+# ---- Test 20c2: duplicated heading cannot split a section past the budget
+
+echo '=== two `## In-flight` headings, 20 entries each → exit 1 ==='
+split_section_dash="$WORK/split-section-dash.md"
+{
+    printf '## Identity\nx\n## Infra\nx\n## Services\nx\n'
+    printf '## In-flight\n'
+    for _i in $(seq 1 20); do printf -- '- window a%02d · topic · busy\n' "$_i"; done
+    printf '## In-flight\n'
+    for _i in $(seq 1 20); do printf -- '- window b%02d · topic · busy\n' "$_i"; done
+    printf '## Awaiting operator\nx\n## Recent landings\nx\n'
+} > "$split_section_dash"
+run_ng out err rc dashboard validate --body-file "$split_section_dash"
+assert_eq        "exit 1 on duplicated heading"      "$rc" "1"
+# The duplicate check is upstream's `_dashboard_duplicate_headings`
+# (#1058). It is what closes the per-section budget evasion.
+assert_contains  "names the duplicated heading"      "$err" "## In-flight  (2x"
+# Each half is 20 entries — under the 24 budget — so WITHOUT the duplicate
+# check this body validates clean. That is the evasion being closed.
+assert_not_contains "entry-count rule alone stays quiet" "$err" "entries (budget"
+
+echo '=== duplicated heading on put → WARNS, still PATCHes ==='
+run_ng out err rc dashboard put --body-file "$split_section_dash"
+assert_eq        "exit 0 — warn, never block"        "$rc" "0"
+assert_contains  "stderr carries the dupe WARNING"   "$err" "duplicated section heading"
+calls=$(<"$CAPTURE")
+assert_contains  "PATCH still issued despite warn"   "$calls" "-X PATCH"
+
+echo '=== unique headings → no duplicate warning ==='
+run_ng out err rc dashboard validate --body-file "$complete_dash"
+assert_eq        "exit 0"                            "$rc" "0"
+assert_not_contains "no spurious duplicate report"   "$err" "duplicated section heading"
+
+# ---- Test 20d: put REFUSES a DUPLICATE marker in the overview body ----
+#
+# The budget check measures what you authored, not the merged body (which
+# also carries prose outside the markers). With a duplicate
+# NEXUS_DASHBOARD_START, `_splice_body` would emit the middle at every
+# marker, so what lands would be a multiple of what was measured. The
+# marker-uniqueness predicate (`_dashboard_marker_verdict`, #1118/#1058)
+# refuses that body before any PATCH, which closes the bypass.
+
+echo '=== duplicate START marker → put REFUSES before the PATCH ==='
+dup_marker_body="$WORK/dup-marker.body"
+printf 'prefix line\n<!-- NEXUS_DASHBOARD_START -->\nold middle\n<!-- NEXUS_DASHBOARD_START -->\nold middle again\n<!-- NEXUS_DASHBOARD_END -->\nsuffix line\n' \
+    > "$dup_marker_body"
+MOCK_BODY_FILE="$dup_marker_body" run_ng out err rc dashboard put --body-file "$complete_dash"
+assert_eq        "exit 1 — refused, not multiplied"  "$rc" "1"
+assert_contains  "names the marker count"            "$err" "2 START marker(s) and 1 END marker(s)"
+calls=$(<"$CAPTURE")
+assert_not_contains "NO PATCH on a duplicated marker" "$calls" "-X PATCH"
+
+echo '=== single marker pair → no marker refusal ==='
+run_ng out err rc dashboard put --body-file "$complete_dash"
+assert_eq        "exit 0"                            "$rc" "0"
+assert_not_contains "no spurious marker refusal"     "$err" "START marker(s)"
+
+# Regression: a --body-file whose last line has NO trailing newline.
+# `_splice_body`'s `print` re-terminates it, so the spliced middle comes
+# out exactly one byte longer than the input. The original size-comparison
+# detector fired here (116 in, 117 out) on a single-marker body that
+# spliced perfectly — a detector crying wolf on healthy input, which is
+# the failure mode this whole change set exists to prevent. Found by the
+# round-2 skeptic pass on jacob-greene/nexus#36.
+echo '=== body-file with no trailing newline → NO false warning ==='
+no_trailing_nl="$WORK/no-trailing-newline.md"
+printf '## Identity\nx\n## Infra\nx\n## Services\nx\n## In-flight\nx\n## Awaiting operator\nx\n## Recent landings\nlast line without a newline' \
+    > "$no_trailing_nl"
+# Confirm the fixture really is unterminated, else it tests nothing.
+if [[ $(tail -c1 "$no_trailing_nl" | wc -l) -eq 0 ]]; then
+    printf '  PASS: fixture last line is unterminated\n'
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: fixture ends with a newline — regression not exercised\n' >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+run_ng out err rc dashboard put --body-file "$no_trailing_nl"
+assert_eq        "exit 0"                            "$rc" "0"
+assert_not_contains "no false duplicate-marker refusal" "$err" "START marker(s)"
+assert_not_contains "no stale size-comparison warn"  "$err" "LARGER than what you passed"
+calls=$(<"$CAPTURE")
+assert_contains  "PATCH issued normally"             "$calls" "-X PATCH"
+
+# ---- Test 21: validate — in-budget body still passes, reports size -----
+
+echo '=== ng dashboard validate (complete + in budget) → exit 0, states size ==='
+run_ng out err rc dashboard validate --body-file "$complete_dash"
+assert_eq        "exit 0"                            "$rc" "0"
+assert_contains  "OK line still names section count" "$out" "all 6 required sections present"
+assert_contains  "size line also reports the budget" "$err" "(budget 12000)"
+
+echo '=== ng dashboard scaffold | validate → scaffold is within budget too ==='
+run_ng out err rc dashboard scaffold
+printf '%s\n' "$out" > "$WORK/scaffolded2.md"
+run_ng out2 err2 rc2 dashboard validate --body-file "$WORK/scaffolded2.md"
+assert_eq        "scaffold passes size budget"       "$rc2" "0"
+
+# ---- Test 22: put — oversize WARNS but never blocks --------------------
+#
+# The non-negotiable half of the design: `put` must stay loud-but-permissive
+# so an operator can push a status update in a hurry. `validate` is the
+# hard gate; `put` is not.
+
+echo '=== ng dashboard put (oversize) → exit 0, WARNS, still PATCHes ==='
+run_ng out err rc dashboard put --body-file "$many_entries_dash"
+assert_eq        "exit 0 — warn, never block"        "$rc" "0"
+assert_contains  "stdout still prints the PATCH url" "$out" "https://mock.example/issues/37"
+assert_contains  "stderr carries the size WARNING"   "$err" "over size budget"
+assert_contains  "warn names the hard gate"          "$err" "ng dashboard validate"
+assert_contains  "warn carries the remedy"           "$err" "tmux list-windows"
+calls=$(<"$CAPTURE")
+assert_contains  "PATCH still issued despite warn"   "$calls" "-X PATCH"
+# And the body that landed is the one we handed it — no truncation.
+merged=$(jq -r '.body' < "$PATCH_BODY" 2>/dev/null || cat "$PATCH_BODY")
+assert_contains  "oversize body pushed intact"       "$merged" "window w30"
+
+echo '=== ng dashboard put (in budget) → no size warning at all ==='
+run_ng out err rc dashboard put --body-file "$complete_dash"
+assert_eq        "exit 0"                            "$rc" "0"
+assert_not_contains "no spurious size warning"       "$err" "over size budget"
+
+# ---- Test 23: get --stat — breakdown WITHOUT the body -------------------
+
+echo '=== ng dashboard get --stat → stats only, body suppressed ==='
+rm -rf "$WORK/state"
+run_ng out err rc dashboard get --stat
+assert_eq        "exit 0"                            "$rc" "0"
+assert_contains  "header reports total bytes"        "$out" "bytes"
+assert_contains  "table has an entries column"       "$out" "entries"
+assert_contains  "unheaded content shows as preamble" "$out" "(preamble)"
+assert_contains  "states the budget"                 "$out" "budget"
+assert_contains  "points at the cache file"          "$out" "dashboard.md"
+# THE POINT: the body must not reach stdout — that is the context blowout
+# `--stat` exists to prevent.
+assert_not_contains "body line 1 NOT printed"        "$out" "old middle line 1"
+assert_not_contains "body line 2 NOT printed"        "$out" "old middle line 2"
+# The cache is still written, so an agent can read the text deliberately.
+assert_file_exists "cache still written under --stat" "$WORK/state/dashboard.md"
+cached_middle=$(<"$WORK/state/dashboard.md")
+assert_contains  "cache holds the real body"         "$cached_middle" "old middle line 1"
+
+echo '=== ng dashboard get --bogus → exit 1, unknown flag ==='
+run_ng out err rc dashboard get --bogus
+assert_eq        "exit 1"                            "$rc" "1"
+assert_contains  "die names unknown flag"            "$err" "unknown flag: '--bogus'"
+
+# ---- Test 24: get (default) — stdout unchanged, warning on stderr -------
+#
+# Byte-compatibility for existing callers is the constraint: the size
+# warning goes to stderr ONLY, and stdout is the body exactly as before.
+
+echo '=== ng dashboard get (oversize body) → body on stdout, warn on stderr ==='
+oversize_full="$WORK/oversize-full.body"
+{
+    printf 'prefix line\n<!-- NEXUS_DASHBOARD_START -->\n'
+    cat "$many_entries_dash"
+    printf '<!-- NEXUS_DASHBOARD_END -->\nsuffix line\n'
+} > "$oversize_full"
+rm -rf "$WORK/state"
+MOCK_BODY_FILE="$oversize_full" run_ng out err rc dashboard get
+assert_eq        "exit 0 — get never blocks"         "$rc" "0"
+assert_contains  "stdout carries the body (first entry)" "$out" "window w01"
+assert_contains  "stdout carries the body (last entry)"  "$out" "window w30"
+assert_contains  "stdout keeps the section headings" "$out" "## In-flight"
+assert_not_contains "no prefix leak"                 "$out" "prefix line"
+# The warning is stderr-only, so stdout stays byte-compatible.
+assert_not_contains "warning NOT on stdout"          "$out" "over size budget"
+assert_contains  "warning IS on stderr"              "$err" "over size budget"
+assert_contains  "warn points at --stat"             "$err" "--stat"
+assert_contains  "warn carries the remedy"           "$err" "tmux list-windows"
+
+echo '=== ng dashboard get (in-budget body) → no warning on stderr ==='
+rm -rf "$WORK/state"
+run_ng out err rc dashboard get
+assert_eq        "exit 0"                            "$rc" "0"
+assert_contains  "stdout unchanged for small body"   "$out" "old middle line 1"
+assert_not_contains "no spurious size warning"       "$err" "over size budget"
 
 # ---- summary ------------------------------------------------------------
 

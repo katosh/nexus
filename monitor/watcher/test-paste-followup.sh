@@ -317,6 +317,19 @@ seq=$(cat "$ACTIONS")
 assert_contains "insert-mode guard sent"  "$seq" 'send-keys -t @3 i BSpace'
 assert_contains "buffer loaded FROM A FILE (#1590)" "$seq" 'load-buffer -b'
 assert_not_contains "payload is never an argv element (#1590)" "$seq" 'set-buffer'
+# ORDER, not just presence. A guard sent AFTER the paste switches the
+# box to insert mode too late to help, and a presence check cannot see
+# that. This is also the only place the guard is pinned at all on this
+# path: the cc-harness scenario cannot pin it, because a bracketed paste
+# arrives as literal text in any VI mode, so the guard is behaviourally
+# redundant against a live candidate (jacob-greene/nexus#208).
+guard_line=$(grep -n 'i BSpace' "$ACTIONS" | head -1 | cut -d: -f1)
+first_paste_line=$(grep -n 'paste-buffer' "$ACTIONS" | head -1 | cut -d: -f1)
+if [[ -n "$guard_line" && -n "$first_paste_line" ]] && (( guard_line < first_paste_line )); then
+    echo '  PASS: insert-mode guard precedes the paste'; PASS=$((PASS+1))
+else
+    echo '  FAIL: insert-mode guard does not precede the paste' >&2; FAIL=$((FAIL+1))
+fi
 assert_contains "buffer pasted to window" "$seq" '-t @3'
 assert_contains "Enter submits"           "$seq" 'send-keys -t @3 Enter'
 # Order: the stamp must precede any tmux action is enforced by code

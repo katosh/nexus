@@ -72,6 +72,24 @@ source "$SCRIPT_DIR/_log-mode.sh"
 # NEXUS_ROOT from its own path, so our cwd (the project dir) is irrelevant.
 [[ -f "$SCRIPT_DIR/locals-env.sh" ]] && . "$SCRIPT_DIR/locals-env.sh"
 
+# Dangling-uv-cache repair (jacob-greene/nexus#98). `locals/uv/cache` — the
+# cache the source above just pointed uv at — is a symlink into purgeable
+# scratch. A purge removes the target, leaves the symlink dangling, and every
+# uvx build then fails with a misleading `File exists (os error 17)`. That is
+# exactly the 2026-08-25 JupyterLab service outage.
+#
+# The repair belongs HERE as well as in bootstrap-recover, because the two
+# cover different paths. bootstrap-recover runs at COLD BOOT; this supervisor
+# also restarts warm, on its own, long after any recovery sweep — and a purge
+# can land in between. Without the guard on this path the restart policy
+# retries the identical `labsh start` against the identical broken symlink and
+# burns all three attempts, which is what happened in the incident.
+#
+# Sourcing only defines the function; the call site is in `_start_cycle`,
+# beside the other pre-start self-heals.
+# shellcheck source=uv-cache-guard.sh
+[[ -f "$SCRIPT_DIR/uv-cache-guard.sh" ]] && . "$SCRIPT_DIR/uv-cache-guard.sh"
+
 # ── in-UI Extension Manager + baseline labextensions (LABSH_WITH) ──────────
 # JupyterLab 4's Extension Manager (the puzzle-piece panel) shells out to `pip`
 # in the SERVER env to install extensions; a uvx-built server env has no pip, so
@@ -703,6 +721,28 @@ prune_phantom_runtime_records() {
     return 0
 }
 
+# Repair a purged uv cache target before starting (jacob-greene/nexus#98).
+#
+# Same class as the `labsh_dangling` self-heal just below it: a precondition
+# the start needs has been destroyed by something outside this supervisor, and
+# retrying the start without repairing it cannot succeed. A no-op (two stat
+# calls) in every healthy case, so it costs nothing per restart. It never
+# blocks the start: if the guard refuses or fails, it has already said why on
+# stderr, and we let `labsh start` run and fail with its own message rather
+# than invent a second failure path here.
+repair_uv_cache() {
+    declare -F nexus_uv_cache_guard >/dev/null 2>&1 || return 0
+    local cache="${UV_CACHE_DIR:-}" rc=0
+    [[ -n "$cache" ]] || return 0
+    nexus_uv_cache_guard "$cache" || rc=$?
+    case "$rc" in
+        10) log "repaired dangling uv cache symlink $cache (scratch was purged) before start" ;;
+        2)  log "REFUSED to repair uv cache $cache — see stderr; the start below will likely fail" ;;
+        3)  log "FAILED to repair uv cache $cache — see stderr; the start below will likely fail" ;;
+    esac
+    return 0
+}
+
 # Loop guard for the phantom-adopt retry (reset per start_server entry, NOT per
 # _start_cycle, so the single retry can never spin).
 PHANTOM_RETRY_ATTEMPTED=0
@@ -723,6 +763,7 @@ _start_cycle() {
     [[ "$port" =~ ^[0-9]+$ ]] || port=$(default_port)
     reap_port_orphan "$port"
     reap_stale_builds "$port"       # kill unfinished builds holding the uv lock (#33)
+    repair_uv_cache                 # recreate a purged uv cache target (jacob-greene/nexus#98)
     read_opts
     # Self-heal a wiped labsh binary BEFORE starting (incident #103, extended):
     # cover both the persistent-shim-with-missing-lib-target dangle case (#103)

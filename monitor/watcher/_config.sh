@@ -189,6 +189,55 @@ case "$MONITOR_FULL_STATE_RESET_STAMP_ON_EMIT" in true|false) ;; *) MONITOR_FULL
 # decision is never lost. false ⇒ pre-fix behaviour.
 MONITOR_PENDING_SKIP_DEAD_WINDOWS="${MONITOR_PENDING_SKIP_DEAD_WINDOWS:-$("$_cfg" monitor.pending_decisions.skip_dead_windows true)}"
 case "$MONITOR_PENDING_SKIP_DEAD_WINDOWS" in true|false) ;; *) MONITOR_PENDING_SKIP_DEAD_WINDOWS=true ;; esac
+# ---- full-state snapshot STAGING freshness (issue #14) -------------------
+#
+# The `--- workspace snapshot ---` body is produced by the ASYNC
+# `full_state_snap` task (it probes every worker pane, O(workers), so it
+# must not run in the heartbeat-bumping compose cycle — nexus-code#236) and
+# read from staging by compose_emit. Two knobs keep that hand-off honest.
+#
+# PRODUCER cadence. Was hard-coded equal to the emit interval (600s), which
+# is precisely why staging could be arbitrarily stale at emit time: two
+# independent same-period schedules drift to an arbitrary phase, so the
+# expected age of the staged body at emit was ~half a period (~300s) and the
+# worst case a full period. Rendering at a QUARTER of the emit interval
+# bounds the age at ~1/4 period. This — not the gate below — is what
+# actually shrinks the everyday exposure window; see the gate's own comment
+# in main.sh for why. Async and off the heartbeat path; at defaults this is
+# 4 renders per 600s against the 20 `idle_section` (30s) and 10
+# `over_limit_scan` (60s) already perform with the same per-pane probe, so
+# ~31 -> ~34, about +10% on that probe class. Renders cannot stack — the
+# scheduler holds an in-flight guard per task. Note the async watchdog
+# budget tracks the interval, so it drops 2400s -> 600s with this change;
+# a render exceeding that is killed as a hung task, which is the intent.
+MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS="${MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS:-$("$_cfg" monitor.full_state.snap_interval_seconds 0)}"
+[[ "$MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS=0
+if (( MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS == 0 )); then
+    # Derived default: emit_interval / 4, never tighter than 30s (the
+    # existing expensive-class floor set by `idle_section`).
+    MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS=$(( MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS / 4 ))
+    (( MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS < 30 )) && MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS=30
+fi
+# CONSUMER staleness gate. compose_emit refuses to serve a staged body older
+# than this and falls through to the (already wall-clock bounded) inline
+# re-render instead. Derived default = emit_interval / 2 = TWO producer
+# beats: the gate fires only when the async path has demonstrably missed a
+# beat, not merely because it is mid-cycle — so the inline re-render stays
+# the exception, not the rule.
+#
+# Corollary, stated plainly: because the producer runs at emit_interval/4,
+# essentially all NORMAL staleness falls below this threshold and this gate
+# does NOT fire. It is a producer-failure backstop, not the everyday catch.
+# The everyday catch is the row-count consistency check in compose_emit,
+# which is threshold-independent. Setting this to 0 disables the age gate
+# (pre-#14 behaviour: a staged body is served at any age) and logs a startup
+# line saying so; the row-count check and the footer annotation still apply.
+MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS="${MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS:-$("$_cfg" monitor.full_state.stage_max_age_seconds -1)}"
+[[ "$MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS" =~ ^-?[0-9]+$ ]] || MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS=-1
+if (( MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS < 0 )); then
+    MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS=$(( MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS / 2 ))
+    (( MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS < 60 )) && MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS=60
+fi
 # Worker-side heartbeat staleness window (issue #74). The per-spawn
 # Claude Code hooks write `monitor/.state/heartbeat/<window>.json`
 # on every tool call / notification / user-prompt submission;
@@ -268,6 +317,65 @@ MONITOR_COMMENT_SURFACE_INTERVAL_SECONDS="${MONITOR_COMMENT_SURFACE_INTERVAL_SEC
 # cache wholesale (every consumer forks — pre-#562 behaviour).
 MONITOR_PANE_CACHE_TTL_SECONDS="${MONITOR_PANE_CACHE_TTL_SECONDS:-$("$_cfg" monitor.pane_cache.ttl_seconds 90)}"
 [[ "$MONITOR_PANE_CACHE_TTL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_PANE_CACHE_TTL_SECONDS=90
+# Bounded comment resurfacing (issue #3). The emit cooldown above is a
+# RATE, not a cap: an unprocessed comment re-emits once per cooldown
+# forever (54 times in one day on 2026-07-31 for a single id), and each
+# repeat bypasses the content-hash dedup gate because it carries an
+# `id=` row. `resurface_max_repeats` caps the repeats and
+# `resurface_backoff_max_seconds` makes the interval between them
+# double, so a stuck item costs a geometric rather than linear number
+# of full-price wakes before it is dropped and reported.
+MONITOR_RESURFACE_MAX_REPEATS="${MONITOR_RESURFACE_MAX_REPEATS:-$("$_cfg" monitor.resurface_max_repeats 4)}"
+[[ "$MONITOR_RESURFACE_MAX_REPEATS" =~ ^[0-9]+$ ]] || MONITOR_RESURFACE_MAX_REPEATS=4
+MONITOR_RESURFACE_BACKOFF_MAX_SECONDS="${MONITOR_RESURFACE_BACKOFF_MAX_SECONDS:-$("$_cfg" monitor.resurface_backoff_max_seconds 3600)}"
+[[ "$MONITOR_RESURFACE_BACKOFF_MAX_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_RESURFACE_BACKOFF_MAX_SECONDS=3600
+export MONITOR_RESURFACE_MAX_REPEATS MONITOR_RESURFACE_BACKOFF_MAX_SECONDS
+
+# Context-budget session rotation (issue #1). Every assistant message
+# re-reads the whole conversation, so an orchestrator that drifts to the
+# 1M ceiling pays ~10x per wake what it paid at 100k. Above
+# `orchestrator_tokens` the watcher renders a `--- rotate session ---`
+# directive telling the orchestrator to hand off (report) and respawn
+# fresh. Render-only: it never triggers an emit of its own.
+# `limit_tokens` is presentation only (the `pct=` figure).
+MONITOR_CONTEXT_ROTATION_ENABLED="${MONITOR_CONTEXT_ROTATION_ENABLED:-$("$_cfg" monitor.context_rotation.enabled true)}"
+[[ "$MONITOR_CONTEXT_ROTATION_ENABLED" == "false" ]] || MONITOR_CONTEXT_ROTATION_ENABLED=true
+MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS="${MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS:-$("$_cfg" monitor.context_rotation.orchestrator_tokens 250000)}"
+[[ "$MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS=250000
+MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS="${MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS:-$("$_cfg" monitor.context_rotation.limit_tokens 1000000)}"
+[[ "$MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS" =~ ^[0-9]+$ ]] && (( MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS > 0 )) || MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS=1000000
+# Orchestrator context PROBE cadence + freshness. The measurement is an
+# async scheduler task (a bounded tail+jq over the largest transcript in
+# the workspace: 0.63s bounded, 1.69s on the full-scan fallback at
+# 59MB); the compose path only reads the small file it writes.
+# `probe_stale_seconds` bounds how old that reading may be before the
+# emit section ignores it, so a reading from before a rotation that
+# already happened cannot nag the fresh session into rotating again.
+MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS="${MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS:-$("$_cfg" monitor.context_rotation.probe_interval_seconds 120)}"
+[[ "$MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS=120
+MONITOR_CONTEXT_PROBE_STALE_SECONDS="${MONITOR_CONTEXT_PROBE_STALE_SECONDS:-$("$_cfg" monitor.context_rotation.probe_stale_seconds 600)}"
+[[ "$MONITOR_CONTEXT_PROBE_STALE_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_PROBE_STALE_SECONDS=600
+
+# Worker half (issue #2). `worker_tokens` is the threshold the worker
+# floor tells workers to self-rotate at AND the one the watcher's
+# `context_scan` task flags on. `scan_interval_seconds` is that scan's
+# cadence (0 disables it); `scan_stale_seconds` bounds how old the
+# resulting TSV may be before the emit section ignores it rather than
+# nagging on numbers that may predate a rotation that already happened.
+MONITOR_CONTEXT_ROTATION_WORKER_TOKENS="${MONITOR_CONTEXT_ROTATION_WORKER_TOKENS:-$("$_cfg" monitor.context_rotation.worker_tokens 250000)}"
+[[ "$MONITOR_CONTEXT_ROTATION_WORKER_TOKENS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_ROTATION_WORKER_TOKENS=250000
+MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS="${MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS:-$("$_cfg" monitor.context_rotation.scan_interval_seconds 300)}"
+[[ "$MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS=300
+MONITOR_CONTEXT_SCAN_STALE_SECONDS="${MONITOR_CONTEXT_SCAN_STALE_SECONDS:-$("$_cfg" monitor.context_rotation.scan_stale_seconds 1800)}"
+[[ "$MONITOR_CONTEXT_SCAN_STALE_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_CONTEXT_SCAN_STALE_SECONDS=1800
+export MONITOR_CONTEXT_ROTATION_ENABLED \
+       MONITOR_CONTEXT_ROTATION_ORCHESTRATOR_TOKENS \
+       MONITOR_CONTEXT_ROTATION_LIMIT_TOKENS \
+       MONITOR_CONTEXT_PROBE_INTERVAL_SECONDS \
+       MONITOR_CONTEXT_PROBE_STALE_SECONDS \
+       MONITOR_CONTEXT_ROTATION_WORKER_TOKENS \
+       MONITOR_CONTEXT_SCAN_INTERVAL_SECONDS \
+       MONITOR_CONTEXT_SCAN_STALE_SECONDS
 # Content-hash dedup gate. Computed AFTER compose_report renders the
 # body and BEFORE paste_to_target: when the stable-content hash of
 # the candidate body matches a recently-emitted hash (ring, below)
@@ -990,6 +1098,7 @@ export MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED MONITOR_FULL_STATE_IDLE_BACKOFF_M
        MONITOR_FULL_STATE_RESTAT_WINDOWS MONITOR_FULL_STATE_RESET_STAMP_ON_EMIT \
        MONITOR_PENDING_SKIP_DEAD_WINDOWS
 export MONITOR_IDLE_THRESHOLD_SECONDS MONITOR_IDLE_CLOSE_HOURS MONITOR_IDLE_POOL_SPAWN_GRACE_SECONDS MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS MONITOR_FULL_STATE_SAFETY_FLOOR_SECONDS MONITOR_HEARTBEAT_STALENESS_SECONDS MONITOR_NOTIFICATIONS_LOG_MAX_BYTES \
+       MONITOR_FULL_STATE_SNAP_INTERVAL_SECONDS MONITOR_FULL_STATE_STAGE_MAX_AGE_SECONDS \
        MONITOR_EMIT_COOLDOWN_SECONDS MONITOR_EMIT_HISTORY_RETENTION_SECONDS \
        MONITOR_ALERT_EMIT_COOLDOWN_SECONDS \
        MONITOR_COMMENT_SURFACE_INTERVAL_SECONDS MONITOR_PANE_CACHE_TTL_SECONDS \

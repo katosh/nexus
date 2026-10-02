@@ -11,7 +11,11 @@
 #        `idle Ns` / `idle Nh NNm` / `idle-too-long` ages collapse,
 #        the `N awaiting-input` prelude scalar collapses to
 #        `awaiting-input` (issue #152 — the volatile delta that
-#        toggles 1↔0 every cycle a worker re-pings), and the trailing
+#        toggles 1↔0 every cycle a worker re-pings), the dead-window
+#        skeptic-pending row's `marker Ns old` / `marker NhNNm old`
+#        age collapses to `marker old` (issue #202 — the marker is
+#        never cleared automatically, so the row persists and its age
+#        advances on every poll), and the trailing
 #        `--- nexus-emit-sig <iso> <nonce> ---` footer is dropped.
 #   2. _compose_emit_should_bypass_dedup <body_file>
 #        Returns 0 (bypass) ONLY if the body carries an eligible
@@ -545,6 +549,80 @@ else
     printf '  FAIL: ring absent after a single record — the pipeline-pid regression\n' >&2
     FAIL=$(( FAIL + 1 ))
 fi
+
+# ---- 10. dead-window skeptic-pending marker age is volatile (jacob-greene/nexus#202) ----
+# The dead-window-skeptic-pending row carries the MARKER's age, and the
+# marker is not cleared automatically. So the row persists, and its age
+# advances every second. Left unstripped it makes the canonical snapshot
+# unique on every poll, which defeats both the dedup gate and the
+# full-state identity check for as long as one dead-window marker exists.
+#
+# The row has two renderers printing two different age forms from the
+# same field: the inline printf's `%ds` raw seconds, and the awk staging
+# renderer's fmt_age, which switches to `NhNNm` above one hour. Both
+# forms are asserted here, because stripping only one leaves the gate
+# defeated whenever the marker crosses an hour.
+echo '=== 10. dead-window marker age does not defeat the hash ==='
+rm -f "$EMIT_DEDUP_HASH_FILE" "$EMIT_DEDUP_TS_FILE" "$EMIT_DEDUP_RING_FILE" "$LOGFILE"
+unset MONITOR_EMIT_DEDUP_MAX_QUIET_SECONDS
+
+write_body_with_dead_window() {
+    local path="$1" ts="$2" nonce="$3" win="$4" age="$5"
+    cat > "$path" <<EOF
+=== nexus state changed at ${ts} (poll-full-state) ===
+*If unsure how to proceed: see CLAUDE.md.*
+workspace: 0 busy | 0 idle | 0 retained | 0 idle-too-long | 0 pane-absent | 0 over-limit | 0 orphan-async | 0 awaiting-input
+--- workspace snapshot ---
+  - ${win} dead-window-skeptic-pending (marker ${age} old; task=t1; window GONE — spawn the skeptic, waive, or \`ng skeptic close ${win}\`; marker NOT auto-cleared)
+(full snapshot; transitions only between snapshots)
+--- nexus-emit-sig ${ts} ${nonce} ---
+EOF
+}
+
+# Seconds form, as the inline printf renders it.
+write_body_with_dead_window "$body_a" "2026-09-22T22:10:00-07:00" "d10001" "ghost-w" "100s"
+write_body_with_dead_window "$body_b" "2026-09-22T22:10:01-07:00" "d10002" "ghost-w" "101s"
+hash_a=$(_compose_emit_stable_hash "$body_a")
+hash_b=$(_compose_emit_stable_hash "$body_b")
+assert_eq "marker age in seconds stripped from stable hash" "$hash_a" "$hash_b"
+
+# Hours form, as fmt_age renders it once the marker passes one hour.
+write_body_with_dead_window "$body_a" "2026-09-22T23:10:00-07:00" "d10003" "ghost-w" "2h05m"
+write_body_with_dead_window "$body_b" "2026-09-22T23:11:00-07:00" "d10004" "ghost-w" "2h06m"
+hash_c=$(_compose_emit_stable_hash "$body_a")
+hash_d=$(_compose_emit_stable_hash "$body_b")
+assert_eq "marker age in hours/minutes stripped from stable hash" "$hash_c" "$hash_d"
+
+# NEGATIVE CONTROL. The strip must remove the age and nothing else. A
+# different window in the same row is a different workspace state and
+# MUST still produce a distinct hash. Without this assertion a strip
+# that deleted the whole row would pass every assertion above.
+write_body_with_dead_window "$body_b" "2026-09-22T22:10:01-07:00" "d10005" "other-w" "100s"
+hash_e=$(_compose_emit_stable_hash "$body_b")
+assert_ne "a different dead window still hashes distinctly" "$hash_a" "$hash_e"
+
+# End to end through the gate: the age advancing alone must suppress.
+rm -f "$EMIT_DEDUP_HASH_FILE" "$EMIT_DEDUP_TS_FILE" "$EMIT_DEDUP_RING_FILE" "$LOGFILE"
+write_body_with_dead_window "$body_a" "2026-09-22T22:10:00-07:00" "d10006" "ghost-w" "100s"
+write_body_with_dead_window "$body_b" "2026-09-22T22:10:01-07:00" "d10007" "ghost-w" "101s"
+_compose_emit_apply_dedup "$body_a" "poll-full-state"; rc1=$?
+_compose_emit_apply_dedup "$body_b" "poll-full-state"; rc2=$?
+assert_rc "first dead-window emit surfaces" 0 "$rc1"
+assert_rc "marker age advancing alone suppresses" 1 "$rc2"
+
+# A genuine change — a second dead window appears — must still emit.
+cat > "$body_b" <<EOF
+=== nexus state changed at 2026-09-22T22:10:02-07:00 (poll-full-state) ===
+*If unsure how to proceed: see CLAUDE.md.*
+workspace: 0 busy | 0 idle | 0 retained | 0 idle-too-long | 0 pane-absent | 0 over-limit | 0 orphan-async | 0 awaiting-input
+--- workspace snapshot ---
+  - ghost-w dead-window-skeptic-pending (marker 102s old; task=t1; window GONE — spawn the skeptic, waive, or \`ng skeptic close ghost-w\`; marker NOT auto-cleared)
+  - other-w dead-window-skeptic-pending (marker 5s old; task=t2; window GONE — spawn the skeptic, waive, or \`ng skeptic close other-w\`; marker NOT auto-cleared)
+(full snapshot; transitions only between snapshots)
+--- nexus-emit-sig 2026-09-22T22:10:02-07:00 d10008 ---
+EOF
+_compose_emit_apply_dedup "$body_b" "poll-full-state"; rc3=$?
+assert_rc "a second dead window appearing still emits" 0 "$rc3"
 
 # ---- summary ---------------------------------------------------------------
 echo

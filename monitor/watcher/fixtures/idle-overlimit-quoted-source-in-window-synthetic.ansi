@@ -1,0 +1,13 @@
+[39m● Read the detector and the fixtures[0m
+     107:#   over-limit       - the canonical "You've hit your <flavor> limit ·
+      551 +#     You've hit your team's shared budget. Switch to another model to continue.
+      334 +    "You've hit your weekly limit · resets 3am (America/Los_Angeles)")
+  ⎿  echo "You've hit your team's shared budget. /model to switch models." \
+     - `You've hit your team's shared budget. /model to switch models.`
+     'You've hit your limit · resets 3am (America/Los_Angeles)'
+  ⍿  printf '%s' 'You've hit your limit · resets 3am (America/Los_Angeles)'
+[38;5;246m✻ Brewed for 8s[0m
+
+[38;5;244m─[0m
+[38;5;246m❯ [7m [0m[39m[49m
+[38;5;244m─[0m

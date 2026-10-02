@@ -348,6 +348,35 @@ RNTASK2=worker-recon-nudge2
 "$CHAN" reconcile "$RNTASK2" --grace 0 --interval 1 --max-iter 1 >/dev/null 2>&1
 assert_eq "reconcile: idle pane nudged (one paste)" "$(wc -l <"$PASTE_LOG" | tr -d ' ')" "1"
 
+# --- the nudge must not terminate reconcile (the #196 containment) ---
+# cmd_nudge ends ordinary states with `exit` (six sites) and with `die`
+# (five more). Called bare, either kills reconcile mid-loop, so reconcile
+# returns the NUDGE's status and its own fail-loud exit 6 never runs.
+# `|| true` cannot trap an exit; only the subshell can. These two probes
+# are the ones that fail when the subshell is reverted.
+#
+# Case 1 — the `exit 5` class: an unresolvable window makes the nudge
+# fail-safe skip. Reverted, reconcile returns 5 instead of 6.
+unset SKEPTIC_WINDOW_INDEX
+mk_panestate idle
+RNTASK3="worker-recon-nudge-unresolvable-$$"
+"$CHAN" init "$RNTASK3" >/dev/null
+"$CHAN" ask "$RNTASK3" still-open --message "never acked" >/dev/null
+"$CHAN" reconcile "$RNTASK3" --grace 0 --interval 1 --max-iter 1 >/dev/null 2>&1
+assert_eq "reconcile survives a skipping nudge -> rc 6 (not the nudge's 5)" "$?" "6"
+
+# Case 2 — the `die` class: an empty window dies inside cmd_nudge.
+# reconcile sends the nudge's stderr to /dev/null, so reverted this path
+# is exit 1 with NO output at all — a silent kill.
+export SKEPTIC_WINDOW_INDEX=7
+RNTASK4="worker-recon-nudge-die-$$"
+"$CHAN" init "$RNTASK4" >/dev/null
+"$CHAN" ask "$RNTASK4" still-open --message "never acked" >/dev/null
+recon4=$("$CHAN" reconcile "$RNTASK4" --window "" --grace 0 --interval 1 --max-iter 1 2>&1); rc=$?
+assert_eq "reconcile survives a dying nudge -> rc 6 (not die's 1)" "$rc" "6"
+assert_contains "reconcile still names the un-acked request after a dying nudge" \
+    "$recon4" "req-001-still-open.open.md"
+
 unset SKEPTIC_WINDOW_INDEX SKEPTIC_PASTE_BIN SKEPTIC_PANESTATE_BIN
 
 # ============================================================

@@ -6,6 +6,7 @@
 #   state=<idle|busy|user-typing|autosuggest-only|empty|blocked|absent|over-limit|
 #          working-background|working-self-paced|idle-orphan-async|unknown> \
 #     active=<0|1> window=<idx> name=<windowname> [input=<typed|ghost|blank|?>] \
+#     [input_text=<pct-encoded>] \
 #     [queued=1] [throttled=1] [retrying=<k>/<N>] [reset_at=<token>] [limit=<flavour>] \
 #     [evidence=<token>] [reason=<token> site=<label> [capture=failed]] \
 #     [orphan_kinds=<csv>] [bg_shells=<count> bg_reliable=<0|1> bg_cpu=<jiffies> \
@@ -1347,7 +1348,22 @@ _bottom_rows() {
 # #1143 defect this PR is about, and it bit immediately — see the AWK note below.
 # A second definition does not have to DRIFT to be wrong; it only has to be
 # evaluated by a different engine.
-_OVER_LIMIT_BANNER_RE='^[[:space:]]*(● API Error: Request rejected \([0-9]+\)[[:space:]]*·[[:space:]]*)?You.{0,3}ve (hit|reached) your ([[:alnum:]-]+ ){0,2}limit[[:space:]]*(·[[:space:]]*)?resets[[:space:]]+[^[:space:]]'
+# SECOND ALTERNATIVE: a notice COMPLETE WITHOUT a reset time
+# (ported from jacob-greene/nexus#173). Claude Code 2.1.268 added a
+# budget-exhaustion family that names no reset time and does not use the
+# word "limit", for example (quoted, so this comment cannot self-match):
+#
+#     "You've hit your team's shared budget. Switch to another model to continue."
+#
+# The `resets <time>` companion exists to reject a HALF-RENDERED headline.
+# A full stop right after the noun is the same evidence — the renderer
+# finished the sentence — so that form is admitted without a companion.
+# Flavour tokens are any non-space run here, because "team's" carries an
+# apostrophe that the alnum class rejects. The clean lead-in (anchor 2)
+# still applies to both alternatives. No reset time is extracted for it,
+# so the caller emits `reset_at=unknown` and the watcher takes its bounded
+# unknown-reset path in `_over_limit.sh`.
+_OVER_LIMIT_BANNER_RE='^[[:space:]]*(● API Error: Request rejected \([0-9]+\)[[:space:]]*·[[:space:]]*)?You.{0,3}ve (hit|reached) your (([[:alnum:]-]+ ){0,2}limit[[:space:]]*(·[[:space:]]*)?resets[[:space:]]+[^[:space:]]|([^[:space:]]+ ){0,2}(limit|budget)\.)'
 
 _detect_over_limit() {
     local plain="$1" bottom
@@ -2337,6 +2353,76 @@ _pid_runs_claude() {
     #     false-alive that never self-clears.
     kill -0 "$pid" 2>/dev/null || return 1
     return 2
+}
+
+_pct_encode() {
+    # Percent-encode to a single space-free token. Byte-wise (LC_ALL=C)
+    # so multi-byte UTF-8 survives a round trip intact.
+    printf '%s' "$1" | LC_ALL=C awk '
+        BEGIN { for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i }
+        {
+            n = length($0)
+            for (i = 1; i <= n; i++) {
+                c = substr($0, i, 1)
+                if (c ~ /^[a-zA-Z0-9._~-]$/) printf "%s", c
+                else printf "%%%02X", ord[c]
+            }
+        }'
+}
+
+# The residual text sitting in the input box, as a percent-encoded token.
+#
+# WHY THIS EXISTS. Every detector above answers "what SHAPE is the input
+# row?" — none answers "what does it SAY?". So a pane whose box holds a
+# dim autosuggest ghost and a pane whose box is genuinely empty emit
+# verdicts that differ by one token and disclose nothing about the text.
+# Downstream that gap is load-bearing: `retire-preflight.sh` authorizes an
+# irreversible `tmux kill-window` off this line, and the ghost — reliably a
+# paraphrase of the agent's own closing recommendation, so it always reads
+# like the correct next step — is discarded by that kill unlogged and
+# unseen. Ten of them were caught only by an orchestrator's manual
+# `capture-pane … | cat -v`, several mutation-class (`merge the PR`,
+# `land #56`, `fix the METHODS §9 prose now while you have context`).
+# `content_hash` cannot close the gap: it digests only the region ABOVE the
+# input row, deliberately, so a ghost animating in place never counts as
+# change — an empty box and a ghost-bearing box hash identically.
+#
+# SHAPE-AGNOSTIC BY DESIGN, and that is the point. It takes everything
+# after the `❯<NBSP>` chevron and parses no dim/bright markers at all, so
+# unlike `_detect_autosuggest` it CANNOT drift when the renderer changes
+# its escape codes (#50). It is a strictly weaker predicate — "is there
+# text in the box?" — and answering it needs no knowledge of how Claude
+# Code paints dim.
+#
+# It does NOT classify. Callers must not read a non-empty value as "ghost":
+# the caller's own decision order establishes what the text is. In
+# `retire-preflight.sh` bright operator text has already vetoed at check 1
+# (`user-typing`), so any text still visible downstream is by elimination
+# not a submitted operator instruction.
+_input_row_text() {
+    local input_row="$1" txt
+    txt=$(printf '%s' "$input_row" | _strip_ansi)
+    # Everything after the chevron; no chevron ⇒ nothing to report.
+    [[ "$txt" == *"❯${NBSP}"* ]] || { printf ''; return 0; }
+    txt=${txt#*"❯${NBSP}"}
+    # Sanitize to one safe line: control bytes become spaces (a word
+    # boundary, never a silent join), then runs of whitespace — including
+    # the NBSP padding tmux paints — collapse, and the ends are trimmed.
+    # No control byte may survive: the encoder would faithfully round-trip
+    # one into a real newline in a consumer's decoded output, where it
+    # could forge an extra line or an extra field.
+    #
+    # One sed, not tr|tr|sed. This runs on every pane-state emit that has
+    # a capture — i.e. every worker pane on every watcher poll — so the
+    # fork count is worth minimising.
+    txt=$(printf '%s' "$txt" \
+        | sed -E "s/[[:cntrl:]]+/ /g; s/(${NBSP}|[[:space:]])+/ /g; s/^ +//; s/ +\$//")
+    [[ -n "$txt" ]] || { printf ''; return 0; }
+    # Cap length so one emit line stays bounded regardless of pane width.
+    if (( ${#txt} > 200 )); then
+        txt="${txt:0:200}…"
+    fi
+    _pct_encode "$txt"
 }
 
 # Walk the pane's process tree for a live claude. Returns 0 if one is found.
@@ -4488,6 +4574,26 @@ emit() {
     fi
     [[ -n "$pane_auth" ]] && extra+=" auth=$pane_auth"
     [[ -n "$pane_content_hash" ]] && extra+=" content_hash=$pane_content_hash"
+    # input_text: what the input box SAYS (see _input_row_text). Computed
+    # lazily here, from whatever bytes this path happens to have loaded, so
+    # every emit that HAS a capture carries it — the renderer path and the
+    # heartbeat idle-refinement path alike — and paths with no capture
+    # (heartbeat busy/blocked fast path, `absent`) simply omit it rather
+    # than paying a tmux call to invent one. Emitted ONLY when non-empty,
+    # so the field's mere presence means "there is text in the box" and
+    # existing consumers see a byte-identical line for an empty box.
+    if [[ -n "${pane_ansi:-}" ]]; then
+        local _row _txt
+        # Reuse the row the classifier already found where one exists
+        # (renderer path sets `input_row`, heartbeat refinement sets
+        # `hb_input_row`); only grep the capture again when neither did.
+        _row="${input_row:-${hb_input_row:-}}"
+        [[ -n "$_row" ]] || _row=$(_find_input_row "$pane_ansi")
+        if [[ -n "$_row" ]]; then
+            _txt=$(_input_row_text "$_row")
+            [[ -n "$_txt" ]] && extra+=" input_text=$_txt"
+        fi
+    fi
     printf 'state=%s active=%s window=%s name=%s%s\n' \
         "$state" "$win_active" "$win_index" "$win_name" "$extra"
 }

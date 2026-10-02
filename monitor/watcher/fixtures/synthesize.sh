@@ -20,7 +20,7 @@ NBSP=$'\xc2\xa0'
     # Empty input row: chevron + NBSP + reverse-video space + reset.
     printf '%s\n' "${ESC}[38;5;246m❯${NBSP}${ESC}[7m ${ESC}[0m${ESC}[39m${ESC}[49m"
     printf '%s\n' "${ESC}[38;5;244m─${ESC}[0m"
-    printf '  ${ESC}[38;5;246m◉ Opus 4.7 (1M context) │ █▎░░░░░░░▓ 124K/1.0M${ESC}[0m\n'
+    printf '%s\n' "  ${ESC}[38;5;246m◉ Opus 4.7 (1M context) │ █▎░░░░░░░▓ 124K/1.0M${ESC}[0m"
     printf '  ${ESC}[38;5;246m-- INSERT -- ⏵⏵ bypass permissions on${ESC}[0m\n'
 } > idle-empty-synthetic.ansi
 
@@ -165,7 +165,7 @@ NBSP=$'\xc2\xa0'
     printf '%s\n' "${ESC}[39mYou've hit your limit · resets 3am (America/Los_Angeles)${ESC}[0m"
     printf '%s\n' "${ESC}[38;5;246m/extra-usage to finish what you're working on.${ESC}[0m"
     printf '%s\n' "${ESC}[38;5;244m─${ESC}[0m"
-    printf '  ${ESC}[38;5;246m◉ Opus 4.7 (1M context) │ █▎░░░░░░░▓ 124K/1.0M${ESC}[0m\n'
+    printf '%s\n' "  ${ESC}[38;5;246m◉ Opus 4.7 (1M context) │ █▎░░░░░░░▓ 124K/1.0M${ESC}[0m"
 } > over-limit-canonical-synthetic.ansi
 
 # --- over-limit: terse variant (no timezone parenthetical) -----------------
@@ -179,6 +179,48 @@ NBSP=$'\xc2\xa0'
     printf '%s\n' "${ESC}[38;5;246m/extra-usage to finish what you're working on.${ESC}[0m"
     printf '%s\n' "${ESC}[38;5;244m─${ESC}[0m"
 } > over-limit-terse-synthetic.ansi
+
+# --- over-limit: cc 2.1.268 budget-exhaustion notice -----------------------
+# Claude Code 2.1.268 added a limit notice with a different shape
+# (jacob-greene/nexus#173). It defeated the pre-#173 detector twice over:
+# the word "limit" is absent, and the apostrophe in "team's" was not in
+# the flavor-token character class. It also carries NO reset time, so the
+# old unconditional "resets <time>" companion requirement rejected it as
+# well. This fixture is the exact shape, byte for byte.
+{
+    printf '%s\n\n' "${ESC}[38;5;246m✻ Brewed for 41m${ESC}[0m"
+    printf '%s\n' "${ESC}[38;5;244m─${ESC}[0m"
+    printf '%s\n' "${ESC}[39mYou've hit your team's shared budget. Switch to another model to continue.${ESC}[0m"
+    printf '%s\n' "${ESC}[38;5;244m─${ESC}[0m"
+    printf '%s\n' "  ${ESC}[38;5;246m◉ Opus 4.7 (1M context) │ █▎░░░░░░░▓ 124K/1.0M${ESC}[0m"
+} > over-limit-shared-budget-cc2.1.268-synthetic.ansi
+
+# --- idle pane whose WINDOW holds the notice as QUOTED SOURCE ---------------
+# The 2026-09-10 false latch, reproduced. An agent editing the detector
+# had its own file-edit diff rendered onto its pane; the scrape read the
+# diff line as a painted notice and the watcher armed a 20.7 h hold on a
+# live, working window. The stored token was `3am_America/Los_Angeles"`
+# — the trailing double quote is the source line's closing quote.
+#
+# Unlike idle-overlimit-text-in-scrollback-synthetic.ansi, the text here
+# is INSIDE the bottom-row window, not padded out of it. Only the
+# clean-lead-in anchor of `_OVER_LIMIT_BANNER_RE` (pane-state.sh) can
+# reject it. Every line is copied verbatim from a real captured pane.
+{
+    printf '%s\n' "${ESC}[39m● Read the detector and the fixtures${ESC}[0m"
+    cat <<'QUOTED_SOURCE'
+     107:#   over-limit       - the canonical "You've hit your <flavor> limit ·
+      551 +#     You've hit your team's shared budget. Switch to another model to continue.
+      334 +    "You've hit your weekly limit · resets 3am (America/Los_Angeles)")
+  ⎿  echo "You've hit your team's shared budget. /model to switch models." \
+     - `You've hit your team's shared budget. /model to switch models.`
+QUOTED_SOURCE
+    printf '%s\n\n' "${ESC}[38;5;246m✻ Brewed for 8s${ESC}[0m"
+    printf '%s\n' "${ESC}[38;5;244m─${ESC}[0m"
+    # Empty input row: chevron + NBSP + reverse-video space + reset.
+    printf '%s\n' "${ESC}[38;5;246m❯${NBSP}${ESC}[7m ${ESC}[0m${ESC}[39m${ESC}[49m"
+    printf '%s\n' "${ESC}[38;5;244m─${ESC}[0m"
+} > idle-overlimit-quoted-source-in-window-synthetic.ansi
 
 # --- idle pane with the over-limit text in scrollback (false-positive guard)
 # The user's last turn referenced the over-limit message verbatim — but

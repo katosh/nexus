@@ -21,6 +21,7 @@ statements those references support) in their reports — see
 | **Semantic Scholar (S2)** | Allen Institute academic graph; relevance search, citation graph, metadata | free, but requires a contact-form request (no guaranteed turnaround); the unauthenticated pool 429s under real load |
 | **ASTA** | Allen AI academic search tool (MCP) | request via the ASTA program |
 | **OpenAlex** | Fully open academic graph (works, citations, institutions, funders) | **none** — works unauthenticated, no request needed |
+| **PubMed** | NCBI E-utilities over MEDLINE/PubMed; biomedical and life-science literature | **none needed**; optional free key raises the rate limit; **opt-in** (see below) |
 
 The three backends are **complementary, not redundant**: ASTA and S2 rank by
 semantic/citation relevance over the S2 graph; OpenAlex ranks by its own
@@ -49,7 +50,46 @@ attempted when selected (which is always, by default). Only an explicit
 setup references and exiting non-zero — the default (`all`) always succeeds
 because OpenAlex alone is enough to serve a search.
 
+**PubMed is a fourth, keyless backend, and it is opt-in.** It is not part
+of `all`, so a default search sends no request to NCBI. Select it with
+`--source pubmed`, combine it in a comma list (`--source all,pubmed`), or
+make it part of your default with `lit.default_source: "all,pubmed"` in
+`config/nexus.yml`. It stays out of `all` because NCBI paces keyless callers
+to 3 requests per second, which adds latency to every search.
+
+PubMed indexes biomedical and life-science journals. For computer science,
+statistics or physics papers outside PubMed, use S2 or OpenAlex. PubMed's
+query syntax applies to `--source pubmed`: field tags such as `[tiab]`
+(title/abstract) and `[au]` (author), and `AND`/`OR`/`NOT`, work in the
+query string.
+
+PubMed drops a query term it cannot match and still returns hits for the
+rest, so a typo silently broadens the query. `ng lit` reports each dropped or
+ignored term as a stderr note, and in the JSON output as `warnings` (a list,
+empty when clean) and `pubmed_query_translation` (the query PubMed actually
+ran). Check `warnings` before you trust a PubMed result set.
+
 ## Acquiring keys
+
+### PubMed (optional)
+
+PubMed needs no key. Two optional settings improve how the nexus uses it:
+
+| Setting | Env var | Config key | Effect |
+|---|---|---|---|
+| API key | `NCBI_API_KEY` | `lit.ncbi_api_key` | raises the NCBI limit from 3 to 10 requests/s |
+| Contact email | `NCBI_EMAIL` | `lit.ncbi_email` | sent as `email=`; NCBI asks callers for a contact so it can reach you before it blocks heavy traffic |
+| Tool name | `NCBI_TOOL` | `lit.ncbi_tool` | sent as `tool=`; default `nexus-lit` |
+
+To get an NCBI API key:
+
+1. Sign in to (or create) an NCBI account at <https://account.ncbi.nlm.nih.gov/>.
+2. Open **Account settings** (<https://account.ncbi.nlm.nih.gov/settings/>).
+3. Under **API Key Management**, select **Create an API Key** and copy it.
+
+`ng lit` paces its own requests under the applicable limit and retries on
+HTTP 429. The NCBI limit applies per IP address, so pacing also holds across
+concurrent `ng lit` runs of the same user (a lock file under `$TMPDIR`).
 
 ### Semantic Scholar (S2)
 
@@ -87,8 +127,8 @@ below.
 
 Resolution order per backend (first hit wins):
 
-1. **Environment** — `export S2_API_KEY=...` (or `ASTA_API_KEY=...`). Wins over
-   all config; best for ephemeral or CI use.
+1. **Environment** — `export S2_API_KEY=...` (or `ASTA_API_KEY=...`,
+   `NCBI_API_KEY=...`). Wins over all config; best for ephemeral or CI use.
 2. **Nexus config** — add under a `lit:` block in `config/nexus.yml` (which is
    gitignored, so inlining the secret is safe):
 
@@ -97,9 +137,12 @@ Resolution order per backend (first hit wins):
      s2_api_key: "your-s2-key"
      asta_api_key: "your-asta-key"        # optional
      openalex_mailto: "you@your-org.edu"  # optional; polite-pool contact
+     ncbi_api_key: "your-ncbi-key"        # optional; PubMed works without it
+     ncbi_email: "you@example.org"        # optional; recommended by NCBI
+     default_source: "all,pubmed"         # optional; adds PubMed to the default
    ```
 
-3. **Legacy `bip` config** — `s2_api_key:` / `asta_api_key:` in
+3. **Legacy `bip` config** (S2 and ASTA only) — `s2_api_key:` / `asta_api_key:` in
    `<nexus.root>/.config/bip/config.yml`. Read as a fallback so an existing
    `bip` setup keeps working without migration.
 
@@ -120,15 +163,17 @@ A JSONL file (one paper per line) that `ng lit search` dedups against and
 
 Record schema (compatible with `bip`'s `refs.jsonl`): `id`, `doi`, `title`,
 `authors[]` (`{first,last}`), `abstract`, `venue`, `published.{year,month,day}`,
-`source.{type,id}`, `pmid`, `pmcid`. `source.type` is `s2`, `asta`, or
-`openalex` depending on which backend the record was pulled from.
+`source.{type,id}`, `pmid`, `pmcid`. `source.type` is `s2`, `asta`,
+`openalex` or `pubmed` depending on which backend the record was pulled from.
+Records added through PubMed carry the PMID, the PMCID when there is one, and
+the abstract.
 
 ## Commands
 
 ```
 ng lit status [--human]
-ng lit search "<query>" [--source s2|asta|openalex|both|all] [--limit N] [--year A:B] [--human]
-ng lit add <DOI|S2-id|openalex:Wid> [--human]
+ng lit search "<query>" [--source s2|asta|openalex|pubmed|both|all[,...]] [--limit N] [--year A:B] [--human]
+ng lit add <DOI|PMID|S2-id|openalex:Wid> [--human]
 ng lit setup
 ```
 
@@ -137,8 +182,9 @@ Default output is JSON (for agent consumption); `--human` is readable.
 ### `ng lit status`
 
 Reports the library path + count, which backends are configured (and from
-which source — env / config / legacy-bip, never the key itself), and whether
-the tool is ready. OpenAlex always reports available (no key needed), so
+which source — env / config / legacy-bip, never the key itself), the PubMed
+rate limit (`3/s` or `10/s`) and whether an NCBI contact email is set, the
+default `--source`, and whether the tool is ready. OpenAlex always reports available (no key needed), so
 `ng lit status` no longer exits non-zero for a missing S2/ASTA key — search
 still works. Setup references are still printed as a hint whenever S2 and
 ASTA are both unconfigured, since that leaves relevance ranking and `add`
@@ -147,9 +193,10 @@ unavailable even though search itself keeps working via OpenAlex.
 ### `ng lit search`
 
 Content-relevance discovery across the selected backend(s). Results are
-deduplicated (by **case-folded** DOI, falling back to id/title), fused into a
-single relevance ranking, and annotated with `in_library` (true if the DOI is
-already in the reference library).
+deduplicated (by **case-folded** DOI or by PMID — two records sharing either
+are one paper — falling back to id/title), fused into a single relevance
+ranking, and annotated with `in_library` (true if the DOI or PMID is already
+in the reference library).
 
 #### Ranking — how multiple backends become one ordered list
 
@@ -189,7 +236,10 @@ into two records.
 |---|---|---|
 | `all` (default) | S2 + ASTA + OpenAlex | every usable backend; OpenAlex always joins since it needs no key |
 | `both` | S2 + ASTA | legacy pair, for scripts that want to pin out OpenAlex explicitly |
-| `s2` / `asta` / `openalex` | one backend | |
+| `s2` / `asta` / `openalex` / `pubmed` | one backend | |
+| comma list, e.g. `all,pubmed` | the union | the way to add PubMed to the default set |
+
+With no `--source`, the value of `lit.default_source` is used, else `all`.
 
 A requested KEYED backend (s2/asta) with no key is skipped with a note, same
 as before OpenAlex existed. Requesting `s2`, `asta`, or `both` with no
@@ -335,6 +385,13 @@ search because every backend answered the same bad query), and
 `no_backend_searched` (nothing ran at all, so nothing was established).
 
 ```console
+$ ng lit search "GENCODE reference annotation" --source pubmed --limit 1 --human
+Found 1 papers (sources: pubmed)
+
+  [new] GENCODE: reference annotation for the human and mouse genomes in 2023.
+      Frankish A, Carbonell-Sala S, Diekhans M, Jungreis I, Loveland JE, Mudge JM, et al.
+      Nucleic acids research (2023)  cites:?  doi:10.1093/nar/gkac1071  pmid:36420896  [pubmed]
+
 $ ng lit search "single-cell differential abundance testing" --limit 5 --human
 Found 5 papers (sources: asta openalex)
 
@@ -347,16 +404,18 @@ Found 5 papers (sources: asta openalex)
 ### `ng lit add`
 
 Fetches a paper's metadata and appends a schema-compatible record to the
-library, dedup-checked by DOI (refused if already present):
+library, dedup-checked by DOI and PMID (refused if already present):
 
+- **A PMID** (`36420896` or `PMID:36420896`) always resolves through PubMed,
+  which needs no key.
 - **With an S2 key** (unchanged): accepts a bare DOI (`10.xxxx/...`) or an
   S2 paper id / `CorpusId:...`, via S2.
 - **Without an S2 key**: falls back to OpenAlex, which needs no key but only
   resolves a bare DOI or an OpenAlex work id (`Wnnnn` or `openalex:Wnnnn`) —
   it has no equivalent of an S2 paper id / `CorpusId:...` to look up by.
 
-So `ng lit add <DOI>` now works on a completely unconfigured nexus; only
-non-DOI ids still require an S2 key.
+So `ng lit add <DOI>` and `ng lit add <PMID>` work on a completely
+unconfigured nexus; only S2 ids still require an S2 key.
 
 ### `ng lit setup`
 

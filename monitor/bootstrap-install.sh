@@ -21,15 +21,16 @@
 #      existing config means the operator likely wants `./watcher`,
 #      not this script.
 #
-#   3. Ensure a Claude Code binary + resolve $CLAUDE_BIN: when no
-#      operator-set $CLAUDE_BIN, no project-local
-#      node_modules/.bin/claude, and no system `claude` on PATH
-#      exists, run monitor/install-claude-local.sh to create the
-#      project-local install. This is the fresh-operator path: a
-#      host with no claude at all must be able to bootstrap, and
-#      the resolver in _claude-bin.sh fails loud when nothing is
-#      found — so the install has to happen here, before the
-#      resolver, not as an agent step after it.
+#   3. Ensure a Claude Code binary + resolve $CLAUDE_BIN: when NONE of
+#      the _claude-bin.sh lookups resolves (operator-set $CLAUDE_BIN,
+#      config `nexus.claude_bin`, project-local node_modules/.bin/
+#      claude, system `claude` on PATH), run monitor/install-claude-
+#      local.sh to create the project-local install. This is the
+#      fresh-operator path: a host with no claude at all must be able
+#      to bootstrap, and the resolver in _claude-bin.sh fails loud when
+#      nothing is found — so the install has to happen here, before the
+#      resolver, not as an agent step after it. A nexus that pins a
+#      native install via `nexus.claude_bin` never takes this path.
 #
 #   4. Compose the install-bootstrap prompt: read
 #      `monitor/install-prompt.md` (the canonical bootstrap brief),
@@ -208,18 +209,35 @@ fi
 # performs the project-local install itself when nothing usable is
 # present.
 #
-# The install is skipped when any of the resolver's three lookups
-# would already succeed:
-#   - $CLAUDE_BIN set by the operator (explicit override),
-#   - $_nexus_root/node_modules/.bin/claude present (already installed),
-#   - `claude` on PATH (operator intentionally on a system install).
-# install-claude-local.sh is itself idempotent, but honoring an
-# existing system claude or operator override means we never force a
-# local install on someone who deliberately runs without one.
+# The install is skipped when ANY of the resolver's lookups would
+# already succeed. That question is asked by PROBING THE RESOLVER in a
+# subshell, not by re-implementing its lookups here. The hand-rolled
+# copy that used to live at this spot knew only three of them, so a
+# lookup added to _claude-bin.sh (the `nexus.claude_bin` config pin)
+# would not have been honoured here: a nexus deliberately running a
+# native install would have had the npm tree re-created under it on
+# every fresh bootstrap. Probing cannot drift.
+#
+# The probe distinguishes the two failure modes (see _claude-bin.sh
+# "Exit codes"):
+#   rc 1 — nothing found anywhere. Recoverable: install the local copy.
+#   rc 2 — `nexus.claude_bin` is set but broken. NOT recoverable by
+#          installing; npm-installing over a deliberate operator choice
+#          would replace it instead of fixing it. Refuse and say why.
 FRESH_INSTALL=0
-if [[ -z "${CLAUDE_BIN:-}" ]] \
-    && [[ ! -x "$_nexus_root/node_modules/.bin/claude" ]] \
-    && ! command -v claude >/dev/null 2>&1; then
+_cb_rc=0
+_cb_err=$(
+    NEXUS_ROOT="$_nexus_root"
+    # shellcheck disable=SC1091
+    . "$_nexus_root/monitor/_claude-bin.sh" 2>&1 >/dev/null
+) || _cb_rc=$?
+if (( _cb_rc == 2 )); then
+    echo "bootstrap-install: REFUSING to install project-local Claude Code —" >&2
+    echo "  this nexus pins a claude binary that does not resolve:" >&2
+    printf '%s\n' "$_cb_err" >&2
+    exit 1
+fi
+if (( _cb_rc != 0 )); then
     FRESH_INSTALL=1
     echo "bootstrap-install: no usable claude binary on this host — installing project-local Claude Code" >&2
     echo "bootstrap-install: npm output follows (a cold cache can take a few minutes)" >&2
@@ -238,9 +256,9 @@ ERR
     fi
 fi
 
-# Resolve $CLAUDE_BIN (env override → project-local install → PATH).
-# The install block above guarantees at least one lookup succeeds,
-# so the resolver's fail-loud exit cannot trigger here.
+# Resolve $CLAUDE_BIN (env override → config pin → project-local
+# install → PATH). The block above either made a lookup succeed or
+# already exited, so the resolver's fail-loud exit cannot trigger here.
 NEXUS_ROOT="$_nexus_root"
 # shellcheck disable=SC1091
 . "$_nexus_root/monitor/_claude-bin.sh"

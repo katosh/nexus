@@ -23,8 +23,10 @@ monitor/spawn-worker.sh	head	prod	7
 monitor/svc.sh	head	prod	4
 monitor/test-ci-trigger-audit.sh	head	test	1
 monitor/test-coldbuild-guard.sh	head	test	5
+monitor/test-evidence-freeze.sh	head	test	5
 monitor/test-interactive-sessions.sh	head	test	1
 monitor/test-interpreter-parity.sh	head	test	1
+monitor/test-verdict-head-binding.sh	head	test	1
 monitor/tmpfs-guard.sh	head	prod	2
 monitor/toolchain-bash.sh	head	prod	1
 monitor/verify-worker-started.sh	head	prod	1
@@ -71,9 +73,11 @@ monitor/watcher/test-integration/_harness.sh	awk-exit	test	3
 monitor/watcher/test-integration/test-graceful-exit-relaunch.sh	awk-exit	test	1
 monitor/watcher/test-integration/test-jupyter-service-real.sh	head	test	6
 monitor/watcher/test-integration/test-realmodel-apispoof.sh	awk-exit	test	1
+monitor/watcher/test-integration/test-realmodel-hooks.sh	head	test	1
 monitor/watcher/test-integration/test-realmodel-longjob-wake.sh	head	test	2
 monitor/watcher/test-integration/test-realmodel-overlimit.sh	awk-exit	test	1
 monitor/watcher/test-integration/test-realmodel-respawn-verify.sh	awk-exit	test	1
+monitor/watcher/test-integration/test-realmodel-vipaste.sh	head	test	1
 monitor/watcher/test-integration/test-same-name-recycle.sh	awk-exit	test	3
 monitor/watcher/test-integration/test-same-name-recycle.sh	head	test	1
 monitor/watcher/test-integration/test-wrapup-retain-close.sh	head	test	1
@@ -89,7 +93,7 @@ monitor/watcher/test-pane-state-claude-identity.sh	awk-exit	test	2
 monitor/watcher/test-pane-state-claude-identity.sh	head	test	5
 monitor/watcher/test-pane-state-longjob-discount.sh	head	test	2
 monitor/watcher/test-pane-state.sh	head	test	2
-monitor/watcher/test-paste-followup.sh	head	test	2
+monitor/watcher/test-paste-followup.sh	head	test	4
 monitor/watcher/test-prune-rotation.sh	head	test	2
 monitor/watcher/test-registry-unreadable-refusal.sh	head	test	1
 monitor/watcher/test-remote-enroll.sh	head	test	2
@@ -121,6 +125,7 @@ monitor/watcher/test-tmux-selection-restore.sh	head	test	5
 monitor/watcher/test-tmux-window-resolver.sh	head	test	5
 monitor/watcher/test-unstick.sh	head	test	3
 monitor/watcher/test-upload-asset-concurrency.sh	head	test	1
+monitor/watcher/test-uv-cache-guard.sh	head	test	2
 monitor/watcher/test-v2-staging-tasks.sh	head	test	1
 monitor/watcher/test-watcher-robustness.sh	head	test	1
 monitor/watcher/test-watcher-supervise.sh	head	test	2

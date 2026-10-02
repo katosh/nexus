@@ -101,6 +101,11 @@ PREVIOUS_SID=""
 # Default to continue-by-default; `--fresh` opts in to the old
 # discard-context behaviour for true emergencies. See header.
 FRESH=0
+# Voluntary context rotation (jacob-greene/nexus#1). Path to the hand-off report the
+# rotating orchestrator just wrote. Implies --fresh: the whole point of a
+# rotation is to DROP the accumulated context, so resuming would be a
+# no-op that costs a wake.
+ROTATION_REPORT=""
 
 while (( $# > 0 )); do
     case "$1" in
@@ -108,10 +113,19 @@ while (( $# > 0 )); do
         --reason)       REASON="${2:-}"; shift 2 ;;
         --previous-sid) PREVIOUS_SID="${2:-}"; shift 2 ;;
         --fresh)        FRESH=1; shift ;;
+        --rotation)     ROTATION_REPORT="${2:-}"; FRESH=1; shift 2 ;;
         -h|--help)      sed -n '2,75p' "$0"; exit 0 ;;
         *) echo "spawn-fresh-orchestrator.sh: unknown flag: $1" >&2; exit 1 ;;
     esac
 done
+
+# A rotation without a readable hand-off report is a bare kill wearing a
+# nicer name — refuse it. The report IS the state transfer; jacob-greene/nexus#1 is
+# explicit that no-state-lost is the acceptance condition.
+if [[ -n "$ROTATION_REPORT" ]] && [[ ! -f "$ROTATION_REPORT" ]]; then
+    echo "spawn-fresh-orchestrator.sh: --rotation report not found: $ROTATION_REPORT (write the hand-off report BEFORE rotating)" >&2
+    exit 1
+fi
 
 [[ -n "$TARGET" ]] || { echo "spawn-fresh-orchestrator.sh: --target required" >&2; exit 1; }
 [[ -d "$NEXUS_ROOT" ]] || { echo "spawn-fresh-orchestrator.sh: NEXUS_ROOT not a directory: $NEXUS_ROOT" >&2; exit 1; }
@@ -210,7 +224,21 @@ log() {
 _compose_situation_report() {
     local now_iso
     now_iso=$(date -Is)
-    if (( COLD == 1 )); then
+    if [[ -n "$ROTATION_REPORT" ]]; then
+        # Voluntary context rotation, NOT a crash. The wording matters:
+        # telling a healthy rotation "your prior session was
+        # unrecoverable" invites the new orchestrator to go hunting for
+        # a failure that never happened.
+        printf 'You are the nexus orchestrator. This is a **planned context rotation**, not a crash — your predecessor was healthy and handed off deliberately because its context had grown past the configured threshold (every message re-reads the whole conversation, so a large session bills every wake at a multiple).\n'
+        printf '\n'
+        printf 'Your predecessor'"'"'s hand-off report is the state transfer. **Read it first, before anything else:**\n'
+        printf '\n'
+        printf '    %s\n' "$ROTATION_REPORT"
+        printf '\n'
+        printf 'It carries the in-flight work, what was mid-decision, and what to pick up. Nothing else from the prior conversation survives.\n'
+        printf '\n'
+        printf 'Then read CLAUDE.md and `skills/nexus.*` for your role; `monitor/agent-prompt.md` has your wake protocol.\n'
+    elif (( COLD == 1 )); then
         printf 'You are the nexus orchestrator. This is a **recovery spawn** — your prior session was unrecoverable or could not be positively identified, so you were started fresh (no `--resume`, no `--continue`). You have NO resumed conversation context.\n'
         printf '\n'
         printf 'Read CLAUDE.md and `skills/nexus.*` for your role; `monitor/agent-prompt.md` has your wake protocol.\n'

@@ -107,6 +107,30 @@ ensure_locals_links() {
         || printf 'install-claude-local: warning: could not provision locals/bin links\n' >&2
 }
 
+# REFUSE when this nexus pins a claude binary OUTSIDE the npm tree.
+# `nexus.claude_bin` (config/nexus.yml) names a binary this installer does
+# not manage — typically a NATIVE Claude Code install. Installing anyway
+# would re-create node_modules while monitor/_claude-bin.sh keeps
+# resolving to the pinned binary: ~135 MB of tree that nothing runs, and
+# that the next reader reasonably mistakes for the live install. Worse, a
+# later reader who "fixes" the resolver back would silently move the whole
+# workspace onto a stale, unvetted version.
+#
+# Placed before the node bootstrap so the refusal costs no Lmod work.
+# Escape hatch for a deliberate install alongside the pin (e.g. staging a
+# candidate for the cc-harness gate): CLAUDE_INSTALL_ALLOW_PINNED=1.
+_pinned_bin=""
+if [[ -x "$NEXUS_ROOT/config/load.sh" ]]; then
+    _pinned_bin=$("$NEXUS_ROOT/config/load.sh" nexus.claude_bin "" 2>/dev/null) || _pinned_bin=""
+fi
+_pinned_bin="${_pinned_bin#"${_pinned_bin%%[![:space:]]*}"}"
+_pinned_bin="${_pinned_bin%"${_pinned_bin##*[![:space:]]}"}"
+if [[ -n "$_pinned_bin" ]] \
+    && [[ "$_pinned_bin" != "$NEXUS_ROOT/node_modules/"* ]] \
+    && [[ -z "${CLAUDE_INSTALL_ALLOW_PINNED:-}" ]]; then
+    die "config nexus.claude_bin pins $_pinned_bin — this nexus does not run the npm install, so installing it would leave an unused node_modules tree behind. Clear the key to return to the npm install, or set CLAUDE_INSTALL_ALLOW_PINNED=1 to install anyway."
+fi
+
 # Ensure node is on PATH before the npm install. On Lmod/Tcl-module HPC
 # hosts node lives behind `module load nodejs`, and the watcher launcher
 # runs this script in a NON-LOGIN shell that never loaded the module —

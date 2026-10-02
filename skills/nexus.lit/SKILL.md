@@ -1,5 +1,5 @@
 ---
-description: "Literature research for scientific work: ng lit content-relevance discovery (S2 + ASTA + OpenAlex) deduped against the reference library, ng lit add to grow it, and the convention that scientific reports cite the references (and supporting statements) they find. Use when a scientific task needs grounding in the literature."
+description: "Literature research for scientific work: ng lit content-relevance discovery (S2 + ASTA + OpenAlex, plus opt-in PubMed) deduped against the reference library, ng lit add to grow it, and the convention that scientific reports cite the references (and supporting statements) they find. Use when a scientific task needs grounding in the literature."
 ---
 
 # nexus.lit — literature research for scientific work
@@ -27,8 +27,8 @@ On-demand, content-relevance paper discovery, native to the nexus (no
 
 ```
 ng lit status                                    # keys / library / readiness
-ng lit search "<query>" [--source s2|asta|openalex|both|all] [--limit N] [--year A:B]
-ng lit add <DOI|S2-id|openalex:Wid>              # pull a paper into the library
+ng lit search "<query>" [--source s2|asta|openalex|pubmed|both|all[,...]] [--limit N] [--year A:B]
+ng lit add <DOI|PMID|S2-id|openalex:Wid>         # pull a paper into the library
 ng lit setup                                     # key-acquisition references
 ```
 
@@ -39,11 +39,18 @@ ng lit setup                                     # key-acquisition references
   phenomenon/method/claim), not by title. The three backends are
   complementary — different sources surface different papers — so the
   default set queries all of them rather than picking one.
-- **Grow the library** — `ng lit add <DOI>` fetches metadata and appends
-  a record. Add the papers you end up relying on so the library (and
+- **PubMed is a fourth, keyless backend — opt-in.** Name it with
+  `--source pubmed` or a comma list (`--source all,pubmed`), or set
+  `lit.default_source: "all,pubmed"`. It covers biomedical and
+  life-science literature, and its query syntax applies: field tags such
+  as `[tiab]` and `[au]`, and `AND`/`OR`, work in the query string.
+  PubMed silently drops a term it cannot match. Read the `warnings` field
+  (and the stderr note) before you trust its hits.
+- **Grow the library** — `ng lit add <DOI|PMID>` fetches metadata and
+  appends a record (a PMID goes through PubMed, with the abstract). Add the papers you end up relying on so the library (and
   future dedup) stays current. Works even with zero keys configured
-  (falls back to OpenAlex for DOI lookups); an S2 key is only needed for
-  non-DOI ids (S2 paper id / `CorpusId:...`).
+  (falls back to OpenAlex for DOI lookups, PubMed for PMIDs); an S2 key
+  is only needed for S2 ids (S2 paper id / `CorpusId:...`).
 - **Results are ranked — read from the top.** Hits are ordered by
   reciprocal-rank fusion over the backends' own rankings (their relevance
   scores are on incomparable scales, so only rank is fused). A paper
@@ -126,7 +133,8 @@ work. Prefer:
 
 - A short claim → reference mapping (what the source establishes), not a
   bare URL dump.
-- A real, resolvable identifier (DOI) for each reference.
+- A real, resolvable identifier (DOI, or PMID when there is no DOI) for
+  each reference.
 - Inclusion only where it grounds or qualifies a claim in the report;
   omit literature that does not bear on the work.
 
@@ -138,7 +146,8 @@ references live in the body alongside the claims they support.
 - Not an embedding/semantic-similarity search over your own library
   (that is `bip semantic`, which needs Ollama and is **not** required
   here). `ng lit` discovery is content-relevance search against S2, ASTA and
-  OpenAlex — all three, per `--source all`, which is the default.
+  OpenAlex — all three, per `--source all`, which is the default — plus
+  PubMed when you select it.
 - Not a replacement for reading the paper — it finds and catalogs;
   judgment about relevance and correctness stays with the worker.
 

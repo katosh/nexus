@@ -94,9 +94,17 @@ WIN=0  # re-resolved from the live session after new-session (see below)
 
 resolve_claude() {
     if [[ -n "${CLAUDE_BIN:-}" && -x "${CLAUDE_BIN:-}" ]]; then printf '%s' "$CLAUDE_BIN"; return; fi
-    local b="$REPO_ROOT/node_modules/.bin/claude"
-    [[ -x "$b" ]] && { printf '%s' "$b"; return; }
-    echo "demo.sh: no claude binary (run monitor/install-claude-local.sh or set CLAUDE_BIN)" >&2
+    # Shared resolver, so a native-pinned nexus (config `nexus.claude_bin`,
+    # no npm tree) still finds a binary instead of dying here.
+    local b
+    b=$(
+        unset CLAUDE_BIN
+        NEXUS_ROOT="$REPO_ROOT"
+        # shellcheck disable=SC1091
+        . "$REPO_ROOT/monitor/_claude-bin.sh" >/dev/null 2>&1 && printf '%s' "$CLAUDE_BIN"
+    ) || b=""
+    [[ -n "$b" && -x "$b" ]] && { printf '%s' "$b"; return; }
+    echo "demo.sh: no claude binary (set CLAUDE_BIN, config nexus.claude_bin, or run monitor/install-claude-local.sh)" >&2
     return 1
 }
 

@@ -218,15 +218,30 @@ cch_skip_if_disabled() {
 }
 
 # Resolve the claude binary. Honors CLAUDE_BIN (the pre-update gate sets
-# this to a candidate-version install in a throwaway prefix); else the
-# project-local install. Echoes the path; rc=1 if none found.
+# this to a candidate-version install in a throwaway prefix); else
+# whatever monitor/_claude-bin.sh resolves. Echoes the path; rc=1 if none
+# found.
+#
+# Going through the shared resolver matters here: on a nexus pinned to a
+# native install (config `nexus.claude_bin`) there is no npm tree, so the
+# old direct test found nothing and EVERY harness scenario self-skipped —
+# a gate that quietly stops gating is worse than one that fails.
 cch_resolve_claude() {
     if [[ -n "${CLAUDE_BIN:-}" ]] && [[ -x "$CLAUDE_BIN" ]]; then
         printf '%s' "$CLAUDE_BIN"; return 0
     fi
-    local local_bin="$CCH_REPO_ROOT/node_modules/.bin/claude"
-    if [[ -x "$local_bin" ]]; then
-        printf '%s' "$local_bin"; return 0
+    local resolved
+    resolved=$(
+        # A set-but-unusable CLAUDE_BIN already failed the -x test above;
+        # clear it so the resolver does not hand it straight back.
+        unset CLAUDE_BIN
+        NEXUS_ROOT="$CCH_REPO_ROOT"
+        # shellcheck disable=SC1091
+        . "$CCH_REPO_ROOT/monitor/_claude-bin.sh" >/dev/null 2>&1 \
+            && printf '%s' "$CLAUDE_BIN"
+    ) || resolved=""
+    if [[ -n "$resolved" && -x "$resolved" ]]; then
+        printf '%s' "$resolved"; return 0
     fi
     return 1
 }
@@ -662,8 +677,16 @@ cch_control() {
     printf '%s\n' "$1" > "$CCH_CONTROL"
 }
 
-# Boot the real claude in a new tmux window against the mock. Echoes the
-# new window's index.
+# Build the launch command string for a harness worker. THE SINGLE
+# CONSTRUCTION SITE — every scenario must reach the launch string through
+# here, never by copying the `printf -v launch` block. Duplicated launch
+# flags drift silently from the production spawn flags, so a scenario
+# ends up gating a boot the watcher never performs.
+# monitor/test-cch-launch-string.sh holds a closed whitelist of the files
+# allowed to carry a `printf -v launch` statement.
+#
+#   cch_launch_cmd                  renderer path (or $CCH_SETTINGS)
+#   cch_launch_cmd <settings-file>  adds `--settings <file>`
 #
 # By DEFAULT this is the renderer path: no `--settings`, so no hooks are
 # wired and the scenario exercises pane-state's renderer classification
@@ -672,45 +695,56 @@ cch_control() {
 # (hooks + settings) could never be cleared by the gate and fell back to
 # source inspection every round.
 #
-# Two opt-in knobs close that hole without disturbing the renderer
-# scenarios:
+# env -i gives a hermetic child: only the vars claude needs. PATH must
+# carry node (claude is a node program) — pass the harness PATH through.
+# ANTHROPIC_AUTH_TOKEN (bearer) instead of ANTHROPIC_API_KEY avoids the
+# interactive custom-API-key approval dialog.
+#
+# Opt-in knobs, all read at CALL time (not at source time), so one
+# scenario may boot differently configured workers in the same run:
 #
 #   CCH_SETTINGS    path to a settings JSON passed as `--settings <path>`.
 #                   Set it to wire real hooks (PreToolUse, PostToolUse,
 #                   Notification, …) into the booted binary — see
 #                   monitor/watcher/test-integration/test-realmodel-pretooluse-hook.sh.
+#                   A non-empty <settings-file> argument wins over it.
 #   CCH_EXTRA_ENV   extra `K=v` assignments spliced into the `env -i`
 #                   line (e.g. NEXUS_ROOT / NEXUS_STATE_DIR so a real
 #                   hook script writes into the harness tmpdir). The
 #                   CALLER is responsible for shell-quoting values; keep
 #                   them path-simple.
+#   CCH_CLAUDE_ARGS extra `claude` flags spliced verbatim after
+#                   `--dangerously-skip-permissions` and any `--settings`
+#                   — added for `--plugin-dir <dir>` so the longjob-watch
+#                   dispatcher plugin (your-org/nexus-code#1535) can be
+#                   booted against the mock and its events COUNTED as API
+#                   requests. The CALLER shell-quotes.
+#   CCH_SKIP_PERMISSIONS (default 1)
+#                   1 (or anything but exactly `0`) appends
+#                   `--dangerously-skip-permissions`, exactly as every
+#                   scenario booted before this knob existed. `0` omits
+#                   it, so the real binary renders its permission dialog
+#                   when the mock drives a file-writing tool. That flag
+#                   is precisely what suppresses the dialog, so no
+#                   harness scenario could paint one before the knob
+#                   (jacob-greene/nexus#158). A typo must not silently
+#                   strip the flag from a gate scenario, hence "exactly".
 #
-# Both default to empty, so existing scenarios boot BEHAVIOURALLY
-# identically — same argv, same env, no --settings — but NOT
-# byte-identically: with CCH_EXTRA_ENV empty the `%s` splice leaves one
-# extra space in the launch line. Measured: delta is exactly 1 byte, and
-# the two strings are identical once spaces are removed, so the token
-# sequence the shell parses is unchanged. Stating the measured fact rather
-# than rounding it up to "byte-identical".
-cch_boot_worker() {
-    local name="$1"
-    # env -i for a hermetic child: only the vars claude needs. PATH must
-    # carry node (claude is a node program) — pass the harness PATH
-    # through. ANTHROPIC_AUTH_TOKEN (bearer) instead of ANTHROPIC_API_KEY
-    # avoids the interactive custom-API-key approval dialog.
-    local settings_arg=""
-    if [[ -n "${CCH_SETTINGS:-}" ]]; then
-        printf -v settings_arg ' --settings %q' "$CCH_SETTINGS"
-    fi
-    # CCH_CLAUDE_ARGS: extra `claude` flags spliced verbatim after
-    # `--dangerously-skip-permissions` — the third opt-in knob, added for
-    # `--plugin-dir <dir>` so the longjob-watch dispatcher plugin
-    # (your-org/nexus-code#1535) can be booted against the mock and its
-    # events COUNTED as API requests. The CALLER shell-quotes; empty leaves
-    # the launch line token-identical to before.
+# With every knob at its default the string is BYTE-identical to the one
+# cch_boot_worker built before the CCH_SKIP_PERMISSIONS knob and the
+# settings argument were folded in here; test-cch-launch-string.sh
+# measures that against the pre-fold builder read from git. (With
+# CCH_EXTRA_ENV empty the `%s` splice leaves one extra space in the
+# launch line — present in the pre-fold string too, and harmless: the
+# token sequence the shell parses is unchanged.)
+cch_launch_cmd() {
+    local settings="${1:-${CCH_SETTINGS:-}}"
+    local settings_arg="" skip_arg=" --dangerously-skip-permissions"
+    [[ -n "$settings" ]] && printf -v settings_arg ' --settings %q' "$settings"
     if [[ -n "${CCH_CLAUDE_ARGS:-}" ]]; then
         settings_arg="$settings_arg ${CCH_CLAUDE_ARGS}"
     fi
+    [[ "${CCH_SKIP_PERMISSIONS:-1}" == "0" ]] && skip_arg=""
     local launch
     # TMUX_TMPDIR is passed through the `env -i` wall on purpose. `env -i`
     # strips $TMUX, which tmux had set for this pane, so anything the pane
@@ -720,12 +754,37 @@ cch_boot_worker() {
 TMUX_TMPDIR=%q ANTHROPIC_BASE_URL=%q ANTHROPIC_AUTH_TOKEN=mock-token \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 \
 DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_BUG_COMMAND=1 \
-%s TERM=%q %q --dangerously-skip-permissions%s' \
+%s TERM=%q %q%s%s' \
         "$CCH_CFG" "$PATH" "$CCH_CFG" "$CCH_TMUX_TMPDIR" \
         "http://127.0.0.1:$CCH_MOCK_PORT" "${CCH_EXTRA_ENV:-}" \
-        "${TERM:-xterm-256color}" "$CLAUDE_BIN" "$settings_arg"
+        "${TERM:-xterm-256color}" "$CLAUDE_BIN" "$skip_arg" "$settings_arg"
+    printf '%s' "$launch"
+}
 
-    cch_tmux new-window -d -t "$CCH_SESSION": -n "$name" -c "$CCH_WORKDIR" "$launch"
+# Boot the real claude in a new tmux window against the mock. Echoes the
+# new window's index.
+#
+#   cch_boot_worker <name>                            renderer path
+#   cch_boot_worker <name> <settings-file>            boots WITH --settings
+#   cch_boot_worker <name> <settings-file|""> <workdir>
+#
+# The one-argument form is the renderer path (unless CCH_SETTINGS is
+# set): it carries no hooks and no settings keys, so it exercises
+# pane-state's renderer classification only. Pass a settings file when
+# the scenario needs a contract that lives in settings — the hook events
+# (2d) or the VI editor mode (2c). Every knob documented on
+# cch_launch_cmd applies.
+#
+# `workdir` defaults to $CCH_WORKDIR, the pre-trusted project dir. A
+# scenario that needs a different cwd (an untrusted nested repo, say)
+# passes it here instead of rebuilding the launch string. Pass "" as the
+# settings file to keep the renderer path.
+cch_boot_worker() {
+    local name="$1" settings="${2:-}" workdir="${3:-$CCH_WORKDIR}"
+    local launch
+    launch=$(cch_launch_cmd "$settings")
+
+    cch_tmux new-window -d -t "$CCH_SESSION": -n "$name" -c "$workdir" "$launch"
     local idx
     idx=$(cch_tmux list-windows -t "$CCH_SESSION" -F '#{window_name} #{window_index}' \
         | awk -v n="$name" '$1==n {print $2; exit}')
@@ -735,6 +794,15 @@ DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1 DISABLE_BUG_COMMAND=1 \
     # production watcher configures worker windows.
     [[ -n "$idx" ]] && cch_tmux set-option -t "$CCH_SESSION:$idx" -w remain-on-exit on 2>/dev/null
     printf '%s' "$idx"
+}
+
+# Boot a worker WITHOUT `--dangerously-skip-permissions`, so the real
+# binary renders its permission dialog when the mock drives a
+# file-writing tool. Same arguments as cch_boot_worker. A one-line
+# wrapper on purpose: readable at the call site, no second copy of the
+# launch flags.
+cch_boot_prompting_worker() {
+    CCH_SKIP_PERMISSIONS=0 cch_boot_worker "$@"
 }
 
 # Run the production pane-state.sh against a live window via the wrapper.
@@ -779,6 +847,346 @@ cch_state() {
 # Capture a window's pane (plain text, last 25 rows like pane-state).
 cch_capture() {
     cch_tmux capture-pane -t "$CCH_SESSION:$1" -p -J -S -25 2>/dev/null
+}
+
+# --- permission-dialog assertion (jacob-greene/nexus#158, Part B) --------
+#
+# THE PROBLEM THIS SOLVES. A scenario that expects Claude Code's
+# tool-permission dialog and paints none still reads a plausible pane
+# state, so the run looks like a pass. That happened three times: the
+# 2.1.263 evaluation, the 2.1.267 evaluation, and the published jacob-greene/nexus#157
+# script, whose control arm ran `Bash true` and therefore exercised
+# nothing. A convention written down twice and broken three times needs
+# a mechanism. These helpers ARE the mechanism, and they are deliberately
+# generic — any scenario that drives a file-writing tool can use them.
+#
+# WHAT IT ASSERTS ON, and why not the obvious thing. It does NOT key on
+# the option-2 text (`Yes, allow all edits during this session
+# (shift+tab)`). That literal changed between cc 2.1.220 and 2.1.267, and
+# the same instability broke the folder-trust detector at 2.1.260. It
+# keys instead on the parts that held across both releases and across
+# both dialog shapes (`Write` -> "Do you want to create …?", `Edit` ->
+# "Do you want to make this edit to …?"):
+#
+#   1. a first option row `1. Yes`, with or without the chevron;
+#   2. a numbered decline row, `N. No` alone or `N. No, …`;
+#   3. the two footer phrases `Esc to cancel` and `Tab to amend`;
+#   4. LIVENESS: a chevron sitting on a NUMBERED option row.
+#
+# It does NOT key on the question literal either. That is the whole point
+# of the exercise: monitor/pane-state.sh carries exactly one question
+# literal and therefore misses both file-edit shapes (jacob-greene/nexus#157). An assertion
+# built on the same literal could never catch that.
+#
+# The two footer phrases are matched SEPARATELY, not as one string. The
+# release under probe joins them with U+00B7 surrounded by plain spaces;
+# a future release that changes the separator must not silently turn this
+# assertion off.
+#
+# Requirement 4 is what stops prose from matching. An agent transcript
+# quoting this comment, or a report describing the dialog, carries the
+# words but never a chevron-selected numbered option row. It mirrors the
+# liveness leg of `pane-state.sh::_has_trust_overlay`.
+#
+# Requirement 3 is what separates this from the folder-trust dialog,
+# whose footer is `Enter to confirm · Esc to cancel` — no `Tab to amend`.
+
+# CO-LOCATION. The five legs are NOT matched independently across the
+# whole frame. They were at first, and that was a false-positive hole:
+# a transcript quoting the dialog prose satisfies legs 1, 2 and 3 on its
+# own, so ANY unrelated live chevron row elsewhere in the same 25-row
+# capture — an AskUserQuestion menu, say — completed the match with no
+# dialog present. Found by the nexus-158 skeptic, request 001.
+#
+# The frame is therefore reduced to a WINDOW first, anchored on the LAST
+# row carrying `Esc to cancel`:
+#
+#   legs 1, 2 and 4 must all land in the eight rows ABOVE the anchor;
+#   leg 3b (`Tab to amend`) must land at the anchor or within two rows.
+#
+# Above-only for the option rows is what closes the hole: a menu pasted
+# BELOW a quoted footer cannot lend its chevron to the match. Two rules
+# do that work. The `anchor + 2` bound drops a menu three or more rows
+# down; the above-only split rejects one that sits one or two rows down,
+# inside the window. Each is gated by its own fixture in
+# monitor/test-cch-permission-dialog.sh. Eight rows
+# is generous against the measured dialog, whose option rows sit two to
+# four rows above the footer, and it tolerates a longer option list.
+#
+# Two rows of slack for `Tab to amend` rather than requiring the same
+# row: both measured releases render one footer row, but a narrow pane
+# could wrap it.
+#
+# Rows are tagged `A|` (above the anchor) or `B|` (anchor and below) so
+# the caller can apply a leg to one region or to the window as a whole.
+_cch_dialog_window() {
+    local plain="$1"
+    awk '
+        { line[NR] = $0; if (index($0, "Esc to cancel")) anchor = NR }
+        END {
+            if (!anchor) exit 1
+            start = anchor - 8; if (start < 1) start = 1
+            stop  = anchor + 2; if (stop > NR)  stop  = NR
+            for (i = start; i <= stop; i++)
+                print (i < anchor ? "A|" : "B|") line[i]
+        }
+    ' <<<"$plain"
+}
+
+# Predicate. rc 0 if the frame carries a live tool-permission dialog.
+# Silent: for scenarios that need to branch rather than fail.
+
+# ORDERING, within the window. The chevron row must sit AT or BELOW the
+# `1. Yes` row. Constraining every leg to the eight rows above the anchor
+# still left the mirror of the original hole open: a live menu drawn
+# ABOVE a quoted dialog lends its chevron to option rows it has nothing
+# to do with, and both land in the same window. Found by the nexus-158
+# skeptic, request 002.
+#
+#     ❯ 1. Blue                      <- live menu, unrelated
+#       2. Green
+#      ⎿ docs quote the dialog:
+#            1. Yes                  <- quoted, not live
+#            3. No
+#            Esc to cancel · Tab to amend
+#
+# A real selection only ever moves DOWN the option list from `1. Yes`, so
+# this rule costs nothing legitimate: the chevron on option 1, 2 or 3 of
+# a real dialog all still match.
+# ONE OVERLAY, not "legs somewhere in a window". The two rules above
+# constrain WHERE each leg may sit relative to the anchor. Neither
+# requires the legs to BELONG TO THE SAME overlay, so each round of
+# fixing closed one arrangement and left the next one open. The
+# nexus-158 skeptic found three arrangements in three tries, which is
+# what independent greps over a shared window will always produce.
+# Request 004 named the property that closes the class instead of the
+# instance, and this is it.
+#
+# A rendered option list has structure that prose plus an unrelated menu
+# never has:
+#
+#   CONTIGUITY  the numbered option rows are consecutive lines;
+#   ALIGNMENT   their `N.` tokens start in the SAME column.
+#
+# So the frame is scanned for maximal RUNS of consecutive numbered option
+# rows, and one single run must carry all of: the `1. Yes` row, an
+# `N. No` row, a chevron, and the chevron at or below the `1. Yes` row.
+#
+# This rejects the interleaved shape, where a live menu row sits between
+# two quoted option rows. Those three rows are consecutive, but the
+# menu row's number starts in a different column, so they are not one
+# option list:
+#
+#      ⎿ docs quote the dialog:
+#           1. Yes            <- column 12
+#     ❯ 2. Blue               <- column 7, so not the same list
+#           3. No             <- column 12
+#           Esc to cancel · Tab to amend
+#
+# EXACT `1. Yes`. The first option row of the permission dialog is the
+# bare word `Yes` and nothing else, measured on 2.1.173 and 2.1.220.
+# The folder-trust dialog's is `1. Yes, I trust this folder`. Requiring
+# the exact row rejects the trust dialog on its own merits, rather than
+# relying on `Tab to amend` being absent — which the skeptic showed can
+# be borrowed from an adjacent line of unrelated text.
+#
+# CONTINUATION ROWS. Contiguity as first written meant "consecutive
+# lines that are themselves option rows", and that rejected a REAL
+# dialog on a narrow terminal. Below about 58 columns Claude Code soft-
+# wraps option 2 inside its own dialog box and emits the tail as its own
+# line, which split the run in two and left neither half with all the
+# legs. Measured on frames captured from the real binary at widths 46,
+# 54, 58, 62 and 120 (jacob-greene/nexus#158, depth-2 skeptic finding 2):
+#
+#   ❯ 1. Yes
+#     2. Yes, allow all edits during this session
+#        (shift+tab)          <- the wrap. NOT an option row.
+#     3. No
+#
+# `capture-pane -J` cannot help: this is the application's own wrap, not
+# the terminal's, so the two lines are genuinely separate.
+#
+# So a non-option line no longer breaks the run PROVIDED it is indented
+# PAST the option column. That is the property that separates the two
+# cases, and it is why this loosening does not undo the tightening
+# above. A soft-wrapped continuation is always indented past the `N.` it
+# belongs to, because the renderer indents it under its own option text.
+# An interleaved live menu row is not: it carries its own `N.` token and
+# is caught by ALIGNMENT, exactly as before. A blank line still breaks
+# the run, so the footer can never be folded in.
+_cch_option_run_ok() {
+    local above="$1"
+    awk '
+        # The column of the `N.` token, counted in TERMINAL COLUMNS.
+        #
+        # The awk match() function returns a BYTE offset unless the
+        # implementation is multibyte-aware in the current locale.
+        # mawk never is, and
+        # gawk is not under a C locale. The chevron ❯ (U+276F) is ONE
+        # column and THREE bytes, so a byte offset reports the chevron
+        # row two positions right of every row below it, `aligned` goes
+        # 0, and a REAL dialog is discarded. Under mawk that rejected
+        # every positive fixture in the hermetic suite, which turned a
+        # fail-loud assertion permanently silent
+        # (jacob-greene/nexus#158, depth-2 skeptic finding 1).
+        #
+        # `opt` admits only spaces, tabs and one optional ❯ before the
+        # digits, so on any row that reaches this function the chevron
+        # is the ONLY character in that prefix whose byte count differs
+        # from its column count. Collapsing it to one ASCII byte makes
+        # the byte offset EQUAL the column offset, under every awk and
+        # every locale. Do NOT fix this by pinning LC_ALL instead: the
+        # assertion should carry no unstated environment precondition.
+        function digitcol(s,   p) {
+            gsub(/❯/, "^", s)
+            p = match(s, /[0-9]+\./)
+            return p
+        }
+        # Column of the first non-blank character. Everything before it
+        # is spaces and tabs, one byte and one column each, so this is
+        # already implementation- and locale-independent.
+        function indentcol(s,   p) { p = match(s, /[^ \t]/); return p }
+        { line[NR] = $0 }
+        END {
+            opt  = "^[ \t]*(❯[ \t]+)?[0-9]+\\.[ \t]"
+            yes  = "^[ \t]*(❯[ \t]+)?1\\.[ \t]+Yes[ \t]*$"
+            # `No` alone, or `No` then a comma: `3. No, and tell Claude
+            # what to do differently (esc)` is a real decline row, and so
+            # is `2. No, exit` in the trust dialog. A word that only
+            # starts with `No` (`Notes`) is not.
+            no   = "^[ \t]*(❯[ \t]+)?[0-9]+\\.[ \t]+No([ \t]*$|,)"
+            # ANCHORED, exactly as `opt`, `yes` and `no` already are. An
+            # unanchored chevron matched a ❯ anywhere INSIDE a row, so
+            # the chevron leg could still be borrowed — now from the
+            # middle of a row rather than from a neighbouring one
+            # (jacob-greene/nexus#158, depth-2 skeptic finding 3):
+            #
+            #     1. Yes
+            #     3. No
+            #     2. See ❯ 4. below for the retry path
+            #
+            # No real dialog draws its chevron anywhere but the row
+            # start, so anchoring costs nothing legitimate.
+            chev = "^[ \t]*❯[ \t]+[0-9]+\\."
+            i = 1
+            while (i <= NR) {
+                if (line[i] !~ opt) { i++; continue }
+                col = digitcol(line[i])
+                j = i                     # last OPTION row of this run
+                k = i + 1
+                while (k <= NR) {
+                    if (line[k] ~ opt) { j = k; k++; continue }
+                    # A soft-wrapped continuation is transparent: it
+                    # neither carries a leg nor ends the run.
+                    if (line[k] !~ /^[ \t]*$/ && indentcol(line[k]) > col) {
+                        k++; continue
+                    }
+                    break
+                }
+                aligned = 1
+                haveyes = 0; haveno = 0; havechev = 0; yidx = 0; cidx = 0
+                for (m = i; m <= j; m++) {
+                    if (line[m] !~ opt) continue        # folded wrap row
+                    if (digitcol(line[m]) != col) aligned = 0
+                    if (!haveyes  && line[m] ~ yes)  { haveyes = 1;  yidx = m }
+                    if (             line[m] ~ no)     haveno = 1
+                    if (!havechev && line[m] ~ chev) { havechev = 1; cidx = m }
+                }
+                if (aligned && haveyes && haveno && havechev && cidx >= yidx)
+                    exit 0
+                i = j + 1
+            }
+            exit 1
+        }
+    ' <<<"$above"
+}
+
+cch_has_permission_dialog() {
+    local plain="$1" window above whole
+    window=$(_cch_dialog_window "$plain") || return 1
+    [[ -n "$window" ]] || return 1
+    above=$(grep '^A|' <<<"$window" | sed 's/^A|//')
+    whole=$(sed 's/^[AB]|//' <<<"$window")
+    _cch_option_run_ok "$above" \
+        && grep -qF 'Tab to amend' <<<"$whole"
+}
+
+# Assertion. rc 0 if the frame carries the dialog; otherwise rc 1 AND a
+# loud diagnostic on stderr naming which leg failed, with the frame
+# quoted so a CI log carries the evidence.
+#
+#   cch_assert_permission_dialog "$frame" "<what the probe expected>"
+#
+# rc 1 rather than `exit 1`: a scenario tallies it through its own
+# ok()/bad() pair, exactly like every other assertion in the suite. The
+# loudness is the stderr diagnostic plus the non-zero return.
+cch_assert_permission_dialog() {
+    local plain="$1" label="${2:-permission dialog}"
+    if cch_has_permission_dialog "$plain"; then
+        return 0
+    fi
+    {
+        printf 'cch_assert_permission_dialog: NO PERMISSION DIALOG IN FRAME\n'
+        printf '  expected: %s\n' "$label"
+        printf '  missing legs:\n'
+        # Each leg is reported against the SAME region the predicate
+        # tests it in, so the diagnostic cannot say a leg is present
+        # while the predicate rejects it for being in the wrong place.
+        local window above whole
+        window=$(_cch_dialog_window "$plain") || window=""
+        above=$(grep '^A|' <<<"$window" 2>/dev/null | sed 's/^A|//')
+        whole=$(sed 's/^[AB]|//' <<<"$window" 2>/dev/null)
+        if [[ -z "$window" ]]; then
+            printf '    - the footer phrase `Esc to cancel` (no anchor row, so no window)\n'
+        else
+            if ! _cch_option_run_ok "$above"; then
+                printf '    - one contiguous, column-aligned run of numbered option\n'
+                printf '      rows, in the 8 rows above the footer, carrying ALL of:\n'
+                printf '      an exact `1. Yes` row, an `N. No` row, and a chevron\n'
+                printf '      at or below the `1. Yes` row.\n'
+                # Which individual pieces are present at all, purely to
+                # orient the reader. These are NOT the predicate: a leg
+                # can be present here and still not belong to any single
+                # option run.
+                printf '      present somewhere in that region:'
+                grep -qE '^[[:space:]]*(❯[[:space:]]+)?1\.[[:space:]]+Yes[[:space:]]*$' <<<"$above" \
+                    && printf ' `1. Yes`'
+                grep -qE '^[[:space:]]*(❯[[:space:]]+)?[0-9]+\.[[:space:]]+No([[:space:]]*$|,)' <<<"$above" \
+                    && printf ' `N. No`'
+                grep -qE '❯[[:space:]]+[0-9]+\.' <<<"$above" \
+                    && printf ' a chevron row'
+                printf '\n'
+            fi
+            grep -qF 'Tab to amend' <<<"$whole" \
+                || printf '    - the footer phrase `Tab to amend`, at or near the footer\n'
+        fi
+        printf '  frame captured:\n'
+        sed 's/^/    | /' <<<"$plain"
+    } >&2
+    return 1
+}
+
+# Poll a window until its pane carries a permission dialog. Echoes the
+# frame it settled on (dialog present or not) so the caller can assert
+# and report on the SAME bytes it waited for. rc 0 if the dialog
+# appeared, 1 on timeout.
+#
+#   frame=$(cch_wait_permission_dialog "$win" 20) || ...
+#
+# Never treat a timeout as benign: a probe that expected a dialog and
+# timed out has established nothing about the pane it goes on to classify.
+cch_wait_permission_dialog() {
+    local window="$1" timeout_s="${2:-25}" waited=0 frame=""
+    while (( waited < timeout_s )); do
+        frame=$(cch_capture "$window")
+        if cch_has_permission_dialog "$frame"; then
+            printf '%s' "$frame"
+            return 0
+        fi
+        sleep 1; waited=$((waited+1))
+    done
+    printf '%s' "$frame"
+    return 1
 }
 
 # Send a prompt the way the watcher injects: type the text, then Enter
@@ -884,6 +1292,36 @@ wait_for() {
         fi
     fi
     : "${FAIL:=0}"; FAIL=$(( FAIL + 1 )); return 1
+}
+
+# Same as wait_for but inverted: succeeds when the predicate STAYS false
+# for the whole window. Mirrors _harness.sh:220, which this library's
+# header has always claimed to mirror; the absence is why a scenario
+# hand-rolled a bare `sleep` before a negative assertion (skeptic pass on
+# Claude Code 2.1.273).
+#
+# A CAUTION that the missing function cost once: a negative assertion
+# bounded by a timer is only as sound as the timer. If the event you
+# assert absent is asynchronous, prefer a positive barrier — wait for a
+# later event that ORDERS after it (a turn-end Stop hook, say) and only
+# then assert absence. Use hold_false when the window itself is the
+# contract ("must stay idle for N seconds"), not as a substitute for a
+# barrier you can observe.
+hold_false() {
+    local label="$1" duration="$2"; shift 2
+    [[ "$1" == "--" ]] || { echo "hold_false: missing -- separator" >&2; return 2; }
+    shift
+    local deadline=$(( $(date +%s) + duration ))
+    while (( $(date +%s) < deadline )); do
+        if "$@" >/dev/null 2>&1; then
+            printf '  FAIL: %s — predicate became true mid-window\n' "$label" >&2
+            printf '         cmd: %s\n' "$*" >&2
+            : "${FAIL:=0}"; FAIL=$(( FAIL + 1 )); return 1
+        fi
+        sleep 0.25
+    done
+    printf '  PASS: %s (held for %ds)\n' "$label" "$duration"
+    : "${PASS:=0}"; PASS=$(( PASS + 1 )); return 0
 }
 
 # Predicate helper: pane state equals expected.

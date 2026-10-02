@@ -1379,7 +1379,13 @@ fi
 #     RECORDED, not fixed, for the shared-ancestor reason. The count is
 #     `_raw_token_echoes`' own output on the merged tree — re-measure with
 #     `_raw_token_echoes monitor/longjob-watch.sh`, never by eye.
+#     FOURTEENTH ROW ADDED at the jacob-greene/nexus upstream-sync seam:
+#     `context-usage.sh` (`ng context`, a `_facade`) joined the surface
+#     population with ONE raw-token arg diagnostic. RECORDED, not fixed, for
+#     the shared-ancestor reason above. Re-measure with
+#     `_raw_token_echoes monitor/context-usage.sh`, never by eye.
 _D_MANIFEST='ci-head-attempts.sh 2
+context-usage.sh 1
 longjob-watch.sh 3
 guards-for-diff.sh 1
 lit.sh 3

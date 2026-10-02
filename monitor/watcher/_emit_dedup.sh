@@ -41,6 +41,18 @@
 #     that toggles 1↔0 every cycle a worker re-pings — issue #152)
 #   - the `idle` / `idle-too-long` split on the `workspace:` tally line,
 #     folded into their sum (your-org/nexus-code#658)
+#   - `marker Ns old` / `marker NhNNm old`, the dead-window
+#     skeptic-pending row's marker age (issue #202). This row has TWO
+#     renderers — the inline `printf` in _idle_probe.sh and the awk
+#     staging renderer — and they print different age forms from the
+#     same field: `%ds` raw seconds, and fmt_age's `NhNNm` above one
+#     hour. Both are wall-clock derived, so both must be stripped or
+#     the canonical snapshot changes every second for as long as one
+#     dead-window marker exists.
+#   - `skeptic required Ns ago`, the same row's owed-time in its detail
+#     column (issue #202, depth-3 skeptic finding 1). It is `now - req`,
+#     so it advances every second too. It is always raw seconds: the
+#     detail string is preformatted in _idle_dead_window_pending_rows.
 #   - the trailing `--- nexus-emit-sig <iso> <nonce> ---` footer
 # Everything else — eligible-comments rows, pending-decisions rows, the
 # local-diff payload, bell entries — flows through untouched, so a
@@ -104,6 +116,10 @@ _emit_volatile_strip() {
         s/interrupted [0-9]+s/interrupted/g
         s/[0-9]+ awaiting-input/awaiting-input/g
         s/taken [0-9]+s ago/taken ago/g
+        s/marker [0-9]+h[0-9]+m old/marker old/g
+        s/marker [0-9]+s old/marker old/g
+        s/skeptic required [0-9]+s ago/skeptic required ago/g
+        s/^\(full snapshot, rendered [0-9]+s ago/(full snapshot/
         /^--- nexus-emit-sig /d
     ' | awk '
         # your-org/nexus-code#658 — fold the CLOCK-DRIVEN half of the
@@ -285,6 +301,29 @@ _compose_emit_stable_hash() {
 _compose_emit_should_bypass_dedup() {
     local body_file="$1"
     [[ -f "$body_file" ]] || return 1
+    # RESURFACE NARROWING (issue #3). The gh-comment bypass above is
+    # justified by "deduped at the source ... so by the time one reaches
+    # here it is genuinely new". That invariant holds for a comment's
+    # FIRST emit and is false for every resurface, which by construction
+    # re-injects an already-seen id. The result was that the one gate
+    # capable of collapsing an identical repeat was switched off by the
+    # repeat itself — 54 full-price wakes for a single unprocessed
+    # comment on 2026-07-31.
+    #
+    # So: when EVERY comment row in the body is a repeat, do not bypass.
+    # The body falls through to the content-hash gate, which suppresses
+    # it only if nothing else in the emit changed either — i.e. exactly
+    # the issue's "an emit with no new information should not be sent at
+    # all". A body carrying any first-time id still bypasses, unchanged,
+    # so a genuinely new operator comment is never delayed.
+    #
+    # Conservative on doubt: the helper returns not-all-repeats whenever
+    # it cannot tell (no state dir, no history, no rows), and the guard
+    # is skipped entirely when _resurface_cap.sh isn't sourced.
+    if declare -F _resurface_body_is_all_repeats >/dev/null 2>&1 \
+       && _resurface_body_is_all_repeats "$body_file"; then
+        return 1
+    fi
     if awk '
         /^--- eligible github comments ---$/ { sec = "gh"; next }
         /^--- requests ---$/                 { sec = "req"; next }

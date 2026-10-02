@@ -2964,10 +2964,35 @@ _idle_skeptic_orphan_grace() {
 # live tmux window named `<$1>-skeptic` (the _skeptic_spawn_cmd template
 # name), covering an action-log gap. Parsed with awk/sed (no jq dependency
 # in the idle path). $2 = live tmux window names (newline-sep; queried if
-# empty). Returns 0 (live skeptic present) / 1 (none).
+# empty).
+#
+# TRI-STATE (jacob-greene/nexus#31):
+#     0  a live skeptic is reviewing $1        — established
+#     1  ASKED tmux, and none is alive         — established
+#     2  COULD NOT ASK tmux                    — nothing established
+#
+# rc 2 is not a detail. Until it existed this function answered rc 1 —
+# "no skeptic is alive" — whenever tmux merely failed to answer, because
+# liveness was inferred from an EMPTY window list and `2>/dev/null` threw
+# the exit status away. An empty list is not evidence: `tmux list-windows`
+# prints nothing and exits non-zero when there is no server (rc 1), when
+# the socket is unreachable, and when the binary is missing entirely
+# (rc 127). Every caller of this predicate feeds the retire gate, and
+# "no reviewer is alive" is the answer that takes the gate DOWN — so a
+# tmux misread let retire-preflight kill a worker whose reviewer was
+# alive, and made `ng wrap-up` refuse a hand-off on a live reviewer.
+# Callers must route rc 2 to a fail-CLOSED class and must not fold it
+# into rc 1.
 _idle_skeptic_live_window() {
     local name="$1" live="${2:-}"
-    [[ -n "$live" ]] || live=$(tmux list-windows -F '#{window_name}' 2>/dev/null)
+    if [[ -z "$live" ]]; then
+        # Ask tmux and KEEP its exit status. A caller-supplied $live is
+        # by construction an answer tmux already gave successfully, so
+        # only the self-query arm can fail to establish anything.
+        local _lrc=0
+        live=$(tmux list-windows -F '#{window_name}' 2>/dev/null) || _lrc=$?
+        (( _lrc == 0 )) || return 2
+    fi
     local log="${STATE_DIR:-}/action-log.jsonl" sw=""
     if [[ -n "$log" && -r "$log" ]]; then
         sw=$(grep -F '"event":"skeptic-spawn"' "$log" 2>/dev/null \
@@ -3178,16 +3203,28 @@ _idle_skeptic_parked() {
     age=$(( now - mtime ))
     # A live skeptic window naming this target is a STRONGER and more direct
     # claim than the freshness of a file the OTHER process happens to touch.
-    local _sw=""
-    if _sw=$(_idle_skeptic_live_window "$name" "$live"); then
-        _IDLE_SKEPTIC_PARK_WINDOW="$_sw"
-        if (( age <= hang )); then
-            _IDLE_SKEPTIC_PARK_BASIS="await"
-        else
-            _IDLE_SKEPTIC_PARK_BASIS="skeptic-live"
-        fi
-        return 0
-    fi
+    #
+    # rc 2 = tmux could not be asked, so liveness is UNKNOWN
+    # (jacob-greene/nexus#31): do not confer the exemption on an unchecked
+    # claim, and do not fall through to the grace ladder either (that would
+    # age into `orphaned`, the one marker-present state that lets a kill
+    # through). Not parked, not orphaned — the window classifies normally,
+    # which at worst emits. `|| _lrc=$?`, not a bare call: rc 1 is the
+    # ordinary answer and a bare non-zero simple command kills a `set -e`
+    # caller.
+    local _sw="" _lrc=0
+    _sw=$(_idle_skeptic_live_window "$name" "$live") || _lrc=$?
+    case $_lrc in
+        0)
+            _IDLE_SKEPTIC_PARK_WINDOW="$_sw"
+            if (( age <= hang )); then
+                _IDLE_SKEPTIC_PARK_BASIS="await"
+            else
+                _IDLE_SKEPTIC_PARK_BASIS="skeptic-live"
+            fi
+            return 0 ;;
+        2)  return 1 ;;
+    esac
     # No live skeptic. Now the marker's freshness matters again: a stale marker
     # with no skeptic is the genuine-hang path and must lapse.
     (( age <= hang )) || return 1
@@ -3231,6 +3268,13 @@ _idle_skeptic_parked() {
 # the skeptic or clearing the marker. A STALE marker (await died) is NOT
 # orphaned here — it lapses via the hang check and resurfaces through
 # normal idle classification (the genuine-hang path). $3 = live windows.
+#
+# Neither is a marker whose liveness could not be CHECKED (tmux
+# unreachable, jacob-greene/nexus#31). `orphaned` is the one
+# marker-present state retire-preflight.sh check 1b does not block on, so
+# claiming it on an unanswered tmux would retire a worker whose reviewer
+# is alive. Fail closed: rc 2 -> not orphaned -> the marker keeps
+# blocking the kill, exactly as an unloadable probe lib already does.
 _idle_skeptic_orphaned() {
     local name="$1" now="$2" live="${3:-}"
     local safe; safe=$(wk_encode "$name")
@@ -3244,7 +3288,14 @@ _idle_skeptic_orphaned() {
     [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
     age=$(( now - mtime ))
     (( age <= hang )) || return 1
-    _idle_skeptic_live_window "$name" "$live" >/dev/null && return 1
+    # `|| _lrc=$?` — see _idle_skeptic_parked. rc 1 is the ordinary answer
+    # here too, and the `&& return 1` this replaced was errexit-exempt.
+    local _lrc=0
+    _idle_skeptic_live_window "$name" "$live" >/dev/null || _lrc=$?
+    case $_lrc in
+        0) return 1 ;;   # a reviewer IS live -> not orphaned
+        2) return 1 ;;   # could not ask -> unknown, so not ASSERTED orphaned
+    esac
     local req grace
     req=$(_idle_skeptic_request_epoch "$name")
     [[ "$req" =~ ^[0-9]+$ ]] || req=0
@@ -3261,6 +3312,99 @@ _idle_skeptic_orphaned() {
     (( req == 0 )) && req="$mtime"
     grace=$(_idle_skeptic_orphan_grace)
     (( now - req > grace ))
+}
+
+# ---- dead-window skeptic-pending sweep (#202) ---------------------------
+#
+# Both consumers of a skeptic-pending marker are keyed on a window that is
+# ALIVE. `monitor/retire-preflight.sh` needs a window to retire, and
+# `orphaned-skeptic-pending` is enumerated from `_idle_list_worker_windows`
+# (a `tmux list-windows` filter). So a marker whose window has closed can
+# never be tested by either: no signal reaches it, and no code path clears
+# it on teardown. Five such markers sat silent for 19 to 22 days before an
+# orchestrator listed the directory by hand.
+#
+# This sweep walks the marker DIRECTORY instead of the window list, which
+# is the one enumeration that survives the window. It is the producer side
+# of the gap; a teardown-side reap (`ng retire <window>`, #12 option 2)
+# would be the complement and is not this function.
+#
+# REPORT-ONLY, deliberately. It never removes, truncates, touches or
+# rewrites a marker. The marker is the only artefact an enforcement path
+# reads (`retire-preflight.sh` check 1b blocks on it), and the action-log
+# `skeptic-request` event that would otherwise hold the record is bounded
+# telemetry: `main.sh` rotates the log at `monitor.state_log_max_bytes`
+# and deletes rotated archives older than `monitor.diff_retention_days`.
+# An automatic sweep-and-delete would therefore fail OPEN — it would erase
+# the only durable record that a REQUIRED validation never happened, which
+# is the exact failure this gate exists to prevent. The orchestrator
+# resolves a row by spawning the skeptic, by recording a waive, or by
+# `ng skeptic close <window>`.
+#
+# The liveness test runs on the SANITIZED window name, because that is
+# what the marker filename is (`${name//[^a-zA-Z0-9_-]/_}`, applied by
+# every one of the three writers). Two live window names can sanitize onto
+# one filename, so the comparison fails CLOSED: any live window whose
+# sanitized name equals the marker's name suppresses the row. A false
+# positive here would accuse a LIVE window of dropping its review — the
+# direction #112 is about — while a false negative only defers the report
+# until that window closes.
+#
+# $1 = now epoch. $2 = live tmux window names, newline-separated (the
+# caller's once-per-sweep capture; pass the FULL window list, not the
+# worker subset, so an infra or orchestrator window still counts as live).
+# Emits the classifier's four-column TSV:
+#   <window> \t dead-window-skeptic-pending \t <marker-age-s> \t <detail>
+# Column 3 is the MARKER's age, not an idle age: the window is gone, so it
+# has no idle age to report.
+_idle_dead_window_pending_rows() {
+    local now="$1" live="${2:-}"
+    local state_dir="${STATE_DIR:-}"
+    [[ -n "$state_dir" ]] || return 0
+    local dir="${state_dir}/skeptic/pending"
+    [[ -d "$dir" ]] || return 0
+    # FAIL CLOSED on an empty live list. Every caller captures it with
+    # `tmux list-windows ... || true`, so a tmux that cannot answer reads
+    # as "no window is live", and every marker — including the marker of
+    # a LIVE, parked worker — would be reported as abandoned. That is the
+    # false accusation the sanitized comparison below exists to prevent
+    # (#202 depth-3 skeptic finding 3). The watcher always runs inside a
+    # tmux session that holds at least the orchestrator window, so an
+    # empty list means "unknown", never "all windows gone".
+    [[ -n "${live//[[:space:]]/}" ]] || return 0
+    local live_safe marker name mtime age req waited
+    live_safe=$(printf '%s\n' "$live" | sed 's/[^a-zA-Z0-9_-]/_/g')
+    for marker in "$dir"/*; do
+        [[ -f "$marker" ]] || continue
+        name="${marker##*/}"
+        grep -qxF -- "$name" <<<"$live_safe" && continue
+        mtime=$(date +%s -r "$marker" 2>/dev/null || echo 0)
+        [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+        age=$(( now - mtime ))
+        (( age < 0 )) && age=0
+        req=$(_idle_skeptic_request_epoch "$name")
+        [[ "$req" =~ ^[0-9]+$ ]] || req=0
+        (( req == 0 )) && req="$mtime"
+        waited=$(( now - req ))
+        (( waited < 0 )) && waited=0
+        printf '%s\t%s\t%s\t%s\n' \
+            "$name" "dead-window-skeptic-pending" "$age" \
+            "skeptic required ${waited}s ago; marker ${dir}/${name}"
+    done
+}
+
+# Row count for the same sweep. `main.sh`'s full-state row-count
+# consistency check asserts `rows == live`, where `live` is the
+# enumerator's count — and `render_full_state_snapshot` now prints one row
+# per dead-window marker too, which are by construction NOT in the
+# enumerator. Without this addend every emit would read `rows > live`,
+# declare the staged snapshot stale, and re-render inline on every cycle
+# (the nexus-code#236 cost this check's own fail-safe was written to
+# avoid). The count lives here so the sweep has exactly one owner.
+# $1 = now epoch (default: now). $2 = live window names.
+_idle_dead_window_pending_count() {
+    _idle_dead_window_pending_rows "${1:-$(date +%s)}" "${2:-}" \
+        | awk 'NF>0 {n++} END {print n+0}'
 }
 
 # ---- background-compute orphan-grace (your-org/nexus-code#445) -----------
@@ -4896,6 +5040,18 @@ list_really_idle_workers() {
         printf '%s\t%s\t%s\t%s\n' "$name" "$cls" "$age" "$detail"
     done <<<"$worker_windows"
 
+    # Dead-window skeptic-pending sweep (#202). Outside the loop on
+    # purpose: these markers name windows the enumerator CANNOT produce,
+    # so the loop above can never reach them. Report-only — see
+    # `_idle_dead_window_pending_rows`. The rows carry a class of their
+    # own, so `list_idle_transitions`' generic (window, class) dedupe
+    # surfaces each one once without further wiring. They are NOT folded
+    # into any `render_idle_prelude` bucket: `n_busy` is the residue
+    # `total_workers - sum(buckets)` over the ENUMERATOR's total, which
+    # excludes a dead window, so bucketing one would deflate `busy` and
+    # hide a genuinely-working worker.
+    _idle_dead_window_pending_rows "$now" "$live_windows"
+
     # Persist `current ∪ engagement-log-keys-after-prune` for the
     # next cycle's disappearance check. The union makes the
     # cold-start-with-stale-row case prune in two cycles (see the
@@ -5171,6 +5327,55 @@ render_idle_prelude() {
     # it from busy so "busy" means genuinely-working.
     local n_parked
     n_parked=$(printf '%s\n' "$idle_set" | awk -F'\t' '$2=="parked-awaiting-skeptic" {n++} END {print n+0}')
+    # …but the idle set only sees windows that pass list_really_idle_workers'
+    # pane gate, and a parked worker fails it by construction: `busy` hits the
+    # `*)` arm and `empty` the `empty)` arm, both `continue`ing BEFORE the
+    # parked-awaiting-skeptic short-circuit further down. monitor/README.md is
+    # explicit that this is the normal shape — "A worker parked in `await`
+    # reads `busy` (the await tool's spinner)" — so the tally above is 0 in the
+    # two states a park actually occupies, and the worker falls into the
+    # `n_busy` residue: exactly the inflation this axis was added to remove.
+    # It also made the counts line contradict `--- workspace snapshot ---`
+    # INSIDE ONE EMIT (issue #7 item 2; distinct from the #14 stage-file
+    # staleness — this diverges at zero skew).
+    #
+    # Fix: count the park the way the snapshot renderer already does —
+    # `_idle_skeptic_parked` directly, over every worker window, with no
+    # idle-candidate precondition — and de-duplicate against the rows the
+    # idle set already contributed. Deliberately reuses the same predicate
+    # rather than a parallel notion of "parked": one source of truth is the
+    # property being restored. `orphaned` markers still fail the predicate,
+    # so a stuck park keeps its own actionable class and is NOT swept in here.
+    #
+    # De-duplicate against EVERY idle-set row, not only the
+    # `parked-awaiting-skeptic` ones. `_idle_skeptic_parked` can be true for a
+    # window the classifier already emitted under an EARLIER class:
+    # `over-limit` (:2893), `pane-absent` (:2964), `idle-orphan-async` (:2982)
+    # and `interrupted` (:3086) all short-circuit above the park check at
+    # :3104, and the comment at :3068-3076 documents the `interrupted` overlap
+    # as deliberate (a crashed await loop is recoverable, not parked). Because
+    # n_busy is the residue `total - sum(buckets)`, counting such a window in
+    # two buckets DEFLATES busy and hides a genuinely-working worker — the same
+    # wrong-busy-count this block exists to fix, in the opposite direction.
+    # Keying the dedup on window NAME alone makes every window contribute to
+    # exactly one bucket, and leaves the actionable scalar (`interrupted`,
+    # `over-limit`, …) visible instead of relabelling it `parked`.
+    # One epoch for the whole sweep, resolved once: per-iteration `date +%s`
+    # lets the second tick over mid-loop, so two windows with the same marker
+    # mtime could land on opposite sides of the hang/grace boundary within a
+    # single render. The sweep is a snapshot; it gets a snapshot's clock.
+    local parked_live_windows already_parked pname parked_now
+    parked_now=$(date +%s)
+    parked_live_windows=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
+    already_parked=$(printf '%s\n' "$idle_set" \
+        | awk -F'\t' 'NF>0 && $1!="" {print $1}')
+    while IFS=$'\t' read -r pname _ _; do
+        [[ -n "$pname" ]] || continue
+        grep -qxF -- "$pname" <<<"$already_parked" && continue
+        if _idle_skeptic_parked "$pname" "$parked_now" "$parked_live_windows"; then
+            n_parked=$(( n_parked + 1 ))
+        fi
+    done < <(_idle_list_worker_windows)
     # idle-with-children (your-org/nexus-code#455 refine): workers idle but
     # holding ≥1 live background child. `idle-awaiting-job` is the exempt
     # long-timeout state; `idle-children-clarify` and `wrapped-with-children`
@@ -5235,7 +5440,6 @@ render_idle_prelude() {
 render_full_state_snapshot() {
     local raw
     raw=$(_idle_list_worker_windows)
-    [[ -n "$raw" ]] || return 0
     local now name activity_epoch window_index pane_state engaged_grace
     now=$(date +%s)
     engaged_grace=$(_openg_grace_seconds)
@@ -5243,6 +5447,20 @@ render_full_state_snapshot() {
     # fidelity) — see list_really_idle_workers.
     local live_windows
     live_windows=$(tmux list-windows -F '#{window_name}' 2>/dev/null || true)
+    # Dead-window skeptic-pending markers (#202), rendered BEFORE the
+    # per-window rows and before the empty-workspace return: the whole
+    # point of these markers is that they outlive every window, so a
+    # workspace with no live worker at all is exactly when they matter
+    # most. This is the surface that re-shows them at the heartbeat
+    # cadence, since the transition emit dedupes each row after one
+    # showing. Report-only — see `_idle_dead_window_pending_rows`.
+    local dw_name dw_age dw_detail
+    while IFS=$'\t' read -r dw_name _ dw_age dw_detail; do
+        [[ -n "$dw_name" ]] || continue
+        printf '  - %s dead-window-skeptic-pending (marker %ds old; %s; window GONE — spawn the skeptic, waive, or `ng skeptic close %s`; marker NOT auto-cleared)\n' \
+            "$dw_name" "$dw_age" "$dw_detail" "$dw_name"
+    done < <(_idle_dead_window_pending_rows "$now" "$live_windows")
+    [[ -n "$raw" ]] || return 0
     while IFS=$'\t' read -r name activity_epoch window_index; do
         [[ -n "$name" ]] || continue
         local probe_target="${window_index:-$name}"
@@ -5451,6 +5669,10 @@ _full_state_restat_live_windows() {
             n = split(live, a, "\n")
             for (i = 1; i <= n; i++) if (a[i] != "") L[a[i]] = 1
         }
+        # A dead-window skeptic-pending row (jacob-greene/nexus#202) names a
+        # window that is GONE by definition; dropping it here would delete
+        # the only row that reports the orphaned marker.
+        /^  - [^ ]+ dead-window-skeptic-pending / { print; next }
         /^  - / { if (!($2 in L)) next }
         { print }
     '
@@ -5504,6 +5726,10 @@ _idle_restat_live_windows() {
             for (i = 1; i <= n; i++) if (a[i] != "") L[a[i]] = 1
             nd = 0
         }
+        # Dead-window skeptic-pending rows (jacob-greene/nexus#202) report a
+        # window that is GONE by definition. Withholding them would hide the
+        # orphaned marker they exist to report.
+        /^  - [^ ]+ dead-window-skeptic-pending / { print; next }
         /^  - / {
             if (!($2 in L)) {
                 if (!($2 in seen)) { seen[$2] = 1; order[++nd] = $2 }
@@ -5622,6 +5848,16 @@ render_idle_section() {
             # indistinguishable from here; `ng skeptic-evidence` is the read
             # that separates them, so it goes FIRST.
             printf "  - %s orphaned-skeptic-pending (idle %s; marker but NO live skeptic — run `ng skeptic-evidence %s` FIRST. evidence NO-VERDICT [none]: nobody reviewed, spawn a skeptic per skills/nexus.skeptic. evidence CANNOT-ESTABLISH [? | resolved-only | discharge-without-verdict]: do NOT clear on it. evidence DELIVERED [attributed | unmatched-subject | no-open-arm | verdict-without-arm | unmatched-other | ambiguous-arms | rearm-after-close | superseded-verdict | prior-verdict-other-artefact]: a verdict WAS delivered, repair the record rather than clearing the marker, which also voids a live obligation)\n", $1, fmt_age($3), $1
+        }
+        $2 == "dead-window-skeptic-pending" {
+            # #202: the WINDOW behind this marker is gone, so neither of
+            # the two marker consumers can ever reach it — the retire gate
+            # has no window to gate, and orphaned-skeptic-pending is
+            # enumerated from the live window list. Column 3 is the MARKER
+            # age, not an idle age. Report-only: this row never clears the
+            # marker, because the marker is the only durable record that a
+            # required validation never happened.
+            printf "  - %s dead-window-skeptic-pending (marker %s old; %s; window GONE — a required skeptic never returned: spawn it per skills/nexus.skeptic, record a waive, or `ng skeptic close %s`; the marker is NOT auto-cleared)\n", $1, fmt_age($3), $4, $1
         }
         $2 == "idle-awaiting-job" {
             # your-org/nexus-code#455 refine, case (a): idle worker with a

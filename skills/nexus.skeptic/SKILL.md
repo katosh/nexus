@@ -677,6 +677,72 @@ Where a producer could have headed the failure off (a data inventory on
 ingest, accumulated gate exit codes, pinned versions, a writability probe,
 named-path deletes), **flag the absence of that guard** as a finding.
 
+**A mutation arm's failure count is not per-assertion evidence.** A
+*mutation arm* is one deliberate break of production code, run to prove
+that an assertion pins something. The arm turns the suite red, so the arm
+is recorded as caught. But the assertion it was meant to pin can pass
+against the fixed and the broken code alike. Another assertion went red
+and covered for it. The green/red tally never shows this, so the suite
+reports coverage it does not have. Attribute each arm to the specific
+assertion it is meant to pin. Then confirm **that** assertion flips red.
+A broad break turns many assertions red at once, for reasons the arm does
+not target. So confirm the assertion fails for the arm's stated reason,
+not incidentally. "The suite went red somewhere" is a signal, not
+per-assertion evidence. The instance is recorded in phase B3 of
+`monitor/watcher/test-integration/test-realmodel-overlimit.sh`, with its
+own history in the comments there. A test pinned a rule that rejects rows
+carrying a leading line number. A different check rejected its input row
+whether or not that rule ran. So no mutation of that rule could make the
+test fail, and the arm still counted as caught.
+
+**A mutation that did not land is not a mutation arm.** Take a
+*landed-mutation proof* on every arm. That is a checksum and a diff,
+taken after the mutation and before the suite runs. Without it, a green
+arm may be a mutation that never applied. The failure is quiet and it
+points the wrong way: an unlanded mutation reads exactly like a gap in
+the suite.
+
+The common cause is a pattern that matches a comment before it matches
+code. The executable line stays untouched and the suite stays green. The
+recorded instance is the `#185` skeptic pass. Two of its arms substituted
+a pattern that appears in both the comments and the code of
+`monitor/pane-state.sh`, at lines 223, 227 and 247. Both stayed green.
+Re-targeted at the executable lines 774 and 799, both turn red. That
+skeptic caught its own error by diffing the mutated file, not by trusting
+the green.
+
+**In Python, a correct proof is still not sufficient.** The proof shows
+that the source changed, not that the interpreter read the change.
+CPython reuses a cached `.pyc` file while the recorded source size and
+modification second both still match. A backup copy and a mutation that
+land inside one second keep that match. The arm then runs against the
+old bytecode, with a correct checksum and a correct diff. The tell is a
+clean `git status` beside a suite that stays red after the restore.
+
+Four arms of a nineteen-arm sweep were invalid this way before the
+skeptic caught it. Set `PYTHONDONTWRITEBYTECODE=1` for every arm, or
+delete `__pycache__` before and after every arm.
+
+So make the harness enforce it, rather than remembering to check:
+
+| Step | Rule |
+|---|---|
+| After the mutation, before the suite | Abort when the tree is unchanged. Print the changed checksums and the diff |
+| After the suite | Restore the tree, then re-check the checksums |
+| On a restore mismatch | Abort the whole sweep, so no later arm inherits a corrupted tree |
+| Once, before the real arms | Run an arm that mutates nothing, and confirm it aborts |
+
+Give each abort its own exit code, so an abort cannot be read as a pass.
+The last row is not optional. A guard that has never fired is a claim,
+not a control.
+
+Two reference implementations exist, and they share no code. `#187`
+carries the `manifest-pin` arm harness. The `#186` skeptic pass carries
+an independent one, written from scratch, which substitutes with
+`python3` and asserts on the substitution count. Both abort at exit 98 on
+an unlanded mutation, and at exit 99 on a failed restore. The second
+self-tested its own guard on a no-op arm and aborted at 98, as it should.
+
 **Proportionality still applies.** Spend the verification budget where
 being wrong is expensive — a merge, a figure, a gene list, an external
 write, a multi-day run. A cosmetic change gets a glance. But when
@@ -1275,7 +1341,8 @@ ng wrap-up <issue> <report-path> --repo <owner>/<repo> \
     --skeptic-verdict <credible|check|suspect|refuted> \
     --skeptic-depth <your-depth> \
     --skeptic-findings <count-of-substantive-new-issues> \
-    [--skeptic-orig <original-worker-window>]   # recursive passes
+    [--skeptic-orig <original-worker-window>] \  # recursive passes
+    [--skeptic-pr <n>] [--skeptic-head <sha>]    # bind the verdict to a commit
 ```
 
 **State the count, or state a disposition — do not leave both blank.**
@@ -1309,6 +1376,47 @@ is read from the skeptic's own provenance when present (so you usually
 need not pass it); pass it explicitly only when wrapping up off-tmux or to
 override. On a recommended second pass the original worker's marker is
 kept live (parked-and-reachable); on termination it is cleared too.
+
+**Bind your verdict to the commit it covers.** A verdict covers exactly
+one commit. It does not extend to commits pushed after you wrapped up.
+
+| Term | Definition |
+|---|---|
+| Head | The tip commit of a pull request's branch. |
+| Validated head | The exact commit a verdict states it covers. |
+| Trailer | The `Skeptic-Verdict: <v> head=<sha> …` line in a pull-request body. One parser finds it. |
+
+When your review covers a pull request, pass `--skeptic-pr <n>`. The
+wrap-up records the head in the `skeptic-verdict` event and publishes the
+trailer on the pull-request body, where a merge on any host can read it.
+The head defaults to that pull request's head at wrap-up time; pass
+`--skeptic-head <sha>` to state an earlier commit. `ng pr merge` then
+refuses to merge a head your verdict never covered.
+
+This closes a real gap. On 2026-09-11 pull request `#175` was validated
+at `ab2fd5f`, the worker pushed `4a284a6` afterwards, and the merge landed
+the unreviewed commit. The merge was correct, but only because the
+orchestrator read the diff by hand. See `jacob-greene/nexus` issue `#155`.
+
+**Read the trailer back before you trust it.** Every failure on the read
+path is fail-open: a record the parser cannot find means `ng pr merge`
+reports "no verdict" and merges. `ng pr verdict set` therefore re-parses
+the body it just published and fails loudly when the record does not come
+back out. Do not ignore that failure. It means the gate is off.
+
+The parser skips a trailer it finds in any of these places. Each rule
+exists so that a record a human reader cannot see cannot assert a verdict.
+
+| Location | Read as a verdict? |
+|---|---|
+| A line starting at column zero | yes |
+| Inside a fenced code block | no |
+| Inside an HTML comment | no |
+| Indented by four spaces | no |
+| After an unclosed code fence | no — and `set` fails loudly rather than report success |
+
+Fence open and close match on character and length, so a nested fence does
+not end a block early. The last trailer in the body wins.
 
 Every mode's wrap-up prints a `CONSEQUENCE:` line stating plainly what
 happens next, so no worker is surprised by the gate: `require` → the
@@ -1424,13 +1532,32 @@ All written to `monitor/.state/action-log.jsonl`:
 - `skeptic-request` — a skeptic is required for `target-window` at `depth`.
 - `skeptic-spawn` — a skeptic was dispatched (`window` reviews `target-window`).
 - `skeptic-verdict` — a verdict landed (`verdict`, `target-window`,
-  `findings-stated`, and `findings` only when a count was supplied — `#881`).
+  `findings-stated`, and `findings` only when a count was supplied — `#881`;
+  `head` = the commit it covers, `head-source`, `pr` — `jacob-greene/nexus#155`).
 - `skeptic-decision` — an `auto`/`deny`/`waived` decision was recorded.
 - `skeptic-role-not-asserted` — a skeptic-STAMPED window wrapped up
   ORDINARY WORKER WORK via `--not-a-skeptic-verdict` (`reason` is
   mandatory). See "A stamped window doing worker work" below.
 - `skeptic-escalate` — issues persist at the depth cap; operator needed.
 - `skeptic-nudge` — a worker was nudged about pending requests.
+
+**The action log is BOUNDED telemetry, not a durable record.** Do not
+treat a `skeptic-` event as evidence that will still exist later. The
+watcher rotates `action-log.jsonl` once it reaches
+`monitor.state_log_max_bytes` (default **10485760 bytes**,
+`monitor/watcher/_config.sh:371`), then deletes rotated archives older
+than `monitor.diff_retention_days` (default **7 days**,
+`monitor/watcher/_config.sh:31`). Both steps run in
+`_prune_rotate_if_oversized` (`monitor/watcher/main.sh:2267`, called for
+the action log at `monitor/watcher/main.sh:2455`). So a `skeptic-request`
+event is erasable within 7 days of a rotation.
+
+The pending marker is what persists, and no gate reads the action log in
+its place. Two consequences. An audit that asks "was a skeptic ever
+required for this window?" from the action log alone can get a false no.
+And a tool that clears a pending marker on the strength of a logged
+event, instead of on a verdict, destroys the only remaining record that
+the validation never happened (`#202`).
 
 The `skeptic-pending` markers under `monitor/.state/skeptic/pending/`
 are the orchestrator's gate: a window with a pending marker has produced

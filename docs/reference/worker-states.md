@@ -250,6 +250,29 @@ mark. It is absent on the heartbeat-authoritative `busy` / `blocked`
 fast-path emits, where no capture is taken (the probe treats those
 agent-working states as implicit change).
 
+`input_text` appears **only when the input box is non-empty**, and
+carries the percent-encoded text sitting in it. Its presence is the
+signal: an empty box emits no field at all. Every state above answers
+"what SHAPE is the input row?"; this answers "what does it SAY?" —
+the question `retire-preflight.sh` needs before authorizing an
+irreversible `tmux kill-window`, since a dim autosuggest ghost and an
+empty box otherwise emit lines differing by a single token. Note
+`content_hash` cannot serve this purpose: it deliberately digests only
+the region *above* the input row, so a ghost and an empty box hash
+identically.
+
+The extractor is **shape-agnostic on purpose** — it takes everything
+after the `❯<NBSP>` chevron and parses no dim or bright markers, so
+unlike `_detect_autosuggest` it cannot drift when Claude Code changes
+its escape codes (issue `#50`). It therefore does **not** classify: a
+non-empty value is not by itself evidence of a ghost. The caller's
+decision order establishes what the text is — bright operator text has
+already emitted `user-typing` upstream, so text still visible on a
+pass-through state is by elimination not a submitted operator
+instruction. The value is percent-encoded so it stays a single
+space-free token containing no literal `=`, and can never forge a
+further `key=value` field or disturb a greedy `s/.*state=…/` parse.
+
 The decision walks the visible bottom of the pane (last 25
 lines, joined across wraps) and picks the first match in this
 order: blocked overlay → over-limit notice → bright user text →

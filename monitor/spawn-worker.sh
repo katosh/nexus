@@ -2552,7 +2552,7 @@ spawn-worker.sh: warn: -c resolves to nexus primary clone ($NEXUS_ROOT).
   See skills/nexus.tmux-spawn/SKILL.md "secondary clones" for the pattern.
   Continuing anyway.
 WARN
-    ROOT_CWD_WARNING="Note: your cwd is the nexus primary clone. If you intend to edit shared code, switch to a worktree (\`git worktree add ../<project>-<task> -b <user>/<task>\`) first. Read-only inspection is fine."
+    ROOT_CWD_WARNING="Note: your cwd is the nexus primary clone. Read-only inspection is fine. If you intend to edit shared code, switch out of it first, and pick by where your work lands. If your pull-request target is a PUBLIC repository, use a FRESH CLONE (\`git clone <remote> work/<project>-<task>/\`): this clone's local branch can run ahead of its public remote, and a worktree shares this \`.git\`, so the unpushed commits stay reachable and a pull request can publish them. For work that stays local, a worktree is fine, but fetch first and name the base ref: \`git fetch origin\` then \`git worktree add ../<project>-<task> -b <user>/<task> origin/main\` (use the repository's default branch). See CLAUDE.md, \"Independent clones for parallel work\"."
 fi
 
 # ---- deliverable-write probe (fail-fast before the worker starts) -------

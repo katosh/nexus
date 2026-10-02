@@ -251,6 +251,11 @@ source "$_script_dir/watcher/_idle_probe.sh" 2>/dev/null || true
 # shellcheck source=_dropped_manifest.sh
 source "$_script_dir/_dropped_manifest.sh"
 
+# Dangling-uv-cache repair (jacob-greene/nexus#98). Sourcing only defines the function;
+# nothing runs until `_recover_uv_cache_guard` calls it from main.
+# shellcheck source=uv-cache-guard.sh
+source "$_script_dir/uv-cache-guard.sh" 2>/dev/null || true
+
 STATE_DIR="${NEXUS_STATE_DIR:-$NEXUS_ROOT/monitor/.state}"
 SERVICES_REGISTRY="${NEXUS_SERVICES_REGISTRY:-$NEXUS_ROOT/monitor/services.registry}"
 LAUNCHER_BIN="${RECOVER_LAUNCHER_BIN:-$_script_dir/watcher/launcher.sh}"
@@ -417,6 +422,50 @@ _recover_registry_readable() {
     # diagnostic that points at the probe rather than at the registry.
     # Measured on bash 4.4.20: order A prints, order B is silent, both rc 1.
     { : ; } 2>/dev/null < "$file" || return 79
+    return 0
+}
+
+# --- dangling uv-cache guard ----------------------------------------------
+#
+# Repair `locals/uv/cache` when scratch was purged out from under it, BEFORE
+# any launch in this sweep. See monitor/uv-cache-guard.sh for the fault, the
+# safety rules, and why the repair warns instead of being silent (jacob-greene/nexus#98).
+#
+# This wrapper adds the two things the shared guard must not decide for
+# itself: the `--dry-run` contract, and how a refusal affects recovery.
+#
+# DRY-RUN writes NOTHING. `boot-recover.sh` runs `--dry-run` purely as a
+# health probe, so it must stay side-effect-free. The marker printed here is
+# `would repair`, which deliberately does NOT match boot-recover's
+# `would (relaunch|run|resume)` gate: a dangling cache alone should not
+# trigger a full recovery sweep, and if it has actually broken anything, the
+# services it broke are unhealthy and trigger the sweep on their own.
+#
+# A refusal or a failed repair NEVER aborts recovery. The guard covers one
+# fault on one path; the watcher, the orchestrator and every non-uv service
+# must still come up. The guard has already logged the reason on stderr.
+_recover_uv_cache_guard() {
+    if ! declare -F nexus_uv_cache_guard >/dev/null 2>&1; then
+        return 0        # older checkout / fork without the guard — no-op
+    fi
+    local cache="${UV_CACHE_DIR:-${NEXUS_LOCALS:-$NEXUS_ROOT/locals}/uv/cache}"
+
+    if (( DRY_RUN == 1 )); then
+        if [[ -L "$cache" && ! -e "$cache" ]]; then
+            log "uv cache: would repair dangling symlink $cache"
+        fi
+        return 0
+    fi
+
+    local rc=0
+    nexus_uv_cache_guard "$cache" || rc=$?
+    case "$rc" in
+        0)  : ;;    # healthy, absent, or a real directory — silent no-op
+        10) log "uv cache: repaired dangling symlink $cache (scratch was purged)" ;;
+        2)  log "uv cache: REFUSED to repair $cache — see the reason above; uv will still fail" ;;
+        3)  log "uv cache: FAILED to repair $cache — see the reason above; uv will still fail" ;;
+        *)  log "uv cache: guard returned an unexpected status $rc for $cache" ;;
+    esac
     return 0
 }
 
@@ -1556,6 +1605,22 @@ _recover_main() {
             return 3
         fi
     fi
+
+    # Dangling-uv-cache guard, BEFORE anything is launched (jacob-greene/nexus#98).
+    #
+    # `locals/uv/cache` is a symlink into purgeable scratch. When the purge
+    # removes the target the symlink survives dangling, and every `uv` call
+    # in the workspace fails with a misleading `File exists (os error 17)`.
+    # That takes down every registered service that builds through uv (the
+    # labsh JupyterLab services), and the supervised-restart policy cannot
+    # clear it — it retries the same command against the same broken link.
+    #
+    # It runs FIRST, ahead of the watcher, so every downstream launch in this
+    # recovery sees a working cache. It is a no-op in the normal case (two
+    # stat calls), so the cost on a healthy boot is nil. It never aborts
+    # recovery: a refusal or a failed repair is logged and the sweep goes on,
+    # because a broken cache must not strand the services that do not use uv.
+    _recover_uv_cache_guard
 
     # Capture the operator-engaged marks BEFORE relaunching the watcher
     # (whose first idle-probe cycle prunes operator-engaged.tsv rows for

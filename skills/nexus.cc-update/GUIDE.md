@@ -2025,6 +2025,31 @@ payable only by ITS scenario (a log carrying only `test-realmodel-vimode`
 cannot clear `2c-paste`, and vice versa), and the composite still records as
 the WEAKEST of them.
 
+The gate ALSO drives this surface in VI normal mode, through
+`test-realmodel-vipaste.sh`. That scenario does not change the
+`2c-paste` mapping above; it is a second pin, on two more production
+paste call sites, with the box dropped to VI NORMAL mode first:
+
+| Path | Form | Pinned |
+|---|---|---|
+| respawn (`monitor/watcher/_respawn.sh::_respawn_paste_prompt_file`) | `i BSpace` + bracketed `pd_paste_file` (`monitor/_paste-deliver.sh`) + `Enter` | `editorMode: "vim"` honoured; delivery and submit into a NORMAL-mode box |
+| follow-up (`monitor/paste-followup.sh`) | `i BSpace` + bracketed `paste-buffer -p -d -b` + `Enter` | delivery and submit into a NORMAL-mode box |
+
+Neither path can pin its `i BSpace` guard by behaviour. A bracketed
+paste arrives as literal text whichever mode the box is in, so the
+guard is redundant on today's binaries — removing it leaves the gate
+green (measured on 2.1.273). The scenario pins that PROPERTY instead:
+a control proves the marker bytes do NOT land when pasted plain into
+the normal-mode box, and the last arm proves a bracketed paste with no
+guard at all still lands. If a release stops treating a bracketed paste
+as literal, that arm goes red and the guard becomes load-bearing.
+
+The guards themselves are pinned hermetically, not by this gate:
+`monitor/watcher/test-paste-followup.sh` records the script's tmux calls
+against a stub and asserts the guard is sent and precedes the paste. So
+a deleted guard is caught by the ordinary suite, and a changed terminal
+contract is caught here. Neither test alone covers both.
+
 ### 2d. Hooks + settings schema
 
 The nexus rides Claude Code's hook + settings contract. Files:
@@ -2366,6 +2391,69 @@ watch is declared as an `external_waits` entry, so an unarmed session reads
 `idle-orphan-async` and the watcher's orphan-async loop resolves it through
 `longjob-watch.sh resolve`. None of those is the emit path.
 
+### 2h. The session-transcript path and file name
+
+Many scripts open Claude Code's own transcript
+(`<cc-home>/projects/<slugged-cwd>/<session-id>.jsonl`) and read it as
+an authority. A change to the directory layout, the slug transform, or
+the file name silently turns every one of them into "no evidence
+found". Representative readers:
+
+- `monitor/paste-followup.sh` — the submission confirmation. Without
+  the transcript it can never print `submitted`, so every orchestrator
+  follow-up degrades to `unconfirmed` (rc 3).
+- `monitor/cc-auto-update-apply.sh` — the autonomous update routine
+  (the pinned orchestrator session's jsonl).
+- `monitor/context-usage.sh` — the context-budget reading behind
+  `ng context`, which every worker uses to decide when to wrap up.
+
+The set is larger than this list. Re-derive it on each review with
+`command grep -rln 'jsonl' monitor/*.sh monitor/watcher/_*.sh`.
+Check: resolve one live session's transcript with the candidate running
+and confirm the glob still finds it.
+
+### 2i. The `"version"` stamp inside transcript records
+
+Each transcript record carries the Claude Code version that wrote it.
+Two loops read that field, not the binary:
+
+- `monitor/watcher/_cc_auto_update.sh` — reads the last `"version"`
+  stamp to decide whether the running orchestrator is still on the old
+  binary.
+- `monitor/cc-restart-watchdog-loop.sh` — the restart watchdog waits
+  for a `"version":"<candidate>"` record to appear past a byte baseline.
+
+A renamed or dropped field makes both read "not upgraded yet" forever,
+so the watchdog keeps restarting a session that is already correct.
+
+### 2j. The `--version` output string format
+
+Several sites parse the first line of `claude --version` to extract the
+version number (today: `2.1.273 (Claude Code)`). Some extract with an
+`N.N.N` regex and some take the first whitespace-delimited field, so a
+reformat can break one style and not the other:
+
+| Site | How it parses | What breaks |
+|---|---|---|
+| `monitor/cc-auto-update-apply.sh` (live-tree drift check, post-install verify) | `grep -oE '[0-9]+\.[0-9]+\.[0-9]+'` | the autonomous bump's post-check, which rolls the pin back on a mismatch |
+| `monitor/cc-restart-watchdog-loop.sh::_binary_candidate` | `grep -oE '[0-9]+\.[0-9]+\.[0-9]+'` | the watchdog's baseline candidate, so it waits for a stamp that never matches |
+| `monitor/cc-harness/_lib.sh::cch_stage_candidate` | `grep -oE '[0-9]+\.[0-9]+\.[0-9]+'` | the staged candidate is refused as "not the requested version" |
+| `monitor/install-claude-local.sh` (already-installed short circuit, install verification) | `awk '{print $1}'` | the short circuit, so every launch reinstalls |
+| `monitor/grep-delegation-arms.sh` | captured, then parsed | the arm-set record lookup (2f) |
+
+This is not guaranteed exhaustive. Re-derive with
+`command grep -rn -- '--version' monitor/` and skip the test stubs and
+the banners that only print it. Check: run `<candidate> --version` and
+confirm both the leading `N.N.N` and the first field still parse.
+
+> Surfaces 2h–2j were added after a skeptic pass on a 2.1.273
+> evaluation found them absent from this list. Each is nexus code
+> reading a Claude Code output format, so each can break with no
+> changelog entry that names it. Their first draft cited wrong line
+> numbers, which a second skeptic pass caught; they cite functions
+> rather than line numbers for that reason. Verify a citation before
+> you trust it.
+
 ## Step 3 — TESTING PIPELINE (the cc-harness gate)
 
 The renderer surfaces in 2a/2b can only be *proven* by driving the real
@@ -2414,6 +2502,19 @@ is untouched), then:
    - `test-realmodel-trust-sandboxed-env.sh` → the `CLAUDE_CODE_SANDBOXED=1`
      canary every `spawn-worker.sh` launcher relies on to stay off the
      workspace-trust dialog (`#1334`), with a control arm.
+   - `test-realmodel-permission-dialog.sh` → boots a worker WITHOUT
+     `--dangerously-skip-permissions` (`CCH_SKIP_PERMISSIONS=0`), paints
+     the real Write and Edit permission dialogs, and asserts pane-state
+     classifies both `blocked` (**2a/2b**; `jacob-greene/nexus#157`).
+   - `test-realmodel-vipaste.sh` → **2c** paste delivery under VI mode:
+     boots with `editorMode: "vim"`, drops the box to normal mode, and
+     drives the respawn paste helper and `monitor/paste-followup.sh`
+     (both bracketed) against the live TUI, plus the bracketed-is-literal
+     property both rest on.
+   - `test-realmodel-hooks.sh` → **2d**: boots with `--settings`, asserts
+     `UserPromptSubmit` / `PreToolUse` / `Stop` still fire, that the
+     matcher alternation still selects, and that a `PreToolUse` exit 2
+     still blocks the tool call.
 
    `test-realmodel-apispoof.sh` and `test-realmodel-long-exchange.sh`
    exist and are **exempt** — a named gap, tracked at
@@ -2429,9 +2530,10 @@ into evidence classes:
 | **2a** pane-state markers | full (`idle-busy`, `autosuggest`) | `gate` |
 | **2b** unstick dialogs | overlay **shape** only — not the Case D footer, not Case A | `gate` for the shape; footer/Case A need a changelog read |
 | **2c-vi** VI-mode | `test-realmodel-vimode` (`#724`, mapped `#867`) | `gate` where the 2c re-checks come back NON-zero; `reachability` where they come back zero — re-check per host, see 2c |
-| **2c-paste** paste delivery | `test-realmodel-paste-held` (`#1591`, mapped `#1614`) | `gate` when that scenario is in your gate log; otherwise `empirical` (with a stated negative control) or `source-inspection` |
-| **2d** hooks + settings | `PreToolUse` + over-limit `Stop`/`StopFailure` | `gate` for those events; every other event is `source-inspection` |
+| **2c-paste** paste delivery | `test-realmodel-paste-held` (`#1591`, mapped `#1614`); `test-realmodel-vipaste` for the respawn and bracketed follow-up forms in VI normal mode | `gate` when that scenario is in your gate log; otherwise `empirical` (with a stated negative control) or `source-inspection` |
+| **2d** hooks + settings | `PreToolUse` payload, `UserPromptSubmit` / `PreToolUse` / `Stop` firing + the exit-2 block (`test-realmodel-hooks`), over-limit `Stop`/`StopFailure` | `gate` for those events; every other event is `source-inspection` |
 | **2e** CLI flags | none | `empirical` (a `--help` diff on the candidate binary, with a negative control) or `source-inspection` |
+| **2h–2j** transcript path, `"version"` stamp, `--version` format | none | `empirical` (resolve a live transcript, read its stamp, parse `<candidate> --version`) or `source-inspection` |
 
 So: **green gate + a changelog review that clears the uncovered
 surfaces, each with an honest evidence class = safe**. A **red** gate

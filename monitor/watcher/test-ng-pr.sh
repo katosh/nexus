@@ -20,6 +20,13 @@
 #     when neither is passed.
 #   cmd_pr_merge — default method=squash, --merge / --rebase / --squash
 #     toggle, --delete-branch fires a DELETE on git/refs/heads/<ref>.
+#   cmd_pr_merge head-binding gate (jacob-greene/nexus#155) — refuses
+#     (exit 5) when the recorded Skeptic-Verdict head is not the head it
+#     is about to merge, merges when they agree, warns and merges when no
+#     verdict is recorded, hard-stops on that case under --require-verdict,
+#     and merges past a mismatch with an audited --verdict-override.
+#   cmd_pr_verdict — set writes the trailer at the PR's current head; get
+#     reads it back and exits 3 when there is none.
 #   cmd_pr_view — read-only one-liner from canned meta.
 
 set -uo pipefail
@@ -70,7 +77,16 @@ make_gh_stub "$STUB_DIR/gh" "$CAPTURE" --with-body-capture "$BODY_CAPTURE" <<'CA
         if [[ "$method" == "PATCH" ]]; then
             ghs_emit <<< '{"html_url":"https://mock.example/pulls/42-edited","number":42}'
         elif [[ "$method" == "GET" ]]; then
-            ghs_emit <<< '{"number":42,"state":"open","user":{"login":"the-author"},"head":{"ref":"feature-branch","sha":"fetchedhead000"},"base":{"ref":"main"},"title":"a pr title"}'
+            # head.sha and body are driven by the environment so the
+            # head-binding gate cases (jacob-greene/nexus#155) can vary the
+            # recorded verdict and the head without a second stub. Built
+            # with jq so a body carrying quotes or newlines stays valid.
+            jq -cn \
+               --arg sha  "${MOCK_PR_HEAD_SHA:-fetchedhead000}" \
+               --arg body "${MOCK_PR_BODY:-pr description here}" \
+               '{number:42, state:"open", user:{login:"the-author"},
+                 head:{ref:"feature-branch", sha:$sha},
+                 base:{ref:"main"}, title:"a pr title", body:$body}'
         else
             ghs_emit <<< '{}'
         fi
@@ -136,6 +152,8 @@ run_ng() {
         MOCK_BASE_TIP_UNREADABLE="${MOCK_BASE_TIP_UNREADABLE:-0}" \
         MOCK_MRB_RUN="${MOCK_MRB_RUN:-}" \
         MOCK_MRB_LOG="${MOCK_MRB_LOG:-}" \
+        MOCK_PR_HEAD_SHA="${MOCK_PR_HEAD_SHA:-}" \
+        MOCK_PR_BODY="${MOCK_PR_BODY:-}" \
         -- "$NG" "$@" ) >"$_out_tmp" 2>"$_err_tmp"
     _rc=$?
     _stdout=$(<"$_out_tmp"); _stderr=$(<"$_err_tmp")
@@ -570,6 +588,102 @@ for _f in --repo --sha --base-sha; do
     assert_eq "ng pr merge 42 $_f refuses a missing value rather than spinning or merging unpinned (rc=$_rc)" \
               "$([[ "$_rc" != 0 && "$_rc" != 124 ]] && echo refused || echo "bad-rc-$_rc")" "refused"
 done
+
+# ---- Test 17f: cmd_pr_merge — the head-binding gate (jacob-greene/nexus#155)
+#
+# Terms. Head: the tip commit of a pull request's branch. Validated head:
+# the exact commit a verdict states it covers. Verdict trailer: the
+# `Skeptic-Verdict:` line in a pull-request body that names both.
+#
+# The cases above all run with a body that carries NO trailer, which is
+# why they still merge. These cases drive the gate itself, through this
+# suite's own stub, at the real verb.
+#
+# The shas are the 2026-09-11 incident on pull request `#175`: validated
+# at `ab2fd5f`, head moved to `4a284a6`, and the merge landed the commit
+# nobody reviewed.
+GATE_VALIDATED="ab2fd5f1111111111111111111111111111aaaa"
+GATE_MOVED="4a284a62222222222222222222222222222bbbb0"
+GATE_BODY="a pr description
+
+Skeptic-Verdict: credible head=$GATE_VALIDATED depth=1 findings=0"
+
+echo '=== ng pr merge 42 — recorded head != head to merge → REFUSED ==='
+MOCK_PR_HEAD_SHA="$GATE_MOVED" MOCK_PR_BODY="$GATE_BODY" \
+    run_ng out err rc pr merge 42
+assert_eq        "exit 5 on a head mismatch"         "$rc" "5"
+assert_contains  "stderr says REFUSED"               "$err" "REFUSED"
+assert_contains  "stderr names the validated head"   "$err" "$GATE_VALIDATED"
+assert_contains  "stderr names the head to merge"    "$err" "$GATE_MOVED"
+calls=$(<"$CAPTURE")
+assert_not_contains "no merge PUT on a refusal"      "$calls" "/pulls/42/merge"
+assert_not_contains "and no merge SHA on stdout"     "$out" "abc1234deadbeef"
+
+echo '=== ng pr merge 42 — recorded head == head to merge → merges ==='
+MOCK_PR_HEAD_SHA="$GATE_VALIDATED" MOCK_PR_BODY="$GATE_BODY" \
+    run_ng out err rc pr merge 42
+assert_eq        "exit 0 when the verdict covers the head" "$rc" "0"
+assert_contains  "stdout prints the merge SHA"       "$out" "abc1234deadbeef"
+calls=$(<"$CAPTURE")
+assert_contains  "the merge PUT was sent"            "$calls" "-X PUT /repos/default-org/default-repo/pulls/42/merge"
+
+echo '=== ng pr merge 42 --verdict-override "<reason>" → merges, audited ==='
+rm -f "$WORK/state/verdict-override.log"
+MOCK_PR_HEAD_SHA="$GATE_MOVED" MOCK_PR_BODY="$GATE_BODY" \
+    run_ng out err rc pr merge 42 --verdict-override "rejoins one wrapped line, changes no word"
+assert_eq        "exit 0 with an override"           "$rc" "0"
+assert_contains  "stderr says OVERRIDE"              "$err" "OVERRIDE"
+calls=$(<"$CAPTURE")
+assert_contains  "the merge PUT was sent"            "$calls" "-X PUT /repos/default-org/default-repo/pulls/42/merge"
+audit=$(cat "$WORK/state/verdict-override.log" 2>/dev/null)
+assert_contains  "an audit line records the reason"  "$audit" "rejoins one wrapped line"
+assert_contains  "the audit names the merged head"   "$audit" "merged-head=$GATE_MOVED"
+
+echo '=== ng pr merge 42 --verdict-override "" → refused, no silent override ==='
+MOCK_PR_HEAD_SHA="$GATE_MOVED" MOCK_PR_BODY="$GATE_BODY" \
+    run_ng out err rc pr merge 42 --verdict-override ""
+assert_eq        "exit 64 (EX_USAGE) on an empty reason" "$rc" "64"
+calls=$(<"$CAPTURE")
+assert_not_contains "no merge PUT"                   "$calls" "/pulls/42/merge"
+
+echo '=== ng pr merge 42 --require-verdict, no trailer → REFUSED ==='
+MOCK_PR_HEAD_SHA="$GATE_MOVED" run_ng out err rc pr merge 42 --require-verdict
+assert_eq        "exit 5 when no verdict is recorded" "$rc" "5"
+calls=$(<"$CAPTURE")
+assert_not_contains "no merge PUT"                   "$calls" "/pulls/42/merge"
+
+echo '=== ng pr merge 42, no trailer, no --require-verdict → warns, merges ==='
+MOCK_PR_HEAD_SHA="$GATE_MOVED" run_ng out err rc pr merge 42
+assert_eq        "exit 0 without a recorded verdict" "$rc" "0"
+assert_contains  "stderr says the head was not checked" "$err" "head not checked"
+
+# ---- Test 17g: cmd_pr_verdict set|get (jacob-greene/nexus#155) --------
+
+echo '=== ng pr verdict set 42 --verdict credible → trailer + PATCH ==='
+MOCK_PR_HEAD_SHA="$GATE_VALIDATED" run_ng out err rc \
+    pr verdict set 42 --verdict credible --depth 1 --findings 0
+assert_eq        "exit 0"                            "$rc" "0"
+assert_contains  "the trailer names the current head" "$out" "head=$GATE_VALIDATED"
+assert_contains  "the trailer names the verdict"     "$out" "Skeptic-Verdict: credible"
+calls=$(<"$CAPTURE")
+assert_contains  "a body PATCH was sent"             "$calls" "-X PATCH /repos/default-org/default-repo/pulls/42"
+body=$(jq -r '.body' < "$BODY_CAPTURE")
+assert_contains  "the patched body carries the trailer" "$body" "Skeptic-Verdict: credible head=$GATE_VALIDATED"
+
+echo '=== ng pr verdict get 42 → reads the recorded trailer ==='
+MOCK_PR_BODY="$GATE_BODY" run_ng out err rc pr verdict get 42 --field head
+assert_eq        "exit 0"                            "$rc" "0"
+assert_eq        "prints the validated head"         "$out" "$GATE_VALIDATED"
+
+echo '=== ng pr verdict get 42, no trailer → exit 3 ==='
+run_ng out err rc pr verdict get 42
+assert_eq        "exit 3 when the PR carries no trailer" "$rc" "3"
+
+echo '=== ng pr verdict set 42 --verdict <not-on-the-ladder> → refused ==='
+run_ng out err rc pr verdict set 42 --verdict excellent
+assert_eq        "exit non-zero on an unknown verdict" "$rc" "1"
+calls=$(<"$CAPTURE")
+assert_not_contains "no PATCH on a refusal"          "$calls" "-X PATCH"
 
 # ---- Test 18: cmd_pr_view — one-liner from canned meta -----------------
 

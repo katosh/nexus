@@ -93,6 +93,16 @@ assert_ctx "  …and no longer stops at the SELF match (#1073)" "AND IT DOES NOT
 assert_ctx "  …retiring the marker-absent-from-YOUR-prompt advice as insufficient" "NOT sufficient"
 run '{"tool_name":"Bash","tool_input":{"command":"cd a && git push origin x"}}'
 assert_ctx "git push fires wrong-remote reminder" "git -C <clone> push"
+# The row's own message teaches `git -C <clone> push`, so the pattern must
+# fire on THAT form too — not only on the adjacency form above. This probe
+# is the one that fails when the widened pattern is reverted; the assertion
+# above cannot, because it asserts on the message text, not on a fire.
+# A fresh window, because the per-(window,tag) dedup would silence a second
+# `git-push` fire in "footgun-test".
+export NEXUS_WORKER_WINDOW="footgun-git-c-form"
+run '{"tool_name":"Bash","tool_input":{"command":"git -C /tmp/t push origin main"}}'
+assert_ctx "git -C <clone> push fires wrong-remote reminder" "Pin each push to its clone"
+export NEXUS_WORKER_WINDOW="footgun-test"
 run '{"tool_name":"Bash","tool_input":{"command":"scancel --name myjob"}}'
 assert_ctx "scancel --name fires sibling-job reminder" "scancel <jobid>"
 run '{"tool_name":"Bash","tool_input":{"command":"kill $(jobs -p)"}}'
@@ -1431,7 +1441,10 @@ assert_silent "a different variable \$TMPDIRX stays SILENT"
 # with one message pin, three silent controls incl. its own prescribed form).
 # 282 -> 285: +3 for the #1630 skeptic (quote-before-slash and empty-default
 # shapes fire; a near-name variable stays silent).
-_EXPECTED_ASSERTIONS=285
+# 285 -> 286: +1 for the `git -C <clone> push` form of the git-push row
+# (the row's own message teaches that form; the adjacency-only regex
+# missed it).
+_EXPECTED_ASSERTIONS=286
 _ran=$(( PASS + FAIL ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     printf '  PASS: every declared assertion executed (%d)\n' "$_EXPECTED_ASSERTIONS"; PASS=$((PASS+1))

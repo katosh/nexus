@@ -6,6 +6,14 @@
 # Exit 0  iff the project's JupyterLab answers /api/status with the
 #         project's current auth token.
 #
+# ALWAYS PASS PROJECT_DIR when you run this by hand. The default is $PWD, and
+# $PWD is almost never a project that has a service. Run bare from the nexus
+# root it reports "the service has never been brought up here" — which reads
+# like a real fault but only means you probed the wrong directory. The correct
+# argument is the service's `workdir` column in monitor/services.registry,
+# which is what the watcher and the supervisor both pass. This is an
+# invocation trap, not a defect (jacob-greene/nexus#98).
+#
 # This is the registry healthcheck command for jupyter-* services AND the
 # probe labsh-supervised.sh runs between restarts — one implementation,
 # so the supervisor and the recovery sweep can never disagree on

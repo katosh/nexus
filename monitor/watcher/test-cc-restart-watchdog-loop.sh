@@ -109,6 +109,12 @@ make_root() {
     local root="$1"
     mkdir -p "$root/config" "$root/monitor/.state" "$root/node_modules/.bin"
     cp "$NEXUS_SRC/config/load.sh" "$root/config/load.sh"
+    # The loop resolves its claude binary through the shared resolver
+    # rather than hard-coding the npm path, so the fixture must ship it.
+    # With no nexus.claude_bin key in this root, the resolver lands on the
+    # node_modules stub written just below — the same binary the hard-coded
+    # form used to name.
+    cp "$NEXUS_SRC/monitor/_claude-bin.sh" "$root/monitor/_claude-bin.sh"
     cat > "$root/node_modules/.bin/claude" <<EOF
 #!/usr/bin/env bash
 printf '%s (Claude Code)\n' "$CANDIDATE"

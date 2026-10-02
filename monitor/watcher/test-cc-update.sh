@@ -272,6 +272,21 @@ else
     fail "emit_section: section missing skill/gate/GATED pointer"
 fi
 
+# ---- 16b: emit_section carries the ROUTING invariant --------------------
+#
+# The emit used to name the guide and the gate but no repository, so a
+# hand-composed spawn prompt guessed — and guessed the asset repo, which
+# the guide forbids. The repository name must travel with the emit.
+_routing_repo="${CC_AUTO_SURFACE_REPO:-your-org/nexus-code}"
+if [[ "$sec1" == *"ROUTING"* ]] \
+   && [[ "$sec1" == *"$_routing_repo"* ]] \
+   && [[ "$sec1" == *"--repo"* ]] \
+   && [[ "$sec1" == *"never the"* ]]; then
+    pass "emit_section: section carries the routing invariant (implementation repo, not the asset repo)"
+else
+    fail "emit_section: section does not name the implementation repo for every write"
+fi
+
 # ---- 17/18: emit gate OFF (default) vs ON (mutation) --------------------
 
 # A fresh signal with an UNSURFACED candidate: with the gate OFF the
