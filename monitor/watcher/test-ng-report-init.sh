@@ -106,6 +106,7 @@ run_ng_home() {
     local _stdout _stderr _rc _out_tmp _err_tmp
     _out_tmp=$(mktemp); _err_tmp=$(mktemp)
     ( cd "$_cwd" && HOME="$_home" CLAUDE_PROJECT_DIR="" CLAUDE_CODE_SESSION_ID="" \
+        CLAUDE_CONFIG_DIR="${_RNH_CFG:-}" NEXUS_CC_HOME="" \
         NEXUS_WORKER_WINDOW="" NEXUS_ROOT="$FAKE_NEXUS" \
         "$NG" "$@" >"$_out_tmp" 2>"$_err_tmp" )
     _rc=$?
@@ -367,6 +368,23 @@ assert_contains  "session-id resolves via tail fallback"  "$body" \
                  "session-id: $SESSION_UUID2"
 assert_contains  "stderr warns about fallback firing"     "$err" \
                  "falling back to '$TAIL_DIR'"
+
+# ---- Test 9b (#1720 residual): the transcript lives ONLY under ------------
+# $CLAUDE_CONFIG_DIR/projects (the agent-sandbox layout when ~/.claude/projects
+# did not exist at the first launch); HOME has no projects dir at all.
+echo '=== session-id: transcript only under $CLAUDE_CONFIG_DIR/projects ==='
+FAKE_HOME9="$WORK/home-cfgonly"; mkdir -p "$FAKE_HOME9"
+CFG9="$WORK/cfg-only"
+CWD_PATH9="$WORK/cfgonly-test/work/proj9"; mkdir -p "$CWD_PATH9"
+SLUG9=$(printf '%s' "$CWD_PATH9" | sed 's|[^a-zA-Z0-9]|-|g')
+SESSION_UUID9="99999999-8888-7777-6666-555555555555"
+mkdir -p "$CFG9/projects/$SLUG9"; touch "$CFG9/projects/$SLUG9/$SESSION_UUID9.jsonl"
+_RNH_CFG="$CFG9" run_ng_home path err rc "$CWD_PATH9" "$FAKE_HOME9" \
+    report-init cfgonly --reports-dir "$FAKE_NEXUS/reports"
+assert_eq       "exit 0 with a config-dir-only transcript" "$rc" "0"
+body=$(<"$path")
+assert_contains "session-id resolves from \$CLAUDE_CONFIG_DIR/projects" "$body" \
+                "session-id: $SESSION_UUID9"
 
 # ---- Test 10: session-id absent → frontmatter says 'unknown' ----------
 

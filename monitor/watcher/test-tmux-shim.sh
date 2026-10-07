@@ -105,10 +105,33 @@ REAL_LEG=0
 
 PRIV_SOCKETS=()
 abort_if_board() {   # <socket-path> <what-for>
+    # An EMPTY path is a private server that could not be created or queried —
+    # still a refusal (a target nobody resolved cannot be proven not to be the
+    # board), but NOT "IS THE BOARD". Callers once passed `${P:-$BOARD_SOCK}`,
+    # so a lost tmux race on CI, where no board exists, read as the board (#1703).
+    if [[ -z "$1" ]]; then
+        echo "ABORT: refusing to $2 — the private server's socket path is UNRESOLVED (server not created or not answering)." >&2
+        echo "FAILED"; exit 9
+    fi
     if [[ "$1" == "$BOARD_SOCK" ]]; then
         echo "ABORT: refusing to $2 — target socket '$1' IS THE BOARD." >&2
         echo "FAILED"; exit 9
     fi
+}
+# start_server <cmd…> — start a PRIVATE server, retrying a bounded number of
+# times. A server killed one line earlier can still be EXITING when the next
+# client connects; tmux 3.4 (the CI runner's) then fails `server exited
+# unexpectedly` instead of starting a fresh one. Measured under CPU load on 3.4,
+# never seen on 2.6; on CI it aborted the suite (#1703). The caller still reads
+# the socket path back and hands it to abort_if_board, so a retry that never
+# succeeds stays a refusal.
+start_server() {
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        "$@" && return 0
+        sleep 0.2
+    done
+    return 1
 }
 cleanup() {
     local s sp
@@ -1667,9 +1690,9 @@ else
     SEMI_SOCK="semi$$"
     th_require_tmux_socket "$SEMI_SOCK"
     PRIV_SOCKETS+=("$SEMI_SOCK")
-    env -u TMUX tmux -f "$TMUXCONF" -L "$SEMI_SOCK" new-session -d -s p -n base >/dev/null 2>&1
+    start_server env -u TMUX tmux -f "$TMUXCONF" -L "$SEMI_SOCK" new-session -d -s p -n base >/dev/null 2>&1
     SEMI_PATH=$(env -u TMUX tmux -L "$SEMI_SOCK" display-message -p '#{socket_path}' 2>/dev/null)
-    abort_if_board "${SEMI_PATH:-$BOARD_SOCK}" "run the #1578 real-server rows"
+    abort_if_board "$SEMI_PATH" "run the #1578 real-server rows"
     semi() { env -u TMUX tmux -L "$SEMI_SOCK" "$@"; }
     semi_shim() {   # an AGENT caller (CLAUDECODE=1), like run_shim; SEMI_AS_OPERATOR=1 drops it
         env -u TMUX PATH="$SHIM_DIR:/usr/bin:/bin:$PATH" NEXUS_TMUX_SOCKET="$SEMI_PATH" \
@@ -1720,9 +1743,9 @@ else
     # make every row after the first fail for that reason instead of its own.
     semi_fresh() {
         semi kill-server >/dev/null 2>&1 || true
-        env -u TMUX tmux -f "$TMUXCONF" -L "$SEMI_SOCK" new-session -d -s p -n base >/dev/null 2>&1
+        start_server env -u TMUX tmux -f "$TMUXCONF" -L "$SEMI_SOCK" new-session -d -s p -n base >/dev/null 2>&1
         SEMI_PATH=$(semi display-message -p '#{socket_path}' 2>/dev/null)
-        abort_if_board "${SEMI_PATH:-$BOARD_SOCK}" "run the #1582 skeptic rows"
+        abort_if_board "$SEMI_PATH" "run the #1582 skeptic rows"
     }
     semi_fresh; semi set -s 'command-alias[50]' 'zq="kill-server"' >/dev/null 2>&1
     out=$(semi_shim zq)
@@ -1774,16 +1797,16 @@ else
 
     # --- #1583 delta (semisplitsk2 F1-F4), each destructive row on a FRESH server.
     # F1: an agent's bare `-C`, fed kill-server on stdin — DEAD at 8c9c3aa9.
-    semi_fresh; out=$( { sleep 1; printf 'kill-server\n'; sleep 1; } | timeout 8 env -u TMUX PATH="$SHIM_DIR:/usr/bin:/bin:$PATH" \
+    semi_fresh; out=$( { sleep 1; printf 'kill-server\n' 2>/dev/null; sleep 1; } | timeout 8 env -u TMUX PATH="$SHIM_DIR:/usr/bin:/bin:$PATH" \
         NEXUS_TMUX_SOCKET="$SEMI_PATH" CLAUDECODE=1 "$SHIM_DIR/tmux" -L "$SEMI_SOCK" -C 2>&1 ); sleep 0.5
     assert_contains "REAL #1583 F1: an AGENT's bare -C on the board is REFUSED" "$out" "control mode"
     assert_eq "REAL #1583 F1: …and the server is STILL ALIVE (dead at 4bbfe878, ff9f8a55, 8c9c3aa9)" "$(semi_alive)" alive
     # F2: session `1s` (created FIRST) whose active pane is index 1; `p` is current
     # and holds nothing matching `1`. 8c9c3aa9 killed 1s:far.1; 4bbfe878 refused.
     semi kill-server >/dev/null 2>&1 || true
-    env -u TMUX tmux -f "$TMUXCONF" -L "$SEMI_SOCK" new-session -d -s 1s -n far >/dev/null 2>&1
+    start_server env -u TMUX tmux -f "$TMUXCONF" -L "$SEMI_SOCK" new-session -d -s 1s -n far >/dev/null 2>&1
     SEMI_PATH=$(semi display-message -p '#{socket_path}' 2>/dev/null)
-    abort_if_board "${SEMI_PATH:-$BOARD_SOCK}" "run the F2 row"
+    abort_if_board "$SEMI_PATH" "run the F2 row"
     semi split-window -d -t 1s:far >/dev/null 2>&1; semi select-pane -t 1s:far.1 >/dev/null 2>&1
     sleep 1.1; semi new-session -d -s p -n base >/dev/null 2>&1; semi new-window -d -t p:2 -n other >/dev/null 2>&1
     out=$(semi_shim kill-pane -t 1)
@@ -1818,10 +1841,10 @@ else
     sp() { env -u TMUX -u NEXUS_TMUX_SOCKET "$SP_REAL" -L "$SP_SOCK" "$@"; }
     sp_fresh() {
         sp kill-server >/dev/null 2>&1 || true
-        env -u TMUX -u NEXUS_TMUX_SOCKET -u CLAUDECODE PATH="${SP_REAL%/*}:/usr/bin:/bin" NEXUS_STATE_DIR="$NEXUS_STATE_DIR" \
+        start_server env -u TMUX -u NEXUS_TMUX_SOCKET -u CLAUDECODE PATH="${SP_REAL%/*}:/usr/bin:/bin" NEXUS_STATE_DIR="$NEXUS_STATE_DIR" \
             "$SP_REAL" -f "$TMUXCONF" -L "$SP_SOCK" new-session -d -s p >/dev/null 2>&1
         SP_PATH=$(sp display-message -p '#{socket_path}' 2>/dev/null)
-        abort_if_board "${SP_PATH:-$BOARD_SOCK}" "run the server-path rows"
+        abort_if_board "$SP_PATH" "run the server-path rows"
     }
     sp_alive() { sp list-sessions >/dev/null 2>&1 && echo alive || echo dead; }
     sp_fresh; sp run-shell 'tmux kill-server' >/dev/null 2>&1; sleep 1
@@ -1832,18 +1855,26 @@ else
     assert_eq "REAL server-path: --apply fronts the shim, verified by re-reading (rc 0)" "$_sp_rc" 0
     sp run-shell 'tmux kill-server' >/dev/null 2>&1; sleep 1
     assert_eq "REAL server-path: after --apply the SAME server-run 'tmux kill-server' is refused — STILL ALIVE" "$(sp_alive)" alive
+    # The job reports through a FILE, not run-shell's stdout: tmux 3.4 (the CI
+    # runner's) does not return a job's output to a detached command-line client
+    # — `run-shell 'echo hi'` prints nothing at rc 0 there, with or without the
+    # shim (measured; 2.6 prints `hi`) — so the stdout form read '' on every CI
+    # cell while the job itself had succeeded (#1703). Waited on, bounded.
+    rm -f "$WORK/spjob.out"
+    sp run-shell "tmux list-windows >/dev/null && echo SPJOBOK > '$WORK/spjob.out'" >/dev/null 2>&1
+    for _sp_i in 1 2 3 4 5 6 7 8 9 10; do [ -s "$WORK/spjob.out" ] && break; sleep 0.2; done
     assert_eq "REAL server-path: control — a server-run 'tmux list-windows' still works through the shim" \
-        "$(sp run-shell 'tmux list-windows >/dev/null && echo SPJOBOK' 2>/dev/null)" SPJOBOK
+        "$(cat "$WORK/spjob.out" 2>/dev/null)" SPJOBOK
     # A PLUGIN-STYLE server job after --apply: `run-shell <plugin>.tmux` scripts
     # call `tmux bind-key`/`set-option`. The job inherits the server's environment,
     # which carries no CLAUDECODE, so the carrier rule must not break it.
     sp run-shell 'tmux bind-key -n F11 display-message plugin-ok' >/dev/null 2>&1
     assert_eq "REAL server-path: a plugin-style job's 'tmux bind-key' still WORKS after --apply (not an agent)" \
         "$(sp list-keys 2>/dev/null | grep -c 'F11.*plugin-ok')" 1
-    abort_if_board "${SP_PATH:-$BOARD_SOCK}" "tear down the server-path server"
+    abort_if_board "$SP_PATH" "tear down the server-path server"
     sp kill-server >/dev/null 2>&1 || true
 
-    abort_if_board "${SEMI_PATH:-$BOARD_SOCK}" "tear down the #1578 server"
+    abort_if_board "$SEMI_PATH" "tear down the #1578 server"
     semi kill-server >/dev/null 2>&1 || true
 
     # Now prove the shim is the ONLY thing that was keeping it alive: with the

@@ -497,10 +497,18 @@ session-wide event rather than a per-window action:
    from now.
 2. **Wait.** Detection lines log on first sight per window; the
    waiting log throttles to once per 5 min.
-3. **Cascade.** Once the reset epoch passes, walk every stuck
+3. **Cascade.** Once the reset epoch passes, or on the cycle a
+   **reset event** is consumed (<your-org>/nexus-code#1739: the
+   logged-in identity changed, i.e. a re-login / account switch, or
+   an over-limit pane was observed busy again), walk every stuck
    window EXCEPT the watcher AND the orchestrator: Enter to
-   dismiss the menu, then a paste-buffer of "Please continue with
-   your task. The API rate limit has reset." + Enter.
+   dismiss the menu, verify the menu left, then a paste-buffer of
+   "Please continue with your task. The API rate limit has reset.
+   Re-check any jobs, watches and messages …" + Enter. A window
+   whose input row holds a typed draft (`input=typed` before the
+   dismiss, `held`/`draft` after it) is refused, as is one whose
+   menu is still live after the Enter. A reset event also pulls
+   every over-limit wake stamp to now.
 4. **Heads-up.** Paste a separate message into the orchestrator
    target naming the unstuck windows and asking it to verify each
    is making progress, then to log `ratelimit-resume-ack` to the
@@ -518,28 +526,20 @@ session-wide event affecting many windows simultaneously and needs
 the orchestrator to verify progress, so the watcher fans out then
 hands off.
 
-### Case C — transient API error
+### Case C — retired
 
-Claude Code occasionally lands on a per-turn API failure (most
-commonly `Internal server error`, type `api_error`) that wedges
-the input prompt with the JSON error chip rendered just below the
-`⏺` arrow. Pressing Enter on this idle prompt nudges Claude Code
-to retry the failed turn.
-
-The watcher fingerprints the chip via `_unstick_fingerprint_api_error`
-(hashing the lines containing `API Error`, `"type":"api_error"`,
-`Internal server error`, `"request_id"`) and sends Enter. A
-per-(window, fingerprint) backoff of
-`monitor.watcher.api_error_backoff_minutes` (default 30) prevents
-hammering a chronically broken endpoint — same fingerprint within
-the window is logged once per cycle as `case=C action=skip-backoff`
-and skipped. Distinct fingerprints (different request_ids /
-messages) and same-fingerprint reappearances after the backoff
-elapses re-fire the Enter.
-
-Enter alone is the chosen action; from this idle state Claude Code
-retries the failed turn, so a separate "please continue" follow-up
-is unnecessary today.
+Case C (an Enter-nudge on an API-error chip) was retired in
+<your-org>/nexus-code#1670. Its literals (`API Error: {"type":"error"` +
+`"Internal server error"`) match no current render — 2.1.280–2.1.284
+print a 500 as `● API Error: 500 Internal server error. This is a
+server-side issue, usually temporary — try again in a moment.` — and
+its remedy was measured inert: on 2.1.284 against the cc-harness mock,
+one bare Enter on that prompt sent no request, while typing `continue`
+did. A turn killed by an API error is owned by the `StopFailure` path:
+`monitor/hooks/turn-failure-emit.sh` writes a typed
+`turn-failure/<window>.json` marker, the idle probe surfaces the window
+as `interrupted <category>:<recovery>`, and the orchestrator resumes it.
+The letter is not reused.
 
 ### Case D — AskUserQuestion overlay on the orchestrator
 

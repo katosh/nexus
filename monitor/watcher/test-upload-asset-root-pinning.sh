@@ -450,11 +450,77 @@ assert_contains "the URL names the PRIMARY's asset repo"     "$stdout" "https://
 assert_eq       "…and NOT the clone's config"                "${stdout##*CLONE-CONFIG-READ*}" "$stdout"
 
 # =========================================================================
+# ==== your-org/nexus-code#1651: the ONE-TREE rule — WHICH NEXUS ============
+#
+# `ng` keys the nexus on its OWN tree; this script keyed it on $NEXUS_ROOT
+# first. So with NEXUS_ROOT at a FOREIGN nexus, `ng` refused a write while
+# `ng upload` pushed to the foreign ASSET repo at rc 0. Both now use
+# `nexus_config_root`. These roots carry the REAL config/load.sh and a real
+# nexus.yml each, with DISTINCT asset repos, so the URL names the tree whose
+# identity was used — the stub load.sh above answers one repo for every tree
+# and could not see this.
+_real_load="$_monitor_dir/../config/load.sh"
+_mk_1651_root() {   # <dir> <asset-owner|none>
+    "$REAL_GIT" clone --quiet "$NEXUS_BARE" "$1"
+    cp "$_real_load" "$1/config/load.sh"
+    cp "$_monitor_dir/../config/nexus.example.yml" "$1/config/nexus.example.yml"
+    if [[ "$2" == malformed ]]; then
+        printf 'github:\n  repo: [unclosed\n' > "$1/config/nexus.yml"
+    elif [[ "$2" != none ]]; then
+        printf 'github:\n  repo: %s/issues\n  asset_repo: %s/assets\n  bot_login: test-bot\n' "$2" "$2" \
+            > "$1/config/nexus.yml"
+    fi
+}
+_bare_head() { "$REAL_GIT" --git-dir="$ASSET_BARE" rev-parse main 2>&1; }
+R1651="$WORK/case-1651"
+_mk_1651_root "$R1651/P"  p-org
+_mk_1651_root "$R1651/F"  f-org
+_mk_1651_root "$R1651/F2" p-org
+_mk_1651_root "$R1651/C"  none
+_mk_1651_root "$R1651/M"  malformed
+
+echo '=== N: NEXUS_ROOT at a FOREIGN nexus — REFUSED, nothing pushed anywhere ==='
+_b=$(_bare_head)
+NR_ROOT="$R1651/F" run_upload "$R1651/P" "$R1651/P/monitor/upload-asset.sh" "$PAYLOAD" --issue 1651
+assert_eq       "#1651 N: refuses (exit 4)"                     "$rc" "4"
+assert_eq       "#1651 N: emits NO url"                         "$stdout" ""
+assert_eq       "#1651 N: the asset remote did not move"        "$(_bare_head)" "$_b"
+assert_eq       "#1651 N: no asset tree under the FOREIGN root" "$([[ -e $R1651/F/assets ]] && echo yes || echo no)" "no"
+assert_eq       "#1651 N: no asset tree under its own root"     "$([[ -e $R1651/P/assets ]] && echo yes || echo no)" "no"
+assert_contains "#1651 N: the refusal names BOTH identities"    "$stderr" "f-org/assets"
+assert_contains "#1651 N: …both of them"                        "$stderr" "p-org/assets"
+
+echo '=== O: a CONFIG-LESS checkout outside work/, NEXUS_ROOT=P — acts for P (as at base) ==='
+NR_ROOT="$R1651/P" run_upload "$R1651/C" "$R1651/C/monitor/upload-asset.sh" "$PAYLOAD" --issue 1651
+assert_eq       "#1651 O: exit 0"                               "$rc" "0"
+assert_contains "#1651 O: the URL names P's asset repo"         "$stdout" "https://github.com/p-org/assets/"
+assert_eq       "#1651 O: asset tree under P"                   "$([[ -d $R1651/P/assets/.git ]] && echo yes || echo no)" "yes"
+assert_eq       "#1651 O: NOT under the checkout"               "$([[ -e $R1651/C/assets ]] && echo yes || echo no)" "no"
+
+echo '=== P: a foreign NEXUS_ROOT with the SAME identity is not refused ==='
+NR_ROOT="$R1651/F2" run_upload "$R1651/P" "$R1651/P/monitor/upload-asset.sh" "$PAYLOAD" --issue 1651
+assert_eq       "#1651 P: exit 0"                               "$rc" "0"
+assert_contains "#1651 P: the URL names the shared asset repo"  "$stdout" "https://github.com/p-org/assets/"
+
+# your-org/nexus-code#1652 item 3. Same shape as O, but the checkout HAS a
+# nexus.yml and it is MALFORMED. At 33a44f48 that read as "no config" and the
+# upload went to P's asset repo at rc 0. O is the no-config control.
+echo '=== Q: a MALFORMED own nexus.yml, NEXUS_ROOT=P — REFUSED, nothing pushed ==='
+rm -rf "$R1651/P/assets"; _b=$(_bare_head)
+NR_ROOT="$R1651/P" run_upload "$R1651/M" "$R1651/M/monitor/upload-asset.sh" "$PAYLOAD" --issue 1652
+assert_eq       "#1652 Q: refuses (exit 4)"                     "$rc" "4"
+assert_eq       "#1652 Q: emits NO url"                         "$stdout" ""
+assert_eq       "#1652 Q: the asset remote did not move"        "$(_bare_head)" "$_b"
+assert_eq       "#1652 Q: no asset tree under P"                "$([[ -e $R1651/P/assets ]] && echo yes || echo no)" "no"
+assert_contains "#1652 Q: the refusal says the config cannot be read" "$stderr" "cannot be read"
+
+# =========================================================================
 # ASSERTION-COUNT GUARD (count=exact). An EXACT comparison, not a floor: this
 # suite's whole value is a set of specific claims, and a claim that silently
 # stops executing is indistinguishable from one that passes. Six cases, in
-# order: 5 + 3 + 5 + 6 + 6 + 3 + 4 + 5, then #1173's I-M: 7 + 4 + 4 + 3 + 3.
-EXPECTED_ASSERTIONS=58
+# order: 5 + 3 + 5 + 6 + 6 + 3 + 4 + 5, then #1173's I-M: 7 + 4 + 4 + 3 + 3,
+# then #1651's N-P: 7 + 4 + 2, then #1652's Q: 5.
+EXPECTED_ASSERTIONS=76
 _ran=$(( ${PASS:-0} + ${FAIL:-0} ))
 if (( _ran != EXPECTED_ASSERTIONS )); then
     printf '  FAIL: assertion count %d != expected %d — an assertion was silently dropped\n' \

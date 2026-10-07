@@ -6,8 +6,9 @@
 #      (often `master`); the script pins HEAD to `main` so the first
 #      `push origin main` succeeds (the new-operator bootstrap trap).
 #   2. basename clobber — two distinct sources sharing a basename route
-#      to the same REPO_PATH; the second upload must WARN about the
-#      silent overwrite and point at `--repo-path`.
+#      to the same REPO_PATH; the second upload must be REFUSED at exit 5
+#      (your-org/nexus-code#1639 — it used to WARN and overwrite at rc 0)
+#      and point at `--repo-path` and `--replace`.
 #   3. URL-on-no-op — a no-op upload (identical content already at the
 #      path) must still emit the SHA-pinned URL on stdout (already the
 #      behaviour; this locks it as a regression guard for scrapers).
@@ -172,13 +173,13 @@ show_stat=$("$REAL_GIT" --git-dir="$BARE" show --stat "$main_sha")
 assert_contains "uploaded file landed on main"      "$show_stat" "assets/7/firstfig.png"
 assert_contains "URL pins to the pushed main SHA"   "$stdout" "$main_sha"
 
-# ---- Test 2: basename clobber across distinct sources → WARN ------------
+# ---- Test 2: basename clobber across distinct sources → REFUSE (#1639) ---
 #
 # Two distinct source files sharing a basename route to the same
 # REPO_PATH. The first upload must NOT warn; the second (different
 # content at the same dest) MUST warn and name the escape hatch.
 
-echo '=== distinct sources, same basename → second upload warns about clobber ==='
+echo '=== distinct sources, same basename → second upload REFUSED at exit 5 ==='
 # Test 1 already left $FAKE_NEXUS/assets as a populated clone on main, so
 # the script now takes its existing-repo branch (reset --hard origin/main).
 
@@ -192,10 +193,11 @@ assert_eq "exit 0 on first upload"                  "$rc" "0"
 assert_not_contains "first upload does not warn"    "$stderr" "WARNING"
 
 run_upload "$SRC_B" --repo-path assets/general/02_heatmap.png
-assert_eq "exit 0 on clobbering upload"             "$rc" "0"
-assert_contains "second upload warns about clobber" "$stderr" "WARNING"
-assert_contains "warning names the basename"        "$stderr" "02_heatmap.png"
-assert_contains "warning points at --repo-path"     "$stderr" "--repo-path"
+assert_eq "exit 5 on clobbering upload"             "$rc" "5"
+assert_eq "clobbering upload prints no URL"         "$stdout" ""
+assert_contains "refusal names the basename"        "$stderr" "02_heatmap.png"
+assert_contains "refusal points at --repo-path"     "$stderr" "--repo-path"
+assert_contains "refusal points at --replace"       "$stderr" "--replace"
 
 # ---- Test 3: no-op upload still emits the SHA-pinned URL ----------------
 #

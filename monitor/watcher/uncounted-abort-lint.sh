@@ -2,8 +2,10 @@
 # uncounted-abort-lint.sh — flag an outcome that is ANNOUNCED but not COUNTED
 # before the summary reads the counters (your-org/nexus-code#783).
 #
-# Usage:  bash monitor/watcher/uncounted-abort-lint.sh [<repo-root>]
+# Usage:  bash monitor/watcher/uncounted-abort-lint.sh [--files] [<repo-root>]
 #   prints one `<file>:<line>\t<text>` row per site; exit 1 if any, 0 if none.
+#   --files prints the POPULATION instead — one repo-relative path per line,
+#   every file this lint reads — and exits 0 (your-org/nexus-code#1747).
 #
 # ---------------------------------------------------------------------------
 # THE DEFECT
@@ -95,6 +97,14 @@
 #
 # "No member found" is a claim about THIS SEARCH, not about the population.
 set -uo pipefail
+
+# `--files` prints the POPULATION, so the guard's `gp_population` forwards to
+# it instead of keeping a second copy of the selection below
+# (your-org/nexus-code#1747; count-fallback-lint.sh's device, #1494). Before it
+# existed test-uncounted-abort-lint.sh declared no population, and its own
+# re-pin history records three reds found only by a full band for that reason.
+_UAL_FILES=0
+if [[ "${1:-}" == --files ]]; then _UAL_FILES=1; shift; fi
 
 ROOT="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 [[ -d "$ROOT/monitor" ]] || {
@@ -201,15 +211,33 @@ _QUOTES_AWK="$(dirname "${BASH_SOURCE[0]}")/_shell_quotes.awk"
 # repo's dominant defect class, so the empty-output case is asserted below.
 _QUOTES_SRC="$(cat "$_QUOTES_AWK")"
 
+# THE SELECTION, factored out so `--files` and the scan cannot disagree: ONE
+# predicate with two consumers. A `gp_population` that re-stated this `case`
+# would be a second implementation of the population, and it would drift.
+_ual_selected0() {   # -> NUL-separated selected paths
+    local f
+    while IFS= read -r -d '' f; do
+        case "$f" in
+            */.git/*) continue ;;
+        esac
+        case "${f##*/}" in
+            *.sh|ng|sandbox-notify) ;;
+            *) continue ;;
+        esac
+        printf '%s\0' "$f"
+    done < <(find "$ROOT/monitor" -type f -print0)
+}
+
+if (( _UAL_FILES )); then
+    # The corpus, plus the awk library this lint CONCATENATES into its program:
+    # bash reads those bytes too, and an edit to them changes every verdict.
+    { _ual_selected0 | while IFS= read -r -d '' f; do printf '%s\n' "${f#"$ROOT"/}"; done
+      printf '%s\n' "$_QUOTES_AWK"; }
+    exit 0
+fi
+
 hits=0
 while IFS= read -r -d '' f; do
-    case "$f" in
-        */.git/*) continue ;;
-    esac
-    case "${f##*/}" in
-        *.sh|ng|sandbox-notify) ;;
-        *) continue ;;
-    esac
     total=$(wc -l < "$f")
     # Both views of this file, read once. `_RAW` for the announcement test and
     # the comment check; `_CODE` for every disposition test.
@@ -257,7 +285,7 @@ while IFS= read -r -d '' f; do
             hits=$(( hits + 1 ))
         fi
     done < "$f"
-done < <(find "$ROOT/monitor" -type f -print0)
+done < <(_ual_selected0)
 
 if (( hits > 0 )); then
     printf '\nuncounted-abort-lint: %d site(s). An outcome is ANNOUNCED but never COUNTED,\n' "$hits" >&2

@@ -1,0 +1,10 @@
+{
+  "name": "nexus-codex-cli",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Project-local OpenAI Codex CLI for the nexus (your-org/nexus-code#1640). ISOLATED from the root package.json on purpose: an `npm install` at the root reconciles @anthropic-ai/claude-code to the root lockfile and would silently downgrade an operator-local cc pin. The version below is a VETTED FLOOR (>=1 day stable); monitor/.state/codex-version-local (gitignored) overrides it. Install with monitor/install-codex-local.sh; resolve with monitor/_codex.sh:codex_bin.",
+  "license": "ISC",
+  "dependencies": {
+    "@openai/codex": "0.156.1"
+  }
+}

@@ -383,7 +383,12 @@ a hook or your task prompt points you there.
   means RE-ARM, not "done": it is an answer about the clock, never
   about the condition** (<your-org>/nexus-code`#1540`, `#1549`). A wait
   expected to outlive 30 minutes belongs to `ng longjob` (next bullet),
-  which survives the cap. A parked
+  which survives the cap. **A `run_in_background` call has the same kind
+  of clock** (2.1.285+, <your-org>/nexus-code`#1685`): the harness stops it
+  at the call's own `timeout` (default 30 min, max 2 h), so set that
+  `timeout` above any wait's own `--timeout`, and read a stop notice
+  (`<status>killed</status>`, "background time limit") as RE-ARM, never
+  as a verdict; past 2 h only `ng longjob` survives. A parked
   agent must be able to name what will RE-INVOKE it; if the answer is
   a status file, it is not parked — it is asleep. Measured: a skeptic
   `await` launched through `async-run.sh` expired cleanly (rc 4,
@@ -402,7 +407,7 @@ a hook or your task prompt points you there.
   `monitor/ng longjob add slurm:<id>|asyncrun:<token>|pid:<pid>|file:<path>|cmd:'<probe>'`.
   **READ `add`'s LAST LINE.** `dispatcher: ARMED` means end your turn.
   `NOT ARMED` (rc 3) means nothing in this session will wake you: run
-  `monitor/longjob-watch.sh await <id> --timeout <s>` in a Bash call with
+  the `await` line `add` prints, with the Bash `timeout` it prints, under
   `run_in_background: true` instead, then `ng longjob status` says why.
   A watch that cannot tell emits `UNKNOWN … PARKED` after 5 blind polls
   rather than sleeping you forever; every delivered line costs a wake
@@ -459,6 +464,20 @@ a hook or your task prompt points you there.
   <task-id>`**: the harness launched the task, so the harness can
   stop it. `svc.sh` stops `setsid`-detached services; nothing
   stops a default-deny refusal by hand-rolling a signal past it.
+- **OpenAI Codex is a CO-WORKER you supervise, never a delegate you
+  forward** (<your-org>/nexus-code`#1640`). For a bounded subtask
+  (a second implementation, a review, a refactor you will check) use
+  `monitor/ng codex run --cd <git-root> --prompt-file <task>`, never a
+  raw `codex exec`: the raw call reads your inherited stdin and appends
+  it to the task, puts the prompt in argv where sibling `/proc` scans
+  ingest it, cannot authenticate from `OPENAI_API_KEY`, and gives you
+  no diff and no list of what it wrote. Read the exit code (0 completed, 3 turn-failed,
+  4 timeout, 5 unavailable, 6 workdir, **7 indeterminate: neither**),
+  then READ `diff.patch`, `writes-outside-diff.txt` and `last-message.txt` before you keep a byte
+  of it. You own the report, the wrap-up and the skeptic contract, so
+  Codex's claims get the same verification as anyone's. Longer than
+  ~20 minutes: add `--background` (it arms `ng longjob`). Skill:
+  `skills/nexus.codex/SKILL.md`.
 - **Label a parameter you CHOSE as chosen, never as upstream
   convention** (<your-org>/nexus-code`#970`). If you pick a value the
   tool does not default for you — a bin width, a threshold, a seed, a
@@ -503,6 +522,43 @@ Deeper skills, consulted only when the above is insufficient:
 push-author verify), `skills/nexus.report/SKILL.md` (section
 semantics, append-only, Infrastructure Issues loop). Resolve by
 absolute path via the spawn prompt.
+
+## Codex worker addendum
+
+Injected, after the floor, into the prompt of a worker spawned with
+`monitor/spawn-worker.sh --harness codex` (<your-org>/nexus-code#1640), and
+into no other. Everything above is still binding; this section says what
+changes because you are running in the OpenAI Codex CLI, not in Claude Code.
+
+- **Read `$NEXUS_ROOT/CLAUDE.md` before acting.** It is this workspace's
+  contract. Claude Code loads it automatically; Codex does not (measured:
+  Codex loads instruction files only from your workdir's own repository, so
+  a workdir in a separate repo under `work/` never sees the nexus one). The
+  launcher lets Codex read `CLAUDE.md` files inside your workdir's
+  repository as if they were `AGENTS.md`. **Never create an `AGENTS.md` (or a
+  `CLAUDE.md`) anywhere under `work/`.**
+- **Tools the floor names that you do NOT have**, and what to use instead:
+  - `SendMessage` / `ListAgents` — reach the orchestrator with
+    `monitor/ng request file --origin "$NEXUS_WORKER_WINDOW" --kind question
+    --slug <s> --file <f>` (durable, watcher-mediated).
+  - `Monitor`, `run_in_background`, the `ng longjob` wake — nothing
+    re-invokes you after your turn ends. Keep a wait inside your turn with a
+    hard bound, or start the job with `monitor/ng longjob run …`, record the
+    token in your report, and end the turn saying what is in flight: the
+    orchestrator sees your pane go idle and follows up.
+  - `TaskStop` — stop what you started by the pid you recorded, through
+    `monitor/proc-kill-authorized --filter`.
+- **No just-in-time GUARDS.** Codex has hooks, `PreToolUse` included, but
+  the nexus wires them only to keep the heartbeat and the submit-stamp
+  receipt current. The Claude PreToolUse guard scripts (footgun guard, `gh`
+  write guard) do not run for you. The rules they would inject are in the
+  floor above, and the PATH-front shims (`gh`, `pip`, `tmux`) still apply.
+- **Your shell commands are not sandboxed by Codex** (`danger-full-access`:
+  Codex's own sandbox cannot start inside this nexus's kernel sandbox). The
+  kernel sandbox still binds every write. Never try to weaken it.
+- **Session id** is `$CODEX_THREAD_ID`; `monitor/ng report-init` reads it.
+  Report, `report-check`, `ng wrap-up` and the skeptic contract are
+  unchanged.
 
 ## Reply-to wrap-up override
 

@@ -414,7 +414,7 @@ but not installed on the asset+issue repo — re-do Phase 2.8.
 
 ```bash
 # 4. End-to-end asset upload.
-./monitor/ng upload README.md --message "preflight"
+./monitor/ng upload README.md --message "preflight" --replace
 ```
 
 Expected: a URL of the form

@@ -432,11 +432,14 @@ fi
 # (your-org/nexus-code#313 item 4). Non-fatal: a timeout still drops into
 # the cockpit, which shows the live state and the verify diagnostics.
 echo "watcher: waiting for the stack to converge (watcher + orchestrator + services)..." >&2
-if "$_script_dir/verify-stack.sh"; then
-    echo "watcher: stack is up — opening the cockpit." >&2
-else
-    echo "watcher: stack not fully converged yet — landing in the cockpit to inspect (key 0 tails the watcher log; the orchestrator may still be spawning)." >&2
-fi
+"$_script_dir/verify-stack.sh"; _vs_rc=$?
+case "$_vs_rc" in
+    0) echo "watcher: stack is up — opening the cockpit." >&2 ;;
+    # 3 = everything up EXCEPT a JupyterLab cold build still materialising
+    # (your-org/nexus-code#1675). Not healthy, and not a failure to chase.
+    3) echo "watcher: stack is up except a JupyterLab cold build still in progress (not healthy yet; the supervisor finishes it) — opening the cockpit." >&2 ;;
+    *) echo "watcher: stack not fully converged yet — landing in the cockpit to inspect (key 0 tails the watcher log; the orchestrator may still be spawning)." >&2 ;;
+esac
 
 # --- become the cockpit -----------------------------------------------------
 

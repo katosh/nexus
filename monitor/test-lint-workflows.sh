@@ -24,6 +24,27 @@ ROOT="$(cd "$HERE/.." && pwd)"
 LINT="$HERE/lint-workflows.py"
 WF="$ROOT/.github/workflows"
 PY="${PYTHON:-python3}"
+
+# --- the guard's population (your-org/nexus-code#1747) ----------------------
+# This suite declared none, so `guards-for-diff` could never select it — while
+# layer 2 runs the lint over the REAL .github/workflows/, and its PF family
+# walks each path-filtered workflow's execution closure into monitor/. The
+# population is the lint's OWN enumeration, forwarded via `--files` (the
+# workflow files, the ci-trigger-audit.py module it imports, and every file
+# `execution_closure` reaches), never a copy; plus the lint itself. `--files`
+# takes the closure for every workflow, a few files wider than the PF family
+# reads — the over-selecting direction, stated in `population()`'s docstring.
+# NOT describable as a path set and therefore not declared: the PyYAML the
+# audit module imports, an installed package rather than a repo file.
+#
+# PLACED HERE, before anything is printed: `gp_handle` EXITS when it handles
+# the flag, and anything printed before it would be read as a population row.
+. "$HERE/_guard_population.sh"
+gp_population() {
+  "$PY" "$LINT" --files "$WF"
+  printf '%s\n' "$LINT"
+}
+gp_handle "$@"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

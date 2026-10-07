@@ -88,6 +88,8 @@ trap 'rm -rf "$WORK"' EXIT
 NEXUS="$WORK/nexus"
 mkdir -p "$NEXUS/monitor" "$NEXUS/config" "$WORK/bin" "$WORK/cache"
 cp "$MINT_REAL" "$NEXUS/monitor/mint-token.sh"
+# mint-token.sh sources the shared resolver and refuses without it (#1651).
+cp "$_test_dir/../_nexus-root.sh" "$NEXUS/monitor/_nexus-root.sh"
 chmod +x "$NEXUS/monitor/mint-token.sh"
 
 # nexus.yml content is irrelevant — load.sh is stubbed. The file just
@@ -557,6 +559,80 @@ if (( _kx_root_ok )); then
     assert_eq "the documented escape hatch lets an exposed key through (exit 0)" "$rc" "0"
     assert_eq "…and it is the same token the happy path returns" "$out" "ghs_testtoken123abc"
 fi
+
+# ---- your-org/nexus-code#1651: the ONE-TREE rule — WHOSE credentials ------
+#
+# The raw $NEXUS_ROOT used to decide whose nexus.yml was minted from, NOT
+# de-nested, while `ng` keys on its own tree. So a foreign NEXUS_ROOT minted
+# THAT nexus's bot token for a write `ng` itself refused, and NEXUS_ROOT at a
+# stale work/<clone> minted from the clone's stale file. These trees carry the
+# REAL config/load.sh and distinct installation ids; a recording curl captures
+# which id reached the token exchange.
+echo '=== #1651 one-tree rule: which nexus'"'"'s credentials are minted ==='
+_real_load="$_test_dir/../../config/load.sh"
+REC="$WORK/curl-1651.txt"
+mkdir -p "$WORK/bin1651"
+cat > "$WORK/bin1651/curl" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$REC"
+printf '{"token":"ghs_testtoken123abc","expires_at":"2099-01-01T00:00:00Z"}'
+STUB
+chmod +x "$WORK/bin1651/curl"
+cp "$WORK/bin/openssl" "$WORK/bin1651/openssl"
+_mk_1651_tree() {   # <dir> <repo|none> <installation-id>
+    mkdir -p "$1/monitor" "$1/config"
+    cp "$MINT_REAL" "$1/monitor/mint-token.sh"
+    cp "$_test_dir/../_nexus-root.sh" "$1/monitor/_nexus-root.sh"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$1/monitor/ng"
+    chmod +x "$1/monitor/mint-token.sh" "$1/monitor/ng"
+    cp "$_real_load" "$1/config/load.sh"
+    cp "$_test_dir/../../config/nexus.example.yml" "$1/config/nexus.example.yml"
+    if [[ "$2" == malformed ]]; then
+        printf 'github:\n  repo: [unclosed\n' > "$1/config/nexus.yml"
+    elif [[ "$2" != none ]]; then
+        printf 'github:\n  repo: %s\n  bot_app_id: 111\n  bot_installation_id: %s\n  bot_pem_path: %s\n  bot_token_cache: %s\n' \
+            "$2" "$3" "$KEY_OK" "$WORK/cache/t1651.json" > "$1/config/nexus.yml"
+    fi
+}
+T1651="$WORK/t1651"
+_mk_1651_tree "$T1651/P"  p-org/p-repo 7001
+_mk_1651_tree "$T1651/F"  f-org/f-repo 7002
+_mk_1651_tree "$T1651/F2" p-org/p-repo 7003
+_mk_1651_tree "$T1651/C"  none         0
+_mk_1651_tree "$T1651/M"  malformed    0
+_mk_1651_tree "$T1651/P/work/nexus-code-stale" s-org/stale-repo 7004
+mint1651() {   # <tree> <NEXUS_ROOT>
+    clean_cache; : > "$REC"
+    out=$(env -u NEXUS_CONFIG -u NEXUS_BOT_APP_ID -u NEXUS_BOT_INSTALLATION_ID \
+          -u NEXUS_BOT_PRIVATE_KEY_PATH -u NEXUS_BOT_TOKEN_CACHE \
+          NEXUS_ROOT="$2" PATH="$WORK/bin1651:$PATH" \
+          "$1/monitor/mint-token.sh" 2>"$WORK/err.txt"); rc=$?
+    err=$(cat "$WORK/err.txt"); rec=$(cat "$REC")
+}
+mint1651 "$T1651/P" "$T1651/F"
+assert_eq       "#1651 Q: a FOREIGN NEXUS_ROOT is refused (exit 2)"     "$rc" "2"
+assert_eq       "#1651 Q: no token on stdout"                           "$out" ""
+assert_eq       "#1651 Q: the token exchange was never called"          "$rec" ""
+assert_contains "#1651 Q: the refusal names the ambiguity"              "$err" "refusing to mint: the nexus is ambiguous"
+mint1651 "$T1651/C" "$T1651/P"
+assert_eq       "#1651 R: a config-less checkout acts for NEXUS_ROOT (exit 0)" "$rc" "0"
+assert_contains "#1651 R: …and mints P's installation"                  "$rec" "installations/7001/"
+mint1651 "$T1651/P" "$T1651/F2"
+assert_eq       "#1651 S: same identity is not refused (exit 0)"        "$rc" "0"
+assert_contains "#1651 S: …and mints its OWN tree's installation"       "$rec" "installations/7001/"
+mint1651 "$T1651/P/work/nexus-code-stale" "$T1651/P/work/nexus-code-stale"
+assert_eq       "#1651 T: NEXUS_ROOT at a stale work/ clone de-nests (exit 0)" "$rc" "0"
+assert_contains "#1651 T: …to the PRIMARY's installation"               "$rec" "installations/7001/"
+assert_eq       "#1651 T: …never the clone's stale one" \
+    "$(printf '%s' "$rec" | grep -c 'installations/7004/' || true)" "0"
+# your-org/nexus-code#1652 item 3: a MALFORMED own nexus.yml is not "no config".
+# At 33a44f48 M minted P's installation 7001 exactly as R does; R is the
+# no-config control and must stay as it is.
+mint1651 "$T1651/M" "$T1651/P"
+assert_eq       "#1652 U: a MALFORMED own config is refused (exit 2)"   "$rc" "2"
+assert_eq       "#1652 U: no token on stdout"                           "$out" ""
+assert_eq       "#1652 U: the token exchange was never called"          "$rec" ""
+assert_contains "#1652 U: the refusal says the config cannot be read"   "$err" "cannot be read"
 
 echo
 echo "=== summary: $PASS passed, $FAIL failed ==="

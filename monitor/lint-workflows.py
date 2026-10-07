@@ -151,6 +151,7 @@ Exit codes:
 Run:
   python3 monitor/lint-workflows.py .github/workflows
   python3 monitor/lint-workflows.py --selftest
+  python3 monitor/lint-workflows.py --files .github/workflows   # the population
 """
 
 import argparse
@@ -928,9 +929,42 @@ def _check_apt_update(doc, path, name):
     return findings, None
 
 
+def _workflow_names(workflows_dir):
+    """The workflow files `lint_dir` lints — ONE predicate, two consumers
+    (`lint_dir` and `population`), so `--files` cannot drift from the scan."""
+    return sorted(f for f in os.listdir(workflows_dir)
+                  if f.endswith(".yml") or f.endswith(".yaml"))
+
+
+def population(workflows_dir):
+    """Every file this lint reads to reach its verdict over WORKFLOWS_DIR, as
+    repo-relative paths (your-org/nexus-code#1747) — what `--files` prints, so
+    monitor/test-lint-workflows.sh's `gp_population` forwards to the lint's own
+    enumeration instead of keeping a copy of it.
+
+    The workflow files, the sibling module `_load_audit` imports, and the PF
+    family's `execution_closure` of each workflow. ERROR DIRECTION, stated: the
+    closure is taken for EVERY workflow, while the PF family only walks it for a
+    workflow carrying an `on.pull_request.paths` filter, so this OVER-selects —
+    the safe direction for a reverse index. It is also only as wide as
+    `execution_closure` itself: an edge it reports as unresolved is a file this
+    lint does not read, and so is correctly absent here.
+    """
+    wf_abs = os.path.abspath(workflows_dir)
+    repo_root = os.path.dirname(os.path.dirname(wf_abs))
+    out = set()
+    for n in _workflow_names(workflows_dir):
+        path = os.path.join(wf_abs, n)
+        out.add(os.path.relpath(path, repo_root))
+        closure, _unresolved = execution_closure(path, repo_root)
+        out.update(closure)
+    out.add(os.path.relpath(os.path.join(_HERE, "ci-trigger-audit.py"),
+                            repo_root))
+    return sorted(out)
+
+
 def lint_dir(workflows_dir):
-    names = sorted(f for f in os.listdir(workflows_dir)
-                   if f.endswith(".yml") or f.endswith(".yaml"))
+    names = _workflow_names(workflows_dir)
     if not names:
         raise Refusal("%s: no workflow files — refusing to report a clean lint "
                       "over an empty set" % workflows_dir)
@@ -2436,6 +2470,10 @@ def main():
                          "read. Exit 1 if any, 0 if none.")
     ap.add_argument("--pipefail", action="store_true",
                     help="with --scan-body: start with pipefail already on")
+    ap.add_argument("--files", action="store_true",
+                    help="print the POPULATION for <workflows-dir> instead of "
+                         "linting it: one repo-relative path per line, every "
+                         "file the lint reads (your-org/nexus-code#1747)")
     args = ap.parse_args()
 
     if args.selftest:
@@ -2456,6 +2494,16 @@ def main():
         sys.stderr.write("usage: %s <workflows-dir> | --selftest\n"
                          % os.path.basename(sys.argv[0]))
         return 2
+    if args.files:
+        try:
+            for rel in population(args.workflows_dir):
+                print(rel)
+        except (Refusal, OSError) as exc:
+            # A population that could not be produced REFUSES; an empty or
+            # partial list would read downstream as "reads none of your files".
+            sys.stderr.write("REFUSED: %s\n" % exc)
+            return 2
+        return 0
 
     try:
         findings, notes, names, checked = lint_dir(args.workflows_dir)

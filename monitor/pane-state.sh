@@ -131,9 +131,10 @@
 #
 # `overlay` is appended only when state=blocked, and names WHICH overlay is
 # waiting on a human: `rate-limit` | `permission` | `bypass-permissions` |
-# `askuq` | `workspace-trust` | `dialog`. The first four are TEXT-KEYED arms;
-# the last two come from the STRUCTURAL arm (`_has_menu_dialog_frame`,
-# your-org/nexus-code#896) that catches any select-dialog Claude Code renders,
+# `askuq` | `workspace-trust` | `login` | `auto-mode-default` | `dialog`. The
+# first four are TEXT-KEYED arms; the last four come from the STRUCTURAL arm
+# (`_has_menu_dialog_frame`, your-org/nexus-code#896; its footerless variant,
+# #1687) that catches any select-dialog Claude Code renders,
 # named or not — `dialog` is the honest generic kind for one nobody has
 # enumerated yet, and it is a NAME, not a detection precondition.
 # `blocked` alone answers "should I wait?"; the kind answers "what do
@@ -549,7 +550,7 @@ usage: pane-state.sh <window-index|session:window|window-name>
                      [--over-limit-file <path>]
                      [--orchestrator-heartbeat-file <path>]
                      [--orchestrator-window <name>]
-                     [--pane-pid <pid>] [--bg-cpu <jiffies>]
+                     [--pane-pid <pid>] [--harness claude-code|codex] [--bg-cpu <jiffies>]
                      [--bg-shells <count>] [--bg-oldest-start <epoch>]
                      [--bg-cmd <string>] [--bg-infra <0|1>] [--bg-members <digest>]
                      [--bg-stale <count>] [--bg-quiesce <count>] [--bg-longjob <0|1>]
@@ -593,6 +594,10 @@ over_limit_file_override=
 orch_hb_file_override=
 orch_window_override=
 pane_pid_override=
+# --harness: which agent's chrome to read (your-org/nexus-code#1640). Live
+# panes answer it from the process walk (_pid_runs_claude sets _PRC_KIND);
+# a FIXTURE has no process, so a fixture of a Codex screen must say so.
+harness_override=
 # tmux's `#{pane_dead}`; empty on the fixture path, where there is no pane.
 pane_dead=
 # Did `tmux capture-pane` SUCCEED? Distinct from "was the capture empty"
@@ -636,6 +641,7 @@ _argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _arglo
         --orchestrator-heartbeat-file) orch_hb_file_override="$2"; shift 2;;
         --orchestrator-window)         orch_window_override="$2"; shift 2;;
         --pane-pid)                    pane_pid_override="$2"; shift 2;;
+        --harness)                     harness_override="$2"; shift 2;;
         --bg-cpu)                      bg_cpu_override="$2"; shift 2;;
         --bg-shells)                   bg_shells_override="$2"; shift 2;;
         --bg-oldest-start)             bg_oldest_start_override="$2"; shift 2;;
@@ -858,7 +864,9 @@ _has_blocked_overlay() {
 # about, numbered or not. NOT caught: a dialog with a different footer literal,
 # one with a single option, one whose options are not column-aligned, one with
 # no `❯` cursor at all (a free-text or yes/no-keypress prompt), or one that
-# leaves the REPL row painted underneath.
+# leaves the REPL row painted underneath. (Since #1687 a dialog with NO footer
+# at all IS caught when its menu terminates the pane — condition (a'),
+# `_has_footerless_menu_frame`, which states its own boundary.)
 # For those the state stays `empty`, i.e. exactly as blind as before this change
 # — no regression, but no coverage either. Closing them needs a new capture from
 # the live binary, not a wider regex guessed at from here.
@@ -866,9 +874,20 @@ _has_menu_dialog_frame() {
     local plain="$1"
     local footer_re='(Enter|Esc) to [a-z]'
 
-    # (a) navigation footer within the last 3 non-blank rows.
-    grep -qE "$footer_re" \
-        <<<"$(printf '%s\n' "$plain" | grep -v '^[[:space:]]*$' | tail -n 3)" || return 1
+    # (a) navigation footer within the last 3 non-blank rows — OR (a') the
+    # FOOTERLESS variant, a select menu that TERMINATES the pane
+    # (your-org/nexus-code#1687; see `_has_footerless_menu_frame`).
+    if ! grep -qE "$footer_re" \
+        <<<"$(printf '%s\n' "$plain" | grep -v '^[[:space:]]*$' | tail -n 3)"; then
+        _has_footerless_menu_frame "$plain" || return 1
+        # (d) applies to (a') exactly as below: positive evidence of work in
+        # flight vetoes a dialog reading.
+        if _detect_busy "$plain" "$(wc -l <<<"$plain")" \
+           || _detect_queued_message "$plain"; then
+            return 1
+        fi
+        return 0
+    fi
 
     # Anchor on the LAST footer occurrence, so a pane that quotes a dialog and
     # is ALSO wedged on one resolves to the live one.
@@ -969,6 +988,84 @@ _has_menu_dialog_frame() {
     return 0
 }
 
+# (a') THE FOOTERLESS SELECT MENU (your-org/nexus-code#1687).
+#
+# Claude Code 2.1.285 shows a one-time "Make auto mode your default permission
+# mode?" offer (when user-scope `permissions.defaultMode` is set, is not
+# `auto`, and no flag/project/local/policy source sets one). Captured from the
+# real binary through `monitor/cc-harness`
+# (`fixtures/blocked-auto-mode-default-offer-realmodel-285.ansi`):
+#
+#    Make auto mode your default permission mode?
+#
+#      Auto mode lets Claude handle permission prompts automatically. …
+#      prompt injection before executing, runs the ones it assesses as …
+#
+#      ❯ Yes, set auto mode as my default permission mode
+#        No, keep accept edits
+#
+# It has NO `Enter/Esc to …` footer, so condition (a) failed and the pane read
+# `state=empty`. A paste + Enter then ACCEPTED "Yes": the session left bypass
+# for auto mode and the operator's user-scope `defaultMode` was rewritten to
+# `auto`. The declared boundary above named this exact gap ("a dialog with a
+# different footer literal"); this closes the no-footer member of it.
+#
+# THE STRUCTURAL FACT, not the wording: the select menu is the LAST thing on
+# the pane. Every non-blank row from the chevron-selected option row to the
+# bottom is an option row in the cursor's column, and the menu has at least one
+# sibling (above or below the cursor) in that column. A live REPL can never
+# satisfy it, because a live REPL always paints its input box and status row
+# (`❯<NBSP>`, `-- INSERT --`, `⏵⏵ … permissions on`) BELOW any transcript text —
+# so a transcript QUOTING this dialog has non-option rows after the menu and is
+# rejected. That is the same live-vs-quoted distinction as condition (c), made
+# with no footer to anchor on. The chevron rule and the column arithmetic are
+# (b1)/(b2)'s, for the same stated reasons (ASCII space after `❯`; literal
+# spaces only).
+#
+# ERROR DIRECTIONS, stated. MISS (stays `empty`, exactly as before #1687): a
+# footerless dialog that paints ANY row below its options (a hint, a footer
+# with a new literal, a multi-line option description at a deeper indent), or
+# a single-option menu. OVER-MATCH (reads `blocked`): a frame whose bottom
+# non-blank rows are a `❯ ` row plus column-aligned rows with no REPL chrome
+# under them — i.e. a pane caught mid-render (the #47 regime) while its
+# transcript happens to end in a quoted menu. The caller's condition (d) vetoes
+# that when a spinner/queue is visible; otherwise it is a one-poll misread
+# toward `blocked`, which is never kill-authorised and only DEFERS a paste. That
+# is the direction chosen on purpose: the hazard here is a paste answering a
+# settings-rewriting dialog, not a delayed delivery.
+_has_footerless_menu_frame() {
+    local plain="$1"
+    local -a rows=()
+    local line
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        rows+=("$line")
+    done <<<"$plain"
+    local n=${#rows[@]} i sel=-1
+    (( n >= 2 )) || return 1
+    for (( i = n - 1; i >= 0; i-- )); do
+        if [[ "${rows[i]}" =~ ^\ *❯\ +[^\ ] ]]; then sel=$i; break; fi
+    done
+    (( sel >= 0 )) || return 1
+    local lead rest gap opt_col sib_re sibs=0
+    lead=${rows[sel]%%❯*}
+    rest=${rows[sel]#*❯}
+    gap=${rest%%[! ]*}
+    opt_col=$(( ${#lead} + 1 + ${#gap} ))
+    printf -v sib_re '^ {%d}[^ ]' "$opt_col"
+    # Every row BELOW the cursor must be a sibling option: the menu ends the pane.
+    for (( i = sel + 1; i < n; i++ )); do
+        [[ "${rows[i]}" =~ $sib_re ]] || return 1
+        sibs=$(( sibs + 1 ))
+    done
+    # Contiguous siblings ABOVE the cursor (the cursor may sit on the last option).
+    for (( i = sel - 1; i >= 0; i-- )); do
+        [[ "${rows[i]}" =~ $sib_re ]] || break
+        sibs=$(( sibs + 1 ))
+    done
+    (( sibs >= 1 ))
+}
+
 # Name the dialog `_has_menu_dialog_frame` just detected. NAMING ONLY — the
 # detection above never consults this, so an unrecognised dialog is still
 # `blocked`, just under the honest generic kind `dialog` rather than a
@@ -982,6 +1079,12 @@ _name_menu_dialog_kind() {
     fi
     if _dialog_is_login "$plain"; then
         printf 'login'; return 0
+    fi
+    # your-org/nexus-code#1687: the one-time auto-mode default offer. Its
+    # "Yes" rewrites the operator's user-scope `permissions.defaultMode`, so it
+    # is worth naming; a reword only degrades the kind to `dialog`.
+    if grep -qiE 'auto mode your default permission mode' <<<"$(_bottom_rows "$plain" 20)"; then
+        printf 'auto-mode-default'; return 0
     fi
     printf 'dialog'
 }
@@ -1147,12 +1250,153 @@ _dialog_is_login() {
 # hour-old failure the operator has already fixed would keep asserting
 # `auth=expired` out of scrollback. 15 matches `_detect_over_limit`'s window,
 # which is the already-exercised number rather than a fresh guess.
+#
+# LIVE-vs-QUOTED: THE STRINGS ARE A PREFILTER, THE HARNESS'S RENDER IS THE
+# EVIDENCE (your-org/nexus-code#1659). The three disjuncts above were a plain
+# string match, so a pane whose TRANSCRIPT merely contained the words read
+# `auth=expired`: on 2026-09-27 the orchestrator's own prose about an expiry
+# raised the alert twice while it was logged in and taking turns (10:22, 93 s;
+# 12:00, 185 s), and each raise emailed the operator and disabled the liveness
+# remedies for as long as the text stayed in the window. Reproduced on the real
+# 2.1.284 binary via monitor/cc-harness: assistant prose, a user message and a
+# fenced code block quoting the strings each read `auth=expired`.
+#
+# What separates the two, measured on the real 2.1.268 AND 2.1.284 renders
+# (captures `auth-expired-*-realmodel-268.ansi`, `auth-expired-*-realmodel-284.ansi`,
+# `idle-auth-quoted-*-realmodel-284.ansi`):
+#
+#   harness error row   `ESC[38;5;220m● ESC[39m ESC[38;5;220mPlease run /login · API Error: 401 …`
+#                       `ESC[38;5;211m✻ ESC[39m ESC[38;5;211m401 OAuth token has expired … ESC[38;5;246m · Retrying …`
+#   assistant prose     `ESC[38;5;231m● ESC[39m Please run /login is …`   glyph coloured, TEXT DEFAULT
+#   tool call           `ESC[38;5;114m● ESC[39m ESC[1mBash ESC[0m(…)`      glyph coloured, TEXT DEFAULT
+#   user message        `ESC[38;5;239mESC[48;5;237m❯ ESC[38;5;231mLogin expired`  glyph not a bullet, colours differ
+#   code block          `  ESC[38;5;153mPlease run /login`                   no glyph at all
+#
+# So the harness paints its OWN message rows glyph AND text in ONE non-default
+# foreground; everything the model or the operator wrote carries default-fg
+# text (or no leading glyph). `_auth_row_is_harness_render` keys on exactly
+# that: a message-bullet / spinner glyph with a non-default fg, the text after
+# it starting in the SAME fg, and a disjunct contained in that same-fg leading
+# run. It is a STRUCTURAL property (equality of two colours on one row), not a
+# palette: no colour NUMBER is pinned, so a theme change does not break it.
+#
+# ONE HARNESS ROW CARRIES MODEL TEXT IN THAT SHAPE: the live SPINNER, whose
+# verb slot shows the in-progress todo's activeForm in the glyph's colour
+# (`✢ Re-run ENCODE … (5m 48s · ↓ 15.2k tokens)`, busy-encode-win5.ansi). A
+# todo titled `Login expired detector fix` would match, so a row carrying the
+# live-spinner suffix — `…` then `(`, a token counter, or `esc to interrupt` —
+# is refused. The retry row is NOT refused by it: its suffix is ` · Retrying`,
+# not `(`, measured on both builds.
+#
+# BOUNDARY, stated because the failure direction is not safe. A pane with NO
+# colour at all (NO_COLOR, a monochrome TERM) has no non-default glyph fg, so
+# the detector returns `none` there; every orchestrator and worker this
+# workspace launches runs in a 256-colour tmux pane, and the committed real
+# captures all carry SGR. A future build that paints the error text in the
+# default fg, or drops the leading glyph, returns `none` too — which is why this
+# is on the collision list in `skills/nexus.cc-update/GUIDE.md` beside the
+# strings. The StopFailure turn-failure marker (`_auth_hold_turn_failure_marker`)
+# was NOT used as a corroborator: it would change WHEN auth-hold engages (only
+# after a turn fails, never on a pane inherited already logged out) and it is a
+# per-target watcher file this pane-local classifier cannot see in fixture mode.
 _detect_auth_expired() {
-    local plain="$1" bottom
+    local plain="$1" ansi="${2:-}" bottom
     bottom=$(_bottom_rows "$plain" 15)
-    grep -qiF 'please run /login' <<<"$bottom" && return 0
-    grep -qiF 'login expired' <<<"$bottom" && return 0
-    grep -qiE '401.*token has expired|token has expired.*401' <<<"$bottom"
+    # PREFILTER on the plain text: the cheap common case (no string at all)
+    # never touches the SGR parser.
+    grep -qiF 'please run /login' <<<"$bottom" \
+        || grep -qiF 'login expired' <<<"$bottom" \
+        || grep -qiE '401.*token has expired|token has expired.*401' <<<"$bottom" \
+        || return 1
+    # No raw bytes, no evidence of WHO rendered the row: `none`, stated above.
+    [[ -n "$ansi" ]] || return 1
+    # The SAME bottom-15-non-blank window as the prefilter, over the RAW rows.
+    # `_strip_ansi` is a per-line sed, so raw and plain rows stay aligned.
+    local -a raw_rows plain_rows keep=()
+    local i n
+    mapfile -t raw_rows <<<"$ansi"
+    mapfile -t plain_rows < <(printf '%s\n' "$ansi" | _strip_ansi)
+    (( ${#raw_rows[@]} == ${#plain_rows[@]} )) || return 1
+    for (( i = 0; i < ${#raw_rows[@]}; i++ )); do
+        [[ "${plain_rows[i]}" =~ ^[[:space:]]*$ ]] || keep+=("$i")
+    done
+    n=${#keep[@]}
+    for (( i = (n > 15 ? n - 15 : 0); i < n; i++ )); do
+        _auth_row_is_harness_render "${raw_rows[keep[i]]}" "${plain_rows[keep[i]]}" && return 0
+    done
+    return 1
+}
+
+# _sgr_fg <current-fg> <one or more concatenated `ESC[…m` sequences> → new fg
+#
+# Tracks the FOREGROUND only, as a normalised token (`d` = default, `5;N`,
+# `2;R;G;B`, or the basic code). Background / attribute codes are skipped,
+# including their ARGUMENTS — `48;5;16` must not be read as fg code 16.
+_sgr_fg() {
+    local fg="$1" seqs="$2" seq params
+    local -a p
+    local j
+    local re=$'^\x1b\\[([0-9;]*)m(.*)$'
+    while [[ "$seqs" =~ $re ]]; do
+        params="${BASH_REMATCH[1]}"; seqs="${BASH_REMATCH[2]}"
+        [[ -z "$params" ]] && { fg=d; continue; }
+        IFS=';' read -r -a p <<<"$params"
+        for (( j = 0; j < ${#p[@]}; j++ )); do
+            case "${p[j]}" in
+                0|39) fg=d ;;
+                3[0-7]|9[0-7]) fg="${p[j]}" ;;
+                38) if [[ "${p[j+1]:-}" == 5 ]]; then fg="5;${p[j+2]:-}"; j=$((j + 2))
+                    elif [[ "${p[j+1]:-}" == 2 ]]; then fg="2;${p[j+2]:-};${p[j+3]:-};${p[j+4]:-}"; j=$((j + 4))
+                    fi ;;
+                48|58) if [[ "${p[j+1]:-}" == 5 ]]; then j=$((j + 2))
+                       elif [[ "${p[j+1]:-}" == 2 ]]; then j=$((j + 4))
+                       fi ;;
+            esac
+        done
+    done
+    printf '%s' "$fg"
+}
+
+# _auth_row_is_harness_render <raw row> <plain row> → 0 when the row is the
+# HARNESS's own error render carrying an auth-expiry disjunct. See the block
+# comment above `_detect_auth_expired` for the measured shapes.
+_auth_row_is_harness_render() {
+    local raw="$1" plain="$2"
+    local E=$'\x1b'
+    local sgrs="((${E}\\[[0-9;]*m)*)"
+    # Message-bullet and spinner-frame glyphs: `●`/`⏺` (message bullet, new and
+    # old builds) and the spinner frames the retry row is painted with.
+    local glyphs='(●|⏺|✻|✽|✶|✳|✢|·|\*)'
+    local re="^[[:space:]]*${sgrs}${glyphs}${sgrs}[[:space:]]+${sgrs}(.*)$"
+    [[ "$raw" =~ $re ]] || return 1
+    local pre="${BASH_REMATCH[1]}" post="${BASH_REMATCH[4]}" lead="${BASH_REMATCH[6]}" msg="${BASH_REMATCH[8]}"
+    # The live spinner row (see above): model text in the harness's colour.
+    local pl="${plain,,}"
+    [[ "$pl" == *"esc to interrupt"* ]] && return 1
+    [[ "$pl" =~ …[[:space:]]*\( ]] && return 1
+    [[ "$pl" =~ (↓|↑)[[:space:]]*[0-9]+(\.[0-9]+)?[km]?[[:space:]]+tokens ]] && return 1
+    local gfg mfg
+    gfg=$(_sgr_fg d "$pre")
+    [[ "$gfg" != d ]] || return 1
+    mfg=$(_sgr_fg "$(_sgr_fg "$gfg" "$post")" "$lead")
+    [[ "$mfg" == "$gfg" ]] || return 1
+    # The same-fg LEADING RUN of the message: text up to the first SGR that
+    # moves the foreground off the glyph's colour.
+    local run="" cur="$gfg" seg
+    local tok=$'^([^\x1b]*)(\x1b\\[[0-9;]*m)(.*)$'
+    while [[ "$msg" =~ $tok ]]; do
+        seg="${BASH_REMATCH[1]}"
+        run+="$seg"
+        cur=$(_sgr_fg "$cur" "${BASH_REMATCH[2]}")
+        msg="${BASH_REMATCH[3]}"
+        [[ "$cur" == "$gfg" ]] || { msg=""; break; }
+    done
+    run+="$msg"
+    run=$(printf '%s\n' "$run" | _strip_ansi)
+    run="${run,,}"
+    [[ "$run" == *"please run /login"* ]] && return 0
+    [[ "$run" == *"login expired"* ]] && return 0
+    [[ "$run" =~ 401.*token\ has\ expired|token\ has\ expired.*401 ]]
 }
 
 # Bypass Permissions warning modal (your-org/nexus-code#768).
@@ -1509,8 +1753,9 @@ _extract_over_limit_flavour() {
 #     token counters (`↓ 5.7k tokens`), and `+N lines` badges advance
 #     on their own. Stripping every digit neutralises them in one
 #     stroke.
-#   - right-aligned composer NUDGES (`● <tip> · /<cmd>`): under
-#     `tui: fullscreen` these blink in and out of the padded gap ABOVE
+#   - right-aligned composer NUDGES (`● <tip> · /<cmd>`, and the effort
+#     nudge whose lead glyph varies by level, `◐ medium · /effort` — #1703):
+#     these blink in and out of the padded gap ABOVE
 #     the input row on their own timer (your-org/nexus-code#573). They
 #     are non-numeric, so the digit-strip missed them; the fix keys on
 #     RIGHT-JUSTIFICATION — a `●` pushed to the right edge by a LARGE
@@ -1575,13 +1820,24 @@ _content_hash() {
     # Residual error is biased to the RECOVERABLE side: on an implausibly
     # narrow pane (< ~48 cols) the nudge could fall under the threshold and
     # leak, merely holding a window open one cycle too long — never a kill.
-    # In the inline renderer the same nudges render BELOW the input row (out of
-    # region), so this filter is a no-op there: one code path, both renderers.
-    local bullet=$'\xe2\x97\x8f'       # ● U+25CF, the nudge's status dot
+    #
+    # THE LEAD GLYPH IS THE EFFORT LEVEL, NOT A FIXED DOT (#1703). The effort
+    # nudge is `<glyph> <level> · /effort`, and claude 2.1.285 picks the glyph
+    # per level: low `○` U+25CB, medium `◐` U+25D0, high `●` U+25CF, xhigh `◉`
+    # U+25C9, max `◈` U+25C8 (and an `effort: <level>` text form with no
+    # glyph). Keying on `●` alone covered only `high`; the cc-harness runs at
+    # the default `medium`, where `◐ medium · /effort` blinks out ~5 s after the
+    # pane goes idle — measured on tmux 3.4 in BOTH renderers, and in the
+    # default (inline) renderer it too sits ABOVE the input row, so the claim
+    # that inline nudges render below it is no longer true. The discriminator is
+    # unchanged — a LARGE leading-blank run — so the over-strip guard stands.
+    # Alternation of literal byte strings, never a bracket expression: a
+    # multibyte character inside `[...]` is not one element under LC_ALL=C.
+    local glyphs=$'(\xe2\x97\x8f|\xe2\x97\x8b|\xe2\x97\x90|\xe2\x97\x89|\xe2\x97\x88|effort:)'
     local min_indent="${_NUDGE_MIN_INDENT:-32}"
     [[ "$min_indent" =~ ^[0-9]+$ ]] || min_indent=32
     printf '%s' "$region" \
-        | grep -vE "^[[:blank:]]{${min_indent},}${bullet}" \
+        | grep -vE "^[[:blank:]]{${min_indent},}${glyphs}" \
         | tr -d '0-9' \
         | tr -s '[:space:]' ' ' \
         | cksum | cut -d' ' -f1
@@ -2301,13 +2557,22 @@ _pid_runs_claude() {
     if [[ -n "$raw" ]]; then
         exe="${raw% (deleted)}"
         case "$exe" in
-            */@anthropic-ai/claude-code/*) return 0 ;;
+            */@anthropic-ai/claude-code/*) _PRC_KIND=claude; return 0 ;;
+            # OpenAI Codex, the second worker harness (your-org/nexus-code#1640).
+            # MEASURED process shape: the pane runs `node …/codex.js` (comm
+            # `MainThread`, exe node — NOT matched, it is the npm wrapper) whose
+            # child is the native binary, exe
+            # …/@openai/codex-linux-x64/vendor/<triple>/bin/codex, comm `codex`.
+            # Before this arm a Codex worker at the pane root failed the gate
+            # and read `absent` — kill-authorised — while mid-turn.
+            */@openai/codex*/bin/codex) _PRC_KIND=codex; return 0 ;;
         esac
         # A candidate installed outside node_modules — cc-harness stages one
         # into a throwaway prefix (`gate.sh` sets CLAUDE_BIN to it), which is
         # exactly the shape that produced `comm=claude.exe`.
         case "${exe##*/}" in
-            claude|claude-code|claude.exe) return 0 ;;
+            claude|claude-code|claude.exe) _PRC_KIND=claude; return 0 ;;
+            codex) _PRC_KIND=codex; return 0 ;;
         esac
         # An exe we could read but not classify still gets the NAME as a second
         # chance rather than an immediate "no": on the kill axis a missed
@@ -2321,7 +2586,8 @@ _pid_runs_claude() {
     comm=$(ps -o comm= -p "$pid" 2>/dev/null | tr -d '[:space:]')
     if [[ -n "$comm" ]]; then
         case "$comm" in
-            claude|claude-code|claude.exe) return 0 ;;
+            claude|claude-code|claude.exe) _PRC_KIND=claude; return 0 ;;
+            codex) _PRC_KIND=codex; return 0 ;;
         esac
         return 1
     fi
@@ -3986,13 +4252,36 @@ _longjob_dispatcher_verdict() {
     [[ -n "$ledger" ]] || return 0
     local verdict active
     verdict=$(NEXUS_STATE_DIR="$sd" "$lj" ledger-verdict "$ledger" --now "$now" 2>/dev/null) || return 0
-    [[ "${verdict%%|*}" == armed ]] || return 0
     # `active=` as COUNTED from the spool by the verb, never the ledger's
     # cached field: that field is published only by a completed pass, so
     # between an `add` and the next write it read 0 → `idle` → kill-authorised
     # over a worker parked on a 4-hour job (skeptic C2).
     active="${verdict##*|active=}"
     [[ "$active" =~ ^[0-9]+$ ]] || return 0
+    case "${verdict%%|*}" in
+        armed) ;;
+        muted)
+            # your-org/nexus-code#1638. `muted` is reached ONLY after the
+            # verb's live / owned / fresh / serving tests pass (see
+            # longjob-watch.sh:_ledger_verdict), so a muted dispatcher is an
+            # armed one whose session event cap is spent. With ZERO live
+            # watches it holds nothing — the same fact as `armed 0` for every
+            # consumer (census exclusion, footer discount, no hold) — and
+            # reading it as anything else pinned a finished worker at
+            # `working-background` for ever: retire-window refused it after
+            # 16 h, and only the worker's own `unmute` could clear it.
+            #
+            # Normalised HERE, at the one reader, rather than as a new
+            # `muted` token: the three consumers select on `armed *`, and a
+            # new token is exactly what a permissive default arm drops.
+            # Muted WITH live watches is deliberately NOT normalised: those
+            # watches will not wake anybody (the cap mutes their lines), so
+            # it is not the self-waking wait that `armed N>0` HOLDS as — it
+            # stays a counted shell, as before.
+            (( active == 0 )) || return 0
+            ;;
+        *) return 0 ;;
+    esac
     printf 'armed %s' "$active"
 }
 
@@ -4481,7 +4770,7 @@ emit() {
                && ! grep -qF "❯${NBSP}" <<<"$pane_plain" \
                && _dialog_is_login "$pane_plain"; then
                 pane_auth=login
-            elif _detect_auth_expired "$pane_plain"; then
+            elif _detect_auth_expired "$pane_plain" "${pane_ansi:-}"; then
                 pane_auth=expired
             fi
         fi
@@ -4654,6 +4943,7 @@ _emit_absent_or_unknown() {
 #     to check) and the rare "newly-spawned window without a
 #     pane_pid yet" path both fall through to the existing
 #     classification chain.
+_PRC_KIND=""
 if [[ -n "$pane_pid" ]] && ! _pane_has_live_claude "$pane_pid"; then
     # your-org/nexus-code#643. "No claude in the tree" is NOT the same claim as
     # "this agent is dead", and `absent` asserts the second. It is the ONE
@@ -4702,6 +4992,88 @@ if [[ -n "$pane_pid" ]] && ! _pane_has_live_claude "$pane_pid"; then
     # Lifting it out is the whole point: three separate sites reached `absent` by
     # falling through, and #780 fixed only this one.
     _emit_absent_or_unknown liveness-gate
+    exit 0
+fi
+
+# ---- OpenAI Codex panes (your-org/nexus-code#1640) --------------------------
+# A Codex pane is classified from Codex's OWN chrome and never reaches the
+# Claude ladder below, which would read every Codex screen as "no input row".
+# The harness comes from the process walk the gate just did (_PRC_KIND), or
+# from --harness for a fixture. Rationale, arm order and coverage boundary:
+# monitor/_pane-state-codex.sh.
+pane_harness="${harness_override:-${_PRC_KIND:-}}"
+# Third source, for a pane with no process to walk (a fixture, or a live pane
+# whose walk found no agent but was not proven dead): Codex's STRUCTURAL
+# chrome — the bold `›` composer (ESC[1m›), the reverse-video menu selector
+# (ESC[1;7m›), the `>_ OpenAI Codex` banner, or the login screen's heading
+# (the one Codex screen with none of the other three: its menu is `> 1.`).
+# Matched on the heading's TAIL: the capture is `Welcome to ESC[1mCodex…`, so
+# the full sentence never occurs as contiguous bytes (measured). Claude Code draws `❯` (U+276F),
+# never `›` (U+203A), and a live Claude pane has already been named `claude`
+# by the walk above, so this arm cannot relabel one.
+# The two TEXT signatures are matched on the SGR-STRIPPED screen: measured,
+# the banner is `>_ ESC[0;1m…OpenAI Codex ESC[0;2m… (v0.156.1)`, so the
+# sentence never occurs as contiguous raw bytes (a raw-byte match on it was
+# dead code until test-pane-state-codex.sh's precondition caught it).
+if [[ -z "$pane_harness" ]]; then
+    _cx_sig_plain=$(printf '%s' "$pane_ansi" | _strip_ansi)
+    if grep -qF $'\e[1m\xe2\x80\xba' <<<"$pane_ansi" \
+       || grep -qF $'\e[1;7m\xe2\x80\xba' <<<"$pane_ansi" \
+       || grep -qF '>_ OpenAI Codex (v' <<<"$_cx_sig_plain" \
+       || grep -qF "OpenAI's command-line coding agent" <<<"$_cx_sig_plain"; then
+        pane_harness=codex
+    fi
+fi
+if [[ "$pane_harness" == codex ]]; then
+    # shellcheck source=monitor/_pane-state-codex.sh
+    if ! . "$_PS_SCRIPT_DIR/_pane-state-codex.sh" 2>/dev/null; then
+        # Cannot read Codex chrome: never guess, never `absent`.
+        emit unknown "reason=codex-classifier-missing harness=codex"
+        exit 0
+    fi
+    if (( ! pane_capture_ok )); then
+        emit unknown "reason=capture-failed harness=codex"
+        exit 0
+    fi
+    pane_plain=$(printf '%s' "$pane_ansi" | _strip_ansi)
+    pane_content_hash=$(_content_hash "$pane_plain")
+    _cx_hb_state="" _cx_hb_fresh=0 _cx_hb_open=0
+    _cx_hb="${hb_file_override:-}"
+    if [[ -z "$_cx_hb" && -z "$fixture" && -n "$win_name" ]]; then
+        _cx_hb="$(_resolve_heartbeat_dir 2>/dev/null)/$win_name.json"
+    fi
+    if [[ -n "$_cx_hb" && -f "$_cx_hb" ]] && command -v jq >/dev/null 2>&1; then
+        _cx_hb_state=$(jq -r '.state // ""' "$_cx_hb" 2>/dev/null) || _cx_hb_state=""
+        _cx_hb_last=$(jq -r '.last_activity // 0' "$_cx_hb" 2>/dev/null) || _cx_hb_last=0
+        _cx_now="${now_override:-$(date +%s)}"
+        [[ "$_cx_hb_last" =~ ^[0-9]+$ ]] || _cx_hb_last=0
+        (( _cx_now - _cx_hb_last <= ${staleness_override:-30} )) && _cx_hb_fresh=1
+        # A turn is OPEN when the last hook was UserPromptSubmit/PostToolUse
+        # and no Stop came after it (skeptic F1). Bounded at the turn-end
+        # staleness (1800 s): a stream never runs that long, and an unbounded
+        # "open" would hold a pane busy forever after a turn that ended with
+        # no Stop and no `■` line on screen.
+        _cx_hb_end=$(jq -r '.last_turn_end // 0' "$_cx_hb" 2>/dev/null) || _cx_hb_end=0
+        [[ "$_cx_hb_end" =~ ^[0-9]+$ ]] || _cx_hb_end=0
+        if [[ "$_cx_hb_state" == user_prompt || "$_cx_hb_state" == busy ]] \
+           && (( _cx_hb_end < _cx_hb_last )) \
+           && (( _cx_now - _cx_hb_last <= ${turn_end_staleness_override:-1800} )); then
+            _cx_hb_open=1
+        fi
+    fi
+    _cx_out=$(_classify_codex_pane "$pane_ansi" "$pane_plain" "$_cx_hb_state" "$_cx_hb_fresh" "$_cx_hb_open")
+    _cx_state="${_cx_out%%$'\t'*}"
+    _cx_extra=""
+    [[ "$_cx_out" == *$'\t'* ]] && _cx_extra="${_cx_out#*$'\t'}"
+    # auth= comes from the Codex classifier's login arm, never from the
+    # Claude-dialog heuristics in emit().
+    pane_auth=""
+    if [[ "$_cx_extra" == *"auth=login"* ]]; then
+        pane_auth=login
+        _cx_extra="${_cx_extra/ auth=login/}"
+    fi
+    # shellcheck disable=SC2086
+    emit "$_cx_state" $_cx_extra
     exit 0
 fi
 
@@ -4833,6 +5205,58 @@ _over_limit_stamp_expired() {
     fi
     [[ "$ts" =~ ^[0-9]+$ ]] || return 0  # unreadable ⇒ treat as expired (fail open)
     (( now - ts > ttl ))
+}
+
+# A STAMP WHOSE RESET HAS PASSED YIELDS TO A LIVE PANE (your-org/nexus-code#1740).
+#
+# Observed 2026-10-05 02:35: `state=over-limit reset_at=2:30am` on a pane
+# visibly mid-turn (a 6m17s spinner, a running Bash call) after the 2:30am
+# reset. The stamp outranked the pane because §1b reads it before any pane
+# text, and the #1141 supersession arm keys on HEARTBEAT activity, which a
+# single long turn does not produce until its next tool event.
+#
+# Two conditions, BOTH required, so the yield can only fire where the stamp is
+# provably stale:
+#   (1) the reset the stamp itself recorded has PASSED: its `reset_at` token
+#       resolved to the first occurrence AFTER the stamp's own `ts` (the
+#       watcher's pure `_over_limit_reset_at_to_epoch`, anchored at `ts`, never
+#       at "now"). An `unknown`/absent token or an unreadable `ts` returns 1:
+#       a reset we cannot place has not passed. ANY OTHER token that fails to
+#       parse is NOT refused: `_over_limit_reset_at_to_epoch` answers its 6 h
+#       safety net (ts + 21600), so such a stamp CAN yield once it is 6 h old —
+#       still only together with (2). Accepted rather than refused: no real
+#       reset is 6 h past its own stamp, so a turn visibly running then is on
+#       the far side of it (the PR #1745 skeptic pass named the earlier wording an
+#       overclaim);
+#   (2) the SAME capture shows in-flight chrome, by the two detectors §1c
+#       already trusts to contradict a banner: a queued-message placeholder or
+#       an active busy signature (token counter / throttle / retry).
+# The stamp is NOT deleted here: the yield is a reading of this capture, and
+# the Stop hook's clear stays the owner of the file. `over-limit` is not a kill
+# state, so the cost being closed is wrong nudges and inflated counts, not kills.
+_over_limit_stamp_reset_passed() {   # <stamp> -> 0 when its recorded reset is in the past
+    local f="$1" ts tok epoch now
+    command -v jq >/dev/null 2>&1 || return 1
+    ts=$(jq -r '.ts // empty' "$f" 2>/dev/null)
+    [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+    tok=$(jq -r '.reset_at // empty' "$f" 2>/dev/null)
+    [[ -n "$tok" && "$tok" != unknown && "$tok" != null ]] || return 1
+    if ! declare -F _over_limit_reset_at_to_epoch >/dev/null; then
+        # shellcheck source=/dev/null
+        . "$_PS_SCRIPT_DIR/watcher/_over_limit.sh" 2>/dev/null || return 1
+        declare -F _over_limit_reset_at_to_epoch >/dev/null || return 1
+    fi
+    epoch=$(_over_limit_reset_at_to_epoch "$tok" "$ts")
+    [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+    now="${now_override:-$(date +%s)}"
+    (( now >= epoch ))
+}
+_over_limit_stamp_live_chrome() {   # uses $pane_plain; 0 when a turn is visibly in flight
+    local ln
+    [[ -n "${pane_plain//[[:space:]]/}" ]] || return 1
+    ln=$(grep -nF "❯${NBSP}" <<<"$pane_plain" | tail -1 | cut -d: -f1)
+    [[ -n "$ln" ]] || ln=$(wc -l <<<"$pane_plain")
+    _detect_queued_message "$pane_plain" || _detect_busy "$pane_plain" "$ln"
 }
 
 # POST-STAMP MODEL ACTIVITY INVALIDATES THE STAMP (your-org/nexus-code#1141).
@@ -5416,8 +5840,21 @@ if [[ -n "$win_name" ]] || [[ -n "$hb_file_override" ]]; then
                 hb_state="$refined_state"
             fi
         fi
+        # `input=` ON A HOOK-`busy` PANE TOO (your-org/nexus-code#1683 F1). This
+        # route emitted `busy` with no `input=` at all, so the paste primitive's
+        # draft gate (`pd_deliver`, #1674) had nothing to read on exactly the
+        # panes that carry hooks — every WORKER — and pasted into an operator's
+        # half-typed message. A FIELD, not a state: the verdict is the hook's,
+        # unchanged. Read off the capture already in hand (none is taken here);
+        # no capture or no REPL row ⇒ no field, as before. `pane_plain` is NOT
+        # assigned, so the emitter's `auth=` derivation is untouched on this route.
+        hb_input_field=""
+        if [[ "$hb_state" == busy && -n "${pane_ansi:-}" ]]; then
+            hb_input_row=$(_find_input_row "$pane_ansi")
+            [[ -n "$hb_input_row" ]] && hb_input_field="input=$(_pane_input_kind "$hb_input_row" "$(printf '%s' "$pane_ansi" | _strip_ansi)")"
+        fi
         if (( ${hb_defer:-0} == 0 )); then
-            emit "$hb_state" ${refined_extra:+"$refined_extra"}
+            emit "$hb_state" ${hb_input_field:+"$hb_input_field"} ${refined_extra:+"$refined_extra"}
             exit 0
         fi
         # Deferred: fall through to the renderer ladder with the capture (and
@@ -5517,6 +5954,12 @@ if [[ -n "$ol_file" ]] && [[ -f "$ol_file" ]]; then
         # this closes. Fall through; the renderer scrape below still catches a
         # genuine ongoing suspension from the live pane text.
         rm -f "$ol_file" 2>/dev/null || true
+    elif _over_limit_stamp_reset_passed "$ol_file" && _over_limit_stamp_live_chrome; then
+        # STALE AND CONTRADICTED BY THIS CAPTURE (your-org/nexus-code#1740):
+        # the recorded reset is past and the pane is visibly mid-turn. Fall
+        # through to the live-pane classifier; the file is left for the Stop
+        # clear (see `_over_limit_stamp_reset_passed`).
+        :
     else
         _emit_over_limit_from_stamp "$ol_file"
         exit 0

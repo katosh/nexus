@@ -78,7 +78,7 @@ default 1800 s, of the last is suppressed as `blocked-by-cooldown`).
 ### Why the layering
 
 A wedge is first given a chance to self-heal: `detect_and_unstick`
-(permission-Enter, api-error-Enter, AskUserQuestion-Escape) runs
+(its per-window cases — e.g. AskUserQuestion-Escape) runs
 during the **waiting** window. If that budget is exhausted, exactly
 **one** re-paste of the pending emit is attempted (a dropped/un-submitted
 Enter on an otherwise-alive pane is rescued by a re-paste, not a

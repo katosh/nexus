@@ -103,7 +103,6 @@ the scripts refuse to read group/world-readable secret files.
 | [`monitor.watcher.probe_model`](#monitorwatcherprobe_model) | string | `MONITOR_PROBE_MODEL` | `claude-haiku-4-5-20251001` |
 | [`monitor.watcher.ratelimit_heuristic_minutes`](#monitorwatcherratelimit_heuristic_minutes) | int (min) | `MONITOR_RATELIMIT_HEURISTIC_MIN` | `30` |
 | [`monitor.watcher.ratelimit_ack_timeout_s`](#monitorwatcherratelimit_ack_timeout_s) | int (s) | `MONITOR_RATELIMIT_ACK_TIMEOUT_S` | `60` |
-| [`monitor.watcher.api_error_backoff_minutes`](#monitorwatcherapi_error_backoff_minutes) | int (min) | `MONITOR_API_ERROR_BACKOFF_MIN` | `30` |
 | [`monitor.watcher.paste_response_grace_seconds`](#monitorwatcherpaste_response_grace_seconds) | int (s) | `MONITOR_ORCH_PASTE_RESPONSE_GRACE_S` | `120` |
 | [`monitor.watcher.unstick_window_seconds`](#monitorwatcherunstick_window_seconds) | int (s) | `MONITOR_ORCH_UNSTICK_WINDOW_S` | `150` |
 | [`monitor.watcher.orchestrator_dead_threshold_seconds`](#monitorwatcherorchestrator_dead_threshold_seconds) | int (s) | `MONITOR_ORCH_DEAD_THRESHOLD_S` | `300` |
@@ -363,7 +362,7 @@ unconditionally.
 File whose first line is the Pushover **user key** from
 [pushover.net](https://pushover.net). `chmod 600`. The key is
 optional because `monitor/notify.sh` falls back to the path above
-(`monitor/notify.sh:107`) — drop the file there and Pushover works
+(`monitor/notify.sh:173`) — drop the file there and Pushover works
 with no config entry at all; with neither key nor file the tier
 silently no-ops.
 
@@ -373,13 +372,13 @@ silently no-ops.
 
 File whose first line is the Pushover **application token** from
 [pushover.net/apps/build](https://pushover.net/apps/build). `chmod 600`.
-Same fallback shape as the user key (`monitor/notify.sh:108`).
+Same fallback shape as the user key (`monitor/notify.sh:174`).
 
 ### `notifications.ntfy.topic_url_path`
 
 **Type** path · **Env** `NEXUS_NOTIFY_TOKEN` · **Default** `~/.claude/.nexus-notify-token`
 
-Fallback push channel; the code fallback is `monitor/notify.sh:109`. File's first line holds the full ntfy topic
+Fallback push channel; the code fallback is `monitor/notify.sh:175`. File's first line holds the full ntfy topic
 URL (e.g. `https://ntfy.sh/<unguessable-topic>`). The topic name is a
 bearer secret on `ntfy.sh`'s public instance — choose something
 unguessable.
@@ -391,6 +390,14 @@ unguessable.
 Where emergency-tier emails go (production address). Used by
 `monitor/notify.sh` when push is unavailable or the alert tier is
 "emergency".
+
+This is the ONLY address the nexus may email (operator rule, 2026-09-28,
+<your-org>/nexus-code#1663). It is read from the PRIMARY nexus's own
+`config/nexus.yml`, never through `NEXUS_CONFIG`: a `NEXUS_CONFIG` naming a
+different recipient is refused (rc 5). Unset means no email, at rc 0. `NEXUS_EMAIL_TO` can only narrow it: set it to
+the same address, or to empty for no email. Anything else (another
+address, a list, a display-name form) is refused at rc 5. A placeholder or
+malformed value here is refused too, rather than mailed.
 
 ### `notifications.email.probe_address`
 
@@ -642,13 +649,11 @@ the watcher pastes the appropriate recovery keystroke:
 - **Case B — rate-limit prompt**: every stuck non-watcher window
   receives Enter + a "please continue" follow-up once the limit has
   reset, and the orchestrator gets a separate heads-up paste.
-- **Case C — transient API-error chip** (Claude Code's per-turn
-  `"Internal server error"` wedge): a single Enter nudges the failed
-  turn into retry, with a per-fingerprint backoff
-  ([`api_error_backoff_minutes`](#monitorwatcherapi_error_backoff_minutes))
-  so a chronically broken endpoint isn't hammered.
+Case C (an API-error Enter-nudge) was retired in <your-org>/nexus-code#1670,
+and with it the `api_error_backoff_minutes` knob; a turn killed by an API
+error is reported through the `StopFailure` marker instead.
 
-Set to `false` to opt out of all three branches and require manual
+Set to `false` to opt out of these branches and require manual
 confirmation. Action + pre-action pane captures are recorded under
 `monitor/.state/watcher-unstick.log` and `monitor/.state/unstick/`
 for post-hoc audit.
@@ -696,19 +701,6 @@ the orchestrator's `ratelimit-resume-ack` action-log entry before
 logging `orchestrator-unresponsive`. Allows for one poll-interval
 round-trip plus a small margin.
 
-### `monitor.watcher.api_error_backoff_minutes`
-
-**Type** int (min) · **Env** `MONITOR_API_ERROR_BACKOFF_MIN` · **Default** `30`
-
-Case C backoff window in minutes. When the watcher detects a per-turn
-API failure wedge (typically `type=api_error`, `"Internal server
-error"`), it sends Enter to nudge the failed turn into retry. The
-same fingerprint (request_id + message) reappearing within this many
-minutes is logged as `case=C action=skip-backoff` and skipped, so a
-chronically broken endpoint isn't hammered. Distinct fingerprints
-and same-fingerprint reappearances after the window elapses re-fire
-the Enter. Set to `0` to disable backoff (every detection acts).
-
 ### `monitor.watcher.paste_response_grace_seconds`
 
 **Type** int (s) · **Env** `MONITOR_ORCH_PASTE_RESPONSE_GRACE_S` · **Default** `120`
@@ -724,8 +716,7 @@ window granted to the one-shot re-submit rescue. See
 
 **Type** int (s) · **Env** `MONITOR_ORCH_UNSTICK_WINDOW_S` · **Default** `150`
 
-Budget for the auto-unstick cycle (permission-Enter / api-error-Enter
-/ AskUserQuestion-Escape) to resolve a wedge before the watcher fires
+Budget for the auto-unstick cycle (e.g. AskUserQuestion-Escape) to resolve a wedge before the watcher fires
 the one-shot re-submit rescue. `grace + unstick_window` must stay
 below `orchestrator_dead_threshold_seconds` so the rescue retains a
 verification window before the absolute deadline (enforced as a

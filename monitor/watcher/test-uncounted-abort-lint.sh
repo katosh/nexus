@@ -48,6 +48,25 @@ PASS=0; FAIL=0; SKIP=0
 _dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LINT="$_dir/uncounted-abort-lint.sh"
 
+# --- the guard's population (your-org/nexus-code#1747) ----------------------
+# This suite declared none, so `guards-for-diff` could never select it; the
+# re-pin history below records three reds found only by a full band for exactly
+# that reason. The population is the lint's OWN selection, forwarded via
+# `--files` (every shell file under monitor/, plus the awk library the lint
+# concatenates into its program), never a copy; plus the lint itself and the
+# helper library this suite sources. The realmodel census below walks
+# test-integration/test-realmodel-*.sh, a strict subset of that selection
+# (every member is a `*.sh` under monitor/), so it needs no second enumerator.
+#
+# PLACED HERE, above the first thing this suite prints: `gp_handle` EXITS when
+# it handles the flag, and anything printed before it would be read as a row.
+. "$_dir/../_guard_population.sh"
+gp_population() {
+    bash "$LINT" --files "$(cd "$_dir/../.." && pwd)"
+    printf '%s\n' "$LINT" "$_dir/_test_helpers.sh"
+}
+gp_handle "$@"
+
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -488,11 +507,37 @@ _nfiles=$(find "$_dir/test-integration" -name 'test-realmodel-*.sh' -type f | wc
 # line, so `dev` @ 049b31d6 was red here (got 15 want 14, reproduced in isolation).
 # Its failure lines do not match the `FAIL:` announcement pattern this census
 # counts, so only the file count moves. `neither` is still 0.
-assert_eq "manifest: 15 realmodel files are enumerated"  "$_nfiles"          "15"
-assert_eq "manifest: 68 realmodel FAIL announcements"    "$(echo "$_c" | cut -d' ' -f1)" "68"
-assert_eq "manifest: 17 are disposed by \`exit\`, NOT by a counter" \
-    "$(echo "$_c" | cut -d' ' -f2)" "17"
-assert_eq "manifest: 51 are disposed by a counter bump"  "$(echo "$_c" | cut -d' ' -f3)" "51"
+# 15 files unchanged, 68 -> 70 announcements, 17 by-exit unchanged, 51 -> 53
+# by-count: bundle-0929 (your-org/nexus-code#1669, #1667). #1669 adds NC-1's
+# "clear not testable" announcement to test-realmodel-auth-failure-hooks.sh and
+# #1667 adds the "hold was not ended by the release file" announcement to
+# test-realmodel-idle-busy.sh; both are disposed by a counter bump
+# (`FAIL=$((FAIL+1))` / `FAIL=$(( FAIL + 1 ))`). Found by the bundle's full local
+# band. `neither` is still 0.
+# 15 files unchanged, 70 -> 71 announcements, 17 by-exit unchanged, 53 -> 54
+# by-count: your-org/nexus-code#1688 splits test-realmodel-auth-failure-hooks.sh's
+# "no marker" announcement in two — the writer EXITED without writing (a writer
+# defect) vs had NOT EXITED by the ceiling (not a verdict) — each disposed by a
+# counter bump on its own line. Re-derived by this block's census on the
+# b9-1688 tree (got 71 / 54 before this re-pin). `neither` is still 0.
+# 15 -> 16 files, 71 -> 72 announcements, 17 -> 18 by-exit, 54 by-count unchanged:
+# your-org/nexus-code#1715 adds test-realmodel-respawn-late-render.sh. Its one
+# announcement is boot_orch's "orchestrator window never appeared", a
+# precondition disposed by `exit 1` — the shape test-realmodel-respawn-verify.sh
+# carries. Found by PR #1726's "NEXUS_ROOT exported" CI band (got 16/72/18), not
+# locally: this suite declares no population, so guards-for-diff could not select
+# it. `neither` is still 0.
+# 16 files unchanged, 72 -> 73 announcements, 18 by-exit unchanged, 54 -> 55
+# by-count: your-org/nexus-code#1732 splits test-realmodel-auth-failure-hooks.sh's
+# "marker survived a successful turn" in two, exactly as #1688 split "no marker":
+# the clear EXITED and left it (a defect) vs had NOT EXITED by the ceiling (not
+# a verdict), each a counter bump. Measured on the bundle-1005a tree (got 73 / 55
+# before this re-pin). `neither` is still 0.
+assert_eq "manifest: 16 realmodel files are enumerated"  "$_nfiles"          "16"
+assert_eq "manifest: 73 realmodel FAIL announcements"    "$(echo "$_c" | cut -d' ' -f1)" "73"
+assert_eq "manifest: 18 are disposed by \`exit\`, NOT by a counter" \
+    "$(echo "$_c" | cut -d' ' -f2)" "18"
+assert_eq "manifest: 55 are disposed by a counter bump"  "$(echo "$_c" | cut -d' ' -f3)" "55"
 # The load-bearing one: the carve-out's CONCLUSION.
 assert_eq "manifest: ZERO realmodel aborts neither exit nor count" \
     "$(echo "$_c" | cut -d' ' -f4)" "0"

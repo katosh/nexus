@@ -1047,10 +1047,23 @@ cp "$(command -v bash)" "$BUILD_BIN"
 JPORT=$(( 49152 + (RANDOM % 16000) ))     # ephemeral; never a labsh port
 printf 'PORT=%s\n' "$JPORT" > "$JDIR/labsh-service.env"
 BUILD_PID=""
+# The build's BODY decides what the shared progress verdict
+# (`labsh_build_release`, your-org/nexus-code#1676) sees:
+#   default      the historical spinner — forks a sleep every 0.2 s (ambiguous
+#                progress; used where only identity matters)
+#   progressing  appends one byte per 0.2 s, so /proc/<pid>/io wchar GROWS —
+#                a slow build that is still moving
+#   stalled      one long `sleep`: bash blocks in wait(), no CPU, no bytes —
+#                a wedged build
+BUILD_BODY_DEFAULT='while :; do sleep 0.2; done'
+BUILD_BODY_PROGRESSING="while :; do printf x >> '$JWD/.prog'; sleep 0.2; done"
+BUILD_BODY_STALLED='sleep 600; :'
 start_build() {   # simulate labsh's backgrounded cold uvx build (no URL yet)
+    local body="${1:-$BUILD_BODY_DEFAULT}"
     : > "$JDIR/labsh.bg.log"       # build log with NO "running at" URL line
+    rm -f "$JDIR/labsh.buildprogress"
     # cwd MUST be the service workdir — that is the identity signal.
-    ( cd "$JWD" && exec "$BUILD_BIN" -c 'while :; do sleep 0.2; done' \
+    ( cd "$JWD" && exec "$BUILD_BIN" -c "$body" \
         tool uvx --from jupyterlab jupyter-lab --port "$JPORT" --no-browser ) >/dev/null 2>&1 &
     BUILD_PID=$!
     echo "$BUILD_PID" > "$JDIR/labsh.bg.pid"
@@ -1092,7 +1105,8 @@ jreg() {   # write a jupyter/labsh registry row (health = flag-file probe)
 }
 reset_jup() {
     rm -rf "$SHDIR"; mkdir -p "$SHDIR"
-    : > "$SVC_CALLS"; rm -f "$FIXFLAG" "$JOK" "$JDIR/labsh.bg.pid"
+    : > "$SVC_CALLS"; rm -f "$FIXFLAG" "$JOK" "$JDIR/labsh.bg.pid" "$JDIR/labsh.buildprogress"
+    unset LABSH_BUILD_STALL_SECONDS LABSH_COLD_BUILD_HARD_CAP
     jreg
     export MONITOR_SERVICE_HEALTH_GRACE_SECONDS=30
     export MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS=300
@@ -1217,36 +1231,128 @@ assert_eq "a bound-but-wedged server is still restarted after grace" \
 stop_build
 
 echo
-echo "## cold-build ceiling ⇒ a pathological never-binding build is eventually restarted"
+echo "## #1676: the ceiling runs on the BUILD's clock, not the incident's (the 2026-09-29 kill loop)"
+# Live shape: the incident opened 13:16:31; each watcher restart started a NEW
+# build; once the INCIDENT was 1800 s old every new build was "past the
+# ceiling" at birth and was force-killed at the next cooldown. Here: an incident
+# 2000 s old (> the 1800 s ceiling) and a build seconds old. RED on origin/dev
+# 33a44f48 (it restarts, forced); GREEN with the build's own age deciding.
 reset_jup
-: > "$SVC_FORCE_CALLS"             # scope the SVC_FORCE assertions to THIS case
+: > "$SVC_FORCE_CALLS"
 export MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1800
-rm -f "$JOK"; start_build          # a build that never binds a URL
-NEXUS_TEST_NOW=20000 _service_health_check_tick        # cold-build
-assert_eq "still cold-build within the ceiling" \
+rm -f "$JOK"
+NEXUS_TEST_NOW=20000 _service_health_check_tick        # the service went down (no build yet)
+start_build "$BUILD_BODY_PROGRESSING"                   # a relaunch's FRESH build
+NEXUS_TEST_NOW=22000 _service_health_check_tick        # incident 2000 s old
+NEXUS_TEST_NOW=22400 _service_health_check_tick        # …and past every cooldown
+assert_eq "a FRESH build in an OLD incident is NOT restarted" \
+    "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "0"
+assert_eq "…and reads cold-build, not recovering" \
     "$(_sh_field "$SHDIR/jupyter-fix.state" status)" "cold-build"
-assert_eq "no restart within the ceiling" "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "0"
-NEXUS_TEST_NOW=21801 _service_health_check_tick        # >1800s in → ceiling passed
-assert_eq "past the ceiling the watcher restarts even a still-'building' service" \
-    "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "1"
-
-# ── CLOCK ORIGIN: the ceiling must actually GET THROUGH svc.sh's guard ───────
-# The assertion above only proves we CALLED svc.sh. It passed all through round
-# 1 while the call was being REFUSED: svc.sh's cold-build guard ages the build
-# from the BUILD PROCESS (etimes), this module ages the incident from
-# FIRST_UNHEALTHY, and a build can only start after the service is already
-# unhealthy — so at our ceiling the build is always younger than the guard's cap
-# and the guard vetoed us. One wasted restart attempt out of three, every time;
-# permanent `flapping` (recovery dead) once that offset exceeds the restart
-# budget. Two clocks, same 1800s duration, different origins.
-#
-# We resolve it by deciding ONCE, here, on OUR clock, and telling svc.sh:
-# SVC_FORCE=1. These assertions FAIL if that coupling is ever broken.
-assert_eq "past the ceiling the watcher FORCES through svc.sh's cold-build guard (clock-origin fix)" \
-    "$(grep -c 'restart:jupyter-fix SVC_FORCE=1' "$SVC_FORCE_CALLS")" "1"
-assert_eq "the forced restart is the one issued at the ceiling (no un-forced restart of a live build)" \
-    "$(grep -c 'restart:jupyter-fix SVC_FORCE=0' "$SVC_FORCE_CALLS")" "0"
+assert_contains "the note gives the build's age verdict (within its ceiling)" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" note)" "inside the 1800s ceiling"
 stop_build
+
+echo "## #1676: a build PAST the ceiling that is still PROGRESSING is NOT restarted"
+# The requirement: a stub whose build takes longer than the ceiling but shows
+# progress must not be restarted. Ceiling 1 s so the (real) build age is past
+# it; the build appends a byte every 0.2 s, so the shared progress counter
+# moves between ticks. RED on origin/dev 33a44f48: it restarts past the ceiling.
+reset_jup
+: > "$SVC_FORCE_CALLS"
+export MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1
+export LABSH_BUILD_STALL_SECONDS=2
+rm -f "$JOK"; start_build "$BUILD_BODY_PROGRESSING"
+sleep 1.2                                               # build age now > ceiling
+NEXUS_TEST_NOW=23000 _service_health_check_tick
+sleep 2.5                                               # > the stall window — but it MOVED
+NEXUS_TEST_NOW=23400 _service_health_check_tick
+sleep 2.5
+NEXUS_TEST_NOW=23800 _service_health_check_tick
+assert_eq "a slow-but-progressing build past the ceiling is NEVER restarted" \
+    "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "0"
+assert_eq "…status stays cold-build" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" status)" "cold-build"
+assert_contains "…and the note says why: past the ceiling but still making progress" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" note)" "still making progress"
+assert_eq "…no attempt counted toward the flap ceiling" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" restart_attempts)" "0"
+stop_build
+
+echo "## #1676 NEGATIVE: a STALLED build past the ceiling IS restarted, forced, and says so"
+# The half that keeps recovery alive: a build that stops moving for the whole
+# stall window is presumed wedged and released — through svc.sh's guard
+# (SVC_FORCE=1), with the reason in the event and counted in build_kills.
+reset_jup
+: > "$SVC_FORCE_CALLS"
+export MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1
+export LABSH_BUILD_STALL_SECONDS=2
+rm -f "$JOK"; start_build "$BUILD_BODY_STALLED"
+sleep 1.2
+NEXUS_TEST_NOW=24000 _service_health_check_tick        # baseline sample; not yet provably stalled
+assert_eq "first sight of a quiet build is not yet a stall (no restart)" \
+    "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "0"
+sleep 2.5                                               # no CPU, no bytes, no log for > 2 s
+NEXUS_TEST_NOW=24400 _service_health_check_tick
+assert_eq "a stalled build past the ceiling IS restarted (recovery not weakened)" \
+    "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "1"
+assert_eq "…FORCED through svc.sh's cold-build guard" \
+    "$(grep -c 'restart:jupyter-fix SVC_FORCE=1' "$SVC_FORCE_CALLS")" "1"
+assert_contains "…the event names the build it killed and why (stalled)" \
+    "$(cat "$SHDIR/jupyter-fix.events")" "killed live labsh build pid $BUILD_PID (stalled)"
+assert_eq "…and build_kills records it" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" build_kills)" "1"
+stop_build
+
+echo "## #1676: past the HARD cap even a progressing build is released (the backstop)"
+reset_jup
+: > "$SVC_FORCE_CALLS"
+export MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1
+export LABSH_COLD_BUILD_HARD_CAP=1
+rm -f "$JOK"; start_build "$BUILD_BODY_PROGRESSING"
+sleep 1.2
+NEXUS_TEST_NOW=25000 _service_health_check_tick
+NEXUS_TEST_NOW=25400 _service_health_check_tick
+assert_eq "past the hard cap the build is restarted, forced" \
+    "$(grep -c 'restart:jupyter-fix SVC_FORCE=1' "$SVC_FORCE_CALLS")" "1"
+assert_contains "…and the event says hard cap, not stall" \
+    "$(cat "$SHDIR/jupyter-fix.events")" "(past-hard-cap)"
+stop_build
+
+echo "## #1676: FLAPPING reached through build kills says so"
+reset_jup
+export MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1
+export LABSH_COLD_BUILD_HARD_CAP=1
+export MONITOR_SERVICE_HEALTH_FLAP_CEILING=1
+export MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS=0
+rm -f "$JOK"; start_build "$BUILD_BODY_PROGRESSING"
+sleep 1.2
+NEXUS_TEST_NOW=26000 _service_health_check_tick
+NEXUS_TEST_NOW=26100 _service_health_check_tick        # attempt 1 kills the (released) build
+NEXUS_TEST_NOW=26200 _service_health_check_tick        # ceiling 1 reached
+assert_eq "flap ceiling reached" "$(_sh_field "$SHDIR/jupyter-fix.state" status)" "flapping"
+assert_contains "the flapping note says the attempts were WEDGED BUILDS" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" note)" "repeated WEDGED BUILDS"
+stop_build
+
+echo "## #1676: a REFUSED restart (svc.sh rc 75) is not counted as an attempt"
+# 2026-09-29 14:24:28: the watcher saw no build, svc.sh's guard did, refused
+# (rc 1 then) — and that refusal was attempt 1/3 toward FLAPPING.
+reset_jup
+rm -f "$JOK"
+REFUSE_STUB="$WORK/svc-refuse-stub.sh"
+printf '#!/usr/bin/env bash\necho "$*" >> "%s"\nexit 75\n' "$SVC_CALLS" > "$REFUSE_STUB"; chmod +x "$REFUSE_STUB"
+SERVICE_HEALTH_SVC_BIN="$REFUSE_STUB"
+NEXUS_TEST_NOW=27000 _service_health_check_tick        # grace
+NEXUS_TEST_NOW=27100 _service_health_check_tick        # past grace → restart → REFUSED
+SERVICE_HEALTH_SVC_BIN="$SVC_STUB"
+assert_eq "svc.sh was asked once" "$(grep -c 'restart jupyter-fix' "$SVC_CALLS")" "1"
+assert_eq "…and the refusal did NOT count as an attempt" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" restart_attempts)" "0"
+assert_eq "…status is cold-build (deferred), not recovering" \
+    "$(_sh_field "$SHDIR/jupyter-fix.state" status)" "cold-build"
+assert_contains "…with a restart-deferred event" \
+    "$(cat "$SHDIR/jupyter-fix.events")" "restart-deferred"
 
 # A restart with NO live build must NOT be forced: forcing unconditionally would
 # silently re-arm the original footgun (an operator/watcher discarding a build
@@ -1364,6 +1470,54 @@ NEXUS_TEST_NOW=44200 _service_health_check_tick
 assert_eq "a finding supersedes the incident ⇒ the alert is cleared" "$(grep -c '^clear service-health:myservice ' "$OPCAP")" "1"
 assert_contains "…naming the reclassification" "$(grep '^clear' "$OPCAP")" "reclassified"
 rm -f "$FINDMODE"
+
+echo "## one page per cause (#1653 F2): the downgrade keys on the ROUTE'S CAUSE, not on 'auth is standing'"
+# 2026-09-27: a login expiry and a service-health alert raised BECAUSE of it
+# each emailed hourly. The route function prints `<code>\t<reason>` (main.sh);
+# only an auth-caused block, with the auth key standing, rides as warning.
+reset_state; : > "$OPCAP"
+set_policy emit-only
+rm -f "$OKFLAG"
+: > "$OPSTAND.auth-expired"          # the auth hold's key is standing
+ROUTE_REASON=$'auth-expired\tthe orchestrator is LOGGED OUT (auth=expired) and cannot take a turn'
+NEXUS_TEST_NOW=45000 _service_health_check_tick
+NEXUS_TEST_NOW=45100 _service_health_check_tick
+assert_eq "route code auth-expired + auth standing → WARNING" "$(grep -c '^raise service-health:myservice warning ' "$OPCAP")" "1"
+assert_eq "…and never as critical" "$(grep -c '^raise service-health:myservice critical ' "$OPCAP")" "0"
+assert_contains "…saying what it rides on" "$(grep '^raise' "$OPCAP")" "already pages for it"
+assert_contains "…with the code stripped from the reason text" "$(grep '^raise' "$OPCAP")" "CANNOT tell the orchestrator: the orchestrator is LOGGED OUT"
+assert_eq "…and no raw code token or tab leaks into it" "$(grep '^raise' "$OPCAP" | grep -cF -e $'\t' -e 'orchestrator: auth-expired')" "0"
+touch "$OKFLAG"; NEXUS_TEST_NOW=45200 _service_health_check_tick
+# F2 CO-OCCURRENCE (the skeptic's `cooccur`): the route is blocked by OVER-LIMIT
+# while auth is ALSO standing. An independent cause — critical.
+reset_state; : > "$OPCAP"
+set_policy emit-only
+rm -f "$OKFLAG"
+ROUTE_REASON=$'over-limit\tthe orchestrator is OVER-LIMIT and emits are held'
+NEXUS_TEST_NOW=45300 _service_health_check_tick
+NEXUS_TEST_NOW=45400 _service_health_check_tick
+assert_eq "F2: over-limit while auth IS standing → still CRITICAL" "$(grep -c '^raise service-health:myservice critical ' "$OPCAP")" "1"
+touch "$OKFLAG"; NEXUS_TEST_NOW=45500 _service_health_check_tick
+# The auth-HOLD arm (a /login dialog open) is the same cause.
+reset_state; : > "$OPCAP"
+set_policy emit-only
+rm -f "$OKFLAG"
+ROUTE_REASON=$'auth-hold\ta dialog is open on the orchestrator and emits are HELD (auth hold)'
+NEXUS_TEST_NOW=45600 _service_health_check_tick
+NEXUS_TEST_NOW=45700 _service_health_check_tick
+assert_eq "route code auth-hold + auth standing → WARNING" "$(grep -c '^raise service-health:myservice warning ' "$OPCAP")" "1"
+touch "$OKFLAG"; NEXUS_TEST_NOW=45800 _service_health_check_tick
+rm -f "$OPSTAND.auth-expired"
+# CONTROL (must not flip): an auth-coded route with the auth key NOT standing
+# stays critical — the downgrade needs the page it rides on to exist.
+reset_state; : > "$OPCAP"
+set_policy emit-only
+rm -f "$OKFLAG"
+ROUTE_REASON=$'auth-expired\tthe orchestrator is LOGGED OUT (auth=expired) and cannot take a turn'
+NEXUS_TEST_NOW=46000 _service_health_check_tick
+NEXUS_TEST_NOW=46100 _service_health_check_tick
+assert_eq "CONTROL: auth-coded route, auth NOT standing → critical" "$(grep -c '^raise service-health:myservice critical ' "$OPCAP")" "1"
+touch "$OKFLAG"; NEXUS_TEST_NOW=46200 _service_health_check_tick
 _SERVICE_HEALTH_OPERATOR_ALERT_FN=_sh_operator_alert_noop
 _SERVICE_HEALTH_ROUTE_BLOCKED_FN=_sh_route_blocked_noop
 

@@ -791,6 +791,60 @@ _idle_pane_state_get() {
 # window index serving another window's recording. Fail-open on every
 # cache condition; MONITOR_PANE_CACHE_MODE=record (the authoritative
 # idle sweep) always forks fresh.
+# ---- render deadline (your-org/nexus-code#1698) -------------------------
+#
+# WHY. `render_idle_prelude` is a COUNT, run under a wall-clock budget
+# (`_render_budget_seconds`), and its dominant cost is forking pane-state.sh
+# for windows whose recording it may not reuse. That cost is not a constant:
+# measured read-only on the live board, one fork costs 1.6–7 s at load 25 and
+# 17–40 s at load 90–105, and ~83% of a cold render is those forks. No cache
+# policy bounds a SERIAL set of forks whose unit cost scales with load; the
+# render timed out with #1702's sweep reuse in place (23:18:53, 2026-09-30).
+#
+# WHAT. When `render_idle_prelude` is given its budget it sets two epochs:
+#   MONITOR_RENDER_PROBE_DEADLINE  no pane-state.sh fork may run past it — a
+#                                  fork is wrapped in `timeout <seconds left>`
+#                                  and refused when none are left;
+#   MONITOR_RENDER_LOOP_DEADLINE   no window is STARTED past it.
+# A window either path skips is recorded in MONITOR_RENDER_DEFERRED_FILE and
+# counted `unprobed`: NEITHER busy NOR idle. Kill safety rests on three
+# things: a deferred probe line carries no `state=` key; the deferral is
+# honoured ONLY with MONITOR_IDLE_PROBE_READONLY=1, which the authoritative
+# recorder (`render_idle_section`) never sets; and the prelude classifies
+# nothing, it only counts. Unset deadlines = the behaviour before #1698.
+
+# _idle_render_now — epoch seconds without a fork (bash ≥ 4.2 builtin).
+_idle_render_now() { printf -v "$1" '%(%s)T' -1; }
+
+# _idle_render_deadline_active — the deferral contract is armed: read-only
+# probe, a deferral sink, and at least one numeric deadline.
+_idle_render_deadline_active() {
+    [[ "${MONITOR_IDLE_PROBE_READONLY:-}" == 1 && -n "${MONITOR_RENDER_DEFERRED_FILE:-}" ]] || return 1
+    [[ "${MONITOR_RENDER_PROBE_DEADLINE:-}" =~ ^[0-9]+$ || "${MONITOR_RENDER_LOOP_DEADLINE:-}" =~ ^[0-9]+$ ]]
+}
+
+# _idle_render_probe_seconds_left — print whole seconds left for a fork and
+# succeed, or fail when no probe deadline is armed (fork unbounded, as before).
+_idle_render_probe_seconds_left() {
+    _idle_render_deadline_active || return 1
+    [[ "${MONITOR_RENDER_PROBE_DEADLINE:-}" =~ ^[0-9]+$ ]] || return 1
+    local _n; _idle_render_now _n
+    printf '%s' "$(( MONITOR_RENDER_PROBE_DEADLINE - _n ))"
+}
+
+# _idle_render_loop_expired — the loop deadline is armed and has passed.
+_idle_render_loop_expired() {
+    _idle_render_deadline_active || return 1
+    [[ "${MONITOR_RENDER_LOOP_DEADLINE:-}" =~ ^[0-9]+$ ]] || return 1
+    local _n; _idle_render_now _n
+    (( _n >= MONITOR_RENDER_LOOP_DEADLINE ))
+}
+
+# _idle_render_defer <name> <reason> — record a window the render skipped.
+_idle_render_defer() {
+    printf 'deferred\t%s\t%s\n' "$1" "$2" >> "$MONITOR_RENDER_DEFERRED_FILE" 2>/dev/null || true
+}
+
 _idle_pane_state_line() {
     local window_index="$1" expected_name="${2:-}"
     if declare -F _pane_cache_read >/dev/null 2>&1; then
@@ -851,14 +905,34 @@ _idle_pane_state_line() {
     # emit), so nothing downstream changes except that the snapshot can now
     # SAY which of the two happened. The stderr excerpt is sanitised to a
     # charset that cannot spell `=`, so a diagnostic can never forge a field.
+    # Render deadline (your-org/nexus-code#1698): on the count-only prelude
+    # path a fork is TIME-SLICED to what is left of the render's probe
+    # window, and refused outright when nothing is left. Either way the
+    # result is `probe=deferred`, which carries NO `state=` key, so no
+    # consumer can read it as idle; the caller counts it as unprobed.
+    local _ps_bound=() _ps_left
+    if _ps_left=$(_idle_render_probe_seconds_left); then
+        if (( _ps_left < 1 )); then
+            printf 'probe=deferred probe_reason=budget\n'
+            return 0
+        fi
+        _ps_bound=(timeout -k 1 "$_ps_left")
+    fi
     local _ps_line _ps_rc=0 _ps_errf="" _ps_err=""
     _ps_errf=$(mktemp "${TMPDIR:-/tmp}/pane-probe-err.XXXXXX" 2>/dev/null) || _ps_errf=""
     if [[ -n "$_ps_errf" ]]; then
-        _ps_line=$("$pane_state_script" "${hb_args[@]}" "$window_index" 2>"$_ps_errf"); _ps_rc=$?
+        _ps_line=$(${_ps_bound[@]+"${_ps_bound[@]}"} "$pane_state_script" "${hb_args[@]}" "$window_index" 2>"$_ps_errf"); _ps_rc=$?
         _ps_err=$(head -c 200 "$_ps_errf" 2>/dev/null | tr '\n' ' ' | tr -c 'A-Za-z0-9 ._:/,()-' '_')
         rm -f "$_ps_errf"
     else
-        _ps_line=$("$pane_state_script" "${hb_args[@]}" "$window_index" 2>/dev/null); _ps_rc=$?
+        _ps_line=$(${_ps_bound[@]+"${_ps_bound[@]}"} "$pane_state_script" "${hb_args[@]}" "$window_index" 2>/dev/null); _ps_rc=$?
+    fi
+    # The SET a `timeout` wrapper injects (124 default, 137 after -k), not
+    # one value. A pane-state.sh that itself exits 124 is read as deferred
+    # too: a proxy whose error is the safe direction (unprobed, never idle).
+    if (( ${#_ps_bound[@]} )) && { (( _ps_rc == 124 )) || (( _ps_rc == 137 )); }; then
+        printf 'probe=deferred probe_reason=timeout\n'
+        return 0
     fi
     if [[ -n "$_ps_line" ]] && declare -F _pane_cache_write >/dev/null 2>&1; then
         _pane_cache_write "$window_index" "$_ps_line"
@@ -3443,6 +3517,15 @@ _bg_children_interval_cap_seconds() {
     [[ "$v" =~ ^[0-9]+$ ]] || v=21600
     printf '%s' "$v"
 }
+# _idle_knob_memo <env-var> <resolver> — set <env-var> to <resolver>'s
+# output if it is empty (your-org/nexus-code#1698). Only meaningful where the
+# caller has declared <env-var> LOCAL (list_really_idle_workers does); the
+# resolvers read the env var first, so every later call is fork-free.
+_idle_knob_memo() {
+    local _km_var="$1" _km_fn="$2"
+    [[ -n "${!_km_var:-}" ]] && return 0
+    printf -v "$_km_var" '%s' "$("$_km_fn")"
+}
 _bg_children_grace_ceiling_seconds() {
     local v="${MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS:-}"
     if [[ -z "$v" && -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/config/load.sh" ]]; then
@@ -4165,6 +4248,18 @@ list_really_idle_workers() {
         fi
     fi
     local close_threshold=$(( close_hours * 3600 ))
+    # Per-window config knobs, resolved AT MOST ONCE per sweep
+    # (your-org/nexus-code#1698). Each resolver forks `config/load.sh` unless
+    # its env knob is set, and the watcher does not export these — measured at
+    # load ~100: 34 such forks per render, ~29 s of a 332 s render, the largest
+    # term after pane-state.sh itself. Declared LOCAL (dynamic scope) so the
+    # memo is visible to the resolvers — including inside `$( )` subshells —
+    # and dies with this call: a config edit is picked up by the next sweep,
+    # exactly as before. An env value the operator set is kept as-is.
+    local MONITOR_BACKGROUND_ORPHAN_GRACE_SECONDS="${MONITOR_BACKGROUND_ORPHAN_GRACE_SECONDS:-}"
+    local MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS="${MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS:-}"
+    local MONITOR_BG_CHILDREN_GRACE_BASE_SECONDS="${MONITOR_BG_CHILDREN_GRACE_BASE_SECONDS:-}"
+    local MONITOR_BG_CHILDREN_BACKOFF_MULT="${MONITOR_BG_CHILDREN_BACKOFF_MULT:-}"
     # Operator-engagement grace (issue #196), resolved once per sweep.
     local engaged_grace
     engaged_grace=$(_openg_grace_seconds)
@@ -4214,6 +4309,12 @@ list_really_idle_workers() {
     local name activity_epoch window_index age pane_state pane_line pane_reset_at
     while IFS=$'\t' read -r name activity_epoch window_index; do
         [[ -n "$name" && "$activity_epoch" =~ ^[0-9]+$ ]] || continue
+        # Render deadline (#1698): past the loop deadline a window is not
+        # started at all; the prelude counts it unprobed, never classified.
+        if _idle_render_loop_expired; then
+            _idle_render_defer "$name" loop
+            continue
+        fi
 
         # Backfill: every observed window gets an engagement-log
         # row at first sight. PR #33 anchored idle-age to the
@@ -4245,6 +4346,10 @@ list_really_idle_workers() {
         local probe_target="${window_index:-$name}"
         local pane_orphan_kinds="" pane_content_hash="" pane_bg_cpu=""
         pane_line=$(_idle_pane_state_line "$probe_target" "$name")
+        if [[ "$pane_line" == probe=deferred* ]] && _idle_render_deadline_active; then
+            _idle_render_defer "$name" "$(_idle_pane_line_field "$pane_line" probe_reason)"
+            continue
+        fi
         if [[ -z "$pane_line" ]]; then
             pane_state=unknown
             pane_reset_at=""
@@ -4272,6 +4377,7 @@ list_really_idle_workers() {
         if [[ "$pane_state" == "working-background" && "$pane_bg_cpu" =~ ^[0-9]+$ ]]; then
             local bg_grace
             bg_progress_epoch=$(_bg_progress_check "$name" "$pane_bg_cpu" "$now")
+            _idle_knob_memo MONITOR_BACKGROUND_ORPHAN_GRACE_SECONDS _bg_orphan_grace_seconds
             bg_grace=$(_bg_orphan_grace_seconds)
             if [[ "$bg_progress_epoch" =~ ^[0-9]+$ ]] \
                && (( now - bg_progress_epoch > bg_grace )); then
@@ -4334,6 +4440,7 @@ list_really_idle_workers() {
             if (( bg_oldest_start > 0 )) && (( now > bg_oldest_start )); then
                 bg_child_age=$(( now - bg_oldest_start ))
             fi
+            _idle_knob_memo MONITOR_BG_CHILDREN_GRACE_CEILING_SECONDS _bg_children_grace_ceiling_seconds
             bg_ceiling=$(_bg_children_grace_ceiling_seconds)
             if _bg_window_is_wrapped "$name"; then
                 # A wrapped worker with live children is NOT automatically an
@@ -4422,9 +4529,11 @@ list_really_idle_workers() {
                 bg_stall_start="$bg_progress_epoch"
                 [[ "$bg_stall_start" =~ ^[0-9]+$ ]] && (( bg_stall_start > 0 )) || bg_stall_start="$now"
                 bg_stall_age=$(( now - bg_stall_start ))
+                _idle_knob_memo MONITOR_BG_CHILDREN_GRACE_BASE_SECONDS _bg_children_grace_base_seconds
                 bg_base=$(_bg_children_grace_base_seconds)
                 if (( bg_stall_age >= bg_base )) || (( bg_child_age >= bg_ceiling )); then
                     bg_surface=1
+                    _idle_knob_memo MONITOR_BG_CHILDREN_BACKOFF_MULT _bg_children_backoff_mult
                     local bg_decision
                     bg_decision=$(_bg_children_decide "$name" "$now" "$bg_stall_start" "$pane_bg_shells" "$bg_oldest_start")
                     bg_child_class="${bg_decision%%$'\t'*}"
@@ -5103,6 +5212,11 @@ list_idle_transitions() {
 # functional suspension the orchestrator should resolve by scheduling
 # a resume at the named reset time.
 #
+# When the caller passes its budget (MONITOR_RENDER_BUDGET_SECONDS) and the
+# render could not afford to probe every window inside it, the line ends
+# with `| N unprobed` (your-org/nexus-code#1698): windows counted as NEITHER
+# busy NOR idle. The axis is absent when zero.
+#
 # The function ALWAYS prints exactly one line. Empty workspace prints
 # `0 busy | 0 idle | 0 retained | 0 idle-too-long | 0 pane-absent | 0 over-limit | 0 orphan-async | 0 interrupted | 0 parked-skeptic | 0 awaiting-input`.
 #
@@ -5120,6 +5234,9 @@ list_idle_transitions() {
 # stale historical rows don't inflate the first count after a
 # watcher cold-start.
 render_idle_prelude() {
+    # Clock the render deadline from ENTRY, as `_run_bounded`'s does (#1698).
+    local _rd_start
+    _idle_render_now _rd_start
     # Total workers (non-reserved) seen this cycle. Reserved windows
     # are excluded by _idle_list_worker_windows.
     local total_workers idle_set
@@ -5134,7 +5251,51 @@ render_idle_prelude() {
     # (render_idle_section) is the sole cycle-mutator of the idle-with-children
     # backoff state; a count-only pass here must not advance the edge-triggered
     # level and steal a clarification nudge (your-org/nexus-code#455 refine).
-    idle_set=$(MONITOR_IDLE_PROBE_READONLY=1 list_really_idle_workers 2>/dev/null)
+    # SWEEP REUSE (your-org/nexus-code#1698): a COUNT-only pass may serve the
+    # recorder's newest complete sweep past the pane-cache TTL, and re-probes a
+    # window only when its hook heartbeat changed activity class since it was
+    # recorded. Before this, under load the prelude re-forked pane-state.sh for
+    # every recording the (slow) recorder had let age past the TTL, serially,
+    # and blew its budget. See `_pane_cache.sh` "sweep-relative reuse".
+    #
+    # RENDER DEADLINE (your-org/nexus-code#1698, reopened): sweep reuse cut
+    # the number of forks but not their unit cost, which scales with load, so
+    # the render still timed out. Given its budget (MONITOR_RENDER_BUDGET_SECONDS,
+    # set by both compose call sites to the same value `_run_bounded` enforces),
+    # the render arms two deadlines — see "render deadline" above
+    # `_idle_pane_state_line` — and windows it could not afford are counted
+    # `unprobed`, never busy or idle. Without a budget nothing changes.
+    local _rd_budget="${MONITOR_RENDER_BUDGET_SECONDS:-}" _rd_sink="" _rd_probe_dl="" _rd_loop_dl=""
+    if [[ "$_rd_budget" =~ ^[0-9]+$ ]] && (( _rd_budget > 0 )); then
+        local _rd_tail _rd_probe_res
+        # Reserves are CHOSEN, not measured constants (per-window non-probe
+        # cost was measured at ~0.9 s at load 25 and scales with load):
+        #   tail  — after the last window: notification count + printf,
+        #           plus the gap between `_run_bounded` arming its timer and
+        #           this line. MONITOR_RENDER_TAIL_RESERVE_SECONDS, default 4.
+        #   probe — the windows still to classify after the last fork, from
+        #           cache. A quarter of the budget, at least 5 s.
+        #           MONITOR_RENDER_PROBE_RESERVE_SECONDS overrides.
+        _rd_tail="${MONITOR_RENDER_TAIL_RESERVE_SECONDS:-4}"
+        [[ "$_rd_tail" =~ ^[0-9]+$ ]] || _rd_tail=4
+        _rd_probe_res="${MONITOR_RENDER_PROBE_RESERVE_SECONDS:-$(( _rd_budget / 4 > 5 ? _rd_budget / 4 : 5 ))}"
+        [[ "$_rd_probe_res" =~ ^[0-9]+$ ]] || _rd_probe_res=5
+        _rd_loop_dl=$(( _rd_start + _rd_budget - _rd_tail ))
+        _rd_probe_dl=$(( _rd_loop_dl - _rd_probe_res ))
+        # No sink, no deferral: the render falls back to the unbounded path
+        # and the outer `_run_bounded` still kills it, labelled TIMED OUT.
+        _rd_sink=$(mktemp "${TMPDIR:-/tmp}/prelude-deferred.XXXXXX" 2>/dev/null) || { _rd_sink=""; _rd_probe_dl=""; _rd_loop_dl=""; }
+    fi
+    idle_set=$(MONITOR_IDLE_PROBE_READONLY=1 MONITOR_PANE_CACHE_SWEEP_REUSE=1 \
+        MONITOR_RENDER_PROBE_DEADLINE="$_rd_probe_dl" MONITOR_RENDER_LOOP_DEADLINE="$_rd_loop_dl" \
+        MONITOR_RENDER_DEFERRED_FILE="$_rd_sink" \
+        list_really_idle_workers 2>/dev/null)
+    local n_unprobed=0
+    if [[ -n "$_rd_sink" ]]; then
+        n_unprobed=$(awk -F'\t' '$1=="deferred" && $2!="" && !seen[$2]++ {n++} END {print n+0}' "$_rd_sink" 2>/dev/null)
+        [[ "$n_unprobed" =~ ^[0-9]+$ ]] || n_unprobed=0
+        rm -f "$_rd_sink" 2>/dev/null || true
+    fi
     local n_idle n_retained n_idle_too_long n_pane_absent n_over_limit n_orphan_async
     # `orphaned-skeptic-pending` (emit/exemption fidelity) folds into the
     # idle tally so it is excluded from the `busy` residue (like the parked
@@ -5185,7 +5346,9 @@ render_idle_prelude() {
     # spawn-grace skips and `empty`-skip windows count as busy here,
     # which matches the operator's mental model ("not idle = working").
     local n_idle_total=$(( n_idle + n_retained + n_idle_too_long + n_pane_absent + n_over_limit + n_orphan_async + n_interrupted + n_parked + n_bg_children ))
-    local n_busy=$(( total_workers - n_idle_total ))
+    # Unprobed windows are subtracted from the busy RESIDUE too: "not idle"
+    # is not "busy" when nobody looked (#1698).
+    local n_busy=$(( total_workers - n_idle_total - n_unprobed ))
     (( n_busy < 0 )) && n_busy=0
 
     # awaiting-input counter (issue #76). Rotate first, then count,
@@ -5222,8 +5385,13 @@ render_idle_prelude() {
         printf '%s' "$now" > "$stamp_path" 2>/dev/null || true
     fi
 
-    printf '%d busy | %d idle | %d retained | %d idle-too-long | %d pane-absent | %d over-limit | %d orphan-async | %d interrupted | %d parked-skeptic | %d idle-children | %d awaiting-input\n' \
+    local _rd_line
+    printf -v _rd_line '%d busy | %d idle | %d retained | %d idle-too-long | %d pane-absent | %d over-limit | %d orphan-async | %d interrupted | %d parked-skeptic | %d idle-children | %d awaiting-input' \
         "$n_busy" "$n_idle" "$n_retained" "$n_idle_too_long" "$n_pane_absent" "$n_over_limit" "$n_orphan_async" "$n_interrupted" "$n_parked" "$n_bg_children" "$n_awaiting"
+    # The `unprobed` axis appears only when non-zero, so an unloaded board's
+    # line (and its dedup canonical) is byte-identical to the pre-#1698 one.
+    (( n_unprobed > 0 )) && _rd_line+=" | ${n_unprobed} unprobed"
+    printf '%s\n' "$_rd_line"
 }
 
 # Render every currently-tracked worker window's full classification

@@ -391,6 +391,49 @@ else
 fi
 
 # ============================================================
+echo '=== K: past the budget, a PROGRESSING build is spared; a STALLED one is reaped (#1676) ==='
+# ============================================================
+# 2026-09-29 15:09:34: this reaper killed build 13776 at 1816 s (>= the 1800 s
+# budget) while it was still progressing on a load-100 node. Age alone no
+# longer reaps: the shared verdict `labsh_build_release` must also see a STALL.
+# RED on origin/dev 33a44f48 (the progressing build is reaped by age).
+if (( HAVE_FIX )); then
+    PROG=$(spawn "$WORK/uv" -c "while :; do printf x >> '$WORK/prog.bytes'; sleep 0.2; done" \
+        tool uvx --from jupyterlab jupyter-lab --port "$PORT" --no-browser)
+    STALL=$(spawn "$WORK/uv" -c 'sleep 600; :' \
+        tool uvx --from jupyterlab jupyter-lab --port "$PORT" --no-browser)
+    for _ in $(seq 1 60); do [[ -r "/proc/$STALL/cmdline" && -r "/proc/$PROG/cmdline" ]] && break; sleep 0.05; done
+    sleep 1.2                                  # both older than the 1 s budget
+    COLD_BUILD_BUDGET=1
+    export LABSH_BUILD_STALL_SECONDS=2
+    # One shared sample file per workdir ⇒ judge ONE build per pass, as in production.
+    rm -f "$WD/.jupyter/labsh.buildprogress"
+    _reap_if_stale "$PROG" "$PORT" "test" && bad "K: progressing build spared (first sight)" "reaped" \
+                                          || ok  "K: progressing build spared on first sight"
+    sleep 2.5
+    _reap_if_stale "$PROG" "$PORT" "test" && bad "K: progressing build past the budget is SPARED" "reaped by age" \
+                                          || ok  "K: progressing build past the budget is SPARED"
+    kill -0 "$PROG" 2>/dev/null && ok "K: progressing build still alive" || bad "K: progressing build still alive" "killed"
+    grep -q 'still making progress' "$WORK/log.txt" && ok "K: the log says WHY it was spared" \
+                                                   || bad "K: spare reason logged" "$(tail -1 "$WORK/log.txt")"
+
+    rm -f "$WD/.jupyter/labsh.buildprogress"
+    _reap_if_stale "$STALL" "$PORT" "test" && bad "K: stalled build not reaped on first sight" "reaped" \
+                                           || ok  "K: a quiet build is not reaped on first sight (no stall proven)"
+    sleep 2.5
+    _reap_if_stale "$STALL" "$PORT" "test" && ok  "K: a STALLED build past the budget IS reaped" \
+                                           || bad "K: stalled build reaped" "spared"
+    for _ in $(seq 1 60); do kill -0 "$STALL" 2>/dev/null || break; sleep 0.05; done
+    kill -0 "$STALL" 2>/dev/null && bad "K: stalled build actually died" "alive" || ok "K: stalled build actually died"
+    grep -q 'presumed wedged' "$WORK/log.txt" && ok "K: the log says it was reaped as WEDGED, not as old" \
+                                              || bad "K: reap reason logged" "$(tail -1 "$WORK/log.txt")"
+    unset LABSH_BUILD_STALL_SECONDS
+    COLD_BUILD_BUDGET=3600
+else
+    bad "K: progressing build past the budget is SPARED" "pre-fix: the reaper decides on age alone"
+fi
+
+# ============================================================
 echo '=== I: contract — the reaper reasons from /proc evidence, not from argv greps ==='
 # ============================================================
 # Structural, and it flips direction: FAILS on pre-fix source, PASSES after.

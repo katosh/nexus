@@ -622,14 +622,61 @@ else
     _D9_RAN=0
 fi
 
+# ============================================================================
+# F. pane-state.sh 1b — a stamp whose RECORDED reset has passed yields to a
+#    pane that is visibly mid-turn (your-org/nexus-code#1740)
+# ============================================================================
+#
+# The 2026-10-05 02:35 shape: `reset_at=2:30am` already past, a live spinner,
+# and §1b still answered over-limit from the stamp. The heartbeat here is OLDER
+# than the stamp, so the #1141 supersession arm (section A) cannot be what
+# releases it: only the new reset-passed + live-chrome arm can.
+# A_NOW = 2027-01-15 08:00 UTC. `1am_UTC` resolved from a stamp written at
+# 22:00 UTC the day before is 01:00 UTC today: PASSED. From a stamp written at
+# 01:00 today it is 01:00 tomorrow: NOT passed.
+echo '=== F. pane-state 1b: a stamp whose reset has passed yields to a live pane (#1740) ==='
+F_IDLE="$FIX_DIR/idle-empty-synthetic.ansi"
+[[ -f "$F_IDLE" ]] || { echo "needs $F_IDLE" >&2; exit 1; }
+f_stamp() {   # $1 = ts, $2 = reset_at token
+    printf '{"ts":%s,"session_id":"sess","error_type":"rate_limit","error_message":"limit","reset_at":"%s","window":"olwin","hook_event_name":"StopFailure"}\n' \
+        "$1" "$2" > "$a_stamp"
+}
+f_run() {   # $1 = fixture
+    "$PS" --fixture "$1" --window 9 --name olwin --active 0 --now "$A_NOW" \
+          --over-limit-file "$a_stamp" --heartbeat-file "$a_hb" 2>&1
+}
+F_PAST=$(( A_NOW - 36000 ))     # 22:00 UTC the previous day
+# 01:00 UTC today, ON the stated time: a PARSED `1am_UTC` resolves strictly
+# after it, to 01:00 tomorrow (not passed); the unparseable-token fallback
+# (ts + 6 h = 07:00) WOULD read as passed. So F3 also proves the token parsed.
+F_RECENT=$(( A_NOW - 25200 ))
+# F1/F2 THE DEFECT: reset passed + a busy pane ⇒ the live pane answers.
+f_stamp "$F_PAST" "1am_UTC"; a_write_hb $(( F_PAST - 60 )) "PostToolUse" "busy"
+out=$(f_run "$A_FIX")
+assert_eq "F1 reset passed + live spinner ⇒ the pane answers (busy), not the stamp" "$(a_state "$out")" "busy"
+assert_file_exists "F2 …and the stamp is NOT deleted (the Stop clear owns the file)" "$a_stamp"
+# F3 CONTROL: same busy pane, reset NOT yet passed ⇒ the stamp still wins.
+f_stamp "$F_RECENT" "1am_UTC"; a_write_hb $(( F_RECENT - 60 )) "PostToolUse" "busy"
+out=$(f_run "$A_FIX")
+assert_eq "F3 CONTROL: reset still ahead ⇒ over-limit, even with a spinner" "$(a_state "$out")" "over-limit"
+# F4 CONTROL: reset passed but the pane is IDLE ⇒ no live chrome, the stamp wins.
+f_stamp "$F_PAST" "1am_UTC"; a_write_hb $(( F_PAST - 60 )) "PostToolUse" "busy"
+out=$(f_run "$F_IDLE")
+assert_eq "F4 CONTROL: reset passed, idle pane ⇒ still over-limit (both conditions are required)" "$(a_state "$out")" "over-limit"
+# F5 CONTROL: a reset we cannot place has not passed, however old the stamp.
+f_stamp "$F_PAST" "unknown"; a_write_hb $(( F_PAST - 60 )) "PostToolUse" "busy"
+out=$(f_run "$A_FIX")
+assert_eq "F5 CONTROL: reset_at=unknown ⇒ over-limit even on a busy pane" "$(a_state "$out")" "over-limit"
+
 # ---- assertion-count guard ------------------------------------------------
 # A:  A1,A2,A3,A4,A5,A5b,A5c,A6,A7,A8,A9,A10    = 12
 # B:  B1,B2,B3,B4,B5,B6,B7                      =  7
 # C:  C0,C1,C2,C3,C4,C5                         =  6
 # D:  D1,D2,D3,D4,D5,D6,D7,D8                   =  8
 # E:  E1,E2,E3,E4                               =  4
+# F:  F1,F2,F3,F4,F5                            =  5
 # D9 runs only where a second awk exists; the budget follows it.
-EXPECTED=$(( 12 + 7 + 6 + 8 + 4 + _D9_RAN ))
+EXPECTED=$(( 12 + 7 + 6 + 8 + 4 + 5 + _D9_RAN ))
 _total=$(( PASS + FAIL ))
 if (( _total != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected.\n' "$_total" "$EXPECTED" >&2

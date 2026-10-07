@@ -67,10 +67,32 @@ export GH_CALLS="$WORK/gh-calls" GH_ISSUES="$WORK/gh-issues.tsv" PUSH_CALLS="$WO
 : > "$GH_CALLS"; : > "$PUSH_CALLS"; : > "$GH_ISSUES"
 gh_reset() { : > "$GH_CALLS"; : > "$GH_ISSUES"; rm -f "$STATE_DIR"/operator-alert/*.ghcomment 2>/dev/null; }
 
-# The push RECORDER stands in for monitor/notify.sh: same argv contract.
+# The push RECORDER stands in for monitor/notify.sh: same argv contract,
+# including `--email-status-file` (your-org/nexus-code#1653 F3). The EMAIL leg's
+# outcome is `ok` for an emergency push and `skipped` otherwise, unless
+# $EMAIL_FAILS (a file holding a count) says to FAIL the next N emergency sends
+# — each failure decrements it — or EMAIL_STATUS forces a value.
 cat > "$WORK/bin/notify-recorder" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$PUSH_CALLS"
+esf=""; pri=routine
+while (( $# > 0 )); do
+    case "$1" in
+        --email-status-file) esf="$2"; shift 2 ;;
+        --priority)          pri="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+st=skipped
+if [[ "$pri" == emergency ]]; then
+    st=ok
+    if [[ -n "${EMAIL_FAILS:-}" && -f "$EMAIL_FAILS" ]]; then
+        n=$(cat "$EMAIL_FAILS"); [[ "$n" =~ ^[0-9]+$ ]] || n=0
+        if (( n > 0 )); then st=failed; printf '%s\n' "$(( n - 1 ))" > "$EMAIL_FAILS"; fi
+    fi
+    [[ -n "${EMAIL_STATUS:-}" ]] && st="$EMAIL_STATUS"
+fi
+[[ -n "$esf" ]] && printf '%s\n' "$st" > "$esf"
 exit "${PUSH_RC:-0}"
 EOF
 chmod +x "$WORK/bin/notify-recorder"
@@ -440,6 +462,85 @@ grep -q '"event":"github-failed".*"reason":"list-failed"' "$JSONL" && pass "19 t
 assert_eq "19 no issue was created" "$(grep -c . "$GH_ISSUES")" 0
 GH_FAIL=1 _operator_alert clear ghdown-key "x" >/dev/null 2>&1
 
+echo "=== 27. REMINDERS BACK OFF on durable state; GitHub reminder comments are CAPPED (your-org/nexus-code#1713) ==="
+# A fake clock for this section only (a function: the module calls `date +%s`).
+date() { if [[ "${1:-}" == "+%s" && "${FAKE_NOW:-}" =~ ^[0-9]+$ ]]; then printf '%s\n' "$FAKE_NOW"; else command date "$@"; fi; }
+B27=1790520974
+reminders_of() {   # <key> → offsets (from B27) of the key's `raise` rows, one per line
+    grep "\"event\":\"raise\".*\"key\":\"$1\"" "$JSONL" | sed -n 's/.*"ts":\([0-9]*\),.*/\1/p' | awk -v b="$B27" '{print $1 - b}'
+}
+gaps_of() { awk 'NR>1{printf "%s%d", (n++ ? " " : ""), $1 - p} {p=$1} END{print ""}'; }
+unset MONITOR_OPERATOR_ALERT_REMINDER_SECONDS MONITOR_OPERATOR_ALERT_REMINDER_MAX_SECONDS
+export MONITOR_OPERATOR_ALERT_PUSH_ENABLED=false MONITOR_OPERATOR_ALERT_GITHUB_ENABLED=false
+# (a) the schedule over 50 h, a WATCHER RESTART at +10 h and a FLAP at +20 h
+for (( t = 0; t <= 50 * 3600; t += 60 )); do
+    export FAKE_NOW=$(( B27 + t ))
+    if (( t == 10 * 3600 )); then   # restart: the in-process and $TMPDIR memos die
+        _OPERATOR_ALERT_MEMO=(); _OPERATOR_ALERT_COMMENT_MEMO=(); rm -f "$TMPDIR"/.nexus-operator-alert.*bo-key* 2>/dev/null
+    fi
+    if (( t == 20 * 3600 )); then
+        export MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS=300
+        _operator_alert clear bo-key "dip"; continue      # starts the hold-down only
+    fi
+    _operator_alert due bo-key && _operator_alert raise bo-key critical "RUN /login"
+done
+export MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS=0
+assert_eq "27a announcements at +0, +1, +3, +7, +15, +31 h — the backoff, through a restart and a flap" \
+    "$(reminders_of bo-key | tr '\n' ' ')" "0 3600 10800 25200 54000 111600 "
+assert_eq "27a …gaps double from 1 h and stop at the 24 h cap's predecessor" "$(reminders_of bo-key | gaps_of)" "3600 7200 14400 28800 57600"
+grep -q '"key":"bo-key".*"next_reminder_s":"86400"' "$JSONL" && pass "27a the 6th announcement records the next reminder at the 24 h cap" \
+    || fail "27a no next_reminder_s=86400 row: $(grep bo-key "$JSONL" | tail -n2)"
+grep -q 'REMINDER #2 key=bo-key.*next reminder in 7200s (#1713 backoff)' "$LOGCAP" && pass "27a the watcher log names the next delay" \
+    || fail "27a log line lacks the next delay: $(grep -m3 'bo-key' "$LOGCAP")"
+# (b) the clear RESETS the schedule: a new incident starts from 1 h again
+export FAKE_NOW=$(( B27 + 50 * 3600 + 60 )); _operator_alert clear bo-key "the operator ran /login"
+: > "$JSONL.27"; cp "$JSONL" "$JSONL.27"
+for (( t = 60 * 3600; t <= 64 * 3600; t += 60 )); do   # > REARM later: a NEW incident
+    export FAKE_NOW=$(( B27 + t )); _operator_alert due bo-key && _operator_alert raise bo-key critical "RUN /login"
+done
+assert_eq "27b after a clear the next incident reminds at +1 h and +3 h again (the backoff resets)" \
+    "$(reminders_of bo-key | awk '$1 >= 60*3600' | tr '\n' ' ')" "216000 219600 226800 "
+export FAKE_NOW=$(( B27 + 65 * 3600 )); _operator_alert clear bo-key "x" >/dev/null 2>&1
+# (c) a MAX below the base disables the backoff (the base wins) — the documented off switch
+export MONITOR_OPERATOR_ALERT_REMINDER_MAX_SECONDS=1
+assert_eq "27c MAX < BASE: the delay after the 5th announcement is the base" "$(_operator_alert_reminder_after 5)" 3600
+unset MONITOR_OPERATOR_ALERT_REMINDER_MAX_SECONDS
+assert_eq "27c default: the delay after the 9th announcement is the 24 h cap" "$(_operator_alert_reminder_after 9)" 86400
+assert_eq "27c an unreadable count is the base (the memo-only degradation)" "$(_operator_alert_reminder_after '')" 3600
+# (d) the GitHub comment cap: 3 reminder comments per incident, the 3rd says so
+export MONITOR_OPERATOR_ALERT_GITHUB_ENABLED=true MONITOR_OPERATOR_ALERT_MAX_REMINDER_COMMENTS=3
+export MONITOR_OPERATOR_ALERT_REMINDER_SECONDS=1 MONITOR_OPERATOR_ALERT_REMINDER_MAX_SECONDS=1   # no backoff: isolate the cap
+gh_reset
+for (( t = 0; t <= 14; t += 2 )); do   # began + 7 reminders
+    export FAKE_NOW=$(( B27 + 70 * 3600 + t )); _operator_alert raise ghcap-key critical "RUN /login"
+done
+assert_eq "27d 7 reminders posted exactly 3 comments" "$(grep -c -- '/issues/41/comments' "$GH_CALLS")" 3
+assert_eq "27d …exactly one of them is the final notice" "$(grep -c 'This is the last reminder comment for this incident (3 of 3)' "$GH_CALLS")" 1
+assert_eq "27d …and the other 4 are recorded as exhausted, not silently dropped" "$(jsonl_count github-reminders-exhausted)" 4
+assert_eq "27d the bell still rang for every reminder (the cap is on GitHub comments only)" \
+    "$(grep -c '"event":"raise".*"key":"ghcap-key"' "$JSONL")" 8
+export FAKE_NOW=$(( B27 + 70 * 3600 + 20 )); _operator_alert clear ghcap-key "done"
+assert_eq "27d the clear still CLOSES the issue past the cap" "$(grep -c -- '-X PATCH /repos/acme/nexus-fixture/issues/41 -f state=closed' "$GH_CALLS")" 1
+[[ ! -e "$STATE_DIR/operator-alert/ghcap-key.ghreminders" ]] && pass "27d the clear removes the per-incident counter" || fail "27d .ghreminders survived the clear"
+# a NEW incident on the same key starts its own budget (keyed on the incident's first epoch)
+gh_reset
+for (( t = 0; t <= 2; t += 2 )); do
+    export FAKE_NOW=$(( B27 + 80 * 3600 + t )); _operator_alert raise ghcap-key critical "RUN /login"
+done
+assert_eq "27d a new incident's first reminder comments again" "$(grep -c -- '/comments -f body=@operator-fixture still standing' "$GH_CALLS")" 1
+export FAKE_NOW=$(( B27 + 80 * 3600 + 4 )); _operator_alert clear ghcap-key "x" >/dev/null 2>&1
+# a STALE counter from another incident (same key, different first) is ignored, not obeyed
+mkdir -p "$STATE_DIR/operator-alert"; printf '123\t99\n' > "$STATE_DIR/operator-alert/stale-key.ghreminders"
+gh_reset
+export FAKE_NOW=$(( B27 + 90 * 3600 )); _operator_alert_github_leg stale-key critical began "m" "$FAKE_NOW"
+export FAKE_NOW=$(( B27 + 90 * 3600 + 2 )); _operator_alert_github_leg stale-key critical continues "m" "$(( B27 + 90 * 3600 ))"
+assert_eq "27d a counter for a DIFFERENT incident does not silence this one" "$(grep -c -- '/comments -f body=@operator-fixture still standing' "$GH_CALLS")" 1
+rm -f "$STATE_DIR/operator-alert/stale-key".* 2>/dev/null
+unset MONITOR_OPERATOR_ALERT_MAX_REMINDER_COMMENTS MONITOR_OPERATOR_ALERT_REMINDER_SECONDS MONITOR_OPERATOR_ALERT_REMINDER_MAX_SECONDS
+unset MONITOR_OPERATOR_ALERT_PUSH_ENABLED MONITOR_OPERATOR_ALERT_GITHUB_ENABLED FAKE_NOW
+unset -f date
+gh_reset
+
 echo "=== 20. the dedup state survives the DISK IT LIMITS: read-only state dir (skeptic oplivesk F2) ==="
 # Measured by the skeptic: RO state dir, 20 cycles → 20 bells + 20 emergency pushes.
 : > "$BELLCAP"; : > "$PUSH_CALLS"; gh_reset
@@ -627,6 +728,367 @@ else
     STATE_DIR="$RO3" TMPDIR="$ROT" _operator_alert_memo_clear g4-main-key
 fi
 chmod 700 "$RO3" "$ROT" 2>/dev/null || true
+
+echo "=== 25. ONE EMAIL PER INCIDENT, AND IT ARRIVES: the whole of 2026-09-27, replayed on a fake clock ==="
+# your-org/nexus-code#1653. On the day: TWO emails EVERY HOUR during a login
+# expiry (`auth-expired` + `service-health:nexus-remote-ssh`, each re-sent at
+# `emergency` on the 3600 s reminder), then two more for FALSE re-detections
+# (10:22, 12:00 — the detector matched the orchestrator's own text about the
+# outage). notify.sh emails on `emergency` and on nothing else, so an EMAIL
+# ATTEMPT here is a recorded push carrying `--priority emergency`. The clock is
+# a `date` shim (FAKE_NOW); both keys run through their PRODUCTION call shapes:
+# `due && raise` / `clear` for the auth hold, the real `_sh_operator_alert_step`
+# for service-health, the real route codes.
+#
+# MUTATION PREDICTIONS, written before the run (your-org/nexus-code#1510):
+#   M8  `_operator_alert.sh` push leg: `began|escalated|confirmed|event)` →
+#       `*|escalated|confirmed|event)` (every reminder emails again) → FLIPS
+#       25a "whole day", 25b "across the restart", 25e "reminder push is
+#       routine", 25f "escalation emails ONCE", 25g "co-occurrence"; must NOT
+#       flip 25c "new incident past REARM emails at once", 25h "delivered stops".
+#   M9  `_operator_alert.sh` raise: the REARM test forced false (no `resumed`)
+#       → FLIPS 25a "whole day" and 25c2 "deferred, not immediate"; must NOT
+#       flip 25c "past REARM", 25h.
+#   M10 `_operator_alert.sh` mail_result: `ok)` arm never matches → FLIPS 25h
+#       "stops after delivery" and 25h "delivered recorded"; must NOT flip 25c.
+#   M11 `_service_health.sh`: `auth-expired|auth-hold)` → `*)` (the old
+#       keyed-on-standing downgrade) → FLIPS 25g "over-limit during auth is
+#       critical"; must NOT flip 25a "whole day".
+REAL_DATE=$(command -v date)
+FAKECLK="$WORK/bin-fakeclock"; mkdir -p "$FAKECLK"
+cat > "$FAKECLK/date" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "+%s" && "\${FAKE_NOW:-}" =~ ^[0-9]+\$ ]]; then printf '%s\n' "\$FAKE_NOW"; exit 0; fi
+exec "$REAL_DATE" "\$@"
+EOF
+chmod +x "$FAKECLK/date"
+# [key] — every email ATTEMPT, or only <key>'s (so a case tests ONE axis)
+emails() { local n; n=$(grep -c -- "operator-alert: ${1:-}.*--priority emergency" "$PUSH_CALLS" 2>/dev/null); [[ "$n" =~ ^[0-9]+$ ]] || n=0; printf '%s' "$n"; }
+E25_KEYS=(auth-expired service-health:nexus-remote-ssh e25-direct)
+e25_reset() {
+    : > "$PUSH_CALLS"; : > "$BELLCAP"; gh_reset
+    local k; for k in "${E25_KEYS[@]}"; do
+        rm -f "$STATE_DIR/operator-alert/$k".{stamp,sev,mail,cleared,chain,ghreminders} 2>/dev/null
+        _operator_alert_memo_clear "$k"
+    done
+    rm -f "$EMAIL_FAILS"; unset EMAIL_STATUS
+}
+export EMAIL_FAILS="$WORK/email-fails"
+# shellcheck source=_service_health.sh
+source "$_test_dir/_service_health.sh" || th_abort "could not source _service_health.sh"
+E25_ROUTE=""      # `<code>\t<reason>`, empty = route open — the real main.sh codes
+_e25_route() { [[ -n "$E25_ROUTE" ]] || return 1; printf '%s' "$E25_ROUTE"; return 0; }
+_SERVICE_HEALTH_ROUTE_BLOCKED_FN=_e25_route
+_SERVICE_HEALTH_OPERATOR_ALERT_FN=_operator_alert
+ROUTE_AUTH=$'auth-expired\tthe orchestrator is LOGGED OUT (auth=expired) and cannot take a turn'
+ROUTE_OVER=$'over-limit\tthe orchestrator is OVER-LIMIT and emits are held'
+auth_tick() {    # <present 0|1> — the auth hold's production calls
+    if (( $1 )); then _operator_alert due auth-expired && _operator_alert raise auth-expired critical "RUN /login IN THE ORCHESTRATOR WINDOW"
+    else [[ -f "$STATE_DIR/operator-alert/auth-expired.stamp" ]] && _operator_alert clear auth-expired "the orchestrator pane no longer reports a logged-out session"; fi
+    return 0
+}
+svc_tick() { _sh_operator_alert_step nexus-remote-ssh emit-only emit-only 2026-09-27T07:56:42-07:00 "policy emit-only"; }
+E25_T0=1790520974   # 2026-09-27T07:56:14-07:00
+at() { printf '%s' $(( E25_T0 + $1 )); }   # seconds after 07:56:14
+unset MONITOR_OPERATOR_ALERT_REMINDER_SECONDS
+OLDPATH=$PATH; export PATH="$FAKECLK:$PATH"
+# In THIS process the clock is a FUNCTION: the module calls `date +%s` on every
+# tick, and a forked shim per call made §25 alone outlast the band's 600 s
+# ceiling under load. Child processes (the restart cases) still get the shim.
+date() { if [[ "${1:-}" == "+%s" && "${FAKE_NOW:-}" =~ ^[0-9]+$ ]]; then printf '%s\n' "$FAKE_NOW"; else command date "$@"; fi; }
+export MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS=300   # the production value, for this section
+
+echo "--- 25a. the WHOLE DAY, 07:56 → 12:20, incl. the 10:22 and 12:00 false re-detections: ONE email (60 s ticks) ---"
+e25_reset
+# Presence windows from operator-alerts.jsonl / watcher.log, as offsets from 07:56:14:
+#   auth present 08:01:14–10:13:40 (+300..+7946), 10:22:38–10:24:11 (+8784..+8877),
+#   12:00:00–12:03:05 (+14626..+14811); service DOWN until 11:56 (+14386).
+auth_present() { local o=$1; (( (o>=300 && o<7946) || (o>=8784 && o<8877) || (o>=14626 && o<14811) )); }
+for (( o = 0; o <= 15360; o += 60 )); do
+    FAKE_NOW=$(at "$o"); export FAKE_NOW
+    if auth_present "$o"; then auth_tick 1; E25_ROUTE=$ROUTE_AUTH; else auth_tick 0; E25_ROUTE=""; fi
+    if (( o < 14386 )); then svc_tick
+    else _operator_alert standing service-health:nexus-remote-ssh && _operator_alert clear service-health:nexus-remote-ssh "recovered"; fi
+done
+assert_eq "25a exactly ONE email attempt for the whole day (was 8)" "$(emails)" 1
+grep -q -- 'operator-alert: auth-expired (began).*--priority emergency' "$PUSH_CALLS" \
+    && pass "25a …and it is the 08:01 auth-expired ANNOUNCEMENT" || fail "25a the one email is not auth began: $(grep -- '--priority emergency' "$PUSH_CALLS")"
+assert_eq "25a both re-detections RESUMED the incident (no new email)" "$(grep -c '"key":"auth-expired","severity":"critical","kind":"resumed"' "$JSONL")" 2
+assert_eq "25a …and neither was ever CONFIRMED (both cleared inside the confirmation window)" \
+    "$(grep -c '"key":"auth-expired","severity":"critical","kind":"confirmed"' "$JSONL")" 0
+assert_eq "25a the auth key still REMINDED, on the #1713 backoff (began + 09:01; the next is owed at 11:01, after the 10:13 clear → 2 auth pushes)" \
+    "$(grep -c -- 'operator-alert: auth-expired (\(began\|continues\))' "$PUSH_CALLS")" 2
+grep -q -- 'service-health:nexus-remote-ssh (began).*--priority routine' "$PUSH_CALLS" \
+    && pass "25a service-health rode as WARNING (route code auth-expired): routine, no email" || fail "25a service-health push: $(grep -m2 service-health "$PUSH_CALLS")"
+grep -q 'rides on\|already pages for it' "$JSONL" && pass "25a …and its text says what it rides on" || fail "25a no rides-on clause"
+grep -q '"event":"mail-delivered","key":"auth-expired"' "$JSONL" && pass "25a the one email is recorded DELIVERED" || fail "25a no mail-delivered row"
+# G1: the two false re-detections ACCUMULATE (93 s + 185 s = 278 s on the day;
+# 60 + 180 = 240 s at this replay's 60 s tick granularity) and stay under 600 s.
+acc=$(grep '"event":"chain-accumulated","key":"auth-expired"' "$JSONL" | tail -n1 | sed -n 's/.*"acc_s":"\([0-9]*\)".*/\1/p')
+assert_eq "25a the re-detections' CUMULATIVE standing time is 240 s (60 s ticks) — under REARM_CONFIRM, so no email" "$acc" 240
+
+echo "--- 25b. the watcher RESTARTS mid-outage: still ONE email ---"
+e25_reset; k25b=$(count_lines "$JSONL")
+for (( m = 0; m <= 60; m++ )); do FAKE_NOW=$(at $(( 300 + m * 60 ))); export FAKE_NOW; auth_tick 1; done
+assert_eq "25b CONTROL: one auth email before the restart" "$(emails auth-expired)" 1
+# A new process, as a revived watcher is: no in-process memo, and the $TMPDIR
+# memo REMOVED so the durable state in the state dir is the only record.
+rm -f "$TMPDIR"/.nexus-operator-alert.* 2>/dev/null
+# Through +11 100 s: the backoff owes reminder #2 at began + 3600 + 7200
+# (your-org/nexus-code#1713). A restart that FORGOT the schedule would remind
+# again at +7 500, one base period after the last.
+for (( m = 61; m <= 187; m++ )); do
+    FAKE_NOW=$(at $(( 300 + m * 60 ))) bash -c '
+        _OPERATOR_ALERT_LOG_FN=: _OPERATOR_ALERT_BELL_FN=:
+        source "$1" || exit 97
+        if _operator_alert due auth-expired; then _operator_alert raise auth-expired critical "RUN /login (after restart)"; fi' \
+        _ "$MODULE" || fail "25b the restarted process failed at minute $m"
+done
+assert_eq "25b ONE auth email across the restart (the delivered state is durable)" "$(emails auth-expired)" 1
+assert_eq "25b …while the restarted process still reminded (continues, routine)" \
+    "$(grep -c -- 'operator-alert: auth-expired (continues).*--priority routine' "$PUSH_CALLS")" 2
+assert_eq "25b …and the BACKOFF survived the restart: reminders at +3900 and +11100, none at +7500 (the schedule is durable state, #1713)" \
+    "$(tail -n +$(( k25b + 1 )) "$JSONL" | grep '"event":"raise","key":"auth-expired".*"kind":"continues"' | sed -n 's/^{"ts":\([0-9]*\),.*/\1/p' | awk -v b="$E25_T0" '{printf "%s%d", (n++ ? " " : ""), $1 - b} END{print ""}')" "3900 11100"
+
+echo "--- 25c. resolved, then a NEW incident PAST REARM: a new email on its FIRST raise ---"
+e25_reset
+FAKE_NOW=$(at 0); export FAKE_NOW; auth_tick 1
+FAKE_NOW=$(at 100); auth_tick 0; FAKE_NOW=$(at 400); auth_tick 0      # clear finalises at +400
+assert_eq "25c CONTROL: one auth email for the first incident" "$(emails auth-expired)" 1
+grep -q -- 'auth-expired (clear).*--priority routine' "$PUSH_CALLS" && pass "25c the RESOLVED notice is not an email" || fail "25c clear push: $(tail -n1 "$PUSH_CALLS")"
+FAKE_NOW=$(at $(( 400 + 7200 + 1 ))); auth_tick 1
+assert_eq "25c past REARM the new incident emailed on its FIRST raise (no delay)" "$(emails auth-expired)" 2
+
+echo "--- 25c2. a GENUINE re-occurrence inside REARM is deferred, not dropped — and rate-capped at 1/h ---"
+e25_reset
+FAKE_NOW=$(at 0); export FAKE_NOW; auth_tick 1                         # began: email at +0
+FAKE_NOW=$(at 100); auth_tick 0; FAKE_NOW=$(at 400); auth_tick 0      # cleared at +400
+FAKE_NOW=$(at 600); auth_tick 1                                       # back 200 s later
+assert_eq "25c2 the re-raise inside REARM is deferred, not immediate" "$(emails auth-expired)" 1
+k0=$(count_lines "$JSONL")
+for (( o = 630; o <= 3660; o += 30 )); do FAKE_NOW=$(at "$o"); auth_tick 1; done   # stands continuously
+assert_eq "25c2 …and STILL STANDING it emails (once)" "$(emails auth-expired)" 2
+conf=$(tail -n +$(( k0 + 1 )) "$JSONL" | grep '"key":"auth-expired","severity":"critical","kind":"confirmed"' | sed -n 's/^{"ts":\([0-9]*\),.*/\1/p')
+assert_eq "25c2 …at +3600 s: 600 s of standing would allow +1200, but SAFETY caps a key at 1 email per 3600 s after its +0 email" "$(( ${conf:-0} - E25_T0 ))" 3600
+grep -q -- 'operator-alert: auth-expired (confirmed).*--priority emergency' "$PUSH_CALLS" && pass "25c2 …as a CONFIRMED announcement" || fail "25c2 no confirmed push"
+for (( o = 3720; o <= 6000; o += 60 )); do FAKE_NOW=$(at "$o"); auth_tick 1; done
+assert_eq "25c2 …and never again while it stands" "$(emails auth-expired)" 2
+
+echo "--- 25l. H1: a GENUINE third outage after a CONFIRMED re-expiry still emails (the skeptic's third rig) ---"
+# expiry +0 (email), /login +60, re-expiry +90 (confirmed email at +100), /login
+# +150, re-expiry +180 standing 3.7 h. Round 3's latch sent 0 for the third.
+e25_reset
+k0=$(count_lines "$JSONL")
+for (( m = 0; m <= 250; m++ )); do    # the third outage's +190 email and an hour past it
+    FAKE_NOW=$(at $(( m * 60 ))); export FAKE_NOW
+    if (( m < 60 || (m >= 90 && m < 150) || m >= 180 )); then auth_tick 1; else auth_tick 0; fi
+done
+assert_eq "25l three outages, three emails" "$(emails auth-expired)" 3
+got=$(tail -n +$(( k0 + 1 )) "$JSONL" | grep -E '"key":"auth-expired","severity":"critical","kind":"(began|confirmed)"' | sed -n 's/^{"ts":\([0-9]*\),.*/\1/p' | while read -r t; do printf '+%d ' $(( (t - E25_T0) / 60 )); done)
+assert_eq "25l …at +0, +100 (cumulative 600 s) and +190 (600 s CONTINUOUS after the latch; the cap +160 does not bind)" "$got" "+0 +100 +190 "
+
+echo "--- 25d. two callers (two crashed workers' detections) raising one cause: ONE email ---"
+e25_reset
+FAKE_NOW=$(at 0); export FAKE_NOW
+for who in w1 w2; do
+    bash -c '_OPERATOR_ALERT_LOG_FN=: _OPERATOR_ALERT_BELL_FN=:; source "$1" || exit 97
+        if _operator_alert due auth-expired; then _operator_alert raise auth-expired critical "turn crashed on auth in $2"; fi' \
+        _ "$MODULE" "$who" || fail "25d caller $who failed"
+done
+assert_eq "25d two sequential callers → ONE email" "$(emails)" 1
+
+echo "--- 25e. the reminder push itself, direct ---"
+e25_reset
+FAKE_NOW=$(at 0); _operator_alert raise e25-direct critical "m"
+FAKE_NOW=$(at 3600); _operator_alert raise e25-direct critical "m"
+assert_eq "25e CONTROL: two pushes (announce + reminder)" "$(count_lines "$PUSH_CALLS")" 2
+grep -q -- 'e25-direct (continues).*--priority routine' "$PUSH_CALLS" \
+    && pass "25e the reminder push is routine (no email)" || fail "25e reminder push: $(tail -n1 "$PUSH_CALLS")"
+
+echo "--- 25f. F1: a service key begun as WARNING, then blocked by an INDEPENDENT cause, ESCALATES and emails ONCE ---"
+# The skeptic's `frozen` rig: auth out 30 min, /login, then the route blocked by
+# OVER-LIMIT for 3.5 h with the service still down. Base emailed the service 5x
+# (hourly); the first cut of this fix emailed it 0x.
+e25_reset
+for (( o = 0; o <= 6000; o += 60 )); do    # to +100 min: the escalation (+30) and one full reminder period past it
+    FAKE_NOW=$(at "$o"); export FAKE_NOW
+    if (( o < 1800 )); then auth_tick 1; E25_ROUTE=$ROUTE_AUTH; else auth_tick 0; E25_ROUTE=$ROUTE_OVER; fi
+    svc_tick
+done
+assert_eq "25f CONTROL: the service began as WARNING (routine)" "$(grep -c -- 'service-health:nexus-remote-ssh (began).*--priority routine' "$PUSH_CALLS")" 1
+assert_eq "25f the escalation to critical emails ONCE (not 0, not hourly)" "$(emails service-health:nexus-remote-ssh)" 1
+grep -q -- 'service-health:nexus-remote-ssh (escalated).*--priority emergency' "$PUSH_CALLS" && pass "25f …as an ESCALATED announcement" || fail "25f no escalated push"
+# G2: WHEN, not only whether. The route turns over-limit on the +1800 tick; the
+# escalation is due IMMEDIATELY (`due <key> critical`), never at the next reminder.
+esc_ts=$(grep '"key":"service-health:nexus-remote-ssh","severity":"critical","kind":"escalated"' "$JSONL" | sed -n 's/^{"ts":\([0-9]*\),.*/\1/p')
+assert_eq "25f the escalation fired ON the first over-limit tick (+1800 s), not up to a reminder later" "$(( ${esc_ts:-0} - E25_T0 ))" 1800
+assert_eq "25f the auth key emailed once too (its own cause)" "$(emails auth-expired)" 1
+
+echo "--- 25g. F2: OVER-LIMIT while auth is ALSO standing is an independent cause — critical, emails ---"
+e25_reset
+for (( o = 0; o <= 5400; o += 60 )); do    # 90 min: past one reminder, so "once" means once
+    FAKE_NOW=$(at "$o"); export FAKE_NOW; auth_tick 1; E25_ROUTE=$ROUTE_OVER; svc_tick
+done
+assert_eq "25g over-limit during auth: the service is CRITICAL and emails once" "$(emails service-health:nexus-remote-ssh)" 1
+assert_eq "25g CONTROL: auth emailed once for its own cause" "$(emails auth-expired)" 1
+
+echo "--- 25k. G1: a GENUINE outage whose detection FLICKERS still emails — within one tick of 600 s CUMULATIVE standing ---"
+# The skeptic's `flicker` rig: auth out 0–60 min, clear, then a genuine outage
+# whose detection drops 6 min in every 14 (8 on, 6 off; each gap > the 300 s
+# hold-down, so every episode finalises a clear and RESUMES). Round 2 sent 0
+# emails in 3 h. THE BOUND: a resumed chain emails within one tick of its
+# cumulative standing reaching REARM_CONFIRM (600 s). Here: episode 1 (+70..+78)
+# stands 480 s; episode 2 begins at +84 min and needs 120 s more → +86 min.
+e25_reset
+k0=$(count_lines "$JSONL")          # count only rows THIS case writes: the JSONL is suite-wide
+for (( m = 0; m <= 180; m++ )); do    # 3 h: the +86 confirm and 94 min of flicker after it
+    FAKE_NOW=$(at $(( m * 60 ))); export FAKE_NOW
+    if (( m < 60 )); then auth_tick 1
+    elif (( m < 70 )); then auth_tick 0
+    elif (( (m - 70) % 14 < 8 )); then auth_tick 1
+    else auth_tick 0; fi
+done
+assert_eq "25k the flickering outage emails (began + ONE confirmed; round 2 sent 0 for the flicker)" "$(emails auth-expired)" 2
+conf_ts=$(tail -n +$(( k0 + 1 )) "$JSONL" | grep '"key":"auth-expired","severity":"critical","kind":"confirmed"' | sed -n 's/^{"ts":\([0-9]*\),.*/\1/p')
+assert_eq "25k …CONFIRMED at +86 min: 480 s + 120 s of cumulative standing, to the tick" "$(( (${conf_ts:-0} - E25_T0) / 60 ))" 86
+assert_eq "25k …and the chain, having emailed, sends nothing more in the remaining 94 min" \
+    "$(tail -n +$(( k0 + 1 )) "$JSONL" | grep -c '"key":"auth-expired","severity":"critical","kind":"confirmed"')" 1
+
+echo "--- 25h. F3: a FAILED first email is retried, email-only, until it lands — then stops ---"
+e25_reset
+printf '2\n' > "$EMAIL_FAILS"      # the first TWO email sends fail
+for (( o = 0; o <= 10800; o += 60 )); do FAKE_NOW=$(at "$o"); export FAKE_NOW; auth_tick 1; done
+assert_eq "25h three email attempts: the failed began, one failed retry, the retry that lands" "$(emails auth-expired)" 3
+assert_eq "25h the retries were EMAIL-ONLY (no re-rung emergency push)" "$(grep -c -- 'auth-expired (mail-retry).*--email-only' "$PUSH_CALLS")" 2
+grep -q '"event":"mail-delivered","key":"auth-expired","attempts":"3"' "$JSONL" && pass "25h delivered recorded, on attempt 3" || fail "25h no mail-delivered attempt 3: $(grep mail- "$JSONL" | tail -3)"
+assert_eq "25h …and it STOPS after delivery (still 3 attempts at +3 h)" "$(emails auth-expired)" 3
+
+echo "--- 25i. F3 durability: an UNDELIVERED email survives a watcher restart and is retried by the new process ---"
+e25_reset
+printf '1\n' > "$EMAIL_FAILS"
+FAKE_NOW=$(at 0); export FAKE_NOW; auth_tick 1                       # began: its email FAILS
+rm -f "$TMPDIR"/.nexus-operator-alert.* 2>/dev/null
+FAKE_NOW=$(at 400) bash -c '_OPERATOR_ALERT_LOG_FN=: _OPERATOR_ALERT_BELL_FN=:; source "$1" || exit 97
+    if _operator_alert due auth-expired; then _operator_alert raise auth-expired critical "RUN /login"; fi' _ "$MODULE" \
+    || fail "25i restarted process failed"
+assert_eq "25i the restarted process RETRIED the undelivered email" "$(grep -c -- 'auth-expired (mail-retry).*--email-only' "$PUSH_CALLS")" 1
+
+echo "--- 25j. an UNCONFIGURED mailer is terminal: recorded, not retried ---"
+e25_reset
+export EMAIL_STATUS=unconfigured
+for (( o = 0; o <= 7200; o += 60 )); do FAKE_NOW=$(at "$o"); export FAKE_NOW; auth_tick 1; done
+unset EMAIL_STATUS
+assert_eq "25j one attempt, no retries" "$(emails auth-expired)" 1
+grep -q '"event":"mail-unconfigured","key":"auth-expired"' "$JSONL" && pass "25j …recorded as mail-unconfigured" || fail "25j not recorded"
+
+echo "--- 25m. a mail-POLICY refusal is terminal too, and is recorded AS A REFUSAL (#1663 R3) ---"
+e25_reset
+# The JSONL is shared with 25j above, which DID record mail-unconfigured for
+# this key: count before and after rather than grep the whole file.
+_unc_before=$(grep -c '"event":"mail-unconfigured","key":"auth-expired"' "$JSONL")
+export EMAIL_STATUS=refused
+for (( o = 0; o <= 7200; o += 60 )); do FAKE_NOW=$(at "$o"); export FAKE_NOW; auth_tick 1; done
+unset EMAIL_STATUS
+assert_eq "25m one attempt, no retries" "$(emails auth-expired)" 1
+grep -q '"event":"mail-refused","key":"auth-expired"' "$JSONL" && pass "25m …recorded as mail-refused" || fail "25m not recorded as mail-refused"
+assert_eq "25m …and NOT as mail-unconfigured (no new such record)" \
+    "$(grep -c '"event":"mail-unconfigured","key":"auth-expired"' "$JSONL")" "$_unc_before"
+
+export PATH=$OLDPATH; unset FAKE_NOW; unset -f date
+export MONITOR_OPERATOR_ALERT_CLEAR_HOLDDOWN_SECONDS=0
+_SERVICE_HEALTH_OPERATOR_ALERT_FN=_sh_operator_alert_noop
+_SERVICE_HEALTH_ROUTE_BLOCKED_FN=_sh_route_blocked_noop
+e25_reset
+
+echo "=== 26. notify.sh reports the EMAIL leg on its own (#1653 F3) — hermetic: stub config, curl stub, refused SMTP ==="
+# The exit code folds every backend together, so "the email arrived" must be
+# read from --email-status-file. The REAL notify.sh, copied beside a stub
+# config/load.sh (so no operator address or relay is ever read) and run with a
+# `curl` stub first on PATH and an SMTP host of 127.0.0.1:1 (connection refused).
+NT="$WORK/notify-tree"; mkdir -p "$NT/monitor" "$NT/config" "$NT/bin"
+cp "$_repo_root/monitor/notify.sh" "$NT/monitor/notify.sh"
+# THE MAIL POLICY (your-org/nexus-code#1663) reads the operator from the
+# PRIMARY nexus's OWN config, resolved by monitor/_nexus-root.sh: the fixture
+# carries that resolver and a config/nexus.yml of its own, and every run below
+# UNSETS NEXUS_ROOT and NEXUS_CONFIG. Without that, a config-less fixture would
+# defer (the one-tree rule) to the inherited NEXUS_ROOT — the operator's real
+# primary and its real address.
+cp "$_repo_root/monitor/_nexus-root.sh" "$NT/monitor/_nexus-root.sh"
+: > "$NT/config/nexus.yml"
+cat > "$NT/config/load.sh" <<'EOF'
+#!/usr/bin/env bash
+# fixture config: answers only from NT_CFG_* env, else the default ($2)
+case "$1" in
+    notifications.email.address)   # the example config answers its placeholder
+                                   case "${NEXUS_CONFIG:-}" in
+                                       *nexus.example.yml) printf '%s\n' you@your-institution.edu ;;
+                                       *) printf '%s\n' "${NT_CFG_ADDR-}" ;;
+                                   esac ;;
+    notifications.email.smtp_host) printf '%s\n' "${NT_CFG_HOST-}" ;;
+    notifications.email.smtp_port) printf '%s\n' "${NT_CFG_PORT:-1}" ;;
+    *) printf '%s\n' "${2:-}" ;;
+esac
+EOF
+chmod +x "$NT/config/load.sh"
+cat > "$NT/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf 'curl %s\n' "$*" >> "$NT_CURL_CALLS"
+printf '200'
+EOF
+chmod +x "$NT/bin/curl"
+export NT_CURL_CALLS="$WORK/nt-curl-calls"; : > "$NT_CURL_CALLS"
+: > "$NT/push.key"; : > "$NT/push.app"; chmod 600 "$NT/push.key" "$NT/push.app"
+printf 'u\n' > "$NT/push.key"; printf 'a\n' > "$NT/push.app"
+nt() {   # run the copied notify.sh hermetically; echo "rc status"
+    local esf="$WORK/nt-es.$RANDOM"; rm -f "$esf"
+    ( unset NEXUS_EMAIL_TO NEXUS_SMTP_HOST NEXUS_SMTP_PORT NEXUS_ROOT NEXUS_CONFIG
+      PATH="$NT/bin:$PATH" NEXUS_PUSHOVER_USER_KEY_FILE="$NT/push.key" NEXUS_PUSHOVER_APP_TOKEN_FILE="$NT/push.app" \
+      NEXUS_NOTIFY_TOKEN="$NT/no-ntfy" bash "$NT/monitor/notify.sh" T M "$@" --email-status-file "$esf" --quiet )
+    local rc=$?
+    printf '%s %s' "$rc" "$(cat "$esf" 2>/dev/null || echo MISSING)"
+}
+# Sanity: the fixture must NOT be able to reach the operator's real relay.
+[[ "$(NT_CFG_ADDR= NT_CFG_HOST= "$NT/config/load.sh" notifications.email.address)" == "" ]] \
+    && pass "26 fixture config serves no real address" || fail "26 fixture config leaks an address"
+got=$(NT_CFG_ADDR=nobody@invalid.example NT_CFG_HOST=127.0.0.1 nt --priority emergency --require-delivery)
+assert_eq "26 emergency, push ok, SMTP REFUSED → rc 0 (a push landed) but email=failed" "$got" "0 failed"
+got=$(NT_CFG_ADDR=nobody@invalid.example NT_CFG_HOST=127.0.0.1 nt --priority emergency --email-only --require-delivery)
+assert_eq "26 --email-only, SMTP refused → rc 3, email=failed" "$got" "3 failed"
+: > "$NT_CURL_CALLS"
+NT_CFG_ADDR=nobody@invalid.example NT_CFG_HOST=127.0.0.1 nt --priority emergency --email-only >/dev/null
+assert_eq "26 --email-only never touches the push backends (0 curl calls)" "$(count_lines "$NT_CURL_CALLS")" 0
+got=$(NT_CFG_ADDR= NT_CFG_HOST= nt --priority emergency --email-only --require-delivery)
+assert_eq "26 no address/relay configured → email=unconfigured (terminal, not a failure)" "${got#* }" "unconfigured"
+got=$(NT_CFG_ADDR=nobody@invalid.example NT_CFG_HOST=127.0.0.1 nt --priority routine)
+assert_eq "26 routine → email=skipped" "$got" "0 skipped"
+# G3: a SET-but-EMPTY override means NO email — never the configured address.
+# The fixture config SERVES an address and relay here, so a fallback would show
+# as an attempted send (email=failed against the refused port), not unconfigured.
+nt_env() {   # <VAR=value>… -- <notify args>…: like nt, but with overrides SET
+    local esf="$WORK/nt-es.$RANDOM" errf="$WORK/nt-err.$RANDOM" -a envs=(); rm -f "$esf"
+    while [[ "$1" != -- ]]; do envs+=("$1"); shift; done; shift
+    ( unset NEXUS_EMAIL_TO NEXUS_SMTP_HOST NEXUS_SMTP_PORT NEXUS_ROOT NEXUS_CONFIG
+      env "${envs[@]}" PATH="$NT/bin:$PATH" NEXUS_PUSHOVER_USER_KEY_FILE="$NT/push.key" NEXUS_PUSHOVER_APP_TOKEN_FILE="$NT/push.app" \
+      NEXUS_NOTIFY_TOKEN="$NT/no-ntfy" bash "$NT/monitor/notify.sh" T M "$@" --email-status-file "$esf" --quiet ) 2>"$errf"
+    local rc=$?
+    printf '%s %s|%s' "$rc" "$(cat "$esf" 2>/dev/null || echo MISSING)" "$(tr '\n' ' ' < "$errf")"
+}
+got=$(nt_env NT_CFG_ADDR=nobody@invalid.example NT_CFG_HOST=127.0.0.1 NEXUS_EMAIL_TO= -- --priority emergency --email-only)
+assert_eq "26 G3 NEXUS_EMAIL_TO='' (config HAS an address) → email=unconfigured, NOT a send" "${got%%|*}" "0 unconfigured"
+assert_contains "26 G3 …refused LOUDLY on stderr, even under --quiet" "$got" "NEXUS_EMAIL_TO is set but EMPTY"
+got=$(nt_env NT_CFG_ADDR=nobody@invalid.example NT_CFG_HOST=127.0.0.1 NEXUS_SMTP_HOST= -- --priority emergency --email-only)
+assert_eq "26 G3 NEXUS_SMTP_HOST='' (config HAS a relay) → email=unconfigured, NOT a send" "${got%%|*}" "0 unconfigured"
+assert_contains "26 G3 …the SMTP refusal is LOUD" "$got" "NEXUS_SMTP_HOST is set but EMPTY"
+# CONTROL (must not flip): UNSET still means "use the config" — here the
+# fixture relay, which refuses, so the send is ATTEMPTED and fails.
+got=$(nt_env NT_CFG_ADDR=nobody@invalid.example NT_CFG_HOST=127.0.0.1 -- --priority emergency --email-only)
+assert_eq "26 G3 CONTROL: overrides UNSET → the config is used (attempted, refused port)" "${got%%|*}" "0 failed"
+# G3: NEXUS_NOTIFY_QUIET=1 — the harness hard off (run-tests.sh exports it) — sends NOTHING.
+: > "$NT_CURL_CALLS"
+got=$(nt_env NT_CFG_ADDR=nobody@invalid.example NT_CFG_HOST=127.0.0.1 NEXUS_NOTIFY_QUIET=1 -- --priority emergency --require-delivery)
+assert_eq "26 G3 NEXUS_NOTIFY_QUIET=1 → rc 0, email=quiet (nothing sent)" "${got%%|*}" "0 quiet"
+assert_eq "26 G3 …and no push backend was touched (0 curl calls)" "$(count_lines "$NT_CURL_CALLS")" 0
+assert_contains "26 G3 …and it SAYS so on stderr" "$got" "nothing sent on any backend"
 
 echo "=== 14. the PRODUCTION default is DETACHED: raise returns before a slow push leg finishes ==="
 : > "$PUSH_CALLS"

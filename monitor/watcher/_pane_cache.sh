@@ -108,10 +108,23 @@ _pane_cache_read() {
     age=$(( now - mtime ))
     # A negative age (clock skew / touched-in-the-future file) is as
     # untrustworthy as a stale one — treat as miss.
-    (( age >= 0 && age <= MONITOR_PANE_CACHE_TTL_SECONDS )) || return 1
+    (( age >= 0 )) || return 1
+    local _sweep_reuse=0
+    [[ -n "${MONITOR_PANE_CACHE_SWEEP_REUSE:-}" && -n "$expected_name" ]] && _sweep_reuse=1
+    if (( age > MONITOR_PANE_CACHE_TTL_SECONDS )); then
+        (( _sweep_reuse )) && _pane_cache_sweep_covers "$mtime" "$now" || return 1
+    fi
     local line
     line=$(head -n1 "$f" 2>/dev/null) || return 1
     [[ "$line" == *state=* ]] || return 1
+    # Change signal (your-org/nexus-code#1698), SWEEP-REUSE callers only: a
+    # recording is refused when the worker's hook heartbeat moved to the other
+    # activity class after the recording was taken. Checked inside the TTL too,
+    # because the transitions the prelude exists to show (idle, wrapped,
+    # awaiting-input) are exactly heartbeat class changes.
+    if (( _sweep_reuse )); then
+        _pane_cache_heartbeat_agrees "$f" "$expected_name" "$line" || return 1
+    fi
     if [[ -n "$expected_name" ]]; then
         # Window-index reuse guard: the recording must describe the
         # window the caller thinks it describes. Only enforced when the
@@ -149,6 +162,114 @@ _pane_cache_write() {
         && mv -f "$f.tmp.$BASHPID" "$f" 2>/dev/null \
         || rm -f "$f.tmp.$BASHPID" 2>/dev/null || true
     return 0
+}
+
+# ---- sweep-relative reuse (your-org/nexus-code#1698) --------------------
+#
+# WHY. The fixed TTL assumes the recorder sweeps every ~30s. Under load it
+# does not: on 2026-09-30 (load 65–105, 18 worker windows) `idle_section`
+# took median 23s, p90 57s, max 182s per sweep, and one pane-state.sh fork
+# cost 5–40s WALL (mean 17–22s over three passes) for 0.8–5.6s CPU. The
+# wall time is spent in the tmux wrapper chain (monitor/tmuxwrap → sandbox
+# wrapper → /usr/bin/tmux): 0.2–2.4s per call through the chain against
+# 10–40ms for /usr/bin/tmux itself — bash interpreter start-ups, which is
+# why the cost scales with load. The recorder writes windows in order, so
+# by the end of a 182s sweep its first recordings are ~180s old — past the
+# 90s TTL — and the compose-time prelude re-forked pane-state.sh for every
+# one of them, serially, against a 20 + 2×windows budget. It was redoing
+# the recorder's work at the moment the node could least afford it.
+#
+# WHAT. A caller that sets MONITOR_PANE_CACHE_SWEEP_REUSE (only
+# `render_idle_prelude` does) may be served a recording OLDER than the TTL
+# when ALL of these hold:
+#   1. the recorder has COMPLETED a sweep, and the recording was written at
+#      or after that sweep's START — it belongs to the newest complete (or
+#      the in-flight) sweep, i.e. it is the freshest reading the watcher has;
+#   2. the recorder is still cycling: now − last_sweep_end ≤ last sweep's
+#      duration + TTL (a dead or wedged recorder stops qualifying, and every
+#      consumer falls back to the TTL rule);
+#   3. the recording is no older than MONITOR_PANE_CACHE_SWEEP_MAX_AGE_SECONDS
+#      (default 300 — CHOSEN, not measured: just above the largest sweep
+#      duration observed in the log, 274s on 2026-09-29);
+#   4. the change signal below does not fire.
+# Every other consumer (over-limit, full-state, auth-hold, orphan-async) is
+# unchanged: the opt-in is per call.
+
+# `.sweep` holds `<start_epoch>\t<end_epoch>` of the last COMPLETE recorder
+# sweep. Written only by the recorder, after its sweep returns.
+_pane_cache_sweep_path() { printf '%s/.sweep\n' "$(_pane_cache_dir)"; }
+
+# _pane_cache_sweep_mark <start_epoch> — the recorder calls this after a
+# sweep that returned. Atomic; best-effort.
+_pane_cache_sweep_mark() {
+    local start="$1" end dir f
+    _pane_cache_enabled || return 0
+    [[ "$start" =~ ^[0-9]+$ ]] || return 0
+    end=$(date +%s)
+    dir=$(_pane_cache_dir)
+    mkdir -p "$dir" 2>/dev/null || return 0
+    f=$(_pane_cache_sweep_path)
+    printf '%s\t%s\n' "$start" "$end" 2>/dev/null > "$f.tmp.$BASHPID" \
+        && mv -f "$f.tmp.$BASHPID" "$f" 2>/dev/null \
+        || rm -f "$f.tmp.$BASHPID" 2>/dev/null || true
+    return 0
+}
+
+# _pane_cache_sweep_covers <entry_mtime> <now> — conditions 1–3 above.
+_pane_cache_sweep_covers() {
+    local mtime="$1" now="$2" start end cap
+    cap="${MONITOR_PANE_CACHE_SWEEP_MAX_AGE_SECONDS:-300}"
+    [[ "$cap" =~ ^[0-9]+$ ]] || cap=300
+    (( now - mtime <= cap )) || return 1
+    local sf; sf=$(_pane_cache_sweep_path)
+    [[ -r "$sf" ]] || return 1
+    IFS=$'\t' read -r start end < "$sf" 2>/dev/null || return 1
+    [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] || return 1
+    (( end >= start && mtime >= start )) || return 1
+    (( now - end <= (end - start) + MONITOR_PANE_CACHE_TTL_SECONDS )) || return 1
+    return 0
+}
+
+# Activity class of a pane-state token / a heartbeat state token:
+# `busy` (the worker is mid-turn) or `rest` (anything else). Only the CLASS
+# is compared — busy→busy hook traffic (every PostToolUse) must not
+# invalidate a recording, or a busy board would re-fork every window.
+# Set into the named variable (printf -v): no subshell, no fork.
+_pane_cache_pane_class() {
+    case "$2" in
+        busy|working-background|working-self-paced|user-typing) printf -v "$1" busy ;;
+        *) printf -v "$1" rest ;;
+    esac
+}
+_pane_cache_hb_class() {
+    case "$2" in
+        busy|user_prompt) printf -v "$1" busy ;;
+        *) printf -v "$1" rest ;;
+    esac
+}
+
+# _pane_cache_heartbeat_agrees <entry_file> <window_name> <line>
+#
+# Succeeds when the recording may be served: the worker's heartbeat
+# (`$STATE_DIR/heartbeat/<name>.json`, written by its Claude Code hooks) is
+# NOT newer than the recording, or is newer but in the SAME activity class.
+# FAIL-CLOSED: no readable heartbeat → the change is unobservable → refuse
+# (the caller forks, exactly as before #1698). Fork-free: `-nt` and `read`
+# are builtins.
+_pane_cache_heartbeat_agrees() {
+    local f="$1" name="$2" line="$3" hb hb_line="" hb_state rec_state
+    hb="${STATE_DIR:-/nonexistent}/heartbeat/${name}.json"
+    [[ -r "$hb" ]] || return 1
+    [[ "$hb" -nt "$f" ]] || return 0
+    IFS= read -r hb_line < "$hb" 2>/dev/null || [[ -n "$hb_line" ]] || return 1
+    [[ "$hb_line" =~ \"state\":\"([a-z_]+)\" ]] || return 1
+    hb_state="${BASH_REMATCH[1]}"
+    [[ "$line" =~ (^|[[:space:]])state=([a-z-]+) ]] || return 1
+    rec_state="${BASH_REMATCH[2]}"
+    local _rc_cls _hb_cls
+    _pane_cache_pane_class _rc_cls "$rec_state"
+    _pane_cache_hb_class _hb_cls "$hb_state"
+    [[ "$_rc_cls" == "$_hb_cls" ]]
 }
 
 # Drop entries older than 10× TTL plus any orphaned tmp files. Cheap

@@ -502,6 +502,33 @@ else
 fi
 
 echo
+echo "=== a fresh busy heartbeat still carries input= (your-org/nexus-code#1683 F1) ==="
+# The hook route emitted `busy` with NO `input=` field, so the paste primitive's
+# draft gate (#1674) was blind on every hook-carrying WORKER pane and pasted into
+# an operator draft. The STATE stays the hook's `busy`; the box is read off the
+# capture. A pane with no REPL row still gets no field (nothing to read).
+assert_hb_busy_input() {   # <label> <fixture> <want-input-field-or-NONE>
+    local label="$1" fx="$2" want="$3" out st inp
+    printf '{"state":"busy","last_activity":%s,"window":"test"}\n' "$NOW" > "$hb_file"
+    out=$("$HELPER" --fixture "$FIX_DIR/$fx" --window 9 --name test --active 0 \
+                    --heartbeat-file "$hb_file" --now "$NOW" 2>&1)
+    st=$(grep -oE '(^| )state=[^ ]+' <<<"$out" | sed 's/.*state=//')
+    inp=$(grep -oE '(^| )input=[^ ]+' <<<"$out" | sed 's/.*input=//'); inp="${inp:-NONE}"
+    if [[ "$st" == busy && "$inp" == "$want" ]]; then
+        printf '  PASS: %-55s state=busy input=%s\n' "$label" "$inp"
+        PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: %-55s got state=%s input=%s, want state=busy input=%s (full: %s)\n' \
+            "$label" "$st" "$inp" "$want" "$out" >&2
+        FAIL=$(( FAIL + 1 ))
+    fi
+}
+assert_hb_busy_input "hook-busy + typed draft → input=typed"        user-typing-synthetic.ansi typed
+assert_hb_busy_input "hook-busy + vim-INSERT draft → input=typed"   user-typing-vim-dim-box-border-synthetic.ansi typed
+assert_hb_busy_input "hook-busy + empty box → input=blank"          idle-empty-synthetic.ansi blank
+assert_hb_busy_input "hook-busy + no REPL row → no input= field"    busy-mid-render-no-chevron-synthetic.ansi NONE
+
+echo
 echo "=== a fresh idle_prompt heartbeat does NOT override a pane with no REPL row ==="
 # The busy-mid-render fixture has no chevron at all and a LIVE token counter.
 #
@@ -1338,6 +1365,34 @@ if [[ -n "$h_fsi" && "$h_fsi" != "$h_fs0" ]]; then
     printf '  PASS: small-indent ● content still moves the hash (right-justification threshold spares it)\n'; PASS=$(( PASS + 1 ))
 else
     printf '  FAIL: small-indent ● content was eaten by the nudge strip (%s vs %s)\n' "$h_fsi" "$h_fs0" >&2; FAIL=$(( FAIL + 1 ))
+fi
+
+# --- effort-nudge lead glyph varies by level (#1703) -------------------------
+# The effort nudge is `<glyph> <level> · /effort` and claude 2.1.285 picks the
+# glyph per level (low ○, medium ◐, high ●, xhigh ◉, max ◈; or an `effort:`
+# text form). Keying on `●` alone left `◐ medium · /effort` — the cc-harness
+# default — in the hash, so it moved when the nudge blinked out ~5 s after idle
+# (test-realmodel-long-exchange.sh red on CI). Each level must read STABLE
+# across the blink; a small-indent `◐` must still move the hash.
+for _eg in $'\xe2\x97\x8b low' $'\xe2\x97\x90 medium' $'\xe2\x97\x89 xhigh' $'\xe2\x97\x88 max' 'effort: medium'; do
+    printf 'Routine transcript line one\n%s Assistant answered the question here\n%s%s %s /effort\n%s%s%s%s\n\xe2\x9d\xaf%s%s[7m %s[0m\n' \
+        "$BUL" "$GAP" "$_eg" "$MDOT" "$DASH" "$DASH" "$DASH" "$DASH" \
+        "$NB" "$ESCB" "$ESCB" > "$ch_tmp/fs_effort.ansi"
+    h_eg=$(ch_field "$("$HELPER" --fixture "$ch_tmp/fs_effort.ansi" --window 9 --name chw --active 0)")
+    if [[ -n "$h_eg" && "$h_eg" == "$h_fs0" ]]; then
+        printf '  PASS: effort nudge `%s` stripped — idle hash stable across blink\n' "$_eg"; PASS=$(( PASS + 1 ))
+    else
+        printf '  FAIL: effort nudge `%s` churned the hash (present=%s absent=%s)\n' "$_eg" "$h_eg" "$h_fs0" >&2; FAIL=$(( FAIL + 1 ))
+    fi
+done
+printf 'Routine transcript line one\n%s Assistant answered the question here\n  \xe2\x97\x90 indented half-circle inside a fence\n%s\n%s%s%s%s\n\xe2\x9d\xaf%s%s[7m %s[0m\n' \
+    "$BUL" "$GAP" "$DASH" "$DASH" "$DASH" "$DASH" \
+    "$NB" "$ESCB" "$ESCB" > "$ch_tmp/fs_indent_half.ansi"
+h_fih=$(ch_field "$("$HELPER" --fixture "$ch_tmp/fs_indent_half.ansi" --window 9 --name chw --active 0)")
+if [[ -n "$h_fih" && "$h_fih" != "$h_fs0" ]]; then
+    printf '  PASS: small-indent ◐ content still moves the hash (glyph widening did not over-strip)\n'; PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: small-indent ◐ content was eaten by the nudge strip (%s vs %s)\n' "$h_fih" "$h_fs0" >&2; FAIL=$(( FAIL + 1 ))
 fi
 
 # Chevron-less pane: classifies absent via the renderer fallback
@@ -2840,8 +2895,21 @@ _md_mutate() {   # _md_mutate <which>
 import sys
 src, dst, which = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(src).read()
-SLICE = ("    grep -qE \"$footer_re\" \\\n"
-         "        <<<\"$(printf '%s\\n' \"$plain\" | grep -v '^[[:space:]]*$' | tail -n 3)\" || return 1\n")
+# (a) is now an `if !` block whose else-arm is the FOOTERLESS variant (a')
+# (your-org/nexus-code#1687). Removing (a) removes the whole block — the footer
+# requirement AND its footerless alternative — so the pane falls through to the
+# footer-anchored conditions below with no bottom-slice test at all.
+SLICE = ("    if ! grep -qE \"$footer_re\" \\\n"
+         "        <<<\"$(printf '%s\\n' \"$plain\" | grep -v '^[[:space:]]*$' | tail -n 3)\"; then\n"
+         "        _has_footerless_menu_frame \"$plain\" || return 1\n"
+         "        # (d) applies to (a') exactly as below: positive evidence of work in\n"
+         "        # flight vetoes a dialog reading.\n"
+         "        if _detect_busy \"$plain\" \"$(wc -l <<<\"$plain\")\" \\\n"
+         "           || _detect_queued_message \"$plain\"; then\n"
+         "            return 1\n"
+         "        fi\n"
+         "        return 0\n"
+         "    fi\n")
 # The (d) guard, hoisted because three of the mutations below must remove it
 # FIRST. Their near-miss panes are BUSY — which is how these shapes actually
 # appear in production — so after #896's skeptic added (d) those panes fail TWO
@@ -2885,12 +2953,21 @@ targets = {
   #     live REPL painting no `❯<NBSP>` row, so (c) goes inert exactly when a
   #     busy pane quotes a dialog.
   'working': [WORKING],
+  # (a') THE FOOTERLESS MENU MUST TERMINATE THE PANE (your-org/nexus-code#1687).
+  #      Relaxed from "every row below the cursor is a sibling option" to "skip
+  #      the rows that are not": a transcript QUOTING the auto-mode offer, with
+  #      the REPL box painted under it, then reads as a live dialog. That the
+  #      real quoted capture flips is what shows this condition — not the
+  #      sibling floor or (d) — is what keeps the arm off ordinary REPL output.
+  'terminates': ['        [[ "${rows[i]}" =~ $sib_re ]] || return 1\n'],
 }
 for guard in targets[which]:
     if s.count(guard) != 1:
         sys.exit("MUTATION TARGET NOT FOUND (%s): found %d" % (which, s.count(guard)))
     if which == 'case':
         repl = "    local footer_re='(Enter|Esc|enter|esc) to [a-z]'\n"
+    elif which == 'terminates':
+        repl = '        [[ "${rows[i]}" =~ $sib_re ]] || continue\n'
     else:
         repl = "    : # %s condition REMOVED by mutation\n" % which
     s = s.replace(guard, repl, 1)
@@ -2929,6 +3006,7 @@ md_cases=(
     "case|busy-esc-to-interrupt-menu-synthetic.ansi|the footer's case-sensitivity (with the agent-is-working test already removed)"
     "working|busy-dialog-quoted-midrender-synthetic.ansi|the agent-is-working test"
     "working|busy-dialog-quoted-queued-synthetic.ansi|the agent-is-working test (queued regime)"
+    "terminates|idle-auto-mode-offer-quoted-realmodel-285.ansi|the footerless arm's menu-terminates-the-pane requirement"
 )
 for md_case in "${md_cases[@]}"; do
     IFS='|' read -r md_which md_fix md_label <<<"$md_case"

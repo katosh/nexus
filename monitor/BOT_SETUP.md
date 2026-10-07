@@ -170,7 +170,7 @@ just that command before moving on.
 
 # 3. Asset upload end-to-end (commits one file to your asset repo's
 #    main branch, prints the URL).
-./monitor/ng upload README.md --message "preflight"
+./monitor/ng upload README.md --message "preflight" --replace
 # expected: https://github.com/<your-asset-repo>/blob/<sha>/assets/general/README.md
 ```
 

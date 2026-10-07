@@ -159,8 +159,13 @@ _alive() { env -u TMUX tmux -S "$SOCK" has-session -t p1 >/dev/null 2>&1 && echo
 _cleanup() {
     # ISOLATION ASSERT, before any teardown: both sockets must be under $WORK.
     case "$SOCK" in "$WORK"/*) env -u TMUX tmux -S "$SOCK" kill-server >/dev/null 2>&1 || true ;; esac
+    # By its SOCKET, -S "$TSOCK" — the path the dir-scoped server itself reported
+    # and the case guard just proved is under $WORK. `env -u TMUX TMUX_TMPDIR=`
+    # was isolated but broke the tmux lint's rule-1 bright line (kill-server
+    # carries -L/-S on the same command), which the lint could not see inside a
+    # case arm until your-org/nexus-code#1652.
     if [[ -n "${TSOCK:-}" ]]; then
-        case "$TSOCK" in "$WORK"/*) env -u TMUX TMUX_TMPDIR="$TDIR" tmux kill-server >/dev/null 2>&1 || true ;; esac
+        case "$TSOCK" in "$WORK"/*) env -u TMUX tmux -S "$TSOCK" kill-server >/dev/null 2>&1 || true ;; esac
     fi
     rm -rf "$WORK"
 }

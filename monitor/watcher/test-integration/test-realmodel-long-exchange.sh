@@ -65,6 +65,9 @@ eng_observe() {
     state=$(sed -n 's/.*state=\([^ ]*\).*/\1/p' <<<"$line")
     hash=$(sed -n 's/.*content_hash=\([0-9]*\).*/\1/p' <<<"$line")
     now=$(date +%s)
+    # Keep the frame this cycle saw, so a later "pane changed" failure can
+    # show WHAT changed (#1703). Taken right after pane-state's own capture.
+    printf '%s\n' "$(cch_capture "$idx")" > "$CCH_DIR/obs-$name.cap"
     PATH="$CCH_DIR/.bin:$PATH" bash -c "
         set -uo pipefail
         STATE_DIR='$ENG_STATE'
@@ -106,6 +109,24 @@ inject_distortion() {
     [[ -n "$tty" && -w "$tty" ]] || return 1
     printf '\033[38;5;196m\342\226\223\342\226\222\342\226\221GLITCH-%s-REDRAW\033[7m\342\214\247\342\214\247\033[0m\342\226\221\342\226\222\342\226\223qpzw\033[0m\r\n' \
         "$tag" > "$tty" 2>/dev/null
+}
+
+# On a hash mismatch, say WHAT moved (#1703): the two pane-state lines and
+# a unified diff of the plain captures bracketing each sample. A capture
+# taken immediately before AND after a pane-state call that agree is the
+# frame pane-state hashed; disagreeing bracket captures mean the pane was
+# mid-repaint at that sample. cat -A makes NBSP / trailing blanks visible.
+dump_frame_diff() {
+    local label="$1" a="$2" b="$3"
+    {
+        echo "    --- $label: diff of the two frames (cat -A; < first, > second) ---"
+        if cmp -s "$a" "$b"; then
+            echo "    (plain captures IDENTICAL — the hashed bytes differ only in what capture-pane -e adds, or the pane moved between capture and hash)"
+        else
+            diff <(cat -A "$a") <(cat -A "$b") | sed 's/^/    | /'
+        fi
+        echo "    --- end $label ---"
+    } >&2
 }
 
 # ---- boot two workers -------------------------------------------------------
@@ -185,10 +206,27 @@ fi
 # nothing happens — CC's timer digits / spinner / input-row churn have
 # to be invisible, otherwise a stale mark would never expire in
 # production. This is the property no synthetic fixture can prove.
-h1=$(cch_pane_state "$W1" | sed -n 's/.*content_hash=\([0-9]*\).*/\1/p')
+cch_capture "$W1" > "$CCH_DIR/h1-pre.cap"
+l1=$(cch_pane_state "$W1")
+cch_capture "$W1" > "$CCH_DIR/h1-post.cap"
+h1=$(sed -n 's/.*content_hash=\([0-9]*\).*/\1/p' <<<"$l1")
 sleep 2
-h2=$(cch_pane_state "$W1" | sed -n 's/.*content_hash=\([0-9]*\).*/\1/p')
+cch_capture "$W1" > "$CCH_DIR/h2-pre.cap"
+l2=$(cch_pane_state "$W1")
+cch_capture "$W1" > "$CCH_DIR/h2-post.cap"
+h2=$(sed -n 's/.*content_hash=\([0-9]*\).*/\1/p' <<<"$l2")
 assert_eq "real idle pane hashes stable across 2s" "$h2" "$h1"
+if [[ "$h2" != "$h1" ]]; then
+    { echo "    sample 1: $l1"; echo "    sample 2: $l2"; } >&2
+    cmp -s "$CCH_DIR/h1-pre.cap" "$CCH_DIR/h1-post.cap" \
+        || dump_frame_diff "sample 1 bracket (pane moving AT sample 1)" "$CCH_DIR/h1-pre.cap" "$CCH_DIR/h1-post.cap"
+    dump_frame_diff "sample 1 -> sample 2" "$CCH_DIR/h1-post.cap" "$CCH_DIR/h2-pre.cap"
+fi
+# The last observe (the clean-frame cycle above) is the baseline the TTL
+# observe below diffs against, so a drift between it and sample 1 is a
+# change the TTL check will see even when h1 == h2.
+cp "$CCH_DIR/obs-convo.cap" "$CCH_DIR/obs-convo.cap.clean"
+cmp -s "$CCH_DIR/obs-convo.cap.clean" "$CCH_DIR/h1-pre.cap" || DRIFT_SINCE_OBS=1
 
 # Static past a 4 s TTL -> the mark lapses (self-expiry on the real
 # rendering surface).
@@ -196,8 +234,11 @@ TTL=4
 sleep $(( TTL + 2 ))
 eng_observe "$W1" convo
 if eng_marked convo "$TTL"; then
-    echo "  FAIL: static pane past TTL still marked (pinned-window risk)" >&2
+    echo "  FAIL: static pane past TTL still marked (pinned-window risk) (row: $(eng_row convo))" >&2
     FAIL=$(( FAIL + 1 ))
+    [[ "${DRIFT_SINCE_OBS:-0}" == 1 ]] \
+        && dump_frame_diff "clean-frame observe -> sample 1" "$CCH_DIR/obs-convo.cap.clean" "$CCH_DIR/h1-pre.cap"
+    dump_frame_diff "sample 2 -> TTL observe" "$CCH_DIR/h2-post.cap" "$CCH_DIR/obs-convo.cap"
 else
     echo "  PASS: static pane past TTL: mark lapsed"; PASS=$(( PASS + 1 ))
 fi

@@ -68,6 +68,10 @@
 #
 # Pure functions: they read /proc and print/return. They never signal, never
 # write, and never touch the network. All are safe to call on any pid.
+# ONE exception, at the bottom of the file: the PROGRESS predicate
+# (`labsh_build_stalled`, and `labsh_build_release` through it) writes one
+# sample file under the service's own <workdir>/.jupyter — it still never
+# signals.
 
 if [[ -n "${_NEXUS_LABSH_BUILD_EVIDENCE_LOADED:-}" ]]; then
     return 0 2>/dev/null || true
@@ -210,4 +214,147 @@ labsh_build_in_progress() {
     age=$(labsh_build_age "$pid") || return 1
     printf '%s %s' "$pid" "$age"
     return 0
+}
+
+# ── PROGRESS: is a live build still MOVING? ────────────────────────────────
+# ONE answer for the three layers that can kill a build in flight
+# (your-org/nexus-code#1676): svc.sh's cold-build guard, the
+# watcher's service-health defer, and the supervisor's own stale-build reaper.
+# Each used to decide on AGE ALONE against its own 1800 s bound, and on
+# 2026-09-29 all three killed PROGRESSING builds: a cold materialisation on a
+# load-100 node needs more than 30 min, so every build was discarded at the
+# bound and the next one started from zero — a kill loop that read as a flap.
+# (The watcher's bound also ran on the INCIDENT clock, so once the incident was
+# 30 min old every NEW build was "past the ceiling" the moment it started.)
+#
+# The model, applied identically by every caller through `labsh_build_release`:
+#
+#   age <  soft ceiling            PROTECTED  (bring-up; nothing to prove)
+#   age >= soft ceiling, MOVING    PROTECTED  (slow, not wedged)
+#   age >= soft ceiling, STALLED   RELEASED   (no progress for the stall window)
+#   age >= hard cap                RELEASED   (backstop: a "build" that keeps
+#                                              moving for hours is not a build)
+#
+# THE ONE EXCEPTION TO "pure" IN THIS FILE: `labsh_build_stalled` persists a
+# progress sample (it must compare across calls). The sample lives with the
+# build it describes, in <workdir>/.jupyter/labsh.buildprogress, so every
+# caller shares ONE baseline — never in any caller's own state dir, which is
+# how three layers would come to disagree about the same process.
+#
+# Knobs (all seconds; 0 disables the respective bound):
+#   LABSH_BUILD_STALL_SECONDS  default 600. A HEALTHY build on this NFS cache
+#       was measured frozen (no CPU, no wchar, no log growth) for 90+ s at a
+#       stretch while legitimately progressing (2026-07-13), so the window is
+#       ~6.7x the longest stall observed. Chosen, not inherited.
+#   LABSH_COLD_BUILD_HARD_CAP  default 7200. WE CHOSE 2 h: the longest build
+#       measured on this nexus was >28 min at load ~100 (2026-09-29, killed at
+#       30 min, still progressing), so 2 h is ~4x that; past it, recovery must
+#       be able to proceed even if the counter keeps ticking (a spinning
+#       process advances CPU time forever).
+
+# labsh_build_progress <pid> <workdir>
+# A monotone forward-motion counter: CPU ticks + bytes written + build-log size.
+# Any increase is progress. Fails (prints nothing) when /proc is unreadable.
+labsh_build_progress() {
+    local pid="${1:-}" workdir="${2:-}" stat rest ticks=0 wchar=0 bg=0
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    rest=${stat#*") "}                        # drop "pid (comm) " — comm may hold spaces
+    # shellcheck disable=SC2086
+    set -- $rest                              # ${12}=utime, ${13}=stime (fields 14/15 overall)
+    # ${12} NOT $12 — the latter is ${1}2, i.e. the state char with a "2" glued on.
+    [[ "${12:-}" =~ ^[0-9]+$ && "${13:-}" =~ ^[0-9]+$ ]] || return 1
+    ticks=$(( ${12} + ${13} ))
+    wchar=$(awk '/^wchar/{print $2; exit}' "/proc/$pid/io" 2>/dev/null)
+    [[ "$wchar" =~ ^[0-9]+$ ]] || wchar=0
+    bg=$(stat -c %s "$workdir/.jupyter/labsh.bg.log" 2>/dev/null)
+    [[ "$bg" =~ ^[0-9]+$ ]] || bg=0
+    printf '%s' $(( ticks + wchar + bg ))
+}
+
+# labsh_build_stalled <pid> <workdir>
+# rc 0 iff the build has PROVABLY made no forward progress for >= the stall
+# window. Unprovable (unreadable counters, first sight, a new pid) ⇒ 1, i.e.
+# "not stalled": a wrong "stalled" destroys a bring-up, a wrong "not stalled"
+# only delays a release, and the hard cap bounds that delay.
+labsh_build_stalled() {
+    local pid="${1:-}" workdir="${2:-}"
+    local stall="${LABSH_BUILD_STALL_SECONDS:-600}"
+    local f="$workdir/.jupyter/labsh.buildprogress"
+    local now cur prev_pid='' prev_ts='' prev_cur=''
+
+    [[ "$stall" =~ ^[0-9]+$ ]] && (( stall > 0 )) || return 1
+    [[ -d "$workdir/.jupyter" ]] || return 1
+    cur=$(labsh_build_progress "$pid" "$workdir") || return 1
+    now=$(date +%s 2>/dev/null) || return 1
+
+    # Test readability first: `< "$f"` on a missing file is a REDIRECT failure
+    # bash reports itself, which a `2>/dev/null` on `read` cannot suppress.
+    if [[ -r "$f" ]]; then
+        read -r prev_pid prev_ts prev_cur < "$f" || true
+    fi
+
+    # A different pid, an unreadable sample, or forward motion ⇒ re-baseline.
+    if [[ "$prev_pid" != "$pid" ]] \
+       || [[ ! "$prev_ts"  =~ ^[0-9]+$ ]] \
+       || [[ ! "$prev_cur" =~ ^[0-9]+$ ]] \
+       || (( cur > prev_cur )); then
+        printf '%s %s %s\n' "$pid" "$now" "$cur" > "$f.tmp.$$" 2>/dev/null \
+            && mv -f "$f.tmp.$$" "$f" 2>/dev/null
+        rm -f "$f.tmp.$$" 2>/dev/null
+        return 1
+    fi
+
+    # Same pid, no advance since prev_ts. The timestamp is deliberately NOT
+    # refreshed — the stall is measured from when motion stopped.
+    (( now - prev_ts >= stall ))
+}
+
+# labsh_build_release <pid> <age-seconds> <workdir> <soft-ceiling-seconds>
+# THE verdict every caller acts on. Prints ONE line, "<token> <explanation>",
+# and returns 0 iff the build may be killed (RELEASED), 1 iff it must be left
+# alone (PROTECTED). Tokens:
+#   released: defer-disabled | past-hard-cap | stalled
+#   protected: within-ceiling | progressing
+# A soft ceiling of 0 means the caller's cold-build defer is disabled, so there
+# is nothing to protect. The stall sample is taken on EVERY call (even inside
+# the ceiling), so the baseline is warm by the time the ceiling passes.
+labsh_build_release() {
+    local pid="${1:-}" age="${2:-}" workdir="${3:-}" soft="${4:-}"
+    local hard="${LABSH_COLD_BUILD_HARD_CAP:-7200}" stall="${LABSH_BUILD_STALL_SECONDS:-600}"
+    local stalled=1 mins
+    [[ "$hard"  =~ ^[0-9]+$ ]] || hard=7200
+    [[ "$stall" =~ ^[0-9]+$ ]] || stall=600
+    [[ "$soft"  =~ ^[0-9]+$ ]] || soft=1800
+    if [[ ! "$age" =~ ^[0-9]+$ ]]; then
+        # Cannot age it ⇒ cannot bound it. Protecting an unbounded build would
+        # block recovery forever; releasing one we cannot age is what the
+        # callers did before this predicate existed.
+        printf 'past-hard-cap build age unknown — cannot be bounded, so not protected\n'
+        return 0
+    fi
+    mins=$(( age / 60 ))
+    if (( soft == 0 )); then
+        printf 'defer-disabled the cold-build defer is disabled (ceiling 0)\n'
+        return 0
+    fi
+    labsh_build_stalled "$pid" "$workdir" && stalled=0
+    if (( hard > 0 && age >= hard )); then
+        if (( stalled == 0 )); then
+            printf 'past-hard-cap build running %sm (%ss), past the %ss hard cap, and not progressing\n' "$mins" "$age" "$hard"
+        else
+            printf 'past-hard-cap build running %sm (%ss), past the %ss hard cap — released even though it may still be moving\n' "$mins" "$age" "$hard"
+        fi
+        return 0
+    fi
+    if (( age < soft )); then
+        printf 'within-ceiling build running %sm (%ss), inside the %ss ceiling\n' "$mins" "$age" "$soft"
+        return 1
+    fi
+    if (( stalled == 0 )); then
+        printf 'stalled build running %sm (%ss) has made NO forward progress (CPU, bytes written, log growth) for >= %ss — presumed wedged\n' "$mins" "$age" "$stall"
+        return 0
+    fi
+    printf 'progressing build running %sm (%ss), past the %ss ceiling but still making progress — slow, not wedged (hard cap %ss)\n' "$mins" "$age" "$soft" "$hard"
+    return 1
 }

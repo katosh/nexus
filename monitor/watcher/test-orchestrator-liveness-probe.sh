@@ -362,6 +362,75 @@ else
     fail "probe fired ${fire_count}/5 cycles on a healthy paste-react loop"
 fi
 
+# --- 1720: transcripts under $CLAUDE_CONFIG_DIR/projects are SEEN --------
+#
+# your-org/nexus-code#1720. Claude Code writes to $CLAUDE_CONFIG_DIR/projects
+# when that is set; in agent-sandbox it can be a REAL directory rather than a
+# symlink to ~/.claude/projects. Pre-fix both probes looked only under
+# <home_dir>/.claude/projects, so a live orchestrator's fresh jsonl read as
+# MISSING — `_orchestrator_jsonl_fresh` said stale and
+# `_orchestrator_unresponsive` fell through to UNRESPONSIVE (false-dead).
+# The fixture's home has NO projects dir; the transcript lives only under
+# <cfg>/projects/<slug>/. The explicit home_dir argument (the fake-home seam)
+# is passed, so the CLAUDE_CONFIG_DIR root must be consulted IN ADDITION to it.
+
+CFG_HOME="$WORK/home-1720"
+CFG_DIR="$WORK/cfg-1720"
+mkdir -p "$CFG_HOME" "$CFG_DIR/projects"
+cfg_slug=$(printf '%s' "$FAKE_NEXUS_ROOT" | sed 's|[^a-zA-Z0-9]|-|g')
+mkdir -p "$CFG_DIR/projects/$cfg_slug"
+CFG_JSONL="$CFG_DIR/projects/$cfg_slug/$VALID_SID.jsonl"
+printf '{"type":"assistant"}\n' > "$CFG_JSONL"
+touch -d "5 seconds ago" "$CFG_JSONL"
+
+rc=0
+( unset NEXUS_CC_HOME; CLAUDE_CONFIG_DIR="$CFG_DIR" HOME="$CFG_HOME" \
+    _orchestrator_jsonl_fresh "$VALID_SID" 300 "$FAKE_NEXUS_ROOT" "$CFG_HOME" ) || rc=$?
+if (( rc == 0 )); then
+    pass "1720: jsonl_fresh sees a fresh jsonl that exists ONLY under \$CLAUDE_CONFIG_DIR/projects"
+else
+    fail "1720: jsonl_fresh blind to \$CLAUDE_CONFIG_DIR/projects (rc=$rc, want 0)"
+fi
+
+# Control: the same file, now stale → still rc 1 (the root is read, the
+# freshness rule is unchanged).
+touch -d "900 seconds ago" "$CFG_JSONL"
+rc=0
+( unset NEXUS_CC_HOME; CLAUDE_CONFIG_DIR="$CFG_DIR" HOME="$CFG_HOME" \
+    _orchestrator_jsonl_fresh "$VALID_SID" 300 "$FAKE_NEXUS_ROOT" "$CFG_HOME" ) || rc=$?
+if (( rc == 1 )); then
+    pass "1720 control: a STALE jsonl under \$CLAUDE_CONFIG_DIR/projects is still stale"
+else
+    fail "1720 control: stale jsonl under \$CLAUDE_CONFIG_DIR/projects read fresh (rc=$rc, want 1)"
+fi
+
+# _orchestrator_unresponsive: paste 300 s ago, threshold 120, and the orch
+# wrote its jsonl (under CLAUDE_CONFIG_DIR only) AFTER the paste → alive.
+now=$(date +%s)
+write_paste_ts "$LP" $(( now - 300 ))
+printf '%s\n' "$VALID_SID" > "$PIN"
+touch -d "10 seconds ago" "$CFG_JSONL"
+reason=""; rc=0
+reason=$( unset NEXUS_CC_HOME; CLAUDE_CONFIG_DIR="$CFG_DIR" HOME="$CFG_HOME" \
+    _orchestrator_unresponsive "$LP" "$PIN" "$FAKE_NEXUS_ROOT" 120 "$CFG_HOME" ) || rc=$?
+if (( rc == 1 )) && [[ -z "$reason" ]]; then
+    pass "1720: unresponsive sees the post-paste write under \$CLAUDE_CONFIG_DIR/projects → alive"
+else
+    fail "1720: unresponsive read a live orch as DEAD — jsonl under \$CLAUDE_CONFIG_DIR/projects unseen (rc=$rc reason='$reason')"
+fi
+
+# Control: transcript under NO root → unresponsive still fires.
+rm -f "$CFG_JSONL"
+reason=""; rc=0
+reason=$( unset NEXUS_CC_HOME; CLAUDE_CONFIG_DIR="$CFG_DIR" HOME="$CFG_HOME" \
+    _orchestrator_unresponsive "$LP" "$PIN" "$FAKE_NEXUS_ROOT" 120 "$CFG_HOME" ) || rc=$?
+if (( rc == 0 )) && [[ "$reason" == *unresponsive_age=* ]]; then
+    pass "1720 control: no transcript under any root → unresponsive still fires"
+else
+    fail "1720 control: unresponsive did not fire with no transcript anywhere (rc=$rc reason='$reason')"
+fi
+rm -f "$PIN" "$LP"
+
 # --- summary -------------------------------------------------------------
 
 echo

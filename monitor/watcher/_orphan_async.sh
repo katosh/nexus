@@ -644,7 +644,9 @@ _orphan_async_compose_brief() {   # <window> <idle-seconds> <resolved-lines-file
     printf 'the EXCEPTION, not the co-equal alternative to resuming. Clearing a wait on a\n'
     printf 'job that IS running destroys the only record that work is outstanding. Use it\n'
     printf 'only after you have independently confirmed the job is not running (for Slurm:\n'
-    printf 'an empty `squeue` for your own ids, checked by id, not by name).\n'
+    printf 'your own ids absent from `squeue -u $USER -h -o "%%i %%T"`, filtered by id, AND a\n'
+    printf 'terminal `sacct -j <id>` row; never an empty `squeue -j <id>`, which this sandbox\n'
+    printf 'returns at rc 0 for a QUEUED job on ~25%% of calls — your-org/nexus-code#1744).\n'
 }
 
 # ---- scan -----------------------------------------------------------------

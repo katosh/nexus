@@ -170,6 +170,10 @@ case "\$1" in
         # had to repair).
         if [[ -f "$WORK/tmux-orchestrator-absent" ]] && ! grep -q 'new-window' "$TMUX_LOG"; then
             names=("watcher" "worker-foo")
+        elif [[ -f "$WORK/tmux-no-workers" ]]; then
+            # The 2026-09-27 restart shape: the orchestrator is up, and no
+            # worker window exists YET because recovery resumes them after.
+            names=("watcher" "orchestrator")
         else
             names=("watcher" "orchestrator" "worker-foo")
         fi
@@ -199,7 +203,48 @@ case "\$1" in
         printf '@7\n'
         exit 0
         ;;
-    kill-window|set-window-option|send-keys|load-buffer|paste-buffer|delete-buffer)
+    load-buffer)
+        # #1715: remember OUR payload's line-break count (the binary's chip K),
+        # so the scripted box below can render OUR chip exactly.
+        f="\${!#}"; [[ -r "\$f" ]] && LC_ALL=C tr -cd '\\n\\r\\013\\014' < "\$f" | wc -c | tr -d ' ' > "$WORK/stub-k"
+        [[ -r "\$f" ]] && cp -- "\$f" "$WORK/stub-loaded"
+        exit 0
+        ;;
+    paste-buffer)
+        date +%s > "$WORK/stub-paste-at"
+        # #1715 (fifth instance): how many pane probes preceded THIS paste — the
+        # readiness gate's evidence, read back by the resume-gate arm.
+        # (the literal path: this stub is written BEFORE PANE_STATE_LOG is set)
+        grep -c . "$WORK/pane-state-calls.log" > "$WORK/stub-probes-at-paste" 2>/dev/null
+        exit 0
+        ;;
+    capture-pane)
+        # #1715: a SCRIPTED input box, only when an arm asks for one.
+        # "$WORK/box-render" = <seconds-after-paste>: until then the box holds
+        # an operator-looking line that is NOT our brief, then OUR chip.
+        # "never" keeps the operator line forever (the negative arm).
+        if [[ -s "$WORK/box-render" ]]; then
+            r=\$(cat "$WORK/box-render"); at=\$(cat "$WORK/stub-paste-at" 2>/dev/null || echo 0)
+            # "flicker-after-2 <S>": OUR chip, except for <S> s right after the
+            # 2nd Enter, when the box REDRAWS as not-ours (#1715, third instance).
+            if [[ "\$r" == flicker-after-2* ]]; then
+                ne=\$(grep -c . "$WORK/stub-enter-at" 2>/dev/null); ne=\${ne:-0}
+                le=\$(tail -n1 "$WORK/stub-enter-at" 2>/dev/null || echo 0)
+                if (( ne == 2 && \$(date +%s) - le < \${r##* } )); then r=never; else r=0; fi
+            fi
+            if [[ "\$r" != never ]] && (( \$(date +%s) - at >= r )); then
+                printf '\342\235\257\302\240[Pasted text #1 +%s lines]\n' "\$(cat "$WORK/stub-k" 2>/dev/null)"
+            else
+                printf '\342\235\257\302\240hold the release until I confirm\n'
+            fi
+        fi
+        exit 0
+        ;;
+    send-keys)
+        [[ "\${!#}" == Enter ]] && date +%s >> "$WORK/stub-enter-at"
+        exit 0
+        ;;
+    kill-window|set-window-option|delete-buffer)
         exit 0
         ;;
     *)
@@ -251,10 +296,33 @@ if [[ -s "$PANE_STATE_SCRIPT" ]]; then
     next=\$(head -n1 "$PANE_STATE_SCRIPT")
     tail -n +2 "$PANE_STATE_SCRIPT" > "$PANE_STATE_SCRIPT.tmp" && mv "$PANE_STATE_SCRIPT.tmp" "$PANE_STATE_SCRIPT"
     printf 'state=%s active=1 window=\$1 name=orchestrator\n' "\$next"
+elif [[ -s "$WORK/pane-state-lost" ]]; then
+    # #1715 (fifth instance): the first L pastes are LOST — the box reads EMPTY
+    # and nothing runs; a later paste's own Enter starts the turn (busy).
+    L=\$(cat "$WORK/pane-state-lost")
+    np=\$(grep -c 'paste-buffer' "$TMUX_LOG" 2>/dev/null); np=\${np:-0}
+    ne=\$(grep -c 'send-keys .* Enter' "$TMUX_LOG" 2>/dev/null); ne=\${ne:-0}
+    # A kept paste sits in the box as TYPED text (our chip, or — with the
+    # -draft2 flag — an operator's text typed right after the RE-paste) until
+    # an Enter for it arrives (ne >= np), which starts the turn.
+    if [[ -f "$WORK/pane-state-lost-draft" ]] && (( np >= 1 )); then
+        printf 'state=user-typing active=1 window=\$1 name=orchestrator input=typed\n'
+    elif (( np > L && ne >= np )); then
+        printf 'state=busy active=1 window=\$1 name=orchestrator\n'
+    elif (( np > L )); then
+        printf 'state=user-typing active=1 window=\$1 name=orchestrator input=typed\n'
+    else
+        printf 'state=idle active=1 window=\$1 name=orchestrator input=blank\n'
+    fi
 elif [[ -s "$WORK/pane-state-by-enters" ]]; then
-    read -r s0 s1 s2 < "$WORK/pane-state-by-enters"
+    # Any number of tokens: token i answers for i Enters, the LAST for every
+    # count beyond (#1715 needs four: "first Enter dropped, second dropped,
+    # third lands").
+    read -r -a ss < "$WORK/pane-state-by-enters"
     n=\$(grep -c 'send-keys .* Enter' "$TMUX_LOG" 2>/dev/null); n=\${n:-0}
-    if (( n >= 2 )); then st=\$s2; elif (( n == 1 )); then st=\$s1; else st=\$s0; fi
+    (( n >= \${#ss[@]} )) && n=\$(( \${#ss[@]} - 1 ))
+    st=\${ss[\$n]}
+    st=\${st//__/ }   # #1715: a token may carry fields, e.g. user-typing__input=typed
     printf 'state=%s active=1 window=\$1 name=orchestrator\n' "\$st"
 elif grep -qs 'send-keys .* Enter' "$TMUX_LOG"; then
     printf 'state=busy active=1 window=\$1 name=orchestrator\n'
@@ -575,6 +643,30 @@ assert_not_contains "kill-window NOT invoked when target absent" \
                     "$tmux_log" "kill-window -t orchestrator"
 assert_contains "new-window still invoked"  "$tmux_log" "new-window -d -n orchestrator"
 rm -f "$WORK/tmux-orchestrator-absent"
+
+# --- Test 4b: a ZERO-length verify budget still probes once (#1703) -----
+#
+# The post-paste verify's deadline is in whole seconds, so the 1 s budget
+# every arm here uses can expire before its first probe whenever a second
+# boundary passes between two `date` forks — Test 4 went red exactly so in
+# PR CI run 36840086024 (rc 4, PSI 66%). Budget 0 is that case made
+# DETERMINISTIC: the deadline is already due, and only a probe-first loop
+# sees the `busy` the Enter caused. Red at a deadline-first loop, measured.
+echo '=== zero verify budget: the submit verify still probes once ==='
+: > "$TMUX_LOG"
+: > "$PANE_STATE_LOG"
+rm -f "$REPORT" "$COOLDOWN"
+rc=0
+NEXUS_ROOT="$FAKE_NEXUS" \
+STATE_DIR="$STATE_DIR" \
+FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=0 \
+PANE_STATE_BIN="$PANE_STATE_STUB" \
+PATH="$TMUX_STUB_BIN:$PATH" \
+    bash "$SCRIPT" --target orchestrator --reason "test: zero verify budget" 2>>"$WORK/stderr-4b.log" || rc=$?
+assert_eq "exit 0 with a zero post-paste verify budget (busy seen on the first probe)" "$rc" "0"
 
 # --- Test 5: missing NEXUS_ROOT / --target → bad usage ------------------
 
@@ -1235,6 +1327,310 @@ else
     fail "manifest consumed by a spawn that never happened — your-org/nexus-code#651 finding 2, through #1327's door"
 fi
 rm -f "$MANIFEST" "$MANIFEST_MARKER"
+
+# --- Test 12: the brief says when workers are being auto-continued -------
+#
+# The 2026-09-27 restart. Recovery spawns the orchestrator BEFORE it resumes
+# the prior workers, so this brief is composed while their windows do not
+# exist. It listed an empty board and said "Confirm your last in-flight
+# delegation"; the orchestrator resumed three workers by hand, racing
+# recovery's own resume. With an ACTIVE auto-continue plan the brief must
+# name every worker with its session id and window state, say plainly not to
+# resume them, and never render the empty board as "gone".
+
+echo '=== auto-continue plan: the brief names the workers and says do NOT resume ==='
+PLAN12="$STATE_DIR/auto-continue-plan.tsv"
+sleep 120 & OWNER12=$!
+_st12=$(cat "/proc/$OWNER12/stat"); _st12="${_st12##*) }"; set -- $_st12; START12="${20}"; set --
+SID_P="aaaaaaaa-0000-0000-0000-000000000001"
+SID_U="bbbbbbbb-0000-0000-0000-000000000002"
+write_plan12() {  # write_plan12 <owner-start> <state>
+    printf '#owner\t%s\t%s\ttok\t%s\t%s\tcontinue\n' "$OWNER12" "$1" "$(date +%s)" "$2" > "$PLAN12"
+    printf 'w-pending\t%s\tpending\t1\n' "$SID_P" >> "$PLAN12"
+    printf 'worker-foo\t%s\tresumed\t1\n' "$SID_U" >> "$PLAN12"
+    printf 'w-skipped\tUNRESOLVED\tskipped:session-unresolvable\t1\n' >> "$PLAN12"
+    printf 'w-capped\t-\tover-cap:12\t1\n' >> "$PLAN12"
+}
+run_spawn12() {
+    NEXUS_ROOT="$FAKE_NEXUS" \
+    STATE_DIR="$STATE_DIR" \
+    FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+    FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+    FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+    FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+    PANE_STATE_BIN="$PANE_STATE_STUB" \
+    PATH="$TMUX_STUB_BIN:$PATH" \
+        bash "$SCRIPT" --target orchestrator --reason "test: $1" 2>"$WORK/stderr-12.log"
+    cat "$REPORT" 2>/dev/null
+}
+
+write_plan12 "$START12" running
+report_12=$(run_spawn12 "auto-continue active")
+assert_contains "brief carries the auto-continue heading" \
+                "$report_12" "## Worker auto-continue IN PROGRESS: do NOT resume these workers by hand"
+assert_contains "brief says the restart was a --continue" \
+                "$report_12" 'The nexus restarted with `--continue`.'
+assert_contains "a not-yet-resumed worker is named, with its session id, as PENDING" \
+                "$report_12" "- \`w-pending\`: session \`$SID_P\` — **pending**"
+assert_contains "a worker whose window is live reads UP" \
+                "$report_12" "- \`worker-foo\`: session \`$SID_U\` — **up**"
+assert_contains "a worker recovery will NOT bring back is marked as the orchestrator's call" \
+                "$report_12" "**NOT auto-continued** (skipped:session-unresolvable): yours to decide"
+assert_contains "a non-empty board still says missing plan workers are QUEUED (the 11:49 board held a bare shell)" \
+                "$report_12" "(workers in the auto-continue section that are missing here are QUEUED, not gone)"
+assert_contains "a worker past the cap is NOT promised, and the brief gives the reason and the cap" \
+                "$report_12" "- \`w-capped\`: session \`-\` — **NOT auto-continued**: past recovery's sanity cap (recover.max_workers=12"
+assert_contains "the first checks lead with do-not-resume" \
+                "$report_12" '0. Do NOT `spawn-worker.sh --resume` any worker listed under "Worker auto-continue"'
+ac_line=$(grep -m1 -n 'Worker auto-continue IN PROGRESS' <<<"$report_12" | cut -d: -f1)
+tw_line=$(grep -m1 -n '^## Current tmux windows' <<<"$report_12" | cut -d: -f1)
+if [[ -n "$ac_line" && -n "$tw_line" ]] && (( ac_line < tw_line )); then
+    pass "the auto-continue section precedes the tmux window list (read before the empty board)"
+else
+    fail "section order: auto-continue at '${ac_line}', tmux list at '${tw_line}'"
+fi
+
+echo '=== auto-continue plan + an EMPTY board: never "gone" ==='
+: > "$WORK/tmux-no-workers"
+report_12e=$(run_spawn12 "auto-continue, empty board")
+rm -f "$WORK/tmux-no-workers"
+assert_contains "the empty board says YET and points at auto-continue" \
+                "$report_12e" "(no worker windows in tmux YET: they are being auto-continued"
+assert_not_contains "the empty board does NOT say plainly that no workers are in tmux" \
+                    "$report_12e" "(no worker windows currently in tmux)"
+assert_contains "with no windows, worker-foo is PENDING-by-status, not up" \
+                "$report_12e" "- \`worker-foo\`: session \`$SID_U\` — resumed, but its window is not visible yet — cannot tell"
+
+echo '=== an unreadable plan: the brief says it CANNOT TELL ==='
+printf 'not a plan\n' > "$PLAN12"
+report_12c=$(run_spawn12 "garbled plan")
+assert_contains "garbled plan → CANNOT TELL heading" \
+                "$report_12c" "## Worker auto-continue: CANNOT TELL"
+assert_contains "garbled plan → do not conclude gone" \
+                "$report_12c" "Do NOT conclude that workers missing from tmux are gone"
+
+echo '=== no ACTIVE plan: the brief is unchanged ==='
+for variant in done dead absent; do
+    case "$variant" in
+        done)   write_plan12 "$START12" done ;;
+        dead)   write_plan12 1 running ;;          # start time mismatch = not the owner
+        absent) rm -f "$PLAN12" ;;
+    esac
+    report_12n=$(run_spawn12 "plan $variant")
+    assert_not_contains "plan $variant → no auto-continue section" "$report_12n" "auto-continue"
+    assert_not_contains "plan $variant → no do-not-resume first check" "$report_12n" "0. Do NOT"
+    # Mode-agnostic: an earlier test may have left the pin cold, which swaps
+    # "Suggested first checks" for "First actions" — both start at "1. ".
+    # NOT assert_contains with a "\n1. " needle: grep -F splits a multi-line
+    # needle into one pattern per line and the EMPTY first line matches
+    # everything — a vacuous pass. Anchor instead.
+    if grep -q '^1\. ' <<<"$report_12n" && ! grep -q '^0\. ' <<<"$report_12n"; then
+        pass "plan $variant → the ordinary first-action list starts at 1."
+    else
+        fail "plan $variant → first-action list: $(grep -m2 -E '^[0-9]\. ' <<<"$report_12n")"
+    fi
+    assert_contains     "plan $variant → the rest of the report is intact" \
+                        "$report_12n" "## Recent reports (top 5 by mtime)"
+done
+kill "$OWNER12" 2>/dev/null; wait "$OWNER12" 2>/dev/null
+rm -f "$PLAN12"
+
+# --- Test 1715: the brief's box reads TYPED-BUT-NOT-OURS at the verify -------
+#
+# your-org/nexus-code#1715, second instance (2026-10-01 11:31:42, full-stack
+# recovery): the post-paste verify read `user-typing input=typed`, the equality
+# said "not the brief", the helper reported UNDELIVERED at once, and the brief's
+# chip was later found in the box and sent by hand. The box below holds a line
+# that is NOT ours at the verdict and OUR chip (our exact K) 3 s after the paste.
+# The fix keeps looking and presses the guarded Enter once the equality holds.
+# NEGATIVE: a box that stays not-ours is never submitted.
+echo '=== #1715: typed-but-not-ours at the verify, then OUR chip: submitted once ==='
+: > "$TMUX_LOG"; : > "$PANE_STATE_LOG"; rm -f "$REPORT" "$COOLDOWN" "$WORK/stub-k" "$WORK/stub-paste-at"
+: > "$PANE_STATE_SCRIPT"
+printf 'idle user-typing__input=typed busy\n' > "$WORK/pane-state-by-enters"
+printf '3\n' > "$WORK/box-render"
+NEXUS_ROOT="$FAKE_NEXUS" \
+STATE_DIR="$STATE_DIR" \
+FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+FRESH_SPAWN_LATE_RENDER_SECONDS=15 \
+FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS=5 \
+PANE_STATE_BIN="$PANE_STATE_STUB" \
+PATH="$TMUX_STUB_BIN:$PATH" \
+    bash "$SCRIPT" --target orchestrator --reason "test: 1715 typed-not-ours" \
+                   2>"$WORK/stderr-1715.log"
+rc=$?
+assert_eq "#1715 the stub saw OUR payload's K (or this arm tests nothing)" "$( [[ -s "$WORK/stub-k" ]] && echo yes )" "yes"
+assert_eq "#1715 exit 0 — the brief that rendered as OUR chip was delivered, not reported UNDELIVERED" "$rc" "0"
+assert_eq "#1715 exactly TWO Enters: the paste's own + one guarded verify Enter" "$(grep -c 'send-keys .* Enter' "$TMUX_LOG")" "2"
+assert_not_contains "#1715 the helper did not give up on the first typed reading" "$(cat "$WORK/stderr-1715.log")" "reporting UNDELIVERED"
+
+echo '=== #1715 (third instance): Enter dropped twice while the box REDRAWS as not-ours; the third lands ==='
+# 2026-10-02 10:56:32: the brief WAS in the box, the retry Enter was dropped,
+# the box read "not shown to be the brief" five seconds later while the resumed
+# TUI redrew, and the typed-retry STOPPED on that one reading. Here: the paste's
+# own Enter and the retry Enter are dropped (state stays typed), the box reads
+# not-ours for 6 s after the 2nd Enter, then OUR chip again; only a 3rd Enter
+# submits. Red at base: the loop broke on the not-ours reading (rc 4, 2 Enters).
+: > "$TMUX_LOG"; : > "$PANE_STATE_LOG"; rm -f "$REPORT" "$COOLDOWN" "$WORK/stub-k" "$WORK/stub-paste-at" "$WORK/stub-enter-at"
+printf 'idle user-typing__input=typed user-typing__input=typed busy\n' > "$WORK/pane-state-by-enters"
+printf 'flicker-after-2 6\n' > "$WORK/box-render"
+NEXUS_ROOT="$FAKE_NEXUS" \
+STATE_DIR="$STATE_DIR" \
+FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS=30 \
+FRESH_SPAWN_SUBMIT_TYPED_RETRY_INTERVAL_SECONDS=1 \
+PANE_STATE_BIN="$PANE_STATE_STUB" \
+PATH="$TMUX_STUB_BIN:$PATH" \
+    bash "$SCRIPT" --target orchestrator --reason "test: 1715 enter dropped twice" \
+                   2>"$WORK/stderr-1715c.log"
+rc=$?
+assert_eq "#1715c the box really read not-ours after the 2nd Enter (or this arm tests nothing)" \
+          "$( grep -q 'not shown to be the brief' "$WORK/stderr-1715c.log" && echo yes )" "yes"
+assert_eq "#1715c exit 0 — the third Enter landed and the brief was delivered" "$rc" "0"
+assert_eq "#1715c exactly THREE Enters: paste's own (dropped), retry (dropped), the one that lands" "$(grep -c 'send-keys .* Enter' "$TMUX_LOG")" "3"
+assert_not_contains "#1715c the typed-retry did not stop on the redraw" "$(cat "$WORK/stderr-1715c.log")" "typed-retry stopped"
+
+echo '=== #1715 NEGATIVE: the box STAYS not-ours — never submitted, UNDELIVERED ==='
+: > "$TMUX_LOG"; : > "$PANE_STATE_LOG"; rm -f "$REPORT" "$COOLDOWN" "$WORK/stub-k" "$WORK/stub-paste-at"
+printf 'idle user-typing__input=typed busy\n' > "$WORK/pane-state-by-enters"
+printf 'never\n' > "$WORK/box-render"; rm -f "$WORK/stub-enter-at"
+NEXUS_ROOT="$FAKE_NEXUS" \
+STATE_DIR="$STATE_DIR" \
+FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+FRESH_SPAWN_LATE_RENDER_SECONDS=4 \
+FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS=5 \
+PANE_STATE_BIN="$PANE_STATE_STUB" \
+PATH="$TMUX_STUB_BIN:$PATH" \
+    bash "$SCRIPT" --target orchestrator --reason "test: 1715 draft stays" \
+                   2>"$WORK/stderr-1715n.log"
+rc=$?
+assert_eq "#1715 NEG exit 4 — an operator draft is reported UNDELIVERED" "$rc" "4"
+assert_eq "#1715 NEG exactly ONE Enter — the paste's own; the draft was never submitted" "$(grep -c 'send-keys .* Enter' "$TMUX_LOG")" "1"
+assert_contains "#1715 NEG …and the refusal names the draft hazard" "$(cat "$WORK/stderr-1715n.log")" "not shown to be the brief"
+rm -f "$WORK/pane-state-by-enters" "$WORK/box-render" "$WORK/stub-enter-at"
+
+# --- Test 1715-lost: the brief's bytes are GONE and no turn ran ------------
+# your-org/nexus-code#1715, fifth instance (2026-10-02 17:19): the paste landed
+# in a resume still restoring, the box later read EMPTY, nothing ran it, and the
+# helper gave up (rc 4). Now: re-gate on a stable empty prompt and RE-PASTE,
+# bounded at FRESH_SPAWN_REPASTE_ATTEMPTS pastes; never into a box holding text.
+# Red at 648f38f3: one paste, rc 4.
+_run_lost() {   # <label> — the shared invocation; arms set the stub files first
+    : > "$TMUX_LOG"; : > "$PANE_STATE_LOG"; rm -f "$REPORT" "$COOLDOWN" "$WORK/stub-k" "$WORK/stub-paste-at" "$WORK/stub-enter-at"
+    : > "$PANE_STATE_SCRIPT"
+    NEXUS_ROOT="$FAKE_NEXUS" \
+    STATE_DIR="$STATE_DIR" \
+    FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+    FRESH_SPAWN_READINESS_BUDGET_SECONDS=4 \
+    FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+    FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+    FRESH_SPAWN_LATE_RENDER_SECONDS=2 \
+    FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS=4 \
+    PANE_STATE_BIN="$PANE_STATE_STUB" \
+    PATH="$TMUX_STUB_BIN:$PATH" \
+        bash "$SCRIPT" --target orchestrator --reason "test: 1715 $1" 2>"$WORK/stderr-1715-$1.log"
+}
+echo '=== #1715-lost: the first paste is LOST (box empty, nothing ran) → re-pasted, delivered ==='
+printf '1\n' > "$WORK/pane-state-lost"; printf '0\n' > "$WORK/box-render"   # the re-paste shows OUR chip
+_run_lost lost-once; rc=$?
+assert_eq "#1715-lost exit 0 — the brief was re-pasted and delivered" "$rc" "0"
+assert_eq "#1715-lost exactly TWO pastes (the lost one + one re-paste)" "$(grep -c 'paste-buffer' "$TMUX_LOG")" "2"
+assert_eq "#1715-lost exactly TWO Enters: paste 1's own + ONE guarded Enter after the equality (no blind Enter on the re-paste)" \
+          "$(grep -c 'send-keys .* Enter' "$TMUX_LOG")" "2"
+assert_contains "#1715-lost the log names the re-paste and its bound" "$(cat "$WORK/stderr-1715-lost-once.log")" "RE-PASTING after a stable-prompt gate (attempt 2/3"
+
+echo '=== #1715-lost GAP (skeptic F1): an operator types into the box right after the RE-paste → never submitted ==='
+# The re-paste used to send the paste's own BLIND Enter, cleared only by a pane
+# reading seconds stale; text typed in that gap was submitted WITH the brief.
+# Here the box holds operator text once the re-paste lands: no Enter may follow.
+# Red at 91cf942d: 2 Enters (the re-paste's blind one), rc 0 — the draft SENT.
+printf '1\n' > "$WORK/pane-state-lost"; printf 'never\n' > "$WORK/box-render"
+_run_lost lost-gap; rc=$?
+assert_eq "#1715-lost GAP exit 4 — the box is not ours, so the brief is UNDELIVERED" "$rc" "4"
+assert_eq "#1715-lost GAP exactly TWO pastes (the lost one + the re-paste)" "$(grep -c 'paste-buffer' "$TMUX_LOG")" "2"
+assert_eq "#1715-lost GAP exactly ONE Enter — paste 1's own; NOTHING submitted the operator's text" "$(grep -c 'send-keys .* Enter' "$TMUX_LOG")" "1"
+rm -f "$WORK/box-render"
+
+echo '=== #1715-lost BOUND: every paste is lost → exactly 3 pastes, then UNDELIVERED ==='
+printf '99\n' > "$WORK/pane-state-lost"
+_run_lost lost-always; rc=$?
+assert_eq "#1715-lost BOUND exit 4 — UNDELIVERED once the attempts are spent" "$rc" "4"
+assert_eq "#1715-lost BOUND exactly THREE pastes (FRESH_SPAWN_REPASTE_ATTEMPTS default)" "$(grep -c 'paste-buffer' "$TMUX_LOG")" "3"
+
+echo '=== #1715-lost NEGATIVE: the box holds TYPED text after the paste → NO re-paste, no extra Enter ==='
+printf '99\n' > "$WORK/pane-state-lost"; : > "$WORK/pane-state-lost-draft"; printf 'never\n' > "$WORK/box-render"
+_run_lost lost-draft; rc=$?
+assert_eq "#1715-lost NEG exit 4" "$rc" "4"
+assert_eq "#1715-lost NEG exactly ONE paste — never re-pasted over typed text" "$(grep -c 'paste-buffer' "$TMUX_LOG")" "1"
+assert_eq "#1715-lost NEG exactly ONE Enter — the paste's own; the draft was never submitted" "$(grep -c 'send-keys .* Enter' "$TMUX_LOG")" "1"
+rm -f "$WORK/pane-state-lost" "$WORK/pane-state-lost-draft" "$WORK/box-render"
+
+echo '=== #1715 resume gate: `empty` is NOT ready on a RESUME — the paste waits for 3 stable reads ==='
+: > "$TMUX_LOG"; : > "$PANE_STATE_LOG"; rm -f "$REPORT" "$COOLDOWN" "$WORK/stub-probes-at-paste"
+printf '%s\n' "$PIN_SID" > "$PIN_FILE"   # a RESUME needs a valid pin (an earlier arm may have left it cold)
+printf 'empty\nempty\nempty\nidle\nidle\nidle\n' > "$PANE_STATE_SCRIPT"
+NEXUS_ROOT="$FAKE_NEXUS" \
+STATE_DIR="$STATE_DIR" \
+FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=6 \
+FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+PANE_STATE_BIN="$PANE_STATE_STUB" \
+PATH="$TMUX_STUB_BIN:$PATH" \
+    bash "$SCRIPT" --target orchestrator --reason "test: 1715 resume gate" 2>"$WORK/stderr-1715-gate.log"
+rc=$?
+assert_contains "#1715 resume gate: this run IS a resume (or the arm tests nothing)" "$(cat "$WORK/stderr-1715-gate.log")" "mode=resume"
+assert_eq "#1715 resume gate exit 0" "$rc" "0"
+assert_eq "#1715 resume gate: the paste came after the 3 empty reads AND 3 stable idle reads (>= 6 probes)" \
+          "$(( $(cat "$WORK/stub-probes-at-paste" 2>/dev/null || echo 0) >= 6 ? 1 : 0 ))" "1"
+: > "$PANE_STATE_SCRIPT"
+
+# --- Test 1715-ro: the STATE DIR is READ-ONLY (your-nexus#386) ------------
+# The respawns behind #1715 ran while the project FS was read-only. The brief
+# must not depend on a tree write: with the state dir unwritable and a STALE
+# report from an earlier run still on disk, the pasted brief must be THIS run's
+# report (composed under $TMPDIR), and the respawn must still be delivered.
+# Red at 648f38f3: `> "$REPORT_FILE"` failed and the stale report was pasted.
+echo '=== #1715-ro: read-only state dir → the brief is THIS run'"'"'s report, delivered ==='
+: > "$TMUX_LOG"; : > "$PANE_STATE_LOG"; rm -f "$COOLDOWN" "$WORK/stub-loaded"
+printf 'STALE report from an earlier run — must not be pasted\n' > "$REPORT"
+# BOTH the dir and the existing report: an existing file in an a-w dir can still
+# be overwritten, and a read-only FS refuses both (measured: dir-only let base pass).
+chmod a-w "$REPORT" "$STATE_DIR"
+if [[ -w "$STATE_DIR" || -w "$REPORT" ]]; then
+    chmod u+w "$STATE_DIR" "$REPORT"
+    pass "#1715-ro SKIPPED: this user can write a mode a-w dir (the precondition cannot be built here)"
+else
+    NEXUS_ROOT="$FAKE_NEXUS" \
+    STATE_DIR="$STATE_DIR" \
+    FRESH_SPAWN_CLAUDE_WAIT_SECONDS=0 \
+    FRESH_SPAWN_READINESS_BUDGET_SECONDS=2 \
+    FRESH_SPAWN_READINESS_POLL_SECONDS=0 \
+    FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 \
+    PANE_STATE_BIN="$PANE_STATE_STUB" \
+    PATH="$TMUX_STUB_BIN:$PATH" \
+        bash "$SCRIPT" --target orchestrator --reason "test: 1715 read-only state dir" \
+                       2>"$WORK/stderr-1715ro.log"
+    rc=$?
+    chmod u+w "$STATE_DIR" "$REPORT"
+    assert_eq "#1715-ro exit 0 — the respawn delivered with the state dir read-only" "$rc" "0"
+    assert_contains "#1715-ro the PASTED brief is this run's report (it names this run's reason)" \
+                    "$(cat "$WORK/stub-loaded" 2>/dev/null)" "test: 1715 read-only state dir"
+    assert_not_contains "#1715-ro …and NOT the stale report left on disk" \
+                        "$(cat "$WORK/stub-loaded" 2>/dev/null)" "STALE report from an earlier run"
+    assert_contains "#1715-ro the log says where the brief was composed instead" \
+                    "$(cat "$WORK/stderr-1715ro.log")" "must not depend on a tree write"
+fi
+rm -f "$REPORT"
 
 # --- summary ------------------------------------------------------------
 

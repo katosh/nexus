@@ -33,6 +33,11 @@
 #          Enter beyond the dropped one, and the draft is still in the box.
 #          It is also the instrument's negative control: the request/record
 #          counters are shown able to say NO.
+#   load   (your-org/nexus-code#1674) no rig fault: the session transcript is
+#          inflated so the RESUME is still loading when the paste and its Enter
+#          arrive. The Enter is lost, the pane reads `empty`, and the brief
+#          later shows in the box. ONE record (rc and requests are NOTES; see the arm), and the
+#          verify stage must be seen WAITING on the indeterminate reading.
 #
 # THE FAULT IS INJECTED AT THE TRANSPORT, NOT IN THE SUBJECT. A PATH-front
 # `tmux` shim (rig-owned, $CCH_DIR/.bin-rv) sits ahead of the harness's
@@ -295,12 +300,83 @@ assert_eq "draft: NO reading outside {idle,busy,user-typing} in the verify windo
 wait_for "draft: the draft is still in the box (user-typing)" 15 -- cch_state_is "$(cur_win)" user-typing
 close_orch
 
+# ---- load: the RESUME itself is the fault (your-org/nexus-code#1674) --------
+# No rig fault. The session's transcript is inflated before the respawn, so the
+# `--resume` is still loading when the paste and its Enter arrive. MEASURED on
+# 2.1.284: an Enter sent then is LOST, the pasted bytes show up in the box as
+# typed text once it renders, and the pane reads `empty`/`unknown` meanwhile.
+# Production (2026-09-29 13:15:00) read that `empty` in the strict typed-retry
+# loop and gave up; the operator pressed Enter by hand 29 s later.
+#
+# WHAT THIS ARM CAN AND CANNOT ASSERT, measured while building it:
+#   * the load must outlast the paste, its Enter AND the one indeterminate retry,
+#     or the strict loop is never reached. 800 MB did not (the retry submitted);
+#     neither did 2.4 GB ending on a compact boundary (the binary loads that fast).
+#     2.4 GB of plain history does: 8 `empty` readings in the verify window.
+#   * but a history that large goes out as the REQUEST, and in one of two head
+#     runs the turn died before the mock saw it: the pane never read `busy`, and
+#     `_respawn_orchestrator` said rc 4 on a brief that WAS submitted (the other
+#     run: rc 0, one request). So rc and the request count are NOTES here; the
+#     discriminator is the TRANSCRIPT: exactly one submission recorded. Measured
+#     at 2.4 GB: head 1, pre-fix base 0 (it gives up on `empty` with the brief
+#     in the box, logging production's 13:15:00 line verbatim).
+# RIG SEAMS, both standing in for a longer production load: readiness budget 0
+# (production's probe TIMED OUT and pasted anyway; a 30 s or even 2 s budget
+# waits the load out here, since each pane-state read takes seconds on a loaded
+# host), and a 1 s verify window. RV_LOAD_MB default 2400, CHOSEN from the above.
+rv_inflate() {   # rv_inflate <sid> <mb> — append valid chained user/assistant pairs
+    local f
+    # First match WITHOUT an early-exit reader (early-exit-readers.manifest, #622):
+    # awk reads its whole input, so nothing closes the pipe on the writer.
+    f=$(_transcripts | awk -v w="/$1.jsonl" 'index($0, w) && !f { print; f = 1 }')
+    [[ -n "$f" ]] || return 1
+    python3 - "$f" "$2" <<'PY'
+import json, sys, uuid
+f, mb = sys.argv[1], int(sys.argv[2])
+recs = [json.loads(l) for l in open(f) if l.strip()]
+u = [r for r in recs if r.get("type") == "user" and isinstance(r.get("message", {}).get("content"), str)][-1]
+a = [r for r in recs if r.get("type") == "assistant"][-1]
+parent = next(r["uuid"] for r in reversed(recs) if r.get("uuid"))
+pad = "lorem ipsum dolor sit amet " * 180
+size, n = 0, 0
+with open(f, "a") as out:
+    while size < mb * 1024 * 1024:
+        n += 1
+        uu = dict(u, uuid=str(uuid.uuid4()), parentUuid=parent, promptId=str(uuid.uuid4()))
+        uu["message"] = dict(u["message"], content="filler turn %d %s" % (n, pad))
+        s = json.dumps(uu); out.write(s + "\n"); size += len(s)
+        aa = dict(a, uuid=str(uuid.uuid4()), parentUuid=uu["uuid"])
+        aa["message"] = dict(a["message"], id="msg_" + uuid.uuid4().hex, content=[{"type": "text", "text": "ack %d %s" % (n, pad)}])
+        s = json.dumps(aa); out.write(s + "\n"); size += len(s); parent = aa["uuid"]
+PY
+}
+arm_version load
+boot_orch load
+_lt=$(_transcripts | awk -v w="/$SID.jsonl" 'index($0, w) && !f { print; f = 1 }')
+echo "  NOTE: load: transcript ${_lt:-<none found for $SID>} = $(stat -c %s "$_lt" 2>/dev/null || echo '?') bytes before inflation"
+rv_inflate "$SID" "${RV_LOAD_MB:-2400}"; _li=$?
+echo "  NOTE: load: rv_inflate rc=$_li; transcript now $(stat -c %s "$_lt" 2>/dev/null || echo '?') bytes"
+rv_brief "$CCH_DIR/b-load" load
+echo "0 none" > "$CCH_DIR/fault"
+r0=$(nreq); s0=$(nrec)
+FRESH_SPAWN_READINESS_BUDGET_SECONDS=0 FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=1 cch_with_tmux_env _drive "$SID" "$CCH_DIR/b-load"; rc=$?
+wait_for "load: the respawned pane returns to idle" 90 -- cch_state_is "$(cur_win)" idle
+sleep 1
+TR="$CCH_DIR/trace-load"
+report_arm load "$TR"
+assert_eq "load: the resume presented an INDETERMINATE reading after the paste (or this arm tests nothing)" "$(( $(n_outside "$TR") > 0 ))" "1"
+echo "  NOTE: load: _respawn_orchestrator rc=$rc, requests +$(grew_by "$(nreq)" "$r0") (not asserted: an oversized history can kill the turn before the mock — see above)"
+assert_eq "load: exactly ONE submission was recorded — the brief left the box once, not zero times, not twice" "$(grew_by "$(nrec)" "$s0")" "1"
+assert_contains "load: the verify stage WAITED on the indeterminate reading instead of giving up" "$(cat "$TR")" "waiting for the box to read as the brief"
+close_orch
+
 # ---- assertion-count guard (count=exact, summary-honesty) -------------------
 # Every assertion runs whether it passes or fails (a failed wait_for is
 # COUNTED, not skipped), so the total is a constant: 3 arms × boot_orch's two
 # waits = 6; ctl 1 wait + 6; drop 1 wait + 8; draft 8 (incl. its wait).
-# MEASURED at 30 on 2.1.280, not arithmetic alone.
-EXPECTED_ASSERTIONS=30
+# MEASURED at 30 on 2.1.280, not arithmetic alone. The `load` arm (#1674) adds
+# boot_orch's 2 waits + 1 wait + 3 = 6, so 36.
+EXPECTED_ASSERTIONS=36
 TOTAL_ASSERTIONS=$(( ${PASS:-0} + ${FAIL:-0} ))
 # ONE physical line, deliberately (the summary-honesty classifier reads it so).
 assert_eq "assertion TOTAL matches EXPECTED_ASSERTIONS — no assertion silently dropped or added" "$TOTAL_ASSERTIONS" "$EXPECTED_ASSERTIONS"

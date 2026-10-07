@@ -31,6 +31,12 @@ bad() { printf '  FAIL: %s — %s
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
+# This suite asserts the WAIT records only. The hook's auto-armed longjob
+# watch (and, since your-org/nexus-code#1727, its NOT-ARMED notice on stdout)
+# is covered in test-pane-state-longjob-discount.sh; left on here, an inherited
+# NEXUS_ROOT would make every slurm case run THAT root's longjob-watch.sh.
+export MONITOR_LONGJOB_AUTO_WATCH=false
+
 [[ -x "$HOOK" ]] || { echo "missing hook: $HOOK" >&2; exit 1; }
 [[ -f "$PATTERNS_DEFAULT" ]] || { echo "missing default patterns: $PATTERNS_DEFAULT" >&2; exit 1; }
 
@@ -973,7 +979,12 @@ fi
 # 121..661, beside the real job id (synthetic here: 4200001) (worker-a-sk, 2026-09-23). The field now
 # anchors the whole line, as `--parsable` prints it.
 reset_hb
-fire_hook "jid=\$(sbatch --parsable j.sh); echo \$jid; grep -n x f" $'121:x = 1\n489:  x\n4200001\n542: done'
+# (An sbatch-ONLY call: since your-org/nexus-code#1727 a bare number is never
+# trusted from a substituted sbatch, NOR from a call that runs another command
+# beside it (`sbatch --parsable j.sh; grep -n x f` now declares a syn- wait and
+# prints NOT ARMED, asserted in test-pane-state-longjob-discount.sh). The
+# ANCHOR is what this case pins: line-numbered lines never become ids.)
+fire_hook "sbatch --parsable j.sh" $'121:x = 1\n489:  x\n4200001\n542: done'
 got=$(read_waits)
 if jq -e 'map(.id) == ["4200001"]' <<<"$got" >/dev/null; then
     ok "#1629 line-numbered output beside a parsable id registers ONLY the real id"
@@ -994,6 +1005,29 @@ if [[ "$(jq -r '.[0].id' <<<"$(read_waits)")" == "2307577" ]]; then
     ok "#1629 trailing whitespace after a parsable id is still accepted (control)"
 else
     bad "#1629 trailing whitespace" "got=$(read_waits)"
+fi
+
+# JOB ID 0, AND A BARE NUMBER FROM INSIDE `$(…)` (your-org/nexus-code#1727).
+# `jid=$(sbatch --parsable j.sh); echo $?` printed `0`, and `0` became the job
+# id: `sacct -j 0` then answered about unrelated jobs for ~9.5 h. Two
+# independent guards, one case each: the job-id predicate refuses `0` on a
+# plain --parsable call, and a substituted sbatch's call reads NO bare number —
+# the `1` below is a valid id SHAPE, so only the substitution rule stops it.
+reset_hb
+fire_hook "sbatch --parsable j.sh" "0" >/dev/null
+got=$(read_waits)
+if jq -e 'length == 1 and (.[0].id | startswith("syn-"))' <<<"$got" >/dev/null; then
+    ok "#1727 a bare 0 is not a job id (syn- fallback, no slurm:0 wait)"
+else
+    bad "#1727 job id 0 accepted" "got=$got"
+fi
+reset_hb
+fire_hook 'J=$(sbatch --parsable j.sh); echo $?' "1" >/dev/null
+got=$(read_waits)
+if jq -e 'length == 1 and (.[0].id | startswith("syn-"))' <<<"$got" >/dev/null; then
+    ok "#1727 inside \$(…) the bare number printed by \`echo \$?\` is not read as the job id"
+else
+    bad "#1727 substituted sbatch read a bare number as its id" "got=$got"
 fi
 
 # NARROW ON PURPOSE. A general bare-numeric id rule would register stray output
@@ -1114,7 +1148,7 @@ got=$(read_waits)
 assert_eq "#1439 CONTROL: no identity in the payload → no launcher field (not an empty string)" \
     "$(jq -r '.[0] | has("launcher")' <<<"$got")" "false"
 
-_EXPECTED_ASSERTIONS=125   # +3: #1439 launcher identity on the row; +3: #1629 phantom parsable ids
+_EXPECTED_ASSERTIONS=127   # +3: #1439 launcher identity on the row; +3: #1629 phantom parsable ids; +2: #1727 id 0 / $(…)
 _ran=$(( PASS + FAIL + 1 ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     ok "every declared assertion executed ($_EXPECTED_ASSERTIONS)"

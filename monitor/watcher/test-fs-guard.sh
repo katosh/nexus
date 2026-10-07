@@ -42,6 +42,9 @@ source "$_dir/_fs_guard.sh"
 WORK=$(mktemp -d)
 # 0555 fixtures must be made writable again before rm can recurse them.
 trap 'chmod -R u+rwX "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
+# The degraded status file + paste lock live in a run dir OUTSIDE the tree
+# (your-org/nexus-code#1724); keep this suite's out of the operator's.
+export NEXUS_DEGRADED_RUNDIR="$WORK/degraded-run"
 
 # root ignores mode bits, so a 0555 dir is still writable for it.
 _can_test_ro=1

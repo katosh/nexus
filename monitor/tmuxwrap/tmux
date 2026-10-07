@@ -1386,8 +1386,18 @@ _tw_resolve_alias() {   # <word> -> _tw_ra_found (1 = an alias of that name exis
             *)        _tw_ra_multi=1 ;;
         esac
         _tw_ra_l="${_tw_ra_l# }"
+        # 3.x RENDERS DIFFERENTLY (#1703, measured on 3.4 — the CI runner's
+        # tmux): `args_escape` prints an entry BARE when it holds nothing to
+        # quote (`zp=plain`, `z\tq=kill-server`, `zb=a\\b`), in SINGLE quotes
+        # when it holds `"` or a space but none of ` #';${}%`
+        # (`'zq="kill-server"'`), and in double quotes otherwise — every form
+        # still escaped, `\t`/`\n` C-style where 2.6 printed `\011`. Decoding
+        # only `"…"` left `'zq` as the NAME, so `zq="kill-server"` resolved to
+        # no alias and the server DIED through it on 3.4 (REAL SK-F1). A bare
+        # 2.6 line holds no backslash, so unrendering it is the identity.
         case "$_tw_ra_l" in
-            '"'*'"') _tw_unrender "${_tw_ra_l:1:$((${#_tw_ra_l} - 2))}"; _tw_ra_l="$_tw_ur" ;;
+            '"'*'"'|"'"*"'") _tw_unrender "${_tw_ra_l:1:$((${#_tw_ra_l} - 2))}"; _tw_ra_l="$_tw_ur" ;;
+            *)               _tw_unrender "$_tw_ra_l"; _tw_ra_l="$_tw_ur" ;;
         esac
         if [ "$_tw_ra_multi" = 1 ]; then _tw_ra_l="${_tw_ra_l//,/$'\n'}"; fi
         while IFS= read -r _tw_ra_e; do
@@ -1399,8 +1409,11 @@ _tw_resolve_alias() {   # <word> -> _tw_ra_found (1 = an alias of that name exis
     done <<< "$_tw_alias_tbl"
     return 0
 }
-# _tw_unrender <text> -> _tw_ur: undo `show`'s quoting inside "…" — `\NNN`
-# octal is that byte, `\X` is X. Measured renderings: `\"`, `\\`, `\011`.
+# _tw_unrender <text> -> _tw_ur: undo `show`'s quoting — `\NNN` octal is that
+# byte, `\X` is X. Measured renderings: `\"`, `\\`, `\011` (2.6); 3.4 adds the
+# C-style `\t \n \r \b \a \v \f` and a leading `\~` (#1703). 2.6 never emits a
+# C-style letter after a lone `\` (it prints `\` itself as `\\`), so decoding
+# them is unambiguous on both.
 _tw_unrender() {
     _tw_ur=""; _tw_ur_s="$1"; _tw_ur_i=0
     while [ "$_tw_ur_i" -lt "${#_tw_ur_s}" ]; do
@@ -1409,6 +1422,7 @@ _tw_unrender() {
             _tw_ur_o="${_tw_ur_s:$_tw_ur_i:3}"
             case "$_tw_ur_o" in
                 [0-7][0-7][0-7]) printf -v _tw_ur_c "\\$_tw_ur_o"; _tw_ur_i=$((_tw_ur_i + 3)) ;;
+                [tnrbavf]*)      printf -v _tw_ur_c "\\${_tw_ur_o:0:1}"; _tw_ur_i=$((_tw_ur_i + 1)) ;;
                 *)               _tw_ur_c="${_tw_ur_s:$_tw_ur_i:1}"; _tw_ur_i=$((_tw_ur_i + 1)) ;;
             esac
         fi
@@ -1939,7 +1953,10 @@ _tw_tell_orchestrator() {   # $1 = the one-line reason; SETS _tw_told
     # unset to the channel, so the prefix is unconditional), and ASK the
     # channel where it writes when we do not.
     if [ -n "${_tw_state:-}" ]; then
-        _tw_reqdir="$_tw_state/requests"
+        # The ONE inbox resolver (your-org/nexus-code#1723), asked in a
+        # subshell so nothing it defines leaks into this shim.
+        _tw_reqdir=$( . "${_tw_chan%/*}/_requests_dir.sh" 2>/dev/null \
+                      && nexus_requests_dir "$_tw_state" 2>/dev/null ) || _tw_reqdir=""
     else
         _tw_reqdir=$("$_tw_chan" dir 2>/dev/null) || _tw_reqdir=""
     fi

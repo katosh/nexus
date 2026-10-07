@@ -159,25 +159,117 @@ _version_hash_files() {
 
 # _version_watcher_source_set <main_sh>
 #
-# The watcher's source set: main.sh itself plus every module it loads
-# via the canonical `source "$_script_dir/<rel>"` pattern (including
-# `../_cc-version.sh`). Parsed from the ON-DISK main.sh so a pull that
-# adds a new module both changes main.sh (hash bump now) and extends
-# the set (tracked from then on). rc 1 when main.sh is absent.
+# The watcher's source set: main.sh plus the TRANSITIVE closure of every
+# module it loads (your-org/nexus-code#1746). Parsed from the ON-DISK files
+# so a pull that adds a module both changes its parent (hash bump now) and
+# extends the set (tracked from then on). rc 1 when main.sh is absent.
+#
+# This used to be depth-1: only main.sh's own `source "$_script_dir/…"` lines.
+# A module reached through a LIBRARY (`_lib.sh` -> `_fs_probe.sh`,
+# `_lib.sh`/`_respawn.sh` -> `_cc_transcript_roots.sh`, `_unstick.sh` ->
+# `_pane-live.sh`) was invisible, so a pull that changed only it left the
+# running watcher on stale code with no drift ever detected. main.sh's
+# comments record the workaround that was needed instead: re-sourcing such
+# modules from main.sh just to put them in the set.
+#
+# THE GRAMMAR, stated so it can be disagreed with. For each file in the set,
+# every non-comment line that is a `source`/`.` statement — or an assignment
+# to a variable that the SAME file later sources (`_ib_sh=…`, `lib=…`,
+# `: "${X:=…}"`) — contributes each `/<name>.sh` path suffix it carries
+# (`/../<name>.sh` included). The suffix is resolved against the file's own
+# directory and against its parent, the two anchors every loader here uses
+# (`$_script_dir`, `${BASH_SOURCE[0]%/*}`, `$_monitor_dir`,
+# `$NEXUS_ROOT/monitor`). Every candidate that EXISTS as a regular file
+# inside the monitor tree joins the set. Errors are in the SAFE direction:
+#   * over-inclusion (a heredoc that writes a `. "$X/foo.sh"` line for a
+#     generated script, a file resolved under both anchors) costs at most one
+#     unneeded self-restart when that file changes;
+#   * a DEEPER candidate that does not exist is DROPPED — a missing file makes
+#     `_version_hash_files` answer TORN, and a reference that never resolves
+#     (a guarded optional module, a generated script's text) would otherwise
+#     disable the self-restart for good. A mid-pull rename at depth >= 2 is
+#     still covered by the settle window: drift must hold still before acting.
+#   * main.sh's OWN `source "$_script_dir/…"` modules keep the original
+#     contract: listed even when missing, so a torn pull reads TORN and the
+#     watcher does nothing until the tree is whole.
+# A path with directories (a variable, then `watcher/_lib.sh`) is tried by
+# each of its suffixes (`watcher/_lib.sh`, `_lib.sh`) under both anchors.
+# NOT covered: a path assembled at runtime from parts with no `.sh` literal.
 _version_watcher_source_set() {
     local main_sh="${1:?main_sh required}"
     [[ -f "$main_sh" ]] || return 1
-    local dir
+    local dir monitor_dir
     dir=$(cd "$(dirname "$main_sh")" && pwd) || return 1
-    {
-        printf '%s\n' "$dir/$(basename "$main_sh")"
-        # shellcheck disable=SC2016
-        sed -nE 's|^[[:space:]]*source[[:space:]]+"\$_script_dir/([^"]+)".*|\1|p' \
-            "$main_sh" \
-            | while IFS= read -r rel; do
-                  [[ -n "$rel" ]] && printf '%s/%s\n' "$dir" "$rel"
-              done
-    } | sort -u
+    monitor_dir=$(cd "$dir/.." && pwd) || return 1
+    local -A seen=()
+    local -a queue=("$dir/$(basename "$main_sh")")
+    local f fdir rel cand base sfx
+    # main.sh's direct modules, on the original contract (listed if missing).
+    # shellcheck disable=SC2016
+    while IFS= read -r rel; do
+        [[ -n "$rel" ]] || continue
+        cand="$dir/$rel"
+        if [[ -f "$cand" ]]; then
+            cand=$(cd "${cand%/*}" 2>/dev/null && printf '%s/%s' "$(pwd)" "${cand##*/}") || cand="$dir/$rel"
+            queue+=("$cand")
+        else
+            seen[$cand]=1
+        fi
+    done < <(sed -nE 's|^[[:space:]]*source[[:space:]]+"\$_script_dir/([^"]+)".*|\1|p' "$main_sh")
+    while (( ${#queue[@]} > 0 )); do
+        f="${queue[0]}"; queue=("${queue[@]:1}")
+        [[ -n "${seen[$f]:-}" ]] && continue
+        seen[$f]=1
+        fdir="${f%/*}"
+        while IFS= read -r rel; do
+            [[ -n "$rel" ]] || continue
+            sfx="$rel"
+            while :; do
+                for base in "$fdir" "${fdir%/*}"; do
+                    cand="$base/$sfx"
+                    [[ -f "$cand" ]] || continue
+                    cand=$(cd "${cand%/*}" 2>/dev/null && printf '%s/%s' "$(pwd)" "${cand##*/}") || continue
+                    case "$cand" in "$monitor_dir"/*) ;; *) continue ;; esac
+                    [[ -n "${seen[$cand]:-}" ]] || queue+=("$cand")
+                done
+                [[ "$sfx" == */* && "${sfx%%/*}" != .. ]] || break
+                sfx="${sfx#*/}"
+            done
+        done < <(_version_source_refs "$f")
+    done
+    printf '%s\n' "${!seen[@]}" | sort -u
+}
+
+# _version_source_refs <file> — the `<rel>.sh` suffixes <file> sources, one
+# per line, per the grammar above. Comment lines are skipped.
+_version_source_refs() {
+    awk '
+        function emit(line,   m) {
+            while (match(line, /\/(\.\.\/)*([A-Za-z0-9_][A-Za-z0-9_.-]*\/)*[A-Za-z0-9_][A-Za-z0-9_.-]*\.sh/)) {
+                print substr(line, RSTART + 1, RLENGTH - 1)
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+        /^[[:space:]]*#/ { next }
+        { lines[NR] = $0 }
+        # A source statement: `source X` / `. X`, at line start or after ; && || then do {
+        $0 ~ /(^|[;&|{[:space:]])(source|\.)[[:space:]]+["$]/ {
+            emit($0)
+            # Variables this file sources: `source "$v"` / `. "${v}"`.
+            s = $0
+            while (match(s, /(source|\.)[[:space:]]+"?\$\{?[A-Za-z_][A-Za-z0-9_]*/)) {
+                v = substr(s, RSTART, RLENGTH); sub(/^(source|\.)[[:space:]]+"?\$\{?/, "", v)
+                vars[v] = 1; s = substr(s, RSTART + RLENGTH)
+            }
+        }
+        END {
+            for (i = 1; i <= NR; i++) {
+                if (!(i in lines)) continue
+                for (v in vars) {
+                    if (lines[i] ~ ("(^|[^A-Za-z0-9_])" v "(=|:=)")) { emit(lines[i]); break }
+                }
+            }
+        }' "$1" 2>/dev/null
 }
 
 # _version_cockpit_source_set <monitor_dir>

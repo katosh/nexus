@@ -198,7 +198,9 @@
 #                                                  → "<state>|<detail>", one shot
 #   longjob-watch.sh await <id> [--timeout S]      block until terminal; for
 #                                                   `run_in_background` when the
-#                                                   dispatcher is NOT armed
+#                                                   dispatcher is NOT armed. S
+#                                                   defaults to fit the default
+#                                                   Bash timeout; > ~2 h → rc 2
 #   longjob-watch.sh unmute | reset
 #   longjob-watch.sh dispatch                      the host-armed loop (never returns).
 #                                                   NEVER BY HAND IN A LIVE SESSION: a second
@@ -269,6 +271,30 @@ UNKNOWN_MAX=$(_cfg MONITOR_LONGJOB_UNKNOWN_MAX monitor.longjob.unknown_max 5)
 TTL_SECONDS=$(_cfg MONITOR_LONGJOB_TTL_SECONDS monitor.longjob.ttl_seconds 604800)
 PROBE_TIMEOUT=$(_cfg MONITOR_LONGJOB_PROBE_TIMEOUT_SECONDS monitor.longjob.probe_timeout_seconds 30)
 (( POLL_SECONDS < 5 )) && POLL_SECONDS=5
+# `await` runs under the Bash tool's run_in_background, and since Claude Code
+# 2.1.285 the harness STOPS that call at the call's own `timeout` (default
+# max(30 min, BASH_DEFAULT_TIMEOUT_MS), ceiling max(2 h, BASH_MAX_TIMEOUT_MS))
+# and re-invokes the agent with a stop notice instead of await's typed rc
+# (your-org/nexus-code#1685). So await's DEFAULT fits the default Bash timeout,
+# the NOT-ARMED fallback prints the Bash `timeout` its --timeout needs, and a
+# --timeout no single background call can hold is refused. BG_SLACK_S covers
+# await's overshoot past its deadline: at most one probe (timeout -k 5).
+_bg_s() { local v="${1:-}" floor="$2"; [[ "$v" =~ ^[0-9]+$ ]] && (( v / 1000 > floor )) && floor=$(( v / 1000 )); printf '%s' "$floor"; }
+BG_DEFAULT_S=$(_bg_s "${BASH_DEFAULT_TIMEOUT_MS:-}" 1800)
+BG_CEIL_S=$(_bg_s "${BASH_MAX_TIMEOUT_MS:-}" 7200)
+BG_SLACK_S=$(( PROBE_TIMEOUT + 30 ))
+AWAIT_DEFAULT_S=$(( BG_DEFAULT_S - BG_SLACK_S ))
+AWAIT_MAX_S=$(( BG_CEIL_S - BG_SLACK_S ))
+# The runnable fallback for <id>: the await line AND the Bash `timeout` (ms) it
+# needs, plus how to read a harness stop. One place, so the two NOT-ARMED arms
+# cannot drift apart.
+_await_fallback() {   # <id> [await-seconds]
+    local s="${2:-$AWAIT_DEFAULT_S}"
+    printf 'Fallback that DOES re-invoke you — ONE Bash call with run_in_background: true AND timeout: %s (ms; it must exceed --timeout, or the harness stops the wait first):\n    monitor/longjob-watch.sh await %s --timeout %s\n' \
+        "$(( (s + BG_SLACK_S) * 1000 ))" "$1" "$s"
+    printf 'It re-invokes you with rc 0 done, 1 failed, 3 unknown, 4 timeout (4: re-enter the same call). A harness STOP notice (<status>killed</status>, "background time limit") is not a verdict on the job either: re-run the call above. --timeout is capped at %ss (one background Bash call cannot outlive %ss); a job longer than that belongs to an ARMED ng longjob watch.\n' \
+        "$AWAIT_MAX_S" "$BG_CEIL_S"
+}
 # A ledger is FRESH while its last_poll is younger than 3 × the poll cadence
 # the ledger ITSELF records + 30 s (see _ledger_verdict) — the reader's own
 # config never decides another process's cadence (skeptic D2).
@@ -655,7 +681,21 @@ cmd_add() {
             [[ "$when" == match && -z "$pattern" ]] && die "add: --when match needs --pattern ERE"
             [[ "$when" == grew && -e "$target" ]] && { size0=$(stat -c %s -- "$target" 2>/dev/null) || size0=0; } ;;
         slurm)
-            [[ "$target" =~ ^[0-9][0-9_.+]*$ ]] || die "add: slurm target must be a job id, got '$target'" ;;
+            # The job-id shape is the PROBE's predicate, sourced, never a copy
+            # here (your-org/nexus-code#1727): `0` passed the old copy, and a
+            # watch on `slurm:0` polls `sacct -j 0`, which answers about
+            # unrelated jobs and never about yours. A probe file that cannot be
+            # sourced or lacks the predicate REFUSES the add (fail closed).
+            local _jv_rc=0
+            # shellcheck disable=SC1090,SC1091
+            ( . "$PROBES_DIR/slurm.sh" >/dev/null 2>&1 || exit 90
+              declare -F lj_slurm_jobid_valid >/dev/null 2>&1 || exit 91
+              lj_slurm_jobid_valid "$target" ) || _jv_rc=$?
+            case "$_jv_rc" in
+                0) ;;
+                90|91) die "add: cannot load the Slurm job-id predicate from $PROBES_DIR/slurm.sh — refusing to watch an unvalidated id" ;;
+                *) die "add: slurm target must be a positive Slurm job id (e.g. 123456, 123456_3), got '$target' — job id 0 does not exist, and 'sacct -j 0' answers about OTHER jobs; read the real id from sbatch's output" ;;
+            esac ;;
     esac
     local now; now=$(_now)
     local spec
@@ -690,11 +730,14 @@ cmd_add() {
             return 3 ;;
         disabled)
             printf 'dispatcher: NOT ARMED (disabled) — %s\n' "${v#*|}"
-            printf 'THIS WATCH WILL NOT WAKE YOU: the dispatcher process is alive but NOT SERVING (the kill switch monitor.longjob.enabled / MONITOR_LONGJOB_ENABLED, or an unscoped launch). The watch is recorded and declared as an external wait. Fallback that DOES re-invoke you: monitor/longjob-watch.sh await %s --timeout <seconds> under run_in_background: true.\n' "$id"
+            printf 'THIS WATCH WILL NOT WAKE YOU: the dispatcher process is alive but NOT SERVING (the kill switch monitor.longjob.enabled / MONITOR_LONGJOB_ENABLED, or an unscoped launch). The watch is recorded and declared as an external wait.\n'
+            _await_fallback "$id"
             return 3 ;;
         *)
             printf 'dispatcher: NOT ARMED (%s) — %s\n' "${v%%|*}" "${v#*|}"
-            printf 'THIS WATCH WILL NOT WAKE YOU. It is recorded (and declared as an external wait, so the watcher'"'"'s orphan-async loop can resolve it later), but nothing in this session is polling the spool. Fallback that DOES re-invoke you: run\n    monitor/longjob-watch.sh await %s --timeout <seconds>\nin a Bash call with run_in_background: true — the harness re-invokes you when it exits (rc 0 done, 1 failed, 3 unknown, 4 timeout). Then report the unarmed session: monitor/longjob-watch.sh status.\n' "$id"
+            printf 'THIS WATCH WILL NOT WAKE YOU. It is recorded (and declared as an external wait, so the watcher'"'"'s orphan-async loop can resolve it later), but nothing in this session is polling the spool.\n'
+            _await_fallback "$id"
+            printf 'Then report the unarmed session: monitor/longjob-watch.sh status.\n'
             return 3 ;;
     esac
 }
@@ -820,11 +863,12 @@ cmd_await() {
     _require_spool
     local id="${1:-}"; shift || true
     [[ -n "$id" ]] || die "await: id required"
-    local timeout_s=3600
+    local timeout_s="$AWAIT_DEFAULT_S"
     _argloop_prev_3=-1; while (( $# )); do (( $# != _argloop_prev_3 )) || _argloop_stuck "$1"; _argloop_prev_3=$#
         case "$1" in --timeout) timeout_s="${2:-}"; shift 2 ;; *) die "await: unknown option $1" ;; esac
     done
     [[ "$timeout_s" =~ ^[0-9]+$ ]] || die "await: --timeout must be an integer"
+    (( timeout_s <= AWAIT_MAX_S )) || die "await: --timeout $timeout_s exceeds ${AWAIT_MAX_S}s, the longest wait one run_in_background Bash call can hold (ceiling ${BG_CEIL_S}s less ${BG_SLACK_S}s slack; your-org/nexus-code#1685) — the harness would STOP it with no verdict. Use --timeout <= $AWAIT_MAX_S with Bash timeout: $(( BG_CEIL_S * 1000 )) and re-enter on rc 4, or leave the job to an ARMED ng longjob watch."
     local p; p=$(_spec_path "$id"); [[ -f "$p" ]] || die "await: no such watch $id"
     local kind target spec interval deadline out state streak=0 umax
     kind=$(_spec_get "$p" .kind); target=$(_spec_get "$p" .target); interval=$(_spec_get "$p" .interval); umax=$(_spec_get "$p" .unknown_max)
@@ -845,7 +889,10 @@ cmd_await() {
             *) streak=0 ;;
         esac
         (( $(_now) >= deadline )) && { printf 'await: TIMEOUT after %ss; last: %s\n' "$timeout_s" "$out"; return 4; }
-        sleep "$interval"
+        # Never sleep past the deadline: the Bash `timeout` printed by
+        # _await_fallback leaves slack for one probe, not for a whole interval.
+        local left=$(( deadline - $(_now) ))
+        if (( left < interval )); then sleep "$left"; else sleep "$interval"; fi
     done
 }
 

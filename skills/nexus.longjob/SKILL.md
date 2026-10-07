@@ -77,8 +77,14 @@ detectors OUTSIDE the emit path:
   external wait, but nothing will wake you. The fallback that DOES re-invoke
   you is
   `monitor/longjob-watch.sh await <id> --timeout <s>` in a Bash call with
-  `run_in_background: true` (rc 0 done, 1 failed, 3 unknown/parked, 4 timeout),
-  and `ng longjob status` says why the session is unarmed; the launcher's
+  `run_in_background: true` (rc 0 done, 1 failed, 3 unknown/parked, 4 timeout)
+  **and a Bash `timeout` above `<s>`**: since 2.1.285 the harness stops a
+  background call at its own `timeout` (default 30 min, max 2 h) with a stop
+  notice instead of the rc (`#1685`). `add` prints the exact pair; `await`'s
+  default `<s>` fits the 30-min default, and a `<s>` no 2-h call can hold is
+  refused (rc 2). Read a stop notice (`<status>killed</status>`) as RE-ARM,
+  like rc 4; a wait that must outlive 2 h per call belongs to an ARMED watch.
+  `ng longjob status` says why the session is unarmed; the launcher's
   reason is in `monitor/.state/longjob/arming.log` (`epoch`, `window`,
   `armed|armed-unprobed|skipped`, `reason`, `src`). `skipped` means a probe
   COMPLETED and said no (or the kill switch / manifest / validator did);
@@ -208,8 +214,9 @@ closes, its dispatcher exits with it and the older pane, still live, has NO
 dispatcher. Its watches stay in the spool and are delivered to nobody until a
 session with that id is launched again. `ledger-verdict` reads that state as
 not armed (`dead`), so `add` says NOT ARMED. In that pane use `await` under
-`run_in_background`, or respawn the session. This is a stated boundary, not
-a tested case: nothing in the suite runs two live panes on one id.
+`run_in_background` (with the Bash `timeout` `add` prints), or respawn the
+session. This is a stated boundary, not a tested case: nothing in the suite
+runs two live panes on one id.
 
 **The unretirable window was this, not the discount.** pane-state's discount
 (`_pane_longjob_root`) walks from the LEDGER's pid up to its claude. It found

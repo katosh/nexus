@@ -113,7 +113,8 @@ cat > "$TMUX_STUB_BIN/tmux" <<STUB
 printf '%s\n' "tmux \$*" >> "$TMUX_LOG"
 # The moment of the FIRST Enter, for PSTUB_DRAFT_AFTER (your-org/nexus-code#1596).
 case "\$*" in
-    send-keys*Enter) [ -f "$WORK/first-enter.ts" ] || date +%s.%N > "$WORK/first-enter.ts" ;;
+    send-keys*Enter) [ -f "$WORK/first-enter.ts" ] || date +%s.%N > "$WORK/first-enter.ts"
+                     date +%s.%N >> "$WORK/enter-ts.log" ;;
 esac
 case "\$1" in
     capture-pane)
@@ -219,6 +220,26 @@ if [ -n "\${PSTUB_DRAFT_AFTER:-}" ]; then
         printf 'state=user-typing active=1 window=%s name=orchestrator input=typed\\n' "\$1"
     else
         printf 'state=idle active=1 window=%s name=orchestrator\\n' "\$1"
+    fi
+    exit 0
+fi
+# PSTUB_LOAD_SECONDS=<T> (your-org/nexus-code#1674): a RESUMED pane still loading
+# a large transcript, as measured on the real 2.1.284 (839 MB --resume): every
+# Enter sent within T seconds of the FIRST Enter is LOST; the pane reads
+# \`empty\` until then, and from then on the brief sits in the box as TYPED text
+# (user-typing input=typed, row = PSTUB_BOX_ROW) until an Enter sent AFTER the
+# load submits it.
+if [ -n "\${PSTUB_LOAD_SECONDS:-}" ]; then
+    if [ ! -f "$WORK/first-enter.ts" ]; then
+        printf 'state=idle active=1 window=%s name=orchestrator\\n' "\$1"; exit 0
+    fi
+    le=\$(awk -v a="\$(cat "$WORK/first-enter.ts")" -v t="\$PSTUB_LOAD_SECONDS" 'BEGIN { printf "%.3f", a + t }')
+    if awk -v le="\$le" '\$1 > le { f = 1 } END { exit !f }' "$WORK/enter-ts.log" 2>/dev/null; then
+        printf 'state=busy active=1 window=%s name=orchestrator\\n' "\$1"
+    elif awk -v le="\$le" -v n="\$(date +%s.%N)" 'BEGIN { exit !(n >= le) }'; then
+        printf 'state=user-typing active=1 window=%s name=orchestrator input=typed\\n' "\$1"
+    else
+        printf 'state=empty active=1 window=%s name=orchestrator\\n' "\$1"
     fi
     exit 0
 fi
@@ -507,7 +528,7 @@ run_typed_arm() {   # run_typed_arm <logfile> [NAME=value…]
     ARM_LOG="$1"; shift
     : > "$TMUX_LOG"
     : > "$ARM_LOG"
-    rm -f "$WORK/first-enter.ts"
+    rm -f "$WORK/first-enter.ts" "$WORK/enter-ts.log"
     touch "$WORK/tmux-target-absent"
     (
         export NEXUS_ROOT="$FAKE_NEXUS" PATH="$TMUX_STUB_BIN:$PATH" PANE_STATE_BIN="$PANE_STATE_STUB"
@@ -620,7 +641,23 @@ ARM_PROMPT="$R96_PROMPT" run_typed_arm "$WORK/typed-r96f.log" PSTUB_TYPING_ENTER
     "PSTUB_BOX_ROW=[Pasted text #1 +${R96_K} lines]" PSTUB_BOX_TURNS_AFTER=2 \
     "PSTUB_BOX_ROW_LATER=[Pasted text #1 +${R96_K} lines]wait, before you"
 assert_eq "R96-loop.turns: rc 4 and exactly 2 Enters (paste + first retry)" "$ARM_RC/$ARM_ENTERS" "4/2"
-assert_contains "R96-loop.turns.said: the loop says why it stopped" "$(cat "$WORK/typed-r96f.log")" "typed-retry stopped"
+# Since #1715 (third instance) a not-ours reading is LOOKED AT AGAIN rather
+# than final, so the loop now waits out its budget pressing nothing; the 2-Enter
+# count above is the safety property, and this line names the refusal.
+assert_contains "R96-loop.turns.said: the loop says why it pressed nothing more" "$(cat "$WORK/typed-r96f.log")" "no Enter on it; looking again"
+
+# --- #1674: a RESUMED pane still loading. The strict loop read `empty` and
+# BROKE, seconds before the box read as the brief (live board 2026-09-29
+# 13:15:00). It must WAIT on an indeterminate reading, then press Enter on the
+# equality — and waiting must not turn into a blind Enter on somebody's draft.
+echo '=== 3c L74-load: Enters during the load are lost, the brief then shows typed → submitted on the 3rd Enter, rc 0 ==='
+run_typed_arm "$WORK/typed-l74a.log" PSTUB_LOAD_SECONDS=5 FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS=10
+assert_eq "L74-load: rc 0 and exactly 3 Enters (paste, the one INDETERMINATE retry, then the equality)" "$ARM_RC/$ARM_ENTERS" "0/3"
+assert_contains "L74-load.said: the wait is logged" "$(cat "$WORK/typed-l74a.log")" "waiting for the box to read as the brief"
+echo '=== 3c L74-draft: the load ends with an OPERATOR DRAFT in the box → no Enter on it, rc 4 ==='
+run_typed_arm "$WORK/typed-l74b.log" PSTUB_LOAD_SECONDS=5 FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS=10 "PSTUB_BOX_ROW=half-typed operator dra"
+assert_eq "L74-draft: rc 4 and exactly 2 Enters (waiting never becomes a blind Enter)" "$ARM_RC/$ARM_ENTERS" "4/2"
+assert_contains "L74-draft.said: the refusal names its reason" "$(cat "$WORK/typed-l74b.log")" "not shown to be the brief"
 
 echo '=== 3c R96-held.placeholder: OUR collapsed brief, held, submits on the 3rd Enter → rc 0 (must NOT flip) ==='
 ARM_PROMPT="$R96_PROMPT" run_typed_arm "$WORK/typed-r96e.log" PSTUB_TYPING_ENTERS=2 "PSTUB_BOX_ROW=[Pasted text #1 +${R96_K} lines]"
@@ -2233,6 +2270,93 @@ if [[ "$launchers_before" == "$launchers_after" ]]; then
 else
     fail "guard: an abort should clean up its launcher tempfile"
 fi
+
+# --- your-org/nexus-code#1720: the resume decider reads EVERY transcript root
+#
+# Claude Code writes transcripts to $CLAUDE_CONFIG_DIR/projects when that is
+# set (agent-sandbox: ~/.claude/sandbox-config). For an operator whose
+# `sandbox-config/projects` is a REAL directory — not a symlink to
+# ~/.claude/projects — a `$HOME/.claude/projects`-only lookup answered `fresh`
+# for every `--continue` boot and every respawn, at rc 0. The fixture is that
+# operator: the transcript ONLY under <cfg>/projects/<slug>/, and a HOME with
+# no projects dir at all. Pre-fix: `fresh`. The negative control (transcript
+# nowhere) must stay `fresh`, so the case cannot pass by always resuming.
+
+echo '=== #1720: transcript only under $CLAUDE_CONFIG_DIR/projects → resume ==='
+CFG_WORK="$WORK/cfg1720"
+CFG_NEXUS="$CFG_WORK/nexus_root.x"
+CFG_SID="0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"
+mkdir -p "$CFG_NEXUS/monitor/.state" "$CFG_WORK/home" "$CFG_WORK/cfg/projects"
+printf '%s\n' "$CFG_SID" > "$CFG_NEXUS/monitor/.state/orchestrator-session-id"
+CFG_SLUG="${CFG_NEXUS//[^a-zA-Z0-9-]/-}"
+mkdir -p "$CFG_WORK/cfg/projects/$CFG_SLUG"
+touch "$CFG_WORK/cfg/projects/$CFG_SLUG/$CFG_SID.jsonl"
+cfg_mode=$(
+    unset NEXUS_CC_HOME
+    HOME="$CFG_WORK/home" CLAUDE_CONFIG_DIR="$CFG_WORK/cfg"
+    export HOME CLAUDE_CONFIG_DIR
+    # shellcheck source=_respawn.sh
+    . "$_test_dir/_respawn.sh"
+    _respawn_choose_resume_mode "$CFG_NEXUS"
+)
+if [[ -d "$CFG_WORK/home/.claude/projects" ]]; then
+    fail "#1720 fixture: HOME must hold NO projects dir, or the case does not test the CLAUDE_CONFIG_DIR root"
+fi
+assert_eq "#1720: pin + transcript ONLY under \$CLAUDE_CONFIG_DIR/projects → resume" \
+          "$(printf '%s' "$cfg_mode" | cut -f1)" "resume"
+assert_eq "#1720: …resuming the PINNED sid" \
+          "$(printf '%s' "$cfg_mode" | cut -f2)" "$CFG_SID"
+
+echo '=== #1720 negative control: transcript under NO root → fresh ==='
+rm -f "$CFG_WORK/cfg/projects/$CFG_SLUG/$CFG_SID.jsonl"
+cfg_mode=$(
+    unset NEXUS_CC_HOME
+    HOME="$CFG_WORK/home" CLAUDE_CONFIG_DIR="$CFG_WORK/cfg"
+    export HOME CLAUDE_CONFIG_DIR
+    # shellcheck source=_respawn.sh
+    . "$_test_dir/_respawn.sh"
+    _respawn_choose_resume_mode "$CFG_NEXUS"
+)
+assert_eq "#1720 control: pin valid, transcript under no root → fresh" \
+          "$(printf '%s' "$cfg_mode" | cut -f1)" "fresh"
+
+echo '=== #1720: the $HOME root still resumes with CLAUDE_CONFIG_DIR set elsewhere ==='
+mkdir -p "$CFG_WORK/home/.claude/projects/$CFG_SLUG"
+touch "$CFG_WORK/home/.claude/projects/$CFG_SLUG/$CFG_SID.jsonl"
+cfg_mode=$(
+    unset NEXUS_CC_HOME
+    HOME="$CFG_WORK/home" CLAUDE_CONFIG_DIR="$CFG_WORK/cfg"
+    export HOME CLAUDE_CONFIG_DIR
+    # shellcheck source=_respawn.sh
+    . "$_test_dir/_respawn.sh"
+    _respawn_choose_resume_mode "$CFG_NEXUS"
+)
+assert_eq "#1720: transcript only under \$HOME/.claude/projects → resume (no regression)" \
+          "$(printf '%s' "$cfg_mode" | cut -f1)" "resume"
+
+echo '=== #1720: cc_transcript_roots order + realpath dedup ==='
+# The symlinked-overlay layout: <cfg>/projects IS <home>/.claude/projects.
+# One directory, so it must print ONCE; the real-directory layout prints both,
+# CLAUDE_CONFIG_DIR first.
+mkdir -p "$CFG_WORK/home2/.claude/projects" "$CFG_WORK/cfg2"
+ln -sfn "$CFG_WORK/home2/.claude/projects" "$CFG_WORK/cfg2/projects"
+roots=$(
+    unset NEXUS_CC_HOME
+    HOME="$CFG_WORK/home2" CLAUDE_CONFIG_DIR="$CFG_WORK/cfg2"
+    export HOME CLAUDE_CONFIG_DIR
+    . "$_test_dir/_respawn.sh"
+    cc_transcript_roots
+)
+assert_eq "#1720: symlinked projects → ONE root" "$(printf '%s\n' "$roots" | grep -c .)" "1"
+roots=$(
+    unset NEXUS_CC_HOME
+    HOME="$CFG_WORK/home" CLAUDE_CONFIG_DIR="$CFG_WORK/cfg"
+    export HOME CLAUDE_CONFIG_DIR
+    . "$_test_dir/_respawn.sh"
+    cc_transcript_roots
+)
+assert_eq "#1720: real-dir projects → both roots, CLAUDE_CONFIG_DIR first" \
+          "$(printf '%s' "$roots" | tr '\n' '|')" "$CFG_WORK/cfg/projects|$CFG_WORK/home/.claude/projects"
 
 # --- Summary ------------------------------------------------------------
 

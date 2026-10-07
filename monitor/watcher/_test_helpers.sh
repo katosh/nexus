@@ -91,6 +91,26 @@ unset -f command_not_found_handle 2>/dev/null || true
 # in a mirror-side test, landed with the mirror sync.
 export NEXUS_PUBLIC_ENABLED=1
 
+# THE TEST FENCE (your-org/nexus-code#1680). A suite's fixtures and the tree
+# under test must never resolve to an enclosing nexus's PRIMARY: the #577
+# de-nesting in monitor/_nexus-root.sh and spawn-worker.sh is right for a
+# worker and wrote 321 fixture rows into the operator's production action log
+# when a fixture nexus happened to sit under a real nexus's work/. run-tests.sh
+# and mutation-gate.sh export NEXUS_TEST_FENCE per suite; a suite sourced
+# STANDALONE (`bash monitor/watcher/test-x.sh` from a clone under work/) gets
+# its TMPDIR as the fence, where every `mktemp -d` fixture lives. An inherited
+# fence (a harness's, or a nesting suite's) is kept: the harness chose it.
+# Exported because the resolvers run in child processes.
+if [[ -z "${NEXUS_TEST_FENCE:-}" ]]; then
+    NEXUS_TEST_FENCE=$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P) || NEXUS_TEST_FENCE=""
+    if [[ -z "$NEXUS_TEST_FENCE" ]]; then
+        # Fail CLOSED: a fence that names nothing real admits nothing, so no
+        # resolver de-nests at all. Never fall back to "no fence".
+        NEXUS_TEST_FENCE="/nonexistent/nexus-test-fence-unresolvable-TMPDIR"
+    fi
+fi
+export NEXUS_TEST_FENCE
+
 : "${PASS:=0}"
 : "${FAIL:=0}"
 : "${SKIP:=0}"

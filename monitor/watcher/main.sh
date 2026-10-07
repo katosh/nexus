@@ -92,13 +92,6 @@
 #                             claude-haiku-4-5-20251001)
 #   MONITOR_HEARTBEAT_STALENESS_SECONDS
 #                          -> monitor.heartbeat_staleness_seconds  (default 30)
-#   MONITOR_API_ERROR_BACKOFF_MIN
-#                          -> monitor.watcher.api_error_backoff_minutes
-#                             (default 30) — minutes a same-fingerprint
-#                             case-C api-error wedge is allowed to recur
-#                             before the watcher will Enter-nudge it
-#                             again. Tunable so a chronically broken
-#                             endpoint can be quieted without code change.
 #   MONITOR_NOTIFICATIONS_LOG_MAX_BYTES
 #                          -> monitor.notifications_log_max_bytes
 #                             (default 10485760 = 10MiB)
@@ -180,7 +173,7 @@
 #   MONITOR_ORCH_UNSTICK_WINDOW_S
 #                          -> monitor.watcher.unstick_window_seconds
 #                             (default 150) — budget for unstick
-#                             cases A-D to recover a wedged
+#                             cases to recover a wedged
 #                             orchestrator before the state machine
 #                             escalates to the re-submit rescue.
 #                             detect_and_unstick runs every cycle
@@ -281,12 +274,13 @@ source "$_script_dir/../_paste-deliver.sh"
 # and by cc-auto-update's deployment gate.
 #
 # Sourced HERE, from main.sh, and not only from `_config.sh` where it is
-# actually used. `_version_watcher_source_set` derives the watcher's
-# version-tracked file set by parsing `source "$_script_dir/…"` lines out of
-# THIS FILE ALONE, so a module reached only through `_config.sh` is invisible
-# to it: editing the resolver would change what the watcher runs without
-# bumping the hash that triggers the self-restart. Leaf module, guarded
-# against double-sourcing, side-effect-free.
+# actually used. When this was written, `_version_watcher_source_set` read
+# `source "$_script_dir/…"` lines out of THIS FILE ALONE, so a module reached
+# only through `_config.sh` was invisible to the self-restart hash. The set is
+# now the transitive closure (your-org/nexus-code#1746), so that reason is
+# gone; the line stays because it is harmless (leaf module, guarded against
+# double-sourcing, side-effect-free) and keeps the module on the torn-pull
+# contract that main.sh's direct modules get.
 # shellcheck source=../_integration_branch.sh
 source "$_script_dir/../_integration_branch.sh"
 
@@ -294,10 +288,9 @@ source "$_script_dir/../_integration_branch.sh"
 # needs `bk_decision_row_actionable` — the pending-decisions pane gate's
 # ruling on whether a pane state still means "a human is needed".
 #
-# Sourced HERE for the same reason `_integration_branch.sh` above is: the
-# version source-set parser reads `source "$_script_dir/…"` lines out of
-# THIS FILE, so a module loaded anywhere else is invisible to the
-# self-restart hash. And sourced AT ALL because the gate's absence is
+# Sourced HERE for the same historical reason as `_integration_branch.sh`
+# above (the source-set parser was depth-1 until your-org/nexus-code#1746).
+# And sourced AT ALL because the gate's absence is
 # silent by construction: `_idle_probe.sh` fails OPEN when the predicate
 # is undefined (an unclassifiable pane must never silence a decision), so
 # a watcher that never loaded this file would emit exactly as it did
@@ -572,6 +565,15 @@ FULL_STATE_CANONICAL_CACHE="${STATE_DIR}/last-full-state-canonical.txt"
 # `_full_state_effective_floor`. Survives restarts (missing ⇒ treated as
 # a fresh streak, so the heartbeat starts responsive after a cold start).
 FULL_STATE_IDLE_ANCHOR="${STATE_DIR}/last-full-state-change.ts"
+# Per-window streak of consecutive full-state polls whose row carried a
+# pane-state READ FAILED (`<window>\t<polls>`), and the set that had reached
+# MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS when the cached canonical was
+# EMITTED (your-org/nexus-code#1738 F2). Missing ⇒ every streak restarts at 1.
+FULL_STATE_READ_FAILED_STREAK="${STATE_DIR}/full-state-read-failed-streak.tsv"
+FULL_STATE_READ_FAILED_EMITTED="${STATE_DIR}/full-state-read-failed-emitted.txt"
+# Volatile-stripped lines of delivered requests / pending decisions / service
+# health that have already snapped the backoff anchor (#1738 F3; newest 500).
+FULL_STATE_DELIVERED_KEYS="${STATE_DIR}/full-state-delivered-keys.txt"
 # Content-hash dedup state. EMIT_DEDUP_HASH_FILE holds the sha256 of
 # the last successfully-emitted body's stable canonical form (see
 # `_compose_emit_stable_hash`); EMIT_DEDUP_TS_FILE holds the epoch of
@@ -739,7 +741,6 @@ WATCHER_REVIVED_MARKER="${STATE_DIR}/watcher-revived"
 export ACTION_LOG TARGET RATELIMIT_PROBE RATELIMIT_HEURISTIC_MIN \
        RATELIMIT_ACK_TIMEOUT_S PROBE_MODEL ANTHROPIC_API_KEY \
        GRAPHQL_THRESHOLD GRAPHQL_TIMEOUT GRAPHQL_TIMEOUT_KILL_AFTER \
-       API_ERROR_BACKOFF_MIN \
        ON_DIALOG MONITOR_WORKER_ASKUQ_GRACE_SECONDS
 
 mkdir -p "${STATE_DIR}" "${DIFF_DIR}" "${UNSTICK_DIR}"
@@ -2118,7 +2119,13 @@ _compose_report_body() {
         # want different remedies (find the slow term / read the child's stderr),
         # so the operator must be able to tell them apart from the emit alone.
         local _pr_rc=0
-        _run_bounded "$_pr_to" "$_pr_tmp" render_idle_prelude || _pr_rc=$?
+        # RENDER DEADLINE (your-org/nexus-code#1698, reopened). The render is
+        # told the SAME budget `_run_bounded` enforces, so it stops forking
+        # probes before the kill and counts what it could not afford as
+        # `unprobed` — a complete, honestly labelled line instead of a
+        # STALE one. The kill below remains the backstop.
+        MONITOR_RENDER_BUDGET_SECONDS="$_pr_to" \
+            _run_bounded "$_pr_to" "$_pr_tmp" render_idle_prelude || _pr_rc=$?
         if (( _pr_rc != 0 )); then
             _pr_degraded=1
             if (( _pr_rc == 124 )); then _pr_mode=timeout; else _pr_mode=failed; fi
@@ -2153,6 +2160,10 @@ _compose_report_body() {
     fi
     if [[ -n "$prelude" ]]; then
         printf 'workspace: %s\n' "$prelude"
+        # Constant text (no count), so it adds no dedup churn of its own.
+        if [[ "$prelude" =~ [0-9]+\ unprobed ]]; then
+            printf 'workspace: ^ UNPROBED — that many windows had no reusable recording (none, too old, recorder not cycling, or their hook heartbeat changed activity class since it was taken) and could not be probed inside this render'"'"'s wall-clock budget. They are counted as NEITHER busy NOR idle. Every other count is a fresh probe or the recorder'"'"'s latest sweep (at most MONITOR_PANE_CACHE_SWEEP_MAX_AGE_SECONDS, default 300 s, old). The per-window idle section is computed separately by the recorder and is unaffected. (your-org/nexus-code#1698)\n'
+        fi
         if (( _pr_degraded )); then
             if [[ "$_pr_mode" == timeout ]]; then
                 printf 'workspace: ^ PARTIAL (TIMED OUT) — the render above was CUT OFF at its wall-clock budget; the counts on that line are incomplete. Other sections are computed separately and are unaffected. In watcher.log: grep for TIMED OUT. (your-org/nexus-code#1329)\n'
@@ -2475,7 +2486,8 @@ _compose_report_body() {
 #      overlay. (`inert` is NOT here: it falls back to the rendering check —
 #      which itself answers 6 when the trailer it finds sits IN the input box,
 #      i.e. the body is there unsent; your-org/nexus-code#1604.)
-#   7  the target was ALREADY on an overlay, so NOTHING was pasted. Never
+#   7  the target was ALREADY on an overlay, or its input box ALREADY held
+#      typed text (your-org/nexus-code#1674), so NOTHING was pasted. Never
 #      retried, and — like rc 2 — never counted toward the watcher's self-heal:
 #      it is a fact about the orchestrator, not a paste-path fault.
 #
@@ -2629,6 +2641,13 @@ _paste_to_target_unlocked() {
                 log "paste_to_target: '${target}' is sitting on an OVERLAY — NOTHING was pasted (an Enter would answer the overlay, your-org/nexus-code#1200). rc 7: not a watcher delivery fault, so it does not count toward self-heal; the body re-composes next cycle."
                 return 7
             fi
+            if [[ "$PD_OUTCOME" == occupied-before-paste ]]; then
+                log "paste_to_target: '${target}' input box already holds TYPED text (an operator draft, or an earlier paste still unsent) — NOTHING was pasted: a paste merges into the draft and our Enter would submit it (your-org/nexus-code#1674). rc 7: not a watcher delivery fault; the body re-composes next cycle."
+                # …but a draft that STAYS withholds every later emit: count the
+                # run and surface it past a threshold (your-org/nexus-code#1683 F2).
+                declare -F _paste_deferral_note >/dev/null 2>&1 && _paste_deferral_note "$target"
+                return 7
+            fi
             log "paste_to_target: '${target}' NOT SUBMITTED (${PD_OUTCOME}, enter_retries=${PD_ENTER_RETRIES}) — the emit is NOT delivered. held = still in the input box after the Enter retries; blocked = an overlay came up and an Enter would answer IT; blocked-before-paste = an overlay was already up, so NOTHING was pasted (your-org/nexus-code#1591, #1200)."
             return 6 ;;
         *)  : ;;   # 3 = unverifiable / in-flight: the rendering check decides
@@ -2768,6 +2787,8 @@ _paste_to_target_unlocked() {
     if [[ "$target" == "${TARGET:-}" && "$stamp_mode" != "no-liveness-stamp" ]]; then
         _orchestrator_record_paste "$ORCH_LAST_PASTE_FILE"
     fi
+    # Delivered: a run of draft deferrals to this target is over (#1683 F2).
+    declare -F _paste_deferral_reset >/dev/null 2>&1 && _paste_deferral_reset "$target"
     return 0
 }
 
@@ -3396,6 +3417,12 @@ source "$_script_dir/_auth_hold.sh"
 # shellcheck source=_operator_alert.sh
 source "$_script_dir/_operator_alert.sh"
 
+# Consecutive draft-deferral counter per paste target, surfaced through the
+# operator alert above past a threshold (your-org/nexus-code#1683 F2).
+# Functions only; no side effects.
+# shellcheck source=_paste_deferral.sh
+source "$_script_dir/_paste_deferral.sh"
+
 # Orchestrator-liveness state machine (issue #164). Replaces the
 # binary unresponsive_age > threshold check from #157 with a
 # three-knob model that distinguishes idle-but-healthy from
@@ -3573,18 +3600,21 @@ export _OPERATOR_ALERT_CLEARED_FN
 # emit-only/flapping escalation coincides with a KNOWN-UNAVAILABLE emit route.
 # The four conditions are the four arms of this file's own emit ladder plus the
 # absent-target probe; each prints the reason the alert carries.
+# Each arm prints `<code>\t<reason>`: the CODE is what `_sh_operator_alert_step`
+# keys its one-page-per-cause downgrade on (your-org/nexus-code#1653 F2), so an
+# over-limit block — checked FIRST — is never mistaken for the login.
 _service_health_route_blocked_via_watcher() {
     if declare -F _over_limit_orchestrator_paused >/dev/null 2>&1 && _over_limit_orchestrator_paused; then
-        printf 'the orchestrator is OVER-LIMIT and emits are held'; return 0
+        printf 'over-limit\tthe orchestrator is OVER-LIMIT and emits are held'; return 0
     fi
     if declare -F _auth_hold_active >/dev/null 2>&1 && _auth_hold_active; then
-        printf 'a dialog is open on the orchestrator and emits are HELD (auth hold)'; return 0
+        printf 'auth-hold\ta dialog is open on the orchestrator and emits are HELD (auth hold)'; return 0
     fi
     if declare -F _auth_hold_expiry_standing >/dev/null 2>&1 && _auth_hold_expiry_standing; then
-        printf 'the orchestrator is LOGGED OUT (auth=expired) and cannot take a turn'; return 0
+        printf 'auth-expired\tthe orchestrator is LOGGED OUT (auth=expired) and cannot take a turn'; return 0
     fi
     if [[ "${_V2_LAST_TARGET_RC:-0}" == "2" ]]; then
-        printf 'the orchestrator window is ABSENT (respawn pending)'; return 0
+        printf 'target-absent\tthe orchestrator window is ABSENT (respawn pending)'; return 0
     fi
     return 1
 }
@@ -3730,7 +3760,7 @@ if [[ ! -f "${BASELINE}" ]]; then
     log "initialised persistent baseline at ${BASELINE}"
 fi
 
-log "watcher up: repo=${REPO} user=${USER_LOGIN} target=${TARGET} interval=${INTERVAL}s retention=${RETENTION_DAYS}d dead_threshold=${AGENT_DEAD_THRESHOLD} missing_respawn_delay=${AGENT_MISSING_RESPAWN_DELAY} respawn_loop=${RESPAWN_LOOP_LIMIT}/${RESPAWN_LOOP_WINDOW}s respawn_consec_limit=${RESPAWN_CONSEC_LIMIT} slow_grind_cooldown=${RESPAWN_SLOW_GRIND_COOLDOWN}s auto_unstick=${AUTO_UNSTICK} on_dialog=${ON_DIALOG} worker_askuq_grace_s=${MONITOR_WORKER_ASKUQ_GRACE_SECONDS} ratelimit_probe=${RATELIMIT_PROBE} probe_key=$([[ -n "${ANTHROPIC_API_KEY:-}" ]] && echo set || echo unset) api_error_backoff_min=${API_ERROR_BACKOFF_MIN} deliveries=(asset=${DELIVERIES_ASSET_ENABLED} bot_mention=${DELIVERIES_BOT_MENTION_ENABLED} connect=${DELIVERIES_CONNECT_TIMEOUT}s max=${DELIVERIES_MAX_TIME}s fetch_cap=${DELIVERIES_MAX_FETCH_PER_CYCLE} seed_first=${DELIVERIES_SEED_ON_FIRST_RUN}) mentions_enabled=${MENTIONS_ENABLED} bot_mentions_enabled=${BOT_MENTIONS_ENABLED}(connect=${MENTIONS_CONNECT_TIMEOUT}s max=${MENTIONS_MAX_TIME}s) graphql_threshold=${GRAPHQL_THRESHOLD} cross_repo_surface=${CROSS_REPO_SURFACE} bot_login=${BOT_LOGIN:-<unset>} orch_fresh_spawn=${ORCH_FRESH_SPAWN_ENABLED} orch_paste_response_grace_s=${ORCH_PASTE_RESPONSE_GRACE_S} orch_unstick_window_s=${ORCH_UNSTICK_WINDOW_S} orch_dead_threshold_s=${ORCH_DEAD_THRESHOLD_S} orch_stale_paste_ceiling_s=${ORCH_STALE_PASTE_CEILING_S} orch_liveness_log_throttle_s=${ORCH_LIVENESS_LOG_THROTTLE_S} orch_stale_s=${ORCH_STALE_SECONDS} orch_fresh_spawn_cooldown_s=${ORCH_FRESH_SPAWN_COOLDOWN_SECONDS} version_restart=${MONITOR_VERSION_RESTART_ENABLED}/${MONITOR_VERSION_CHECK_INTERVAL_SECONDS}s(settle=${MONITOR_VERSION_SETTLE_SECONDS}s cooldown=${MONITOR_VERSION_RESTART_COOLDOWN_SECONDS}s self=${MONITOR_VERSION_SELF_RESTART} services=${MONITOR_VERSION_SERVICE_RESTART})"
+log "watcher up: repo=${REPO} user=${USER_LOGIN} target=${TARGET} interval=${INTERVAL}s retention=${RETENTION_DAYS}d dead_threshold=${AGENT_DEAD_THRESHOLD} missing_respawn_delay=${AGENT_MISSING_RESPAWN_DELAY} respawn_loop=${RESPAWN_LOOP_LIMIT}/${RESPAWN_LOOP_WINDOW}s respawn_consec_limit=${RESPAWN_CONSEC_LIMIT} slow_grind_cooldown=${RESPAWN_SLOW_GRIND_COOLDOWN}s auto_unstick=${AUTO_UNSTICK} on_dialog=${ON_DIALOG} worker_askuq_grace_s=${MONITOR_WORKER_ASKUQ_GRACE_SECONDS} ratelimit_probe=${RATELIMIT_PROBE} probe_key=$([[ -n "${ANTHROPIC_API_KEY:-}" ]] && echo set || echo unset) deliveries=(asset=${DELIVERIES_ASSET_ENABLED} bot_mention=${DELIVERIES_BOT_MENTION_ENABLED} connect=${DELIVERIES_CONNECT_TIMEOUT}s max=${DELIVERIES_MAX_TIME}s fetch_cap=${DELIVERIES_MAX_FETCH_PER_CYCLE} seed_first=${DELIVERIES_SEED_ON_FIRST_RUN}) mentions_enabled=${MENTIONS_ENABLED} bot_mentions_enabled=${BOT_MENTIONS_ENABLED}(connect=${MENTIONS_CONNECT_TIMEOUT}s max=${MENTIONS_MAX_TIME}s) graphql_threshold=${GRAPHQL_THRESHOLD} cross_repo_surface=${CROSS_REPO_SURFACE} bot_login=${BOT_LOGIN:-<unset>} orch_fresh_spawn=${ORCH_FRESH_SPAWN_ENABLED} orch_paste_response_grace_s=${ORCH_PASTE_RESPONSE_GRACE_S} orch_unstick_window_s=${ORCH_UNSTICK_WINDOW_S} orch_dead_threshold_s=${ORCH_DEAD_THRESHOLD_S} orch_stale_paste_ceiling_s=${ORCH_STALE_PASTE_CEILING_S} orch_liveness_log_throttle_s=${ORCH_LIVENESS_LOG_THROTTLE_S} orch_stale_s=${ORCH_STALE_SECONDS} orch_fresh_spawn_cooldown_s=${ORCH_FRESH_SPAWN_COOLDOWN_SECONDS} version_restart=${MONITOR_VERSION_RESTART_ENABLED}/${MONITOR_VERSION_CHECK_INTERVAL_SECONDS}s(settle=${MONITOR_VERSION_SETTLE_SECONDS}s cooldown=${MONITOR_VERSION_RESTART_COOLDOWN_SECONDS}s self=${MONITOR_VERSION_SELF_RESTART} services=${MONITOR_VERSION_SERVICE_RESTART})"
 if [[ -n "${MONITOR_ORCH_UNRESPONSIVE_THRESHOLD_S:-}" ]]; then
     log "DEPRECATED: MONITOR_ORCH_UNRESPONSIVE_THRESHOLD_S=${MONITOR_ORCH_UNRESPONSIVE_THRESHOLD_S} seeded the new MONITOR_ORCH_DEAD_THRESHOLD_S; rename to MONITOR_ORCH_DEAD_THRESHOLD_S (or set monitor.watcher.orchestrator_dead_threshold_seconds) — legacy var removed in a future release."
 fi
@@ -4256,7 +4286,15 @@ _v2_task_requests_poll() {
 # prelude, full-state snapshot) then reuses for the rest of the loop.
 _v2_task_idle_section() {
     _pane_cache_gc 2>/dev/null || true
+    # Stamp the sweep's START before it runs and mark it COMPLETE after it
+    # returns (your-org/nexus-code#1698): the compose-time prelude may then
+    # reuse this sweep's recordings past the TTL instead of re-forking them.
+    # A sweep killed mid-way never reaches the mark, so a partial sweep is
+    # never advertised as complete.
+    local _sweep_start
+    _sweep_start=$(date +%s)
     MONITOR_PANE_CACHE_MODE=record render_idle_section 2>/dev/null || true
+    _pane_cache_sweep_mark "$_sweep_start" 2>/dev/null || true
 }
 # Event-fetch split (issue #181). The two sources ride different
 # rate-limit buckets and live at different cadences:
@@ -5151,7 +5189,10 @@ _v2_task_compose_emit() {
                 fi
             fi
             _ce_rc=0
-            MONITOR_PRELUDE_DRY_RUN=1 _run_bounded "$_ce_to" "$_ce_tmp" render_idle_prelude || _ce_rc=$?
+            # The render is told its own budget so it can degrade INSIDE it,
+            # counting what it could not afford as `unprobed` (#1698).
+            MONITOR_PRELUDE_DRY_RUN=1 MONITOR_RENDER_BUDGET_SECONDS="$_ce_to" \
+                _run_bounded "$_ce_to" "$_ce_tmp" render_idle_prelude || _ce_rc=$?
             canonical_prelude=$(cat "$_ce_tmp" 2>/dev/null || true)
             _bounded_failure_log "$_ce_rc" "$_ce_to" compose_emit "inline prelude render" "cycle NOT blocked"
             rm -f "$_ce_tmp" 2>/dev/null || true
@@ -5163,9 +5204,64 @@ _v2_task_compose_emit() {
             full_state_canonical=$(printf '%s\n---snapshot---\n%s' \
                 "$canonical_prelude" "$full_state_lines" \
                 | _emit_volatile_strip)
+            # A PERSISTENT pane-state READ FAILED is actionable
+            # (your-org/nexus-code#1738 F2). The projection below folds a
+            # READ FAILED row into `<w> live`, because one failed read under
+            # host load is instrument churn. Advance each window's streak of
+            # CONSECUTIVE failing polls (one per full-state evaluation, every
+            # MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS); a window that reaches
+            # MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS projects as
+            # `read-failed` in the candidate. The CACHED canonical is projected
+            # with the set that was persistent when it was EMITTED, so the
+            # crossing differs from the last emit exactly once: it emits and
+            # snaps the anchor back, and a failed paste leaves the record
+            # unchanged so the next poll retries. A row that flickers never
+            # reaches N, stays `live`, and neither emits nor resets the anchor.
+            # Both files live under STATE_DIR. A failing helper degrades to the
+            # pre-#1738 projection (READ FAILED folded into `live`), logged.
+            local _fs_rf_now="" _fs_rf_then=""
+            local _fs_rf_streak="${FULL_STATE_READ_FAILED_STREAK:-${STATE_DIR}/full-state-read-failed-streak.tsv}"
+            local _fs_rf_emitted="${FULL_STATE_READ_FAILED_EMITTED:-${STATE_DIR}/full-state-read-failed-emitted.txt}"
+            if declare -F _full_state_read_failed_streak_update >/dev/null \
+               && declare -F _full_state_read_failed_windows >/dev/null; then
+                if ! _fs_rf_now=$(printf '%s\n' "$full_state_canonical" | _full_state_read_failed_windows \
+                        | _full_state_read_failed_streak_update "$_fs_rf_streak" \
+                            "${MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS:-3}"); then
+                    log "full-state: READ FAILED streak update failed (${_fs_rf_streak}); persistent READ FAILED rows fold into live this poll"
+                    _fs_rf_now=""
+                fi
+                _fs_rf_then=$(cat "$_fs_rf_emitted" 2>/dev/null || true)
+                if [[ -n "$_fs_rf_now" && "$_fs_rf_now" != "$_fs_rf_then" ]]; then
+                    log "full-state: pane-state READ FAILED persisted ${MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS:-3}+ polls: $(printf '%s' "$_fs_rf_now" | tr '\n' ' ')"
+                fi
+            fi
             if [[ -f "$FULL_STATE_CANONICAL_CACHE" ]]; then
                 cached_canonical=$(cat "$FULL_STATE_CANONICAL_CACHE" 2>/dev/null || true)
-                if [[ "$full_state_canonical" == "$cached_canonical" ]]; then
+                # Compare the ACTIONABLE projections, not the canonicals
+                # (your-org/nexus-code#1736). The canonical carries every
+                # worker's busy/working-background/idle activity; a worker its
+                # own longjob watch wakes for a minute flips it twice, and with
+                # a handful of self-waking workers the backoff never left its
+                # base rung. An activity-only difference now takes the "same"
+                # branch: it waits for the effective floor and leaves the anchor
+                # alone. The body still carries the activity when it does emit,
+                # and the cache below still stores the full canonical.
+                #
+                # FAIL TOWARD EMITTING. Two empty projections compare EQUAL, so
+                # a projection that is missing (a harness that did not source
+                # it) or fails would turn every change into "same" and hold it
+                # for the floor. Either case falls back to the full canonicals.
+                local _fs_proj_new="" _fs_proj_old="" _fs_proj_rc=1
+                if declare -F _full_state_actionable_projection >/dev/null; then
+                    _fs_proj_rc=0
+                    _fs_proj_new=$(printf '%s\n' "$full_state_canonical" | _full_state_actionable_projection "$_fs_rf_now") || _fs_proj_rc=1
+                    _fs_proj_old=$(printf '%s\n' "$cached_canonical" | _full_state_actionable_projection "$_fs_rf_then") || _fs_proj_rc=1
+                fi
+                if (( _fs_proj_rc != 0 )) || [[ -z "$_fs_proj_new" && -n "$full_state_canonical" ]]; then
+                    log "full-state: actionable projection unavailable (rc=${_fs_proj_rc}); comparing full canonicals"
+                    _fs_proj_new="$full_state_canonical"; _fs_proj_old="$cached_canonical"
+                fi
+                if [[ "$_fs_proj_new" == "$_fs_proj_old" ]]; then
                     last_emit_mtime=$(date +%s -r "$FULL_STATE_CANONICAL_CACHE" 2>/dev/null || echo 0)
                     [[ "$last_emit_mtime" =~ ^[0-9]+$ ]] || last_emit_mtime=0
                     # Adaptive idle backoff. The idle-streak anchor tracks when
@@ -5197,7 +5293,7 @@ _v2_task_compose_emit() {
                         log "full-state suppressed: canonical unchanged, floor_age=$((now_ts - last_emit_mtime))s/${_fs_eff_floor}s (base ${MONITOR_FULL_STATE_SAFETY_FLOOR_SECONDS}s, idle ${_fs_idle_dur}s)"
                     fi
                 else
-                    # Canonical CHANGED — reset the idle-streak anchor so the
+                    # Actionable projection CHANGED — reset the idle-streak anchor so the
                     # effective floor snaps back to base and the heartbeat is
                     # responsive again. This is the "snap back the moment the
                     # canonical changes / a worker transitions" half of the
@@ -5462,6 +5558,37 @@ _v2_task_compose_emit() {
                     if [[ -n "$full_state_canonical" ]]; then
                         printf '%s' "$full_state_canonical" > "${FULL_STATE_CANONICAL_CACHE}.tmp" \
                             && mv "${FULL_STATE_CANONICAL_CACHE}.tmp" "$FULL_STATE_CANONICAL_CACHE" 2>/dev/null || true
+                        # The persistent READ FAILED set this emit carried
+                        # (#1738 F2): the cached canonical is projected with it.
+                        printf '%s' "$_fs_rf_now" > "${_fs_rf_emitted}.tmp" 2>/dev/null \
+                            && mv "${_fs_rf_emitted}.tmp" "$_fs_rf_emitted" 2>/dev/null || true
+                    fi
+                fi
+                # Requests, pending decisions and service health are actionable
+                # but live outside the full-state canonical, so the projection
+                # above cannot see them (your-org/nexus-code#1736). They emit on
+                # their own triggers; once one is DELIVERED, snap the heartbeat
+                # back to its base floor as a canonical change would. Only on a
+                # successful paste: a held or failed one re-composes next cycle.
+                #
+                # Only a NEW or CHANGED item snaps it (your-org/nexus-code#1738
+                # F3). A re-paste of an UNCHANGED standing item is its own re-nag
+                # cadence at work, not a board change; snapping on it held the
+                # heartbeat near base for as long as the item stood. Rationale
+                # and failure direction: `_full_state_delivery_new_keys`. A
+                # missing or failing helper snaps, as before.
+                if [[ -n "$requests_now" || -n "$pending_now" || -n "$service_health_now" ]]; then
+                    local _fs_dk_new="snap"
+                    if declare -F _full_state_delivery_new_keys >/dev/null; then
+                        _fs_dk_new=$(printf '%s\n%s\n%s\n' "$requests_now" "$pending_now" "$service_health_now" \
+                            | _full_state_delivery_new_keys "${FULL_STATE_DELIVERED_KEYS:-${STATE_DIR}/full-state-delivered-keys.txt}") \
+                            || _fs_dk_new="snap"
+                    fi
+                    if [[ -n "$_fs_dk_new" ]]; then
+                        printf '%s' "$(date +%s)" > "${FULL_STATE_IDLE_ANCHOR}.tmp" 2>/dev/null \
+                            && mv "${FULL_STATE_IDLE_ANCHOR}.tmp" "$FULL_STATE_IDLE_ANCHOR" 2>/dev/null || true
+                    else
+                        log "full-state: delivered request/decision/service-health items unchanged since they last snapped the backoff; anchor kept (#1738 F3)"
                     fi
                 fi
             else

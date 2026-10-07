@@ -586,12 +586,102 @@ cch_setup() {
     trap cch_teardown EXIT
 }
 
+# _cch_proc_start <pid> — print the kernel START TIME (clock ticks since boot,
+# /proc/<pid>/stat field 22) of a LIVE, non-zombie pid; rc 1 when the pid is
+# gone or a zombie. (pid, start) is the process IDENTITY: a bare pid can be
+# recycled, and `kill -0` answers true for a recycled pid — and for a thread
+# id — so no liveness question in teardown is asked of a bare pid. A zombie
+# has finished every write it will ever make, so for teardown it is GONE.
+# comm (field 2) may hold spaces and parentheses: split after the LAST ')'.
+_cch_proc_start() {
+    local stat rest
+    stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    [[ -n "$stat" ]] || return 1
+    rest=${stat##*) }
+    local -a f
+    read -r -a f <<<"$rest"
+    case "${f[0]:-}" in Z|X|x|'') return 1 ;; esac
+    [[ "${f[19]:-}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s' "${f[19]}"
+}
+
+# _cch_await_gone <grace-seconds> <pid:start>… — TERM each process that still
+# has the recorded identity, wait up to <grace> for all of them to leave, then
+# KILL any survivor and wait up to 2 s more. Signals only a pid whose START
+# TIME still matches (a recycled pid is somebody else's process and is left
+# alone). Order is the caller's: pass leaves first (bottom-up), so a parent is
+# never reaped ahead of the child whose exit it would otherwise wait on.
+# rc 0 when every process left; rc 1 (with the survivors named on stderr) when
+# one outlived the KILL wait — the caller proceeds either way, because a
+# teardown that never returns is worse than a remnant.
+_cch_await_gone() {
+    local grace="$1"; shift
+    [[ "$grace" =~ ^[0-9]+$ ]] || grace=10
+    local ent pid st polls i alive="" _phase
+    for ent in "$@"; do
+        pid=${ent%%:*}; st=${ent#*:}
+        [[ "$(_cch_proc_start "$pid")" == "$st" ]] && kill -TERM "$pid" 2>/dev/null
+    done
+    for _phase in term kill; do
+        if [[ "$_phase" == kill ]]; then
+            polls=20
+            for ent in "$@"; do
+                pid=${ent%%:*}; st=${ent#*:}
+                [[ "$(_cch_proc_start "$pid")" == "$st" ]] && kill -KILL "$pid" 2>/dev/null
+            done
+        else
+            polls=$(( grace * 10 ))
+        fi
+        for (( i = 0; i <= polls; i++ )); do
+            alive=""
+            for ent in "$@"; do
+                pid=${ent%%:*}; st=${ent#*:}
+                [[ "$(_cch_proc_start "$pid")" == "$st" ]] && alive+=" $pid"
+            done
+            [[ -z "$alive" ]] && return 0
+            (( i < polls )) && sleep 0.1
+        done
+    done
+    echo "cch_teardown: process(es)${alive} survived TERM + KILL; moving the run dir anyway" >&2
+    return 1
+}
+
 cch_teardown() {
+    # AWAIT THE PANE PROCESSES BEFORE THE RUN DIR IS MOVED
+    # (your-org/nexus-code#1670 item 4). `kill-server` HUPs the panes and
+    # RETURNS; the harness `claude` then writes its exit bookkeeping — a
+    # `<sid>.jsonl` under cfg/projects/ — by PATH, some time later. When the
+    # move below had already happened, that write re-created
+    # `$CCH_DIR/cfg/projects/…` and left a `/tmp/cc-harness-*` remnant
+    # (seen 2026-09-25/26/27, and reproduced once in five boots on
+    # 2026-09-29). So: snapshot every pane's process tree (leaves first, by
+    # parent-pid walk, never by cmdline) WITH its start time, stop the server,
+    # and wait for those exact processes to leave before touching the dir.
+    #
+    # CHOSEN bound: CCH_TEARDOWN_GRACE, default 10 s, then KILL + 2 s. A
+    # graceful claude exit measures ~0.1 s locally; slow shared CI runners
+    # have been seen to take several seconds (see _cch_kill_tree), and a
+    # teardown longer than ~12 s would be felt in every harness scenario.
+    local -a _cch_await=()
+    local _p _q _st _panes=""
     if [[ -n "${CCH_TMUXWRAP:-}" && -x "${CCH_TMUXWRAP:-}" ]]; then
+        # -a: every pane on THIS server — it is private, so "all" is ours.
+        _panes=$(cch_tmux list-panes -a -F '#{pane_pid}' 2>/dev/null) || _panes=""
+        for _p in $_panes; do
+            [[ "$_p" =~ ^[0-9]+$ ]] || continue
+            for _q in $(_cch_tree_pids "$_p"); do
+                _st=$(_cch_proc_start "$_q") && _cch_await+=("$_q:$_st")
+            done
+        done
         cch_tmux kill-server 2>/dev/null || true   # tmux-scoped: cch_tmux() pins -L "$CCH_SOCKET" (this file)
     fi
     if [[ -n "${CCH_MOCK_PID:-}" ]]; then
+        # The mock writes requests.log into the run dir too: await it as well.
+        _st=$(_cch_proc_start "$CCH_MOCK_PID") && _cch_await+=("$CCH_MOCK_PID:$_st")
         kill "$CCH_MOCK_PID" 2>/dev/null || true
+    fi
+    if (( ${#_cch_await[@]} > 0 )); then
+        _cch_await_gone "${CCH_TEARDOWN_GRACE:-10}" "${_cch_await[@]}" || true
     fi
     if [[ -n "${CCH_DIR:-}" && -d "${CCH_DIR:-}" ]]; then
         # Move the run dir aside (rename) instead of rm: the killed claude

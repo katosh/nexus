@@ -229,7 +229,8 @@ fi
 # ---- result variables (reset by each entry point) ------------------------
 PD_OUTCOME=""            # submitted | submitted-after-retry | queued |
                          # queued-after-retry | held | blocked |
-                         # blocked-before-paste | inert | in-flight |
+                         # blocked-before-paste | occupied-before-paste |
+                         # inert | in-flight |
                          # undecidable-box | unverifiable | tmux-failed |
                          # dead-pane | pane-unknown
 _PD_NEEDLE_DERIVED=""
@@ -469,12 +470,20 @@ pd_evidence_seen() {
     return 1
 }
 
-# pd_pane_verdict <pane-state-key>
+# pd_pane_verdict <pane-state-key> [before-paste]
 #
 # held     state=user-typing AND input=typed — the text is IN the input box.
 #          An ALLOWLIST of one: `input=?` is undecidable and `ghost`/`blank`
 #          say nothing typed is there (w234sk F8).
-# queued   the pane is mid-turn and the box is not holding typed text.
+# queued   the pane is mid-turn. AFTER our paste, typed text in a mid-turn box
+#          is expected (ours, queued behind the turn), so the default mode does
+#          not read `input=` here.
+#          `before-paste` mode (your-org/nexus-code#1683 F1) DOES: before a byte
+#          of ours goes out, typed text in a mid-turn box can only be somebody
+#          else's, so a busy-family pane with input=typed is `held` and one with
+#          input=? is `draft` — the same allowlist as `user-typing`. A busy line
+#          with no `input=` field (no REPL row to read) stays `queued`: every
+#          doubt pastes, as before.
 # blocked  an overlay is up. NEVER press Enter.
 # draft    state=user-typing with input=? — undecidable, so treated as an
 #          operator draft. NEVER press Enter.
@@ -495,7 +504,7 @@ _pd_field() {
     }'
 }
 pd_pane_verdict() {
-    local key="${1:-}" bin="${PD_PANE_STATE_BIN:-$_pd_dir/pane-state.sh}" line st inp
+    local key="${1:-}" mode="${2:-}" bin="${PD_PANE_STATE_BIN:-$_pd_dir/pane-state.sh}" line st inp
     [[ -n "$key" && -x "$bin" ]] || { printf 'unknown'; return 0; }
     # THE VERDICT MUST COME FROM THE TMUX THE PASTE WENT TO. pane-state.sh is an
     # EXTERNAL process: it runs whatever `tmux` is on PATH. If `tmux` is a shell
@@ -522,7 +531,10 @@ pd_pane_verdict() {
                 "?")   printf 'draft' ;;
                 *)     printf 'clear' ;;
             esac ;;
-        busy|working-background|working-self-paced) printf 'queued' ;;
+        busy|working-background|working-self-paced)
+            if [[ "$mode" == before-paste && "$inp" == typed ]]; then printf 'held'
+            elif [[ "$mode" == before-paste && "$inp" == "?" ]]; then printf 'draft'
+            else printf 'queued'; fi ;;
         # "could not look" and "don't know yet" are NOT "the box is clear".
         unknown|empty|"")         printf 'unknown' ;;
         *)                        printf 'clear' ;;
@@ -546,12 +558,47 @@ pd_pane_verdict() {
 # >= 0x80 dropped on both sides, TAB as four spaces): Claude Code's cleaning
 # removes only non-ASCII invisibles, so the projection of what it shows equals
 # the projection of what we pasted, whatever its rule is.
+#
+# THE WHOLE INPUT REGION, NOT THE GLYPH ROW (your-org/nexus-code#1729). The first
+# cut decided on the `❯` row ALONE, so our chip with an operator CONTINUATION
+# below it (shift+Enter after the chip, then text — an indented row under the
+# glyph row) read as ours, and the retry Enter submitted the operator's text
+# together with our brief. So every row AFTER the glyph row, up to the box's
+# bottom border (a row of nothing but `─` U+2500, 3+ of them — the real 2.1.273
+# capture draws a full-width one directly under the input, see
+# fixtures/pasted-multiline-chip-realmodel-273.ansi) or the end of the capture,
+# is now part of the decision:
+#   placeholder  every one of those rows must be BLANK (visible projection).
+#   text         the region, WHITESPACE-FREE, must EQUAL the whole payload,
+#                whitespace-free, under the visible projection. Whitespace-free
+#                so a line Ink WRAPS (at a word, dropping the space, or mid-word)
+#                and the two-column continuation indent compare equal; a row the
+#                payload does not account for cannot. The ASCII fallback (first
+#                row only, below) admits the region only when its ASCII
+#                projection equals the payload's AND every continuation row is
+#                pure ASCII — so an extra row is caught by one or the other.
+# The old first-row tests still GATE both branches, so this only ever refuses
+# more. ERROR DIRECTION, stated: a payload row that itself is nothing but `─`
+# ends the region early and the equality then fails — refused, the safe side;
+# a multi-row payload of ours whose LATER rows carry a glyph the visible
+# projection cannot predict is refused too (`draft`, never an Enter). No border
+# found means the region runs to the end of the capture: anything drawn there
+# (a footer) is refused, never accepted.
 pd_box_is_ours() {
-    local tgt="$1" file="${2:-}" cap row text first k n
+    local tgt="$1" file="${2:-}" cap row text first k n rest
     [[ -n "$file" && -r "$file" ]] || return 1
     cap=$(tmux capture-pane -p -t "$tgt" -S -40 2>/dev/null) || return 1
     row=$(printf '%s\n' "$cap" | LC_ALL=C awk 'index($0, "\342\235\257") == 1 { r = $0 } END { printf "%s", r }')
     [[ -n "$row" ]] || return 1
+    # The rows BELOW that glyph row, up to the bottom border (#1729). The same
+    # "last row starting with `❯`" rule as `row` above, so both read one box.
+    rest=$(printf '%s\n' "$cap" | LC_ALL=C awk '
+        index($0, "\342\235\257") == 1 { s = ""; done = 0; next }
+        { if (done) next
+          t = $0; n = gsub(/\342\224\200/, "", t)
+          if (n >= 3 && t ~ /^[ \t]*$/) { done = 1; next }
+          s = s $0 "\n" }
+        END { printf "%s", s }')
     local rowraw text_v want_v want_a
     rowraw=$(printf '%s' "$row" | LC_ALL=C sed -e 's/^\xe2\x9d\xaf//' -e 's/^\(\xc2\xa0\| \)*//')
     # TWO projections of the row. `text` is the ASCII one (every byte >= 0x80
@@ -588,6 +635,9 @@ pd_box_is_ours() {
             [[ "$k" =~ ^[0-9]+$ ]] || return 1
             (( k == n )) || return 1
         done < <(printf '%s' "$text" | LC_ALL=C command grep -oE '\[Pasted text #[0-9]+( \+[0-9]+ lines)?\]')
+        # …and NOTHING below the chip (#1729): an operator continuation row
+        # under our placeholder is text the next Enter would submit with it.
+        [[ -z "$(printf '%s' "$rest" | _pd_visible | _pd_wsfree)" ]] || return 1
         return 0
     fi
     IFS= read -r first < "$file" || [[ -n "$first" ]] || return 1
@@ -609,16 +659,38 @@ pd_box_is_ours() {
     # and a keycap byte-identical.
     want_v=$(printf '%s' "$first" | _pd_visible)
     [[ -n "$want_v" ]] || return 1
-    [[ "$want_v" == "$text_v" ]] && return 0
-    (( $(_pd_cp_len "$text_v") >= 8 )) && [[ "$want_v" == "$text_v"* ]] && return 0
     # FALLBACK, and only where it is DISCRIMINATING: what INK does to an emoji
     # when it draws the box is NOT measured, so an ASCII-rich line must not be
     # stranded by a glyph we cannot predict. 8+ ASCII characters, whole or prefix —
     # never the short whole-equality that collided above.
     want_a=$(printf '%s' "$first" | LC_ALL=C sed -e 's/\t/    /g' -e 's/[\x80-\xff]//g' -e 's/[[:space:]]*$//')
-    (( ${#text} >= 8 )) && [[ "$want_a" == "$text"* ]] && return 0
+    local by_v=0 by_a=0
+    if [[ "$want_v" == "$text_v" ]] || { (( $(_pd_cp_len "$text_v") >= 8 )) && [[ "$want_v" == "$text_v"* ]]; }; then
+        by_v=1
+    fi
+    (( ${#text} >= 8 )) && [[ "$want_a" == "$text"* ]] && by_a=1
+    (( by_v || by_a )) || return 1
+    # THE FIRST ROW IS NECESSARY, NOT SUFFICIENT (#1729): the whole input region
+    # must be the whole payload. Visible projection first, whitespace-free.
+    local box_v pay_v
+    box_v=$( { printf '%s\n' "$rowraw"; printf '%s' "$rest"; } | _pd_visible | _pd_wsfree)
+    pay_v=$(_pd_visible < "$file" | _pd_wsfree)
+    [[ -n "$pay_v" && "$box_v" == "$pay_v" ]] && return 0
+    # The ASCII route, only behind a first row the fallback itself admitted: the
+    # region's ASCII projection equals the payload's (no extra ASCII), AND every
+    # continuation row is pure ASCII (no extra non-ASCII the projection drops).
+    (( by_a )) || return 1
+    [[ "$(printf '%s' "$rest" | LC_ALL=C tr -d '\000-\177' | wc -c | tr -d ' ')" == 0 ]] || return 1
+    local box_a pay_a
+    box_a=$( { printf '%s\n' "$rowraw"; printf '%s' "$rest"; } | LC_ALL=C sed -e 's/[\x80-\xff]//g' | _pd_wsfree)
+    pay_a=$(LC_ALL=C sed -e 's/[\x80-\xff]//g' < "$file" | _pd_wsfree)
+    [[ -n "$pay_a" && "$box_a" == "$pay_a" ]] && return 0
     return 1
 }
+
+# _pd_wsfree (stdin -> stdout): every ASCII whitespace byte removed, newlines
+# included — the comparison basis for a WRAPPED, indented input region (#1729).
+_pd_wsfree() { LC_ALL=C tr -d ' \t\n\r\013\014'; }
 
 # _pd_visible (stdin -> stdout): TAB as four spaces, the invisible candidate set
 # (Tier U + Tier C) removed, trailing whitespace trimmed. With no tier tables
@@ -842,9 +914,35 @@ pd_deliver() {
     # SELECTS ITS HIGHLIGHTED DEFAULT (#1200). One read, before a byte goes out.
     # Only a POSITIVE `blocked` refuses; every doubt pastes, as in
     # paste-followup.sh's own guard.
-    if [[ "$(pd_pane_verdict "$key")" == blocked ]]; then
+    #
+    # …AND NEVER INTO A BOX THAT ALREADY HOLDS TYPED TEXT (your-org/nexus-code#1674).
+    # A bracketed paste lands at the CURSOR, so into an operator's half-typed
+    # message it MERGES, and our Enter then submits the draft with the emit inside
+    # it. Measured on the live board 2026-09-29 13:16:02: the startup-sweep emit
+    # was pasted into the operator's message and sent it mid-word (the enqueue
+    # record: operator text, then the emit, then a word cut in half). That
+    # record carried our needle, so this primitive reported `queued` — delivered — for the operator's own message.
+    # The retry Enters have been an EQUALITY since #1596; the FIRST Enter was
+    # still a shape-blind one into whatever the box held. So the same allowlist
+    # decides here: `held` (user-typing input=typed) and `draft` (input=?,
+    # undecidable, read as a draft per #626) paste NOTHING. A ghost, a blank box,
+    # `busy`, an unreadable pane — every doubt — still pastes, exactly as before.
+    # ERROR DIRECTION, stated: this also defers when the typed text is an EARLIER
+    # paste of ours still stuck in the box, so a stranded emit now blocks later
+    # ones (each refusal logged) instead of being submitted merged with them.
+    # RESIDUAL: a draft begun between this read and the paste (~0.3 s) is not seen.
+    # `before-paste`: a MID-TURN pane's box is read too (your-org/nexus-code#1683
+    # F1) — an operator types ahead into a busy worker, and that draft is exactly
+    # as mergeable as one in an idle box.
+    local _pd_pre; _pd_pre=$(pd_pane_verdict "$key" before-paste)
+    if [[ "$_pd_pre" == blocked ]]; then
         [[ -n "$norm" ]] && rm -f "$norm"
         PD_ENTER_RETRIES=0; PD_OUTCOME="blocked-before-paste"
+        return "$PD_RC_NOT_SUBMITTED"
+    fi
+    if [[ "$_pd_pre" == held || "$_pd_pre" == draft ]]; then
+        [[ -n "$norm" ]] && rm -f "$norm"
+        PD_ENTER_RETRIES=0; PD_OUTCOME="occupied-before-paste"
         return "$PD_RC_NOT_SUBMITTED"
     fi
     _PD_NEEDLE_DERIVED=$(pd_needle_from_file "${norm:-$file}")

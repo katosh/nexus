@@ -502,7 +502,12 @@ workspace: N busy | N idle | N retained | N idle-too-long | N pane-absent | N ov
 this page. The line can also read `workspace: UNAVAILABLE …`,
 `workspace: ^ PARTIAL …` or `workspace: ^ STALE …`; each of those
 says the counts are incomplete or dated, and none of them means
-"an empty workspace".)
+"an empty workspace". A trailing `| N unprobed` means the render
+reached its budget before it could probe N windows that had no
+reusable recording (none, too old, a stalled recorder, or a hook
+heartbeat that changed class); those are counted as neither busy nor
+idle, so never read them as candidates to close. The other counts may
+be the recorder's latest sweep, up to 300 s old.)
 
 (`awaiting-input` counts workers whose `Notification` hook —
 `permission_prompt`, `idle_prompt`, MCP elicitation — fired

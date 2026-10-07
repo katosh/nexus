@@ -957,6 +957,74 @@ _over_limit_reconcile_alive() {
         "$reset_epoch" "$first_seen" "$now" "$attempts"
 }
 
+# RELEASE EVERY ROW on a CREDENTIAL CHANGE (your-org/nexus-code#1739; skeptic S2
+# on #1741). A re-login / account switch lifts the OLD account's limit before any
+# row's reset epoch, and a wake stamped hours out would otherwise sit there.
+#
+# MOVING THE CLOCK ALONE RESUMES NOTHING — the first cut claimed it "let the wake
+# loop's existing, tested resumption path run", and that was false: pane-state.sh
+# answers `over-limit` from the hook's unexpired StopFailure stamp
+# (`over-limit/<window>.json`) BEFORE it reads the pane, so the expedited row read
+# `over-limit`, consumed an attempt per wake (60/120/240 s) and failed open ~7 min
+# later — hours before reset_at whenever the event was not a real reset.
+#
+# THE CHOICE, stated: option (a), fail open IMMEDIATELY, and ONLY on
+# `credential-change`. A new identity is positive evidence that the stamp
+# describes the old account's limit, so each row's stamp is moved aside (kept as
+# `*.released-credential-change.<epoch>` for audit — pane-state reads only
+# `<window>.json`) and `attempts` is set one short of the cap. On the next wake a
+# live pane takes the resume path; a pane still rendering the banner takes the
+# fail-open probe AT ONCE (the wake brief; a still-limited turn re-stamps via
+# StopFailure). Every OTHER source (`over-limit-resumed:*`) touches NO row: one
+# busy pane is evidence of quota, not that another pane's stamp is stale, and
+# expediting such a row would only burn its attempts toward an early fail-open
+# (option (b), restoring next_attempt afterwards, was rejected as two writes to
+# undo one). Those rows keep their own clocks; `_over_limit_reconcile_alive`
+# already expedites any of them the scan sees alive. Prints the count changed.
+_over_limit_stamp_dir() {
+    if [[ -n "${NEXUS_STATE_DIR:-}" ]]; then printf '%s/over-limit' "$NEXUS_STATE_DIR"
+    else printf '%s/over-limit' "${STATE_DIR:-.}"; fi
+}
+
+_over_limit_expedite_all() {
+    local source="${1:-reset-event}" path now n=0 snapshot row
+    if [[ "$source" != credential-change ]]; then
+        printf '0'; return 0
+    fi
+    path=$(_over_limit_state_path)
+    [[ -f "$path" ]] || { printf '0'; return 0; }
+    now=$(date +%s)
+    snapshot=$(cat "$path" 2>/dev/null)
+    local max_attempts="${MONITOR_OVER_LIMIT_MAX_ATTEMPTS:-4}"
+    [[ "$max_attempts" =~ ^[0-9]+$ ]] || max_attempts=4
+    local key window role token reset_epoch first_seen next_attempt attempts
+    local sdir stamp new_attempts new_next
+    sdir=$(_over_limit_stamp_dir)
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        IFS=$'\t' read -r key window role token reset_epoch first_seen next_attempt \
+            attempts <<<"$row"
+        [[ "$next_attempt" =~ ^[0-9]+$ ]] || continue
+        [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
+        new_next="$next_attempt"; new_attempts="$attempts"
+        (( next_attempt > now )) && new_next="$now"
+        stamp="$sdir/${window}.json"
+        if [[ -f "$stamp" ]]; then
+            mv -f "$stamp" "$stamp.released-${source}.${now}" 2>/dev/null \
+                && "$_OVER_LIMIT_LOG_FN" \
+                    "over-limit: '${window}' (key=${key}) hook stamp released by reset event (${source}) — kept as $(basename "$stamp").released-${source}.${now}"
+        fi
+        (( max_attempts > 0 && attempts < max_attempts - 1 )) && new_attempts=$(( max_attempts - 1 ))
+        [[ "$new_next" == "$next_attempt" && "$new_attempts" == "$attempts" ]] && continue
+        "$_OVER_LIMIT_LOG_FN" \
+            "over-limit: '${window}' (key=${key}) wake expedited by reset event (${source}) from $(( next_attempt - now ))s out to now (attempts ${attempts} -> ${new_attempts})"
+        _over_limit_write_row "$key" "$window" "$role" "$token" \
+            "$reset_epoch" "$first_seen" "$new_next" "$new_attempts"
+        n=$(( n + 1 ))
+    done <<<"$snapshot"
+    printf '%s' "$n"
+}
+
 # Resolve a tmux window name to its index (for pane-state.sh).
 #
 # THREE-STATE, same contract as monitor/_tmux-window.sh's resolvers
@@ -1320,6 +1388,14 @@ _over_limit_evaluate_row() {
                 # into a pane that never actually came back.
                 _over_limit_liveness_set "$key" "$now" "resumed"
                 _over_limit_drop "$key"
+                # A pane observed BUSY again is running a fresh turn: this
+                # account has quota, so every worker parked at the rate-limit
+                # MENU is owed its nudge now (your-org/nexus-code#1739). `idle`
+                # is not evidence — a pane can stop reading over-limit by
+                # scrolling — so only `busy` raises the event.
+                if [[ "$state" == busy ]] && declare -F _unstick_reset_event_signal >/dev/null 2>&1; then
+                    _unstick_reset_event_signal "over-limit-resumed:${window}"
+                fi
             else
                 "$_OVER_LIMIT_LOG_FN" \
                     "over-limit: '${window}' transitioned out but paste failed; will retry next cycle"

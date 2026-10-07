@@ -349,6 +349,93 @@ matched_desc=""
 # wake loop (`monitor/watcher/_orphan_async.sh`) cannot resolve.
 # Collect EVERY id instead; the ids are what make the waits resolvable.
 matched_ids=()
+# Ids a Slurm row parsed but the job-id predicate REFUSED (`0`, `007`), and
+# whether a bare-number row was distrusted for sitting in `$(…)`. Neither is a
+# watch, so both are named in the NOT-ARMED notice (your-org/nexus-code#1727).
+_rejected_ids=()
+_id_distrust=0
+# An `sbatch` inside `$(…)` or backticks. Matched against the WHOLE scan view,
+# not per line, so `jid=$(\n  sbatch --parsable …\n)` is caught too: `[^)…]`
+# spans a newline in bash's ERE. Over-matching (`$(cat f) sbatch` cannot match:
+# the class stops at the first `)`) errs toward distrusting a bare number,
+# which costs a NOT-ARMED notice, never a wrong job.
+_CMDSUBST_SBATCH_ERE='(\$\(|`)[^)`]*\bsbatch\b'
+# ONLY THE ID SBATCH ITSELF PRINTS MAY ARM (your-org/nexus-code#1727 core). A
+# `--parsable` row's id field accepts ANY bare-integer stdout line, and the hook
+# sees the whole tool call's stdout, not sbatch's. `sbatch --parsable j.sh;
+# grep -c x f` prints the id AND a count; proj-overlay2 armed `slurm:1` from two
+# `grep -c` lines exactly so. So a bare number is trusted only when EVERY
+# command segment of the call (split on ; && || | & and newlines) is an sbatch
+# or a command that prints nothing to stdout here: cd, export, module/ml,
+# source/., set, umask, true/:, a pure VAR=value assignment, a comment line,
+# loop/branch syntax, and `tee` (it re-prints sbatch's own output).
+# RESIDUAL, stated: `source`/`.` and `module` are allowed although a sourced
+# file CAN print; `source env.sh; sbatch --parsable …` printing `7` would still
+# be read as an id. They are allowed because they are how a submission is set
+# up, and distrusting them would un-watch most real submissions.
+# Any other segment may have printed the integer, so the call is DISTRUSTED:
+# a `syn-` wait plus the NOT-ARMED notice, never a guessed id. Quoting and
+# heredocs are not parsed; a separator inside quotes only ADDS segments, which
+# errs toward distrust (a loud notice), never toward a wrong watch.
+_parsable_call_is_sbatch_only() {   # <command text> → 0 when only sbatch can have printed
+    local seg w
+    while IFS= read -r seg || [[ -n "$seg" ]]; do
+        seg="${seg#"${seg%%[![:space:]]*}"}"
+        [[ -n "$seg" ]] || continue
+        [[ "$seg" == \#* ]] && continue
+        while [[ "$seg" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+(.*)$ ]]; do
+            seg="${BASH_REMATCH[1]}"
+        done
+        [[ "$seg" =~ ^[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*$ ]] && continue
+        # Shell CONTROL words and the WRAPPERS the slurm rows already accept
+        # (timeout/nice/env/stdbuf/time/nohup) print nothing themselves:
+        # strip them, and a wrapper's own option/duration tokens, then judge
+        # the command they run. So `if grep -q …; then sbatch …` still judges
+        # `grep`, and `for f in a b; do sbatch --parsable "$f"; done` arms.
+        w="${seg%%[[:space:]]*}"
+        while :; do
+            case "$w" in
+                do|then|else|if|while|until|'{'|'!'|time|nohup|env|nice|stdbuf|timeout) ;;
+                *) break ;;
+            esac
+            seg="${seg#"$w"}"; seg="${seg#"${seg%%[![:space:]]*}"}"
+            while [[ "$seg" =~ ^(-[^[:space:]]*|[0-9]+[smhd]?|[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*)([[:space:]]+(.*))?$ ]]; do
+                seg="${BASH_REMATCH[3]}"
+            done
+            w="${seg%%[[:space:]]*}"
+        done
+        case "$w" in
+            ''|sbatch|cd|export|module|ml|source|.|set|umask|true|:|tee|done|fi|'}'|esac) ;;
+            for) ;;   # the loop HEADER `for x in …` prints nothing; its body is judged per segment
+            *) return 1 ;;
+        esac
+    # FD REDIRECTIONS FIRST (ncbundle17-sk on PR 1745): `2>&1`, `>&2` and
+    # `&>`/`&>>` carry an `&` that is not a separator; split on it and
+    # `sbatch --parsable j.sh 2>&1`, the commonest idiom there is, left a
+    # segment `1` and was distrusted.
+    done < <(printf '%s\n' "$1" \
+                | sed -E 's/[0-9]*[<>]&[0-9-]+//g; s/&>>?/>/g' \
+                | sed -E 's/(&&|\|\||[;|&])/\n/g')
+    return 0
+}
+# _slurm_id_ok <id> — the job-id predicate from the PROBE file, loaded lazily
+# (only a Slurm row ever asks) from this hook's own tree, so it holds without
+# NEXUS_ROOT. If the file cannot be loaded every id is REFUSED: the failure
+# direction is a `syn-` wait plus a loud notice, never an unvalidated watch.
+_slurm_pred=""   # "" = not loaded yet, 1 = loaded, 0 = unavailable
+_slurm_id_ok() {
+    if [[ -z "$_slurm_pred" ]]; then
+        _slurm_pred=0
+        local _hd
+        _hd=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd) || _hd=""
+        # shellcheck disable=SC1090,SC1091
+        if [[ -n "$_hd" ]] && . "$_hd/../longjob-probes.d/slurm.sh" >/dev/null 2>&1 \
+            && declare -F lj_slurm_jobid_valid >/dev/null 2>&1; then
+            _slurm_pred=1
+        fi
+    fi
+    [[ "$_slurm_pred" == 1 ]] && lj_slurm_jobid_valid "$1"
+}
 
 # THE FIELD SEPARATOR IS NOT A LIMIT ON THE REGEX LANGUAGE
 # (your-org/nexus-code#1269). `|` is this file format's field separator, so a
@@ -408,10 +495,44 @@ while IFS='|' read -r kind cmd_re id_re desc; do
         # even an explicit loop over `BASH_REMATCH` cannot reach ids 2..N. Each
         # `Submitted batch job <id>` is on its own line, so testing lines is
         # what makes them all reachable.
-        if [[ -n "$id_re" ]] && [[ -n "$stdout_str" ]]; then
+        #
+        # A BARE-NUMBER ID ROW INSIDE `$(…)` READS NOTHING
+        # (your-org/nexus-code#1727). The `--parsable` rows' id field accepts
+        # ANY stdout line that is just an integer. When the matched `sbatch`
+        # sits inside a command substitution, its stdout went into the
+        # VARIABLE, so every bare integer the tool call printed came from
+        # something else — `jid=$(sbatch --parsable j.sh); echo $?` prints `0`,
+        # and that `0` became a job id. "Is this row's id field a bare-number
+        # shape?" is asked of the row itself (does it match `12345`?), so no
+        # row is named here. The cost is declared: `jid=$(sbatch --parsable
+        # …); echo $jid` prints the REAL id and it is not read either — that
+        # call falls to the `syn-` wait and the NOT-ARMED notice below, which
+        # names the one command that arms it. A wrong id is strictly worse:
+        # `sacct` answers about ANOTHER job.
+        _id_distrust=0
+        if [[ -n "$id_re" ]] && [[ "12345" =~ $id_re ]]; then
+            if [[ "$command_scan" =~ $_CMDSUBST_SBATCH_ERE ]]; then
+                _id_distrust=1
+            elif ! _parsable_call_is_sbatch_only "$command_scan"; then
+                _id_distrust=2
+            fi
+        fi
+        if [[ -n "$id_re" ]] && [[ -n "$stdout_str" ]] && (( _id_distrust == 0 )); then
             while IFS= read -r _out_line || [[ -n "$_out_line" ]]; do
                 if [[ "$_out_line" =~ $id_re ]]; then
-                    matched_ids+=("${BASH_REMATCH[1]}")
+                    _cand="${BASH_REMATCH[1]}"
+                    # A Slurm row's id must be a Slurm job id — the ONE shape,
+                    # shared with the probe and `longjob-watch.sh add`
+                    # (your-org/nexus-code#1727). A rejected id is not recorded
+                    # as a wait either: the orphan-async resolver would ask
+                    # `sacct` about it just as the watch did.
+                    case "$kind" in
+                        slurm|slurm-srun-async)
+                            if ! _slurm_id_ok "$_cand"; then
+                                _rejected_ids+=("$_cand"); continue
+                            fi ;;
+                    esac
+                    matched_ids+=("$_cand")
                 fi
             done <<< "$stdout_str"
         fi
@@ -490,33 +611,100 @@ mv -f "$tmp" "$hb_file" 2>/dev/null || rm -f "$tmp"
 # worker dismissed via declare-no-wait.sh is not in $fresh and gets no watch.
 # `--no-declare`: this hook already declared the `slurm <id>` wait above, and
 # the dispatcher removes that entry when the watch retires. `--no-first-probe`:
-# this is claude's PostToolUse hot path; no synchronous `sacct` here. Every
-# failure is silent (rc 0) — the watch is a convenience over a wait that is
-# already recorded; the unarmed case is what `longjob-watch.sh status` reports.
+# this is claude's PostToolUse hot path; no synchronous `sacct` here.
+#
+# NEVER SILENT WHEN NOTHING WAS ARMED (your-org/nexus-code#1727). This section
+# used to discard every failure (`>/dev/null 2>&1 || true`) and say nothing
+# when no id was parsed at all, so `jid=$(sbatch --parsable …)` — the most
+# common submission idiom there is — left the worker believing the job was
+# watched while nothing was. Whenever a Slurm launch matched and a REAL watch
+# was not armed for it (no id in the output, an id the predicate refused, a
+# bare-number id distrusted inside `$(…)`, or `add` returning non-zero —
+# which includes add's own `dispatcher: NOT ARMED` rc 3), the hook prints ONE
+# PostToolUse `additionalContext` naming why and the command that arms it — the
+# same JSON form bash-footgun-guard.sh uses. It never blocks the call: rc is
+# always 0, and the ARMED case prints nothing. A DISMISSED id stays silent: the
+# worker said so on purpose.
 _lj_auto="${MONITOR_LONGJOB_AUTO_WATCH:-}"
 if [[ -z "$_lj_auto" && -n "${NEXUS_ROOT:-}" && -x "$NEXUS_ROOT/config/load.sh" ]]; then
     _lj_auto=$("$NEXUS_ROOT/config/load.sh" monitor.longjob.auto_watch_launches true 2>/dev/null) || _lj_auto=true
 fi
 case "${_lj_auto:-true}" in 1|true|yes|on) ;; *) exit 0 ;; esac
 case "$matched_kind" in
-    slurm|slurm-srun-async)
-        _lj="${NEXUS_ROOT:-}/monitor/longjob-watch.sh"
-        [[ -n "${NEXUS_ROOT:-}" && -x "$_lj" ]] || exit 0
-        _fresh_ids=$(printf '%s' "$updated" | jq -r --arg k "$matched_kind" '.external_waits[] | select(.kind == $k) | .id' 2>/dev/null) || exit 0
-        # The SESSION KEY comes from the PAYLOAD's `session_id` — the field
-        # claude itself supplies to every hook — not from this process's env.
-        # A suite that exported CLAUDE_CODE_SESSION_ID itself could only prove
-        # the key it supplied; the payload is where production supplies it
-        # (skeptic, refuting its own attack: the hook env carries it too, via
-        # the host's child-env builder, but the payload is the documented one).
-        _lj_sid=$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null) || _lj_sid=""
-        while IFS= read -r _jid; do
-            [[ "$_jid" =~ ^[0-9][0-9_.+]*$ ]] || continue          # a syn-… id has no job to probe
-            grep -qxF "$_jid" <<<"$(printf '%s\n' "${matched_ids[@]}")" || continue   # only THIS launch's ids
-            NEXUS_STATE_DIR="$state_dir" NEXUS_WORKER_WINDOW="$window" NEXUS_LONGJOB_SESSION_ID="$_lj_sid" \
-                "$_lj" add "slurm:$_jid" --id "auto-slurm-$_jid" --desc "${matched_desc:-sbatch} (auto-watched by async-launch-detect)" \
-                --no-declare --no-first-probe >/dev/null 2>&1 || true
-        done <<<"$_fresh_ids"
-        ;;
+    slurm|slurm-srun-async) ;;
+    *) exit 0 ;;
 esac
+_na=()   # one reason per launch that got NO real watch
+_grp_why=(); _grp_ids=()
+_na_group() {   # <reason> <id> — file <id> under <reason>, one entry per distinct reason
+    local i
+    for i in "${!_grp_why[@]}"; do
+        if [[ "${_grp_why[i]}" == "$1" ]]; then _grp_ids[i]+="$2 "; return 0; fi
+    done
+    _grp_why+=("$1"); _grp_ids+=("$2 ")
+}
+_fresh_ids=$(printf '%s' "$updated" | jq -r --arg k "$matched_kind" '.external_waits[] | select(.kind == $k) | .id' 2>/dev/null) || _fresh_ids=""
+_lj="${NEXUS_ROOT:-}/monitor/longjob-watch.sh"
+_lj_ok=1
+[[ -n "${NEXUS_ROOT:-}" && -x "$_lj" ]] || _lj_ok=0
+# The SESSION KEY comes from the PAYLOAD's `session_id` — the field claude
+# itself supplies to every hook — not from this process's env. A suite that
+# exported CLAUDE_CODE_SESSION_ID itself could only prove the key it supplied
+# (skeptic, refuting its own attack: the hook env carries it too, via the
+# host's child-env builder, but the payload is the documented one).
+_lj_sid=$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null) || _lj_sid=""
+if (( ${#_rejected_ids[@]} > 0 )); then
+    _na+=("refused job id(s) $(printf '%s ' "${_rejected_ids[@]}")— not a Slurm job id (job id 0 does not exist; 'sacct -j 0' answers about OTHER jobs)")
+fi
+for _jid in "${matched_ids[@]}"; do
+    # Only THIS launch's ids that are still waits: a dismissed one is skipped,
+    # silently and on purpose.
+    grep -qxF -- "$_jid" <<<"$_fresh_ids" || continue
+    if [[ "$_jid" == syn-* ]]; then
+        if (( _id_distrust == 1 )); then
+            _na+=("the sbatch ran inside \$(…) or backticks, so its stdout went into the variable and no bare number in this output can be trusted as its job id")
+        elif (( _id_distrust == 2 )); then
+            _na+=("this call ran other commands beside sbatch --parsable, so a bare number in its output may not be the job id (e.g. a grep -c count)")
+        elif (( ${#_rejected_ids[@]} > 0 )); then
+            :   # the refused id(s) above are the reason; saying "none read" too would contradict it
+        else
+            _na+=("no job id could be read from this call's output")
+        fi
+        continue
+    fi
+    if ! _slurm_id_ok "$_jid"; then
+        _na+=("'$_jid' is not a Slurm job id (or the job-id predicate could not be loaded)")
+        continue
+    fi
+    if (( _lj_ok == 0 )); then
+        _na_group "monitor/longjob-watch.sh not found (NEXUS_ROOT unset or not executable), so nothing can watch it" "$_jid"
+        continue
+    fi
+    _add_out=$(NEXUS_STATE_DIR="$state_dir" NEXUS_WORKER_WINDOW="$window" NEXUS_LONGJOB_SESSION_ID="$_lj_sid" \
+        "$_lj" add "slurm:$_jid" --id "auto-slurm-$_jid" --desc "${matched_desc:-sbatch} (auto-watched by async-launch-detect)" \
+        --no-declare --no-first-probe 2>&1 </dev/null)
+    _add_rc=$?
+    if (( _add_rc != 0 )); then
+        # A re-submission of the SAME id (a retry) finds its watch already
+        # recorded: that watch exists, so this call armed nothing NEW and
+        # lost nothing either. Every other refusal is reported.
+        [[ "$_add_out" == *"watch auto-slurm-$_jid already exists"* ]] && continue
+        # add's own verdict line, else its last line (a `die` message).
+        _why=$(printf '%s\n' "$_add_out" | grep -m1 -E '^dispatcher:|^longjob-watch:' 2>/dev/null) || _why=""
+        [[ -n "$_why" ]] || _why=$(printf '%s\n' "$_add_out" | tail -n 1)
+        _na_group "'longjob-watch.sh add' rc=$_add_rc: ${_why:0:300}" "$_jid"
+    fi
+done
+# Ids sharing one reason are named ONCE with that reason — a 15-job grid under
+# an unarmed dispatcher is one sentence, not fifteen copies of it.
+for _gi in "${!_grp_why[@]}"; do
+    _na+=("job(s) ${_grp_ids[_gi]% }: ${_grp_why[_gi]}")
+done
+if (( ${#_na[@]} > 0 )); then
+    _msg="longjob NOT ARMED for this Slurm submission (your-org/nexus-code#1727) — no watch will wake you when it ends: $(printf '%s; ' "${_na[@]}")"
+    _msg+="for each job, run: ng longjob add slurm:<id> (the REAL id — sbatch's output or squeue --me), and check it says ARMED; if add itself says NOT ARMED, use the fallback it prints."
+    jq -nc --arg m "${_msg:0:4000}" \
+        '{hookSpecificOutput:{hookEventName:"PostToolUse", additionalContext:$m}}' \
+        2>/dev/null || true
+fi
 exit 0

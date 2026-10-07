@@ -194,7 +194,16 @@ jq -e '.experimental.monitors | length == 1 and .[0].command != "" and .[0].when
 echo "=== every launch surface splices the flag ==="
 sw="$REPO_ROOT/monitor/spawn-worker.sh"
 n=$(grep -o 'PLUGIN_ARG:+ \$PLUGIN_ARG' "$sw" | wc -l); (( n == 3 )) && ok "spawn-worker.sh: 3 launcher lines carry \${PLUGIN_ARG:+ …} (fresh, resume, loop)" || bad "spawn-worker.sh PLUGIN_ARG splice count $n (want 3)"
-grep -q '^PLUGIN_ARG=\$(_spawn_plugin_arg "\$WINDOW_NAME")' "$sw" && grep -q '^    PLUGIN_ARG=\$(_spawn_plugin_arg "\$WINDOW_NAME")' "$sw" && ok "spawn-worker.sh: PLUGIN_ARG computed on both the fresh and the resume path" || bad "spawn-worker.sh PLUGIN_ARG assignment"
+# Since the Codex harness (#1640/#1642) the FRESH-path computation sits in the
+# claude arm of an `if [ "$HARNESS" = codex ]` whose codex arm sets PLUGIN_ARG
+# EMPTY on purpose (the dispatcher is a Claude Code plugin monitor; Codex has no
+# equivalent wake). Reviewed for #1643: assert both computations AND the explicit
+# empty codex arm, rather than loosening the anchor to any indentation.
+n=$(grep -c '^ *PLUGIN_ARG=\$(_spawn_plugin_arg "\$WINDOW_NAME")$' "$sw")
+(( n == 2 )) && ok "spawn-worker.sh: PLUGIN_ARG computed on both the fresh and the resume path (2 sites)" || bad "spawn-worker.sh PLUGIN_ARG assignment count $n (want 2)"
+grep -q '^    PLUGIN_ARG=""$' <<<"$(grep -A4 '^if \[ "\$HARNESS" = codex \]; then$' "$sw")" \
+    && ok "spawn-worker.sh: the codex fresh arm sets PLUGIN_ARG EMPTY explicitly (no plugin monitor for Codex)" \
+    || bad "spawn-worker.sh: codex fresh arm does not set PLUGIN_ARG=\"\" explicitly"
 grep -q -- '--plugin-dir)          PLUGIN_DIR=' "$REPO_ROOT/monitor/claude-loop.sh" && grep -q 'args+=( --plugin-dir "\$PLUGIN_DIR" )' "$REPO_ROOT/monitor/claude-loop.sh" && ok "claude-loop.sh parses --plugin-dir and re-passes it on every (re)invocation" || bad "claude-loop.sh plugin-dir"
 grep -q '\${name_flag}\${plugin_flag}\$continue_flag' "$REPO_ROOT/monitor/watcher/_respawn.sh" && ok "_respawn.sh: the orchestrator launcher carries \${plugin_flag}" || bad "_respawn.sh splice"
 # The loop wrapper must ACCEPT the flag the spawner passes: an unknown arg is fatal there.

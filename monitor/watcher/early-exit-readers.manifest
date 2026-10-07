@@ -19,10 +19,10 @@ monitor/ng	head	prod	9
 monitor/node-forensics.sh	head	prod	3
 monitor/remote-up.sh	awk-exit	prod	1
 monitor/skeptic-channel.sh	awk-exit	prod	1
-monitor/spawn-worker.sh	head	prod	7
+monitor/spawn-worker.sh	head	prod	6
 monitor/svc.sh	head	prod	4
 monitor/test-ci-trigger-audit.sh	head	test	1
-monitor/test-coldbuild-guard.sh	head	test	5
+monitor/test-coldbuild-guard.sh	head	test	4
 monitor/test-interactive-sessions.sh	head	test	1
 monitor/test-interpreter-parity.sh	head	test	1
 monitor/tmpfs-guard.sh	head	prod	2
@@ -73,6 +73,7 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh	head	test	6
 monitor/watcher/test-integration/test-realmodel-apispoof.sh	awk-exit	test	1
 monitor/watcher/test-integration/test-realmodel-longjob-wake.sh	head	test	2
 monitor/watcher/test-integration/test-realmodel-overlimit.sh	awk-exit	test	1
+monitor/watcher/test-integration/test-realmodel-respawn-late-render.sh	awk-exit	test	1
 monitor/watcher/test-integration/test-realmodel-respawn-verify.sh	awk-exit	test	1
 monitor/watcher/test-integration/test-same-name-recycle.sh	awk-exit	test	3
 monitor/watcher/test-integration/test-same-name-recycle.sh	head	test	1

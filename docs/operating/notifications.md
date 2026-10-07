@@ -33,9 +33,10 @@ Used automatically when Pushover isn't configured. Install the [iOS](https://app
 
 Used when the tier is `emergency` and at least one push channel succeeded — or as a last-resort if every push channel failed.
 
-- **Recipient.** `notifications.email.address` (env override: `$NEXUS_EMAIL_TO`). `notifications.email.probe_address` is a disposable alias for probes only.
+- **Recipient.** `notifications.email.address`. `$NEXUS_EMAIL_TO` may only narrow it: equal to that address, or empty for no email. Any other value is refused (rc 5) and never redirects. `notifications.email.probe_address` is a disposable alias for probes only (reserved; not consumed).
+- **Mail policy** (operator rule, 2026-09-28, <your-org>/nexus-code#1663): the nexus emails **only the operator** and **never as the operator**. `notify.sh` refuses (rc 5) any recipient that is not exactly `notifications.email.address` in the PRIMARY nexus's own `config/nexus.yml` (resolved by the one-tree rule, `monitor/_nexus-root.sh`; `NEXUS_CONFIG` or `NEXUS_ROOT` naming another recipient is refused, never followed). No address configured means no email at rc 0, with the push backends unaffected. and refuses (rc 6) a sender that would carry the operator's address, local part or login. The envelope sender and recipient are set explicitly: `nexus-monitor@<host>` and the operator alone. Every message carries `Auto-Submitted: auto-generated` and a footer naming the host. `notify.sh` is the only file allowed to send mail, and `monitor/watcher/mail-path-lint.sh` enforces that.
 - **Relay.** `notifications.email.smtp_host` / `.smtp_port` (env overrides: `$NEXUS_SMTP_HOST`, `$NEXUS_SMTP_PORT`). Must accept mail from the cluster host without authentication.
-- **Body shape.** `notify.sh` enforces: subject `[nexus] <title>`; plain-text body starts with `Event: <title>` and `Issue: <click-url-or-(no link)>`, followed by the message. Sender is `nexus-monitor@<cluster-host>`.
+- **Body shape.** `notify.sh` enforces: subject `[nexus] <title>`; plain-text body starts with `Event: <title>` and `Issue: <click-url-or-(no link)>`, followed by the message. Sender is `nexus monitor <nexus-monitor@<cluster-host>>`, for the header and the envelope alike; the body ends with a footer naming the host.
 - **Inline images.** Pass `--image <path.png>`. `notify.sh` builds a `multipart/related` MIME tree — plain-text alternative plus an HTML `<img src="cid:...">` referencing the attached image. The payload travels with the mail; no public URL needed.
 
 ## `monitor/notify.sh`
@@ -49,9 +50,9 @@ monitor/notify.sh "<title>" "<body>"
                   [--require-delivery] [--quiet]
 ```
 
-Round-trip ~0.4 s per channel; each request carries its own `curl --max-time` cap — 10 s for Pushover, 15 s for an ntfy upload with `--image`, 5 s for a plain ntfy post (`monitor/notify.sh:145,177,181`). Silent no-op when nothing is configured, so callers in the monitor loop need no conditional.
+Round-trip ~0.4 s per channel; each request carries its own `curl --max-time` cap — 10 s for Pushover, 15 s for an ntfy upload with `--image`, 5 s for a plain ntfy post (`monitor/notify.sh:216,248,252`). Silent no-op when nothing is configured, so callers in the monitor loop need no conditional.
 
-Pass `--require-delivery` for manual probes; the helper then exits nonzero on total failure. Exit codes: `0` ok or silently-skipped, `1` usage, `2` `--require-delivery` set with no configured backend, `3` `--require-delivery` set and every backend failed, `4` missing `curl` / `python3`.
+Pass `--require-delivery` for manual probes; the helper then exits nonzero on total failure. Exit codes: `0` ok or silently-skipped, `1` usage, `2` `--require-delivery` set with no configured backend, `3` `--require-delivery` set and every backend failed, `4` missing `curl` / `python3`, `5` the email was refused because the recipient is not the operator, and `6` the email was refused because the sender would carry the operator's identity. `5` and `6` outrank a push that landed.
 
 ## `sandbox-notify` — the in-pane wake
 

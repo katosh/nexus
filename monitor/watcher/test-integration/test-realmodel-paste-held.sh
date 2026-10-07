@@ -348,6 +348,46 @@ sleep 2
 assert_eq "busy: …and its request reached the backend" "$(grew "$(nreq)" "$r0")" "yes"
 close_orch
 
+# ---- draft / busydraft: an OPERATOR DRAFT is in the box (your-org/nexus-code#1674)
+# Measured on the live board 2026-09-29 13:16:02: the orchestrator was MID-TURN,
+# the operator was typing, and the startup-sweep emit was pasted INTO the
+# half-typed message; the first Enter sent it mid-word. The emit must paste
+# NOTHING (rc 7) and press no Enter, idle or busy, and the draft must still be
+# in the box afterwards. `busydraft` is the production shape: it rests on
+# pane-state giving typed input precedence over `busy`, measured here rather than
+# read off the classifier.
+DRAFT_TEXT="when we restart the emit gets stuck until I enter it "
+sig_of() { tail -1 "$1" | sed -n 's/.*\(nexus-emit-sig [^ ]* [^ ]*\).*/\1/p'; }
+n_with() { _transcripts | while IFS= read -r _t; do command grep -cF -- "$1" "$_t"; done | awk '{s+=$1} END{print s+0}'; }
+boot_orch
+cch_tmux send-keys -t "$CCH_SESSION:$WIN" -l "$DRAFT_TEXT"
+wait_for "draft: the operator draft reads user-typing before the emit" 15 -- cch_state_is "$WIN" user-typing
+emit_body "$CCH_DIR/b-draft" draft "plain ascii line"
+r0=$(nreq); s0=$(nrec)
+cch_with_tmux_env _drive emit "$CCH_DIR/b-draft"; rc=$?
+sleep 4
+assert_eq "draft: the emit is REFUSED before the paste (rc 7) — nothing merged into the draft" "$rc" "7"
+assert_eq "draft: NO request reached the backend — the draft was not submitted" "$(grew "$(nreq)" "$r0")" "no"
+assert_eq "draft: …and NO submission is recorded" "$(grew "$(nrec)" "$s0")" "no"
+wait_for "draft: the draft is still in the box" 15 -- cch_state_is "$WIN" user-typing
+close_orch
+
+boot_orch
+cch_control '{"mode":"text","text":"one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty","drip_ms":800}'
+cch_send "$WIN" "long busy turn"
+wait_for "busydraft: the pane is mid-turn" 20 -- cch_state_is "$WIN" busy
+cch_tmux send-keys -t "$CCH_SESSION:$WIN" -l "$DRAFT_TEXT"
+wait_for "busydraft: a draft typed DURING the turn reads user-typing (typed input outranks busy)" 15 -- cch_state_is "$WIN" user-typing
+emit_body "$CCH_DIR/b-busydraft" busydraft "plain ascii line"
+sig=$(sig_of "$CCH_DIR/b-busydraft")
+cch_with_tmux_env _drive emit "$CCH_DIR/b-busydraft"; rc=$?
+assert_eq "busydraft: the emit is REFUSED before the paste (rc 7)" "$rc" "7"
+cch_control '{"mode":"text","text":"MOCK_OK_AFTER"}'
+sleep 20
+assert_eq "busydraft: the emit's signature is in NO record — it was never merged into the draft and sent" "$(n_with "$sig")" "0"
+assert_eq "busydraft: …and the draft was not sent either (no record carries it)" "$(n_with "$DRAFT_TEXT")" "0"
+close_orch
+
 # ---- negctl: the instrument can say NO ---------------------------------------
 boot_orch
 emit_body "$CCH_DIR/b-neg" negctl "plain ascii line"
@@ -380,7 +420,9 @@ echo "  NOTE: records written across all arms:${_kinds}"
 # the potency row, the implication row). MEASURED at 60 on 2.1.280 — the run
 # that added the arm reported `60 passed` against an arithmetic 58 that forgot
 # boot_orch's own two rows.
-EXPECTED_ASSERTIONS=60
+# + 14 for the your-org/nexus-code#1674 `draft` (2 boot + 5) and `busydraft`
+# (2 boot + 5) arms.
+EXPECTED_ASSERTIONS=74
 TOTAL_ASSERTIONS=$(( ${PASS:-0} + ${FAIL:-0} ))
 # ONE physical line, deliberately (the summary-honesty classifier reads it so).
 assert_eq "assertion TOTAL matches EXPECTED_ASSERTIONS — no assertion silently dropped or added" "$TOTAL_ASSERTIONS" "$EXPECTED_ASSERTIONS"

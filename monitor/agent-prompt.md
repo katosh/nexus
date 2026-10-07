@@ -132,8 +132,8 @@ Mutual liveness contract:
   - If `paste_response_grace_seconds` (default 120) has elapsed
     without either bump, the watcher transitions to
     pasted-without-response and gives `unstick_window_seconds`
-    (default 150) for cases A–D in `_unstick.sh` (permission
-    Enter, rate-limit cascade, api-error Enter, AskUQ chip-bar
+    (default 150) for the cases in `_unstick.sh` (permission
+    prompt surfaced, rate-limit cascade, AskUQ chip-bar
     Escape) to recover.
   - If `orchestrator_dead_threshold_seconds` (default 300)
     elapses without recovery: fresh-spawn. The new agent
@@ -184,7 +184,7 @@ ng pr edit <n> [--title <t>] [--body-file <f>]
 ng pr merge <n> [--squash|--merge|--rebase] [--sha <verified-head>] [--base-sha <verified-base>|--verify-base] [--delete-branch]
 ng pr view <n>
 ng preflight <owner/repo>                    # bot installed on this repo? (yes/no)
-ng upload <path> [--repo-path <p>] [--message <m>]
+ng upload <path> [--repo-path <p>] [--message <m>] [--replace]   # exit 5: destination holds DIFFERENT content (#1639)
 ```
 
 Most pr / issue / show verbs accept `--repo OWNER/NAME` to target a

@@ -72,12 +72,14 @@
 #   - Otherwise the orchestrator is **pasted-without-response**.
 #     The state machine stamps an `unresponsive-since` marker on
 #     first entry and lets the watcher's standard
-#     `detect_and_unstick` loop probe cases A–D each cycle. Cases
-#     A (permission prompt Enter), C (api-error chip Enter), and
-#     D (AskUserQuestion chip-bar Escape + meta-paste) all
-#     terminate a stuck-but-alive orchestrator's wedge, after
-#     which the Stop hook fires and the heartbeat advances past
-#     the marker — state resets to healthy on the next cycle.
+#     `detect_and_unstick` loop probe its cases each cycle. Case
+#     D (AskUserQuestion chip-bar Escape + meta-paste) terminates
+#     a stuck-but-alive orchestrator's wedge, after which the Stop
+#     hook fires and the heartbeat advances past the marker —
+#     state resets to healthy on the next cycle. Case A surfaces a
+#     permission prompt as a decision and sends no key (#1599);
+#     the API-error Enter arm (Case C) was retired in #1670 — a
+#     failed turn is the StopFailure marker's to report.
 #
 #   - If `now - unresponsive_since >= unstick_window_seconds` —
 #     unstick has had its chance. Before escalating to a respawn,
@@ -132,6 +134,26 @@
 # Loaded by `monitor/watcher/main.sh` and by
 # `monitor/watcher/test-orchestrator-liveness.sh`. Side-effect-free
 # at load time — function definitions only.
+
+# Where Claude Code transcripts live (your-org/nexus-code#1720). Signals
+# 3 and 4 below look under every root `cc_transcript_roots` prints —
+# $CLAUDE_CONFIG_DIR/projects as well as <home>/.claude/projects. main.sh
+# has it already via _lib.sh; the suite sources this file alone, so load it
+# here too (definitions only). Partial-tree fallback: the same roots in the
+# same order, minus the realpath dedup, which only saves a repeated stat.
+if ! declare -F cc_transcript_roots >/dev/null 2>&1 \
+   && [[ -r "${BASH_SOURCE[0]%/*}/../_cc_transcript_roots.sh" ]]; then
+    # shellcheck source=monitor/_cc_transcript_roots.sh
+    source "${BASH_SOURCE[0]%/*}/../_cc_transcript_roots.sh"
+fi
+if ! declare -F cc_transcript_roots >/dev/null 2>&1; then
+    cc_transcript_roots() {
+        [[ -n "${NEXUS_CC_HOME:-}" ]]     && printf '%s\n' "$NEXUS_CC_HOME/projects"
+        [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] && printf '%s\n' "$CLAUDE_CONFIG_DIR/projects"
+        [[ -n "${1:-${HOME:-}}" ]]        && printf '%s\n' "${1:-$HOME}/.claude/projects"
+        return 0
+    }
+fi
 
 # _orchestrator_heartbeat_age <heartbeat_file>
 #
@@ -255,48 +277,56 @@ _orchestrator_pasted_without_response() {
         sid=$(head -n 1 "$pin_file" 2>/dev/null | tr -d '[:space:]')
         if [[ -n "${sid:-}" ]] \
            && [[ "$sid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            local slug proj_dir jsonl jsonl_mtime
+            # Both signals are read under EVERY transcript root
+            # (your-org/nexus-code#1720): with CLAUDE_CONFIG_DIR set,
+            # Claude Code writes under IT, and a `$home_dir`-only lookup
+            # silently lost both witnesses. `home_dir` stays the fake-home
+            # seam — it replaces $HOME as the third root.
+            local slug proj_dir jsonl jsonl_mtime root
             slug=$(printf '%s' "$nexus_root" | sed 's|[^a-zA-Z0-9]|-|g')
-            proj_dir="$home_dir/.claude/projects/$slug"
+            while IFS= read -r root; do
+                [[ -n "$root" ]] || continue
+                proj_dir="$root/$slug"
 
-            # Signal 3: pinned session's jsonl mtime — fragile, fallback
-            # only. A session whose orchestrator-settings.json predates
-            # the new hooks will never bump either heartbeat or paste-
-            # received; any session log write post-paste is also positive
-            # evidence. Removed after the deprecation window — see the
-            # file header.
-            jsonl="$proj_dir/$sid.jsonl"
-            if [[ -f "$jsonl" ]]; then
-                jsonl_mtime=$(date +%s -r "$jsonl" 2>/dev/null || echo 0)
-                if [[ "$jsonl_mtime" =~ ^[0-9]+$ ]] && (( jsonl_mtime > last_paste_ts )); then
-                    return 1
+                # Signal 3: pinned session's jsonl mtime — fragile, fallback
+                # only. A session whose orchestrator-settings.json predates
+                # the new hooks will never bump either heartbeat or paste-
+                # received; any session log write post-paste is also positive
+                # evidence. Removed after the deprecation window — see the
+                # file header.
+                jsonl="$proj_dir/$sid.jsonl"
+                if [[ -f "$jsonl" ]]; then
+                    jsonl_mtime=$(date +%s -r "$jsonl" 2>/dev/null || echo 0)
+                    if [[ "$jsonl_mtime" =~ ^[0-9]+$ ]] && (( jsonl_mtime > last_paste_ts )); then
+                        return 1
+                    fi
                 fi
-            fi
 
-            # Signal 4: the session's tool-results/ dir mtime — an
-            # INDEPENDENT, watcher-side liveness witness that does NOT
-            # depend on any orchestrator-side hook being installed.
-            # Claude Code persists a file under
-            # `<projects>/<slug>/<sid>/tool-results/` for every tool
-            # call whose output is large enough to offload; the dir's
-            # mtime therefore advances the instant a live turn produces
-            # such output — regardless of WHO drove the orchestrator
-            # (operator-direct pane paste, bypassing watcher paste-
-            # tracking, or a watcher paste). This is precisely the
-            # witness the 2026-06-05 false-positive respawn ignored: a
-            # 1.6 MB tool-result landed 28 s before the kill while all
-            # of {heartbeat, paste-received, jsonl} lagged
-            # `last_paste_ts`. Strictly additive — a post-paste write
-            # here is positive evidence of life and short-circuits to
-            # healthy before the dead-threshold floor.
-            local tool_results_dir tr_mtime
-            tool_results_dir="$proj_dir/$sid/tool-results"
-            if [[ -d "$tool_results_dir" ]]; then
-                tr_mtime=$(date +%s -r "$tool_results_dir" 2>/dev/null || echo 0)
-                if [[ "$tr_mtime" =~ ^[0-9]+$ ]] && (( tr_mtime > last_paste_ts )); then
-                    return 1
+                # Signal 4: the session's tool-results/ dir mtime — an
+                # INDEPENDENT, watcher-side liveness witness that does NOT
+                # depend on any orchestrator-side hook being installed.
+                # Claude Code persists a file under
+                # `<projects>/<slug>/<sid>/tool-results/` for every tool
+                # call whose output is large enough to offload; the dir's
+                # mtime therefore advances the instant a live turn produces
+                # such output — regardless of WHO drove the orchestrator
+                # (operator-direct pane paste, bypassing watcher paste-
+                # tracking, or a watcher paste). This is precisely the
+                # witness the 2026-06-05 false-positive respawn ignored: a
+                # 1.6 MB tool-result landed 28 s before the kill while all
+                # of {heartbeat, paste-received, jsonl} lagged
+                # `last_paste_ts`. Strictly additive — a post-paste write
+                # here is positive evidence of life and short-circuits to
+                # healthy before the dead-threshold floor.
+                local tool_results_dir tr_mtime
+                tool_results_dir="$proj_dir/$sid/tool-results"
+                if [[ -d "$tool_results_dir" ]]; then
+                    tr_mtime=$(date +%s -r "$tool_results_dir" 2>/dev/null || echo 0)
+                    if [[ "$tr_mtime" =~ ^[0-9]+$ ]] && (( tr_mtime > last_paste_ts )); then
+                        return 1
+                    fi
                 fi
-            fi
+            done < <(cc_transcript_roots "$home_dir")
         fi
     fi
 

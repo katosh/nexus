@@ -101,6 +101,27 @@ YAML
 }
 
 STUB="$WORK/stub-bin"; mkdir -p "$STUB"
+
+# HERMETIC NOTIFIER (your-org/nexus-code#1663 skeptic R4). A port move runs
+# remote-port-change-notify.sh, whose push notifier and `ng` default to the REAL
+# siblings: this suite used to reach the real monitor/notify.sh at emergency
+# priority, saved only by the mail policy refusing its config-less fixture root.
+# Both seams now point at recording stubs, and NEXUS_NOTIFY_QUIET=1 is the
+# harness's hard off should anything still reach the real notifier.
+cat > "$STUB/notify.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$REMOTE_PORT_SELECT_PUSH_LOG"
+exit 0
+EOF
+cat > "$STUB/ng" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$REMOTE_PORT_SELECT_NG_LOG"
+exit 1
+EOF
+chmod +x "$STUB/notify.sh" "$STUB/ng"
+export REMOTE_PORT_SELECT_PUSH_LOG="$WORK/push-calls.log" REMOTE_PORT_SELECT_NG_LOG="$WORK/ng-calls.log"
+export REMOTE_NOTIFY_PUSH_BIN="$STUB/notify.sh" REMOTE_NOTIFY_NG_BIN="$STUB/ng"
+export NEXUS_NOTIFY_QUIET=1
 cat > "$STUB/sshd" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$WORK/sshd-argv"
@@ -286,6 +307,10 @@ else
 fi
 assert_contains "stderr announces the move for the OCCUPANCY reason" "$out" "moving to the next free port"
 assert_contains "PORT CHANGED alert fired" "$out" "PORT CHANGED"
+# R4: the move's push went to the STUB — a positive control that the seam is
+# the path actually taken, not merely set.
+assert_contains "the port-change push reached the recording STUB, not monitor/notify.sh" \
+    "$(cat "$REMOTE_PORT_SELECT_PUSH_LOG" 2>/dev/null)" "--priority emergency"
 assert_file_exists "durable port-history.log written (alert survives the session)" "$HISTFILE"
 hist=$(cat "$HISTFILE" 2>/dev/null || echo "")
 assert_contains "history row names the OLD (occupied) port" "$hist" "old=$OCC"

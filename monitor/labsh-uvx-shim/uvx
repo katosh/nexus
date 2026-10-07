@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# labsh-uvx-shim/uvx — applies the labsh server-env pin (your-org/nexus-code#1676).
+#
+# labsh-supervised.sh puts this directory at the FRONT of PATH for the labsh it
+# runs, so labsh's own `uvx --from jupyterlab … jupyter-lab …` call lands here.
+# For THAT call only:
+#   * record the spec (the arguments before `jupyter-lab`) to
+#     $LABSH_PIN_DIR/labsh-server.spec, so `labsh-pin.sh refresh` can replay
+#     exactly what labsh asks for without re-deriving labsh's internals;
+#   * if a pin captured under the SAME spec exists, add `--constraints <pin>`,
+#     which makes uv resolve to the pinned set and reuse its cached env.
+# Every other call passes through unchanged. ALWAYS `exec`: labsh records `$!`
+# as the build pid, and the build-identity gates (_labsh_build_evidence.sh)
+# require that pid's executable to be uv — a shim that stayed resident as bash
+# would make every real build look like an impostor.
+#
+# Knobs: LABSH_PIN_DIR (set by the supervisor; unset ⇒ pass-through),
+#        LABSH_SVC_PIN=0 (record the spec, never apply the pin).
+# Messages go to stderr, which labsh redirects into labsh.bg.log; they must
+# never contain a URL, because a URL in that log means "server bound".
+
+_shim_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+# shellcheck source=../_labsh_pin.sh
+if ! source "$_shim_dir/../_labsh_pin.sh" 2>/dev/null; then
+    echo "labsh-uvx-shim: cannot load _labsh_pin.sh — cannot even find the real uvx" >&2
+    exit 127
+fi
+real=$(labsh_pin_real_uvx) || { echo "labsh-uvx-shim: no real uvx on PATH" >&2; exit 127; }
+# labsh-supervised.sh runs `labsh start` under BASH_ENV=labsh-uvx-shim/bash_env.sh,
+# which CHAINS the nexus prelude and then fronts this directory (the prelude
+# alone re-fronts locals/bin inside labsh, and this shim is never reached). The
+# original BASH_ENV is parked in LABSH_SHIM_BASH_ENV: hand it back to the
+# server's process tree so everything the server spawns sees the plain prelude.
+if [[ -n "${LABSH_SHIM_BASH_ENV+x}" ]]; then
+    export BASH_ENV="$LABSH_SHIM_BASH_ENV"
+    unset LABSH_SHIM_BASH_ENV
+fi
+
+pin_dir="${LABSH_PIN_DIR:-}"
+if [[ -n "$pin_dir" && -d "$pin_dir" ]] && cut=$(labsh_pin_server_split "$@"); then
+    spec_f=$(labsh_pin_spec_file "$pin_dir")
+    pin_f=$(labsh_pin_file "$pin_dir")
+    args=("$@")
+    if printf '%s\n' "${args[@]:0:cut}" > "$spec_f.tmp.$$" 2>/dev/null; then
+        mv -f "$spec_f.tmp.$$" "$spec_f" 2>/dev/null || rm -f "$spec_f.tmp.$$"
+    fi
+    if [[ "${LABSH_SVC_PIN:-1}" == 0 ]]; then
+        echo "labsh-uvx-shim: LABSH_SVC_PIN=0 — starting UNPINNED" >&2
+    elif [[ ! -s "$pin_f" ]]; then
+        echo "labsh-uvx-shim: no server-env pin yet — starting UNPINNED (captured after the first healthy start)" >&2
+    elif ! cmp -s "$pin_f.spec" "$spec_f"; then
+        echo "labsh-uvx-shim: the uvx spec changed since the pin was captured — starting UNPINNED (re-captured once healthy)" >&2
+    else
+        echo "labsh-uvx-shim: resolving against the server-env pin $pin_f ($(grep -c '==' "$pin_f") packages)" >&2
+        exec "$real" --constraints "$pin_f" "$@"
+    fi
+fi
+exec "$real" "$@"

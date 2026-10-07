@@ -93,7 +93,7 @@ SCRIPT="$FAKE_NEXUS/monitor/spawn-worker.sh"
 # (_chan_safe, _chan_apply_utf8_locale) are never defined, so request-channel.sh
 # fails downstream with `mv: cannot stat …/.new.md` — a symptom that names
 # neither the encoder nor this fixture.
-for _dep in _claude-bin.sh _tmux-window.sh _fm_lib.sh _channel_lib.sh _bookkeeping.sh; do
+for _dep in _claude-bin.sh _tmux-window.sh _fm_lib.sh _channel_lib.sh _bookkeeping.sh _requests_dir.sh; do
     cp "$_test_dir/../$_dep" "$FAKE_NEXUS/monitor/$_dep"
 done
 cp "$_test_dir/../request-channel.sh" "$FAKE_NEXUS/monitor/request-channel.sh"

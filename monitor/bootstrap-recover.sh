@@ -73,31 +73,59 @@
 #          event for it — recovery only owns nexus-spawned workers, so a
 #          window with no spawn record (operator shell, externally
 #          created) is skipped with a log line;
-#        - EITHER its LATEST lifecycle event is that `spawn` (active —
-#          abruptly interrupted, never handed off), OR the window is
-#          OPERATOR-ENGAGED (your-org/your-nexus#202). A later
-#          `wrap-up` (incl. its `window-retain` `reason=wrap-up-*`
-#          companion) or `window-close` normally retires a window —
-#          the orchestrator's dispatch loop owns continuations of
-#          wrapped work, recovery only owns ABRUPT interruptions — BUT
-#          a window the OPERATOR is driving must survive a restart even
-#          if it wrapped. The operator-engaged signal is the watcher's
-#          own authoritative mark (`_openg_marked`, issues #196/#201/
-#          #263/#264 in operator-engaged.tsv): a valid hook-driven
-#          engagement mark NOT superseded by a newer wrap-up/spawn. So
-#          a wrapped-then-re-driven window (operator submitted a prompt
-#          after wrapping → mark's `since` > wrap epoch → mark valid)
-#          is RESPAWNED; a wrapped-and-abandoned window (no re-engage →
-#          wrap epoch > mark `since` → `_openg_marked` false) is still
-#          skipped, so genuinely-done work is never resurrected. The
-#          precise predicate: respawn iff (NOT infra/registry) AND
-#          (lifecycle==active OR operator-engaged). The engaged set is
-#          CAPTURED at the very start of recovery — before the watcher
-#          relaunch — because the watcher's first idle-probe cycle
-#          prunes operator-engaged.tsv rows for windows not yet
-#          respawned. A `no-record` window (no spawn event) stays
-#          skipped even if it somehow carries a mark: `--resume` can't
-#          resolve its session/workdir, so it would only fail loudly.
+#        - its LATEST lifecycle event is not `window-close` — a closed
+#          (`ng retire-window`) window is TERMINAL and never resurrected,
+#          whatever else about it still looks live;
+#        - AND ONE OF THREE, which is also the WHY the recovery brief names
+#          for it (the plan's 5th column):
+#            active    — the latest lifecycle event is that `spawn`:
+#                        abruptly interrupted, never handed off;
+#            engaged   — the window WRAPPED but the OPERATOR is driving it
+#                        (your-org/your-nexus#202): the watcher's own
+#                        authoritative mark (`_openg_marked`, issues #196/
+#                        #201/#263/#264 in operator-engaged.tsv), a valid
+#                        hook-driven engagement mark NOT superseded by a
+#                        newer wrap-up/spawn;
+#            follow-up — the window WRAPPED but its work is still in flight
+#                        (the 2026-09-28 17:05 restart: `authmail` mid round
+#                        5 and its paired skeptic `authmailsk` were both
+#                        dropped because both had wrapped EARLIER rounds).
+#                        Live iff, after the latest wrap-up, the window was
+#                        dispatched to (a `paste-followup` action-log event,
+#                        or a machine-input `paste-followup` stamp) or held
+#                        by the orchestrator (a `window-retain` whose reason
+#                        is not `wrap-up-*`); or it is in an open skeptic
+#                        pairing: its own require-marker is live, it is the
+#                        skeptic of a target whose marker is live, an open
+#                        spawn-skeptic request names it, or a ROUND is open —
+#                        a non-`credible` verdict whose skeptic owes the
+#                        re-review, or whose target owes the fix (the verdict
+#                        came after its latest wrap-up). A pairing closed with
+#                        `ng skeptic close` ENDS it: close deletes the marker,
+#                        and its DONE sentinel cancels any dispatch/hold that
+#                        is not newer and closes an open round; a `credible`
+#                        verdict closes the round too. `ng skeptic resolve`
+#                        and a `satisfied` decision do NOT (#1666 round 2).
+#                        `_recover_followup_live` carries the measurements.
+#          A wrap-up otherwise retires the window: the orchestrator's
+#          dispatch loop owns continuations of wrapped work, recovery only
+#          owns interrupted work, the operator's session, and work that was
+#          handed another round. So a wrapped-and-idle window (no engagement,
+#          no follow-up) is still skipped. The precise predicate:
+#            respawn iff NOT infra/registry AND has a spawn record AND NOT
+#                    closed AND (active OR engaged OR follow-up-live)
+#          FAIL DIRECTION: a follow-up source that exists but cannot be
+#          READ counts as live (`unknown:<source>`) — resuming a finished
+#          worker is cheap and idempotent and the orchestrator re-closes it;
+#          dropping a live one strands its work. The engaged set and the
+#          machine-input half are CAPTURED at the very start of recovery —
+#          before the watcher relaunch — because the watcher's first cycle
+#          prunes operator-engaged.tsv and machine-input.tsv rows for
+#          windows not yet respawned; the whole predicate is then evaluated
+#          ONCE, with the candidate set, so the brief and the walk agree
+#          (#1660). A `no-record` window (no spawn event) stays skipped even
+#          if it somehow carries a mark: `--resume` can't resolve its
+#          session/workdir, so it would only fail loudly.
 #      Idle-but-unwrapped workers ARE included: the snapshot carries no
 #      busy/idle signal, an idle unwrapped worker may be awaiting
 #      follow-ups or mid-task, and resume is cheap + idempotent (the
@@ -251,6 +279,13 @@ source "$_script_dir/watcher/_idle_probe.sh" 2>/dev/null || true
 # shellcheck source=_dropped_manifest.sh
 source "$_script_dir/_dropped_manifest.sh"
 
+# Auto-continue plan (the 2026-09-27 restart). We WRITE it before the
+# orchestrator spawn so its turn-1 brief can say which workers recovery is
+# about to resume by itself; `spawn-worker.sh --resume` reads it to refuse
+# a hand resume racing ours. Side-effect-free on source.
+# shellcheck source=_autocontinue_plan.sh
+source "$_script_dir/_autocontinue_plan.sh"
+
 STATE_DIR="${NEXUS_STATE_DIR:-$NEXUS_ROOT/monitor/.state}"
 SERVICES_REGISTRY="${NEXUS_SERVICES_REGISTRY:-$NEXUS_ROOT/monitor/services.registry}"
 LAUNCHER_BIN="${RECOVER_LAUNCHER_BIN:-$_script_dir/watcher/launcher.sh}"
@@ -299,6 +334,28 @@ LIST_ONLY=0
 # workers at all. Resolved once from the boot-intent file (see
 # `_recover_read_boot_intent`); 0 for every ordinary mid-life recovery.
 COLD_BOOT=0
+# The boot-intent verdict word, set by `_recover_read_boot_intent`.
+BOOT_VERDICT=none
+
+# The worker candidate set, resolved ONCE before the watcher relaunch and the
+# orchestrator spawn, so the plan the orchestrator's brief renders and the
+# walk `recover_workers` performs are the SAME list. Computing it twice (once
+# for the brief, once for the walk, with the watcher's first snapshot in
+# between) would let the brief promise workers the walk never resumes.
+RECOVER_CANDIDATES=()
+# Parallel to RECOVER_CANDIDATES: WHY each is resumed (`active`, `engaged`, or
+# `follow-up:<signals>`). Resolved in the same single pass, so the brief and
+# the walk cannot disagree about the reason either.
+RECOVER_WHY=()
+RECOVER_CANDIDATES_SET=0
+# 1 once an auto-continue plan was written this run; AC_TOKEN is exported
+# only to OUR spawn-worker calls, which is what exempts them from the plan's
+# pending refusal (exit 27).
+AC_PLAN=0
+AC_TOKEN=""
+# 1 when another live recovery owns the active plan: our walk must not touch
+# the windows that plan still lists as pending (skeptic F1 on #1660).
+AC_DEFER=0
 
 # Operator-engaged windows captured at the very START of recovery
 # (before the watcher relaunch, whose first idle-probe cycle prunes
@@ -307,6 +364,19 @@ COLD_BOOT=0
 # empty so sourcing this file for its functions (tests) is side-
 # effect-free.
 ENGAGED_WINDOWS=" "
+
+# Follow-up inputs captured at the very START of recovery, beside the engaged
+# set and for the same reason: the watcher's first cycle after a relaunch
+# prunes machine-input.tsv rows for windows not currently in tmux, which at a
+# cold restart is every not-yet-respawned worker. FOLLOWUP_MI_STATE is
+# `absent` (no ledger: nothing was delivered through it), `read`, or
+# `unreadable` (it exists and could not be read — see _recover_followup_live's
+# fail direction). FOLLOWUP_MI_ROWS holds the `paste-followup` rows only, as
+# `<window><TAB><epoch-usec>` lines. Empty defaults keep sourcing side-effect-
+# free.
+FOLLOWUP_MI_STATE=absent
+FOLLOWUP_MI_ROWS=""
+FOLLOWUP_MI_CAPTURED=0
 
 log() { echo "[recover] $*" >&2; }
 
@@ -1022,32 +1092,416 @@ _recover_snapshot_tmux_windows() {
 # Lifecycle state of one window per the action log. Prints exactly one
 # word:
 #   active     — latest lifecycle event is `spawn`
-#   retired    — latest is `wrap-up` / `window-close` / the wrap-up
-#                companion `window-retain` with reason=wrap-up-* (the
-#                companion matters because an orchestrator-side
-#                `ng wrap-up` may lack the `window=` extra on the
-#                wrap-up event itself)
-#   no-record  — no `spawn` event for this window (not nexus-spawned;
+#   wrapped    — latest is `wrap-up`, or its companion `window-retain` with
+#                reason=wrap-up-* (the companion matters because an
+#                orchestrator-side `ng wrap-up` may lack the `window=` extra
+#                on the wrap-up event itself)
+#   closed     — latest is `window-close` (what `ng retire-window` writes).
+#                TERMINAL: a closed window is never resurrected, whatever
+#                else about it still looks live.
+#   no-record  — no lifecycle event for this window (not nexus-spawned;
 #                recovery does not own it), or no action log at all
+# `wrapped` and `closed` used to be one word, `retired`. They are split
+# because a wrapped window may still have follow-up work in flight
+# (_recover_followup_live) and a closed one never does.
 _recover_worker_lifecycle_state() {
     local name="$1" log="$2"
     [[ -f "$log" ]] || { echo no-record; return 0; }
-    local last
+    local last spawned
     last=$(grep -F "\"window\":\"$name\"" "$log" 2>/dev/null \
         | grep -E '"event":"(spawn|wrap-up|window-close)"|"event":"window-retain".*"reason":"wrap-up-' \
         | tail -n 1)
-    if [[ -z "$last" ]]; then
+    # A SPAWN record, not merely a lifecycle event: a window with a wrap-up and
+    # no spawn is not nexus-spawned by any record `--resume` can resolve, so it
+    # is `no-record` whatever its latest event (skeptic F2 on #1666). `grep -c`
+    # reads to the end: a `grep -q` in a pipeline exits early and, under
+    # pipefail, can turn a match into a failure.
+    spawned=$(grep -F "\"window\":\"$name\"" "$log" 2>/dev/null | grep -cF '"event":"spawn"')
+    if [[ -z "$last" || ! "$spawned" =~ ^[1-9][0-9]*$ ]]; then
         echo no-record
     elif [[ "$last" == *'"event":"spawn"'* ]]; then
         echo active
+    elif [[ "$last" == *'"event":"window-close"'* ]]; then
+        echo closed
     else
-        echo retired
+        echo wrapped
     fi
 }
 
-# Emit the snapshot windows that qualify for respawn, one name per
-# line. Non-qualifying windows are logged with the exclusion reason —
-# the loud-on-skip evidence trail.
+# --- follow-up: wrapped, but the work is not over ---------------------------
+#
+# The 2026-09-28 17:05 restart. `authmail` was mid-way through round 5 of a
+# skeptic loop and `authmailsk` was its paired skeptic waiting for the delta.
+# Both had run `ng wrap-up` on EARLIER rounds, so their latest lifecycle
+# event was a wrap-up and recovery dropped both as done; the orchestrator
+# resumed them by hand. Every multi-round skeptic loop has this shape: a
+# worker wraps up per round and keeps iterating.
+#
+# A wrap-up says "this round is handed off", not "this window is finished".
+# What says a wrapped window is still in play is something that happened TO
+# it after that wrap-up. Measured on the live ledger at the restart:
+#
+#   authmail    wrap-up 05:59  → paste-followup 08:22 (round 5 dispatched)
+#   authmailsk  wrap-up 08:21  → paste-followup 08:22, window-retain 08:22
+#                                "paired skeptic waiting for authmail round 5"
+#
+# while every genuinely finished window (ccpolicy, recoverymsg, ncbundle7,
+# ncbundle7sk) ends in `window-close`, which is terminal above. Over the
+# whole ledger (36,581 events), 3 of 1,318 wrap-ups were followed by a paste
+# within 10 s, so a post-wrap paste is a deliberate dispatch rather than a
+# routine nudge; and 158 of 632 closes came from exactly this
+# wrapped-then-follow-up state, a median 26 min after the last follow-up,
+# so the state is a real "still in flight", not a transient.
+#
+# Capture the machine-input half ONCE, before the watcher relaunch (see
+# FOLLOWUP_MI_STATE). Idempotent.
+_recover_capture_followup_inputs() {
+    (( FOLLOWUP_MI_CAPTURED == 1 )) && return 0
+    FOLLOWUP_MI_CAPTURED=1
+    FOLLOWUP_MI_ROWS=""
+    local mi="$STATE_DIR/machine-input.tsv" rows
+    if [[ ! -e "$mi" ]]; then
+        FOLLOWUP_MI_STATE=absent
+        return 0
+    fi
+    # Only the `paste-followup` kind: it is the delivery guard key that
+    # paste-followup.sh and `ng send` (including --stamp-only, the one record
+    # an agent-to-agent SendMessage leaves) own. The watcher's own wakes stamp
+    # other kinds (unstick-*, over-limit-wake, orphan-async-wake) and are not
+    # dispatches.
+    if rows=$(awk -F'\t' '$3 == "paste-followup" && $2 ~ /^[0-9]+$/ { print $1 "\t" $2 }' "$mi" 2>/dev/null); then
+        FOLLOWUP_MI_STATE=read
+        FOLLOWUP_MI_ROWS="$rows"
+    else
+        FOLLOWUP_MI_STATE=unreadable
+        log "workers: WARNING machine-input ledger $mi exists and could not be read — every wrapped window will be treated as follow-up-UNKNOWN and RESUMED (resume is cheap and idempotent; the orchestrator re-closes a done one)"
+    fi
+    return 0
+}
+
+# The action-log half. Walks the window's events IN LEDGER ORDER (the log is
+# append-only, so line order is time order without parsing a timestamp) and
+# prints, when the window's latest lifecycle event is a wrap-up:
+#   <wrap-ts>                                 nothing happened after it, or
+#   <wrap-ts> <kinds> <last-followup-ts>      where <kinds> is `+`-joined:
+#     dispatched — a `paste-followup` TO the window (paste-followup.sh and
+#                  `ng send` both log it) after the latest wrap-up;
+#     held       — a `window-retain` whose reason is NOT `wrap-up-*`: an
+#                  orchestrator hold ("paired skeptic waiting for round 5").
+# Prints nothing when there is no wrap-up to measure from (a `spawn` or a
+# `window-close` resets it; the lifecycle state already answers those).
+_recover_followup_since_wrap() {
+    local name="$1" log="$2"
+    grep -F "\"window\":\"$name\"" "$log" 2>/dev/null | awk '
+        function field(k,    re) {
+            re = "\"" k "\":\"[^\"]*\""
+            if (match($0, re)) return substr($0, RSTART + length(k) + 4, RLENGTH - length(k) - 5)
+            return ""
+        }
+        {
+            ev = field("event")
+            if (ev == "spawn" || ev == "window-close") { wts = ""; kinds = ""; fts = ""; next }
+            if (ev == "wrap-up" || (ev == "window-retain" && field("reason") ~ /^wrap-up-/)) {
+                wts = field("ts"); if (wts == "") wts = "-"
+                kinds = ""; fts = ""; next
+            }
+            if (wts == "") next
+            if (ev == "paste-followup")     k = "dispatched"
+            else if (ev == "window-retain") k = "held"
+            else next
+            if (index("+" kinds "+", "+" k "+") == 0) kinds = (kinds == "" ? k : kinds "+" k)
+            fts = field("ts"); if (fts == "") fts = "-"
+        }
+        END {
+            if (wts == "") exit
+            if (kinds != "") print wts, kinds, fts
+            else print wts
+        }'
+}
+
+# ISO timestamp → epoch seconds, or empty when it cannot be parsed.
+_recover_epoch_of() {
+    [[ -n "${1:-}" && "$1" != "-" ]] || return 0
+    date -d "$1" +%s 2>/dev/null || true
+}
+
+# The skeptic-state key for a window: the channel/marker encoding
+# (`wk_encode`, monitor/_bookkeeping.sh). Identity for every ordinary name.
+_recover_skeptic_key() {
+    if declare -F wk_encode >/dev/null 2>&1; then
+        wk_encode "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# Targets a skeptic window validates: `target-window` and `orig-window` of
+# its LATEST `skeptic-spawn` event. Prints nothing for a non-skeptic.
+_recover_skeptic_targets() {
+    local name="$1" log="$2" line
+    line=$(grep -F "\"window\":\"$name\"" "$log" 2>/dev/null \
+        | grep -F '"event":"skeptic-spawn"' | tail -n 1)
+    [[ -n "$line" ]] || return 0
+    awk '
+        function field(k,    re) {
+            re = "\"" k "\":\"[^\"]*\""
+            if (match($0, re)) return substr($0, RSTART + length(k) + 4, RLENGTH - length(k) - 5)
+            return ""
+        }
+        { t = field("target-window"); o = field("orig-window")
+          if (t != "") print t
+          if (o != "" && o != t) print o }' <<<"$line"
+}
+
+# mtime (epoch s) of a pairing's DONE sentinel, or empty.
+_recover_done_epoch() {
+    local f="$STATE_DIR/skeptic/$(_recover_skeptic_key "$1")/DONE"
+    [[ -f "$f" ]] || return 0
+    stat -c %Y "$f" 2>/dev/null || true
+}
+
+# Has the pairing on <target> ENDED since the verdict at <ts>? rc 0 = ended.
+# Exactly two things end a skeptic round:
+#   - `ng skeptic close`  — a DONE sentinel written at or after the verdict;
+#   - a `credible` verdict — handled by the callers, which read the LATEST
+#                            verdict and treat `credible` as terminal.
+# NOT `ng skeptic resolve`, and NOT an orchestrator `satisfied` decision: both
+# clear a MARKER, and the round can go on after them. Measured on the replay of
+# skeptic F1's cases: w215esk (2026-09-02) was resolved at 14:08 and dispatched
+# its next round at 16:13; backendchannelsk (09-17) was resolved at 12:56 and
+# returned another verdict at 13:01. Counting either as an end dropped both.
+# <n> (the verdict's ledger line) is kept in the signature for the callers.
+_recover_pairing_ended() {
+    local t="$1" _n="$2" ts="$3" _log="$4" ep done_ep
+    ep=$(_recover_epoch_of "$ts")
+    done_ep=$(_recover_done_epoch "$t")
+    if [[ -n "$ep" && -n "$done_ep" ]] && (( done_ep >= ep )); then
+        return 0
+    fi
+    return 1
+}
+
+# A skeptic ROUND that returned a non-terminal verdict and is still open —
+# the 2026-09-28 authmailsk case, which the require-marker cannot see: a
+# `check` verdict DISCHARGES the target's marker, so between that verdict and
+# the target's next re-arm nothing marked either window (skeptic F1 on #1666:
+# 104 of 186 non-terminal verdicts since 09-01 had no second-pass request;
+# 46 got another round after an uncovered gap of median 7 min, max 222 min).
+# Prints zero, one or two signals, one per line:
+#   skeptic-awaiting-fix — <name> is a SKEPTIC whose latest verdict is
+#                          non-terminal (anything but `credible`) and whose
+#                          pairing has not ended: it owes a re-review of the
+#                          fix it asked for;
+#   owes-delta           — <name> is a TARGET whose latest RECEIVED verdict is
+#                          non-terminal, arrived AFTER its own latest wrap-up,
+#                          and whose pairing has not ended: it owes the fix.
+#                          A wrap-up after the verdict is the delta delivered,
+#                          which a re-arm then marks (`skeptic-pending`).
+_recover_skeptic_round_open() {
+    local name="$1" log="$2" line n v t ts wn
+    local fields='
+        function field(k,    re) {
+            re = "\"" k "\":\"[^\"]*\""
+            if (match($0, re)) return substr($0, RSTART + length(k) + 4, RLENGTH - length(k) - 5)
+            return ""
+        }
+        { v = field("verdict"); t = field("target-window"); ts = field("ts")
+          print (v == "" ? "-" : v), (t == "" ? "-" : t), (ts == "" ? "-" : ts) }'
+    # As the SKEPTIC.
+    line=$(grep -nF "\"window\":\"$name\"" "$log" 2>/dev/null \
+        | grep -F '"event":"skeptic-verdict"' | tail -n 1)
+    if [[ -n "$line" ]]; then
+        n=${line%%:*}
+        read -r v t ts <<<"$(awk "$fields" <<<"${line#*:}")"
+        if [[ "$n" =~ ^[0-9]+$ && "$v" != - && "$v" != credible && "$t" != - ]] \
+           && ! _recover_pairing_ended "$t" "$n" "$ts" "$log"; then
+            echo skeptic-awaiting-fix
+        fi
+    fi
+    # As the TARGET.
+    line=$(grep -nF "\"target-window\":\"$name\"" "$log" 2>/dev/null \
+        | grep -F '"event":"skeptic-verdict"' | tail -n 1)
+    if [[ -n "$line" ]]; then
+        n=${line%%:*}
+        read -r v t ts <<<"$(awk "$fields" <<<"${line#*:}")"
+        if [[ "$n" =~ ^[0-9]+$ && "$v" != - && "$v" != credible ]]; then
+            wn=$(grep -nF "\"window\":\"$name\"" "$log" 2>/dev/null \
+                | grep -E '"event":"wrap-up"|"event":"window-retain".*"reason":"wrap-up-' | tail -n 1)
+            wn=${wn%%:*}
+            if { [[ ! "$wn" =~ ^[0-9]+$ ]] || (( wn < n )); } \
+               && ! _recover_pairing_ended "$name" "$n" "$ts" "$log"; then
+                echo owes-delta
+            fi
+        fi
+    fi
+    return 0
+}
+
+# Is follow-up work still live for a WRAPPED window? Prints the live signals
+# `+`-joined and returns 0; returns 1 (printing nothing) when none is.
+#
+#   dispatched / held      — the action-log half above
+#   delivered              — a machine-input `paste-followup` stamp newer
+#                            than the latest wrap-up (covers `ng send
+#                            --stamp-only`, which logs no action-log event)
+#   skeptic-pending        — the window is a TARGET whose require-marker
+#                            (skeptic/pending/<w>) is live: it wrapped and is
+#                            waiting for a verdict it must answer
+#   skeptic-owed           — the window is a SKEPTIC whose target's
+#                            require-marker is live: it owes a verdict
+#   skeptic-requested      — an open (`.new` / `.claimed`) spawn-skeptic
+#                            request names it as `target-window`
+#   skeptic-awaiting-fix   — it is a SKEPTIC whose latest verdict is not
+#   owes-delta               `credible` and whose round is open; or a TARGET
+#                            that received such a verdict after its latest
+#                            wrap-up (_recover_skeptic_round_open)
+#
+# A pairing closed with `ng skeptic close` ENDS the follow-up: `close`
+# deletes the require-marker (so the marker signals cannot fire), and a DONE
+# sentinel at or after the latest dispatched/held/delivered signal, on the
+# window's own channel or on a target it validates, cancels those three —
+# the round that dispatch opened has ended with a verdict.
+#
+# FAIL DIRECTION: a source that EXISTS but cannot be read yields
+# `unknown:<source>`, which counts as live. Resuming a finished worker is
+# cheap and idempotent — the orchestrator's window-cleanup re-closes it —
+# while dropping a live one strands its work until somebody notices. An
+# ABSENT source is not unreadable: no machine-input ledger, no skeptic state
+# or no request inbox each simply means nothing was recorded there. Never
+# fails the walk: every path returns 0 or 1.
+_recover_followup_live() {
+    local name="$1" log="$2"
+    local -a sig=()
+    local line wts="" kinds="" fts="" wep="" fep=""
+    line=$(_recover_followup_since_wrap "$name" "$log")
+    read -r wts kinds fts <<<"$line"
+    wep=$(_recover_epoch_of "$wts")
+    [[ -n "$kinds" ]] && fep=$(_recover_epoch_of "$fts")
+
+    # Time-ordered signals first: they are what a DONE can cancel.
+    local -a timed=()
+    [[ -n "$kinds" ]] && timed+=("$kinds")
+    [[ -n "$kinds" && -z "$fep" ]] && fep=unknown
+
+    case "$FOLLOWUP_MI_STATE" in
+        unreadable) sig+=("unknown:machine-input") ;;
+        read)
+            local mi_us
+            mi_us=$(awk -F'\t' -v w="$name" '$1 == w && $2 + 0 > m { m = $2 + 0 } END { if (m) printf "%.0f", m }' \
+                <<<"$FOLLOWUP_MI_ROWS")
+            if [[ -n "$mi_us" ]]; then
+                local mi_ep=$(( mi_us / 1000000 ))
+                if [[ -z "$wep" ]]; then
+                    # A stamp exists and the wrap time cannot be read: cannot
+                    # order them, so it counts (fail direction above).
+                    timed+=("delivered")
+                    fep=unknown
+                elif (( mi_ep > wep )); then
+                    timed+=("delivered")
+                    if [[ "$fep" != unknown ]] && { [[ -z "$fep" ]] || (( mi_ep > fep )); }; then
+                        fep=$mi_ep
+                    fi
+                fi
+            fi ;;
+    esac
+
+    # Skeptic state. The pending dir and the channel dirs live under one root.
+    local sk_root="$STATE_DIR/skeptic" pend="$STATE_DIR/skeptic/pending"
+    local sk_readable=1
+    if [[ -e "$sk_root" ]] && ! [[ -d "$sk_root" && -r "$sk_root" && -x "$sk_root" ]]; then
+        sk_readable=0
+    elif [[ -e "$pend" ]] && ! [[ -d "$pend" && -r "$pend" && -x "$pend" ]]; then
+        sk_readable=0
+    fi
+    local -a targets=()
+    local t
+    while IFS= read -r t; do
+        [[ -n "$t" ]] && targets+=("$t")
+    done < <(_recover_skeptic_targets "$name" "$log")
+
+    if (( ${#timed[@]} > 0 )); then
+        if (( sk_readable == 1 )) && [[ "$fep" != unknown ]]; then
+            local done_ep closed_by=""
+            for t in "$name" "${targets[@]+"${targets[@]}"}"; do
+                done_ep=$(_recover_done_epoch "$t")
+                if [[ -n "$done_ep" ]] && (( done_ep >= fep )); then
+                    closed_by="$t"
+                    break
+                fi
+            done
+            if [[ -n "$closed_by" ]]; then
+                log "worker '$name': follow-up (${timed[*]}) ENDED — the skeptic pairing on '$closed_by' was closed (DONE) at or after it"
+                timed=()
+            fi
+        fi
+        sig+=("${timed[@]+"${timed[@]}"}")
+    fi
+
+    if (( sk_readable == 0 )); then
+        sig+=("unknown:skeptic-state")
+    elif [[ -d "$pend" ]]; then
+        [[ -e "$pend/$(_recover_skeptic_key "$name")" ]] && sig+=("skeptic-pending")
+        for t in "${targets[@]+"${targets[@]}"}"; do
+            if [[ -e "$pend/$(_recover_skeptic_key "$t")" ]]; then
+                sig+=("skeptic-owed")
+                break
+            fi
+        done
+    fi
+
+    # A non-terminal verdict whose round is still open (skeptic F1 on #1666).
+    # Read only when the skeptic state is readable: its DONE is one of the
+    # ends, and an unreadable state already counts as live above.
+    if (( sk_readable == 1 )); then
+        local rs
+        while IFS= read -r rs; do
+            [[ -n "$rs" ]] && sig+=("$rs")
+        done < <(_recover_skeptic_round_open "$name" "$log")
+    fi
+
+    # Open spawn-skeptic requests naming this window as the one to validate.
+    # The ONE inbox resolver (your-org/nexus-code#1723); a refused value
+    # leaves rq empty, and `-e ""` is false, so the skeptic check below
+    # simply sees no request rather than reading the wrong directory.
+    local rq f
+    declare -F nexus_requests_dir >/dev/null 2>&1 \
+        || . "$_script_dir/_requests_dir.sh" 2>/dev/null
+    rq=$(nexus_requests_dir "$STATE_DIR" 2>/dev/null) || rq=""
+    if [[ -e "$rq" ]]; then
+        if [[ -d "$rq" && -r "$rq" && -x "$rq" ]]; then
+            for f in "$rq"/*.new.md "$rq"/*.claimed.md; do
+                [[ -f "$f" ]] || continue
+                # `kind: spawn-skeptic` is a frontmatter line; `target-window:
+                # <w>` is written in the request BODY's details block (as
+                # request-channel.sh files it). Both must be whole lines.
+                if awk -v w="$name" '
+                        $0 == "kind: spawn-skeptic" { k = 1 }
+                        $0 == "target-window: " w { m = 1 }
+                        END { exit (k && m) ? 0 : 1 }' "$f" 2>/dev/null; then
+                    sig+=("skeptic-requested")
+                    break
+                fi
+            done
+        else
+            sig+=("unknown:requests")
+        fi
+    fi
+
+    (( ${#sig[@]} > 0 )) || return 1
+    local IFS=+
+    printf '%s' "${sig[*]}"
+    return 0
+}
+
+# Emit the snapshot windows that qualify for respawn, one per line as
+# `<name><TAB><why>`, where <why> is `active`, `engaged` or
+# `follow-up:<signals>` — the reason the recovery brief names. The predicate:
+#
+#   respawn iff NOT infra/registry AND has a spawn record AND NOT closed
+#           AND (lifecycle == active OR operator-engaged OR follow-up-live)
+#
+# Non-qualifying windows are logged with the exclusion reason — the
+# loud-on-skip evidence trail.
 _recover_snapshot_workers() {
     local snap="$STATE_DIR/last-snapshot.txt"
     local actionlog="$STATE_DIR/action-log.jsonl"
@@ -1071,12 +1525,16 @@ _recover_snapshot_workers() {
         log "workers:   service window would classify as a dead worker. Not respawning anything."
         return 0
     fi
+    # The follow-up predicate reads machine-input.tsv, which the watcher
+    # prunes; _recover_main captures it before the watcher relaunch. This
+    # call is the no-op backstop for a caller that did not.
+    _recover_capture_followup_inputs
     local registry_names=" "
     local rn _rest
     while IFS=$'\t' read -r rn _rest; do
         [[ -n "$rn" ]] && registry_names+="$rn "
     done < <(_recover_parse_registry "$SERVICES_REGISTRY")
-    local name state
+    local name state fu
     while IFS= read -r name; do
         [[ -n "$name" ]] || continue
         # Infra windows are not workers: the orchestrator ($TARGET_WINDOW)
@@ -1094,15 +1552,24 @@ _recover_snapshot_workers() {
         state=$(_recover_worker_lifecycle_state "$name" "$actionlog")
         case "$state" in
             active)
-                printf '%s\n' "$name" ;;
-            retired)
-                # Wrapped/closed normally retires a window — BUT a
-                # window the OPERATOR is driving must survive a restart
-                # even if it wrapped (your-org/your-nexus#202). The
-                # engaged set was captured before the watcher relaunch.
+                printf '%s\tactive\n' "$name" ;;
+            closed)
+                # TERMINAL. `window-close` is the orchestrator's retirement;
+                # not even an operator-engaged mark or a live follow-up
+                # signal brings it back.
+                log "worker '$name': already wrapped/closed per action log (window-close: never resurrected) — skipping" ;;
+            wrapped)
+                # A wrap-up normally hands the window off — BUT a window the
+                # OPERATOR is driving must survive a restart even if it
+                # wrapped (your-org/your-nexus#202; the engaged set was
+                # captured before the watcher relaunch), and so must one
+                # whose follow-up work is still in flight.
                 if _recover_window_operator_engaged "$name"; then
                     log "worker '$name': wrapped/closed BUT operator-engaged — continuing the operator's interactive session"
-                    printf '%s\n' "$name"
+                    printf '%s\tengaged\n' "$name"
+                elif fu=$(_recover_followup_live "$name" "$actionlog"); then
+                    log "worker '$name': wrapped BUT follow-up live ($fu) — resuming"
+                    printf '%s\tfollow-up:%s\n' "$name" "$fu"
                 else
                     log "worker '$name': already wrapped/closed per action log — skipping"
                 fi ;;
@@ -1177,6 +1644,7 @@ _recover_archive_state_file() {
 # real run resurrecting everything.
 _recover_read_boot_intent() {
     COLD_BOOT=0
+    BOOT_VERDICT=none
     [[ -f "$BOOT_INTENT_FILE" ]] || { printf none; return 0; }
     local mode='' ts='' line
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -1196,22 +1664,22 @@ _recover_read_boot_intent() {
     if (( age < 0 || age > BOOT_INTENT_TTL )); then
         log "boot-intent: IGNORING $BOOT_INTENT_FILE (mode=${mode:-?}, age=${age}s > ttl=${BOOT_INTENT_TTL}s) — a boot intent this old never reached its own worker walk; recovering normally"
         (( DRY_RUN == 0 )) && _recover_archive_state_file "$BOOT_INTENT_FILE" "boot-intent" >/dev/null
-        printf stale; return 0
+        BOOT_VERDICT=stale; printf stale; return 0
     fi
     case "$mode" in
         fresh)
             COLD_BOOT=1
             log "boot-intent: FRESH boot requested (${age}s ago, no --continue) — this run will resurrect NO worker agents"
             (( DRY_RUN == 0 )) && _recover_archive_state_file "$BOOT_INTENT_FILE" "boot-intent" >/dev/null
-            printf fresh ;;
+            BOOT_VERDICT=fresh; printf fresh ;;
         continue)
             log "boot-intent: --continue boot (${age}s ago) — resuming prior worker agents as usual"
             (( DRY_RUN == 0 )) && _recover_archive_state_file "$BOOT_INTENT_FILE" "boot-intent" >/dev/null
-            printf continue ;;
+            BOOT_VERDICT=continue; printf continue ;;
         *)
             log "boot-intent: malformed record at $BOOT_INTENT_FILE (mode='${mode}') — recovering normally"
             (( DRY_RUN == 0 )) && _recover_archive_state_file "$BOOT_INTENT_FILE" "boot-intent" >/dev/null
-            printf malformed ;;
+            BOOT_VERDICT=malformed; printf malformed ;;
     esac
     return 0
 }
@@ -1397,8 +1865,8 @@ _recover_write_dropped_manifest() {
 # the pre-boot window list and resurrect the whole board anyway.
 _recover_cold_boot_drop() {
     local -a dropped=()
-    local name
-    while IFS= read -r name; do
+    local name _why
+    while IFS=$'\t' read -r name _why; do
         [[ -n "$name" ]] && dropped+=("$name")
     done < <(_recover_snapshot_workers)
 
@@ -1439,7 +1907,10 @@ recover_worker() {
         log "worker '$name': would resume via $SPAWN_WORKER_BIN --resume"
         echo dry-run-would-resume; return 0
     fi
-    "$SPAWN_WORKER_BIN" --resume "$name" >&2
+    # The plan token rides ONLY on our own call: it is what tells
+    # spawn-worker this resume IS the auto-continue the plan announced,
+    # rather than a hand resume racing it (exit 27).
+    NEXUS_AUTOCONTINUE_TOKEN="$AC_TOKEN" "$SPAWN_WORKER_BIN" --resume "$name" >&2
     local rc=$?
     case "$rc" in
         0)  log "worker '$name': resumed"
@@ -1450,6 +1921,8 @@ recover_worker() {
             echo workdir-unresolvable ;;
         13) log "worker '$name': window came alive concurrently (spawn-worker exit 13) — leaving it"
             echo already-alive ;;
+        26) log "worker '$name': a LIVE process already holds its session (spawn-worker exit 26) — not resuming it a second time"
+            echo held-live ;;
         *)  log "worker '$name': resume FAILED (spawn-worker exit $rc)"
             echo resume-failed ;;
     esac
@@ -1458,33 +1931,137 @@ recover_worker() {
 
 # Walk every qualifying worker, bounded by MAX_WORKERS. One wedged
 # resume is logged, never fatal — recovery of the rest must proceed.
-recover_workers() {
-    local -a candidates=()
-    local name
-    while IFS= read -r name; do
-        [[ -n "$name" ]] && candidates+=("$name")
+# Resolve the candidate set once (see RECOVER_CANDIDATES). Idempotent.
+_recover_capture_candidates() {
+    (( RECOVER_CANDIDATES_SET == 1 )) && return 0
+    RECOVER_CANDIDATES=()
+    RECOVER_WHY=()
+    local name why
+    while IFS=$'\t' read -r name why; do
+        [[ -n "$name" ]] || continue
+        RECOVER_CANDIDATES+=("$name")
+        RECOVER_WHY+=("${why:-active}")
     done < <(_recover_snapshot_workers)
-    if (( ${#candidates[@]} == 0 )); then
-        log "workers: none to respawn"
+    RECOVER_CANDIDATES_SET=1
+}
+
+# Write the auto-continue plan BEFORE the orchestrator spawn, so the brief
+# composed at that moment can name the workers recovery is about to resume
+# and tell the orchestrator not to race it. Only the candidates the walk
+# will actually TRY are `pending`: a window already alive needs nothing, and
+# one past the cap is listed as `over-cap` so the brief says it is NOT coming
+# back on its own. No plan is written when nothing is pending (the per-turn
+# `--services-only` refresh, the common case) or under --dry-run.
+#
+# Session ids come from the canonical resolver, `spawn-worker.sh --resume
+# <w> --dry-run`, exactly as the cold-boot manifest gets them, so the brief
+# cannot disagree with the resume that follows.
+_recover_plan_autocontinue() {
+    (( DRY_RUN == 1 )) && return 0
+    _recover_capture_candidates
+    local -a rows=() overcap=() overcap_why=()
+    local name out sid n=0 i why
+    for (( i = 0; i < ${#RECOVER_CANDIDATES[@]}; i++ )); do
+        name="${RECOVER_CANDIDATES[$i]}"
+        why="${RECOVER_WHY[$i]:-active}"
+        # THE WALK'S CAP RULE, EXACTLY (skeptic F2 on #1660): `recover_workers`
+        # counts every candidate it reaches toward recover.max_workers, alive or
+        # not, in candidate order. Counting only the dead ones here let the
+        # brief promise a worker as PENDING that the walk then dropped at the cap.
+        if (( n >= MAX_WORKERS )); then
+            overcap+=("$name")
+            overcap_why+=("$why")
+            continue
+        fi
+        n=$(( n + 1 ))
+        _recover_window_exists "$name" && continue
+        sid=""
+        # No `| head`: the resolver prints exactly ONE `resolved:` line, and an
+        # early-closing reader under pipefail is the #622 class the
+        # early-exit-reader manifest tracks.
+        out=$("$SPAWN_WORKER_BIN" --resume "$name" --dry-run 2>/dev/null) \
+            && sid=$(sed -n 's/^resolved:.*[[:space:]]session=\([^ ]*\) workdir=.*/\1/p' <<<"$out")
+        rows+=("$name" "${sid:-UNRESOLVED}" "$why")
+    done
+    # Nothing pending AND nothing past the cap: no plan, the brief is
+    # unchanged. A candidate past the cap alone still gets a plan, because
+    # the brief must SAY it is not coming back (skeptic F2 on #1660).
+    if (( ${#rows[@]} == 0 && ${#overcap[@]} == 0 )); then
         return 0
     fi
-    local n_resumed=0 n_alive=0 n_skipped=0 n_capped=0 n_done=0 outcome
-    for name in "${candidates[@]}"; do
+    AC_TOKEN="$(date +%s).$$.${RANDOM}${RANDOM}"
+    local boot=mid-life brc=0
+    [[ "$BOOT_VERDICT" == continue ]] && boot=continue
+    ac_plan_begin "$STATE_DIR" "$AC_TOKEN" "$boot" "${rows[@]}" || brc=$?
+    if (( brc == 2 )); then
+        # Another live recovery is mid-walk and owns the plan. Leave its plan
+        # AND its pending windows alone: our walk skips them (AC_DEFER).
+        AC_TOKEN=""
+        AC_DEFER=1
+        log "workers: a CONCURRENT recovery (pid $(_ac_owner_field "$STATE_DIR" 2)) owns the auto-continue plan — not replacing it; its pending workers are left to it"
+        return 0
+    fi
+    if (( brc == 0 )); then
+        AC_PLAN=1
+        for (( i = 0; i < ${#overcap[@]}; i++ )); do
+            printf '%s\t-\tover-cap:%s\t%s\t%s\n' "${overcap[$i]}" "$MAX_WORKERS" "$(date +%s)" "${overcap_why[$i]}" \
+                >> "$(ac_plan_path "$STATE_DIR")"
+        done
+        log "workers: auto-continue plan written ($(( ${#rows[@]} / 3 )) pending) at $(ac_plan_path "$STATE_DIR") — the orchestrator's brief will name them"
+    else
+        log "workers: WARNING could not write the auto-continue plan — the orchestrator's brief will NOT know workers are being resumed"
+    fi
+}
+
+recover_workers() {
+    _recover_capture_candidates
+    local -a candidates=("${RECOVER_CANDIDATES[@]+"${RECOVER_CANDIDATES[@]}"}")
+    local name
+    if (( ${#candidates[@]} == 0 )); then
+        log "workers: none to respawn"
+        (( AC_PLAN == 1 )) && ac_plan_finish "$STATE_DIR" "$AC_TOKEN"
+        return 0
+    fi
+    local n_resumed=0 n_alive=0 n_skipped=0 n_capped=0 n_done=0 outcome i
+    for (( i = 0; i < ${#candidates[@]}; i++ )); do
+        name="${candidates[$i]}"
+        if (( AC_DEFER == 1 )) && ac_plan_active "$STATE_DIR" \
+           && ac_plan_pending_match "$STATE_DIR" "$name" "" >/dev/null; then
+            log "worker '$name': a concurrent recovery is auto-continuing it — leaving it to that recovery"
+            n_skipped=$(( n_skipped + 1 ))
+            continue
+        fi
+        # The cap rule `_recover_plan_autocontinue` mirrors (skeptic F2 on
+        # #1660): every candidate reached counts, alive or not. A capped row is
+        # recorded, so no plan row is ever left `pending` by the walk.
         if (( n_done >= MAX_WORKERS )); then
             log "worker '$name': NOT respawned — sanity cap recover.max_workers=$MAX_WORKERS reached"
             n_capped=$(( n_capped + 1 ))
+            (( AC_PLAN == 1 )) && ac_plan_set_status "$STATE_DIR" "$name" "over-cap:$MAX_WORKERS" "$AC_TOKEN"
             continue
         fi
         n_done=$(( n_done + 1 ))
+        log "worker '$name': candidate — why: ${RECOVER_WHY[$i]:-active}"
         outcome=$(recover_worker "$name")
+        (( AC_PLAN == 1 )) && ac_plan_set_status "$STATE_DIR" "$name" "$(_recover_plan_status "$outcome")" "$AC_TOKEN"
         case "$outcome" in
             resumed|dry-run-would-resume) n_resumed=$(( n_resumed + 1 )) ;;
-            already-alive)                n_alive=$(( n_alive + 1 )) ;;
+            already-alive|held-live)      n_alive=$(( n_alive + 1 )) ;;
             *)                            n_skipped=$(( n_skipped + 1 )) ;;
         esac
     done
+    (( AC_PLAN == 1 )) && ac_plan_finish "$STATE_DIR" "$AC_TOKEN"
     log "workers: ${#candidates[@]} candidate(s) — $n_resumed resumed, $n_alive already alive, $n_skipped skipped, $n_capped over cap"
     return 0
+}
+
+# recover_worker outcome word → plan status.
+_recover_plan_status() {
+    case "$1" in
+        resumed|already-alive|held-live) printf '%s' "$1" ;;
+        session-unresolvable|workdir-unresolvable) printf 'skipped:%s' "$1" ;;
+        *) printf 'failed:%s' "$1" ;;
+    esac
 }
 
 # --- main -----------------------------------------------------------------
@@ -1512,7 +2089,8 @@ _recover_main() {
             --no-workers)    DO_WORKERS=0; shift ;;
             --dry-run)       DRY_RUN=1; shift ;;
             --list)          LIST_ONLY=1; shift ;;
-            -h|--help)       sed -n '2,203p' "$0"; return 0 ;;
+            # The whole leading comment block, however long it grows.
+            -h|--help)       awk 'NR > 1 && !/^#/ { exit } NR > 1' "$0"; return 0 ;;
             *) echo "bootstrap-recover.sh: unknown flag: $1" >&2; return 1 ;;
         esac
     done
@@ -1564,6 +2142,9 @@ _recover_main() {
         _recover_capture_engaged_windows
         [[ "$ENGAGED_WINDOWS" != " " ]] && \
             log "workers: operator-engaged windows captured:${ENGAGED_WINDOWS%" "}"
+        # Same moment, same reason: the watcher prunes machine-input.tsv rows
+        # for windows not in tmux, and the follow-up predicate reads them.
+        _recover_capture_followup_inputs
 
         # Resolve the operator's boot intent, and on a cold boot do the
         # drop NOW — before the watcher relaunch (which would overwrite
@@ -1574,6 +2155,11 @@ _recover_main() {
         _recover_read_boot_intent >/dev/null
         if (( COLD_BOOT == 1 )); then
             _recover_cold_boot_drop
+        else
+            # The mirror image of the cold-boot manifest: on a CONTINUE,
+            # tell the incoming orchestrator which workers WE are about to
+            # resume, before it is spawned and composes its brief.
+            _recover_plan_autocontinue
         fi
     fi
 

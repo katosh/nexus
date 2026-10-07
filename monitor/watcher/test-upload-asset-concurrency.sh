@@ -9,6 +9,10 @@
 #      typically amortises to far fewer than N pushes).
 #   B) Deterministic batch drain: 9 pre-staged requests + 1 live upload are
 #      drained by a SINGLE manager in ONE push, and all 10 get result URLs.
+#   H/I/J) Destination collision (your-org/nexus-code#1639): a same-basename
+#      upload of DIFFERENT bytes is refused at exit 5 with no URL unless
+#      --replace; identical bytes are not refused; a refusal is per-request
+#      and does not abort the rest of the batch, even when it is all of it.
 #   C) Orphaned-marker recovery: a marker left behind by a (simulated) dead
 #      manager is picked up and resolved by the next upload — the kernel-
 #      backed flock takeover, observed through its effect.
@@ -429,6 +433,106 @@ assert_eq "failure names verify-before-return" \
     "$(printf '%s' "$stderrG" | grep -c 'verify-before-return FAILED')" "1"
 assert_eq "swallowed-push wrote no result URL file" \
     "$(find "$STAGING" -name '*.url' | wc -l | tr -d ' ')" "0"
+
+# =========================================================================
+echo '=== Test H: same-basename collision → exit 5, no URL, first bytes survive (#1639) ==='
+# Two DIFFERENT files named summary.md for one issue map to ONE destination,
+# assets/382/summary.md. The second used to WARN and then overwrite HEAD at
+# rc 0 — silent in practice. It must now refuse (exit 5) unless --replace.
+setup_fake_nexus
+STAGING="$FAKE_NEXUS/assets.staging"
+head_bytes() {   # head_bytes <repo_path> — the bytes at the bare remote's main
+    "$REAL_GIT" --git-dir="$BARE" show "main:${1}" 2>/dev/null
+}
+mkdir -p "$WORK/h1" "$WORK/h2"
+printf 'first worker summary\n'  > "$WORK/h1/summary.md"
+printf 'second worker summary\n' > "$WORK/h2/summary.md"
+run_upload "$WORK/h1/summary.md" --issue 382
+assert_eq "H first upload exit 0" "$rc" "0"
+assert_url_resolves "H first upload URL resolves" "$stdout"
+: > "$PUSH_COUNT_FILE"
+run_upload "$WORK/h2/summary.md" --issue 382
+assert_eq "H collision refused at exit 5" "$rc" "5"
+assert_eq "H collision prints NO URL" "$stdout" ""
+assert_eq "H collision leaves the FIRST bytes at HEAD" \
+    "$(head_bytes assets/382/summary.md)" "first worker summary"
+assert_eq "H collision made no push" "$(push_count)" "0"
+assert_eq "H refusal names the path and both remedies" \
+    "$(printf '%s' "$stderr" | grep -F 'assets/382/summary.md already holds a DIFFERENT asset' >/dev/null \
+        && printf '%s' "$stderr" | grep -F -e '--repo-path <unique path>' >/dev/null \
+        && printf '%s' "$stderr" | grep -F -e '--replace' >/dev/null && echo 1 || echo 0)" "1"
+assert_eq "H refused request left nothing staged" \
+    "$(find "$STAGING" -name 'req.*' | wc -l | tr -d ' ')" "0"
+# CONTROL: identical bytes are not a collision.
+run_upload "$WORK/h1/summary.md" --issue 382
+assert_eq "H control identical re-upload exit 0 (not refused)" "$rc" "0"
+assert_url_resolves "H control identical re-upload URL resolves" "$stdout"
+# The deliberate overwrite.
+run_upload "$WORK/h2/summary.md" --issue 382 --replace
+assert_eq "H --replace overwrite exit 0" "$rc" "0"
+assert_url_resolves "H --replace URL resolves" "$stdout"
+assert_eq "H --replace puts the NEW bytes at HEAD" \
+    "$(head_bytes assets/382/summary.md)" "second worker summary"
+
+# =========================================================================
+echo '=== Test I: a refusal is PER-REQUEST — the rest of the batch still lands (#1639) ==='
+# The manager drains OTHER callers' requests. One colliding pre-staged request
+# must not abort the batch: the fresh ones commit and get URLs, the colliding
+# one gets a `.refused` result and is cleared. Its marker carries NO `replace`
+# key — the pre-#1639 marker shape — which must mean REFUSE.
+mkdir -p "$STAGING"
+printf 'a third, different summary\n' > "$STAGING/req.collI.blob"
+{
+    printf 'repo_path\tassets/382/summary.md\n'
+    printf 'shape\tpin\n'
+    printf 'message\tcolliding pre-staged\n'
+} > "$STAGING/req.collI.req"
+printf 'fresh pre-staged\n' > "$STAGING/req.freshI.blob"
+{
+    printf 'repo_path\tassets/382/freshI.md\n'
+    printf 'shape\tpin\n'
+    printf 'message\tfresh pre-staged\n'
+    printf 'replace\t0\n'
+} > "$STAGING/req.freshI.req"
+payload="$WORK/liveI.txt"; printf 'live-I\n' > "$payload"
+: > "$PUSH_COUNT_FILE"
+run_upload "$payload" --issue 382
+assert_eq "I live fresh upload exit 0 despite a refused peer" "$rc" "0"
+assert_url_resolves "I live fresh upload URL resolves" "$stdout"
+if [[ -f "$STAGING/req.freshI.url" ]]; then
+    assert_url_resolves "I fresh pre-staged request got its URL" "$(<"$STAGING/req.freshI.url")"
+else
+    printf '  FAIL: I fresh pre-staged request got its URL — no result file\n' >&2; FAIL=$(( FAIL + 1 ))
+fi
+assert_eq "I colliding pre-staged request got a .refused result" \
+    "$([ -f "$STAGING/req.collI.refused" ] && echo 1 || echo 0)" "1"
+assert_eq "I colliding pre-staged marker+blob cleared (never re-drained)" \
+    "$(find "$STAGING" -name 'req.collI.req' -o -name 'req.collI.blob' | wc -l | tr -d ' ')" "0"
+assert_eq "I colliding request left HEAD bytes unchanged" \
+    "$(head_bytes assets/382/summary.md)" "second worker summary"
+assert_eq "I batch pushed once" "$(push_count)" "1"
+
+# =========================================================================
+echo '=== Test J: a batch where EVERY request is refused — no push, no hang (#1639) ==='
+rm -f "$STAGING"/req.*
+printf 'yet another summary\n' > "$STAGING/req.collJ.blob"
+{
+    printf 'repo_path\tassets/382/summary.md\n'
+    printf 'shape\tpin\n'
+    printf 'message\tcolliding pre-staged J\n'
+    printf 'replace\t0\n'
+} > "$STAGING/req.collJ.req"
+: > "$PUSH_COUNT_FILE"
+run_upload "$WORK/h1/summary.md" --issue 382
+assert_eq "J all-refused batch: live request exit 5" "$rc" "5"
+assert_eq "J all-refused batch: NO URL" "$stdout" ""
+assert_eq "J all-refused batch: no push" "$(push_count)" "0"
+assert_eq "J all-refused batch: peer refusal recorded" \
+    "$([ -f "$STAGING/req.collJ.refused" ] && echo 1 || echo 0)" "1"
+assert_eq "J all-refused batch: lock free afterwards" \
+    "$(flock -n "$FAKE_NEXUS/assets.lock" true && echo 1 || echo 0)" "1"
+assert_eq "J all-refused batch: HEAD bytes unchanged" \
+    "$(head_bytes assets/382/summary.md)" "second worker summary"
 
 # =========================================================================
 echo

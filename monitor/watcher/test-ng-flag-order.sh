@@ -543,7 +543,27 @@ _delegates_of_body() {   # <body> → each delegated script it routes to, once
         | sed 's|.*[/ ]||' \
         | gawk '!seen[$0]++'
 }
-_delegates_for() { _delegates_of_body "$(_cmd_body "$1")"; }
+# The fixture installer's view, which also follows ONE level into a named arm
+# handler: `cmd_degraded` dispatches `probe) _degraded_probe "${@:2}" ;;`, and
+# the `_facade degraded-probe.sh` is in the handler, not the body. Without it
+# the script is never installed, and B-REACH reports the sub-verb dead at the
+# gate. Only ONE-LINE handler definitions are followed. A multi-line handler is
+# missed in the LOUD direction (B-REACH names it unreachable), never as a pass.
+# The pairs (`_subs_pairs_for`) still read the body alone: a handler's script
+# dispatches no sub-verbs of its own, so it has nothing to reconcile.
+_delegates_for() {
+    local body h
+    body=$(_cmd_body "$1")
+    {   _delegates_of_body "$body"
+        while IFS= read -r h; do
+            _delegates_of_body "$(grep -m1 -E "^${h}\(\)[[:space:]]*\{.*\}" "$NG_SRC")"
+        done < <(_subs_handlers_of "$body")
+    } | gawk 'NF && !seen[$0]++'
+}
+# <body> → the `_name` handler each `arm) _name …` calls (the `_subs_of` shape).
+_subs_handlers_of() { printf '%s\n' "$1" | gawk '
+    match($0,/^[[:space:]]+[a-z][a-z0-9-]*\)[[:space:]]*(_[a-z0-9_]+)[[:space:]]*("|;|$)/,m) { print m[1] }
+' | sort -u; }
 
 # THE PAIRS, because a sub-verb is only half an answer once a verb can have
 # more than one delegate. B-REACH-POP reconciles `<script> <sub-verb>` rows
@@ -1379,7 +1399,17 @@ fi
 #     RECORDED, not fixed, for the shared-ancestor reason. The count is
 #     `_raw_token_echoes`' own output on the merged tree — re-measure with
 #     `_raw_token_echoes monitor/longjob-watch.sh`, never by eye.
+#     FOURTEENTH AND FIFTEENTH ROWS at the bundle-1006a seam
+#     (your-org/nexus-code#1722, #1724): `doctor.sh` (`ng doctor`) and
+#     `degraded-status.sh` (`ng degraded status`) are NEW and each joined with
+#     ONE arg diagnostic, `*) echo "<tool>: unknown argument: ${1:0:60}"`. The
+#     token is length-capped, but `_raw_token_echoes` counts it, and the fix is
+#     still the shared `_arg_excerpt` ancestor, not a fifth copy. RECORDED, not
+#     fixed, like the rows above. The counts are this suite's own D2 output on
+#     the bundle tree; they were not counted by eye.
 _D_MANIFEST='ci-head-attempts.sh 2
+degraded-status.sh 1
+doctor.sh 1
 longjob-watch.sh 3
 guards-for-diff.sh 1
 lit.sh 3

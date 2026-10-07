@@ -608,6 +608,10 @@ if [ -z "$WORKDIR" ]; then
     WORKDIR_OWNED=1
 fi
 mkdir -p "$WORKDIR" || die "cannot create workdir: $WORKDIR"
+# ABSOLUTE, because the suite cd's wherever it likes and a relative fence would
+# be resolved against each resolver's own cwd (your-org/nexus-code#1680).
+MG_FENCE=$(cd "$WORKDIR" && pwd -P) && [ -n "$MG_FENCE" ] \
+    || die "cannot resolve the workdir to an absolute path: $WORKDIR"
 MUT=""
 mg_cleanup() {
     [ -n "$MUT" ] && rm -f -- "$MUT"
@@ -656,7 +660,14 @@ mg_run() {   # <script> <capture-base> -> rc; writes <base>.out/<base>.err
     # DUMPS CORE — into the CWD, i.e. the repository root. Measured on two clean
     # clones after a full band: an untracked 64 KB `core` "from 'yes yes'" in
     # each, and every later run-log header in those trees read `dirty=yes`.
-    TMPDIR="$run_tmp" timeout -k 10 "$TIMEOUT_S" \
+    # THE TEST FENCE (your-org/nexus-code#1680). The copies (t0/t1) and the
+    # suite's TMPDIR all live under $WORKDIR, and a --workdir under a nexus's
+    # work/ made each of them "a nexus tree nested under a nexus's work/": the
+    # copied tree took the PRIMARY's identity (every baseline red) and the
+    # suite's fixture nexuses re-rooted onto the primary and wrote 321 rows into
+    # its production action log. Under the fence, the primary-root resolvers
+    # (monitor/_nexus-root.sh, spawn-worker.sh) never leave $WORKDIR.
+    NEXUS_TEST_FENCE="$MG_FENCE" TMPDIR="$run_tmp" timeout -k 10 "$TIMEOUT_S" \
         bash -c 'ulimit -c 0; ulimit -f "$1" || exit 90; shift; exec bash "$@"' _ "$CAP_KB" "$script" \
         >"$base.out" 2>"$base.err"
     rc=$?

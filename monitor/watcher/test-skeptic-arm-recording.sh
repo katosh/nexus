@@ -326,6 +326,19 @@ _drive t1 check 1207 sk-t1 ""
 _rc_rearm=$?
 assert_eq "a DISCHARGED artefact re-arms for a new round (rc 0)" "$_rc_rearm" "0"
 
+# AN APPEND THAT FAILED IS NOT `armed` (your-org/nexus-code#1719, the instance
+# after wrap-up's). A DIRECTORY at the ledger path makes `>>` fail
+# deterministically, for any uid; the marker write beside it still works.
+printf 'v9\n' > "$WORK/reports/r9.md"
+mkdir -p "$PEND/.t9.ledger"
+_out9=$("$NG" skeptic-arm t9 --report "$WORK/reports/r9.md" --issue 1719 --state-dir "$STATE" 2>&1)
+_rc9=$?
+assert_eq "#1719 skeptic-arm whose ledger append FAILS exits 5, never 0" "$_rc9" "5"
+assert_contains "#1719 …and says the arm row was NOT recorded" "$_out9" "the arm row was NOT recorded for t9"
+assert_eq "#1719 …and never prints the word 'armed t9'" "$( [[ "$_out9" == *"armed t9 sha="* ]] && echo printed || echo absent)" "absent"
+assert_file_exists "#1719 …while the round IS opened (the marker is the gate)" "$PEND/t9"
+rmdir "$PEND/.t9.ledger" 2>/dev/null || true
+
 # COULD NOT NAME A SUBJECT is exit 4 and is LOUD. Silence here is the whole
 # defect: an unreadable report used to leave a shut gate and an empty ledger with
 # nothing said. Measured failure modes of `_skeptic_artefact_sha`: a relative
@@ -395,7 +408,7 @@ _mk_nexus() {   # _mk_nexus <dir>
     cp "$SPAWN" "$fn/monitor/spawn-worker.sh"; chmod +x "$fn/monitor/spawn-worker.sh"
     cp "$REPO_ROOT/monitor/guard-block.sh.in" "$fn/monitor/"
     local d
-    for d in _claude-bin.sh _tmux-window.sh _fm_lib.sh _channel_lib.sh _bookkeeping.sh; do
+    for d in _claude-bin.sh _tmux-window.sh _fm_lib.sh _channel_lib.sh _bookkeeping.sh _requests_dir.sh; do
         cp "$REPO_ROOT/monitor/$d" "$fn/monitor/"
     done
     cp "$REPO_ROOT/monitor/request-channel.sh" "$fn/monitor/"
@@ -1079,7 +1092,7 @@ assert_eq "#1370 CONTROL: after a re-arm the later sha=- row is a new round and 
 # Assertions in this harness mutate GLOBALS, so an `assert_*` inside `( )` loses
 # its FAIL and the suite exits 0; a missing helper is rc 127 counted by nothing.
 # A green verdict is therefore not evidence the arms ran — the count is.
-EXPECTED=135   # REBASE SEAM (W2-16 x #1251). Ancestor 103; dev added +1 for the
+EXPECTED=139   # +4 #1719: skeptic-arm on a failed ledger append (bundle-1005a)   # REBASE SEAM (W2-16 x #1251). Ancestor 103; dev added +1 for the
                # #1251 claude-stub positive control; this branch added +14. Either
                # side taken alone is WRONG — 117 drops dev's control, 104 drops
                # this branch's fourteen. The sum is the only resolution that

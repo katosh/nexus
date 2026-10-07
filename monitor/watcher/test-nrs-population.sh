@@ -106,13 +106,62 @@ else
 fi
 
 
+echo "=== the CI shards PARTITION the population (#1703) ==="
+# CI runs the band as a matrix, one `--shard K/N` slice per cell. A slice that
+# is dropped, or two that overlap, leaves the gate reading green over suites
+# it never probed — the #833 defect again, one level out. So the union of the
+# slices, as `select` reports them, must equal the unsliced population exactly,
+# member for member, and no slice may be empty.
+WF="$REPO_ROOT/.github/workflows/tests.yml"
+n_shards=$(sed -n 's/.*band --timeout [0-9]* --shard "\${{ matrix\.shard }}\/\([0-9]*\)".*/\1/p' "$WF")
+matrix=$(sed -n '/^  inherited-root-gate:/,/^  [a-z-]*:$/{s/^ *shard: \[\(.*\)\]$/\1/p}' "$WF" | tr -d ' ')
+want=$(seq -s, 1 "${n_shards:-0}" 2>/dev/null)
+if [[ "$n_shards" =~ ^[1-9][0-9]*$ && "$matrix" == "$want" ]]; then
+    printf '  PASS: %s\n' "the gate's matrix lists shards $matrix and its step slices /$n_shards — the two agree"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: %s\n' "the gate's matrix lists [${matrix:-none}] but its step slices /${n_shards:-none} — a slice is dropped or never run" >&2
+    FAIL=$(( FAIL + 1 ))
+    n_shards=4
+fi
+full=$(bash "$NRS" select | LC_ALL=C sort | sed "s|^$REPO_ROOT/||")
+union=""; empty=0
+for (( k = 1; k <= n_shards; k++ )); do
+    slice=$(bash "$NRS" select --shard "$k/$n_shards" | sed "s|^$REPO_ROOT/||")
+    [[ -n "$slice" ]] || empty=$(( empty + 1 ))
+    union+="$slice"$'\n'
+done
+union=$(printf '%s' "$union" | grep . | LC_ALL=C sort)
+if [[ -n "$full" && "$union" == "$full" && "$empty" == 0 ]]; then
+    printf '  PASS: %s\n' "the $n_shards slices are disjoint, none is empty, and their union is the population ($(printf '%s\n' "$full" | grep -c .) suites)"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: %s\n' "the $n_shards slices do not partition the population: $empty empty; diff below" >&2
+    diff <(printf '%s\n' "$full") <(printf '%s\n' "$union") >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+# A malformed slice is REFUSED rather than read as "the whole population" or
+# "nothing" — either reading would make a matrix typo invisible.
+bad_ok=1
+for spec in 0/4 5/4 4 x/4; do
+    rc=0; bash "$NRS" select --shard "$spec" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" == 2 ]] || { bad_ok=0; printf '    --shard %s exited %s, not 2\n' "$spec" "$rc" >&2; }
+done
+if (( bad_ok )); then
+    printf '  PASS: %s\n' "malformed --shard specs (0/4 5/4 4 x/4) are refused at rc 2"
+    PASS=$(( PASS + 1 ))
+else
+    printf '  FAIL: %s\n' "a malformed --shard spec was accepted" >&2
+    FAIL=$(( FAIL + 1 ))
+fi
+
 # ---- assertion-count guard (your-org/nexus-code#805/#833) ------------------
 # An exact expected total, not just the shared ledger. The ledger stops a
 # ZERO-assertion run announcing a pass; it cannot see an assertion silently
 # dropped from the middle of a suite, which is how a guard quietly narrows
 # without anything going red. `test-summary-honesty-manifest.sh` requires this
 # of every suite that claims a green.
-EXPECTED_ASSERTIONS=5
+EXPECTED_ASSERTIONS=8
 TOTAL=$(( PASS + FAIL ))
 if (( TOTAL != EXPECTED_ASSERTIONS )); then
     printf '  FAIL: assertion count %d != expected %d — an assertion was silently dropped\n' \

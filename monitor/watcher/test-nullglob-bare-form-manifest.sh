@@ -32,7 +32,8 @@ _repo_root=$(cd "$_test_dir/../.." && pwd)
 GEN="$_test_dir/nullglob-bare-form.sh"
 AWKF="$_test_dir/_nullglob_bare_form.awk"
 MAN="$_test_dir/nullglob-bare-form.manifest"
-# The file three `safe` rows depend on. See the BASH_ENV case below.
+# The file two `safe` rows depend on (three until the #1720 residual removed
+# one site). See the BASH_ENV case below.
 BASH_ENV_FILE="$_repo_root/monitor/shellenv/bash_env.sh"
 
 # THE SPELLING-SET PREDICATE for "this file enables nullglob".
@@ -492,8 +493,8 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-echo "=== the BASH_ENV chain: the property three \`safe\` rows rest on ==="
-# your-org/nexus-code#1214 sk2 F2. Three `monitor/ng` rows are dispositioned
+echo "=== the BASH_ENV chain: the property two \`safe\` rows rest on ==="
+# your-org/nexus-code#1214 sk2 F2. Two `monitor/ng` rows are dispositioned
 # `safe (b)` -- not reachable under nullglob. That rests on the PROCESS
 # BOUNDARY holding, and an earlier version of those rows named only
 # BASHOPTS/SHELLOPTS as the carriers to check. It missed the one this nexus
@@ -506,16 +507,19 @@ echo "=== the BASH_ENV chain: the property three \`safe\` rows rest on ==="
 #
 # Nothing is broken today because that file carries no `shopt`. This turns that
 # from PROSE into a RED: it is the cheapest thing on this branch that converts
-# a claim three permanent dispositions depend on into something that fails.
+# a claim two permanent dispositions depend on into something that fails.
+# (THREE until your-org/nexus-code#1720's residual rewrote _report_session_id:
+# its per-root `ls -t <dir>/*.jsonl` became an array glob behind an explicit
+# emptiness test, so that pairing no longer exists and its row was removed.)
 if [[ -r "$BASH_ENV_FILE" ]]; then
     pass "the BASH_ENV prelude exists and is readable (a missing file must not pass silently)"
     if command grep -qE "$_NG_SET_RE" "$BASH_ENV_FILE"; then
-        fail "monitor/shellenv/bash_env.sh SETS nullglob — it is exported as BASH_ENV into every agent process, so three \`safe\` rows in nullglob-bare-form.manifest are no longer safe. Re-disposition them or remove the option."
+        fail "monitor/shellenv/bash_env.sh SETS nullglob — it is exported as BASH_ENV into every agent process, so two \`safe\` rows in nullglob-bare-form.manifest are no longer safe. Re-disposition them or remove the option."
     else
         pass "monitor/shellenv/bash_env.sh sets no nullglob — the safe (b) rows hold"
     fi
 else
-    fail "cannot read $BASH_ENV_FILE — the property three \`safe\` rows depend on is unverifiable"
+    fail "cannot read $BASH_ENV_FILE — the property two \`safe\` rows depend on is unverifiable"
 fi
 # POSITIVE CONTROL: the predicate must fire on a file that does set it, or the
 # green above is equally consistent with a grep that can never match.

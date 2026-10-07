@@ -45,6 +45,11 @@
 #      one flag.
 #   2. A tmux invocation scoped only by `TMUX_TMPDIR` — no `-L`/`-S`, no
 #      `env -u TMUX` on that same command — is unisolated. LOCAL check only.
+#      The tmpdir may be set ON the call (`TMUX_TMPDIR=x tmux …`) or by an
+#      EARLIER command on the same line (`( export TMUX_TMPDIR=x; tmux … )`,
+#      `export TMUX_TMPDIR=x; tmux …`, `&&`, a bare assignment) — the last two
+#      were BLIND until your-org/nexus-code#1646. An assignment on an EARLIER
+#      LINE is not connected: rule2 is per line (see _tmux_kill_scan.awk).
 #   3. `kill-session`/`kill-window`/`kill-pane` must name a target (`-t`);
 #      untargeted acts on the CURRENT one, which can be the last.
 #   4. `-L default` / `-S …/default` is syntactically a pin and semantically
@@ -72,6 +77,17 @@
 # Pragmas are COUNTED and the count is pinned by `--selftest`, so an exemption
 # cannot be added silently. A pragma never exempts rule2 or rule4 — those
 # describe a scoping idiom that is a no-op regardless of author intent.
+#
+# ONE NARROW EXCEPTION, with its own token and its own pinned count
+# (your-org/nexus-code#1646):
+#
+#     ( export TMUX_TMPDIR=…; nx_write_tmux_shim … )   # tmux-shim-writer: <why>
+#
+# exempts rule2 ONLY where the command word is exactly `nx_write_tmux_shim`.
+# That function is not a tmux invocation — it reads TMUX_TMPDIR to BAKE it into
+# a shim of the form `env -u TMUX TMUX_TMPDIR=<dir> <real tmux> -L <sock>` — and
+# reaches rule2 only because the command-word test is a substring match on
+# "tmux". On a real `tmux`/`"$REAL_TMUX"` call the token exempts nothing.
 #
 # COVERAGE BOUNDARY (one sentence, on the axis the mechanism varies on):
 #   A SECOND, HARDER LIMIT — VERB RESOLUTION (your-org/nexus-code#892, F6).
@@ -177,11 +193,25 @@ scan() {
     }
 }
 
-count_pragmas() {
-    files0 "$1" \
-      | xargs -0 grep -hF "$PRAGMA" 2>/dev/null \
-      | grep -cE 'kill-server|kill-session|kill-window|kill-pane' || true
+# THE PRAGMA COUNTS ARE THE SCANNER'S OWN EXEMPTION DECISIONS
+# (your-org/nexus-code#1650 N2). Each counter used to be a second regex over the
+# raw text, beside the scanner's matcher, and the two disagreed: the scanner
+# exempted `"nx_write_tmux_shim"` and `exec nx_write_tmux_shim` while the
+# counter saw 0, so a shim-writer exemption could be added without moving the
+# pin (and `kill-ser`/`killp` under `# tmux-scoped:` likewise). The scanner now
+# emits one `exempt-<kind>` marker per line on which it GRANTS that exemption,
+# and the counters count those markers — one matcher, by construction. A pragma
+# on a line where nothing needed exempting is no longer counted: it grants
+# nothing. FAIL CLOSED: a scan that could not complete prints `ERR`, which can
+# never equal a pinned number.
+count_exemptions() {   # <root> <kind: shim-writer|tmux-scoped>
+    local out
+    out=$(files0 "$1" | xargs -0 -r awk -v with_file=1 -v emit_exempt=1 -f "$AWK_SCAN") \
+        || { echo ERR; return 1; }
+    grep -cE "^[^:]*:[0-9]+:exempt-$2:" <<<"$out" || true
 }
+count_shimw_pragmas() { count_exemptions "$1" shim-writer; }
+count_pragmas()       { count_exemptions "$1" tmux-scoped; }
 
 explain() {
     cat >&2 <<'EXPLAIN'
@@ -204,7 +234,8 @@ LINT FAIL — tmux call is not provably socket-scoped at its call site.
 
   Wrapper-routed and genuinely safe? Annotate inline with a reason:
       ... kill-server ...   # tmux-scoped: <why this wrapper pins a socket>
-  Pragmas are counted and pinned by --selftest. They never exempt rule2/rule4.
+  Pragmas are counted and pinned by --selftest. They never exempt rule2/rule4,
+  except `# tmux-shim-writer:` on an nx_write_tmux_shim call (rule2 only).
 EXPLAIN
 }
 
@@ -402,6 +433,134 @@ TMUX_TMPDIR="$T" tmux kill-window -t a:0'
     _expect 'pragma-annotated wrapper call' CLEAN \
 'cch_tmux kill-server 2>/dev/null || true   # tmux-scoped: cch_tmux pins -L "$CCH_SOCKET"'
 
+    # === 5b. TMUX_TMPDIR set by an EARLIER command on the line (#1646) =======
+    # Every hazard shape below scanned CLEAN before #1646; each is a potency
+    # plant for the carrier arm. The controls pin the over-refusal direction.
+    echo "=== TMUX_TMPDIR carried from an earlier command on the line (#1646) ==="
+    _expect 'subshell: ( export TMUX_TMPDIR=…; tmux … )' rule2-tmux-tmpdir-insufficient \
+'( export TMUX_TMPDIR="$T"; tmux new-session -d -s x )'
+    _expect 'chained: export TMUX_TMPDIR=…; tmux …' rule2-tmux-tmpdir-insufficient \
+'export TMUX_TMPDIR="$T"; tmux new-session -d -s x'
+    _expect 'chained with &&: export TMUX_TMPDIR=… && tmux …' rule2-tmux-tmpdir-insufficient \
+'export TMUX_TMPDIR="$T" && tmux kill-window -t a:0'
+    _expect 'a bare assignment then tmux' rule2-tmux-tmpdir-insufficient \
+'TMUX_TMPDIR="$T"; tmux new-session -d -s x'
+    _expect 'an unset TMUX in an EARLIER fragment is NOT neutralisation' rule2-tmux-tmpdir-insufficient \
+'( unset TMUX; export TMUX_TMPDIR="$T"; tmux new-session -d -s x )'
+    _expect 'control: carried tmpdir + -L on the call is scoped' CLEAN \
+'( export TMUX_TMPDIR="$T"; tmux -L iso new-session -d -s x )'
+    _expect 'control: carried tmpdir + env -u TMUX on the call is scoped' CLEAN \
+'export TMUX_TMPDIR="$T"; env -u TMUX tmux new-session -d -s x'
+    _expect 'control: an export alone is not a tmux call' CLEAN 'export TMUX_TMPDIR="$T"'
+    # The subshell OPENER standing as its own word hid the call from EVERY rule.
+    _expect 'a spaced subshell: ( tmux kill-server )' rule1-killserver-unscoped '( tmux kill-server )'
+    _expect 'a negated call: ! tmux kill-server' rule1-killserver-unscoped '! tmux kill-server'
+    _expect 'a spaced subshell: ( tmux kill-window )' rule3-untargeted-kill '( tmux -L iso kill-window )'
+    # A KEYWORD or a WRAPPER ahead of the call was returned as the command word
+    # and the line scanned CLEAN under every rule (#1650 N3). One plant each.
+    echo "=== a kill behind a keyword or a wrapper (#1650 N3) ==="
+    _expect 'then tmux kill-server'                rule1-killserver-unscoped 'if c; then tmux kill-server; fi'
+    _expect 'do tmux kill-server'                  rule1-killserver-unscoped 'for i in 1; do tmux kill-server; done'
+    _expect 'else tmux kill-server'                rule1-killserver-unscoped 'if c; then :; else tmux kill-server; fi'
+    _expect 'if tmux kill-server'                  rule1-killserver-unscoped 'if tmux kill-server; then :; fi'
+    _expect 'while tmux kill-server'               rule1-killserver-unscoped 'while tmux kill-server; do :; done'
+    _expect 'timeout N tmux kill-server'           rule1-killserver-unscoped 'timeout 5 tmux kill-server'
+    _expect 'timeout -s KILL N tmux kill-server'   rule1-killserver-unscoped 'timeout -s KILL 5 tmux kill-server'
+    _expect 'nohup tmux kill-server'               rule1-killserver-unscoped 'nohup tmux kill-server'
+    _expect 'sudo tmux kill-server'                rule1-killserver-unscoped 'sudo tmux kill-server'
+    _expect 'sudo -u root tmux kill-server'        rule1-killserver-unscoped 'sudo -u root tmux kill-server'
+    _expect 'then + wrapper: then timeout 5 tmux kill-server' rule1-killserver-unscoped \
+'if c; then timeout 5 tmux kill-server; fi'
+    _expect 'timeout N tmux kill-window (untargeted)' rule3-untargeted-kill 'timeout 5 tmux -L iso kill-window'
+    _expect 'then + carried tmpdir'                rule2-tmux-tmpdir-insufficient \
+'if c; then export TMUX_TMPDIR="$T"; tmux new-session -d -s x; fi'
+    _expect 'do TMUX_TMPDIR=… tmux (prefix form)'  rule2-tmux-tmpdir-insufficient \
+'for i in 1; do TMUX_TMPDIR="$T" tmux new-session -d -s x; done'
+    # #1121 ARM ORDER: the pin and target tests used to read the WHOLE fragment,
+    # so once `sudo` is a recognised wrapper its OWN `-S` (password on stdin)
+    # and `-t TYPE` would satisfy has_socket_pin / has_targeted — a permissive
+    # match deciding before the deny. They read from the tmux word on now.
+    _expect "sudo -S is sudo's flag, not a socket pin" rule1-killserver-unscoped 'sudo -S tmux kill-server'
+    _expect "sudo -t TYPE is sudo's flag, not a target" rule3-untargeted-kill 'sudo -t unconfined_t tmux -L iso kill-window'
+    # …and a carrier arm (which `continue`s) does not swallow a keyword-led call.
+    _expect 'then TMUX_TMPDIR=… tmux kill-server is a CALL, not a carrier' rule1-killserver-unscoped \
+'if c; then TMUX_TMPDIR="$T" tmux kill-server; fi'
+    # A CASE ARM and two more wrappers (your-org/nexus-code#1652). Each scanned
+    # CLEAN at 33a44f48; the first is the live instance's exact shape.
+    echo "=== a kill in a case arm, or behind stdbuf / ionice (#1652) ==="
+    _expect 'case W in PAT) … tmux kill-server (one line)' rule1-killserver-unscoped \
+'case "$TSOCK" in "$WORK"/*) env -u TMUX TMUX_TMPDIR="$TDIR" tmux kill-server >/dev/null 2>&1 || true ;; esac'
+    _expect 'a multi-line arm: PAT) tmux kill-server ;;' rule1-killserver-unscoped '    foo) tmux kill-server ;;'
+    _expect 'an alternation arm: a|b) tmux kill-server ;;' rule1-killserver-unscoped '    a|b) tmux kill-server ;;'
+    _expect 'a paren-led arm: (x) tmux kill-server ;;' rule1-killserver-unscoped '    (x) tmux kill-server ;;'
+    _expect 'an arm with an untargeted kill-window' rule3-untargeted-kill '    *) tmux -L iso kill-window ;;'
+    _expect 'stdbuf -oL tmux kill-server'          rule1-killserver-unscoped 'stdbuf -oL tmux kill-server'
+    _expect 'stdbuf -o L tmux kill-server'         rule1-killserver-unscoped 'stdbuf -o L tmux kill-server'
+    _expect 'ionice -c3 tmux kill-server'          rule1-killserver-unscoped 'ionice -c3 tmux kill-server'
+    _expect 'ionice -c 3 -n 7 tmux kill-server'    rule1-killserver-unscoped 'ionice -c 3 -n 7 tmux kill-server'
+    _expect 'control: a -S-pinned kill in a case arm is scoped' CLEAN \
+'case "$TSOCK" in "$WORK"/*) env -u TMUX tmux -S "$TSOCK" kill-server >/dev/null 2>&1 || true ;; esac'
+    _expect 'control: a case PATTERN named tmux is not a call' CLEAN 'case "$x" in tmux) echo hi ;; esac'
+    _expect 'control: stdbuf wrapping a non-tmux command' CLEAN 'stdbuf -oL grep tmux f'
+    _expect 'control: then + -L pinned is scoped'  CLEAN 'if c; then tmux -L iso kill-server; fi'
+    _expect 'control: timeout + -L pinned is scoped' CLEAN 'timeout -k 2 5 tmux -L iso kill-server'
+    _expect 'control: sudo -u + -S <path> is scoped' CLEAN 'sudo -u root tmux -S /tmp/iso.sock kill-server'
+    _expect 'control: timeout wrapping a non-tmux command' CLEAN 'timeout 5 sleep 1'
+    _expect 'control: the words as DATA' CLEAN 'echo "then tmux kill-server"'
+    # THE ONE EXEMPTION, and that it cannot be moved onto a real call.
+    _expect 'shim writer WITHOUT the pragma is flagged' rule2-tmux-tmpdir-insufficient \
+'( export TMUX_TMPDIR="$D"; nx_write_tmux_shim "$B" "$R" s ) || exit 1'
+    _expect 'shim writer WITH the pragma is exempt' CLEAN \
+'( export TMUX_TMPDIR="$D"; nx_write_tmux_shim "$B" "$R" s ) || exit 1   # tmux-shim-writer: pins -L s'
+    _expect 'the shim-writer pragma does NOT exempt a real tmux call' rule2-tmux-tmpdir-insufficient \
+'( export TMUX_TMPDIR="$D"; tmux new-session -d -s x )   # tmux-shim-writer: nope'
+    _expect '…nor a writer-NAMED lookalike' rule2-tmux-tmpdir-insufficient \
+'( export TMUX_TMPDIR="$D"; my_nx_write_tmux_shim_v2 "$B" )   # tmux-shim-writer: nope'
+    _expect 'the tmux-scoped pragma does NOT exempt the carried shape' rule2-tmux-tmpdir-insufficient \
+'export TMUX_TMPDIR="$D"; tmux kill-window -t a:0   # tmux-scoped: nope'
+
+    # === 5b. the COUNTER sees exactly what the SCANNER exempts (#1650 N2) ===
+    # Each exempted form must be CLEAN to the scan AND counted 1 — the two
+    # answers come from one decision now, and this is where that is proven.
+    # The forms the old second regex missed come first.
+    echo "=== every exemption the scanner grants is counted (#1650 N2) ==="
+    _count_case() {   # _count_case <label> <shim-writer|tmux-scoped> <want> <line>
+        local d n v
+        d=$(mktemp -d "$tmp/count.XXXXXX"); printf '%s\n' "$4" > "$d/planted.sh"
+        n=$(count_exemptions "$d" "$2"); v=$(scan "$d" 2>&1)
+        _ck "$1 → counted $3" $([[ "$n" == "$3" ]] && echo 0 || echo 1) "counted $n"
+        if [[ "$3" != 0 ]]; then
+            _ck "$1 → and the scan is clean" $([[ -z "$v" ]] && echo 0 || echo 1) "got: $v"
+        fi
+    }
+    _count_case 'a QUOTED "nx_write_tmux_shim"' shim-writer 1 \
+'( export TMUX_TMPDIR="$D"; "nx_write_tmux_shim" "$B" "$R" s )   # tmux-shim-writer: pins -L s'
+    _count_case 'exec nx_write_tmux_shim' shim-writer 1 \
+'( export TMUX_TMPDIR="$D"; exec nx_write_tmux_shim "$B" "$R" s )   # tmux-shim-writer: pins -L s'
+    _count_case 'the plain form' shim-writer 1 \
+'( export TMUX_TMPDIR="$D"; nx_write_tmux_shim "$B" "$R" s )   # tmux-shim-writer: pins -L s'
+    _count_case 'control: a lookalike is flagged, never counted' shim-writer 0 \
+'( export TMUX_TMPDIR="$D"; my_nx_write_tmux_shim_v2 "$B" )   # tmux-shim-writer: nope'
+    _count_case 'control: a pragma with NOTHING to exempt grants nothing' shim-writer 0 \
+'nx_write_tmux_shim "$B" "$R" s   # tmux-shim-writer: no tmpdir on this line'
+    _count_case 'an ABBREVIATED kill-ser under tmux-scoped' tmux-scoped 1 \
+'"$PTMUX" kill-ser   # tmux-scoped: private shim'
+    _count_case 'the killp short form under tmux-scoped' tmux-scoped 1 \
+'"$PTMUX" killp   # tmux-scoped: private shim'
+    _count_case 'the plain kill-server form under tmux-scoped' tmux-scoped 1 \
+'"$PTMUX" kill-server   # tmux-scoped: private shim'
+    # TWO exemptions on ONE line count 2 (your-org/nexus-code#1652 item 2). The
+    # counter used to emit one marker per LINE, so both of these counted 1 and a
+    # second exempted kill could be added beside a reviewed one unseen.
+    _count_case 'TWO exempted kill-servers on one line' tmux-scoped 2 \
+'"$PTMUX" kill-server; "$PTMUX" kill-server   # tmux-scoped: private shim'
+    _count_case 'one pragma exempting rule1 AND rule3 (a \; sequence)' tmux-scoped 2 \
+'"$PTMUX" kill-server \; kill-window   # tmux-scoped: private shim'
+    _count_case 'TWO shim-writer calls on one line' shim-writer 2 \
+'( export TMUX_TMPDIR="$D"; nx_write_tmux_shim "$B" "$R" s; nx_write_tmux_shim "$B" "$R" t )   # tmux-shim-writer: pins -L s/t'
+    _count_case 'control: a -L-pinned kill needs no pragma, so none is counted' tmux-scoped 0 \
+'tmux -L iso kill-server   # tmux-scoped: redundant'
+
     # === 5c. a QUOTED argument ending in `;` is a TMUX separator (#1579) ======
     # tmux ends a command at any argument whose last character is `;`, judged
     # after the shell removes quotes (#1578). The scanner used to split every
@@ -571,27 +730,94 @@ tmux kill-server'
             'lint-no-tmux-server-kill' && echo 0 || echo 1)
 
     # === 8. manifest =======================================================
-    echo "=== pragma manifest ==="
-    local n expected
-    n=$(count_pragmas "$repo_root/monitor")
-    expected="${LINT_TMUX_EXPECTED_PRAGMAS:-2}"
-    _ck "pragma count is $expected as expected" \
-        $([[ "$n" == "$expected" ]] && echo 0 || echo 1) \
-        "found $n — an exemption was added or removed; review it, then update LINT_TMUX_EXPECTED_PRAGMAS"
-
+    # The manifest is a REVIEW RATCHET (a count that forces a human to look at
+    # each new exemption), not a detector check: sections 1-7 prove the
+    # detector fires. gate.sh runs the selftest with the ratchet split out
+    # (LINT_TMUX_SELFTEST_SKIP_MANIFEST=1) and checks it separately via
+    # --manifest-check, so a stale count is filed as repo hygiene instead of
+    # refusing every candidate before a scenario runs (your-org/nexus-code#1657;
+    # 2.1.283 on 2026-09-27). The unit band still runs the full selftest.
+    if [[ "${LINT_TMUX_SELFTEST_SKIP_MANIFEST:-0}" == "1" ]]; then
+        echo "=== pragma manifest: SKIPPED here (LINT_TMUX_SELFTEST_SKIP_MANIFEST=1) — checked by --manifest-check ==="
+        printf '\n  %d pass / %d fail\n' "$passes" "$fails"
+        (( fails == 0 )) || return 1
+        echo "lint-no-tmux-server-kill: SELFTEST OK (detector sections; manifest ratchet split out)"
+        return 0
+    fi
+    manifest_checks || true   # its _ck calls already counted any FAIL
     printf '\n  %d pass / %d fail\n' "$passes" "$fails"
     (( fails == 0 )) || return 1
     echo "lint-no-tmux-server-kill: SELFTEST OK"
     return 0
 }
 
+# manifest_checks — the counted-exemption ratchet (section 8), shared by
+# --selftest and --manifest-check. rc 0 iff both pinned counts hold.
+manifest_checks() {
+    local _mfails=0
+    echo "=== pragma manifest ==="
+    local n expected
+    n=$(count_pragmas "$repo_root/monitor")
+    # 4 = cc-harness/_lib.sh (cch_tmux), test-integration/_harness.sh, and the two
+    # Codex real-binary suites added by #1640/#1642 (test-codex-busy-phases.sh,
+    # test-codex-worker-e2e.sh). REVIEWED for #1643: each kills through "$PTMUX",
+    # written by nx_write_tmux_shim under a private TMUX_TMPDIR as
+    # `env -u TMUX … <real binary> -L cxp|cxe`, and only inside [[ -x "$PTMUX" ]]
+    # — the same shape as the _harness.sh exemption.
+    expected="${LINT_TMUX_EXPECTED_PRAGMAS:-4}"
+    [[ "$n" == "$expected" ]] || _mfails=$((_mfails + 1))
+    _ck "pragma count is $expected as expected" \
+        $([[ "$n" == "$expected" ]] && echo 0 || echo 1) \
+        "found $n — an exemption was added or removed; review it, then update LINT_TMUX_EXPECTED_PRAGMAS"
+
+    # The #1646 shim-writer exemption, pinned separately: the two Codex
+    # real-binary suites (test-codex-busy-phases.sh, test-codex-worker-e2e.sh),
+    # each `( export TMUX_TMPDIR="$SOCKDIR"; nx_write_tmux_shim … cxp|cxe )`.
+    # REVIEWED for #1646: nx_write_tmux_shim writes `env -u TMUX … -L <sock>`.
+    local ns nsexp
+    ns=$(count_shimw_pragmas "$repo_root/monitor")
+    nsexp="${LINT_TMUX_EXPECTED_SHIMW_PRAGMAS:-2}"
+    [[ "$ns" == "$nsexp" ]] || _mfails=$((_mfails + 1))
+    _ck "shim-writer pragma count is $nsexp as expected" \
+        $([[ "$ns" == "$nsexp" ]] && echo 0 || echo 1) \
+        "found $ns — a shim-writer exemption was added or removed; review it, then update LINT_TMUX_EXPECTED_SHIMW_PRAGMAS"
+    (( _mfails == 0 ))
+}
+
+# pragma_files <dir> — every file carrying a counted exemption, one
+# `<path><TAB><tmux-scoped><TAB><shim-writer>` per line. Derived from the
+# SCANNER'S OWN exemption decisions (`emit_exempt`), the same source
+# count_pragmas / count_shimw_pragmas read since #1650 N2 — so the per-file
+# split can never disagree with the manifest total. gate.sh uses it to tell an
+# exemption INSIDE the files it executes (a safety question) from one outside
+# them (repo hygiene), for BOTH kinds (your-org/nexus-code#1657). A scan that
+# fails prints nothing and returns 1: the caller then refuses (fail-closed).
+pragma_files() {
+    local out
+    out=$(files0 "$1" | xargs -0 -r awk -v with_file=1 -v emit_exempt=1 -f "$AWK_SCAN") || return 1
+    awk -F: '
+        $3 == "exempt-tmux-scoped" { t[$1]++; seen[$1] = 1 }
+        $3 == "exempt-shim-writer" { w[$1]++; seen[$1] = 1 }
+        END { for (f in seen) printf "%s\t%d\t%d\n", f, t[f] + 0, w[f] + 0 }' <<<"$out" | sort
+}
+
 # ---------------------------------------------------------------------------
 case "${1:-}" in
     --selftest) selftest; exit $? ;;
+    --manifest-check)
+        passes=0; fails=0
+        _ck() {  # same contract as selftest's _ck
+            if (( $2 == 0 )); then printf '  PASS: %s\n' "$1"; passes=$((passes+1))
+            else printf '  FAIL: %s%s\n' "$1" "${3:+ — $3}" >&2; fails=$((fails+1)); fi
+        }
+        manifest_checks; exit $? ;;
+    --pragma-files)
+        pragma_files "${2:-$repo_root/monitor}"; exit 0 ;;
     --manifest)
         t="${2:-$repo_root/monitor}"
         echo "scanned:  $t"
         echo "pragmas:  $(count_pragmas "$t")"
+        echo "shim-writer pragmas: $(count_shimw_pragmas "$t")"
         echo "files:    $(files0 "$t" | tr -dc '\0' | wc -c | tr -d ' ') shell files (derived; see WHICH FILES)"
         files0 "$t" \
           | xargs -0 grep -nHE '(^|[[:space:]])kill-(server|session|window|pane)([[:space:]]|$)' 2>/dev/null \

@@ -55,7 +55,7 @@ mkdir -p "$FAKE_NEXUS/monitor" \
 cp "$SCRIPT_REAL" "$FAKE_NEXUS/monitor/spawn-worker.sh"
 chmod +x "$FAKE_NEXUS/monitor/spawn-worker.sh"
 cp "$_test_dir/../guard-block.sh.in" "$FAKE_NEXUS/monitor/guard-block.sh.in"
-for _dep in _claude-bin.sh _tmux-window.sh _fm_lib.sh _channel_lib.sh _bookkeeping.sh; do
+for _dep in _claude-bin.sh _tmux-window.sh _fm_lib.sh _channel_lib.sh _bookkeeping.sh _requests_dir.sh; do
     cp "$_test_dir/../$_dep" "$FAKE_NEXUS/monitor/$_dep"
 done
 cp "$_test_dir/../request-channel.sh" "$FAKE_NEXUS/monitor/request-channel.sh"

@@ -142,8 +142,13 @@
 #   5   ownership check failed (principal != request origin)
 #   6   illegal state transition (e.g. reply to an already-replied id; ack of a
 #       LIVE reply:required id — it would close without the demanded reply)
+#   7   the request inbox is unusable: a CONFIGURED inbox (NEXUS_REQUESTS_DIR /
+#       monitor.requests.dir) that does not exist, a relative configured value,
+#       or a symlink that does not resolve — refused rather than reported as an
+#       empty inbox (your-org/nexus-code#1723)
 #
-# State dir resolution mirrors monitor/ng + skeptic-channel.sh:
+# The inbox location: monitor/_requests_dir.sh (env, then config key, then
+# <state>/requests). State dir resolution mirrors monitor/ng + skeptic-channel.sh:
 #   NEXUS_STATE_DIR → NEXUS_ROOT/monitor/.state → config nexus.root →
 #   script-relative fallback.
 
@@ -242,7 +247,10 @@ _resolve_state_dir() {
 }
 
 STATE_DIR="$(_resolve_state_dir)"
-REQ_DIR="$STATE_DIR/requests"
+# shellcheck source=_requests_dir.sh
+. "$_script_dir/_requests_dir.sh"
+REQ_SRC=$(nexus_requests_dir_source "$STATE_DIR") || exit 7
+REQ_DIR=$(nexus_requests_dir "$STATE_DIR") || exit 7
 REPLIES_DIR="$REQ_DIR/replies"
 IDS_DIR="$REQ_DIR/.ids"
 
@@ -257,13 +265,55 @@ _confine_root() {
 }
 
 # A request id is a filename stem composed only of [A-Za-z0-9_-] (the ts
-# contributes digits + T + Z; origin/slug are _chan_safe-sanitized;
-# disambiguator is `-NN`). REJECTING anything else is the load-bearing
+# contributes digits + T + Z; origin is validated to that alphabet; the slug
+# is mapped INTO it by `_req_slug`; disambiguator is `-NN`). REJECTING anything else is the load-bearing
 # path-confinement guard for `fetch`/`await`/`show`: it makes `..`, `/`,
 # and absolute paths un-representable as an id, so no id can ever name a
 # file outside the inbox tree (RFC §D.6, §6).
 _validate_id() {
     [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] || die "illegal request id (must be [A-Za-z0-9_-]): $1"
+}
+
+# _req_slug <slug> — the slug component of a minted id, INSIDE `_validate_id`'s
+# alphabet (your-org/nexus-code#1699).
+#
+# The mint used `_chan_safe` (= `wk_encode`), whose escape is `%XX`, while
+# `_validate_id` — and `remote-forced-command.sh`'s await/fetch — accept only
+# `[A-Za-z0-9_-]`. So `--slug proj-S0.2` minted `…-proj-S0%2E2`, a request that
+# `ack`/`reply`/`fail`/`show` all refused: the channel printed an id it could
+# not address. The mint is narrowed rather than the validator widened, because
+# the validator is the path-confinement guard and it has a second copy on the
+# remote surface.
+#
+#   [A-Za-z0-9_-]  pass through — the IDENTITY on every slug that was already
+#                  valid, so no existing id shape moves and the idempotency
+#                  globs keyed on a raw slug (`ng`'s rearm-declined filer,
+#                  tmuxwrap's incident filer) keep matching.
+#   anything else  `_XX` per byte, uppercase hex (a multibyte character is
+#                  several `_XX`).
+#
+# DELIBERATELY NOT INJECTIVE, and why that is safe here: a literal slug `a_2Eb`
+# and `a.b` both map to `a_2Eb`. The slug is a human label, not a key — the id's
+# uniqueness comes from the `mkdir` reservation below, which gives the second
+# filer in the same second `-01`, so two such slugs can never share an id or
+# overwrite each other's request. Injectivity would require escaping `_`, which
+# would move every existing `_`-bearing slug (`wk_encode_word` does exactly
+# that, for keys that must decode; a slug never needs to).
+_req_slug() {
+    local LC_ALL=C s="${1-}"
+    case "$s" in
+        *[!A-Za-z0-9_-]*) ;;
+        *) printf '%s' "$s"; return 0 ;;
+    esac
+    local out="" i c
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            [A-Za-z0-9_-]) out+="$c" ;;
+            *) printf -v out '%s_%02X' "$out" "'$c" ;;
+        esac
+    done
+    printf '%s' "$out"
 }
 
 # Resolve an id to its current on-disk file + state. The FILENAME SUFFIX is the
@@ -462,9 +512,19 @@ cmd_file() {
     esac
     [[ "$kind" =~ ^[a-z][a-z0-9-]*$ ]] || die "file: --kind must be a kebab token: $(_arg_excerpt "$kind")"
 
-    local safe_slug; safe_slug=$(_chan_safe "$slug")
+    local safe_slug; safe_slug=$(_req_slug "$slug")
     [[ -n "$safe_slug" ]] || die "file: --slug sanitizes to empty: $(_arg_excerpt "$slug")"
 
+    if [[ -L "$REQ_DIR" && ! -d "$REQ_DIR" ]]; then
+        nexus_requests_dir_check "$REQ_DIR" "$REQ_SRC"; exit 7
+    fi
+    # A configured inbox (typically under ~/.claude) is created private: it
+    # holds request bodies, and it must not be the principals dir's sibling
+    # in permissions (your-org/nexus-code#1723).
+    if [[ "$REQ_SRC" != default && ! -d "$REQ_DIR" ]]; then
+        ( umask 077; mkdir -p "$REQ_DIR" ) 2>/dev/null \
+            || die "file: cannot create the configured inbox $REQ_DIR (from ${REQ_SRC})"
+    fi
     mkdir -p "$REQ_DIR" "$IDS_DIR" "$REPLIES_DIR" 2>/dev/null \
         || die "file: cannot create inbox dirs under $REQ_DIR"
 
@@ -702,6 +762,7 @@ cmd_list() {
             *) die "list: unknown flag: $(_arg_excerpt "$1")" ;;
         esac
     done
+    nexus_requests_dir_check "$REQ_DIR" "$REQ_SRC" || exit 7
     [[ -d "$REQ_DIR" ]] || return 0
     # The content-transition intermediates (.replying/.failing — a crashed
     # reply/fail pending the watcher reaper) are selected under `claimed`,
@@ -1215,8 +1276,12 @@ cmd_reply() {
         [[ -n "$session_id" ]] && rblock+="    session_id: $session_id"$'\n'
     fi
     if [[ "$publish" == "false" ]]; then
-        rblock+="  progress_path: monitor/.state/requests/replies/$id/progress.md"$'\n'
-        rblock+="  results_path:  monitor/.state/requests/replies/$id/results.md"$'\n'
+        # The default inbox keeps its repo-relative spelling; a configured one
+        # lives outside the tree, so its paths are absolute (#1723).
+        local _rp="monitor/.state/requests/replies"
+        [[ "$REQ_SRC" != default ]] && _rp="$REPLIES_DIR"
+        rblock+="  progress_path: $_rp/$id/progress.md"$'\n'
+        rblock+="  results_path:  $_rp/$id/results.md"$'\n'
     elif [[ -n "$issue" ]]; then
         rblock+="  github_issue: $issue"$'\n'
     fi

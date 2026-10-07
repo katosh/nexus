@@ -45,8 +45,24 @@ script each response. Schema (all keys optional):
                                              #    invalid_request_error / …)
                                              #   -> drives the StopFailure
                                              #    `error` token CC surfaces
-    "error_text":"..."                       # error mode: message body
+    "error_text":"...",                      # error mode: message body
+    "hold_file": "<path>",                   # text mode, streaming: after the
+    "hold_max_s": 120                        #   last text chunk, keep the
+                                             #   stream OPEN (block not stopped,
+                                             #   no message_stop) until <path>
+                                             #   exists or hold_max_s elapses;
+                                             #   then finish normally. Logs
+                                             #   which one ended the hold.
   }
+
+A HOLD IS A GATE, NOT A DURATION (your-org/nexus-code#1667). A scenario that
+must OBSERVE the pane mid-stream cannot size a stream against its observer's
+latency: under host load one pane-state.sh poll took 5-10 s, and a 6 s drip
+finished between two polls. With `hold_file` the stream stays open until the
+scenario says it has seen what it needed (it creates the file), so the
+observation window is as long as the observer needs, bounded by `hold_max_s`.
+The log line `(hold released by file …)` vs `(hold bound … expired …)` lets
+the scenario prove the stream was still open when it observed.
 
 When the control file is absent/malformed, falls back to a single-shot
 text response of $MOCK_TEXT (default "MOCK_OK_HELLO").
@@ -430,7 +446,24 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(drip_ms / 1000.0)
         if hang:
             return  # leave the block open; caller holds the connection
+        self._hold(ctl)
         emit("content_block_stop", {"type": "content_block_stop", "index": 0})
+
+    def _hold(self, ctl):
+        """Keep the text block open until `hold_file` exists or `hold_max_s`
+        elapses (see the module docstring). No-op without `hold_file`."""
+        path = ctl.get("hold_file")
+        if not path:
+            return
+        bound = float(ctl.get("hold_max_s", 120) or 120)
+        t0 = time.time()
+        log("  (hold: stream open until {} exists, bound {:.0f}s)".format(path, bound))
+        while not os.path.exists(path):
+            if time.time() - t0 >= bound:
+                log("  (hold bound {:.0f}s expired; releasing WITHOUT the file)".format(bound))
+                return
+            time.sleep(0.1)
+        log("  (hold released by file after {:.1f}s)".format(time.time() - t0))
 
     def _emit_tool_use(self, emit, ctl):
         tool = ctl.get("tool") or {"name": "Bash", "input": {"command": "true"}}

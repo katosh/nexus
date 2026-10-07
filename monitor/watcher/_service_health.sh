@@ -154,18 +154,22 @@ _sh_svc_bin() {
 #                   that don't declare one (6th column). 'auto-restart'
 #                   (grace → restart → emit) or 'emit-only' (never auto-
 #                   restart; emit and let the orchestrator decide).
-#   cold_build_ceiling — belt-and-suspenders upper bound (seconds) on how
-#                   long a jupyter/labsh service's failing healthcheck is
-#                   excused as an in-progress COLD BUILD (see
-#                   `_sh_labsh_build_in_progress`). Past this the watcher
-#                   stops deferring even if a build still looks in flight —
-#                   a "build" running longer than this is pathological
-#                   (wedged uvx) and must be recoverable. Default 1800
-#                   (30 min): well above the observed ~615 s cold build and
-#                   the supervisor's 900 s START_GRACE, so a genuine cold
-#                   build never trips it. 0 disables the cold-build defer
-#                   entirely (legacy behaviour: restart a labsh service on
-#                   grace like any other).
+#   cold_build_ceiling — seconds of a labsh COLD BUILD's OWN age (never the
+#                   incident's) during which its failing healthcheck is
+#                   excused unconditionally (see `_sh_labsh_build_in_progress`).
+#                   Past it the build stays excused ONLY while it is still
+#                   making progress, until the hard cap
+#                   (LABSH_COLD_BUILD_HARD_CAP, default 7200 s); a build that
+#                   stalls for LABSH_BUILD_STALL_SECONDS (600) past it is
+#                   presumed wedged and restarted. One shared verdict,
+#                   `labsh_build_release` in _labsh_build_evidence.sh, used by
+#                   svc.sh and the supervisor too (your-org/nexus-code#1676).
+#                   It USED to be an absolute bound on the incident clock:
+#                   "a build running longer than this is pathological". On a
+#                   load-100 node a healthy build took >30 min, and every
+#                   rebuild was killed at the bound. Default 1800. 0 disables
+#                   the cold-build defer entirely (legacy behaviour: restart a
+#                   labsh service on grace like any other).
 : "${MONITOR_SERVICE_HEALTH_GRACE_SECONDS:=30}"
 : "${MONITOR_SERVICE_HEALTH_RESTART_COOLDOWN_SECONDS:=300}"
 : "${MONITOR_SERVICE_HEALTH_FLAP_CEILING:=3}"
@@ -186,7 +190,8 @@ _sh_svc_bin() {
 # Two injected seams, defaults inert so the module stays sourceable alone:
 #
 #   _SERVICE_HEALTH_ROUTE_BLOCKED_FN  rc 0 iff the emit route is known-unavailable,
-#                                     printing a one-clause REASON on stdout.
+#                                     printing `<code>\t<reason>` on stdout (a
+#                                     bare reason reads as code `unknown`).
 #                                     main.sh wires the four conditions above.
 #   _SERVICE_HEALTH_OPERATOR_ALERT_FN `<raise|clear> <key> [<severity>] <msg>`,
 #                                     main.sh wires `_operator_alert`
@@ -207,13 +212,38 @@ _SERVICE_HEALTH_OPERATOR_ALERT_FN="${_SERVICE_HEALTH_OPERATOR_ALERT_FN:-_sh_oper
 _sh_operator_alert_key() { printf 'service-health:%s' "$1"; }
 
 # _sh_operator_alert_step <name> <status> <policy> <first_iso> <note>
+#
+# The route function may print `<code>\t<reason>`; the CODE names which arm
+# blocked the route (`over-limit`, `auth-hold`, `auth-expired`, `target-absent`).
+# A bare reason with no tab is code `unknown` (an older or injected function).
 _sh_operator_alert_step() {
-    local name="$1" status="$2" policy="$3" first_iso="$4" note="$5" reason
+    local name="$1" status="$2" policy="$3" first_iso="$4" note="$5" out code reason
     case "$status" in emit-only|flapping) ;; *) return 0 ;; esac
-    reason=$("$_SERVICE_HEALTH_ROUTE_BLOCKED_FN") || return 0
-    "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" due "$(_sh_operator_alert_key "$name")" || return 0
-    "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" raise "$(_sh_operator_alert_key "$name")" critical \
-        "service '${name}' is DOWN (since ${first_iso}, status ${status}, policy ${policy}) and the watcher CANNOT tell the orchestrator: ${reason:-the emit route is unavailable}. ${note}. Nobody in-band can act on this until the orchestrator can take a turn; look at monitor/svc.sh status and \`ng service-incident ${name}\`."
+    out=$("$_SERVICE_HEALTH_ROUTE_BLOCKED_FN") || return 0
+    code=unknown; reason=$out
+    if [[ "$out" == *$'\t'* ]]; then code=${out%%$'\t'*}; reason=${out#*$'\t'}; fi
+    # ONE PAGE PER CAUSE (your-org/nexus-code#1653 F2). When the route is
+    # blocked BECAUSE of the login — the auth-hold or the auth-expiry arm — the
+    # operator is already paged for that (the auth hold's own critical key), and
+    # /login is the fix for both. Then this alert rides as `warning`: recorded,
+    # pushed routine, filed as its own issue; no bell, no email. Keyed on the
+    # route's CAUSE, never on "auth is standing" alone: the route function
+    # checks OVER-LIMIT first, so an over-limit block during a login outage is
+    # code `over-limit` and stays critical. Severity is recomputed on EVERY
+    # tick and handed to `due`, so when the cause changes to an independent one
+    # the key ESCALATES and emails once (F1). Error direction: if this lands
+    # before the auth key is stamped it stays critical — two emails, never zero.
+    local severity=critical auth_key="${_AUTH_HOLD_EXPIRY_ALERT_KEY:-auth-expired}" rides=""
+    case "$code" in
+        auth-expired|auth-hold)
+            if "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" standing "$auth_key"; then
+                severity=warning
+                rides=" (No separate bell or email: the route is blocked by the login, and the standing '${auth_key}' alert already pages for it.)"
+            fi ;;
+    esac
+    "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" due "$(_sh_operator_alert_key "$name")" "$severity" || return 0
+    "$_SERVICE_HEALTH_OPERATOR_ALERT_FN" raise "$(_sh_operator_alert_key "$name")" "$severity" \
+        "service '${name}' is DOWN (since ${first_iso}, status ${status}, policy ${policy}) and the watcher CANNOT tell the orchestrator: ${reason:-the emit route is unavailable}. ${note}. Nobody in-band can act on this until the orchestrator can take a turn; look at monitor/svc.sh status and \`ng service-incident ${name}\`.${rides}"
     return 0
 }
 _sh_operator_alert_clear() {   # <name> <why> — a no-op unless the key is standing
@@ -885,11 +915,11 @@ _sh_clear_finding() {
 # relaunches via recover_service. Returns svc.sh's rc. Test override:
 # SERVICE_HEALTH_SVC_BIN can point at a capture stub.
 # _sh_restart_service <name> [force]
-# <force>=1 means WE have already ruled a labsh cold build pathological on our
-# own clock (it is past our cold_build_ceiling), so svc.sh's cold-build guard
-# must not re-derive that verdict from the build's process age — a different
-# origin, which always reads younger than our `elapsed` and would veto this
-# restart. See the clock-origin note in the state machine.
+# <force>=1 means the shared verdict (`labsh_build_release`) has already
+# RELEASED the live labsh build (stalled, or past the hard cap), so svc.sh's
+# cold-build guard need not re-derive it. See the clock-origin note in the
+# state machine. rc 75 = svc.sh's guard REFUSED (a build it can see is in
+# flight and protected) — nothing was restarted.
 _sh_restart_service() {
     local name="$1" force="${2:-0}"
     [[ "$force" =~ ^[01]$ ]] || force=0
@@ -1025,16 +1055,18 @@ _service_health_check_tick() {
         [[ -n "$name" ]] || continue
         [[ -n "$policy" ]] || policy="$(_sh_resolve_policy "")"
         local sf; sf="$(_sh_state_file "$name")"
-        local prev_status="" attempts=0 first_unhealthy="" first_iso="" last_restart=0
+        local prev_status="" attempts=0 first_unhealthy="" first_iso="" last_restart=0 build_kills=0
         if [[ -f "$sf" ]]; then
             prev_status=$(_sh_field "$sf" status 2>/dev/null || true)
             attempts=$(_sh_field "$sf" restart_attempts 2>/dev/null || echo 0)
+            build_kills=$(_sh_field "$sf" build_kills 2>/dev/null || echo 0)
             first_unhealthy=$(_sh_field "$sf" first_unhealthy 2>/dev/null || echo "")
             first_iso=$(_sh_field "$sf" first_unhealthy_iso 2>/dev/null || echo "")
             last_restart=$(_sh_field "$sf" last_restart 2>/dev/null || echo 0)
         fi
         [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=0
         [[ "$last_restart" =~ ^[0-9]+$ ]] || last_restart=0
+        [[ "$build_kills" =~ ^[0-9]+$ ]] || build_kills=0
 
         # Supervisor record, resolved once per service per tick (a kill -0 +
         # a /proc read; cheaper than the healthcheck it accompanies).
@@ -1408,6 +1440,7 @@ _service_health_check_tick() {
             first_iso="$(_sh_iso)"
             attempts=0
             last_restart=0
+            build_kills=0
             _sh_record_event "$name" detected-unhealthy "healthcheck failed: ${health} (policy ${policy})"
             _sh_log "service '$name' UNHEALTHY (healthcheck: ${health}; policy ${policy})"
         fi
@@ -1421,54 +1454,73 @@ _service_health_check_tick() {
         local cbceiling="${MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS:-1800}"
         [[ "$cbceiling" =~ ^[0-9]+$ ]] || cbceiling=1800
 
-        # Evaluate "is a labsh cold build materialising?" ONCE per tick, into a
-        # variable, because two decisions below need it and they must not
-        # disagree: the defer branch (don't restart a build in flight) and the
-        # act branch (tell svc.sh we have already ruled this build pathological).
+        # Evaluate "is a labsh cold build materialising, and may it be killed?"
+        # ONCE per tick, into variables, because two decisions below need it
+        # and they must not disagree: the defer branch (don't restart a build
+        # in flight) and the act branch (tell svc.sh we have already ruled this
+        # build killable).
         #
-        # ── CLOCK ORIGIN — the whole point of this variable ──────────────────
-        # This module's ceiling counts from `first_unhealthy` (the INCIDENT).
-        # svc.sh's cold-build guard counts from the build process's own start
-        # (`etimes`). A build can only begin AFTER the service is already
-        # unhealthy, so `age = elapsed - D` with `D > 0` ALWAYS. Two clocks, the
-        # same 1800s duration, different origins: at our ceiling the build is
-        # still D seconds short of the guard's cap, so svc.sh REFUSED our first
-        # post-ceiling restart — a guaranteed wasted attempt out of three, and a
-        # permanent `flapping` (recovery dead) whenever D exceeds the restart
-        # budget, e.g. if monitor.service_health.grace_seconds is raised toward
-        # restart_cooldown_seconds. Found by the round-2 skeptic
-        # (your-org/your-nexus#273); it survived round 1 because the guard was
-        # tested as a function and nobody asked whether the WATCHER gets through.
+        # ── CLOCK ORIGIN: THE BUILD'S, NEVER THE INCIDENT'S ─────────────────
+        # This ceiling used to count from `first_unhealthy` — the INCIDENT. A
+        # build can only start after the service is unhealthy, and every
+        # restart starts a NEW one, so once the incident was `cbceiling` old
+        # every build the relaunch started was "past the ceiling" the moment it
+        # was born, and was killed at the next cooldown. Live, 2026-09-29: the
+        # incident opened 13:16:31; from 13:46 on, three consecutive fresh
+        # builds were force-killed ~5.5 min in, and the flap ceiling then read
+        # those three self-inflicted kills as "FLAPPING — restarts did not hold"
+        # while a healthy install was running (your-org/nexus-code#1676).
+        # The earlier fix for the two-clocks problem (your-org/your-nexus#273)
+        # made OUR clock win over svc.sh's; this makes the BUILD's clock the
+        # only one, via the SAME verdict svc.sh and the supervisor consult.
         #
-        # The fix is to have ONE origin decide. Reaching the act branch below
-        # while a build is live implies `elapsed >= cbceiling` BY CONSTRUCTION
-        # (the defer branch is the only gate on a live build, and it would have
-        # been taken otherwise) — i.e. WE have already declared it pathological,
-        # on OUR clock, which is exactly what the ceiling means. So we pass
-        # SVC_FORCE=1 and svc.sh's guard does not re-derive that verdict from a
-        # clock it cannot reconcile with ours.
-        local cb_build=0
+        # ── PROGRESS, NOT A FIXED CEILING ───────────────────────────────────
+        # `labsh_build_release` (_labsh_build_evidence.sh): inside the ceiling
+        # a build is protected; past it, protected ONLY while it is MOVING;
+        # past the hard cap, released. So a slow build on a loaded node is
+        # never killed for being slow, and a wedged one is still recovered.
+        #
+        # Reaching the act branch below with a live build implies the verdict
+        # RELEASED it — so we pass SVC_FORCE=1 and svc.sh does not re-derive
+        # it (it would reach the same verdict from the same shared sample).
+        local cb_build=0 cb_protect=0 cb_pid="" cb_age="" cb_verdict="" cb_ev=""
         if (( cbceiling > 0 )) && _sh_is_labsh_service "$launch" "$health" \
                && _sh_labsh_build_in_progress "$workdir"; then
             cb_build=1
+            if declare -F labsh_build_in_progress >/dev/null \
+                   && declare -F labsh_build_release >/dev/null \
+                   && cb_ev=$(labsh_build_in_progress "$workdir"); then
+                cb_pid="${cb_ev%% *}"; cb_age="${cb_ev##* }"
+                if cb_verdict=$(labsh_build_release "$cb_pid" "$cb_age" "$workdir" "$cbceiling"); then
+                    cb_protect=0
+                else
+                    cb_protect=1
+                fi
+            else
+                # A partial deploy: identity established, the verdict helper
+                # absent. Fall back to the old incident-clock bound rather than
+                # protecting without any bound at all.
+                (( elapsed < cbceiling )) && cb_protect=1
+                cb_verdict="unverified build age unknown to this watcher (verdict helper unavailable) — incident-clock fallback"
+            fi
         fi
 
-        if (( cb_build )) && (( elapsed < cbceiling )); then
+        if (( cb_build && cb_protect )); then
             # --- labsh COLD BUILD in progress: defer to the supervisor
             #     (#326 already made it patient), NEVER restart. This
             #     SUSPENDS the grace/restart machine for the life of the
             #     build — the healthcheck failing throughout is legitimate
-            #     bring-up (uvx materialising the env), not an outage. The
-            #     defer is self-calibrating: it lasts exactly as long as the
-            #     build process runs with no URL (or until the cbceiling
-            #     backstop). A genuinely-dead service has no live build ⇒
-            #     this branch is skipped ⇒ ordinary restart still recovers it.
+            #     bring-up (uvx materialising the env), not an outage. It lasts
+            #     while the build is alive and inside its ceiling or still
+            #     MOVING, until it binds a URL, dies, stalls, or hits the hard
+            #     cap. A genuinely-dead service has no live build ⇒ this branch
+            #     is skipped ⇒ ordinary restart still recovers it.
             status="cold-build"
-            note="labsh cold build in progress (${elapsed}s; uvx materialising the JupyterLab env on NFS — minutes). Deferring to the supervisor; the watcher will NOT restart until the build binds a URL, the build process dies, or the ${cbceiling}s cold-build ceiling elapses."
+            note="labsh cold build in progress (pid ${cb_pid:-?}; ${cb_verdict#* }; uvx materialising the JupyterLab env on NFS). Deferring to the supervisor; the watcher will NOT restart while the build is alive and progressing — only once it binds a URL, dies, stalls with no progress for ${LABSH_BUILD_STALL_SECONDS:-600}s past the ${cbceiling}s ceiling, or passes the ${LABSH_COLD_BUILD_HARD_CAP:-7200}s hard cap."
             if [[ "$prev_status" != "cold-build" ]]; then
                 _sh_record_event "$name" cold-build-in-progress \
-                    "healthcheck fails while a labsh cold build materialises the env (live build process); deferring to supervisor, no restart (policy ${policy})"
-                _sh_log "service '$name' labsh COLD BUILD in progress — deferring to supervisor, not restarting"
+                    "healthcheck fails while a labsh cold build materialises the env (live build pid ${cb_pid:-?}, ${cb_verdict%% *}); deferring to supervisor, no restart (policy ${policy})"
+                _sh_log "service '$name' labsh COLD BUILD in progress (pid ${cb_pid:-?}: ${cb_verdict#* }) — deferring to supervisor, not restarting"
             fi
         elif (( elapsed < grace )); then
             # --- grace window: defer to the supervisor wrapper's self-heal.
@@ -1494,6 +1546,13 @@ _service_health_check_tick() {
             fi
             status="flapping"
             note="auto-restart ceiling (${ceiling}) reached after ${attempts} attempts; needs orchestrator"
+            # Say what the attempts WERE. A restart that released a live build
+            # was a judgement that the build was wedged (stalled or past the
+            # hard cap), not evidence that the service will not stay up — and
+            # the reader must not be left to infer the former from the latter.
+            if (( build_kills > 0 )); then
+                note="${note} — ${build_kills} of the ${attempts} attempt(s) killed a live labsh build the shared verdict had RELEASED (stalled or past the hard cap), so this is repeated WEDGED BUILDS, not a server that will not stay up"
+            fi
         elif (( last_restart > 0 && now - last_restart < cooldown )); then
             # --- in cooldown after a recent restart — wait it out.
             status="recovering"
@@ -1503,22 +1562,37 @@ _service_health_check_tick() {
             #     elapsed, wedged or wrapper-dead).
             _sh_log "service '$name' restart attempt $(( attempts + 1 ))/${ceiling} via svc.sh restart (policy ${policy})"
             local rc=0
-            # cb_build here ⇒ elapsed >= cbceiling (see the clock-origin note
-            # above): we have already ruled this build pathological on OUR
-            # clock, so svc.sh's guard must not veto us on its own.
+            # cb_build here ⇒ the shared verdict RELEASED the build (see the
+            # clock-origin note above): say which way, in the log and the event,
+            # so a later reader can tell a wedged build from a dead server.
             if (( cb_build )); then
-                _sh_log "service '$name' has a live labsh build past the ${cbceiling}s cold-build ceiling — presumed WEDGED; forcing the restart through svc.sh's cold-build guard"
+                _sh_log "service '$name' labsh build pid ${cb_pid:-?} RELEASED: ${cb_verdict#* } — forcing the restart through svc.sh's cold-build guard"
             fi
             _sh_restart_service "$name" "$cb_build" || rc=$?
-            attempts=$(( attempts + 1 ))
-            last_restart="$now"
-            status="recovering"
-            if (( rc == 0 )); then
-                _sh_record_event "$name" restart-issued "attempt ${attempts}/${ceiling} (svc.sh restart rc=0)"
-                note="restart attempt ${attempts}/${ceiling} issued; next tick verifies"
+            if (( rc == 75 )); then
+                # svc.sh's cold-build guard REFUSED: a build it can see is in
+                # flight and protected. Nothing was restarted, so nothing is
+                # counted — a refusal is not an attempt that "did not hold"
+                # (2026-09-29: attempt 1/3 was exactly this, and it was one of
+                # the three that tripped FLAPPING). The next tick sees the build
+                # and defers; last_restart still arms the cooldown so a build
+                # the two sides disagree about cannot be hammered every tick.
+                last_restart="$now"
+                status="cold-build"
+                note="restart DEFERRED: svc.sh's cold-build guard refused (a labsh build is in flight and progressing); not counted toward the ${ceiling}-attempt ceiling"
+                _sh_record_event "$name" restart-deferred "svc.sh refused (rc=75: a labsh build in flight and progressing); not counted as an attempt"
             else
-                _sh_record_event "$name" restart-failed "attempt ${attempts}/${ceiling} (svc.sh restart rc=${rc})"
-                note="restart attempt ${attempts}/${ceiling} returned rc=${rc}; next tick verifies"
+                attempts=$(( attempts + 1 ))
+                last_restart="$now"
+                status="recovering"
+                if (( cb_build )); then build_kills=$(( build_kills + 1 )); fi
+                if (( rc == 0 )); then
+                    _sh_record_event "$name" restart-issued "attempt ${attempts}/${ceiling} (svc.sh restart rc=0)$( (( cb_build )) && printf '; killed live labsh build pid %s (%s)' "${cb_pid:-?}" "${cb_verdict%% *}")"
+                    note="restart attempt ${attempts}/${ceiling} issued; next tick verifies"
+                else
+                    _sh_record_event "$name" restart-failed "attempt ${attempts}/${ceiling} (svc.sh restart rc=${rc})"
+                    note="restart attempt ${attempts}/${ceiling} returned rc=${rc}; next tick verifies"
+                fi
             fi
         fi
 
@@ -1540,6 +1614,7 @@ _service_health_check_tick() {
             "first_unhealthy_iso=${first_iso}" \
             "restart_attempts=${attempts}" \
             "last_restart=${last_restart}" \
+            "build_kills=${build_kills}" \
             "escalated=${escalated}" \
             "last_check=${now}" \
             "last_check_iso=$(_sh_iso)" \

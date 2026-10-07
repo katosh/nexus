@@ -227,7 +227,7 @@ Run from the nexus root (`monitor/ng <verb> ...` or
 | `ng process <comment-id>` | Eligibility check + eyes + fetch body | `issue=<n>` / `author=<login>` / `body<<EOF` … |
 | `ng dashboard get` | Fetch overview-issue dashboard middle | dashboard markdown |
 | `ng dashboard put [--body-file <path>]` | Splice + PATCH dashboard | issue URL |
-| `ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin\|latest] [--message <msg>]` | Commit a file to the nexus asset repo's `main` and print a SHA-pinned URL that renders in any logged-in browser | asset URL pinned to the post-push SHA |
+| `ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin\|latest] [--message <msg>] [--replace]` | Commit a file to the nexus asset repo's `main` and print a SHA-pinned URL that renders in any logged-in browser. A destination already holding DIFFERENT content is REFUSED at exit 5 (<your-org>/nexus-code#1639): pass `--repo-path <unique>` to keep both, or `--replace` to overwrite deliberately | asset URL pinned to the post-push SHA |
 | `ng fetch-asset <user-attachments URL> [--out PATH] [--image-only]` | Download a `github.com/user-attachments/...` asset via the user's PAT (the bot's installation token 404s on this surface). Default `--out` is `monitor/.state/assets/<asset-id>.<ext>` | `path=…` / `content_type=…` / `bytes=…` |
 | `ng watcher-status` | One-shot watcher liveness summary | key=value block |
 | `ng log-action <agent> --event <name> [--note <t>] [--extra k=v]…` | Append one JSONL action-trace line | (silent) |

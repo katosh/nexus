@@ -1214,21 +1214,67 @@ _c1346_n() {   # $1 = window -> number of request files naming it
     bash -c 'shopt -s nullglob; a=("$1"/requests/*"$2"*.md); echo "${#a[@]}"' _ "$NEXUS_STATE_DIR" "$1"
 }
 
+# your-org/nexus-code#1700 — the refusal is no longer keyed on "defaulted"
+# alone (that skipped REQUIRED reviews at rc 0 for issues that existed). A
+# defaulted repo is now CORROBORATED: by this run's landed link comment (arg
+# 9), else by the ref probe, which REFUSES only on a positive not-found. The
+# probe is `gh issue view`, so `gh` is a FUNCTION here: no case may reach
+# GitHub, and the verdict must not depend on the network (the #1346 lesson).
+gh() {
+    printf '%s\n' "$*" >> "$NEXUS_STATE_DIR/gh1346.calls"
+    if [[ "${1:-}" == issue && "${2:-}" == view && " ${G1346_ABSENT:-} " == *" ${3:-} "* ]]; then
+        echo "GraphQL: Could not resolve to an issue or pull request with the number of ${3:-}" >&2
+        return 1
+    fi
+    printf '{"number":%s}' "${3:-0}"
+}
+
 _c1346_setup w1346
 _c1346_before=$(_c1346_n w1346)
 # NON-VACUITY: the resolver really did reach a require, or the refusal below
 # would be indistinguishable from the `skipped (no require)` short-circuit.
 assert_eq "#1346 FIXTURE: the resolver reached a require" "${_SK_SPAWN_REQ:-0}" "1"
-_c1346_out=$(_wrapup_file_spawn_skeptic_request 1134 "$(_wrep w1346)" "" "" "" \
-    your-org/your-nexus "" 0 2>&1)
+_c1346_rc=0
+_c1346_out=$(G1346_ABSENT=1134 _wrapup_file_spawn_skeptic_request 1134 "$(_wrep w1346)" "" "" "" \
+    your-org/your-nexus "" 0 0 2>&1) || _c1346_rc=$?
 _c1346_after=$(_c1346_n w1346)
-assert_contains "#1346 a DEFAULTED repo REFUSES the filing" \
+assert_contains "#1346 a DEFAULTED repo the issue is ABSENT from REFUSES the filing" \
     "$_c1346_out" "REFUSING to file the spawn-skeptic request"
 assert_contains "#1346 …naming the remedy rather than only the complaint" \
     "$_c1346_out" "--repo <owner>/<name>"
-assert_contains "#1346 …and saying nothing is lost, so the refusal is actionable" \
-    "$_c1346_out" "pending marker still holds the retire gate shut"
+assert_contains "#1700 …and reporting FAILED, which cmd_wrap_up counts as a failed step" \
+    "$_c1346_out" "FAILED (refused-defaulted-repo"
+assert_eq "#1700 …with a non-zero status" "$(( _c1346_rc != 0 ? 1 : 0 ))" "1"
 assert_eq "#1346 …and NO request file is written" "$_c1346_after" "$_c1346_before"
+
+# #1700 — the measured case: defaulted, and the link comment LANDED on that
+# thread this run. It FILES, says the repo was defaulted and how it was
+# corroborated, and does not probe (GitHub already answered with the POST).
+# The issue is marked ABSENT for the stub so a probe, if one ran, would refuse.
+_c1346_setup w1700l
+: > "$NEXUS_STATE_DIR/gh1346.calls"
+_c1700l_before=$(_c1346_n w1700l)
+_c1700l_out=$(G1346_ABSENT=1134 _wrapup_file_spawn_skeptic_request 1134 "$(_wrep w1700l)" "" "" "" \
+    your-org/your-nexus "" 0 1 2>/dev/null)
+assert_contains "#1700 defaulted + comment LANDED: the request is filed" "$_c1700l_out" "filed "
+assert_eq "#1700 …exactly one request file" "$(( $(_c1346_n w1700l) - _c1700l_before ))" "1"
+assert_eq "#1700 …and NO probe ran (the landed POST is the corroboration)" \
+    "$(grep -c 'issue view' "$NEXUS_STATE_DIR/gh1346.calls")" "0"
+
+# #1700 — defaulted, no comment landed, issue EXISTS → files.
+_c1346_setup w1700e
+_c1700e_out=$(_wrapup_file_spawn_skeptic_request 1134 "$(_wrep w1700e)" "" "" "" \
+    your-org/your-nexus "" 0 0 2>/dev/null)
+assert_contains "#1700 defaulted + probe EXISTS: the request is filed" "$_c1700e_out" "filed "
+
+# #1700 — an issue with NO repo is never stamped unqualified.
+_c1346_setup w1700n
+_c1700n_rc=0
+_c1700n_out=$(_wrapup_file_spawn_skeptic_request 1134 "$(_wrep w1700n)" "" "" "" \
+    "" "" 0 0 2>/dev/null) || _c1700n_rc=$?
+assert_contains "#1700 issue + EMPTY repo: FAILED, not an unqualified pointer" "$_c1700n_out" \
+    "FAILED (issue 1134 named but no repo resolved)"
+assert_eq "#1700 …with a non-zero status" "$(( _c1700n_rc != 0 ? 1 : 0 ))" "1"
 
 # NEG CONTROL — an EXPLICIT repo must still file. Without this, everything above
 # is satisfied by a function that refuses unconditionally, which is the other
@@ -1240,6 +1286,7 @@ _wrapup_file_spawn_skeptic_request 1134 "$(_wrep w1346x)" "" "" "" \
 _c1346x_after=$(_c1346_n w1346x)
 assert_eq "#1346 NEG CONTROL: an EXPLICIT repo still files normally" \
     "$(( _c1346x_after > _c1346x_before ? 1 : 0 ))" "1"
+unset -f gh
 
 _f2out=$(_f2_rec w879f2 require)
 assert_contains "#879 F2 a producer-path require names the SPAWN MODE as its source" \

@@ -169,8 +169,9 @@ _emit_volatile_strip() {
 # the effective safety-floor the suppression check should use this cycle.
 #
 # Rule: start at the base floor; double it each time sustained idle crosses
-# the next power-of-two multiple of the base, capped at the max. With
-# base=900 / max=7200 that is 900 (idle < 30m) → 1800 (30m ≤ idle < 60m) →
+# the next power-of-two multiple of the base, capped at the max. The
+# default max is 86400 (#1736): …→ 57600 (16h ≤ idle < 32h) → 86400
+# (idle ≥ 32h). With base=900 / max=7200 that is 900 (idle < 30m) → 1800 (30m ≤ idle < 60m) →
 # 3600 (60m ≤ idle < 120m) → 7200 (idle ≥ 120m).
 #
 # `max` is a TRUE CAP — any positive value is honoured exactly, not only
@@ -204,8 +205,8 @@ _full_state_effective_floor() {
     if [[ "$enabled" != "true" ]] || (( base <= 0 )); then
         printf '%s\n' "$base"; return 0
     fi
-    local max="${MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS:-7200}"
-    [[ "$max" =~ ^[0-9]+$ ]] || max=7200
+    local max="${MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS:-86400}"
+    [[ "$max" =~ ^[0-9]+$ ]] || max=86400
     (( max <= base )) && { printf '%s\n' "$base"; return 0; }
     local eff="$base" thresh="$base"
     # `eff < max`, NOT `eff * 2 <= max` (your-org/nexus-code#659). The
@@ -218,6 +219,192 @@ _full_state_effective_floor() {
     done
     (( eff > max )) && eff="$max"
     printf '%s\n' "$eff"
+}
+
+# The ACTIONABLE projection of a full-state canonical
+# (your-org/nexus-code#1736). main.sh compares the projection of the
+# candidate canonical against the projection of the cached (last-emitted)
+# one. Equal projections are "nothing the orchestrator acts on changed":
+# the emit waits for the effective floor and the idle-streak anchor is
+# NOT reset. Unequal projections emit at once and snap the anchor back.
+#
+# Why a projection and not the canonical itself: the canonical carries the
+# ACTIVITY axis — each row's `(active, state=busy|working-background|…)`
+# versus `idle (state=…)`, and the prelude's busy/idle counts. A worker
+# woken for a minute by its own longjob watch flips that axis twice. With
+# 5–7 self-waking workers the canonical changed every few minutes, every
+# change both emitted at once and reset the anchor, and the backoff never
+# climbed past its base rung (measured 2026-10-04: 11 non-actionable
+# `poll-full-state` emits in 4 h 11 m on a board where every worker was
+# waiting on its own Slurm jobs). The orchestrator never acts on an
+# activity flip, so a flip must rarefy the heartbeat, not reset it.
+#
+# The emit BODY is untouched: when a heartbeat does land, it still shows
+# who is busy. Only the change detector stops listening to activity.
+#
+# What is DROPPED, and only this (enumerated; everything else is kept):
+#   prelude  `N busy`, `N idle`, `N retained`, `N unprobed`. Busy and idle
+#            are the activity axis itself. `retained` is the idle class of
+#            an operator-retained window, so it moves 1↔0 exactly when that
+#            window flips busy↔idle. `unprobed` is the render-budget's
+#            share of the busy residue (#1698): it moves with host load,
+#            not with the board.
+#   rows     `<w> (active, state=…)`, `<w> idle (state=…)` and
+#            `<w> idle-awaiting-job (…)` all project to `<w> live`. These
+#            are the three shapes one live worker passes through while it
+#            waits on its own job. A `WEDGED?` note on an idle-awaiting-job
+#            row survives as `<w> live wedged`: a stall is a finding, its
+#            seconds-counter is not.
+#   rows     every other RECOGNISED class keeps `<w> <class>` and drops
+#            its detail (child counts, `state=` sub-activity, reset times,
+#            recovery hints), because the class is what the orchestrator
+#            acts on and the detail ticks while the class stands. A parked
+#            worker's `state=busy` spinner is the plainest example.
+#   order    rows are sorted: a window-set comparison, not a list one.
+#
+# What is KEPT: the window set (every row's name), every other prelude
+# counter (idle-too-long, pane-absent, over-limit, orphan-async,
+# interrupted, parked-skeptic, idle-children, awaiting-input), the class
+# of every non-activity row, and ANY line or row class this filter does
+# not recognise, verbatim. Same asymmetry as the #658 fold above: an
+# unrecognised token costs a noisy emit, a wrongly dropped one costs a
+# silent miss, so the default is keep.
+#
+# Requests, pending decisions and service health are not in the canonical
+# at all. They emit through their own triggers; main.sh snaps the anchor
+# back when a paste DELIVERS one of them.
+#
+# READ FAILED rows (your-org/nexus-code#1738 F2). A row whose pane-state
+# probe FAILED (`state=unknown; pane-state.sh READ FAILED …`) renders through
+# the idle arm, so it projects to `<w> live` like any idle worker: one failed
+# read under host load is instrument churn, not a board change. But "could
+# not determine" that PERSISTS is the state that most needs an operator, and
+# at deep idle the heartbeat can be 24 h away. So the caller passes $1, the
+# newline-separated names whose READ FAILED has persisted for N consecutive
+# full-state polls (`_full_state_read_failed_streak_update`); a READ FAILED
+# row named there projects with a ` read-failed` suffix. Without $1 the
+# projection is exactly the pre-#1738 one.
+#
+# Pure: stdin → stdout. Input is the canonical (already volatile-stripped).
+_full_state_actionable_projection() {
+    # ENVIRON, not `awk -v`: -v processes backslash escapes in its value.
+    _FS_RF_SET="${1:-}" awk '
+        BEGIN {
+            np = split(ENVIRON["_FS_RF_SET"], pa, "\n")
+            for (i = 1; i <= np; i++) if (pa[i] != "") RF[pa[i]] = 1
+        }
+        function tally(line,    pre, rest, n, f, i, out) {
+            pre = ""
+            rest = line
+            if (rest ~ /^workspace: /) { pre = "workspace: "; sub(/^workspace: /, "", rest) }
+            n = split(rest, f, " \\| ")
+            out = ""
+            for (i = 1; i <= n; i++) {
+                if (f[i] ~ /^[0-9]+ (busy|idle|retained|unprobed)$/) continue
+                out = out (out == "" ? "" : " | ") f[i]
+            }
+            return pre out
+        }
+        function row(line,    name) {
+            name = line
+            sub(/^  - /, "", name); sub(/ .*/, "", name)
+            return row_class(line, name) ((name in RF) && index(line, "READ FAILED") ? " read-failed" : "")
+        }
+        function row_class(line, name,    rest, cls) {
+            rest = line
+            sub(/^  - /, "", rest)
+            rest = substr(rest, length(name) + 2)
+            if (rest ~ /^\(active, state=/ || rest ~ /^idle \(state=/ || rest == "idle")
+                return name " live"
+            if (rest ~ /^idle-awaiting-job( |$)/)
+                return name " live" (rest ~ /WEDGED\?/ ? " wedged" : "")
+            cls = rest; sub(/ .*/, "", cls)
+            if (cls ~ /^(pane-absent|OVER-LIMIT|interrupted|parked-awaiting-skeptic|orphaned-skeptic-pending|wrapped-with-children|wrapped-awaiting-protocol|operator-engaged)$/)
+                return name " " cls (rest ~ /WEDGED\?/ ? " wedged" : "")
+            return name " " rest
+        }
+        # The prelude: everything before ---snapshot--- (one tally line in
+        # practice). A line that is not a tally passes through.
+        !snap && $0 == "---snapshot---" { snap = 1; print; next }
+        !snap && / busy( \||$)/ { print tally($0); next }
+        !snap { print; next }
+        /^  - / { rows[++nr] = row($0); next }
+        { other[++no] = $0 }
+        END {
+            # Sort rows (insertion sort: a board is tens of windows).
+            for (i = 2; i <= nr; i++) {
+                v = rows[i]; j = i - 1
+                while (j >= 1 && rows[j] > v) { rows[j + 1] = rows[j]; j-- }
+                rows[j + 1] = v
+            }
+            for (i = 1; i <= nr; i++) print "  - " rows[i]
+            for (i = 1; i <= no; i++) print other[i]
+        }
+    '
+}
+
+# The window names whose full-state row carries a pane-state READ FAILED
+# (your-org/nexus-code#1738 F2). Pure: canonical on stdin → sorted names.
+_full_state_read_failed_windows() {
+    awk '/^  - / && index($0, "READ FAILED") {
+            n = $0; sub(/^  - /, "", n); sub(/ .*/, "", n)
+            if (n != "") print n
+        }' | sort -u
+}
+
+# Advance the per-window READ FAILED streak by ONE full-state poll and print
+# the names whose streak has reached N (your-org/nexus-code#1738 F2).
+#   $1  streak file (`<window>\t<consecutive polls>`), under STATE_DIR
+#   $2  N, the persistence threshold (MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS)
+#   stdin  this poll's READ FAILED names (`_full_state_read_failed_windows`)
+# A name absent this poll is DROPPED, so its next failure starts again at 1:
+# "persists" means N CONSECUTIVE polls. That is what keeps flicker inert — a
+# row failing every other poll never reaches N, and below N the row projects
+# as `live`, so it neither emits nor resets the backoff anchor.
+# Returns 1 (and prints nothing) when the file cannot be written; the caller
+# then projects without the persistent set, i.e. the pre-#1738 behaviour.
+_full_state_read_failed_streak_update() {
+    local file="$1" n="${2:-3}" cur
+    [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 )) || n=3
+    cur=$(cat)
+    _FS_RF_CUR="$cur" awk -F'\t' '
+        BEGIN { m = split(ENVIRON["_FS_RF_CUR"], c, "\n"); for (i = 1; i <= m; i++) if (c[i] != "") C[c[i]] = 1 }
+        NF >= 2 && ($1 in C) && $2 ~ /^[0-9]+$/ { P[$1] = $2 }
+        END { for (k in C) printf "%s\t%d\n", k, P[k] + 1 }
+    ' "$file" 2>/dev/null < /dev/null > "${file}.tmp" \
+        || _FS_RF_CUR="$cur" awk 'BEGIN { m = split(ENVIRON["_FS_RF_CUR"], c, "\n"); for (i = 1; i <= m; i++) if (c[i] != "") printf "%s\t1\n", c[i] }' > "${file}.tmp" \
+        || return 1
+    mv "${file}.tmp" "$file" 2>/dev/null || return 1
+    _FS_RF_N="$n" awk -F'\t' '$2 >= ENVIRON["_FS_RF_N"] + 0 { print $1 }' "$file" | sort
+}
+
+# Which lines of a DELIVERED requests / pending-decisions / service-health
+# payload are NEW to the full-state backoff (your-org/nexus-code#1738 F3).
+#   $1  seen-keys file under STATE_DIR (one volatile-stripped line per key)
+#   stdin  the payload; every non-blank line, volatile-stripped, is a key
+# Prints the keys not in the file and appends them (the file keeps its
+# newest 500 lines). main.sh snaps the heartbeat anchor back only when this
+# prints something: a NEW or CHANGED item is a board change, a re-paste of
+# an UNCHANGED standing item is not — the item has its own re-nag cadence
+# (requests_render's per-id backoff, pending decisions' cooldown), which
+# keeps re-surfacing it whatever the heartbeat does, so resetting the
+# heartbeat on every re-nag only pinned it near base for as long as the item
+# stood (#1736's defect again, on another trigger). A key forgotten past the
+# cap, or a lost file, makes an old item count as new once: one extra snap,
+# the safe direction. Returns 1 if the file cannot be written.
+_full_state_delivery_new_keys() {
+    local file="$1" cur new
+    cur=$(_emit_volatile_strip | awk 'NF { print }')
+    [[ -n "$cur" ]] || return 0
+    new=$(_FS_DK_CUR="$cur" awk '
+        BEGIN { m = split(ENVIRON["_FS_DK_CUR"], c, "\n") }
+        { S[$0] = 1 }
+        END { for (i = 1; i <= m; i++) if (c[i] != "" && !(c[i] in S) && !(c[i] in P)) { P[c[i]] = 1; print c[i] } }
+    ' "$file" 2>/dev/null < /dev/null) || new="$cur"
+    [[ -n "$new" ]] || return 0
+    { cat "$file" 2>/dev/null; printf '%s\n' "$new"; } | tail -n 500 > "${file}.tmp" \
+        && mv "${file}.tmp" "$file" 2>/dev/null || { printf '%s\n' "$new"; return 1; }
+    printf '%s\n' "$new"
 }
 
 # Stable-content sha256 of an emit body: the volatile strip above,

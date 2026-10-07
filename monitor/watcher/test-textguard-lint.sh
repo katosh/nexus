@@ -38,6 +38,23 @@ set -uo pipefail
 _dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LINT="$_dir/textguard-lint.sh"
 
+# --- the guard's population (your-org/nexus-code#1747) ----------------------
+# This suite declared none, so `guards-for-diff` could never select it — and
+# its last case runs the lint over the REAL repo, so any file the lint scans can
+# redden it. That invisibility shipped a CI red on PR #1745. The population is
+# the lint's OWN selection, forwarded via `--files`, never a copy; plus the lint
+# itself and the helper library this suite sources (bash reads both). The
+# fixture trees live under $WORK, where no diff can reach them.
+#
+# PLACED HERE, above the first thing this suite prints: `gp_handle` EXITS when
+# it handles the flag, and anything printed before it would be read as a row.
+. "$_dir/../_guard_population.sh"
+gp_population() {
+    bash "$LINT" --files "$(cd "$_dir/../.." && pwd)"
+    printf '%s\n' "$LINT" "$_dir/_test_helpers.sh"
+}
+gp_handle "$@"
+
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 

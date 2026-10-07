@@ -314,6 +314,7 @@ assert_eq "the jq population is non-empty (a zero here would vacuously green eve
 
 # LOUD — the gate refuses outright. Verified mechanically below.
 jq_loud=(
+    monitor/cc-floor.sh
     monitor/ci-run-execution.sh
     monitor/declare-no-wait.sh
     monitor/declare-wait.sh
@@ -325,6 +326,10 @@ jq_loud=(
     monitor/watcher/_gh_stub.sh
     monitor/worker-health.sh
 )
+# `monitor/cc-floor.sh` — a NEW jq dependency, recorded as a DECISION
+# (your-org/nexus-code#1657). `propose` parses the GitHub API's JSON; without jq
+# it `die`s ("jq required", rc 1) before any API write, so nothing degrades and
+# no floor PR is half-opened. LOUD.
 # `monitor/skeptic-channel.sh` — a NEW jq dependency, recorded as a DECISION
 # (your-org/nexus-code#1536). Its one gate is `window <target>`, which reads the
 # spawn provenance records to say whether a skeptic window exists. LOUD: without
@@ -483,6 +488,26 @@ expected_jq=(
     # — still earns the second Enter. Designed, announced and three-valued, but
     # it is "jq absent changes behaviour", which is what this manifest tracks.
     # (C order: `_p` sorts before `_s`.)
+    #
+    # your-org/nexus-code#1671. A DECISION, first in C order (`_ag` < `_au`).
+    # `amg_claude_mode` reads the agents-md mode from the user and --settings
+    # JSON with jq. Without jq, or on JSON jq rejects, a settings file that
+    # EXISTS yields `unreadable`, which amg_scan reports as LOADED: the spawn
+    # WARNS about an AGENTS.md the binary might not read. Not LOUD, because the
+    # spawn is not refused. Deliberately not FALLBACK, because a sed parse of
+    # the harness's settings schema fails toward `suppressed`, which is the
+    # silent direction. With no settings file at all, jq is never needed.
+    monitor/_agents-md-guard.sh
+    # your-org/nexus-code#1654. A DECISION, placed second in C order (`_au`).
+    # `ac_session_held` reads Claude Code's ~/.claude/sessions/<pid>.json
+    # registry with jq to learn whether a LIVE process holds a session id.
+    # Without jq it returns 3 (CANNOT TELL): `spawn-worker.sh --resume` WARNS
+    # and proceeds on the same-name window check alone, so exit 26 cannot
+    # fire. Not LOUD (resume is not refused), and deliberately not FALLBACK:
+    # a sed/grep parse of the HARNESS's JSON fails toward "not held" the day
+    # its format changes, which is the direction that runs one session twice.
+    # The auto-continue plan half (exit 27) is jq-free and unaffected.
+    monitor/_autocontinue_plan.sh
     monitor/_paste-deliver.sh
     monitor/_submit_evidence.sh
     monitor/cc-auto-update-apply.sh
@@ -502,6 +527,15 @@ expected_jq=(
     # the log line is what makes it observable after the fact rather than
     # inferred.
     monitor/cc-harness/gate.sh
+    # your-org/nexus-code#1640. DEGRADES, and cannot be LOUD: a Codex hook
+    # must exit 0 and print nothing (Codex parses hook stdout for decisions,
+    # and a failing hook would wedge the worker). Without jq the SessionStart
+    # thread id is not read, so the descriptor's .session_id stays empty: the
+    # retire gate then treats the worker's own submits as the operator's
+    # (blocks retirement — the safe direction) and `--resume` needs an
+    # explicit thread id. The heartbeat itself still goes through
+    # worker-heartbeat.sh, listed below with its own degrade.
+    monitor/codex-hook.sh
     monitor/guard-block.sh.in
     monitor/hooks/async-launch-detect.sh
     monitor/hooks/bash-footgun-guard.sh

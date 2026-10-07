@@ -1260,7 +1260,7 @@ seed_engagement_log_matching_activity
 export MOCK_PANE_STATE_bgs3=working-background
 export MOCK_BG_SHELLS_bgs3=1 MOCK_BG_RELIABLE_bgs3=1 MOCK_BG_CPU_bgs3=428
 export MOCK_BG_INFRA_bgs3=0
-export MOCK_BG_CMD_bgs3='zsh:grep_-raIl_PR_22049'
+export MOCK_BG_CMD_bgs3='zsh:grep_-raIl_SAMPLE_X'
 export MOCK_BG_WEDGED_bgs3=1
 run_probe_capture out rc 'render_full_state_snapshot'
 assert_contains "snapshot: a wedged child is NAMED as such (#1446)" "$out" \
@@ -3897,7 +3897,7 @@ PASTE_TS=$(date -Is -d "@$_at_now")
 cat >> "$LOG" <<EOF
 {"ts":"$PASTE_TS","agent":"monitor","event":"paste-followup","note":"please wrap up","window":"pasted"}
 EOF
-printf 'nudged\t%s\tunstick-api-error\n' "$_at_now" > "$STATE_DIR/machine-input.tsv"
+printf 'nudged\t%s\tunstick-ratelimit\n' "$_at_now" > "$STATE_DIR/machine-input.tsv"
 # Both pastes land and fire the workers' UserPromptSubmit hooks.
 stamp_user_prompt pasted "$_at_now"
 stamp_user_prompt nudged "$_at_now"

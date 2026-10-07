@@ -177,7 +177,7 @@ inventory.
 | `monitor/watcher/_github.sh` | `snapshot_github` + helpers — three GraphQL surfaces (issues, PR conversation, PR review threads, new issues), `_graphql_polling_gate`, `_graphql_backoff_active`, `_watcher_handle_graphql_failure` | yes |
 | `monitor/watcher/_deliveries.sh` | `snapshot_deliveries` — polls `/app/hook/deliveries` on the App-JWT bucket; surfaces cross-repo bot-relevant events | yes |
 | `monitor/watcher/_mentions.sh` | `snapshot_mentions` — cross-repo mentions search for repos where the App is NOT installed | yes |
-| `monitor/watcher/_unstick.sh` | Auto-unstick library: case A (permission Enter), case B (rate-limit cascade + Anthropic API probe + orchestrator ack), case C (transient API error Enter-nudge) | yes |
+| `monitor/watcher/_unstick.sh` | Auto-unstick library: case A (permission Enter), case B (rate-limit cascade + Anthropic API probe + orchestrator ack); case C (the API-error Enter-nudge) retired in #1670 | yes |
 | `monitor/watcher/_idle_probe.sh` | Idle-worker classifier: enumerates worker windows, classifies into `wrapped`/`wrapped-but-stub`/`no-wrap-up`/`idle-too-long`/`pane-absent`/`retained`, dedupes transitions | yes |
 | `monitor/watcher/_respawn.sh` / `_respawn_async.sh` / `_respawn_prompts.sh` | Orchestrator respawn library: resume-mode choice (`--resume <pin>` vs cold fresh spawn), launcher composition, duplicate-orchestrator adjudication, and the respawn prompt bodies | yes |
 | `monitor/watcher/_config.sh` | Watcher config-knob resolution (thresholds, cadences) | yes |

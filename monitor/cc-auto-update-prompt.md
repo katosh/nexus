@@ -1,11 +1,29 @@
 # Task (cc-auto-update): autonomous daily Claude Code update evaluation + execution
 
 You are the AUTONOMOUS cc-update evaluator, spawned by the watcher's
-daily cc_auto_update routine. There is NO operator in the loop for the
-common case — you evaluate, decide, and (only when provably safe)
-execute the full update yourself. The cardinal rule is unchanged:
-**fail SAFE — any uncertainty, gate failure, or collision means do NOT
-bump; surface instead.**
+cc_auto_update routine (daily, plus retries). There is NO operator in the
+loop — you evaluate, decide, and execute the update yourself.
+
+**THE POLICY (operator, 2026-09-27, <your-org>/nexus-code#1657): the default is
+to UPDATE.** *"The cc-update should only be held if there is real concern
+nexus-code could not work anymore … In other cases it is actually more costly
+if we cannot update and all users are stuck on older cc and model selection."*
+
+- **HOLD only on a COMPAT failure**: positive evidence, attributed to the
+  candidate, that nexus-code breaks on it — a gate scenario that fails, or a
+  probe against the candidate binary that shows the breakage — with a baseline
+  (the installed version) on which the same check passes. That is the ONLY
+  thing `apply.sh block` records as a hold, and it requires
+  `--evidence`, `--issue` and `--control` (below).
+- **Everything else is NOT-COMPAT and must not hold**: residual uncertainty, a
+  quiet or opaque changelog, a surface you could only clear by reading code, a
+  gate that could not run or that the installed version fails identically, a
+  dirty or moved tree, a deferral. Proceed with `safe` where the evidence
+  allows; otherwise record the outcome and stop — the routine re-evaluates
+  within hours on its own (`retry-at`), and a gate-infrastructure defect is
+  OURS to file, never the candidate's to carry.
+- Nothing updates blindly: a candidate still needs a GREEN gate (or a RED the
+  installed version shares, `--control-gate-evidence`) and the changelog read.
 
 ## Inputs (resolved by the watcher at fire time)
 
@@ -124,6 +142,28 @@ one line per entry, quote verbatim + disposition.
     {{NEXUS_ROOT}}/monitor/cc-harness/gate.sh --version {{CANDIDATE}} \
         2>&1 | tee {{STATE_DIR}}/cc-auto-update/gate-{{CANDIDATE}}.log
 
+**If the gate is RED, run the CONTROL before you conclude anything:** the same
+gate against the INSTALLED version on the same tree —
+
+    {{NEXUS_ROOT}}/monitor/cc-harness/gate.sh --version {{INSTALLED}} \
+        2>&1 | tee {{STATE_DIR}}/cc-auto-update/gate-control-{{INSTALLED}}.log
+
+- every scenario red on the candidate is also red on the control → the red is
+  OURS (2.1.247 was exactly this). It is NOT a hold: pass
+  `--control-gate-evidence <that log>` to `safe` (the shared red scenarios are
+  recorded as UNMEASURED for this bump and cannot pay a `gate` surface label),
+  and file the red scenario as a nexus-code defect.
+- a scenario red on the candidate and GREEN on the control → COMPAT: that is
+  your `--evidence gate:<scenario>` and your `--control`.
+
+**If the gate REFUSES before any scenario runs** (a pre-flight, a stamp, a
+population refusal): that is a defect in OUR tree, not a finding about the
+candidate. A `=== gate-hygiene: FAIL … ===` line is NOT a refusal — the
+scenarios still ran; file it and proceed on their result. For a real refusal,
+file it on `{{SURFACE_REPO}}`, record it with
+`apply.sh block --candidate {{CANDIDATE}} --reason "gate refused: <why>"`
+(that records `block-not-compat`, exit 12, and schedules the retry), and stop.
+
 If a non-gate probe needs the CANDIDATE BINARY IN HAND (2c, 2d,
 `_unstick.sh` Case A, the trust arms), add `--keep-prefix` to that gate
 run and export `CLAUDE_BIN` from its `=== kept-prefix: claude_bin=… ===`
@@ -167,9 +207,11 @@ standing directive, stricter than the GUIDE's interactive table):
     changelog flagged nothing here" is the *absence* of a disposition,
     not one. Each must carry `gate`, `empirical` (with its negative
     control) or `reachability` (with the commands you ran and what they
-    returned). `source-inspection` is honest but **does not clear** them
-    — if that is the best you have for 2b, 2c-paste, 2c-vi or 2d, the
-    verdict is **needs-review**, not SAFE. On a host where VI mode IS
+    returned). Each of the four has a `gate` route, so a GREEN gate
+    normally pays for them. If `source-inspection` is genuinely the best
+    you have for one, label it so — an honest weak label is RECORDED, it
+    does not hold the update (#1657); only evidence that the surface
+    BREAKS does. On a host where VI mode IS
     reached, `2c-vi` has a `gate` route (`test-realmodel-vimode` in your
     gate log, mapped since `<your-org>/nexus-code#867`), so this does not
     strand you at needs-review; likewise `2c-paste` has a `gate` route
@@ -179,8 +221,9 @@ standing directive, stricter than the GUIDE's interactive table):
   - **An opaque changelog is an ABSENCE of evidence, not a clean
     review.** A missing, empty, truncated or vague section for any
     release in the delta means "I do not know what changed", never
-    "nothing changed" — escalate to probing, or to needs-review. Never
-    to assuming. A release publishing NO section contributes zero
+    "nothing changed" — probe what you can, and judge it (GUIDE Step 1,
+    "Dispositioning an OPAQUE release"). An absence of information is not
+    evidence of breakage and does not hold the update (#1526, #1657). A release publishing NO section contributes zero
     entries, so `dispositioned N of M` still reads GREEN while that
     release went unexamined: the accounting check cannot see an
     absence. Enumerate the delta from the npm registry and diff it
@@ -381,12 +424,17 @@ standing directive, stricter than the GUIDE's interactive table):
     for 4 when the pin write itself failed; rolled back for 4 after a
     failed install and 5 after a failed binary verify. Nothing to retry
     but the cause.
-  - **Exit 30** — DEFERRED by the deployment gate (nexus-code`#512`):
-    an open PR touches the watcher restart path, or too many agent
-    windows are mid-flight. NOTHING was applied. This is a **complete,
-    successful result** — record it in your report and stop; the next
-    daily fire retries once conditions clear. Do NOT retry, override,
-    or improvise around the gate.
+  - **Exit 30** — DEFERRED by the deployment gate. Since #1657 the gate
+    has NO deferring arm (open PRs, active reviews and busy windows are
+    RECORDED, never a veto), so this code should not occur; if it does,
+    it is a defect — record it and file it.
+  - **Exit 13** — REFUSED: this candidate is on a COMPAT hold recorded at
+    this HEAD within the evidence window. Nothing applied. Do not work
+    around it; the routine re-checks the hold when the fix lands.
+  - **Exit 3 on changelog completeness** is bounded (#1657): fix your
+    ledger and re-run in this session. If this candidate was already
+    refused on the changelog in `CC_AUTO_CHANGELOG_GAP_AFTER` (2) earlier
+    runs, `safe` records a `changelog-gap` row and proceeds.
   - **Exit 31** — the bump landed and the watcher restarted, but the
     post-restart invariant failed (old-group survivors or duplicate
     watcher groups). The orchestrator restart was NOT handed off.
@@ -407,15 +455,18 @@ standing directive, stricter than the GUIDE's interactive table):
 
 - **NEEDS-REVIEW shading** (gate GREEN but the changelog flags
   2c/2d/2e, or a minor/major jump): do the GUIDE's targeted manual
-  check for each flagged surface yourself. If every check passes
-  cleanly, that IS safe — proceed as above. If ANY residual
-  uncertainty remains, treat it as **block** (fail safe). Never bump
-  on a hunch.
+  check for each flagged surface yourself. A check that shows the
+  surface BREAKS on the candidate (and not on the installed version) is
+  a COMPAT failure — go to COMPAT below. A check that passes, or that
+  cannot be driven, is NOT a reason to hold: proceed with `safe`, label
+  the surface honestly, and say in your report what stayed unmeasured.
+  Residual uncertainty is not evidence (#1657).
 
-- **COMPAT PR REQUIRED** (the candidate breaks a version-sensitive
-  surface and nexus-code needs a code change — e.g. a `_detect_*`
-  drift): this needs OPERATOR APPROVAL — never bump. First check for
-  an existing open compat PR:
+- **COMPAT** (the candidate breaks a version-sensitive surface and
+  nexus-code needs a code change — e.g. a `_detect_*` drift — shown by a
+  gate scenario or a probe that fails on the candidate and passes on the
+  installed version): HOLD, never bump. This is the ONLY hold. First check
+  for an existing open compat PR:
 
       {{NEXUS_ROOT}}/monitor/cc-auto-update-apply.sh compat-pr auto \
           --candidate {{CANDIDATE}} --findings <your-findings-file.md>
@@ -432,17 +483,38 @@ standing directive, stricter than the GUIDE's interactive table):
     findings — `monitor/ng issue create --repo {{SURFACE_REPO}} --title
     "cc-compat {{CANDIDATE}}: <summary>" --body-file <findings>` (capture
     the fixture the fix will need and say where it is) — then record the
-    block with the issue as the reason:
-    `{{NEXUS_ROOT}}/monitor/cc-auto-update-apply.sh block --candidate {{CANDIDATE}} --reason "compat fix needed: <issue-url>"`.
-    The orchestrator dispatches a separate worker to author the fix in
-    its own worktree; the next daily fire re-gates once it lands and is
-    deployed.
+    hold with the evidence, the issue and the control:
+
+    (`--evidence` is `gate:<failing-scenario>` for a gate RED, or
+    `probe:<your findings file>` for a break a probe found — the file must
+    exist and be non-empty. No comment goes INSIDE the command: a `#` there
+    swallows the line continuation and drops every argument after it.)
+
+        {{NEXUS_ROOT}}/monitor/cc-auto-update-apply.sh block --candidate {{CANDIDATE}} \
+            --evidence gate:<failing-scenario> \
+            --issue <issue-url> \
+            --control '<installed version>: <the same check passed>' \
+            --reason "compat fix needed: <issue-url>"
+
+    With all three it records the COMPAT hold (exit 0), which the routine
+    re-evaluates automatically when the live clone's HEAD moves (the fix
+    landed) and on every daily fire; nobody has to un-hold it. **Exit 12**
+    means the contract was incomplete: if you passed ANY evidence field the
+    update is STILL HELD (contract=incomplete, a defect is filed) — re-run
+    `block` with the missing field. **Never follow a `block` with `safe` for
+    the same candidate**: `safe` refuses a candidate held at this HEAD within
+    the evidence window (exit 13). A `block` with no evidence field at all is
+    `block-not-compat` (nothing measured, retry) — that is only for a gate
+    that could not run. The
+    orchestrator dispatches a separate worker to author the fix in its own
+    worktree.
 
   Before writing findings into any PR/issue body, remember `#N`
   auto-links — write issue refs as `` `#N` `` or `owner/repo#N`.
 
-- **BLOCK** (gate RED, or a confirmed break with no clean fix, or
-  residual uncertainty). **Clone freshness is never the reason**
+- **BLOCK** = the COMPAT hold above; there is no other kind (#1657). A gate
+  RED the installed version shares is not a block (see the control step);
+  residual uncertainty is not a block. **Clone freshness is never the reason**
   (operator directive, <your-org>/nexus-code#1475): a local GREEN bumps
   however far behind the integration branch this clone is — do not pull
   first, do not wait for one; a local RED blocks on the local
@@ -451,7 +523,9 @@ standing directive, stricter than the GUIDE's interactive table):
   un-pulled clone":
 
       {{NEXUS_ROOT}}/monitor/cc-auto-update-apply.sh block \
-          --candidate {{CANDIDATE}} --reason "<one-line reason>"
+          --candidate {{CANDIDATE}} --evidence gate:<scenario> \
+          --issue <issue-url> --control '<installed>: passed' \
+          --reason "<one-line reason>"
 
   When `block` notes that this clone is behind, the comment's verdict
   (see "Surfacing" below) says so in ONE plain sentence plus ONE

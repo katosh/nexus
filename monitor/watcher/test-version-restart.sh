@@ -75,9 +75,28 @@ source "$_script_dir/_mod_b.sh"
 source "$_script_dir/../_shared.sh"
 echo watcher-fixture v1
 EOF
-printf '#!/usr/bin/env bash\n# mod a v1\n' > "$WD/_mod_a.sh"
-printf '#!/usr/bin/env bash\n# mod b v1\n' > "$WD/_mod_b.sh"
+# DEPTH-2 modules (your-org/nexus-code#1746): _mod_a.sh sources one the way
+# _lib.sh sources _fs_probe.sh, _mod_b.sh one through a variable the way
+# _config.sh sources _integration_branch.sh. Plus the two shapes that must NOT
+# join the set: a COMMENTED source line, and a reference to a file that does
+# not exist (kept, it would make the set permanently TORN).
+cat > "$WD/_mod_a.sh" <<'EOF'
+#!/usr/bin/env bash
+# mod a v1
+source "${BASH_SOURCE[0]%/*}/../_deep.sh"
+# source "${BASH_SOURCE[0]%/*}/../_ghost.sh"
+[[ -r "${BASH_SOURCE[0]%/*}/../_missing.sh" ]] && source "${BASH_SOURCE[0]%/*}/../_missing.sh"
+EOF
+cat > "$WD/_mod_b.sh" <<'EOF'
+#!/usr/bin/env bash
+# mod b v1
+_lv="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/_viavar.sh"
+source "$_lv"
+EOF
 printf '#!/usr/bin/env bash\n# shared v1\n' > "$MON/_shared.sh"
+printf '#!/usr/bin/env bash\n# deep v1\n'   > "$MON/_deep.sh"
+printf '#!/usr/bin/env bash\n# viavar v1\n' > "$MON/_viavar.sh"
+printf '#!/usr/bin/env bash\n# ghost v1\n'  > "$MON/_ghost.sh"
 
 # Cockpit source set members the module hashes: svc.sh +
 # bootstrap-recover.sh + watcher/_lib.sh + watcher/_version_restart.sh.
@@ -200,8 +219,34 @@ set_out=$(_version_watcher_source_set "$WD/main.sh")
 assert_contains "set includes main.sh"   "$set_out" "$WD/main.sh"
 assert_contains "set includes _mod_a.sh" "$set_out" "$WD/_mod_a.sh"
 assert_contains "set includes _mod_b.sh" "$set_out" "$WD/_mod_b.sh"
-assert_contains "set includes ../-relative module" "$set_out" "$WD/../_shared.sh"
-assert_eq "set has exactly 4 entries" "$(printf '%s\n' "$set_out" | wc -l | tr -d ' ')" "4"
+assert_contains "set includes ../-relative module" "$set_out" "$MON/_shared.sh"
+assert_contains "#1746: set includes a DEPTH-2 module (sourced by a module)" "$set_out" "$MON/_deep.sh"
+assert_contains "#1746: set includes a depth-2 module sourced through a variable" "$set_out" "$MON/_viavar.sh"
+assert_not_contains "#1746: a COMMENTED source line does not join the set" "$set_out" "_ghost.sh"
+assert_not_contains "#1746: a reference to a MISSING file is dropped (never a permanent TORN)" "$set_out" "_missing.sh"
+assert_eq "set has exactly 6 entries" "$(printf '%s\n' "$set_out" | wc -l | tr -d ' ')" "6"
+h_before=$(_version_hash_files $(_version_watcher_source_set "$WD/main.sh"))
+printf '#!/usr/bin/env bash\n# deep v2\n' > "$MON/_deep.sh"
+h_after=$(_version_hash_files $(_version_watcher_source_set "$WD/main.sh"))
+assert_eq "#1746: the set still hashes (not TORN)" "$([[ -n "$h_after" ]] && echo yes)" "yes"
+[[ "$h_before" != "$h_after" ]] \
+    && { printf '  PASS: #1746: a pull changing ONLY a depth-2 module changes the watcher hash\n'; PASS=$((PASS+1)); } \
+    || { printf '  FAIL: #1746: depth-2 module edited, watcher hash unchanged — the watcher would run stale code\n' >&2; FAIL=$((FAIL+1)); }
+printf '#!/usr/bin/env bash\n# deep v1\n' > "$MON/_deep.sh"
+
+echo '=== watcher source set over the REAL tree (#1746) ==='
+# A fixture cannot test SELECTION over the real loaders, so ask the real
+# main.sh. These three are reached ONLY through libraries; each was outside
+# the depth-1 set.
+real_set=$(_version_watcher_source_set "$_real_dir/main.sh")
+_real_mon=$(cd "$_real_dir/.." && pwd)
+for m in _fs_probe.sh _cc_transcript_roots.sh _pane-live.sh; do
+    assert_contains "#1746: real set includes monitor/$m (sourced by a library)" "$real_set" "$_real_mon/$m"
+done
+_rs_missing=0
+while IFS= read -r f; do [[ -f "$f" ]] || _rs_missing=$((_rs_missing + 1)); done <<<"$real_set"
+assert_eq "#1746: every real set member exists (no TORN)" "$_rs_missing" "0"
+assert_eq "#1746: the real set hashes" "$([[ -n "$(_version_hash_files $real_set)" ]] && echo yes)" "yes"
 
 echo '=== service script resolver ==='
 got=$(_version_service_script "$ROOT/work/svc" "./serve.sh --port 1")

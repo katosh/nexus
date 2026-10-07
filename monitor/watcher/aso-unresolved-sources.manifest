@@ -1,6 +1,7 @@
 _node-bootstrap.sh	$init
 jupyter-kernel-crawl.sh	$NEXUS_LMOD_INIT
 jupyter-kernel-crawl.sh	$init
+labsh-uvx-shim/bash_env.sh	${LABSH_SHIM_BASH_ENV}
 longjob-watch.sh	$1
 shellenv/bash_env.sh	${NEXUS_PREV_BASH_ENV}
 watcher/_service_health.sh	$SERVICE_HEALTH_LABSH_EVIDENCE
@@ -20,6 +21,9 @@ watcher/test-ng-wrap-up.sh	$1
 watcher/test-ng-wrap-up.sh	$1
 watcher/test-ng-wrap-up.sh	$1
 watcher/test-no-sandbox-gate.sh	$0
+watcher/test-operator-alert.sh	$1
+watcher/test-operator-alert.sh	$1
+watcher/test-operator-alert.sh	$1
 watcher/test-orphan-async-terminate.sh	$dst
 watcher/test-pane-state-claude-identity.sh	$1
 watcher/test-pane-state-claude-identity.sh	$1

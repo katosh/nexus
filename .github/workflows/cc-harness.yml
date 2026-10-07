@@ -26,6 +26,14 @@ on:
     paths:
       - 'monitor/cc-harness/**'
       - 'monitor/pane-state.sh'
+      # <your-org>/nexus-code#1643: pane-state.sh SOURCES the Codex classifier
+      # module added by #1640/#1642, so a change to it changes every pane
+      # reading this workflow's realmodel scenarios check. PF001 named it.
+      - 'monitor/_pane-state-codex.sh'
+      # <your-org>/nexus-code#1657: gate.sh SOURCES the hold-policy module for the
+      # tree stamp's dirty_digest, so a change to it changes the gated-tree line
+      # this workflow's gate run writes. PF001 named it.
+      - 'monitor/_cc-hold-policy.sh'
       - 'monitor/watcher/test-integration/test-realmodel-*.sh'
       # <your-org>/nexus-code#568 D6. The realmodel scenarios SOURCE these two
       # modules, so a change to either changes what this workflow proves —

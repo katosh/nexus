@@ -95,7 +95,7 @@ STATE_DIR="$FAKE_NEXUS/monitor/.state"
 REQ_DIR="$STATE_DIR/requests"
 
 # The REAL channel scripts — wrap-up must ride them, not reimplement them.
-for _dep in request-channel.sh _channel_lib.sh _fm_lib.sh; do
+for _dep in request-channel.sh _channel_lib.sh _fm_lib.sh _requests_dir.sh; do
     cp "$_test_dir/../$_dep" "$FAKE_NEXUS/monitor/$_dep"
 done
 chmod +x "$FAKE_NEXUS/monitor/request-channel.sh"
@@ -125,6 +125,7 @@ LOCAL=""; ISSUE=""
 while (( \$# > 0 )); do
     case "\$1" in
         --issue) ISSUE="\$2"; shift 2 ;;
+        --replace) shift ;;   # #1639: boolean; wrap-up passes it (#1637)
         --*)     shift 2 ;;
         *)       [[ -z "\$LOCAL" ]] && LOCAL="\$1"; shift ;;
     esac

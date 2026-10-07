@@ -260,7 +260,43 @@ front_locals_bin() {
             export PATH="$NEXUS_LOCALS_DIR/bin:$pruned"
             ;;
     esac
+    front_pin_shim
     hash -r 2>/dev/null || true
+}
+
+# ── server-env pin (your-org/nexus-code#1676) ──────────────────────────────
+# Every restart used to re-resolve labsh's UNPINNED `uvx --from jupyterlab …`
+# against the live index, so any upstream release forced a >30-min cold
+# rebuild of the server env on NFS. The uvx shim in labsh-uvx-shim/ pins that
+# ONE call to the env that last served healthy (rationale: _labsh_pin.sh). It
+# must sit AHEAD of locals/bin, so it is re-fronted whenever locals/bin is.
+# LABSH_SVC_PIN=0 keeps the shim recording the spec but never applies a pin.
+export LABSH_PIN_DIR="$PROJECT_DIR/.jupyter"
+PIN_SHIM_DIR="$SCRIPT_DIR/labsh-uvx-shim"
+PIN_TOOL="$SCRIPT_DIR/labsh-pin.sh"
+# `labsh start` under a CHAINING BASH_ENV. The nexus BASH_ENV prelude
+# (monitor/shellenv/bash_env.sh) re-fronts locals/bin in EVERY non-interactive
+# bash, and labsh is a bash script — so under it, labsh's bare `uvx` resolved to
+# locals/bin/uvx and the shim was never reached (measured while testing #1676:
+# a fake uvx fronted ahead of locals/bin was shadowed the same way).
+# labsh-uvx-shim/bash_env.sh sources the prelude UNCHANGED, then fronts only the
+# shim directory; the shim hands the original BASH_ENV back to the server's
+# process tree before it execs the real uvx. UV_* are plain exported variables
+# from locals-env.sh (sourced above) and are not touched by either file.
+labsh_start_pinned() {
+    if [[ -r "$PIN_SHIM_DIR/bash_env.sh" && -x "$PIN_SHIM_DIR/uvx" ]]; then
+        LABSH_SHIM_BASH_ENV="${BASH_ENV:-}" BASH_ENV="$PIN_SHIM_DIR/bash_env.sh" labsh start "$@"
+    else
+        labsh start "$@"
+    fi
+}
+front_pin_shim() {
+    [[ -x "$PIN_SHIM_DIR/uvx" ]] || return 0
+    local pruned=":${PATH}:"
+    pruned="${pruned//:$PIN_SHIM_DIR:/:}"
+    pruned="${pruned#:}"
+    pruned="${pruned%:}"
+    export PATH="$PIN_SHIM_DIR:$pruned"
 }
 front_locals_bin
 
@@ -511,12 +547,20 @@ reap_port_orphan() {
 # runs while the service is already unhealthy (no live healthy server on this
 # port to hit). Reversible: `git revert` drops only this reaper. Best-effort;
 # missing tools are not fatal.
-# How long one of OUR cold builds may run before it counts as an orphan.
-# Mirrors the watcher's monitor.service_health.cold_build_ceiling_seconds
-# (default 1800) so the two layers agree on when a build stops being in-flight.
+# How long one of OUR cold builds is protected UNCONDITIONALLY. Mirrors the
+# watcher's monitor.service_health.cold_build_ceiling_seconds (default 1800).
 # Must exceed START_GRACE (900) or the supervisor's own MAX_FAILS bounce would
 # reap builds that are still legitimately materialising.
+#
+# PAST IT A BUILD IS NOT AN ORPHAN BY AGE ALONE (your-org/nexus-code#1676).
+# It stays protected while it is still MOVING, and is reaped only once it has
+# stalled for LABSH_BUILD_STALL_SECONDS or passed LABSH_COLD_BUILD_HARD_CAP —
+# the shared verdict `labsh_build_release`, which svc.sh's guard and the
+# watcher's defer consult too. Measured 2026-09-29 15:09:34, this reaper killed
+# build 13776 at 1816s ("stale", ">= 1800s budget") while it was still
+# progressing on a load-100 node; the replacement started from zero.
 COLD_BUILD_BUDGET="${LABSH_COLD_BUILD_BUDGET:-1800}"
+[[ "$COLD_BUILD_BUDGET" =~ ^[0-9]+$ ]] || COLD_BUILD_BUDGET=1800
 
 # The shared evidence predicate. Sourced, not reimplemented: the watcher's
 # `_sh_labsh_build_in_progress` asks the SAME question with opposite polarity,
@@ -528,15 +572,16 @@ _LABSH_EVIDENCE="$SCRIPT_DIR/_labsh_build_evidence.sh"
 
 _REAP_KILLED=0
 _reap_if_stale() {
-    local pid="$1" port="$2" src="$3" age
+    local pid="$1" port="$2" src="$3" age verdict
     declare -F labsh_build_is_ours >/dev/null || return 1   # helper absent → reap nothing
+    declare -F labsh_build_release >/dev/null || return 1   # verdict absent → reap nothing
     labsh_build_is_ours "$pid" "$PROJECT_DIR" "$port" || return 1   # not ours → silent
     age=$(labsh_build_age "$pid") || return 1
-    if (( age < COLD_BUILD_BUDGET )); then
-        log "NOT reaping pid $pid ($src): our labsh build for port $port, but only ${age}s old (< ${COLD_BUILD_BUDGET}s budget) — a build in flight, not an orphan"
+    if ! verdict=$(labsh_build_release "$pid" "$age" "$PROJECT_DIR" "$COLD_BUILD_BUDGET"); then
+        log "NOT reaping pid $pid ($src): our labsh build for port $port — ${verdict#* } — a build in flight, not an orphan"
         return 1
     fi
-    log "reaping stale labsh build (pid $pid, ${age}s >= ${COLD_BUILD_BUDGET}s budget, $src) before start — releases the uv lock"
+    log "reaping stale labsh build (pid $pid, $src): ${verdict#* } — before start; releases the uv lock"
     kill "$pid" 2>/dev/null && _REAP_KILLED=1
     return 0
 }
@@ -737,7 +782,7 @@ _start_cycle() {
         reinstall_labsh || true
     fi
     log "starting labsh server (preferred port $port${OPTS[*]:+, opts: ${OPTS[*]}})"
-    labsh start --port "$port" ${OPTS[@]+"${OPTS[@]}"}
+    labsh_start_pinned --port "$port" ${OPTS[@]+"${OPTS[@]}"}
     rc=$?
     # rc=127 == the shell could not exec the shim's lib target (binary wiped) —
     # the same #103 failure, catching a wipe that raced in after the pre-start
@@ -745,7 +790,7 @@ _start_cycle() {
     if (( rc == 127 )); then
         log "labsh start rc=127 (binary missing) — self-healing and retrying start once"
         if reinstall_labsh; then
-            labsh start --port "$port" ${OPTS[@]+"${OPTS[@]}"}
+            labsh_start_pinned --port "$port" ${OPTS[@]+"${OPTS[@]}"}
             rc=$?
         fi
     fi
@@ -816,6 +861,7 @@ _start_cycle() {
         fi
         log "phantom-adopt suspected (rc=1, unhealthy after ${START_GRACE}s) but every runtime record is serving or already gone — not retrying (will retry on the next unhealthy streak)"
     fi
+    _after_failed_start
     if (( url_seen )); then
         log "WARNING: server exposed a URL but did not pass the healthcheck within ${START_GRACE}s — will retry on the next unhealthy streak"
     else
@@ -894,6 +940,126 @@ run_periodic() {
     log "periodic hook launched (pid $PERIODIC_PID, log $PROJECT_DIR/$PERIODIC_LOG, bound ${PERIODIC_TIMEOUT}s)"
 }
 
+# _build_protected — rc 0 iff OUR labsh build is in flight (no URL yet) AND the
+# shared verdict PROTECTS it (inside the ceiling, or past it but still moving).
+# The watchdog then neither counts a strike nor bounces. Before this, START_GRACE
+# (900 s) expiring was followed by three failed probes and a bounce whose
+# `reap_stale_builds` killed the still-progressing build at its 1800 s budget
+# (2026-09-29 15:09:34, pid 13776) — the same kill the watcher's layer made.
+# Logged on first sight and on each change of verdict, not on every probe.
+BUILD_WAIT_SEEN=''
+_build_protected() {
+    local ev pid age verdict
+    declare -F labsh_build_in_progress >/dev/null || return 1
+    declare -F labsh_build_release >/dev/null || return 1
+    if ! ev=$(labsh_build_in_progress "$PROJECT_DIR"); then
+        BUILD_WAIT_SEEN=''
+        return 1
+    fi
+    pid="${ev%% *}"; age="${ev##* }"
+    if verdict=$(labsh_build_release "$pid" "$age" "$PROJECT_DIR" "$COLD_BUILD_BUDGET"); then
+        log "our labsh build (pid $pid) is RELEASED: ${verdict#* } — resuming the ordinary bounce"
+        BUILD_WAIT_SEEN=''
+        return 1
+    fi
+    if [[ "$BUILD_WAIT_SEEN" != "$pid ${verdict%% *}" ]]; then
+        log "healthcheck failing while OUR labsh build (pid $pid) is in flight: ${verdict#* } — not bouncing (a bounce would discard it)"
+        BUILD_WAIT_SEEN="$pid ${verdict%% *}"
+    fi
+    return 0
+}
+
+# ── pin capture / refresh / quarantine (your-org/nexus-code#1676) ──────────
+# capture: once per server generation (keyed on the recorded build pid), from a
+# server that has just passed its healthcheck. Synchronous: it is one local
+# `uv pip freeze`, and labsh-pin.sh refuses (rc 3) rather than pin a server it
+# cannot prove is ours and healthy.
+PIN_CAPTURED_FOR=''
+_maybe_capture_pin() {
+    local bg
+    [[ -x "$PIN_TOOL" ]] || return 0
+    bg=$(cat "$BG_PID_FILE" 2>/dev/null) || bg=''
+    [[ -n "$bg" && "$bg" != "$PIN_CAPTURED_FOR" ]] || return 0
+    PIN_CAPTURED_FOR="$bg"
+    "$PIN_TOOL" capture "$PROJECT_DIR" >/dev/null 2>&1 || true
+}
+# refresh: WE CHOSE weekly (LABSH_SVC_REPIN_DAYS, default 7; 0 = never) — the
+# path by which security and feature releases reach the lab without anyone
+# asking. Runs ASYNC, only while healthy, and only swaps the pin after the
+# candidate env serves a smoke test; the running server is never touched. Owned
+# by bash's job table (see _periodic_in_flight for why never `kill -0`).
+#
+# A FAILED REFRESH MUST NOT BECOME A RETRY LOOP (skeptic labshcoldsk, #1677).
+# `refreshed_at` moves only on success, so gating on it alone relaunched a
+# failing refresh every PERIODIC_EVERY round (~10 min): a timed-out candidate
+# build became back-to-back cold builds on NFS, each leaving an orphaned
+# builds-v0/.tmp*, and a smoke failure a throwaway jupyter-lab every cycle. So
+# the SUPERVISOR stamps every attempt itself, before launch, in a file it owns
+# (a tool that refuses before taking its lock cannot then escape the backoff),
+# and a new attempt also waits LABSH_SVC_REPIN_RETRY_HOURS (WE CHOSE 24) after
+# the last one. The finished job's rc is reaped from the job table and logged.
+REPIN_DAYS="${LABSH_SVC_REPIN_DAYS:-7}"
+[[ "$REPIN_DAYS" =~ ^[0-9]+$ ]] || REPIN_DAYS=7
+REPIN_RETRY_HOURS="${LABSH_SVC_REPIN_RETRY_HOURS:-24}"
+[[ "$REPIN_RETRY_HOURS" =~ ^[0-9]+$ ]] || REPIN_RETRY_HOURS=24
+REFRESH_ATTEMPT_FILE=".jupyter/labsh-pin.refresh-attempt"
+REFRESH_PID=''
+_refresh_in_flight() {
+    local p
+    [[ -n "$REFRESH_PID" ]] || return 1
+    for p in $(jobs -pr); do [[ "$p" == "$REFRESH_PID" ]] && return 0; done
+    return 1
+}
+_maybe_refresh_pin() {
+    local last attempt now rrc
+    [[ -x "$PIN_TOOL" ]] || return 0
+    if [[ -n "$REFRESH_PID" ]] && ! _refresh_in_flight; then
+        rrc=0; wait "$REFRESH_PID" 2>/dev/null || rrc=$?
+        log "server-env pin refresh (pid $REFRESH_PID) finished rc=$rrc ($( (( rrc == 0 )) && echo 'swapped or already current' || echo 'NOT swapped')); next attempt no sooner than ${REPIN_RETRY_HOURS}h — see $PROJECT_DIR/.jupyter/labsh-pin.log"
+        REFRESH_PID=''
+    fi
+    (( REPIN_DAYS > 0 )) || return 0
+    [[ -s ".jupyter/labsh-server.pin" ]] || return 0        # nothing pinned ⇒ starts already float
+    _refresh_in_flight && return 0
+    now=$(date +%s)
+    last=$(sed -n 's/^refreshed_at=//p' ".jupyter/labsh-server.pin.meta" 2>/dev/null | tail -1)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    (( now - last >= REPIN_DAYS * 86400 )) || return 0
+    attempt=$(cat "$REFRESH_ATTEMPT_FILE" 2>/dev/null) || attempt=0
+    [[ "$attempt" =~ ^[0-9]+$ ]] || attempt=0
+    (( now - attempt >= REPIN_RETRY_HOURS * 3600 )) || return 0
+    printf '%s\n' "$now" > "$REFRESH_ATTEMPT_FILE"
+    "$PIN_TOOL" refresh "$PROJECT_DIR" >/dev/null 2>&1 &
+    REFRESH_PID=$!
+    log "server-env pin is older than ${REPIN_DAYS}d — background refresh launched (pid $REFRESH_PID, log $PROJECT_DIR/.jupyter/labsh-pin.log); the running server is not touched"
+}
+# After a start that did not become healthy within START_GRACE:
+#   * a pin uv could not RESOLVE is quarantined at once (positive evidence in
+#     labsh.bg.log; labsh-pin.sh acts only on that);
+#   * a pin that RESOLVED but whose server still failed the healthcheck is
+#     DEMOTED after PINNED_FAIL_LIMIT consecutive such starts — rolled back to
+#     .prev, else quarantined (skeptic labshcoldsk, #1677: without this a bad
+#     pinned env was restarted identically until a human deleted the pin). Two,
+#     not one, WE CHOSE: a single failed start has transient causes (a port
+#     race, a token rotation) that are not the pin's; two in a row, with no
+#     healthy probe between them, is the pin's. The count resets on any healthy
+#     probe and is only incremented for a start labsh.bg.log shows was pinned.
+PINNED_FAIL_LIMIT=2
+PINNED_START_FAILS=0
+_after_failed_start() {
+    [[ -x "$PIN_TOOL" ]] || return 0
+    "$PIN_TOOL" quarantine "$PROJECT_DIR" >/dev/null 2>&1 || true
+    [[ -s ".jupyter/labsh-server.pin" ]] || { PINNED_START_FAILS=0; return 0; }
+    grep -q 'labsh-uvx-shim: resolving against the server-env pin' ".jupyter/labsh.bg.log" 2>/dev/null \
+        || return 0
+    PINNED_START_FAILS=$(( PINNED_START_FAILS + 1 ))
+    if (( PINNED_START_FAILS >= PINNED_FAIL_LIMIT )); then
+        log "$PINNED_START_FAILS consecutive PINNED starts failed their healthcheck — demoting the server-env pin (roll back to .prev, else quarantine)"
+        "$PIN_TOOL" demote "$PROJECT_DIR" >/dev/null 2>&1 || true
+        PINNED_START_FAILS=0
+    fi
+}
+
 log "supervisor up: project=$PROJECT_DIR interval=${INTERVAL}s threshold=$MAX_FAILS"
 
 # A PREDECESSOR'S ORPHANED HOOK IS REAPED BEFORE THE FIRST ROUND (skeptic
@@ -924,6 +1090,15 @@ while true; do
     if "$HEALTH" "$PROJECT_DIR" >/dev/null 2>&1; then
         fails=0
         REJECT_BAILS=0      # a healthy probe restores the fast-bail budget (#1584)
+        PINNED_START_FAILS=0
+        _maybe_capture_pin
+        (( ticks % PERIODIC_EVERY == 0 )) && _maybe_refresh_pin
+        continue
+    fi
+    # A failing healthcheck while OUR build is still materialising is bring-up,
+    # not a fault: a bounce here reaps the build and restarts it from zero.
+    if _build_protected; then
+        fails=0
         continue
     fi
     fails=$(( fails + 1 ))

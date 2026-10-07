@@ -1,0 +1,6 @@
+# Reviewed exemptions for mail-path-lint.sh (your-org/nexus-code#1663).
+# <path> TAB <prefix of the line, after leading whitespace> TAB <why it is not a sender>
+# A row that matches no line fails the lint (exit 4): remove it, do not widen it.
+monitor/hooks/async-launch-detect.sh	_HD_DATA_CMDS='	a word list of heredoc-consuming commands for masking; names the mail tools, invokes none
+docs/reference/dependency-surface.md	| SMTP via python3 	inventory row describing notify.sh's sender
+docs/reference/dependency-surface.md	**Email & Notification Backends**	inventory prose describing notify.sh's sender

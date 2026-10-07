@@ -1160,6 +1160,12 @@ A run that exits from inside a parse refusal leaves a record without an
      present, a `Full report: <URL>` footer is appended.
    - `--no-comment` skips this step (caller will `ng reply` later).
    - Default: a templated body built from the report's H1 + Summary.
+   - Post-once: a re-run for the same issue + report reads the earlier
+     wrap-up comment. Identical content (ignoring only the asset-link
+     move) posts nothing; different content POSTs a **new** comment
+     ending `Supersedes the earlier wrap-up comment: <url>`. An earlier
+     comment is never edited or re-pointed — its SHA-pinned link
+     already cites the report as it was (`<your-org>/nexus-code#1637`).
 3. **Rocket-react the trigger comment** on `--trigger-repo` (defaults
    to `--repo`) if `--trigger-comment <id>` is supplied.
 4. **Append a wrap-up event** to `monitor/.state/action-log.jsonl`

@@ -178,6 +178,22 @@ has   "the partial counts are still shown"                "$body" "workspace: 2 
 has   "…flagged as a RENDER FAILURE, not a cut-off"       "$body" "PARTIAL (RENDER FAILED)"
 hasnt "…and NOT as a timeout"                             "$body" "TIMED OUT"
 
+echo "=== A2e. a render that DEGRADED INSIDE its budget says which windows it did not see (#1698) ==="
+# The render is told the budget `_run_bounded` enforces (so it can stop forking
+# probes before the kill), and a line carrying `N unprobed` gets a constant
+# explanation: those windows are neither busy nor idle, the rest is current.
+render_idle_prelude() { printf '5 busy | 1 idle | 0 retained | 3 unprobed budget=%s\n' "${MONITOR_RENDER_BUDGET_SECONDS:-UNSET}"; }
+MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS=20
+body=$(_compose_report_body "test" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "")
+has   "the render was TOLD the budget _run_bounded enforces"  "$body" "budget=20"
+has   "the counts are shown as current"                       "$body" "workspace: 5 busy | 1 idle | 0 retained | 3 unprobed"
+has   "…with the UNPROBED explanation"                        "$body" "workspace: ^ UNPROBED"
+has   "…which says they are NEITHER busy NOR idle"            "$body" "NEITHER busy NOR idle"
+hasnt "…and does NOT call the other counts current (sweep reuse serves ≤300 s)" "$body" "is current"
+has   "…but names the recorder's latest sweep as their source" "$body" "the recorder's latest sweep"
+hasnt "…and is not dressed as a PARTIAL"                      "$body" "PARTIAL"
+hasnt "…nor as a STALE re-emit"                               "$body" "STALE"
+
 echo "=== A3. MUST-NOT-FIRE: a healthy prelude carries no marker ==="
 render_idle_prelude() { printf '2 busy | 1 idle | 0 retained\n'; }
 MONITOR_STARTUP_RENDER_TIMEOUT_SECONDS=20
@@ -187,6 +203,7 @@ hasnt "…and NO 'UNAVAILABLE' marker"                   "$body" "UNAVAILABLE"
 hasnt "…and NO 'PARTIAL' marker"                       "$body" "PARTIAL"
 hasnt "…and NO 'TIMED OUT' label"                      "$body" "TIMED OUT"
 hasnt "…and NO 'RENDER FAILED' label"                  "$body" "RENDER FAILED"
+hasnt "…and NO 'UNPROBED' note"                        "$body" "UNPROBED"
 
 echo "=== A6. a render killed AFTER a complete one re-emits the PREVIOUS counts, DATED (#1406) ==="
 # `UNAVAILABLE` was honest and unusable: the render fails under load, and load
@@ -483,7 +500,7 @@ else bad "row survived: [$(cat "$sf")] — the tracker DOES need a reaper; revis
 # This is the same protection this branch relied on elsewhere, and it is not
 # decoration: `test-summary-honesty-manifest` flagged this very file as
 # `ledger=no::count=none` when it was first written.
-_EXPECTED_ASSERTIONS=85
+_EXPECTED_ASSERTIONS=94
 _ran=$(( PASS + FAIL ))
 if (( _ran == _EXPECTED_ASSERTIONS )); then
     printf '  PASS: every declared assertion executed (%d)\n' "$_EXPECTED_ASSERTIONS"; _th_pass

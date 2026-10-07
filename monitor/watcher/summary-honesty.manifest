@@ -184,6 +184,7 @@ monitor/watcher/test-flock-fd-cloexec.sh::ledger=no::count=none
 monitor/watcher/test-fm-lib.sh::ledger=no::count=none
 monitor/watcher/test-fork-headroom-guard.sh::ledger=no::count=none
 monitor/watcher/test-fs-guard.sh::ledger=yes::count=none
+monitor/watcher/test-full-state-actionable-backoff.sh::ledger=no::count=none
 monitor/watcher/test-full-state-clock-only-change.sh::ledger=no::count=none
 monitor/watcher/test-full-state-emit-noise.sh::ledger=no::count=none
 monitor/watcher/test-full-state-idle-backoff.sh::ledger=no::count=none
@@ -273,6 +274,7 @@ monitor/watcher/test-ng-wrap-up.sh::ledger=no::count=none
 monitor/watcher/test-no-sandbox-gate.sh::ledger=no::count=none
 monitor/watcher/test-notification-record.sh::ledger=no::count=none
 monitor/watcher/test-operator-alert.sh::ledger=yes::count=none
+monitor/watcher/test-operator-alert-property.sh::ledger=yes::count=none
 monitor/watcher/test-orchestrator-liveness-probe.sh::ledger=no::count=none
 monitor/watcher/test-orchestrator-liveness.sh::ledger=no::count=none
 monitor/watcher/test-orchestrator-session-pin.sh::ledger=no::count=none

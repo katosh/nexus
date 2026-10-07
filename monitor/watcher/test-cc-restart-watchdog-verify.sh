@@ -468,6 +468,56 @@ LOOP_ARGS=()
     && pass "--base-size overrides a stale baseline, and says it ignored the file" \
     || fail "exit $RC, or no IGNORING note"
 
+# ---- signal-case plumbing (#1703) -------------------------------------------
+# The SIG cases below race TWO exits of the loop: the TERM this suite sends,
+# and the loop's own kill-wait deadline (`fail "orchestrator was never
+# killed"`, rc 1, which ALSO releases the marker). They used
+# WATCHDOG_DEADLINE_SECONDS=60, so whenever more than 60 s passed between the
+# loop computing DEADLINE and the TERM taking effect, the deadline won and the
+# case read "exit 1, want 143 / no SIGNAL line" — a trap-defect signature for
+# what is a scheduling outcome. Reproduced by shrinking the budget
+# (deadline 1 s, TERM 7 s after arming): rc 1, marker released, no SIGNAL —
+# byte-for-byte the PR #1706 bash-4.4 cell, which also ran +60 s over its
+# siblings (108 s vs ~48 s), i.e. the loop sat out its whole deadline.
+# The deadline is not what these cases test, so it is set out of reach and the
+# signal is the only exit; the HANG it guarded against is bounded here instead,
+# by a reap deadline that FAILS with its own message and SIGKILLs the loop.
+SIG_LOOP_DEADLINE=3600   # the loop's kill-wait give-up — never the exit under test
+SIG_REAP_BOUND=120       # seconds for a TERMed loop to exit; trap runs after `sleep 2`
+# _proc_state PID → R/S/Z/… or empty when gone. `kill -0` cannot tell an
+# exited-unreaped child (a zombie) from a live one, which is the question here.
+_proc_state() {
+    awk '{r=$0; sub(/^.*\) /,"",r); split(r,f," "); print f[1]}' "/proc/$1/stat" 2>/dev/null
+}
+# _sig_and_reap PID LOGFILE — sets SIG_RC. Refuses to signal a loop that has
+# already exited (that is the deadline path, reported AS such with its log),
+# and bounds the wait for the trap to complete.
+_sig_and_reap() {
+    local pid="$1" log="$2" st end
+    st=$(_proc_state "$pid")
+    if [[ -z "$st" || "$st" == Z ]]; then
+        wait "$pid"; SIG_RC=$?
+        fail "the loop exited (rc $SIG_RC) BEFORE the TERM was sent — not a trap result; its log:"
+        sed 's/^/      | /' "$log" >&2 2>/dev/null
+        return 1
+    fi
+    kill -TERM "$pid" || fail "kill -TERM $pid failed"
+    end=$(( SECONDS + SIG_REAP_BOUND ))
+    while :; do
+        st=$(_proc_state "$pid")
+        [[ -z "$st" || "$st" == Z ]] && break
+        if (( SECONDS >= end )); then
+            fail "the loop did not exit within ${SIG_REAP_BOUND}s of TERM (state $st) — SIGKILLed; its log:"
+            sed 's/^/      | /' "$log" >&2 2>/dev/null
+            kill -KILL "$pid" 2>/dev/null
+            break
+        fi
+        sleep 0.1
+    done
+    wait "$pid"; SIG_RC=$?
+    return 0
+}
+
 # ===== SIG. a signalled watchdog releases the marker it wrote (w234sk F6) ===
 echo "== SIG: SIGTERM while waiting for the kill → rc 143, armed marker released =="
 RSG="$WORK/sigterm"; J=$(make_root "$RSG" "$BASE")
@@ -479,7 +529,7 @@ env -i PATH="$RSG/stubbin:/usr/bin:/bin" HOME="$RSG" \
     TMUX_STUB_ORCH_PID="$$" TMUX_STUB_NEW_PID="$$" \
     TMUX_STUB_JSONL="$J" STUB_APPEND="" \
     NEXUS_ROOT="$RSG" NEXUS_STATE_DIR="$RSG/monitor/.state" \
-    CC_AUTO_PROJECTS_DIR="$RSG/projects" WATCHDOG_DEADLINE_SECONDS=60 \
+    CC_AUTO_PROJECTS_DIR="$RSG/projects" WATCHDOG_DEADLINE_SECONDS="$SIG_LOOP_DEADLINE" \
     bash "$LOOP" >/dev/null 2>&1 &
 sig_pid=$!
 armed_seen=0
@@ -489,8 +539,7 @@ for _i in $(seq 1 150); do
 done
 (( armed_seen )) && pass "control: the loop armed before the signal (the release below is not vacuous)" \
     || fail "the loop never armed within 15 s, so the SIG case proves nothing"
-kill -TERM "$sig_pid" 2>/dev/null
-wait "$sig_pid"; sig_rc=$?
+_sig_and_reap "$sig_pid" "$(logfile "$RSG")"; sig_rc=$SIG_RC
 (( sig_rc == 143 )) && pass "exit 143 on SIGTERM" || fail "exit $sig_rc, want 143"
 [[ ! -f "$RSG/monitor/.state/restart-watchdog-armed" ]] \
     && pass "SIGTERM released the armed marker this run wrote" \
@@ -511,7 +560,7 @@ env -i PATH="$RSF/stubbin:/usr/bin:/bin" HOME="$RSF" \
     TMUX_STUB_ORCH_PID="$$" TMUX_STUB_NEW_PID="$$" \
     TMUX_STUB_JSONL="$J" STUB_APPEND="" \
     NEXUS_ROOT="$RSF" NEXUS_STATE_DIR="$RSF/monitor/.state" \
-    CC_AUTO_PROJECTS_DIR="$RSF/projects" WATCHDOG_DEADLINE_SECONDS=60 \
+    CC_AUTO_PROJECTS_DIR="$RSF/projects" WATCHDOG_DEADLINE_SECONDS="$SIG_LOOP_DEADLINE" \
     WATCHDOG_ATTEMPT=ours-sigf-1 \
     bash "$LOOP" >/dev/null 2>&1 &
 sf_pid=$!
@@ -523,8 +572,7 @@ done
 (( sf_armed )) && pass "control: our run armed fully (baseline written) before the swap" \
     || fail "our run never armed within 15 s, so SIGF proves nothing"
 printf 'attempt=foreign-claimant-9\narmed_at=now\n' > "$RSF/monitor/.state/restart-watchdog-armed"
-kill -TERM "$sf_pid" 2>/dev/null
-wait "$sf_pid"; sf_rc=$?
+_sig_and_reap "$sf_pid" "$(logfile "$RSF")"; sf_rc=$SIG_RC
 (( sf_rc == 143 )) && pass "exit 143 on SIGTERM" || fail "exit $sf_rc, want 143"
 grep -qx "attempt=foreign-claimant-9" "$RSF/monitor/.state/restart-watchdog-armed" 2>/dev/null \
     && pass "the foreign claimant's marker is intact (the single-flight is still held)" \

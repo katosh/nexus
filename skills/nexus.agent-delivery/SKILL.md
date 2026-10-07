@@ -6,8 +6,9 @@ description: "The harness-neutral contract for delivering an instruction to an a
 # Agent delivery — the harness-neutral contract
 
 **Status.** The contract is implemented by `monitor/send.sh` (`ng send`) against
-**one** harness, `claude-code`. Everything marked *UNVALIDATED* below could not be
-tested, because a second harness does not exist in this nexus yet. Those parts are
+two harnesses, `claude-code` and — since `<your-org>/nexus-code#1640` — `codex`
+(see "The second harness" below). Everything marked *UNVALIDATED* below was
+written before the second harness existed and has been re-scoped, not deleted. Those parts are
 proposals; the rest is measured. The distinction is kept explicit on purpose —
 `<your-org>/nexus-code#1049` exists because a delivery claim was believed without a
 receipt, and a spec nobody has built against is the same failure one level up.
@@ -641,12 +642,37 @@ inventing a confirmation.
    unsure. A wrong rc 1 is what manufactures a double delivery.
 6. Keep every harness-specific path inside your adapter.
 
+## The second harness: OpenAI Codex (<your-org>/nexus-code#1640)
+
+`monitor/harness/codex.sh` is the first adapter written against this
+contract by someone other than its author's own harness. Measured on
+codex-cli 0.156.1, the real TUI on a private tmux server against a mock
+backend (`monitor/watcher/test-integration/test-codex-worker-e2e.sh`):
+
+- **Identity (§1)** held unchanged: the window name, recorded as
+  `harness: codex` in the descriptor.
+- **Receipt (§2)**: `submit-stamp` works with no contract change. Codex's
+  own command hooks run `monitor/codex-hook.sh` → `worker-heartbeat.sh`, so
+  the stamp comes from the same writer as Claude's. `ng send` → `UNKNOWN`
+  (paste-followup cannot read a Codex transcript), then
+  `ng send --check --last` → `delivered [receipt=submit-stamp]`.
+- **The queued path is better than Claude's.** A paste steered into a
+  busy Codex fires `UserPromptSubmit` when Codex consumes it, so the
+  §2 `#1099` gap (no stamp for a queued paste) does not exist for Codex.
+- **`generic-tmux`'s paste reaches a foreign REPL**: Codex accepted the
+  bracketed paste plus Enter, which retires the first item below for this
+  one harness.
+- **Not used:** `codex queue --thread <id> --message …` is shell-invocable
+  but talks to an app-server daemon this nexus does not run; it is
+  undeclared because nobody has watched it deliver.
+
 ## What is UNVALIDATED
 
-- The adapter contract has one implementation plus a generic fallback. **No second
-  harness has been written against it**, so its sufficiency is a proposal.
-- `generic-tmux` is exercised against Claude Code panes only; whether a foreign
-  harness's REPL tolerates the VI-safe bracketed-paste sequence is untested.
+- The adapter contract has two implementations plus a generic fallback; the
+  second (Codex) needed no contract change, but two harnesses are still a
+  small sample, and both deliver through tmux.
+- `generic-tmux`'s bracketed paste is exercised against Claude Code and
+  Codex panes only.
 - Harness resolution precedence is asserted, not exercised against a mixed board.
 - The `invoke: agent` latency envelope is ONE observation (~5 min). The regime the
   loss claim describes — roughly 20 concurrent, many-minute subagents — is

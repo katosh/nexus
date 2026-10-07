@@ -44,19 +44,13 @@
 #                             from the orchestrator after a cascade
 #                             before declaring it unresponsive.
 #                             Default 60.
-#   API_ERROR_BACKOFF_MIN     Minutes a same-fingerprint case-C
-#                             api-error wedge is allowed to recur
-#                             before the watcher will Enter-nudge it
-#                             again. Default 30. Tunable via the
-#                             monitor.watcher.api_error_backoff_minutes
-#                             config knob.
 #   ON_DIALOG                 Case-D action mode (auto-dismiss / skip
 #                             / error). Default `auto-dismiss`. Set
 #                             from `monitor.watcher.on_dialog` in the
 #                             watcher's caller. See the Case D
 #                             narrative below.
 #
-# Three scenarios this defends against:
+# The scenarios this defends against (C is a retired letter):
 #
 #   A) Permission prompt during normal run — DETECTED, NEVER ANSWERED
 #      (your-org/nexus-code#1599).
@@ -118,11 +112,16 @@
 #        1. Probe the Anthropic API (or fall back to a heuristic
 #           timer) to learn when the rate limit resets.
 #        2. Wait. Per-window detection lines log only on first sight.
+#           A RESET EVENT ends the wait at once (your-org/nexus-code#1739):
+#           a re-login / account switch, or an over-limit pane seen busy
+#           again. See "RESET EVENTS" above `_ratelimit_episode_over`.
 #        3. Once the reset epoch passes, cascade an unstick across
 #           every stuck window EXCEPT the watcher and the
 #           orchestrator (TARGET): Enter to dismiss the menu, then
 #           paste-buffer "Please continue with your task. The API
-#           rate limit has reset." + Enter.
+#           rate limit has reset. Re-check …" + Enter — but only after a
+#           re-read shows the menu LEFT, and never into a window whose
+#           input row holds a typed draft (#1739).
 #           THAT DISMISS ENTER IS AN EQUALITY (your-org/nexus-code#1598):
 #           it is pressed only when a capture taken at that moment, on
 #           the exact target, reads a LIVE menu whose HIGHLIGHTED row is
@@ -150,30 +149,25 @@
 # pane each cycle, so making it the cascade actor is cheaper and more
 # direct than asking the orchestrator to tmux-walk its siblings.
 #
-#   C) Transient API error wedge.
-#      Claude Code occasionally lands on a per-turn API failure (most
-#      commonly an "Internal server error" / type=api_error response)
-#      that wedges the input prompt: the `⏺` arrow sits idle waiting
-#      for user input with the JSON error chip rendered just below the
-#      command line, e.g.
-#
-#         ⏺ Do something.
-#           ⎿  API Error: {"type":"error","error":{...,"type":"api_error",
-#              "message":"Internal server error"},"request_id":"…"}
-#
-#      Pressing Enter on this idle prompt usually nudges Claude Code
-#      to retry the failed turn. The watcher detects the chip via
-#      capture-pane, fingerprints the API error block, and sends Enter.
-#      A per-(window, fingerprint) backoff (API_ERROR_BACKOFF_MIN,
-#      default 30 min) prevents hammering a chronically broken endpoint:
-#      the same fingerprint reappearing within the window is logged
-#      once per cycle as `case=C action=skip-backoff` and skipped.
-#      Distinct fingerprints (different request_ids / messages) and
-#      same-fingerprint reappearances after the backoff elapses re-fire
-#      the Enter. Enter alone is the chosen action — Claude Code
-#      retries the failed turn from this idle state, so a separate
-#      "please continue" follow-up is unnecessary today. Expand to a
-#      paste-buffer follow-up if Enter ever observed insufficient.
+#   C) RETIRED (your-org/nexus-code#1670). This letter used to be an
+#      API-error arm: on a `API Error: {"type":"error"…"Internal server
+#      error"` chip it pressed ONE bare Enter, on the premise that Enter
+#      on the idle prompt retries the failed turn. Both halves had gone
+#      false. The literals match no current render: 2.1.280–2.1.284
+#      print a 500 as
+#         ● API Error: 500 Internal server error. This is a server-side issue, usually temporary — try again in a moment.
+#      And the remedy is inert: measured on 2.1.284 against the
+#      cc-harness mock (500/api_error, then flipped to success), one
+#      bare Enter on that empty prompt sent NO request (mock requests
+#      1 -> 1, reproduced twice), while typing `continue` + Enter did
+#      (1 -> 2, reply rendered). Re-keying would have restored a no-op
+#      keystroke — and, with no `input=` check, one that SUBMITS an
+#      operator draft sitting in the box. API-error recovery is owned by
+#      the StopFailure path: `hooks/turn-failure-emit.sh` writes a typed
+#      `turn-failure/<window>.json` marker, `_idle_probe.sh` surfaces the
+#      window as `interrupted <category>:<recovery>`, and the
+#      ORCHESTRATOR decides the resume. The letter is not reused, so
+#      `case=C` in an old `watcher-unstick.log` stays unambiguous.
 #
 #   D) AskUserQuestion chip-bar dialog (dialog-guard).
 #      The orchestrator is paste-driven; any blocking modal that
@@ -354,20 +348,6 @@ unstick_log() {
 # fingerprint across poll cycles.
 _unstick_fingerprint() {
     grep -E '(Do you want to proceed\?|What do you want to do\?|❯[[:space:]]+[0-9]+\.|^[[:space:]]*[0-9]+\.[[:space:]]|Stop and wait for limit)' \
-        | sha1sum | cut -c1-12
-}
-
-# Stable fingerprint of an API-error chip. Pulls every line carrying
-# any of the chip tokens (the rendered "API Error:" header, the inner
-# JSON `"type":"api_error"`, the message string, and the request_id)
-# and hashes the lot. Different request_ids yield different
-# fingerprints, so each transient failure is unique; the same wedge
-# captured across poll cycles yields the same fingerprint as long as
-# pane content is stable. A wrapped chip (long line broken across
-# rendered rows) still fingerprints stably because each visual line
-# matches one of the patterns.
-_unstick_fingerprint_api_error() {
-    grep -E '(API Error|"type":"api_error"|Internal server error|"request_id")' \
         | sha1sum | cut -c1-12
 }
 
@@ -645,54 +625,6 @@ _unstick_permission_relay() {
     return 0
 }
 
-# Send Enter to a window wedged on a transient API-error chip. The
-# chip indicates the previous turn's request returned an error rather
-# than a completion; pressing Enter on the idle prompt prompts Claude
-# Code to retry the failed turn. Backoff is per-(window, fingerprint):
-# the same fingerprint reappearing within API_ERROR_BACKOFF_MIN
-# (default 30 min) is logged and skipped, so a chronically broken
-# endpoint isn't hammered. Distinct fingerprints (different request_ids
-# / messages) and same-fingerprint reappearances after the backoff
-# elapses re-fire the Enter.
-#
-# Why Enter alone (no follow-up paste): from this idle state Claude
-# Code retries the failed turn on Enter; a separate "please continue"
-# prompt is unnecessary today. If we ever observe Enter not nudging
-# it, expand here to a paste-buffer follow-up after a short sleep.
-_act_api_error() {
-    local window="$1" pane="$2"
-    local case_key="api-error"
-    local fp_file="$UNSTICK_DIR/${window}.${case_key}.fp"
-    local epoch_file="$UNSTICK_DIR/${window}.${case_key}.epoch"
-    local fp prev_fp last_epoch now backoff_min backoff_s age
-    fp=$(printf '%s\n' "$pane" | _unstick_fingerprint_api_error)
-    prev_fp=""
-    [[ -f "$fp_file" ]] && prev_fp=$(<"$fp_file")
-    last_epoch=0
-    [[ -f "$epoch_file" ]] && last_epoch=$(<"$epoch_file")
-    now=$(date +%s)
-    backoff_min="${API_ERROR_BACKOFF_MIN:-30}"
-    backoff_s=$(( backoff_min * 60 ))
-    age=$(( now - last_epoch ))
-    if [[ "$fp" == "$prev_fp" ]] && (( age < backoff_s )); then
-        unstick_log "window=$window case=C action=skip-backoff fp=$fp age_s=$age backoff_s=$backoff_s"
-        return 0
-    fi
-    local audit="$UNSTICK_DIR/${window}.${case_key}.${fp}.audit"
-    [[ -f "$audit" ]] || printf '%s\n' "$pane" > "$audit"
-    # EXACT target, never the bare name: once the window is gone tmux resolves a
-    # bare `-t <name>` by unique PREFIX and this Enter submits whatever a live
-    # sibling (`<w>-skeptic`) holds in its input box (your-org/nexus-code#1524).
-    if tmux send-keys -t "$(_unstick_exact_target "$window")" Enter 2>/dev/null; then
-        printf '%s' "$fp" > "$fp_file"
-        printf '%s' "$now" > "$epoch_file"
-        _unstick_stamp_machine_input "$window" "unstick-api-error"
-        unstick_log "window=$window case=C action=sent-Enter fp=$fp audit=$(basename "$audit")"
-    else
-        unstick_log "window=$window case=C action=send-keys-failed fp=$fp"
-    fi
-}
-
 # Stable fingerprint of an AskUserQuestion chip-bar overlay. Pulls
 # the lines that carry the chip-bar's distinguishing markers (the
 # `Type something.` and `Chat about this` literals, the numbered
@@ -945,10 +877,11 @@ _handle_unstick_window() {
     # that SENDS A KEY may precede the arm that REFUSES, when both could fire on
     # the same pane (your-org/nexus-code#1121). Case A sends no key since #1599,
     # so it goes FIRST: before B (the cascade's dismiss Enter), before D (Escape
-    # + paste), before W (a different record kind) and before C (Enter). Placed
+    # + paste) and before W (a different record kind). Placed
     # first, its error direction is OVER-REFUSAL only — it can never answer.
     #
-    # THIS USED TO SAY Case C is "disjoint from all menus, so its position in the
+    # THIS USED TO SAY Case C (the API-error Enter arm, retired since
+    # your-org/nexus-code#1670) is "disjoint from all menus, so its position in the
     # chain is incidental". That was FALSE (skeptic pass on #1626, finding 1):
     # the arms test PRESENCE in a 25-line capture, not exclusivity, so an
     # api-error chip anywhere above a LIVE `Do you want to proceed?` made C claim
@@ -969,11 +902,11 @@ _handle_unstick_window() {
     # sending no key that reason is gone, and the ordering it forced is now the
     # hazard. What remains is the over-refusal it costs, stated: A needs the
     # literal `Do you want to proceed?` AND a `❯ N.` row anywhere in the capture,
-    # so a live AskUQ / rate-limit menu / api-error wedge whose capture ALSO
+    # so a live AskUQ / rate-limit menu whose capture ALSO
     # carries that title — an AskUQ whose question is literally that sentence,
     # or a pane quoting a permission prompt within 25 rows — is refused and
-    # surfaced as a permission_prompt decision instead of being dismissed or
-    # nudged. On the orchestrator that means an AskUQ stays up until someone
+    # surfaced as a permission_prompt decision instead of being dismissed.
+    # On the orchestrator that means an AskUQ stays up until someone
     # answers; that is a liveness cost, never a key into a live prompt.
     #
     # Deliberately NOT narrowed with a live-ness gate of its own: a gate that
@@ -984,7 +917,7 @@ _handle_unstick_window() {
     # matched an agent whose tool call QUOTED them, and the watcher pressed
     # Enter into that pane and into the orchestrator's. A quoted menu falls
     # through to the cases below, exactly as a pane without the literals does.
-    # The rate-limit menu precedes D and C only by history; they are disjoint in
+    # The rate-limit menu precedes D only by history; they are disjoint in
     # what they send a key INTO only because A, above, has already taken every
     # pane that carries a permission prompt.
     case "$(printf '%s\n' "$pane" | _unstick_ratelimit_menu_verdict)" in
@@ -1028,18 +961,10 @@ _handle_unstick_window() {
         fi
         return 0
     fi
-    # Tight match: the rendered chip starts with `API Error: {"type":"error"`
-    # and the inner failure we currently auto-retry has the literal
-    # message "Internal server error". The two-grep AND keeps benign
-    # mentions of either substring (e.g. user prose, code generation)
-    # from triggering. -F (fixed string) avoids regex-meta concerns
-    # around the brace and quotes.
-    if grep -qF 'API Error: {"type":"error"' <<<"$pane" \
-       && grep -qF '"Internal server error"' <<<"$pane"; then
-        _act_api_error "$window" "$pane"
-        printf 'api-error'
-        return 0
-    fi
+    # No API-error arm: Case C was retired (your-org/nexus-code#1670) — see the
+    # Case C tombstone in the header. An API-error pane falls through here and
+    # gets NO key; the StopFailure marker -> `interrupted` -> orchestrator path
+    # owns its recovery.
     return 0
 }
 
@@ -1251,11 +1176,26 @@ _unstick_exact_target() {
 }
 
 # Cascade the unstick to a single non-orchestrator window: Enter to
-# dismiss the menu, then a follow-up paste prompting the agent to
-# continue. Returns 0 on success.
+# dismiss the menu, VERIFY the pane left the menu, then a follow-up paste
+# prompting the agent to continue. Returns 0 on success.
+#
+# Optional $2 names the RESET EVENT that expedited this cascade
+# (your-org/nexus-code#1739), e.g. `credential-change`; empty for the ordinary
+# epoch-elapsed path. It changes only the wording of the continuation brief.
+#
+# THREE REFUSALS, each a log line and NO paste (#1739 acceptance "a typed draft
+# → refused", plus the dismissal check the issue asks for):
+#   operator-draft     pane-state reports `input=typed` BEFORE the dismiss
+#                      Enter — no key at all (`?` is not believed here; see
+#                      the comment at the check).
+#   dismiss-unverified the menu is still LIVE after the Enter: the Enter did not
+#                      dismiss it, and a paste + Enter would land in the menu.
+#   operator-draft     typed text is in the box AFTER the dismissal (a draft the
+#                      menu was hiding) — the paste would append to it and the
+#                      primitive's Enter would submit both.
 _cascade_unstick_to_window() {
-    local window="$1"
-    local pane tgt verdict
+    local window="$1" reason="${2:-}"
+    local pane tgt verdict pv
     tgt=$(_unstick_exact_target "$window")
     # Re-read HERE, on the exact target: the detection that put this window on
     # the list is up to one pd_deliver per earlier window old (~9 s each).
@@ -1273,25 +1213,104 @@ _cascade_unstick_to_window() {
         unstick_log "window=$window case=B action=cascade-refused reason=${verdict:-unreadable} fp=$fp audit=$(basename "$audit") — NO Enter: it would select whatever is highlighted, or submit whatever is in the box (your-org/nexus-code#1598)"
         return 1
     fi
+    # BEFORE THE DISMISS: only `input=typed` is believed. `pd_pane_verdict`
+    # cannot answer here — it reads `state=` first and a live menu is
+    # `blocked` — and `input=?` is uninformative under a menu, which REPLACES
+    # the input row, so the row pane-state classifies is a menu line. Refusing
+    # on `?` here would refuse every live menu; it is refused AFTER the
+    # dismissal instead, where the real input row is back on screen.
+    if [[ "$(_unstick_pane_input "$window")" == typed ]]; then
+        unstick_log "window=$window case=B action=cascade-refused reason=operator-draft stage=before-dismiss input=typed fp=$fp — NO key: typed text is the operator's (your-org/nexus-code#1739)"
+        return 1
+    fi
     if ! tmux send-keys -t "$tgt" Enter 2>/dev/null; then
         unstick_log "window=$window case=B action=cascade-send-keys-failed fp=$fp"
         return 1
     fi
+    # VERIFY THE DISMISSAL (your-org/nexus-code#1739). The paste used to follow a
+    # bare 0.2 s sleep, so an Enter the menu did not act on was followed by a
+    # paste + Enter INTO the menu. Poll until the re-read pane no longer shows a
+    # LIVE menu (`quoted`/`none` — the menu text may stay in scrollback above the
+    # restored input row, which is exactly what `quoted` means). The bound is
+    # CHOSEN, not measured: 3 s covers a repaint on a loaded host many times
+    # over and costs nothing when the menu goes at once.
+    local verify_s="${UNSTICK_DISMISS_VERIFY_S:-3}" waited=0 after=""
+    [[ "$verify_s" =~ ^[0-9]+$ ]] || verify_s=3
     sleep 0.2
+    while :; do
+        after=$(tmux capture-pane -t "$tgt" -p -S -25 2>/dev/null) || after=""
+        if [[ -n "$after" ]]; then
+            case "$(printf '%s\n' "$after" | _unstick_ratelimit_menu_verdict)" in
+                stop-highlighted|other-highlighted) ;;
+                *) break ;;
+            esac
+        fi
+        if (( waited >= verify_s * 2 )); then
+            unstick_log "window=$window case=B action=cascade-refused reason=dismiss-unverified waited_s=$verify_s fp=$fp — the menu is still live (or the pane unreadable) after the dismiss Enter; NO paste (your-org/nexus-code#1739)"
+            return 1
+        fi
+        sleep 0.5; waited=$(( waited + 1 ))
+    done
+    if declare -F pd_pane_verdict >/dev/null 2>&1; then
+        pv=$(pd_pane_verdict "$window" before-paste)
+        case "$pv" in
+            held|draft)
+                unstick_log "window=$window case=B action=cascade-refused reason=operator-draft stage=after-dismiss verdict=$pv fp=$fp — menu dismissed, but typed text is in the box; NO paste (your-org/nexus-code#1739)"
+                return 1 ;;
+            blocked)
+                unstick_log "window=$window case=B action=cascade-refused reason=dismiss-unverified stage=pane-state verdict=blocked fp=$fp — pane-state still reads blocked; NO paste (your-org/nexus-code#1739)"
+                return 1 ;;
+        esac
+    fi
     # Stamp BEFORE the paste (stamp-before-paste ordering — a paste
     # must never outrun its stamp, else the worker's UserPromptSubmit
     # races ahead of the ledger row and reads as an operator submit).
     # This is a watcher-initiated worker wake → machine attribution is
     # correct by construction (#293, gap row 7).
     _unstick_stamp_machine_input "$window" "unstick-ratelimit"
-    if ! _paste_line_to_window "$window" "Please continue with your task. The API rate limit has reset."; then
+    local brief
+    brief=$(_unstick_resume_brief "$reason")
+    if ! _paste_line_to_window "$window" "$brief"; then
         unstick_log "window=$window case=B action=cascade-paste-failed fp=$fp"
         return 1
     fi
     printf '%s' "$fp" > "$UNSTICK_DIR/${window}.ratelimit.fp"
     printf '%d' "1" > "$UNSTICK_DIR/${window}.ratelimit.tries"
-    unstick_log "window=$window case=B action=cascade-resumed fp=$fp audit=$(basename "$audit")"
+    unstick_log "window=$window case=B action=cascade-resumed fp=$fp${reason:+ trigger=$reason} audit=$(basename "$audit")"
     return 0
+}
+
+# The `input=` field pane-state reports for <window>, or `unknown`. Same reader
+# rule as `pd_pane_verdict`: when `tmux` is a shell FUNCTION (a rig aimed at a
+# private server) an external pane-state would read the LIVE board, so only an
+# explicitly named PD_PANE_STATE_BIN is consulted then.
+_unstick_pane_input() {
+    local window="$1" bin="${PD_PANE_STATE_BIN:-}" line
+    if [[ -z "$bin" ]]; then
+        declare -F tmux >/dev/null 2>&1 && { printf 'unknown'; return 0; }
+        bin="${NEXUS_ROOT:-}/monitor/pane-state.sh"
+        [[ -x "$bin" ]] || bin="${BASH_SOURCE[0]%/*}/../pane-state.sh"
+    fi
+    [[ -x "$bin" ]] || { printf 'unknown'; return 0; }
+    line=$("$bin" "$window" 2>/dev/null) || line=""
+    if [[ " $line " =~ [[:space:]]input=([^[:space:]]+)[[:space:]] ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        printf 'unknown'
+    fi
+}
+
+# The continuation brief pasted after a dismissed rate-limit menu. ONE line (the
+# paste primitive submits one line). The re-check clause is the operator's ask on
+# #1739: a worker stranded at the menu may have had Slurm jobs and watches finish
+# unobserved, so "continue" alone resumes it on stale beliefs.
+_unstick_resume_brief() {
+    local reason="${1:-}"
+    if [[ -n "$reason" ]]; then
+        printf 'Please continue with your task. The API rate limit has reset (watcher saw a reset event: %s, e.g. a re-login or account switch). Re-check any jobs, watches and messages that may have finished while you were stopped, then continue.' "$reason"
+    else
+        printf 'Please continue with your task. The API rate limit has reset. Re-check any jobs, watches and messages that may have finished while you were stopped, then continue.'
+    fi
 }
 
 # Send the orchestrator a heads-up about the cascade we just performed.
@@ -1339,7 +1358,7 @@ _cascade_heads_up_orchestrator() {
             return 2 ;;
     esac
     if declare -F pd_pane_verdict >/dev/null 2>&1; then
-        case "$(pd_pane_verdict "$target")" in
+        case "$(pd_pane_verdict "$target" before-paste)" in   # a mid-turn draft too (#1683 F1)
             held|draft)
                 [[ -n "${_UNSTICK_HEADSUP_QUIET:-}" ]] \
                     || unstick_log "case=B action=heads-up-deferred target=$target reason=operator-draft n=$n — typed text is already in the input box; no key, no paste"
@@ -1378,13 +1397,23 @@ _act_ratelimit() {
     # If a previous cascade is still awaiting ack, don't double-fire.
     # _check_orchestrator_ack runs at the top of each detect_and_unstick
     # cycle and clears the marker.
-    if [[ -f "$cascade_file" ]]; then
+    # …UNLESS a reset event (#1739) was consumed this cycle: every window on
+    # this list is at the menu NOW, after the event, so it is owed a nudge
+    # whatever an earlier cascade is still waiting for. The per-window re-read
+    # in `_cascade_unstick_to_window` keeps that from double-acting on a pane.
+    local event="${_UNSTICK_RESET_EVENT:-}"
+    if [[ -f "$cascade_file" && -z "$event" ]]; then
         return 0
     fi
 
     # Determine reset epoch (cached or freshly probed).
     local reset_epoch=""
     [[ -f "$reset_file" ]] && reset_epoch=$(<"$reset_file")
+    if [[ -n "$event" ]]; then
+        unstick_log "case=B action=reset-epoch-expedited source=$event stored=${reset_epoch:-<none>} using=now count=${#windows[@]}"
+        reset_epoch="$now"
+        printf '%s\n' "$reset_epoch" > "$reset_file"
+    fi
     if [[ -z "$reset_epoch" ]]; then
         local probed
         probed=$(_probe_ratelimit_reset)
@@ -1448,7 +1477,7 @@ _act_ratelimit() {
         # The orchestrator gets the heads-up, not the per-agent
         # "please continue" follow-up.
         [[ "$w" == "$target" ]] && continue
-        if _cascade_unstick_to_window "$w"; then
+        if _cascade_unstick_to_window "$w" "$event"; then
             n=$(( n + 1 ))
         fi
     done
@@ -1517,6 +1546,149 @@ _retry_pending_heads_up() {
     return 0
 }
 
+# ---- RESET EVENTS: a re-login lifts the limit before the epoch (#1739) ----
+#
+# Case B waits for a reset EPOCH (probed, else heuristic and clamped to
+# RATELIMIT_HEURISTIC_MIN). Nothing invalidated that epoch when the limit was
+# lifted some OTHER way. Measured 2026-10-04 (operator nexus, watcher-unstick.log):
+# `proj-b7pot`/`proj-subreg` detected 21:37:23/21:37:35, cascade scheduled for
+# 22:07:25 (heuristic 30 min); the operator switched account at ~21:45 and the
+# orchestrator recovered through the over-limit path at 21:48:06, while both
+# workers stayed at the menu until a human pressed Escape. (Bounded by the 30-min
+# clamp, not "until Oct 7" — but every one of those minutes was a worker idle
+# with its Slurm jobs finishing unobserved, and a stamped 21,835 s over-limit wake
+# had no clamp at all.)
+#
+# A RESET EVENT runs the case-B cascade on the very cycle the event is consumed.
+# A `credential-change` event ALSO releases every over-limit row (its stamp is
+# moved aside and the row fails open at once if the pane still reads over-limit;
+# see `_over_limit_expedite_all`). Other sources leave over-limit rows alone. Two
+# sensors, and only two — each chosen for what its FALSE POSITIVE costs. A false
+# event pastes a continuation into a still-limited worker, which re-hits the
+# menu and starts a new episode: noise, never a lost worker. A MISSED event
+# costs the old behaviour, the epoch path, which still runs.
+#
+#   credential-change  the logged-in IDENTITY changed: account uuid +
+#                      organization uuid (`oauthAccount` in Claude Code's global
+#                      config), counted only while the credential store shows a
+#                      LOGIN — its `claudeAiOauth` object holds an `accessToken`
+#                      KEY (jq `has()`: key presence, never the value). No token,
+#                      refresh token or expiry is read out, compared or stored;
+#                      the stored baseline is a sha1 of the uuids. expiresAt is
+#                      deliberately not used: it moves on every routine refresh,
+#                      and a re-login to the SAME account lifts no limit anyway.
+#                      The store's subscriptionType/rateLimitTier are NOT in the
+#                      tuple (#1741 S1 follow-up): they are optional on some login
+#                      shapes, and requiring them would read "unknown" forever on
+#                      such an account — a dead sensor that never says so.
+#                      If EITHER file is unreadable, absent or torn, the account
+#                      has no accountUuid, or the store shows no login, the
+#                      signature is EMPTY, which is never a change in either
+#                      direction (`could not look` is not `changed`; a
+#                      half-tuple must not be compared, #1741 S1). Gated on the
+#                      two files' mtime+size, so the (multi-MB) config file is
+#                      parsed only when it was written.
+#   over-limit-resumed a pane stamped over-limit was observed BUSY again — a
+#                      fresh turn is running, so this account has quota.
+#                      `_over_limit.sh` raises it through
+#                      `_unstick_reset_event_signal`. `idle` resumptions are NOT
+#                      a signal: a pane can stop reading over-limit by scrolling.
+#
+# REJECTED as a sensor, stated so nobody adds it back as the obvious one: the
+# auth-hold `RELEASED` line. Its `kind=dialog` covers EVERY select dialog
+# including this very rate-limit menu, so it fires whenever anyone presses Escape.
+#
+# THE EVENT IS A FILE (`ratelimit.reset-event`, `<epoch>\t<source>`) so a
+# producer in another watcher task (over-limit wakes) and the consumer here
+# (detect_unstick, 10 s cadence) need not share a process. Consumed once.
+
+_unstick_cred_paths() {
+    local cfg="${CLAUDE_CONFIG_DIR:-}"
+    if [[ -n "$cfg" ]]; then
+        printf '%s\n%s\n' "${UNSTICK_CRED_ACCOUNT_FILE:-$cfg/.claude.json}" \
+            "${UNSTICK_CRED_STORE_FILE:-$cfg/.credentials.json}"
+    else
+        printf '%s\n%s\n' "${UNSTICK_CRED_ACCOUNT_FILE:-${HOME:-}/.claude.json}" \
+            "${UNSTICK_CRED_STORE_FILE:-${HOME:-}/.claude/.credentials.json}"
+    fi
+}
+
+# Identity signature on stdout (sha1 of the identity tuple), EMPTY when neither
+# file yields an identity. Never prints a field value.
+_unstick_cred_signature() {
+    local acct store a="" c=""
+    { IFS= read -r acct; IFS= read -r store; } < <(_unstick_cred_paths)
+    command -v jq >/dev/null 2>&1 || return 0
+    if [[ -r "$acct" ]]; then
+        a=$(jq -r '[(.oauthAccount.accountUuid // ""), (.oauthAccount.organizationUuid // "")] | join("|")' "$acct" 2>/dev/null) || a=""
+    fi
+    if [[ -r "$store" ]]; then
+        c=$(jq -r 'if ((.claudeAiOauth | type) == "object") and (.claudeAiOauth | has("accessToken")) then "login" else "" end' "$store" 2>/dev/null) || c=""
+    fi
+    # BOTH HALVES OR NOTHING (skeptic S1 on #1741). This used to return empty
+    # only when BOTH were empty, so a ONE-SIDED read produced a signature over
+    # half the tuple — a different value from the baseline — and raised a
+    # credential-change for an identity that never changed. Measured by the
+    # skeptic: 5 false events across logout + same-account login, a chmod 000
+    # store, and a torn (mid-write) config. A half we could not read is
+    # "could not look", which is never "changed": the account half needs its
+    # accountUuid, the store half must show a login, and jq must have parsed
+    # (a torn file is rc != 0, collapsed to empty above). Only the ACCOUNT half
+    # enters the hash; the store half is a gate.
+    [[ -n "${a%%|*}" && "$c" == login ]] || return 0
+    printf '%s' "$a" | sha1sum | cut -c1-16
+    return 0
+}
+
+# Raise a reset event. Callable from any watcher module; first writer wins
+# until consumed (a second source in the same cycle adds nothing).
+_unstick_reset_event_signal() {
+    local source="${1:-unknown}" f
+    [[ -n "${UNSTICK_DIR:-}" ]] || return 0
+    f="$UNSTICK_DIR/ratelimit.reset-event"
+    [[ -f "$f" ]] && return 0
+    mkdir -p "$UNSTICK_DIR" 2>/dev/null || true
+    printf '%s\t%s\n' "$(date +%s)" "${source//[$'\t\n']/_}" > "$f"
+}
+
+# The credential sensor: compare the identity signature with the stored
+# baseline; raise `credential-change` when a known baseline is replaced by a
+# DIFFERENT known one. The first sighting only records the baseline.
+_unstick_cred_observe() {
+    [[ "${UNSTICK_CRED_SENSOR:-true}" == true ]] || return 0
+    local acct store gate_now gate_was="" sig old=""
+    { IFS= read -r acct; IFS= read -r store; } < <(_unstick_cred_paths)
+    gate_now="$(stat -c '%Y.%s' "$acct" 2>/dev/null)/$(stat -c '%Y.%s' "$store" 2>/dev/null)"
+    local gate_f="$UNSTICK_DIR/credential.gate" sig_f="$UNSTICK_DIR/credential.sig"
+    [[ -f "$gate_f" ]] && gate_was=$(<"$gate_f")
+    [[ "$gate_now" == "$gate_was" && -f "$sig_f" ]] && return 0
+    sig=$(_unstick_cred_signature)
+    printf '%s' "$gate_now" > "$gate_f"
+    [[ -n "$sig" ]] || return 0
+    [[ -f "$sig_f" ]] && old=$(<"$sig_f")
+    printf '%s' "$sig" > "$sig_f"
+    if [[ -n "$old" && "$old" != "$sig" ]]; then
+        unstick_log "case=B action=credential-change old_sig=$old new_sig=$sig — logged-in identity changed (re-login / account switch); raising a reset event (your-org/nexus-code#1739)"
+        _unstick_reset_event_signal credential-change
+    fi
+}
+
+# Consume a pending reset event: prints its source and expedites every
+# over-limit wake stamp. rc 1 when there is none.
+_unstick_reset_event_take() {
+    local f="$UNSTICK_DIR/ratelimit.reset-event" ep="" src=""
+    [[ -f "$f" ]] || return 1
+    IFS=$'\t' read -r ep src < "$f" || true
+    rm -f "$f"
+    src="${src:-unknown}"
+    local n=""
+    if declare -F _over_limit_expedite_all >/dev/null 2>&1; then
+        n=$(_over_limit_expedite_all "$src")
+    fi
+    unstick_log "case=B action=reset-event source=$src raised_epoch=${ep:-?} over_limit_expedited=${n:-n/a} — rate-limit menus are cascaded on this cycle (your-org/nexus-code#1739)"
+    printf '%s' "$src"
+}
+
 # A reset epoch that has ELAPSED while nobody is stuck belongs to a finished
 # episode. Left on disk it makes the NEXT episode cascade in the same second it
 # is detected — "the limit has reset" pasted into a pane that has just hit it
@@ -1577,6 +1749,9 @@ detect_and_unstick() {
     command -v tmux >/dev/null 2>&1 || return 0
     _check_orchestrator_ack
     _retry_pending_heads_up
+    _unstick_cred_observe
+    local _UNSTICK_RESET_EVENT=""
+    _UNSTICK_RESET_EVENT=$(_unstick_reset_event_take) || _UNSTICK_RESET_EVENT=""
     local windows
     windows=$(tmux list-windows -F '#{window_name}' 2>/dev/null) || return 0
     local -a ratelimit_windows=()

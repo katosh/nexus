@@ -218,6 +218,7 @@ cp "$_test_dir/../guard-block.sh.in" "$FAKE_NEXUS/monitor/guard-block.sh.in"
 cp "$_test_dir/../request-channel.sh" "$FAKE_NEXUS/monitor/request-channel.sh"
 chmod +x "$FAKE_NEXUS/monitor/request-channel.sh"
 cp "$_test_dir/../_channel_lib.sh" "$FAKE_NEXUS/monitor/_channel_lib.sh"
+cp "$_test_dir/../_requests_dir.sh" "$FAKE_NEXUS/monitor/_requests_dir.sh"
 mkdir -p "$FAKE_NEXUS/node_modules/.bin"
 cat > "$FAKE_NEXUS/node_modules/.bin/claude" <<'CLAUDE_STUB'
 #!/bin/bash

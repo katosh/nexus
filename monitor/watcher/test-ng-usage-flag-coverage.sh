@@ -221,8 +221,19 @@ _drifts() {   # <ng-file> <drift-out> <checked-out> <skipped-out>
 # is its own header — so the property "every parsed flag is in the help it
 # prints" is exactly the one worth keeping true for a tool workers are told
 # to reach for from the floor.
+# `codex-run.sh` (your-org/nexus-code#1640), reachable as `ng codex`, is
+# enrolled on the same footing: its --help is its own header.
+# `degraded-probe.sh` (your-org/nexus-code#1724), reachable as `ng degraded
+# probe`, is enrolled at birth on the same footing: its --help is its header.
+# `degraded-status.sh` (your-org/nexus-code#1724, `ng degraded status`) and
+# `doctor.sh` (your-org/nexus-code#1722, `ng doctor`) are enrolled at birth on
+# the same footing: each prints its own usage, naming the one flag it parses.
 _WALKED_FACADES='send.sh
-longjob-watch.sh'
+longjob-watch.sh
+codex-run.sh
+degraded-probe.sh
+degraded-status.sh
+doctor.sh'
 
 _delegated_scripts() {
     {   grep -oE '"\$_script_dir/[a-z-]+\.sh"' "$NG_SRC" | sed 's|.*/||; s|"||'

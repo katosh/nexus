@@ -82,6 +82,29 @@
 # Run them all. None alone is a census.
 #
 # ---------------------------------------------------------------------------
+# THE SOURCE ARM'S PRECONDITION (your-org/nexus-code#1431, #1707)
+# ---------------------------------------------------------------------------
+#
+# `probe` also diffs the SOURCE checkout's monitor/.state and reports/, for
+# suites that re-root past the decoy. Until #1707 that diff saw NEW PATHS
+# only, so its verdict carried an unstated precondition: it was sound only
+# from a CLEAN monitor/.state. An append to a file that already existed read
+# hermetic, and in a `band` only the suite that first created a shared file
+# was blamed while every later appender passed.
+#
+# That precondition is REMOVED. Every pre-existing path's size, mtime and
+# inode is snapshotted around each suite, and a file that grew, shrank, was
+# rewritten, replaced or removed gates exactly like a new one — attributed to
+# the suite that ran between the two snapshots, so a serial band blames every
+# appender, not just the creator. What remains is a WEAKER precondition, and
+# it is detected rather than assumed: NOTHING ELSE writes the source root
+# while the probe runs. A configured nexus (config/nexus.yml present — the
+# operator's primary) fails it by construction, so there a modified file is
+# printed UNATTRIBUTED and does not gate; NEW paths gate either way. CI
+# checkouts, worktrees and fresh clones satisfy it. `_src_snapshot` states the
+# residue a stat triple cannot see.
+#
+# ---------------------------------------------------------------------------
 # THE POPULATION QUESTION IS ANSWERED BY RUNNING, NOT BY READING (#1336)
 # ---------------------------------------------------------------------------
 #
@@ -121,7 +144,8 @@
 #
 # Usage:
 #   monitor/nexus-root-sensitivity.sh probe <suite.sh>...
-#   monitor/nexus-root-sensitivity.sh band [--timeout N] [suite.sh...]
+#   monitor/nexus-root-sensitivity.sh band [--timeout N] [--shard K/N] [suite.sh...]
+#   monitor/nexus-root-sensitivity.sh select [--shard K/N]
 #   monitor/nexus-root-sensitivity.sh attribute <root>
 #   monitor/nexus-root-sensitivity.sh audit [--log PATH] [--no-verify]
 #   monitor/nexus-root-sensitivity.sh spellings [suite.sh...]
@@ -142,6 +166,7 @@ TIMEOUT_SECS=${NRS_TIMEOUT:-420}
 MAX_LEAK_LINES=${NRS_MAX_LEAK_LINES:-25}
 KEEP_DECOY=0
 VERIFY=1
+SHARD=""
 AUDIT_LOG=""
 
 die() { printf '%s: %s\n' "$PROG" "$*" >&2; exit 2; }
@@ -286,16 +311,82 @@ snapshot() {
     return 0
 }
 
-# _src_paths <root> — every path (file, dir, link) under <root>/monitor/.state
-# and <root>/reports, root-relative, sorted. Paths only: the #1431 arm counts
-# NEW entries, so content digests are irrelevant and on a live primary would
-# only add the watcher's own churn.
-_src_paths() {
+# _src_snapshot <root> — one TSV row per path under <root>/monitor/.state and
+# <root>/reports: `path  type  size  mtime  inode`, byte-sorted by path.
+# Directories carry `-` for the three stat fields: a directory's mtime moves
+# whenever an entry is added or removed, which the path set already reports,
+# so counting it again would only double-count the same write.
+#
+# STAT, NOT A CONTENT HASH, AND THAT IS A MEASURED CHOICE (your-org/nexus-code#1707).
+# The arm's job is "did this suite write into a file that was already there",
+# and every write(2) moves the file's mtime: measured 2026-10-01, a same-size
+# rewrite one process launch after the first write moved %T@ by 0.39 s on
+# tmpfs and by 0.015 s on this host's NFS, which reports microseconds. Size
+# catches an append whatever the clock does; inode catches a tmp+mv
+# replacement. Hashing every pre-existing file would cost O(state size) per
+# probe to detect only the residue the triple misses: a SAME-SIZE rewrite on
+# the SAME inode whose mtime was explicitly restored (utime/`touch -d`), or one
+# landing inside the filesystem's timestamp tick of the BEFORE snapshot. That
+# residue is a stated boundary, not a gap nobody looked at.
+_src_snapshot() {
     local root="$1" d
     for d in monitor/.state reports; do
         [ -d "$root/$d" ] || continue
-        find "$root/$d" -mindepth 1 -printf "$d/%P\n" 2>/dev/null
-    done | sort -u
+        find "$root/$d" -mindepth 1 -printf "$d/%P\t%y\t%s\t%T@\t%i\n" 2>/dev/null
+    done | awk -F'\t' 'BEGIN{OFS="\t"} $2=="d"{$3="-";$4="-";$5="-"} {print}' \
+         | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -u
+}
+
+# _src_changes <before> <after> — every way the source tree moved, one line
+# each: `NEW <path>`, `REMOVED <path>`, `GREW +<n>B <path>`,
+# `SHRANK -<n>B <path>`, `REPLACED <path>` (new inode), `REWRITTEN <path>`
+# (same size, same inode, mtime moved), `RETYPED <path>`.
+#
+# The #1431 arm counted NEW paths only (`comm -13` over the path set), so an
+# APPEND to a file that already existed read HERMETIC (#1707): in one band the
+# suite that first CREATED monitor/.state/longjob/arming.log was blamed and
+# every later suite appending rows to it passed, and a single probe was sound
+# only from a clean monitor/.state. Each probe diffs ITS OWN before/after pair,
+# so in a serial band every change is attributed to the suite that ran
+# between the two snapshots, appenders included.
+_src_changes() {
+    # FILENAME, not the `NR == FNR` idiom: with an EMPTY before-file (a clean
+    # monitor/.state) NR == FNR stays true through the AFTER file, and every
+    # new path was read as a before-row and printed REMOVED — which a quiet
+    # root gates anyway, and a contended one demoted to UNATTRIBUTED.
+    awk -F'\t' '
+        FILENAME == ARGV[1] { b[$1] = $0; next }
+        {
+            if (!($1 in b)) { print "NEW " $1; next }
+            split(b[$1], o, "\t"); delete b[$1]
+            if (o[2] != $2)      print "RETYPED " $1
+            else if ($2 == "d")  next
+            else if (o[3] != $3) printf "%s %s%dB %s\n", ($3 > o[3] ? "GREW" : "SHRANK"), ($3 > o[3] ? "+" : "-"), ($3 > o[3] ? $3 - o[3] : o[3] - $3), $1
+            else if (o[5] != $5) print "REPLACED " $1
+            else if (o[4] != $4) print "REWRITTEN " $1
+        }
+        END { for (p in b) print "REMOVED " p }
+    ' "$1" "$2" | LC_ALL=C sort -k2
+}
+
+# _src_contended <root> — is something OTHER than this probe writing into
+# <root>'s state while it runs? Only then is a change there unattributable.
+#
+# The discriminator is STRUCTURAL: `config/nexus.yml` is gitignored, so a CI
+# checkout, a worktree and a fresh clone never have one, and a configured
+# nexus — the operator's primary, where the watcher and every agent's `ng`
+# append to monitor/.state continuously — always does. Its error direction,
+# stated: a configured nexus whose watcher is down and whose agents are idle
+# is called contended anyway, which DEMOTES its modification evidence to
+# unattributed (never to hermetic, and never hides a NEW path); a tree written
+# by something this file cannot see while lacking nexus.yml is called quiet,
+# and then that writer's churn is blamed on the suite — the loud direction.
+# NRS_SOURCE_CONTENDED=0|1 overrides it, which is how the tests reach both arms.
+_src_contended() {
+    case "${NRS_SOURCE_CONTENDED:-}" in
+        1) return 0 ;; 0) return 1 ;;
+    esac
+    [ -e "$1/config/nexus.yml" ]
 }
 
 # ---------------------------------------------------------------------------
@@ -373,13 +464,22 @@ probe_one() {
     # writing `monitor/.state/.trash/…` into the checkout through `_trash.sh`'s
     # BASH_SOURCE-rooted default (#1451); that suite carries the per-suite
     # `allow-source-leak` marker naming #1451 until it lands, and everyone
-    # else stays gated. Only NEW paths count: on an operator's
-    # primary the watcher appends to existing files continuously, and a
-    # size change there would be its noise, not this suite's write.
+    # else stays gated.
+    #
+    # A MODIFIED pre-existing file is a write too (your-org/nexus-code#1707).
+    # The arm used to count NEW paths only, on the argument that an operator's
+    # primary appends to existing files continuously. That made an APPEND
+    # invisible everywhere, not just on the primary: a probe was sound only
+    # from a clean monitor/.state, and in a band only the suite that first
+    # created a shared file was blamed. So every pre-existing file's
+    # size/mtime/inode is snapshotted too and any change gates — EXCEPT in a
+    # CONTENDED root (`_src_contended`: a configured nexus other writers share),
+    # where a modification cannot be attributed to this suite and is printed
+    # as UNATTRIBUTED instead of gating. NEW paths gate in both.
     # NRS_SOURCE_ROOT exists so this arm is testable against a planted root.
     local src_root="${NRS_SOURCE_ROOT:-$REPO_ROOT}"
     local src_before="$work/src-before.txt" src_after="$work/src-after.txt"
-    _src_paths "$src_root" > "$src_before" 2>/dev/null
+    _src_snapshot "$src_root" > "$src_before" 2>/dev/null
 
     # Tripwire: no record referencing THIS DECOY may appear in the REAL state
     # directory. Contaminating the operator's canonical state is exactly the
@@ -452,12 +552,21 @@ probe_one() {
     leaked_n=${leaked_n%%[!0-9]*}
     : "${leaked_n:=0}"
 
-    # #1431: NEW paths under the SOURCE root's monitor/.state and reports/.
-    _src_paths "$src_root" > "$src_after" 2>/dev/null
-    local srcleak="$work/src-leak.txt"
-    comm -13 "$src_before" "$src_after" > "$srcleak" 2>/dev/null
-    local srcleak_n
+    # #1431 + #1707: every change under the SOURCE root's monitor/.state and
+    # reports/ — new paths AND modified, replaced or removed pre-existing ones.
+    _src_snapshot "$src_root" > "$src_after" 2>/dev/null
+    local srcchg="$work/src-changes.txt" srcleak="$work/src-leak.txt" srcunattr="$work/src-unattr.txt"
+    _src_changes "$src_before" "$src_after" > "$srcchg" 2>/dev/null
+    if _src_contended "$src_root"; then
+        grep -E '^NEW ' "$srcchg" > "$srcleak"
+        grep -vE '^NEW ' "$srcchg" > "$srcunattr"
+    else
+        cp "$srcchg" "$srcleak"
+        : > "$srcunattr"
+    fi
+    local srcleak_n srcunattr_n
     srcleak_n=$(grep -c . "$srcleak"; true); srcleak_n=${srcleak_n%%[!0-9]*}; : "${srcleak_n:=0}"
+    srcunattr_n=$(grep -c . "$srcunattr"; true); srcunattr_n=${srcunattr_n%%[!0-9]*}; : "${srcunattr_n:=0}"
 
     tally=$(grep -oE '=== summary: [0-9]+ passed, [0-9]+ failed ===' "$out" | tail -1)
     [ -n "$tally" ] || tally=$(grep -oE '[0-9]+ passed, [0-9]+ failed' "$out" | tail -1)
@@ -541,13 +650,20 @@ probe_one() {
                "$verdict" "$rc" "$tally" "$la_before" "$leaked_n"
         if [ "$verdict" = LEAK-AT-SOURCE ] || [ "$verdict" = ALLOWED-AT-SOURCE ]; then
             printf '    *** WROTE INTO THE SOURCE CHECKOUT, not the decoy (#1431) — a BASH_SOURCE re-root walks past NEXUS_ROOT: pin NEXUS_STATE_DIR in the suite.\n' >&3
-            printf '    new paths under %s (first %s):\n' "$src_root" "$MAX_LEAK_LINES" >&3
+            printf '    changes under %s (first %s):\n' "$src_root" "$MAX_LEAK_LINES" >&3
             head -n "$MAX_LEAK_LINES" "$srcleak" | sed 's/^/      > /' >&3
             if [ "$verdict" = ALLOWED-AT-SOURCE ]; then
                 printf '    ALLOWED-AT-SOURCE by an explicit marker — reason: %s\n' "$marker_reason" >&3
             elif [ -n "$marker_reason" ]; then
                 printf '    marker REJECTED — %s\n' "$marker_reason" >&3
             fi
+        fi
+        if [ "$srcunattr_n" -gt 0 ]; then
+            # Printed whatever the verdict: a demotion is not an absence.
+            printf '    UNATTRIBUTED — %s pre-existing path(s) under %s changed during this probe, but the root is CONTENDED\n' "$srcunattr_n" "$src_root"
+            printf '    (a configured nexus other writers share; #1707), so they are NOT counted against this suite. First %s:\n' "$MAX_LEAK_LINES"
+            head -n "$MAX_LEAK_LINES" "$srcunattr" | sed 's/^/      ? /'
+            printf '    Probe from a worktree or a fresh clone to make these attributable.\n'
         fi
         if [ "$verdict" = LEAK ] || [ "$verdict" = ALLOWED ] \
            || { [ "$leaked_n" -gt 0 ] && [[ "$verdict" = *-AT-SOURCE ]]; }; then   # both roots: print both lists
@@ -660,6 +776,33 @@ fixture_suites() {
             printf '%s\n' "$f"; continue
         fi
     done
+}
+
+
+# shard_select K/N — the K-th of N disjoint slices of the population on stdin
+# (your-org/nexus-code#1703). The serial band outgrew one CI job: 124 suites
+# fitted in ~17 min at bbf8fa86, 146 at 3d022b09 were cancelled at the 30-min
+# ceiling with no output. So CI runs it as a matrix, one slice per cell.
+#
+# The slice is taken over a BYTE-sorted list, so every cell computes the same
+# order whatever its locale, and member i goes to slice (i mod N)+1. The
+# slices are therefore disjoint and their union is the whole population —
+# test-nrs-population.sh asserts exactly that through `select`, because a
+# matrix that silently drops a slice is a gate that does not look.
+# The spec is validated in main(), where `die` ends the script: in here it
+# would run in a pipeline subshell and end only that.
+shard_valid() {
+    [[ "$1" =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]] && (( BASH_REMATCH[1] <= BASH_REMATCH[2] ))
+}
+shard_select() {
+    LC_ALL=C sort | awk -v k="${1%/*}" -v n="${1#*/}" '(NR - 1) % n == k - 1'
+}
+
+# The population `band` walks by default, sliced when --shard was given.
+selected_suites() {
+    if [ -n "$SHARD" ]; then fixture_suites | shard_select "$SHARD"
+    else fixture_suites
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -962,7 +1105,7 @@ cmd_audit() {
 run_probes() {
     local -a suites=("$@")
     local rec verdict n_leak=0 n_herm=0 n_skip=0 n_to=0 n_vac=0 n_allow=0 n_unmeasured=0 n_srcleak=0 n_allowsrc=0
-    local n_envskip=0 n_unknownverdict=0
+    local n_envskip=0 n_unknownverdict=0 n_done=0
     local human; human=$(mktemp "${TMPDIR:-/tmp}/nrs-human-XXXXXX")
     local recs;  recs=$(mktemp "${TMPDIR:-/tmp}/nrs-recs-XXXXXX")
 
@@ -986,8 +1129,16 @@ run_probes() {
             continue
         }
         exec 3>>"$human"
+        local t0=$SECONDS
         rec=$(probe_one "$s")
         exec 3>&-
+        n_done=$((n_done+1))
+        # PROGRESS, on stderr and NOW (#1703). The human-readable section is
+        # buffered and printed after the loop, so a band killed at its job
+        # ceiling used to leave nothing at all — run 36799007596 printed no
+        # line in 30 minutes. One line per suite says where the time went.
+        printf '[%d/%d] %4ds %s %s\n' "$n_done" "${#suites[@]}" "$(( SECONDS - t0 ))" \
+            "$(printf '%s' "$rec" | cut -f2)" "${s#"$REPO_ROOT"/}" >&2
         if [ -e "$NRS_ABORT_SENTINEL" ]; then
             cat "$human"
             say ""
@@ -1217,7 +1368,7 @@ cmd_self_test() {
 
 # ---------------------------------------------------------------------------
 main() {
-    [ "$#" -ge 1 ] || die "usage: $PROG {probe|band|attribute|audit|spellings|self-test} [...]"
+    [ "$#" -ge 1 ] || die "usage: $PROG {probe|band|select|attribute|audit|spellings|self-test} [...]"
     local sub="$1"; shift
     local -a rest=()
     while [ "$#" -gt 0 ]; do
@@ -1226,21 +1377,32 @@ main() {
             --log)     AUDIT_LOG="$2"; shift 2 ;;
             --no-verify) VERIFY=0; shift ;;
             --keep-decoy) KEEP_DECOY=1; shift ;;
+            --shard)   SHARD="$2"; shift 2 ;;
             --) shift; rest+=("$@"); break ;;
             *) rest+=("$1"); shift ;;
         esac
     done
+    if [ -n "$SHARD" ]; then
+        shard_valid "$SHARD" || die "--shard wants K/N with 1 <= K <= N, got '$SHARD'"
+    fi
     case "$sub" in
         probe)
             [ "${#rest[@]}" -gt 0 ] || die "probe needs at least one suite path"
             run_probes "${rest[@]}" ;;
         band)
-            if [ "${#rest[@]}" -gt 0 ]; then run_probes "${rest[@]}"
+            if [ "${#rest[@]}" -gt 0 ]; then
+                [ -z "$SHARD" ] || die "--shard slices the default population; it does not combine with explicit suites"
+                run_probes "${rest[@]}"
             else
-                local -a all; mapfile -t all < <(fixture_suites)
-                [ "${#all[@]}" -gt 0 ] || die "no fixture-building suites discovered"
+                local -a all; mapfile -t all < <(selected_suites)
+                [ "${#all[@]}" -gt 0 ] || die "no fixture-building suites discovered${SHARD:+ in shard $SHARD}"
                 run_probes "${all[@]}"
             fi ;;
+        # The population `band` would walk, one path per line — the seam the
+        # partition assertion in test-nrs-population.sh reads (#1703).
+        select)
+            [ "${#rest[@]}" -eq 0 ] || die "select takes no suite arguments"
+            selected_suites ;;
         audit)      cmd_audit ;;
         attribute)  cmd_attribute "${rest[@]}" ;;
         spellings)  cmd_spellings "${rest[@]}" ;;

@@ -89,3 +89,5 @@
 #
 test-run-tests-bounded.sh	1200	613.23	ceiling set INSIDE the suite's own runtime distribution (n=8, 524.85-613.23, two over 600); 1200 is ~2x the MAX observed, not 2x a single sample (#992 reopen 2026-08-31)
 test-guards-for-diff.sh	3600	1668.60	a ~25-28 min suite (n=2 completed walls 1487.58 / 1668.60 across two quiet boxes, plus 4 censored >900); 3600 is >= 2x the MAX observed, not 2x one sample (#1474 local form; the primitive's cost is the real lever, see the family note above)
+test-operator-alert.sh	1320	601.22	n=3 walls 414 (isolated, load ~56) / 507.72 (band, load ~55) / >601.22 CENSORED (TIMEOUT-killed in a --jobs 6 band, load ~70, 170 of 198 assertions passed, 0 failed, NOT a hang); 1320 is >= 2x the censored MAX. It is ~4x its dev form (108 s) because section 25 replays whole days in 30-60 s ticks and every tick forks _operator_alert due/raise; the lever is a fork-free due, not this row (your-org/nexus-code#1653)
+test-operator-alert-property.sh	900	421.44	n=2 completed walls 381.10 / 421.44 in --jobs 4 and --jobs 6 bands at load ~55-70 (24 seeds + 7 fixed schedules at PROP_JOBS=8); 900 is >= 2x the MAX observed (your-org/nexus-code#1653)

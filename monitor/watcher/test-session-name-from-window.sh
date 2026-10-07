@@ -123,10 +123,13 @@ grep -q "could not read" "$WORK/warn.txt" \
     || bad "unreadable --help warned with the wrong reason" "[$(cat "$WORK/warn.txt")]"
 
 echo '=== 5. _respawn_compose_launcher: the orchestrator gets its window name ==='
+# NEXUS_STATE_DIR pinned (#1703): the composer resolves its state dir from the
+# nexus root it is given, here the SOURCE checkout, and records an arming row
+# (_longjob-plugin.sh) there on every compose unless the state dir is pinned.
 compose() { # <stub> <target> <outfile>
     ( set +u
-      CLAUDE_BIN="$2"; NEXUS_ROOT="$REPO_ROOT"
-      export CLAUDE_BIN NEXUS_ROOT
+      CLAUDE_BIN="$2"; NEXUS_ROOT="$REPO_ROOT"; NEXUS_STATE_DIR="$WORK/state"
+      export CLAUDE_BIN NEXUS_ROOT NEXUS_STATE_DIR
       . "$_test_dir/_respawn.sh" >/dev/null 2>&1
       _respawn_compose_launcher "$3" "$REPO_ROOT" "" "" "$4" ) >/dev/null 2>&1
 }

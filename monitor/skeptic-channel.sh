@@ -1127,7 +1127,12 @@ _await_terminal() {
 # lines; the walk is bounded to the requests dir, never recursive.
 _open_spawn_request_for() {
     local task="$1" f
-    for f in "$STATE_DIR"/requests/*.new.md "$STATE_DIR"/requests/*.claimed.md; do
+    local rq
+    # The ONE inbox resolver (your-org/nexus-code#1723).
+    declare -F nexus_requests_dir >/dev/null 2>&1 \
+        || . "$_script_dir/_requests_dir.sh" 2>/dev/null
+    rq=$(nexus_requests_dir "$STATE_DIR" 2>/dev/null) || return 0
+    for f in "$rq"/*.new.md "$rq"/*.claimed.md; do
         [[ -e "$f" ]] || continue
         grep -qxF -e "origin: $task" "$f" 2>/dev/null || continue
         grep -qxF -e "kind: spawn-skeptic" "$f" 2>/dev/null || continue
@@ -1703,7 +1708,7 @@ _res_evidence_note() {
 # release its own required validation, so a set NEXUS_WORKER_WINDOW refuses.
 cmd_resolve() {
     local task=""
-    local reason="" disposition=0 delta_owed="" _delta_flag=0 withdraw_delta=0
+    local reason="" disposition=0 delta_owed="" _delta_flag=0 withdraw_delta=0 _res_rat_failed=0
     local _a; for _a in "$@"; do [[ "$_a" == "--delta-owed" ]] && _delta_flag=1; done
     _argloop_prev_6=-1; while (( $# > 0 )); do (( $# != _argloop_prev_6 )) || _argloop_stuck "$1"; _argloop_prev_6=$#
         case "$1" in
@@ -1901,7 +1906,7 @@ EOF
         # later wrap-up of NEW work arms normally. Recorded here, read by ng.
         (( _res_require_unsettled )) && printf 'scope    : settles-completed-round (declined nothing; a later wrap-up ARMS normally, #815 does not apply)\n'
         printf '\n%s\n' "$reason"
-    } >> "$rationale" 2>/dev/null || warn "resolve: could not write rationale to $rationale"
+    } >> "$rationale" 2>/dev/null || { _res_rat_failed=1; warn "resolve: could not write rationale to $rationale"; }
     # RECORD WHAT A DISPOSITION RELEASE COVERED. Check 1c compares this release's
     # TIME against the report's mtime, so any later write re-armed it — including
     # an append of follow-up records. retire-preflight release (c) carries the
@@ -2033,7 +2038,13 @@ EOF
     else
         printf 'recorded a disposition-only resolution for %s (no marker was present)\n' "$task"
     fi
-    printf 'rationale appended: %s\n' "$rationale"
+    # Only what happened (your-org/nexus-code#1719): the append above can fail
+    # (EROFS), and this line used to say "appended" either way.
+    if (( ${_res_rat_failed:-0} )); then
+        printf 'rationale NOT appended (write failed): %s\n' "$rationale"
+    else
+        printf 'rationale appended: %s\n' "$rationale"
+    fi
     _res_evidence_note "$task"
     (( disposition )) && printf 'retire-preflight check 1c (disposition: second-pass) is released for %s\n' "$task"
     # NOT "the window can now be retired": that line was FALSE whenever an await

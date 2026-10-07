@@ -462,6 +462,9 @@ _CANDIDATE_DESC='tracked *test-*.sh'
 # red was to RAISE the suite to the protected form rather than to record it as
 # unprotected, and a suite that asserts other readers' honesty has no business
 # being the weaker kind.
+# ONE ENTRANT at your-org/nexus-code#1657: `test-cc-hold-policy.sh` enters
+# fully protected at birth (ledger=yes via `th_summary_and_exit`, count=exact
+# via EXPECTED) — raised to the form rather than recorded as unprotected.
 # Every corpus file is on exactly one of two lists: the manifest (what a
 # suite's green does NOT certify) or this one (nothing withheld — ledger=yes
 # AND count=exact). Together they are a PIN: |PROTECTED| + |manifest| is the
@@ -499,6 +502,11 @@ _CANDIDATE_DESC='tracked *test-*.sh'
 # (ledger=yes via `th_summary_and_exit`, count=exact via EXPECTED_ASSERTIONS),
 # written in the protected form from the start. Mutation-tested per the rule
 # below on both axes in a real worktree; measurements in the w239 report.
+#
+# TWO ENTRANTS at the your-org/nexus-code#1663 seam (the mail policy):
+# `test-mail-path-lint.sh` and `test-notify-mail-policy.sh` are NEW suites and
+# enter fully protected (ledger=yes via `th_summary_and_exit`, count=exact via
+# EXPECTED_ASSERTIONS), written in the protected form from the start.
 #
 # ONE ENTRANT at the your-org/nexus-code#1490 seam:
 # `test-tee-reopen-lint.sh` is a NEW suite and enters fully protected
@@ -828,6 +836,9 @@ _CANDIDATE_DESC='tracked *test-*.sh'
 # your-org/nexus-code#1622 — ONE ENTRANT, BORN protected (ledger=yes,
 # count=exact): monitor/watcher/test-integration/test-realmodel-respawn-verify.sh,
 # the orchestrator-respawn verify stage against the real binary.
+# your-org/nexus-code#1715 — ONE ENTRANT, BORN protected (ledger=yes,
+# count=exact): monitor/watcher/test-integration/test-realmodel-respawn-late-render.sh,
+# the same verify stage when the brief's paste renders late.
 # your-org/nexus-code#1496 — ONE ENTRANT, BORN protected (ledger=yes,
 # count=exact): monitor/watcher/test-claude-md-fallback-collapse.sh, the
 # executor of CLAUDE.md's FALLBACK-COLLAPSE block.
@@ -837,12 +848,52 @@ _CANDIDATE_DESC='tracked *test-*.sh'
 # your-org/nexus-code#1532 — ONE ENTRANT, BORN protected (ledger=yes,
 # count=exact): monitor/watcher/test-watcher-supervise-probe.sh, the watcher
 # supervisor as a persistent longjob watch.
+# your-org/nexus-code#1640 — TWO ENTRANTS, BORN protected (ledger=yes,
+# count=exact): monitor/watcher/test-codex-run.sh (the Codex co-worker helper
+# against a stub) and monitor/watcher/test-codex-run-real.sh (the same helper
+# driving the real binary against the mock Responses backend). Layer 2 adds
+# THREE more, born protected: test-codex-worker.sh (hermetic Codex worker
+# harness), test-pane-state-codex.sh (the Codex pane classifier and its kill
+# differential) and test-integration/test-codex-worker-e2e.sh (the real TUI).
+# The skeptic round adds ONE more, born protected:
+# test-integration/test-codex-busy-phases.sh (the skeptic's busy-phase probes
+# against the real TUI, as a regression suite).
+# your-org/nexus-code#1665 — ONE ENTRANT, BORN protected (ledger=yes,
+# count=exact): monitor/watcher/test-bootstrap-recover-followup.sh, the
+# follow-up arm of bootstrap-recover.sh's worker-inclusion predicate.
+# your-org/nexus-code#1670 item 4 — ONE ENTRANT, BORN protected (ledger=yes,
+# count=exact): monitor/watcher/test-cc-harness-teardown-remnant.sh, cch_teardown
+# awaiting the pane processes before the run dir is moved (a stub claude).
+# your-org/nexus-code#1671 — ONE ENTRANT, BORN protected (ledger=yes,
+# count=exact): monitor/watcher/test-agents-md-guard.sh, the spawn-time
+# AGENTS.md scan (amg_scan) and its spawn-worker.sh wiring.
+# your-org/nexus-code#1698 and #1680 (bundle-0930) — TWO ENTRANTS, BORN protected
+# (ledger=yes, count=exact): monitor/watcher/test-prelude-sweep-reuse.sh, the
+# prelude's reuse of the recorder's last complete sweep; and
+# monitor/watcher/test-test-fence-state.sh, the NEXUS_TEST_FENCE harness fence
+# (given its exact count guard at integration, not opted out).
+# your-org/nexus-code#1698 reopened (bundle-1001c) — ONE ENTRANT, BORN protected
+# (ledger=yes, count=exact): monitor/watcher/test-prelude-render-deadline.sh,
+# the prelude render's deadline and its `unprobed` degradation.
+# your-org/nexus-code#1734, #1724, #1742 (bundle-1005a) — THREE ENTRANTS, BORN
+# protected (ledger=yes, count=exact): monitor/cc-harness/test-probe-2g-limits.sh,
+# the structural 2g output-limit probe; monitor/watcher/test-degraded-probe.sh,
+# `ng degraded probe`; and monitor/watcher/test-svc-url-warning.sh, svc.sh's
+# no-URL warning.
+# your-org/nexus-code#1747, #1722, #1724, #1723 (bundle-1006a) — FOUR ENTRANTS,
+# BORN protected (ledger=yes, count=exact):
+# monitor/watcher/test-lint-suites-declare-population.sh, the every-lint-suite-
+# declares ratchet; monitor/watcher/test-doctor.sh, `ng doctor`;
+# monitor/watcher/test-fs-degraded-note.sh, the watcher's repeating DEGRADED
+# note and `ng degraded status`; and monitor/watcher/test-requests-dir.sh, the
+# request-inbox resolver and its one-composer lint.
 PROTECTED='monitor/cc-harness/test-cc-harness-gate-coverage-trackedness.sh
 monitor/test-obligations.sh
 monitor/test-window-key.sh
 monitor/watcher/test-absent-evidence-precedence.sh
 monitor/watcher/test-agent-delivery-latency-envelope.sh
 monitor/watcher/test-agent-delivery.sh
+monitor/watcher/test-agents-md-guard.sh
 monitor/watcher/test-agent-tmpdir.sh
 monitor/watcher/test-argloop-progress-guard.sh
 monitor/watcher/test-assert-bot-author-generic-optin.sh
@@ -853,11 +904,14 @@ monitor/watcher/test-async-run-cancel.sh
 monitor/watcher/test-async-run.sh
 monitor/watcher/test-auth-hold.sh
 monitor/watcher/test-awk-v-escape-lint.sh
-monitor/watcher/test-band-verdict.sh
 monitor/watcher/test-backtick-label-lint.sh
+monitor/watcher/test-band-verdict.sh
+monitor/watcher/test-bootstrap-recover-followup.sh
 monitor/watcher/test-cc-auto-update-default-docs.sh
 monitor/watcher/test-cc-harness-gate-population.sh
 monitor/watcher/test-cc-harness-socket-isolation.sh
+monitor/watcher/test-cc-harness-teardown-remnant.sh
+monitor/watcher/test-cc-hold-policy.sh
 monitor/watcher/test-cc-surface-dedup.sh
 monitor/watcher/test-cc-update-no-remote-code.sh
 monitor/watcher/test-changelog-merge-union.sh
@@ -891,6 +945,9 @@ monitor/watcher/test-claude-md-shopt-dynamic-scope.sh
 monitor/watcher/test-claude-md-tmux-socket-selection.sh
 monitor/watcher/test-claude-md-worktree-blind-spot.sh
 monitor/watcher/test-claude-md-zsh-path-tie.sh
+monitor/watcher/test-codex-run-real.sh
+monitor/watcher/test-codex-run.sh
+monitor/watcher/test-codex-worker.sh
 monitor/watcher/test-dangerous-rm-decide-hook.sh
 monitor/watcher/test-declare-no-wait.sh
 monitor/watcher/test-delivery-resolvers-primary-root.sh
@@ -918,13 +975,18 @@ monitor/watcher/test-heredoc-backtick-lint.sh
 monitor/watcher/test-hook-matcher-body-coherence.sh
 monitor/watcher/test-idle-wrapup-scan-scope.sh
 monitor/watcher/test-input-box-chrome.sh
+monitor/watcher/test-integration/test-codex-busy-phases.sh
+monitor/watcher/test-integration/test-codex-worker-e2e.sh
 monitor/watcher/test-integration/test-realmodel-dangerous-rm-decide.sh
 monitor/watcher/test-integration/test-realmodel-paste-held.sh
+monitor/watcher/test-integration/test-realmodel-respawn-late-render.sh
 monitor/watcher/test-integration/test-realmodel-respawn-verify.sh
 monitor/watcher/test-integration/test-realmodel-trust-dialog.sh
 monitor/watcher/test-integration/test-realmodel-trust-sandboxed-env.sh
 monitor/watcher/test-issue-ref.sh
 monitor/watcher/test-knob-default-agrees.sh
+monitor/watcher/test-labsh-pin.sh
+monitor/watcher/test-mail-path-lint.sh
 monitor/watcher/test-merge-ref-base.sh
 monitor/watcher/test-mutation-gate-bounds.sh
 monitor/watcher/test-mutation-gate-did-not-run.sh
@@ -935,6 +997,7 @@ monitor/watcher/test-ng-identity-dashboard-sync.sh
 monitor/watcher/test-ng-reply-arg-binding.sh
 monitor/watcher/test-ng-skeptic-orphans.sh
 monitor/watcher/test-ng-usage-flag-coverage.sh
+monitor/watcher/test-notify-mail-policy.sh
 monitor/watcher/test-nrs-population.sh
 monitor/watcher/test-nullglob-bare-form-manifest.sh
 monitor/watcher/test-operator-path-literals-manifest.sh
@@ -946,6 +1009,7 @@ monitor/watcher/test-over-limit-orchestrator-activity.sh
 monitor/watcher/test-over-limit-stale-stamp.sh
 monitor/watcher/test-pane-state-asyncrun-liveness.sh
 monitor/watcher/test-pane-state-claude-identity.sh
+monitor/watcher/test-pane-state-codex.sh
 monitor/watcher/test-pane-state-resolver-precondition.sh
 monitor/watcher/test-pane-state-restart-quiescence.sh
 monitor/watcher/test-pane-state-wrapped-idle.sh
@@ -953,6 +1017,8 @@ monitor/watcher/test-paste-dead-pane-guard-arms.sh
 monitor/watcher/test-paste-deliver.sh
 monitor/watcher/test-paste-followup-receipt-and-usage.sh
 monitor/watcher/test-population-primary-shape.sh
+monitor/watcher/test-prelude-render-deadline.sh
+monitor/watcher/test-prelude-sweep-reuse.sh
 monitor/watcher/test-proc-exists-authorized.sh
 monitor/watcher/test-proc-kill-authorized.sh
 monitor/watcher/test-proc-redirect-order.sh
@@ -1016,6 +1082,7 @@ monitor/watcher/test-suite-declaration-census.sh
 monitor/watcher/test-summary-honesty-manifest.sh
 monitor/watcher/test-svc-orphans.sh
 monitor/watcher/test-tee-reopen-lint.sh
+monitor/watcher/test-test-fence-state.sh
 monitor/watcher/test-th-require-fixture-repo.sh
 monitor/watcher/test-tmpfs-guard.sh
 monitor/watcher/test-tmux-fixture-shell-parity.sh
@@ -1029,9 +1096,17 @@ monitor/watcher/test-trust-config-clobber-mechanism.sh
 monitor/watcher/test-uncounted-abort-lint.sh
 monitor/watcher/test-upload-asset-positional.sh
 monitor/watcher/test-upload-asset-root-pinning.sh
+monitor/watcher/test-uv-builds-gc.sh
 monitor/watcher/test-v2-task-rc-propagation.sh
 monitor/watcher/test-verify-worker-started.sh
-monitor/watcher/test-watcher-supervise-probe.sh'
+monitor/watcher/test-watcher-supervise-probe.sh
+monitor/cc-harness/test-probe-2g-limits.sh
+monitor/watcher/test-degraded-probe.sh
+monitor/watcher/test-svc-url-warning.sh
+monitor/watcher/test-lint-suites-declare-population.sh
+monitor/watcher/test-doctor.sh
+monitor/watcher/test-fs-degraded-note.sh
+monitor/watcher/test-requests-dir.sh'
 
 _corpus_verdict() {   # <scanned> <indep> <pinned> -> rc 0 sound, rc 1 + reason
     local scanned="$1" indep="$2" pinned="$3"

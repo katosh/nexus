@@ -102,6 +102,21 @@ tmux() {
                 esac
             done
             printf 'send-keys win=%s args=%s\n' "$target" "${rest# }" >> "$ACTIONS"
+            # A LIVE rate-limit menu takes the Enter (your-org/nexus-code#1739:
+            # the cascade now VERIFIES the dismissal before it pastes). Unless
+            # the test planted `<win>.sticky` (a menu that ignores the Enter),
+            # the pane becomes `<win>.after` if planted, else a quiet REPL; a
+            # planted `$PSTATE_DIR/<win>.after` replaces the fake pane-state row.
+            local _w="${target#:=}"
+            if [[ " ${rest} " == *" Enter "* && -n "$PANES_DIR" && -f "$PANES_DIR/$_w" && ! -e "$PANES_DIR/$_w.sticky" ]] \
+                && grep -qF 'Stop and wait for limit' "$PANES_DIR/$_w" \
+                && [[ "$(_unstick_ratelimit_menu_verdict < "$PANES_DIR/$_w")" == *-highlighted ]]; then
+                if [[ -f "$PANES_DIR/$_w.after" ]]; then mv "$PANES_DIR/$_w.after" "$PANES_DIR/$_w"
+                else printf '%s\n' '● Stopped.' '' '───' "❯ " '───' > "$PANES_DIR/$_w"; fi
+                if [[ -n "${PSTATE_DIR:-}" && -f "$PSTATE_DIR/$_w.after" ]]; then
+                    mv "$PSTATE_DIR/$_w.after" "$PSTATE_DIR/$_w"
+                fi
+            fi
             return 0
             ;;
         load-buffer)
@@ -183,18 +198,24 @@ setup_test() {
     RATELIMIT_HEURISTIC_MIN="30"
     RATELIMIT_ACK_TIMEOUT_S="60"
     PROBE_MODEL="claude-haiku-4-5-20251001"
-    API_ERROR_BACKOFF_MIN="30"
     ON_DIALOG="auto-dismiss"
     # Case W (worker-blocked-question relay) state. STATE_DIR roots the
     # decisions dir exactly as in production (where
     # UNSTICK_DIR=$STATE_DIR/unstick); the grace default matches
     # production so pre-grace tests are honest.
     STATE_DIR="$WORK"
+    # The credential sensor (#1739) reads Claude Code's config + credential
+    # store; aim it at per-test paths so no row ever reads the operator's.
+    UNSTICK_CRED_ACCOUNT_FILE="$WORK/cred/claude.json"
+    UNSTICK_CRED_STORE_FILE="$WORK/cred/credentials.json"
+    UNSTICK_DISMISS_VERIFY_S="1"
+    PSTATE_DIR=""
     MONITOR_WORKER_ASKUQ_GRACE_SECONDS="300"
     export AUTO_UNSTICK WATCHER_WINDOW TARGET UNSTICK_DIR UNSTICK_LOG \
            ACTION_LOG RATELIMIT_PROBE RATELIMIT_HEURISTIC_MIN \
-           RATELIMIT_ACK_TIMEOUT_S PROBE_MODEL API_ERROR_BACKOFF_MIN \
-           ON_DIALOG STATE_DIR MONITOR_WORKER_ASKUQ_GRACE_SECONDS
+           RATELIMIT_ACK_TIMEOUT_S PROBE_MODEL \
+           ON_DIALOG STATE_DIR MONITOR_WORKER_ASKUQ_GRACE_SECONDS \
+           UNSTICK_CRED_ACCOUNT_FILE UNSTICK_CRED_STORE_FILE UNSTICK_DISMISS_VERIFY_S
 }
 
 teardown_test() {
@@ -233,9 +254,8 @@ $
 EOF
 }
 
-# API-error wedge fixture (case C). The chip lives directly under the
-# command line. Distinct request_ids → distinct fingerprints across
-# re-emits.
+# The PRE-2.1.280 synthetic API-error chip the retired Case C keyed on
+# (your-org/nexus-code#1670). No real-binary capture of it exists in the repo.
 api_error_pane() {
     local rid="${1:-req_011XYZ}"
     cat <<EOF
@@ -244,9 +264,7 @@ api_error_pane() {
 EOF
 }
 
-# Pane that mentions "API Error" in passing but is NOT the wedge —
-# verifies the AND-grep with `"Internal server error"` keeps benign
-# prose from triggering case C.
+# Pane that mentions "API Error" in passing — conversation prose.
 api_error_prose_pane() {
     cat <<'EOF'
 ⏺ Tell me about API Error handling.
@@ -1038,7 +1056,7 @@ detect_and_unstick
 log_content=$(<"$UNSTICK_LOG")
 assert_eq "A1626-chip.nokeys: zero send-keys into a live danger prompt under a chip" "$(sk_count rtev)" "0"
 assert_contains "A1626-chip.refused: Case A refused it, naming the danger" "$log_content" "window=rtev case=A action=refused verdict=danger"
-assert_not_contains "A1626-chip.noC: Case C never claimed it" "$log_content" "case=C"
+assert_not_contains "A1626-chip.noC: no case=C line (the arm is retired, #1670)" "$log_content" "case=C"
 teardown_test
 
 echo '=== Case A first (#1626 F1): a QUOTED rate-limit menu above a live prompt — no cascade Enter ==='
@@ -1114,13 +1132,13 @@ teardown_test
 
 # CONTROLS (must NOT flip under the reordering mutant): with no permission prompt
 # on the pane every other arm still claims what it claimed.
-echo '=== Case A first (#1626 F1) controls: no permission prompt ⇒ C, B and D unchanged ==='
+echo '=== Case A first (#1626 F1) controls: no permission prompt ⇒ B and W unchanged, a chip gets nothing ==='
 setup_test
 api_error_pane "req_ctl1626" > "$PANES_DIR/agent-1"
 quiet_pane > "$PANES_DIR/watcher"
 WINDOWS_LIST=$'agent-1\nwatcher'
 detect_and_unstick
-assert_eq "A1626-ctl.chip: a chip with no permission prompt still gets case C's one Enter" "$(sk_count agent-1 Enter)" "1"
+assert_eq "A1626-ctl.chip: a chip with no permission prompt gets NO key (Case C retired, #1670)" "$(sk_count agent-1)" "0"
 ratelimit_pane > "$PANES_DIR/agent-2"
 assert_eq "A1626-ctl.ratelimit: a live rate-limit menu with no permission prompt still reaches case B" \
     "$(_handle_unstick_window agent-2)" "ratelimit"
@@ -1242,138 +1260,86 @@ assert_contains "A1626-recur.named: the line says it recurred" "$log_content" "e
 assert_eq "A1626-recur.nokeys: still zero send-keys" "$(sk_count rtev)" "0"
 teardown_test
 
-# ---- Case C: api-error wedge -------------------------------------------
+# ---- Case C: RETIRED (your-org/nexus-code#1670) -------------------------
+#
+# Case C used to press ONE bare Enter on an API-error chip. It was retired:
+# its literals matched no current render, and its remedy was measured INERT on
+# 2.1.284 (mock requests 1 -> 1 after the bare Enter, twice; `continue` + Enter
+# 1 -> 2). API-error recovery belongs to the StopFailure marker ->
+# `interrupted` -> orchestrator path. These cases pin the retirement: an
+# API-error pane, in EITHER render, gets NO key, NO case=C line, NO
+# api-error state and NO machine-input stamp. The old synthetic render is
+# the base-RED case (the pre-#1670 arm fired on it); the real render is the
+# one a re-keyed arm would fire on (the mutation-gate subject).
+#
+# The real 2.1.284 render, captured with `capture-pane -p` (plain text, the
+# form `_handle_unstick_window` reads) from the cc-harness mock returning
+# 500/api_error. Scrubbed: the banner rows, the blank padding rows, and the
+# harness port (127.0.0.1:33015 -> 127.0.0.1:PORT). The divider rows are
+# shortened; nothing in _unstick.sh keys on their width.
+api_error_pane_2_1_284() {
+    cat <<'EOF'
+❯ say pong
 
-echo '=== Case C: api-error wedge → Enter sent + fingerprint recorded ==='
+● API Error: 500 Internal server error. This is a server-side issue, usually temporary — try again in a moment.
+  If it persists, check your inference gateway (127.0.0.1:PORT).
+
+✻ Churned for 0s · done 10:39 AM
+
+────────────────────────────────────────
+❯ 
+────────────────────────────────────────
+  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+EOF
+}
+
+# C1670 <label> <pane-fn> [args…]: the one no-action contract, per fixture.
+_c1670_assert_no_action() {
+    local label="$1"; shift
+    setup_test
+    "$@" > "$PANES_DIR/agent-1"
+    quiet_pane > "$PANES_DIR/watcher"
+    WINDOWS_LIST=$'agent-1\nwatcher'
+    # The production loop FIRST, on fresh state: calling the arm selector
+    # first would itself act and arm the old backoff, masking the key count.
+    detect_and_unstick
+    assert_eq "C1670.$label.nokeys: zero send-keys into agent-1" "$(sk_count agent-1)" "0"
+    assert_eq "C1670.$label.noaction: no tmux action of ANY kind aimed at agent-1" \
+        "$(grep -cE "(win|target)=(:=)?agent-1( |\$)" "$ACTIONS" || true)" "0"
+    assert_not_contains "C1670.$label.nolog: no case=C line" "$(<"$UNSTICK_LOG")" "case=C"
+    assert_eq "C1670.$label.nostate: no api-error fp/epoch/audit files" \
+        "$(bash -c 'n=0; for f in "$1"/agent-1.api-error.*; do [[ -e "$f" ]] && n=$((n+1)); done; echo $n' _ "$UNSTICK_DIR")" "0"
+    assert_not_contains "C1670.$label.nostamp: no machine-input stamp for agent-1" \
+        "$(cat "$WORK/machine-input.tsv" 2>/dev/null)" $'agent-1\t'
+    assert_eq "C1670.$label.arm: _handle_unstick_window claims no arm" \
+        "$(_handle_unstick_window agent-1)" ""
+    teardown_test
+}
+
+echo '=== Case C retired (#1670): the REAL 2.1.284 500 render gets no key ==='
+_c1670_assert_no_action real284 api_error_pane_2_1_284
+echo '=== Case C retired (#1670): the OLD synthetic JSON-chip render gets no key (base: Enter) ==='
+_c1670_assert_no_action oldjson api_error_pane "req_aaaa1111"
+echo '=== Case C retired (#1670): prose quoting "API Error" gets no key ==='
+_c1670_assert_no_action prose api_error_prose_pane
+echo '=== Case C retired (#1670): an idle pane gets no key ==='
+_c1670_assert_no_action idle quiet_pane
+
+# your-org/nexus-code#1524, kept from the Case C section it used to live in:
+# the READ that selects an arm (_handle_unstick_window) is exact-targeted.
+# Recorded raw by the stub, since its pane lookup strips `:=` either way.
+echo '=== C1524: the arm-selecting capture-pane read uses the EXACT target ==='
 setup_test
-api_error_pane "req_aaaa1111" > "$PANES_DIR/agent-1"
-quiet_pane                    > "$PANES_DIR/watcher"
+api_error_pane_2_1_284 > "$PANES_DIR/agent-1"
+quiet_pane             > "$PANES_DIR/watcher"
 WINDOWS_LIST=$'agent-1\nwatcher'
 detect_and_unstick
-log_content=$(<"$UNSTICK_LOG")
-actions_content=$(<"$ACTIONS")
-assert_contains "case C logs sent-Enter for agent-1" "$log_content" "window=agent-1 case=C action=sent-Enter"
-send_count=$(grep -cE '^send-keys win=(:=)?agent-1' <<<"$actions_content" || true)
-assert_eq "agent-1 received exactly one send-keys" "$send_count" "1"
-# your-org/nexus-code#1524: the Enter goes to the EXACT target `:=agent-1`, never
-# the bare name tmux resolves by unique PREFIX once agent-1 is gone (the Enter
-# would submit a live `agent-1-skeptic`'s input box). The pair, not either half:
-# the exact count alone passes if a second, bare Enter were added beside it.
-assert_eq "C1524.exact: case C Enter went to :=agent-1 exactly once" \
-    "$(grep -cE '^send-keys win=:=agent-1 args=Enter$' <<<"$actions_content" || true)" "1"
-assert_eq "C1524.bare: no case C Enter went to the BARE name agent-1" \
-    "$(grep -cE '^send-keys win=agent-1 args=Enter$' <<<"$actions_content" || true)" "0"
-# The READ that selects the arm (_handle_unstick_window) is exact-targeted too.
-# Recorded raw by the stub, since its pane lookup strips `:=` either way.
 captures=$(cat "$WORK/captures.log" 2>/dev/null)
 assert_eq "C1524.read-exact: the arm-selecting capture-pane read :=agent-1" \
     "$(grep -cxF 'capture-pane target=:=agent-1' <<<"$captures" || true)" "1"
 assert_eq "C1524.read-bare: no capture-pane read the BARE name agent-1" \
     "$(grep -cxF 'capture-pane target=agent-1' <<<"$captures" || true)" "0"
-[[ -f "$UNSTICK_DIR/agent-1.api-error.fp" ]] \
-    && { echo "  PASS: fingerprint file written"; PASS=$((PASS+1)); } \
-    || { echo "  FAIL: fingerprint file missing" >&2; FAIL=$((FAIL+1)); }
-[[ -f "$UNSTICK_DIR/agent-1.api-error.epoch" ]] \
-    && { echo "  PASS: epoch file written"; PASS=$((PASS+1)); } \
-    || { echo "  FAIL: epoch file missing" >&2; FAIL=$((FAIL+1)); }
-assert_not_contains "watcher window untouched" "$log_content" "window=watcher"
-# Issue #201: api-error Enter nudges hit an IDLE-classified prompt —
-# without a machine-input stamp the busy retry would falsely mark
-# the window operator-engaged.
-assert_contains "case C stamps machine-input ledger" \
-    "$(cat "$WORK/machine-input.tsv" 2>/dev/null)" $'agent-1\t'
-assert_contains "case C stamp names its source" \
-    "$(awk -F'\t' '$1=="agent-1" {print $3}' "$WORK/machine-input.tsv" 2>/dev/null)" 'unstick-api-error'
-teardown_test
-
-echo '=== Case C: same fingerprint within backoff → skip ==='
-setup_test
-api_error_pane "req_bbbb2222" > "$PANES_DIR/agent-1"
-quiet_pane                    > "$PANES_DIR/watcher"
-WINDOWS_LIST=$'agent-1\nwatcher'
-# First detection acts.
-detect_and_unstick
-# Second detection on the same wedge should be backoff-suppressed.
-: > "$ACTIONS"
-: > "$UNSTICK_LOG"
-detect_and_unstick
-log_content=$(<"$UNSTICK_LOG")
-actions_content=$(<"$ACTIONS")
-assert_contains "second pass logs skip-backoff" "$log_content" "window=agent-1 case=C action=skip-backoff"
-assert_not_contains "no second sent-Enter" "$log_content" "case=C action=sent-Enter"
-send_count=$(grep -cE '^send-keys win=(:=)?agent-1' <<<"$actions_content" || true)
-assert_eq "agent-1 received zero send-keys on second pass" "$send_count" "0"
-teardown_test
-
-echo '=== Case C: distinct fingerprint (new request_id) re-fires Enter ==='
-setup_test
-api_error_pane "req_cccc3333" > "$PANES_DIR/agent-1"
-quiet_pane                    > "$PANES_DIR/watcher"
-WINDOWS_LIST=$'agent-1\nwatcher'
-detect_and_unstick
-# Swap to a different request_id → different fp → must re-fire even
-# though the previous fp was just recorded.
-api_error_pane "req_dddd4444" > "$PANES_DIR/agent-1"
-: > "$ACTIONS"
-: > "$UNSTICK_LOG"
-detect_and_unstick
-log_content=$(<"$UNSTICK_LOG")
-actions_content=$(<"$ACTIONS")
-assert_contains "distinct fp re-fires" "$log_content" "window=agent-1 case=C action=sent-Enter"
-send_count=$(grep -cE '^send-keys win=(:=)?agent-1' <<<"$actions_content" || true)
-assert_eq "agent-1 received one send-keys for the new fp" "$send_count" "1"
-teardown_test
-
-echo '=== Case C: post-backoff re-detection re-fires Enter ==='
-setup_test
-api_error_pane "req_eeee5555" > "$PANES_DIR/agent-1"
-quiet_pane                    > "$PANES_DIR/watcher"
-WINDOWS_LIST=$'agent-1\nwatcher'
-detect_and_unstick
-# Force the recorded epoch to be older than the backoff window
-# (default 30 min → 1800 s).
-echo $(( $(date +%s) - 2000 )) > "$UNSTICK_DIR/agent-1.api-error.epoch"
-: > "$ACTIONS"
-: > "$UNSTICK_LOG"
-detect_and_unstick
-log_content=$(<"$UNSTICK_LOG")
-actions_content=$(<"$ACTIONS")
-assert_contains "post-backoff re-fire" "$log_content" "window=agent-1 case=C action=sent-Enter"
-send_count=$(grep -cE '^send-keys win=(:=)?agent-1' <<<"$actions_content" || true)
-assert_eq "agent-1 received one send-keys after backoff" "$send_count" "1"
-teardown_test
-
-echo '=== Case C: configurable backoff via API_ERROR_BACKOFF_MIN ==='
-setup_test
-API_ERROR_BACKOFF_MIN=0
-export API_ERROR_BACKOFF_MIN
-api_error_pane "req_ffff6666" > "$PANES_DIR/agent-1"
-quiet_pane                    > "$PANES_DIR/watcher"
-WINDOWS_LIST=$'agent-1\nwatcher'
-detect_and_unstick
-: > "$ACTIONS"
-: > "$UNSTICK_LOG"
-# Backoff=0 → same fp on second pass should also fire (age >= 0 fails
-# the `< backoff_s` test).
-detect_and_unstick
-log_content=$(<"$UNSTICK_LOG")
-actions_content=$(<"$ACTIONS")
-assert_contains "backoff=0 re-fires same fp" "$log_content" "window=agent-1 case=C action=sent-Enter"
-send_count=$(grep -cE '^send-keys win=(:=)?agent-1' <<<"$actions_content" || true)
-assert_eq "agent-1 received one send-keys with backoff=0" "$send_count" "1"
-teardown_test
-
-echo '=== Case C: benign prose mentioning "API Error" does NOT trigger ==='
-setup_test
-api_error_prose_pane > "$PANES_DIR/agent-1"
-quiet_pane           > "$PANES_DIR/watcher"
-WINDOWS_LIST=$'agent-1\nwatcher'
-detect_and_unstick
-log_content=$(<"$UNSTICK_LOG")
-actions_content=$(<"$ACTIONS")
-assert_not_contains "no false-positive on prose" "$log_content" "case=C"
-send_count=$(grep -cE '^send-keys win=(:=)?agent-1' <<<"$actions_content" || true)
-assert_eq "agent-1 received zero send-keys on prose" "$send_count" "0"
+assert_not_contains "watcher window untouched" "$(<"$UNSTICK_LOG")" "window=watcher"
 teardown_test
 
 # ---- _probe_ratelimit_reset: unified header parsing --------------------
@@ -1819,6 +1785,181 @@ W_FP=$(_test_w_fp)
 [[ ! -f "$WORK/decisions/orchestrator.$W_FP.json" ]] \
     && { echo "  PASS: no decision record for orchestrator"; PASS=$((PASS+1)); } \
     || { echo "  FAIL: relay record written for orchestrator" >&2; FAIL=$((FAIL+1)); }
+teardown_test
+
+# ---- Case B: a RESET EVENT expedites the cascade (your-org/nexus-code#1739) ----
+#
+# Row ids R39-* were named in the prediction BEFORE the fix existed. Red on base:
+# base has no sensor, so the event rows cascade nothing until the epoch.
+
+# Write an identity into the per-test credential files (identity-level fields
+# ONLY, plus a token field the sensor must never copy out).
+r39_cred() { # <account-uuid> <tier>
+    mkdir -p "$WORK/cred"
+    printf '{"oauthAccount":{"accountUuid":"%s","organizationUuid":"org-1","emailAddress":"x@y"}}\n' "$1" > "$UNSTICK_CRED_ACCOUNT_FILE"
+    printf '{"claudeAiOauth":{"accessToken":"SECRET-TOKEN-%s","expiresAt":%s,"subscriptionType":"max","rateLimitTier":"%s"}}\n' "$1" "$RANDOM" "$2" > "$UNSTICK_CRED_STORE_FILE"
+    touch -d "@$(( $(date +%s) + RANDOM % 1000 ))" "$UNSTICK_CRED_STORE_FILE" "$UNSTICK_CRED_ACCOUNT_FILE"
+}
+r39_board() {
+    ratelimit_pane > "$PANES_DIR/agent-1"
+    ratelimit_pane > "$PANES_DIR/agent-2"
+    quiet_pane     > "$PANES_DIR/orchestrator"
+    quiet_pane     > "$PANES_DIR/watcher"
+    WINDOWS_LIST=$'agent-1\nagent-2\norchestrator\nwatcher'
+}
+paste_count() { local n; n=$(grep -cE "^paste-buffer buf=.* target=:=$1\$" "$ACTIONS" || true); printf '%s' "${n:-0}"; }
+
+echo '=== Case B (#1739): two windows at the menu + a credential change → both resumed within ONE poll ==='
+setup_test; r39_board; r39_cred acct-A tier-1
+detect_and_unstick                       # poll 1: baseline + episode scheduled 30 min out
+assert_eq "R39-change.precondition: nothing pasted before the change" "$(paste_count agent-1)$(paste_count agent-2)" "00"
+r39_cred acct-B tier-1                   # the operator switches account
+detect_and_unstick                       # poll 2
+log_content=$(<"$UNSTICK_LOG")
+assert_contains "R39-change.event: credential change logged" "$log_content" "case=B action=credential-change"
+assert_contains "R39-change.expedited: epoch pulled to now" "$log_content" "case=B action=reset-epoch-expedited source=credential-change"
+assert_contains "R39-change.a1: agent-1 resumed" "$log_content" "window=agent-1 case=B action=cascade-resumed"
+assert_contains "R39-change.a2: agent-2 resumed" "$log_content" "window=agent-2 case=B action=cascade-resumed"
+assert_eq "R39-change.paste: one continuation per window" "$(paste_count agent-1)$(paste_count agent-2)" "11"
+assert_contains "R39-change.brief: the brief names the event and asks for a re-check" \
+    "$(grep -m1 -E '^load-buffer .*content=Please continue' "$ACTIONS")" "Re-check any jobs, watches and messages"
+assert_contains "R39-change.headsup: orchestrator told" "$log_content" "case=B action=heads-up target=orchestrator n=2"
+assert_not_contains "R39-change.secret: no token value in the log" "$log_content" "SECRET-TOKEN"
+assert_not_contains "R39-change.secret: no account uuid in the stored baseline" "$(cat "$UNSTICK_DIR"/credential.* 2>/dev/null)" "acct-B"
+teardown_test
+
+echo '=== Case B (#1739): NO credential change → unchanged behaviour (still waits for the epoch) ==='
+setup_test; r39_board; r39_cred acct-A tier-1
+detect_and_unstick
+touch -d "@$(( $(date +%s) + 5 ))" "$UNSTICK_CRED_ACCOUNT_FILE"   # rewritten, same identity
+detect_and_unstick
+log_content=$(<"$UNSTICK_LOG")
+assert_not_contains "R39-same.noevent: no reset event" "$log_content" "reset-event"
+assert_not_contains "R39-same.nocascade: no window resumed" "$log_content" "cascade-resumed"
+assert_eq "R39-same.nokeys: zero keys into either menu" "$(sk_count agent-1)$(sk_count agent-2)" "00"
+teardown_test
+
+echo '=== Case B (#1739): the FIRST sighting and an UNREADABLE store are not changes ==='
+setup_test; r39_board
+detect_and_unstick                       # no files at all
+r39_cred acct-A tier-1
+detect_and_unstick                       # first identity ever seen: baseline only
+rm -f "$UNSTICK_CRED_ACCOUNT_FILE" "$UNSTICK_CRED_STORE_FILE"
+detect_and_unstick                       # vanished: could not look, not changed
+log_content=$(<"$UNSTICK_LOG")
+assert_not_contains "R39-first.noevent: no credential-change raised" "$log_content" "credential-change"
+assert_not_contains "R39-first.nocascade: no window resumed" "$log_content" "cascade-resumed"
+teardown_test
+
+echo '=== Case B (#1739): a TYPED operator draft is refused, its sibling is still resumed ==='
+setup_test; install_fake_pane_state; r39_board; r39_cred acct-A tier-1
+echo 'state=blocked active=1 overlay=rate-limit input=typed' > "$PSTATE_DIR/agent-2"
+echo 'state=blocked active=1 overlay=rate-limit input=?'     > "$PSTATE_DIR/agent-1"
+echo 'state=idle active=0 input=blank'                        > "$PSTATE_DIR/agent-1.after"
+detect_and_unstick
+r39_cred acct-B tier-1
+detect_and_unstick
+log_content=$(<"$UNSTICK_LOG")
+assert_contains "R39-draft.refused: agent-2 refused as an operator draft" "$log_content" "window=agent-2 case=B action=cascade-refused reason=operator-draft stage=before-dismiss"
+assert_eq "R39-draft.nokeys: ZERO keys into the drafting pane" "$(sk_count agent-2)" "0"
+assert_eq "R39-draft.nopaste: nothing pasted into it" "$(paste_count agent-2)" "0"
+assert_contains "R39-draft.sibling: input=? under a live menu is not a refusal — agent-1 resumed" "$log_content" "window=agent-1 case=B action=cascade-resumed"
+teardown_test; uninstall_fake_pane_state
+
+echo '=== Case B (#1739): a draft the menu was HIDING is refused after the dismissal ==='
+setup_test; install_fake_pane_state; r39_board; r39_cred acct-A tier-1
+WINDOWS_LIST=$'agent-1\norchestrator\nwatcher'
+echo 'state=blocked active=1 overlay=rate-limit input=?' > "$PSTATE_DIR/agent-1"
+echo 'state=user-typing active=1 input=typed'            > "$PSTATE_DIR/agent-1.after"
+detect_and_unstick
+r39_cred acct-B tier-1
+detect_and_unstick
+log_content=$(<"$UNSTICK_LOG")
+assert_contains "R39-hidden.refused: refused after the dismiss" "$log_content" "window=agent-1 case=B action=cascade-refused reason=operator-draft stage=after-dismiss"
+assert_eq "R39-hidden.onekey: exactly the ONE dismiss Enter, no submit" "$(sk_count agent-1 Enter)" "1"
+assert_eq "R39-hidden.nopaste: nothing pasted" "$(paste_count agent-1)" "0"
+teardown_test; uninstall_fake_pane_state
+
+echo '=== Case B (#1739): a menu that does NOT leave on Enter gets no paste ==='
+setup_test; r39_board; r39_cred acct-A tier-1
+WINDOWS_LIST=$'agent-1\norchestrator\nwatcher'
+touch "$PANES_DIR/agent-1.sticky"
+detect_and_unstick
+r39_cred acct-B tier-1
+detect_and_unstick
+log_content=$(<"$UNSTICK_LOG")
+assert_contains "R39-sticky.refused: dismissal unverified" "$log_content" "window=agent-1 case=B action=cascade-refused reason=dismiss-unverified"
+assert_eq "R39-sticky.onekey: exactly the ONE dismiss Enter" "$(sk_count agent-1 Enter)" "1"
+assert_eq "R39-sticky.nopaste: nothing pasted into the menu" "$(paste_count agent-1)" "0"
+teardown_test
+
+echo '=== Case B (#1739): a signalled event (over-limit resumed) cascades even with a cascade pending its ack ==='
+setup_test; r39_board
+detect_and_unstick                                     # episode scheduled
+echo "$(date +%s)" > "$UNSTICK_DIR/ratelimit.cascade.epoch"   # an earlier cascade awaiting its ack
+_unstick_reset_event_signal "over-limit-resumed:orchestrator"
+_unstick_reset_event_signal "credential-change"        # second source: first writer wins
+detect_and_unstick
+log_content=$(<"$UNSTICK_LOG")
+assert_contains "R39-signal.source: the first source is the one consumed" "$log_content" "case=B action=reset-event source=over-limit-resumed:orchestrator"
+assert_contains "R39-signal.a1: agent-1 resumed" "$log_content" "window=agent-1 case=B action=cascade-resumed fp="
+assert_eq "R39-signal.consumed: the event file is gone" "$([[ -e "$UNSTICK_DIR/ratelimit.reset-event" ]] && echo present || echo gone)" "gone"
+teardown_test
+
+echo '=== Case B (#1741 S1): ONE-SIDED reads are "could not look", never a change ==='
+s1_events() { grep -c 'action=credential-change' "$UNSTICK_LOG" || true; }
+setup_test; r39_board; r39_cred acct-A tier-1
+detect_and_unstick                                           # baseline A
+# logout: the store loses its identity while the config keeps oauthAccount
+printf '{}\n' > "$UNSTICK_CRED_STORE_FILE"; touch -d "@$(( $(date +%s) + 7 ))" "$UNSTICK_CRED_STORE_FILE"
+detect_and_unstick
+assert_eq "S1-logout.store: a store with no identity raises nothing" "$(s1_events)" "0"
+printf '{"other":1}\n' > "$UNSTICK_CRED_ACCOUNT_FILE"; touch -d "@$(( $(date +%s) + 9 ))" "$UNSTICK_CRED_ACCOUNT_FILE"
+detect_and_unstick
+assert_eq "S1-logout.both: both halves empty raises nothing" "$(s1_events)" "0"
+r39_cred acct-A tier-1                                       # log back in, SAME account
+detect_and_unstick
+assert_eq "S1-relogin.same: same-account login raises nothing" "$(s1_events)" "0"
+chmod 000 "$UNSTICK_CRED_STORE_FILE"; touch -d "@$(( $(date +%s) + 11 ))" "$UNSTICK_CRED_STORE_FILE"
+detect_and_unstick
+chmod 600 "$UNSTICK_CRED_STORE_FILE"; touch -d "@$(( $(date +%s) + 13 ))" "$UNSTICK_CRED_STORE_FILE"
+detect_and_unstick
+assert_eq "S1-chmod: an unreadable store, then readable again, raises nothing" "$(s1_events)" "0"
+good=$(<"$UNSTICK_CRED_ACCOUNT_FILE")
+printf '%s' "${good:0:30}" > "$UNSTICK_CRED_ACCOUNT_FILE"; touch -d "@$(( $(date +%s) + 15 ))" "$UNSTICK_CRED_ACCOUNT_FILE"
+detect_and_unstick
+printf '%s\n' "$good" > "$UNSTICK_CRED_ACCOUNT_FILE"; touch -d "@$(( $(date +%s) + 17 ))" "$UNSTICK_CRED_ACCOUNT_FILE"
+detect_and_unstick
+assert_eq "S1-torn: a torn (mid-write) config, then whole again, raises nothing" "$(s1_events)" "0"
+assert_not_contains "S1-nocascade: no window resumed across all of it" "$(<"$UNSTICK_LOG")" "cascade-resumed"
+r39_cred acct-B tier-1                                       # control: a REAL switch still fires
+detect_and_unstick
+assert_eq "S1-control: a real account switch still raises exactly one event" "$(s1_events)" "1"
+teardown_test
+
+echo '=== Case B (#1741 S1 follow-up): a login with NO subscription/tier fields still senses a switch ==='
+s1t_cred() { # <account-uuid>: a login shape carrying no subscriptionType / rateLimitTier
+    mkdir -p "$WORK/cred"
+    printf '{"oauthAccount":{"accountUuid":"%s","organizationUuid":"org-1"}}\n' "$1" > "$UNSTICK_CRED_ACCOUNT_FILE"
+    printf '{"claudeAiOauth":{"accessToken":"SECRET-TOKEN-%s","expiresAt":%s}}\n' "$1" "$RANDOM" > "$UNSTICK_CRED_STORE_FILE"
+    touch -d "@$(( $(date +%s) + RANDOM % 1000 + 20 ))" "$UNSTICK_CRED_STORE_FILE" "$UNSTICK_CRED_ACCOUNT_FILE"
+}
+setup_test; r39_board; s1t_cred acct-A
+detect_and_unstick
+assert_eq "S1t-baseline: a tier-less login yields a KNOWN baseline (not unknown)" \
+    "$([[ -s "$UNSTICK_DIR/credential.sig" ]] && echo known || echo unknown)" "known"
+s1t_cred acct-B
+detect_and_unstick
+assert_eq "S1t-switch: an account switch on a tier-less login raises one event" "$(s1_events)" "1"
+assert_contains "S1t-cascade: and the menus are cascaded" "$(<"$UNSTICK_LOG")" "window=agent-1 case=B action=cascade-resumed"
+teardown_test
+
+echo '=== Case B (#1741 S1 follow-up): a tier change on the SAME account is not an identity change ==='
+setup_test; r39_board; r39_cred acct-A tier-1
+detect_and_unstick
+r39_cred acct-A tier-2
+detect_and_unstick
+assert_eq "S1t-tier: same account, new tier raises nothing" "$(s1_events)" "0"
 teardown_test
 
 # ---- Summary -----------------------------------------------------------

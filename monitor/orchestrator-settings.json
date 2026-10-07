@@ -1,5 +1,8 @@
 {
   "skipDangerousModePermissionPrompt": true,
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  },
   "syncClaudeAiSkills": false,
   "syncClaudeAiPlugins": false,
   "env": {

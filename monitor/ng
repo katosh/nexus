@@ -383,8 +383,60 @@ source "$_script_dir/_bookkeeping.sh" || {
     exit 1
 }
 
-REPO="$("$_cfg" github.repo)"
-USER_LOGIN="$("$_cfg" github.user_login)"
+# `github.repo` IS READ FROM THE SAME TREE THE ROOT IDENTITY IS KEYED ON
+# (your-org/nexus-code#1650, #1649 N1). `_resolve_repo` recognises the nexus
+# root by IDENTITY with `_NG_ROOT`. `config/load.sh`, asked bare, reads
+# `$NEXUS_ROOT/config/nexus.yml` instead, and ITS fallback is its own directory
+# NOT de-nested. So the two answered about different trees: with NEXUS_ROOT
+# aimed at a foreign or stale root, a write POSTed to THAT root's repo at rc 0,
+# and a stale `work/<clone>`'s own `ng` read the clone's stale nexus.yml while
+# treating the primary as "home". Measured identical at 07fc9d7d and its parent.
+#
+# `_NG_ROOT` is decided by the SHARED one-tree rule, `nexus_config_root`
+# (monitor/_nexus-root.sh), which `upload-asset.sh` and `mint-token.sh` use too:
+# ng's own de-nested tree, unless that tree has NO OPINION (no nexus.yml, or the
+# example placeholder) and NEXUS_ROOT names another root — then that root. The
+# no-opinion arm is the config-less checkout OUTSIDE work/ run with
+# NEXUS_ROOT=<primary>, which the first cut of #1651 refused (the placeholder
+# counted as a disagreement) where base wrote to the right repo. When both trees
+# have an identity and they DIFFER, REPO is left EMPTY (every consumer fails
+# closed) and `_require_repo` names both sides. NEXUS_CONFIG is an explicit file
+# that wins inside load.sh, so it skips the comparison; `--repo` is the per-call
+# override and bypasses all of this.
+NG_REPO_CONFLICT=""
+if [[ -n "${NEXUS_CONFIG:-}" ]]; then
+    _NG_ROOT=$(nexus_primary_root "$_script_dir/.." 2>/dev/null) || _NG_ROOT=""
+elif _NG_ROOT=$(nexus_config_root "$_script_dir/.." 2>/dev/null); then
+    :
+elif _ng_crc=$?; (( _ng_crc == 3 || _ng_crc == 2 )); then
+    # rc 3: the two trees name different identities. rc 2: ng's OWN tree has a
+    # config/nexus.yml that cannot be read (your-org/nexus-code#1652 item 3) —
+    # a BROKEN config, which must not be read as "no opinion" and so must not
+    # hand the write to NEXUS_ROOT's nexus. Either way stdout is the one-line
+    # description, and every $REPO consumer refuses via _require_repo.
+    NG_REPO_CONFLICT="$_NG_ROOT"
+    _NG_ROOT=$(nexus_primary_root "$_script_dir/.." 2>/dev/null) || _NG_ROOT=""
+else
+    # FAIL CLOSED on any other rc. Falling back to ng's own tree here is a
+    # `||` collapse: a resolver that CRASHED (measured: an unset local under
+    # `set -u`, rc 1) would silently pick a root and the write would go through.
+    NG_REPO_CONFLICT="could not decide which nexus this ng acts for (one-tree resolver rc $_ng_crc)"
+    _NG_ROOT=$(nexus_primary_root "$_script_dir/.." 2>/dev/null) || _NG_ROOT=""
+fi
+unset _ng_crc
+[[ -n "$_NG_ROOT" ]] || _NG_ROOT=$(cd "$_script_dir/.." && pwd -P)
+# Read a github.* identity key from _NG_ROOT's config — never bare "$_cfg".
+_ng_cfg() { NEXUS_ROOT="$_NG_ROOT" "$_cfg" "$@"; }
+REPO="$(_ng_cfg github.repo)"
+USER_LOGIN="$(_ng_cfg github.user_login)"
+[[ -z "$NG_REPO_CONFLICT" ]] || REPO=""
+
+# Refuse, naming both sides, when the two roots disagree about github.repo.
+# Called wherever $REPO is about to be USED without an explicit --repo.
+_require_repo() {
+    [[ -z "$NG_REPO_CONFLICT" ]] && return 0
+    die "refusing to guess the target repo: $NG_REPO_CONFLICT. Run the ng of the nexus you mean, fix NEXUS_ROOT, or pass --repo explicitly (your-org/nexus-code#1650)."
+}
 
 # Resolve the canonical `monitor/.state/` for this nexus operator.
 # Precedence (most-specific first):
@@ -421,6 +473,13 @@ _resolve_state_dir() {
     printf '%s/.state' "$_script_dir"
 }
 STATE_DIR="$(_resolve_state_dir)"
+# The request inbox: the ONE resolver every reader and writer calls
+# (your-org/nexus-code#1723). Never compose "$STATE_DIR/requests" here.
+_ng_requests_dir() {
+    declare -F nexus_requests_dir >/dev/null 2>&1 \
+        || . "$_script_dir/_requests_dir.sh" 2>/dev/null || return 1
+    nexus_requests_dir "$STATE_DIR"
+}
 DASH_CACHE="$STATE_DIR/dashboard.md"
 # Append-only list of comment- and issue-ids we've eyed from this
 # toolchain. Read by monitor/watcher/main.sh's snapshot_github to
@@ -557,7 +616,7 @@ _usage_for() {
         cmd_stranded_branches) echo "usage: ng stranded-branches [--since <date>] [--base <ref>] [--remote <name>] [--with-prs] [--repo <owner/name>]   # fetch, then list every remote branch NOT merged into the integration branch (commits ahead, last-commit date, subject); --with-prs marks which have an open PR (#1399)" ;;
         cmd_show)           echo "usage: ng show <comment-id> [--repo <owner/name>] [--meta]" ;;
         cmd_comment_edit)   echo "usage: ng comment-edit <comment-id> (--expect-updated-at <ts> | --force) [--repo <owner/name>] [--body-file <path>]   # CAS: exit 4 on concurrent edit; get <ts> from \`ng show <id> --meta\`" ;;
-        cmd_upload)         echo "usage: ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin|latest] [--message <msg>]" ;;
+        cmd_upload)         echo "usage: ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin|latest] [--message <msg>] [--replace]" ;;
         cmd_retire_window)  echo "usage: ng retire-window <window> [--reason <text>] [--dry-run] [--keep-window] [--assume-absent] [--strict]   # preflight + kill + prune the MANIFESTED state surfaces + verify, then report references the manifest does not name (--strict makes those a failure)" ;;
         cmd_decision_answer) echo "usage: ng decision-answer <window> <fp> allow|deny --nonce <nonce> [--reason <text>]   # ANSWER a forwarded dangerous-rm request (orchestrator-only, #1632)" ;;
         cmd_decision_ack)   echo "usage: ng decision-ack <window> <fingerprint> | <path-to-decision-json> | <window> --all [--reason <text>]   # DURABLE ack of a pending-decision row (\`rm\` does not stick)" ;;
@@ -571,11 +630,13 @@ _usage_for() {
        [--skeptic-subject <report-path|sha256>]   # WHAT YOU ACTUALLY READ. --skeptic-target is a SPAWN-TIME stamp and goes stale the moment a retained reviewer is re-tasked; this is the one field on the path that is your assertion rather than an inference (#963)
        [--not-a-skeptic-verdict <why>]   # a skeptic-STAMPED window wrapping up ORDINARY WORKER WORK: takes the producer path, asserts no verdict, clears no marker (#879)
    --skeptic-findings is OPTIONAL and an omitted count is recorded AS ABSENT, never as a measured 0 (#881)
-   EXIT CODES: 0 = published | 1 = a step FAILED, retry it | 3 = nothing failed and NOTHING WAS PUBLISHED.
+   EXIT CODES: 0 = published | 1 = a step FAILED, retry it | 3 = nothing failed and NOTHING WAS PUBLISHED
+       | 4 = a REQUIRED skeptic gate could NOT be armed (the pending marker did not write, e.g. EROFS): the
+       wrap-up STOPPED before publishing anything; make the state dir writable and re-run (#1719).
        A retry reproduces 3 exactly; only you can clear it. Either the composed teaser carried no claim
        (#1114), or your report changed outside the Summary section and the composed body did not (#862).
        stderr names the cause and the ways out." ;;
-        cmd_skeptic_arm) echo "usage: ng skeptic-arm <window> --report <path> [--issue N] [--depth N] [--state-dir D]   # RECORD WHAT AN ARM IS ABOUT — AND OPEN THE ROUND (#1537): a new arm ARCHIVES the prior round (its DONE/RELEASED sentinels AND its *.answered.md correspondence — moved to skeptic/.archive/<task>.reset-<ts>/, path printed on stderr, #1609) and writes the pending marker await reads; an existing marker is never rewritten. RECORD WHAT AN ARM IS ABOUT, for the writers of the armed state that live outside ng (spawn-worker.sh --skeptic-role). exit 0 = an \`armed\` row was appended, 3 = this artefact is ALREADY OUTSTANDING so nothing was appended, 4 = COULD NOT NAME A SUBJECT (says so on stderr; a marker may still exist). Skipping the append when the sha is already outstanding is load-bearing: a second arm for one artefact IS \`ambiguous-N-arms-outstanding\` (#1156 pole B)" ;;
+        cmd_skeptic_arm) echo "usage: ng skeptic-arm <window> --report <path> [--issue N] [--depth N] [--state-dir D]   # RECORD WHAT AN ARM IS ABOUT — AND OPEN THE ROUND (#1537): a new arm ARCHIVES the prior round (its DONE/RELEASED sentinels AND its *.answered.md correspondence — moved to skeptic/.archive/<task>.reset-<ts>/, path printed on stderr, #1609) and writes the pending marker await reads; an existing marker is never rewritten. RECORD WHAT AN ARM IS ABOUT, for the writers of the armed state that live outside ng (spawn-worker.sh --skeptic-role). exit 0 = an \`armed\` row was appended, 3 = this artefact is ALREADY OUTSTANDING so nothing was appended, 4 = COULD NOT NAME A SUBJECT (says so on stderr; a marker may still exist), 5 = the arm row could NOT be WRITTEN (an unwritable state dir; the round and marker were still opened, #1719). Skipping the append when the sha is already outstanding is load-bearing: a second arm for one artefact IS \`ambiguous-N-arms-outstanding\` (#1156 pole B)" ;;
         cmd_skeptic_ledger_rotate) echo "usage: ng skeptic-ledger-rotate <window> [--state-dir D]   # A REUSED WINDOW NAME MUST NOT MERGE UNRELATED ROUNDS (#1252). Called by spawn-worker.sh on a FRESH spawn. exit 0 = a fully SETTLED ledger was archived to skeptic/.archive/, 3 = no ledger on this key, 5 = REFUSED and KEPT — an arm is outstanding, a marker is pending, or the ledger could not be read. It never rotates an open obligation" ;;
         cmd_skeptic_obligations) echo "usage: ng skeptic-obligations <window> [--state-dir <path>]   # WHAT THIS WINDOW OWES, BY TASK. One line per artefact still outstanding, naming its issue and report. exit 0 = nothing outstanding, 1 = one or more. The pending MARKER cannot answer this: its content is \`1\`, so presence cannot say WHICH obligation and absence cannot be checked (#961)" ;;
         cmd_skeptic_orphans) echo "usage: ng skeptic-orphans [--state-dir <path>]   # EVERY skeptic-pending marker, classified by whether its window is PRESENT in tmux (the only discriminator that separates a live pairing from an orphan — age does not, measured), with the action log's last row for the window. REPORT ONLY, reaps nothing; per orphan the remedy is ng skeptic-evidence then ng skeptic resolve. exit 0 = looked, 3 = no marker store" ;;
@@ -584,6 +645,9 @@ _usage_for() {
         cmd_report_init)    echo "usage: ng report-init <slug> [--project <name>] [--issue <#>] [--comment-id <id>] [--reports-dir <path>] [--skeptic-role]" ;;
         cmd_report_check)   echo "usage: ng report-check <path> [--allow-todo] [--skeptic-gate-settling]" ;;
         cmd_report_grep)    echo "usage: ng report-grep [grep-opts] <pattern> [path...]   # ignore-file-blind corpus search; exit 3 (not a silent zero) if the tree is invisible to the search (#618)" ;;
+        cmd_doctor)         echo "usage: ng doctor [--quiet]   # read-only setup check: cc install vs expected, gh floor, config placeholders + mode, transcript root; one PASS/WARN/FAIL/UNKNOWN row each; exit 1 on any FAIL (#1722)" ;;
+        cmd_degraded)       echo "usage: ng degraded probe [--timeout S] [--surface NAME=ABS_DIR]... | status [--timeout S]   # probe: per-surface writability OK/EROFS/ENOSPC/EACCES/HANG/MISSING/ERROR; status: the watcher's degraded status file + a probe; exit 0 all OK, 1 not OK or watcher degraded, 2 usage/refused path, 3 could not probe (#1724)" ;;
+        cmd_codex)          echo "usage: ng codex [run] --cd <git-root> (--prompt-file F | --prompt-stdin) [--out DIR] [--model M] [--sandbox MODE] [--timeout S] [--allow-dirty] [--no-git] [--resume ID] [--ephemeral] [--config K=V] [--also-watch DIR] [--output-schema F] [--background] [--dry-run]   # supervised Codex co-worker; exit 0 completed, 3 turn-failed, 4 timeout, 5 unavailable, 6 workdir, 7 indeterminate (#1640)" ;;
         cmd_longjob)        echo "usage: ng longjob add <kind>:<target> [--desc T] [--interval S] [--notify terminal|transitions] [--persistent] | list | show <id> | rm <id> | status | events [N] | await <id> [--timeout S] | probe <kind>:<target>   # kinds: slurm asyncrun pid file cmd (#1535)" ;;
         cmd_fetch_asset)    echo "usage: ng fetch-asset <user-attachments URL> [--out PATH] [--image-only]" ;;
         cmd_issue)          echo "usage: ng issue <n> | ng issue create ... | ng issue comment <n> ... | ng issue close <n> ... | ng issue view <n> ..." ;;
@@ -747,6 +811,44 @@ _resolve_repo() {
     if [[ "$origin" =~ github\.com[:/]([^/]+)/([^/]+)$ ]]; then
         cwd_repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]%.git}"
     fi
+    # your-org/nexus-code#1636: a NEXUS ROOT's origin is the IMPLEMENTATION
+    # repo (every operator clones your-org/nexus-code), never the repo this
+    # nexus's issues live in. So "cwd origin" there answered about the wrong
+    # repository: `ng issue 383` at the root read nexus-code #383 at rc 0, and
+    # every write verb refused with "cwd is your-org/nexus-code". The same
+    # holds for any directory whose `git` walks UP to the root — every
+    # `work/<dir>` that is not its own repository.
+    #
+    # The nexus root is recognised by IDENTITY: the cwd toplevel IS the primary
+    # root this `ng` belongs to (its own tree, de-nested out of any
+    # `work/<clone>` by the shared resolver). A secondary clone
+    # (`work/nexus-code-<task>/`) is a different directory, so cwd origin stays
+    # the right answer there — and write verbs keep refusing.
+    #
+    # NOT "the toplevel carries config/nexus.yml": that was the first cut, and
+    # the skeptic pass measured 2 of 815 secondary clones on one host carrying a
+    # STALE copy of that file, where a write without --repo went to github.repo
+    # at rc 0 instead of refusing — #1636's own class, one directory down.
+    if [[ -n "$cwd_repo" ]]; then
+        local cwd_top nx_root
+        cwd_top=$(git rev-parse --show-toplevel 2>/dev/null || true)
+        # HOME is the root this ng ACTS FOR (#1651, the one-tree rule's answer)
+        # AND ng's own de-nested tree. They differ only for a config-less
+        # checkout outside work/ acting for NEXUS_ROOT's nexus, where base
+        # treated the checkout itself as home and wrote to github.repo from it;
+        # that is kept. Under work/ both are the primary, so a secondary clone
+        # still keeps its cwd origin and a write still refuses (#1645).
+        nx_root="$_NG_ROOT"
+        local nx_own
+        nx_own=$(nexus_primary_root "$_script_dir/.." 2>/dev/null || true)
+        if [[ -n "$cwd_top" ]] && { { [[ -n "$nx_root" && "$cwd_top" -ef "$nx_root" ]]; } \
+                || { [[ -n "$nx_own" && "$cwd_top" -ef "$nx_own" ]]; }; }; then
+            cwd_repo=""
+        fi
+    fi
+    # #1650: a cwd origin can still answer a READ, but no path may fall back to
+    # a $REPO the two roots disagree about.
+    [[ "$mode" == read && -n "$cwd_repo" ]] || _require_repo
     case "$mode" in
         read)
             if [[ -n "$cwd_repo" && "$cwd_repo" != "${REPO:-}" ]]; then
@@ -1477,7 +1579,7 @@ cmd_stranded_branches() {
 
 cmd_upload() {
     _help_check "$@"
-    (( $# > 0 )) || die "usage: ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin|latest] [--message <msg>]"
+    (( $# > 0 )) || die "usage: ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin|latest] [--message <msg>] [--replace]"
     exec "$_script_dir/upload-asset.sh" "$@"
 }
 
@@ -1494,18 +1596,36 @@ cmd_upload() {
 #      breaks crash-resume, which keys off the report's session-id.
 #   1. $CLAUDE_PROJECT_DIR/sessions/current_session_id — Claude Code
 #      writes this when it knows; cheap and reliable.
-#   2. Most-recently-modified ~/.claude/projects/<cwd-slug>/<uuid>.jsonl
+#   2. Most-recently-modified <root>/<cwd-slug>/<uuid>.jsonl over EVERY
+#      transcript root (cc_transcript_roots: $CLAUDE_CONFIG_DIR/projects and
+#      ~/.claude/projects, #1720),
 #      where <cwd-slug> mirrors Claude Code's path normalisation:
 #      every non-alphanumeric character (including '/' AND '_') becomes
 #      '-', and the leading '-' from a leading '/' is preserved.
 #      e.g. /shared/your-lab-m/user/operator/nexus → -shared-your-lab-m-user-your-nexus.
 #      LAST-RESORT ONLY: freshest-jsonl is a heuristic, not the caller.
-#   3. Fallback: scan ~/.claude/projects/ for any project dir whose name
+#   3. Fallback: scan each root, in order, for any project dir whose name
 #      contains the slugified cwd tail; pick the most-recently-modified.
 #      A stderr warning fires so future divergences in Claude Code's
 #      slug rule are visible.
 #   4. Empty string — caller substitutes "unknown".
 _report_session_id() {
+    # Layer -1: a CODEX worker (your-org/nexus-code#1640) answers from its own
+    # env and RETURNS, before any ~/.claude fallback below: those read the
+    # newest Claude transcript for this cwd, which for a Codex worker is SOME
+    # OTHER agent's session (often the orchestrator's) — a confident wrong id
+    # in a report's frontmatter. Measured on codex-cli 0.156.1: Codex exports
+    # CODEX_THREAD_ID into every shell it runs, equal to the session_id its
+    # hooks receive (UUIDv7, so the UUID shape check applies). A malformed
+    # value yields NOTHING (report-check then refuses `unknown`), never a
+    # fallthrough to a Claude transcript.
+    if [[ -n "${CODEX_THREAD_ID:-}" ]]; then
+        local cx_sid="${CODEX_THREAD_ID//[$'\n\r\t ']/}"
+        if [[ "$cx_sid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            printf '%s' "$cx_sid"
+        fi
+        return 0
+    fi
     # Layer 0: the caller's own session, straight from Claude Code.
     if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
         local env_sid="${CLAUDE_CODE_SESSION_ID//[$'\n\r\t ']/}"
@@ -1526,20 +1646,44 @@ _report_session_id() {
     local cwd cwd_slug latest projects_dir
     cwd=$(pwd)
     cwd_slug=$(printf '%s' "$cwd" | sed 's|[^a-zA-Z0-9]|-|g')
-    projects_dir="$HOME/.claude/projects"
-    if [[ -d "$projects_dir/$cwd_slug" ]]; then
-        latest=$(ls -t "$projects_dir/$cwd_slug"/*.jsonl 2>/dev/null | head -1)
+    # EVERY transcript root, not just ~/.claude/projects (#1720 residual):
+    # inside agent-sandbox Claude Code writes under $CLAUDE_CONFIG_DIR/projects,
+    # which is a separate directory for an operator whose ~/.claude/projects
+    # did not exist at the first sandbox launch.
+    local -a _roots=() _globs=()
+    declare -F cc_transcript_roots >/dev/null 2>&1 \
+        || . "$_script_dir/_cc_transcript_roots.sh" 2>/dev/null
+    if declare -F cc_transcript_roots >/dev/null 2>&1; then
+        while IFS= read -r projects_dir; do
+            [[ -n "$projects_dir" ]] && _roots+=( "$projects_dir" )
+        done < <(cc_transcript_roots)
+    fi
+    # Partial tree (the helper absent, as in a copied `ng`): the same roots in
+    # the same order, the way watcher/_lib.sh falls back — never ~/.claude only.
+    if (( ${#_roots[@]} == 0 )); then
+        [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] && _roots+=( "$CLAUDE_CONFIG_DIR/projects" )
+        _roots+=( "$HOME/.claude/projects" )
+    fi
+    for projects_dir in "${_roots[@]}"; do
+        [[ -d "$projects_dir/$cwd_slug" ]] && _globs+=( "$projects_dir/$cwd_slug"/*.jsonl )
+    done
+    if (( ${#_globs[@]} > 0 )); then
+        latest=$(ls -t "${_globs[@]}" 2>/dev/null | head -1)
         [[ -n "$latest" ]] && { basename -s .jsonl "$latest"; return 0; }
     fi
     # Fallback: cwd-tail substring match. Slugify the tail so dirs
     # under work/<project_with_underscores> still resolve.
-    [[ -d "$projects_dir" ]] || return 0
-    local tail tail_slug match
+    local tail tail_slug match=""
     tail="${cwd##*/}"
     tail_slug=$(printf '%s' "$tail" | sed 's|[^a-zA-Z0-9]|-|g')
     [[ -n "$tail_slug" ]] || return 0
-    match=$(ls -t -d "$projects_dir"/*"$tail_slug"* 2>/dev/null | head -1)
-    [[ -n "$match" && -d "$match" ]] || return 0
+    for projects_dir in "${_roots[@]}"; do
+        [[ -d "$projects_dir" ]] || continue
+        match=$(ls -t -d "$projects_dir"/*"$tail_slug"* 2>/dev/null | head -1)
+        [[ -n "$match" && -d "$match" ]] && break
+        match=""
+    done
+    [[ -n "$match" ]] || return 0
     echo "ng: warning: session-id slug '$cwd_slug' not found; falling back to '$(basename "$match")' (Claude Code's slug rule may have changed)" >&2
     latest=$(ls -t "$match"/*.jsonl 2>/dev/null | head -1)
     [[ -n "$latest" ]] && basename -s .jsonl "$latest"
@@ -2873,7 +3017,9 @@ _wrapup_deliver_channel_reply() {
 #
 # Step 4 already records every successful wrap-up comment in the action
 # log with its url, keyed by (issue, report-basename, repo). Scan that log
-# for a prior hit and reuse the recorded url instead of posting again.
+# for a prior hit so the caller can READ that comment and post nothing when
+# this run's content is identical. The prior comment is never edited or
+# re-pointed (your-org/nexus-code#1637) — see Step 2 in cmd_wrap_up.
 # Keyed on the LOGICAL wrap-up identity, not the per-upload asset url
 # (which the upload step regenerates on every retry). Echoes the most
 # recent matching comment url on stdout; empty when none exists (the
@@ -2907,6 +3053,10 @@ _wrapup_prior_comment_url() {
 # records, per wrap-up, which trigger it carried and what its comment step
 # achieved.
 #
+# PUBLISHED means `ok` or `posted-new` (your-org/nexus-code#1637). `edited` and
+# `updated-and-posted` have had no producer since #1637 retired them, and stay
+# in the allowlist ONLY so action-log rows written before it still count.
+#
 # FAIL CLOSED (rc 1 => withhold). Withholding costs one watcher re-emit; a
 # false rocket is SILENT — `_mark_processed rocket` evicts the mention from
 # the #360 re-emit registry, marking the escalation handled with nothing
@@ -2924,7 +3074,8 @@ _wrapup_trigger_already_answered() {
           | select(.event == "wrap-up")
           | select(.issue == $i and .report == $r and .repo == $repo)
           | select((."trigger-comment" // "") == $t)
-          | select((.comment // "") == "ok" or (.comment // "") == "edited"
+          | select((.comment // "") == "ok" or (.comment // "") == "posted-new"
+                   or (.comment // "") == "edited"
                    or (.comment // "") == "updated-and-posted")
         ] | length' "$log_file" 2>/dev/null) || return 1
     [[ "$hit" =~ ^[0-9]+$ ]] || return 1
@@ -2932,112 +3083,31 @@ _wrapup_trigger_already_answered() {
 }
 
 
-# Re-point a prior wrap-up link comment at a fresh asset upload (#524
-# defect 2). Every `ng wrap-up` run re-uploads the report to a NEW
-# SHA-pinned blob, so a re-wrap that merely REUSES the prior comment
-# leaves the thread linking the PRE-correction report while printing
-# success (observed: `#523` — the reused comment linked a stale blob
-# with 0 mentions of the corrected finding; the new blob had 9).
-#
-# Reads the prior comment, splices every asset link ending in this
-# report's basename over to <new-asset-url>, and writes back through
-# the CAS path (_comment_patch_cas) so the re-point can't itself
-# reintroduce the lost-update race. One retry on a detected concurrent
-# edit (re-read + re-splice), then fail loud.
-#
-#   _wrapup_repoint_link_comment <target> <prior-comment-html-url>
-#                                <report-basename> <new-asset-url>
-#   stdout: comment html_url
-#   rc 0  re-pointed (or already pointing at the new blob)
-#   rc 2  cannot re-point (comment deleted / id unparseable / body no
-#         longer references this report) — caller should post fresh
-#   rc 1  hard failure (fetch/PATCH/verify), including CAS conflicts
-#         that persisted across the retry
-_wrapup_repoint_link_comment() {
-    local target="$1" prior_url="$2" bname="$3" new_url="$4"
-    local cid="${prior_url##*issuecomment-}"
-    if [[ ! "$cid" =~ ^[0-9]+$ ]]; then
-        printf 'wrap-up: prior comment url has no issuecomment-<id> suffix: %s\n' "$prior_url" >&2
-        return 2
-    fi
-    local attempt meta cur_body cur_updated new_body out rc
-    for attempt in 1 2; do
-        meta=$(api "/repos/$target/issues/comments/$cid" 2>/dev/null) || {
-            printf 'wrap-up: prior link comment %s no longer fetchable (deleted?)\n' "$cid" >&2
-            return 2
-        }
-        cur_body=$(jq -r '.body // empty' <<<"$meta")
-        cur_updated=$(jq -r '.updated_at // empty' <<<"$meta")
-        if [[ -z "$cur_body" || -z "$cur_updated" ]]; then
-            printf 'wrap-up: prior link comment %s: malformed metadata\n' "$cid" >&2
-            return 2
-        fi
-        new_body=$(_replace_asset_links "$cur_body" "$bname" "$new_url")
-        if [[ "$new_body" == "$cur_body" ]]; then
-            if [[ "$cur_body" == *"$new_url"* ]]; then
-                # Idempotent retry: the comment already links the new blob.
-                printf '%s\n' "$prior_url"
-                return 0
-            fi
-            printf 'wrap-up: prior link comment %s no longer references %s — posting fresh instead\n' \
-                "$cid" "$bname" >&2
-            return 2
-        fi
-        rc=0
-        out=$(_comment_patch_cas "$target" "$cid" "$new_body" "$cur_updated") || rc=$?
-        if (( rc == 0 )); then
-            printf '%s\n' "$out"
-            return 0
-        fi
-        # rc 4 = someone edited between our read and write; re-read the
-        # CURRENT body and re-splice once. Anything else is a hard fail.
-        (( rc == 4 )) || return 1
-    done
-    printf 'wrap-up: comment %s kept moving under concurrent edits; re-run ng wrap-up\n' "$cid" >&2
-    return 1
-}
 
-# CAS-edit a wrap-up link comment to an EXPLICIT new body
-# (your-org/nexus-code#656).
-#
-# `_wrapup_repoint_link_comment` above only ever rewrites asset URLs
-# inside the existing body. That is right for a pure re-run, and it is
-# why a CORRECTED `## Summary` could never reach the thread: the composed
-# body was recomputed every run and then discarded, while the caller was
-# told `UPDATED` and given exit 0.
-#
-# Same optimistic-concurrency shape as the re-point path, deliberately —
-# an edit that silently clobbers a concurrent one would be the same class
-# of defect in a new place.
-_wrapup_set_comment_body() {
-    local target="$1" prior_url="$2" new_body="$3"
-    local cid="${prior_url##*issuecomment-}"
-    [[ "$cid" =~ ^[0-9]+$ ]] || {
-        printf 'wrap-up: prior comment url has no issuecomment-<id> suffix: %s\n' "$prior_url" >&2
-        return 2
-    }
-    local attempt meta cur_body cur_updated out rc
-    for attempt in 1 2; do
-        meta=$(api "/repos/$target/issues/comments/$cid" 2>/dev/null) || {
-            printf 'wrap-up: prior link comment %s no longer fetchable (deleted?)\n' "$cid" >&2
-            return 2
-        }
-        cur_body=$(jq -r '.body // empty' <<<"$meta")
-        cur_updated=$(jq -r '.updated_at // empty' <<<"$meta")
-        [[ -n "$cur_updated" ]] || {
-            printf 'wrap-up: prior link comment %s: malformed metadata\n' "$cid" >&2
-            return 2
-        }
-        if [[ "$cur_body" == "$new_body" ]]; then
-            printf '%s\n' "$prior_url"; return 0
-        fi
-        rc=0
-        out=$(_comment_patch_cas "$target" "$cid" "$new_body" "$cur_updated") || rc=$?
-        if (( rc == 0 )); then printf '%s\n' "$out"; return 0; fi
-        (( rc == 4 )) || return 1
-    done
-    printf 'wrap-up: comment %s kept moving under concurrent edits; re-run ng wrap-up\n' "$cid" >&2
-    return 1
+# your-org/nexus-code#1637. A wrap-up whose content differs from the earlier
+# wrap-up comment POSTs a NEW comment and appends this one line to it, linking
+# the history WITHOUT touching the earlier comment (which is never edited or
+# re-pointed: asset URLs are SHA-pinned, so its link already cites the report
+# as it was when it was posted). The #524 re-point and #656 in-place edit
+# helpers that used to live here are gone with the behaviour.
+_WU_SUPERSEDES_PREFIX='Supersedes the earlier wrap-up comment: '
+
+# Drop a trailing `Supersedes …` line that THIS verb appended, so a later
+# identical re-run compares equal to the comment it would otherwise have
+# re-posted. Only the LAST line is examined; trailing blank lines left behind
+# are stripped too (bodies are composed via $(…), which strips them anyway).
+# Bound, stated: a supplied body whose own last line happens to begin with the
+# prefix is compared as if that line were absent. That errs toward `updated`
+# (nothing posted) for such a body only when everything else is identical.
+#   _wrapup_strip_supersedes_line <body>   → stdout: body without the line
+_wrapup_strip_supersedes_line() {
+    local b="$1" last
+    last="${b##*$'\n'}"
+    if [[ "$b" == *$'\n'* && "$last" == "$_WU_SUPERSEDES_PREFIX"* ]]; then
+        b="${b%$'\n'*}"
+        while [[ "$b" == *$'\n' ]]; do b="${b%$'\n'}"; done
+    fi
+    printf '%s' "$b"
 }
 
 # ---- skeptic protocol (skills/nexus.skeptic) ----------------------------
@@ -3423,15 +3493,18 @@ _skeptic_artefact_sha() {
 # _skeptic_record_arm <pending-dir> <key> <sha> <issue> <report-path>
 # Append the subject of the arm being written RIGHT NOW. Append-only: no
 # read-modify-write race, no temp-file dance, and round N-1 survives beneath
-# round N as the audit trail. Best-effort — a state dir that cannot be written
-# must not fail a wrap-up; it just means no subject was recorded and therefore
-# no suppression is possible later. Failing toward arming, as everywhere here.
+# round N as the audit trail. A state dir that cannot be written must not fail
+# a wrap-up; it just means no subject was recorded and therefore no suppression
+# is possible later. Failing toward arming, as everywhere here. But the append's
+# OUTCOME is returned (rc 1 = not recorded), so a caller can SAY so rather than
+# imply it was (your-org/nexus-code#1719: an EROFS append was silent).
 _skeptic_record_arm() {
     local dir="$1" key="$2" sha="$3" issue="${4:-}" report="${5:-}"
     [[ -n "$dir" && -n "$key" && -n "$sha" ]] || return 0
     printf 'armed\t%s\t%s\t%s\t%s\n' "$sha" "$(date -Is 2>/dev/null || printf '?')" \
         "${issue:--}" "${report:--}" \
-        >> "$(_skeptic_ledger_file "$dir" "$key")" 2>/dev/null || true
+        >> "$(_skeptic_ledger_file "$dir" "$key")" 2>/dev/null || return 1
+    return 0
 }
 
 # _skeptic_last_arm_ts <pending-dir> <key> — the timestamp (column 3) of the
@@ -4134,7 +4207,8 @@ _skeptic_rearm_subject() {
 # re-blocks the worker. Prints a one-word outcome; never fails the wrap-up.
 _skeptic_file_rearm_adjudication() {
     local window="$1" issue="$2" report="$3" sha="${4:--}" class="$5" detail="$6" why="$7"
-    local chan="$_script_dir/request-channel.sh" origin slug reqdir="$STATE_DIR/requests" g
+    local chan="$_script_dir/request-channel.sh" origin slug reqdir g
+    reqdir=$(_ng_requests_dir) || reqdir=""
     [[ -n "$window" ]] || { printf 'skipped (no window)'; return 0; }
     [[ -x "$chan" ]] || { printf 'FAILED (request-channel.sh missing)'; return 0; }
     origin=$(wk_encode_word "$window" 2>/dev/null) || origin=""
@@ -6774,7 +6848,35 @@ _wrapup_skeptic_step() {
                 (( _wu_reset_rc == 0 )) || printf 'WARNING: archiving the prior skeptic round for %s FAILED (rc=%s) — its DONE/answered files may still be in the channel (#469).\n' \
                     "$source_window" "$_wu_reset_rc"
             fi
-            [[ -n "$sw_safe" ]] && printf '%s' "$next" > "$pending_dir/${sw_safe}" 2>/dev/null || true
+            # THE MARKER IS THE GATE, SO ITS WRITE IS CHECKED (your-org/nexus-code#1719).
+            # This used to be `printf … > marker 2>/dev/null || true`, and the
+            # block below then printed "A skeptic-pending marker is set" whatever
+            # had happened. On a read-only mount (your-nexus#386, EROFS) the
+            # write failed, nothing was armed, nothing blocked retirement, and
+            # the output said the gate was armed: a manufactured success whose
+            # only evidence was an absence. The write is now READ BACK, and a
+            # marker that does not hold `$next` stops the wrap-up with exit 4
+            # BEFORE any later step — before the upload, the comment and the
+            # `wrap-up` action row the window-cleanup loop reads as "wrapped",
+            # because with no marker nothing else would hold this window open.
+            if [[ -n "$sw_safe" ]]; then
+                local _sk_mk="$pending_dir/${sw_safe}" _sk_mk_err="" _sk_mk_got=""
+                _sk_mk_err=$( { printf '%s' "$next" > "$_sk_mk"; } 2>&1 ) || true
+                _sk_mk_got=$(cat -- "$_sk_mk" 2>/dev/null) || _sk_mk_got=""
+                if [[ "$_sk_mk_got" != "$next" ]]; then
+                    {
+                        printf '\n=== SKEPTIC REQUIRED — BUT THE GATE COULD NOT BE ARMED (your-org/nexus-code#1719) ===\n'
+                        printf 'The skeptic-pending marker was NOT written: %s\n' "$_sk_mk"
+                        printf '  write: %s\n' "${_sk_mk_err:-<no error text; the file does not hold depth $next>}"
+                        printf 'NOTHING holds this review: no marker, no skeptic-ledger row, no\n'
+                        printf 'spawn-skeptic request, and retire-preflight has nothing to refuse on.\n'
+                        printf 'This wrap-up STOPPED HERE: nothing was uploaded, commented, logged or\n'
+                        printf 'retained. Make %s writable (a read-only mount?) and re-run\n' "$pending_dir"
+                        printf 'the same wrap-up; or tell the orchestrator that %s owes a REQUIRED skeptic.\n' "$source_window"
+                    } >&2
+                    return 4
+                fi
+            fi
             # RECORD WHAT THIS ARM IS ABOUT (your-org/nexus-code#984, #963).
             #
             # The marker holds a depth integer and nothing else, so from the
@@ -6794,8 +6896,14 @@ _wrapup_skeptic_step() {
                 local _sk_arm_sha=""
                 _sk_arm_sha=$(_skeptic_artefact_sha "${_SK_REPORT_PATH:-}") || _sk_arm_sha=""
                 if [[ -n "$_sk_arm_sha" ]]; then
+                    # A failed append is SAID, never implied (#1719). It does not
+                    # stop the wrap-up: the marker above holds the review, and a
+                    # missing subject only means no later suppression is possible,
+                    # which fails toward arming.
                     _skeptic_record_arm "$pending_dir" "$sw_safe" \
-                        "$_sk_arm_sha" "$issue" "${_SK_REPORT_PATH:-}"
+                        "$_sk_arm_sha" "$issue" "${_SK_REPORT_PATH:-}" \
+                        || printf 'WARNING: the skeptic-ledger arm row was NOT recorded (%s) — the marker still holds the review, but this arm has no recorded subject (your-org/nexus-code#1719).\n' \
+                            "$(_skeptic_ledger_file "$pending_dir" "$sw_safe")" >&2
                 fi
                 # The owed delta is now carried by the MARKER (and the arm): hand
                 # the promise over, keeping the record for the audit trail. Only
@@ -6845,7 +6953,14 @@ _wrapup_skeptic_step() {
             printf 'CONSEQUENCE: a skeptic MUST validate this result; this window cannot\n'
             printf 'retire until a skeptic returns a verdict (retire-preflight.sh enforces\n'
             printf 'the skeptic-pending marker — see skills/nexus.window-cleanup).\n'
-            printf 'A skeptic-pending marker is set; the task is NOT complete until a\n'
+            # The claim is made only where it is true (#1719): the marker was
+            # read back above, and with no source window none was written.
+            if [[ -n "$sw_safe" ]]; then
+                printf 'A skeptic-pending marker is set; the task is NOT complete until a\n'
+            else
+                printf 'NO skeptic-pending marker was written (no source window resolved, so\n'
+                printf 'nothing gates a retirement); the task is still NOT complete until a\n'
+            fi
             printf 'skeptic returns a verdict. The orchestrator should spawn:\n\n'
             _skeptic_spawn_cmd "$source_window" "$next"
             printf '\nWhile the skeptic reviews, DO NOT go idle — enter the await loop\n'
@@ -8029,8 +8144,18 @@ cmd_skeptic_arm() {
         return 3
     fi
     mkdir -p "$pend" 2>/dev/null || true
-    _skeptic_record_arm "$pend" "$key" "$sha" "$issue" "$rp"
+    # The append's outcome decides the word printed (your-org/nexus-code#1719,
+    # the instance after wrap-up's): `armed` used to print after an EROFS
+    # append that recorded nothing. The round is still opened either way: the
+    # marker is the gate, and failing toward a shut gate is the safe side.
+    local _rec_rc=0
+    _skeptic_record_arm "$pend" "$key" "$sha" "$issue" "$rp" || _rec_rc=$?
     _skeptic_arm_open_round "$sd" "$pend" "$key" "$window" "$depth" open
+    if (( _rec_rc != 0 )); then
+        printf 'ng skeptic-arm: the arm row was NOT recorded for %s (append to %s failed — a read-only or full state dir?): no subject is on record, so a verdict cannot be attributed to this artefact. The round was opened anyway (the marker is the gate). Exit 5 (#1719).\n' \
+            "$window" "$(_skeptic_ledger_file "$pend" "$key")" >&2
+        return 5
+    fi
     printf 'armed %s sha=%s issue=%s report=%s\n' "$window" "$sha" "${issue:--}" "$rp"
     return 0
 }
@@ -9084,7 +9209,11 @@ _wrapup_file_spawn_skeptic_request() {
     # `repo_explicit` defaults to 1: a direct caller that passes a repo
     # POSITIONALLY is asserting it. Only `cmd_wrap_up` can know whether its repo
     # came from `--repo` or from the `github.repo` default, so only it passes 0.
+    # `comment_landed` (your-org/nexus-code#1700) is 1 when THIS RUN's link
+    # comment POST to `<repo>/issues/<issue>` succeeded — GitHub itself has then
+    # confirmed the thread, so a defaulted repo needs no further probe.
     local trigger_comment="$5" repo="$6" reply_to="${7:-}" repo_explicit="${8:-1}"
+    local comment_landed="${9:-0}"
     (( ${_SK_SPAWN_REQ:-0} == 1 )) || { printf 'skipped (no require)'; return 0; }
 
     local target="$_SK_SPAWN_TARGET"
@@ -9144,7 +9273,8 @@ _wrapup_file_spawn_skeptic_request() {
     # this origin+depth already sits in the inbox. Targeted globs only —
     # never a broad rm/scan.
     local slug="skeptic-d${depth}"
-    local reqdir="$STATE_DIR/requests"
+    local reqdir
+    reqdir=$(_ng_requests_dir) || reqdir=""
     if [[ -d "$reqdir" ]]; then
         local existing g
         # Save/restore, not a bare `shopt -u` tail: `ng` is SOURCED
@@ -9406,41 +9536,77 @@ _wrapup_file_spawn_skeptic_request() {
     local subject_ref issue_line
     if [[ -n "$issue" ]]; then
         # A DEFAULTED REPO IS NOT AN ASSERTION ABOUT WHERE AN ISSUE LIVES
-        # (your-org/nexus-code#1346).
+        # (your-org/nexus-code#1346) — BUT IT IS NOT A REASON TO SKIP A REQUIRED
+        # REVIEW EITHER (your-org/nexus-code#1700).
         #
         # `cmd_wrap_up` resolves `target=$(_resolve_repo write "$repo_arg")`,
-        # which falls back to the configured `github.repo` when `--repo` was
-        # omitted. Stamping that into `issue: <repo>#<n>` publishes a
-        # repo-QUALIFIED pointer the caller never made. Measured live:
-        # `issue: your-org/your-nexus#1134`, where `#1134` is a nexus-code
-        # issue and does not exist in your-nexus.
+        # which falls back to the nexus's configured `github.repo` when `--repo`
+        # was omitted (never to a cwd origin: a foreign one is refused, #108).
+        # #1346 measured that default stamped onto a number from ANOTHER repo:
+        # `issue: your-org/your-nexus#1134`, a nexus-code issue absent from
+        # your-nexus, 404ing in the skeptic's window minutes later.
         #
-        # THE REFUSAL IS KEYED ON THE LOCAL, DETERMINISTIC FACT — "an issue was
-        # named and the repo was DEFAULTED" — and never on a network answer.
-        # An earlier draft refused on a live `gh issue view` returning
-        # not-found, which made the VERDICT depend on GitHub being reachable:
-        # fixtures with synthetic issue numbers passed offline and failed
-        # online. A guard whose answer depends on the network is worse than
-        # either answer.
-        if (( repo_explicit == 0 )); then
-            printf 'ng wrap-up: REFUSING to file the spawn-skeptic request — issue %s would be\n' "$issue" >&2
-            printf '  stamped as %s#%s, but that repo was NOT given on the command line. It is\n' "$repo" "$issue" >&2
-            printf '  the configured default (`github.repo`), supplied because `--repo` was\n' >&2
-            printf '  omitted — so the pointer would assert a repo you never named, and a wrong\n' >&2
-            printf '  one 404s in the SKEPTIC'"'"'s window minutes later, reading as a deleted\n' >&2
-            printf '  issue rather than a mis-stamped pointer. Name the repo the issue lives in:\n' >&2
-            printf '      ng wrap-up %s <report> --repo <owner>/<name>\n' "$issue" >&2
-            printf '  Nothing is lost: the pending marker still holds the retire gate shut and the\n' >&2
-            printf '  orphan backstop still surfaces the outstanding review.\n' >&2
-            printf 'skreq=refused-defaulted-repo\n'
-            return 0
+        # Its first fix refused EVERY defaulted repo, on the local fact alone.
+        # #1700 measured what that cost: three workers ran `ng wrap-up 90001
+        # <report> --skeptic-decision require` from the nexus root, the issue
+        # existed in github.repo, the link comment LANDED on that very thread,
+        # and the request a `require` spawn mode demands was then not filed —
+        # at rc 0. A refusal whose evidence is "you did not type it" fires on
+        # the ordinary case and buys nothing there: the comment already went
+        # to the same thread the pointer names.
+        #
+        # So a defaulted repo is CORROBORATED, not refused, by the strongest
+        # evidence available, in this order:
+        #   1. this run's link comment POST to <repo>/issues/<n> succeeded —
+        #      GitHub confirmed the thread; no further probe;
+        #   2. otherwise (--no-comment, a failed POST) the best-effort probe:
+        #      `exists` files, `absent` is #1346 itself and REFUSES, and
+        #      `unknown` files with the pointer marked UNVERIFIED — "could not
+        #      look" must not strand a review (the #1346 network lesson).
+        # A refusal now returns FAILED, and `cmd_wrap_up` counts a required
+        # request that was not filed as a FAILED STEP: non-zero exit, named in
+        # the partial-failure block. A filing that did not happen is never rc 0.
+        local _ref_state="" repo_source_line=""
+        if [[ -z "$repo" ]]; then
+            # Unreachable from `cmd_wrap_up` (its resolve dies first, before
+            # anything posts), so this is the direct-caller floor: never stamp an
+            # unqualified `issue: #<n>`.
+            printf 'ng wrap-up: REFUSING to file the spawn-skeptic request — issue %s was named\n' "$issue" >&2
+            printf '  but NO repo resolved, so the pointer would be unqualified (your-org/nexus-code#1700).\n' >&2
+            printf 'FAILED (issue %s named but no repo resolved)' "$issue"
+            return 1
         fi
-        # BEST-EFFORT ANNOTATION, never a verdict. Runs only when it can, and
-        # `unknown` (no gh, no network, non-numeric) is indistinguishable from
-        # not asking — which is why it may not decide anything.
-        local _ref_state; _ref_state=$(_wrapup_issue_ref_state "$repo" "$issue")
+        if (( repo_explicit == 0 )); then
+            if (( comment_landed == 1 )); then
+                _ref_state=exists
+                repo_source_line="issue-repo-source: defaulted (github.repo); the link comment landed on ${repo}#${issue} in this run, so GitHub confirmed the thread (your-org/nexus-code#1700)"
+            else
+                _ref_state=$(_wrapup_issue_ref_state "$repo" "$issue")
+                case "$_ref_state" in
+                    exists)
+                        repo_source_line="issue-repo-source: defaulted (github.repo); confirmed to exist there at filing time (your-org/nexus-code#1700)" ;;
+                    absent)
+                        printf 'ng wrap-up: REFUSING to file the spawn-skeptic request — issue %s does NOT\n' "$issue" >&2
+                        printf '  exist on %s, which is the configured default (`github.repo`), used\n' "$repo" >&2
+                        printf '  because `--repo` was omitted. Stamping it would publish a pointer to nothing\n' >&2
+                        printf '  that 404s in the SKEPTIC'"'"'s window (your-org/nexus-code#1346). Name the repo\n' >&2
+                        printf '  the issue lives in and re-run:\n' >&2
+                        printf '      ng wrap-up %s <report> --repo <owner>/<name>\n' "$issue" >&2
+                        printf 'FAILED (refused-defaulted-repo: %s#%s does not exist; re-run with --repo)' "$repo" "$issue"
+                        return 1 ;;
+                    *)
+                        repo_source_line="issue-repo-source: defaulted (github.repo); NOT corroborated — no link comment landed this run and GitHub could not be asked (your-org/nexus-code#1700)" ;;
+                esac
+            fi
+        else
+            # BEST-EFFORT ANNOTATION, never a verdict, for an EXPLICIT repo: the
+            # caller asserted it. `unknown` (no gh, no network, non-numeric) is
+            # indistinguishable from not asking — which is why it decides nothing.
+            _ref_state=$(_wrapup_issue_ref_state "$repo" "$issue")
+        fi
         subject_ref="issue #${issue}"
         issue_line="issue: ${repo}#${issue}"
+        [[ -n "$repo_source_line" ]] && issue_line="${issue_line}"$'\n'"${repo_source_line}"
         case "$_ref_state" in
             absent)  issue_line="${issue_line}"$'\n'"issue-ref: DOES NOT RESOLVE — ${repo}#${issue} was not found at filing time. The repo WAS given explicitly, so either it or the number is wrong. Do not read a 404 here as a deleted issue (your-org/nexus-code#1346)" ;;
             unknown) issue_line="${issue_line}"$'\n'"issue-ref: UNVERIFIED — GitHub could not be asked at filing time; confirm the repo before trusting this pointer (your-org/nexus-code#1346)" ;;
@@ -9503,10 +9669,10 @@ EOF
 # The universal end-of-task hand-off, folded into one verb:
 #   1. upload the report to the asset repo (via upload-asset.sh)
 #   2. post a templated comment on <issue> with the asset URL
-#      (post-once idempotent: a re-run does not duplicate the link
-#      comment for this issue+report+repo — it RE-POINTS the prior
-#      comment's asset URL at the fresh upload via the CAS edit
-#      path, since step 1 mints a new blob every run; #524 defect 2)
+#      (post-once idempotent: an identical re-run does not duplicate the
+#      link comment for this issue+report+repo; a re-run whose content
+#      differs POSTs a NEW comment linking the earlier one. An earlier
+#      comment is NEVER edited or re-pointed — your-org/nexus-code#1637)
 #   3. rocket-react the trigger comment if --trigger-comment is set
 #   4. append a wrap-up entry to the action log
 #   5. append a window-retain entry (auto by default; --no-retain
@@ -10358,6 +10524,9 @@ EOF
 
     # Per-step outcomes. ok | failed | skipped.
     local upload_st=failed comment_st=skipped rocket_st=skipped log_st=failed
+    # your-org/nexus-code#1637: the earlier wrap-up comment a `posted-new` run
+    # superseded (linked from the new one, never edited).
+    local superseded_url=""
     # your-org/nexus-code#1114: the teaser the composer REFUSED to publish,
     # carried out so the diagnostic can quote the exact bytes back at the
     # author. Naming what it would have posted is what makes the refusal
@@ -10542,13 +10711,37 @@ EOF
     # against: it warns and proceeds, and the existing post-failure path still
     # reports a failed comment and exits 1. The refusing arm is cheap to be
     # right about — the issue is absent from that repo, and no retry changes it.
-    if [[ -n "$issue" && -n "$target" ]] && (( no_comment == 0 )); then
-        local _tp_out _tp_rc=0
+    #
+    # UNDER --no-comment TOO (your-org/nexus-code#1709). It used to run only when
+    # a link comment would be posted, so a `--no-comment` wrap-up naming an issue
+    # absent from a DEFAULTED repo armed the marker, uploaded the report and
+    # rocketed the trigger, and only THEN did the spawn-skeptic filing refuse at
+    # rc 1 (#1700's backstop). A `--no-comment` hand-off is still a hand-off to
+    # THAT thread (the worker replies there itself), so a positive 404 is the
+    # same mis-target and is refused before the first write.
+    #
+    # ONLY ON `github.repo` under --no-comment. The probe runs under the BOT
+    # token (`api`), and GitHub answers a repo the installation cannot see with
+    # the same "Not Found" as a missing issue. With a comment, that repo would
+    # fail the POST anyway; with --no-comment on ANOTHER repo nothing else needs
+    # the bot there, so probing would REFUSE a legitimate hand-off. `github.repo`
+    # is the nexus's own repo, where the bot is always installed, so there a 404
+    # means the issue. Keyed on the RESOLVED TARGET, not on how it was named
+    # (your-org/nexus-code#1717): the first cut probed only when `--repo` was
+    # OMITTED, so `--no-comment --repo <github.repo>` naming an absent issue
+    # still filed at rc 0. Compared case-insensitively, as GitHub resolves
+    # owner/name. Any other repo stays the caller's assertion, annotated (not
+    # refused) by the filing step.
+    local _tp_home=0
+    [[ -n "$REPO" && "${target,,}" == "${REPO,,}" ]] && _tp_home=1
+    if [[ -n "$issue" && -n "$target" ]] && { (( no_comment == 0 )) || (( _tp_home )); }; then
+        local _tp_out _tp_rc=0 _tp_what="post its link comment"
+        (( no_comment == 1 )) && _tp_what="hand off (--no-comment: you reply there yourself)"
         _tp_out=$(api -X GET "/repos/$target/issues/$issue" --jq '.number' 2>&1) || _tp_rc=$?
         if (( _tp_rc != 0 )) && [[ "$_tp_out" == *"Not Found"* || "$_tp_out" == *"HTTP 404"* ]]; then
             {
                 printf 'ng wrap-up: REFUSED — issue #%s does not exist on `%s`, which is where this\n' "$issue" "$target"
-                printf '  wrap-up would post its link comment. Nothing was published, NO MARKER WAS\n'
+                printf '  wrap-up would %s. Nothing was uploaded or published, NO MARKER WAS\n' "$_tp_what"
                 printf '  TOUCHED, no request was filed and nothing was logged.\n'
                 printf '  `--repo` selects the ISSUE-THREAD target. It does NOT select the upload\n'
                 printf '  destination (the report always uploads to the configured asset repo) and it\n'
@@ -10610,9 +10803,12 @@ EOF
 
     # Step 1: upload the report. Stdout = URL; stderr = progress + errors.
     # Skipped entirely in channel-only mode (no issue ⇒ no asset thread).
+    # --replace (your-org/nexus-code#1639): a re-run re-uploads THIS report to
+    # its own path, which is legitimate; the SHA-pinned URL an earlier comment
+    # cites keeps resolving to the bytes it cited (#1637).
     if [[ -z "$issue" ]]; then
         : # upload_st already `skipped`
-    elif asset_url=$("$_script_dir/upload-asset.sh" "$report_path" --issue "$issue" 2>"$err_buf"); then
+    elif asset_url=$("$_script_dir/upload-asset.sh" "$report_path" --issue "$issue" --replace 2>"$err_buf"); then
         # Trim trailing newline (`$()` already strips it, but be explicit).
         asset_url="${asset_url%$'\n'}"
         if [[ -n "$asset_url" ]]; then
@@ -10674,173 +10870,55 @@ EOF
         fi
         # your-org/nexus-code#1114: everything below PUBLISHES. A degenerate
         # teaser must not reach any of it — not the fresh POST, not the
-        # in-place edit, not the re-point. The refusal is the whole fix.
+        # superseding POST (#1637). The refusal is the whole fix.
         if [[ "$comment_st" == degenerate-teaser ]]; then
             : # nothing publishable was composed; fall through to reporting
         else
         : > "$err_buf"
-        # Post-once idempotency (B15 / your-org/your-nexus#236): if a
-        # prior wrap-up for this (issue, report, repo) already posted the
-        # link comment, don't double-post on a retry. But step 1 just
-        # re-uploaded the report to a NEW blob, so reusing the prior
-        # comment AS-IS would pin the thread to the STALE upload while
-        # printing success (#524 defect 2). Re-point the prior comment's
-        # asset link(s) at the new blob via the CAS edit path; when the
-        # comment is gone or no longer references this report, post the
-        # canonical link comment fresh (a duplicate beats a stale link).
+        # Post-once idempotency (B15 / your-org/your-nexus#236), bounded by
+        # one invariant (your-org/nexus-code#1637):
+        #
+        #     A LATER WRAP-UP NEVER EDITS OR RE-POINTS AN EARLIER COMMENT.
+        #     No PATCH to any prior comment is issued from this verb.
+        #
+        # An earlier wrap-up comment is a HISTORICAL RECORD of what was handed
+        # off at that moment, and asset URLs are SHA-PINNED (upload-asset.sh
+        # pins blob/<sha>/...), so the prior comment's link ALREADY resolves
+        # to the report as it was when that comment was posted. The old design
+        # treated the comment as mutable — #524 re-pointed its link to each
+        # new upload, #656/#940 rewrote its body in place, #605 re-pointed it
+        # and posted a second one — and so rewrote what the earlier comment
+        # CITED. Observed: a skeptic's first-pass CHECK verdict was rewritten
+        # to CREDIBLE on re-check, erasing the CHECK from the thread; and
+        # (#1640) a first verdict's "Full report" link was silently moved to
+        # the second report.
+        #
+        # So the prior comment is only ever READ, to decide what THIS run
+        # publishes. Its body is compared after two normalisations: the
+        # trailing `Supersedes …` line this verb itself appends is dropped,
+        # and its asset link(s) are rewritten to this run's URL (the one
+        # difference an honest retry always has).
+        #
+        #   differs (composed OR --comment-body-file) → POST a NEW comment,
+        #       with one appended line linking the earlier one. `posted-new`.
+        #       A corrected Summary (#656) and a second verdict (#605) are
+        #       new information: published, with the history left intact.
+        #   same, link did not move → nothing to do. `updated` (the token is
+        #       kept for action-log compatibility; nothing is mutated).
+        #   same, link MOVED → the report changed, the composed body did not.
+        #       `nothing-published`, exit 3 (#862; see the arm below).
+        #   prior body unreadable → this run cannot be shown redundant, so it
+        #       posts fresh (a duplicate beats a dropped hand-off). `ok`.
         local prior_comment_url
         prior_comment_url=$(_wrapup_prior_comment_url "$issue" "$basename" "$target")
         if [[ -n "$prior_comment_url" ]]; then
-            # your-org/nexus-code#605. Re-pointing alone SILENTLY DISCARDS
-            # a supplied --comment-body-file: the prior body stays, exit is
-            # 0, and the line printed reads `UPDATED`. A repeat wrap-up is
-            # the NORMAL shape of the skeptic protocol (verdict → worker
-            # fixes → skeptic verifies and wraps up again on the same
-            # issue), so the dropped body is precisely the comment that
-            # tells the orchestrator whether the PR is mergeable. It cost a
-            # real verdict on PR #596.
-            #
-            # So: decide whether this is an idempotent RETRY (same content,
-            # only the asset blob moved) or NEW INFORMATION.
-            #   same  → re-point only, as before. `UPDATED` is honest.
-            #   differ→ re-point the old comment (so no comment in the
-            #           thread cites a stale blob — the invariant post-once
-            #           re-pointing exists to hold) AND post the new body as
-            #           a NEW comment. A second verdict is new information,
-            #           not a corrected link.
-            # Nothing supplied a body → unchanged behaviour.
-            # your-org/nexus-code#656. This comparison used to run ONLY when
-            # a --comment-body-file was supplied, so the AUTO-COMPOSED
-            # canonical body — the one that quotes `## Summary` — was
-            # recomputed every run and then silently discarded. A corrected
-            # Summary (a retracted claim, a refuted result, a revised
-            # verdict) could not reach the thread through this path at all,
-            # while the caller was told `UPDATED` and handed exit 0.
-            #
-            # On the reporter's own night that false claim stayed off
-            # GitHub only because the ~300-char truncation happened to cut
-            # just before it. Safety by coincidence is not safety.
-            #
-            # So compare ALWAYS, and split by WHAT differs:
-            #   supplied body differs  → NEW comment (#605: a second
-            #       verdict is new information, not a corrected link)
-            #   composed body differs  → EDIT this comment (it IS the
-            #       canonical link comment; a corrected Summary belongs in
-            #       place, not as a duplicate)
-            #   same                   → re-point only, and say `unchanged`
-            local body_is_new=0 body_is_edit=0
-            local prior_body prior_norm
-            prior_body=$(api "/repos/$target/issues/comments/${prior_comment_url##*issuecomment-}" 2>/dev/null \
-                | jq -r '.body // empty' 2>/dev/null) || prior_body=""
-            if [[ -z "$prior_body" ]]; then
-                # Cannot read the prior body ⇒ cannot establish that this
-                # run's content is redundant. Only a SUPPLIED body is worth
-                # posting fresh on that basis; for the composed body the
-                # re-point path below already republishes the link.
-                [[ -n "$body_file" ]] && body_is_new=1
-            else
-                # Normalise away the one difference a pure retry always
-                # has: the asset link moved to this run's blob.
-                prior_norm=$(_replace_asset_links "$prior_body" "$basename" "$asset_url")
-                if [[ "$prior_norm" != "$body" ]]; then
-                    if [[ -n "$body_file" ]]; then body_is_new=1; else body_is_edit=1; fi
-                fi
+            local prior_body="" prior_cmp prior_norm
+            local prior_cid="${prior_comment_url##*issuecomment-}"
+            if [[ "$prior_cid" =~ ^[0-9]+$ ]]; then
+                prior_body=$(api "/repos/$target/issues/comments/$prior_cid" 2>/dev/null \
+                    | jq -r '.body // empty' 2>/dev/null) || prior_body=""
             fi
-            local repoint_rc=0
-            comment_url=$(_wrapup_repoint_link_comment \
-                "$target" "$prior_comment_url" "$basename" "$asset_url" \
-                2>"$err_buf") || repoint_rc=$?
-            if (( repoint_rc == 0 )) && (( body_is_edit == 1 )); then
-                # The canonical link comment's own content changed — edit it
-                # in place (your-org/nexus-code#656). Failure here is LOUD:
-                # reporting success for a correction that did not publish is
-                # the defect being fixed, not an acceptable degradation.
-                : > "$err_buf"
-                local edited_url
-                if edited_url=$(_wrapup_set_comment_body "$target" "$comment_url" "$body" 2>"$err_buf"); then
-                    comment_url="$edited_url"
-                    comment_st=edited
-                else
-                    comment_st=failed
-                    failure_detail+=$'  comment: composed body changed but the in-place edit FAILED — the correction is NOT published\n'
-                    [[ -s "$err_buf" ]] && failure_detail+="    $(head -3 "$err_buf" | tr '\n' ' ')"$'\n'
-                fi
-            elif (( repoint_rc == 0 )) && (( body_is_new == 1 )); then
-                # The link is fixed; now publish the content that would
-                # otherwise have been dropped.
-                : > "$err_buf"
-                local fresh_url
-                if fresh_url=$(_post_body "/repos/$target/issues/$issue/comments" "$body" 2>"$err_buf"); then
-                    comment_url="$fresh_url"
-                    comment_st=updated-and-posted
-                else
-                    # Loud, and NON-zero overall: the caller supplied a body
-                    # that is now published nowhere. Reporting success here
-                    # would be the #605 defect wearing a different hat.
-                    comment_st=failed
-                    failure_detail+="  comment: --comment-body-file content differs from the existing wrap-up comment, and POST of the new comment failed: $(tr '\n' ' ' < "$err_buf")"$'\n'
-                    comment_url=""
-                fi
-            elif (( repoint_rc == 0 )); then
-                # your-org/nexus-code#862 — THE RESIDUE, and the reason this
-                # arm is not simply "nothing happened".
-                #
-                # #656 (the `edited` arm above) closed the case where the
-                # composed body ITSELF changed: a corrected `## Summary` now
-                # reaches the thread. What it cannot close is the case the
-                # append-only convention actively PRODUCES. Reports are
-                # append-only and this comment quotes `## Summary` alone, so
-                # a superseding verdict written where the convention says to
-                # write it — appended further down — leaves the composed body
-                # BYTE-IDENTICAL. There is genuinely nothing to publish, and
-                # the old message said exactly that, truthfully, at exit 0.
-                #
-                # Truthful and useless: the report DID change, the thread did
-                # not, and nobody was told. The only artefact is an absence.
-                #
-                # Discriminate on whether the ASSET LINK MOVED. `prior_norm`
-                # is `prior_body` with asset links rewritten to THIS run's
-                # URL, so the two differ iff the link moved.
-                #
-                #   link moved  no  → nothing changed anywhere. Quiet, exit 0.
-                #   link moved  yes → the composed body is byte-identical
-                #                     anyway. NOTHING PUBLISHED, exit 3.
-                #
-                # THE BICONDITIONAL IS NOT EXACT, AND THIS IS THE STATED
-                # BOUND (your-org/nexus-code#873 review, F1). The URL pins the
-                # ASSET REPO HEAD, not this report's bytes. A concurrent
-                # upload by another window moves that head, so the link can
-                # move while THIS report did not — a spurious rc 3.
-                #
-                # The direction matters, and it is the safe one: this can
-                # only speak when it should have been quiet, never go quiet
-                # when it should speak. A false NOTHING PUBLISHED costs a
-                # reader one confused minute; a false silence is `#862`
-                # itself, and is undetectable downstream.
-                #
-                # Keyed here rather than on a report-content hash because an
-                # honest re-run must stay silent: a warning that fired on
-                # every idempotent retry would be tuned out within a day and
-                # then be worth less than nothing. The false-alarm mode is
-                # named in the stderr block rather than left for a reader to
-                # discover by hunting.
-                #
-                # Exit 3, distinct from 1, because the caller must be able to
-                # tell "a step failed, retry it" from "nothing failed, nothing
-                # published, go and say it yourself". A retry cannot fix this
-                # one — only the caller can.
-                #
-                # Keyed on the asset, not on a report-content hash, so an
-                # honest re-run stays silent. A warning that fired on every
-                # idempotent retry would be tuned out within a day and would
-                # then be worth less than nothing.
-                if [[ -n "$prior_body" && "$prior_norm" != "$prior_body" ]]; then
-                    comment_st=nothing-published
-                else
-                    comment_st=updated
-                fi
-            elif (( repoint_rc == 2 )); then
-                : > "$err_buf"
+            if [[ -z "$prior_body" ]]; then
                 if comment_url=$(_post_body "/repos/$target/issues/$issue/comments" "$body" 2>"$err_buf"); then
                     comment_st=ok
                 else
@@ -10849,9 +10927,49 @@ EOF
                     comment_url=""
                 fi
             else
-                comment_st=failed
-                failure_detail+="  comment: re-point of prior link comment $prior_comment_url failed: $(tr '\n' ' ' < "$err_buf")"$'\n'
-                comment_url=""
+                prior_cmp=$(_wrapup_strip_supersedes_line "$prior_body")
+                prior_norm=$(_replace_asset_links "$prior_cmp" "$basename" "$asset_url")
+                if [[ "$prior_norm" != "$body" ]]; then
+                    local new_body="${body}"$'\n\n'"${_WU_SUPERSEDES_PREFIX}${prior_comment_url}"
+                    if comment_url=$(_post_body "/repos/$target/issues/$issue/comments" "$new_body" 2>"$err_buf"); then
+                        comment_st=posted-new
+                        superseded_url="$prior_comment_url"
+                        body="$new_body"
+                    else
+                        # Loud and non-zero: new content is published nowhere.
+                        # The earlier comment is untouched either way.
+                        comment_st=failed
+                        failure_detail+="  comment: content differs from the earlier wrap-up comment $prior_comment_url, and POST of the NEW comment failed — the new content is NOT published: $(tr '\n' ' ' < "$err_buf")"$'\n'
+                        comment_url=""
+                    fi
+                elif [[ "$prior_norm" != "$prior_cmp" ]]; then
+                    # your-org/nexus-code#862 — THE RESIDUE. Reports are
+                    # append-only and the composed comment quotes the opening
+                    # of `## Summary` alone, so a superseding verdict appended
+                    # further down leaves the composed body BYTE-IDENTICAL
+                    # while the report (and so its asset link) moved.
+                    # Truthful-and-quiet here would be useless: the report
+                    # changed, the thread did not, and nobody was told.
+                    #
+                    # The link-moved test is not exact, and this is the stated
+                    # bound (#873 review, F1): the URL pins the ASSET REPO
+                    # HEAD, not this report's bytes, so a concurrent upload by
+                    # another window can move it — a spurious rc 3. That is
+                    # the safe direction: a false NOTHING PUBLISHED costs a
+                    # reader a minute; a false silence is #862 itself.
+                    # Keyed on the asset rather than a content hash so an
+                    # honest re-run stays silent.
+                    #
+                    # Exit 3, distinct from 1: nothing failed and a retry
+                    # reproduces it exactly; only the caller can clear it.
+                    # The earlier comment is NOT re-pointed (#1637) — its
+                    # pinned link still cites the report it was posted about.
+                    comment_url="$prior_comment_url"
+                    comment_st=nothing-published
+                else
+                    comment_url="$prior_comment_url"
+                    comment_st=updated
+                fi
             fi
         elif comment_url=$(_post_body "/repos/$target/issues/$issue/comments" "$body" 2>"$err_buf"); then
             comment_st=ok
@@ -10870,16 +10988,34 @@ EOF
     # + comment URLs (the skeptic always has a complete artifact). Driven by
     # the _SK_SPAWN_* globals set in Step 0b; a no-op unless the skeptic
     # step resolved to a require/second-pass path with a real source window.
-    # Best-effort: the status is surfaced but never flips the wrap-up exit
-    # (the pending marker + orphan backstop still guarantee the skeptic is
-    # not lost).
+    # A request that resolves to anything but `filed`/`skipped` FLIPS THE EXIT
+    # (`skreq_st` below, your-org/nexus-code#1700). The pending marker and the
+    # orphan backstop still hold the review, but rc 0 told three callers it was
+    # filed when it was not (#1709 removed the "best-effort" claim this line made).
     local skreq_status=""
     if (( ${_SK_SPAWN_REQ:-0} == 1 )); then
         skreq_status=$(_wrapup_file_spawn_skeptic_request \
             "$issue" "$report_path" "$asset_url" "$comment_url" \
             "$trigger_comment" "$target" "$reply_to" \
-            "$( [[ -n "$repo_arg" ]] && printf 1 || printf 0 )") || true
+            "$( [[ -n "$repo_arg" ]] && printf 1 || printf 0 )" \
+            "$( [[ "$comment_st" == ok || "$comment_st" == posted-new ]] && printf 1 || printf 0 )") || true
     fi
+    # your-org/nexus-code#1700: a REQUIRED request that was not filed is a
+    # FAILED STEP. It used to be "best-effort" — surfaced on stderr, exit
+    # untouched — and three workers' wrap-ups exited 0 with the review filed by
+    # nobody. The pending marker and the orphan backstop still hold; the exit
+    # status is what tells the CALLER, and the caller is who can fix it now.
+    local skreq_st=skipped
+    case "$skreq_status" in
+        ""|filed*|skipped*) ;;
+        *)  skreq_st=failed
+            # Name what is actually owed: a spawn mode REQUIRES a review, a
+            # reviewer's suspect verdict RECOMMENDS a second pass (#1709).
+            local _skreq_owed="this wrap-up's skeptic mode REQUIRES a review"
+            [[ "${_SK_SPAWN_EFFECTIVE:-}" == second-pass ]] \
+                && _skreq_owed="this wrap-up RECOMMENDS a second skeptic pass"
+            failure_detail+="  spawn-skeptic: request NOT filed (${skreq_status}) — ${_skreq_owed}. Fix the cause and re-run the wrap-up, or file it by hand: ng request file --origin ${source_window:-<window>} --kind spawn-skeptic ... (your-org/nexus-code#1700)"$'\n' ;;
+    esac
 
     # Step 2c (remote-request channel): deliver the ANSWER back over the
     # request/reply channel instead of (or, with --issue, in addition to)
@@ -11139,12 +11275,19 @@ EOF
     if [[ "$comment_st" == ok ]]; then
         printf 'posted comment: %s\n' "$comment_url"
         _wrapup_print_published_body "${body:-}"
+    elif [[ "$comment_st" == posted-new ]]; then
+        # your-org/nexus-code#1637: the content differs from the earlier
+        # wrap-up comment, so it is a NEW comment. Say that the earlier one
+        # was not touched — it is a historical record, not a draft.
+        printf 'posted comment: NEW %s (content differs from the earlier wrap-up comment %s, which was left untouched)\n' \
+            "$comment_url" "$superseded_url"
+        _wrapup_print_published_body "${body:-}"
     elif [[ "$comment_st" == updated ]]; then
         # your-org/nexus-code#656: the headline word was `UPDATED`, which
         # reads as "your correction is published" for a run that published
-        # nothing. Say what happened — the body is byte-identical and only
-        # the asset link moved.
-        printf 'posted comment: unchanged %s (post-once: link re-pointed to the new upload; comment body is identical — nothing to publish)\n' "$comment_url"
+        # nothing. Since #1637 nothing is touched at all: the composed body is
+        # identical and the link did not move.
+        printf 'posted comment: unchanged %s (identical to the earlier wrap-up comment; nothing to publish)\n' "$comment_url"
     elif [[ "$comment_st" == degenerate-teaser ]]; then
         # your-org/nexus-code#1114. Same headline as #862's arm — NOTHING
         # PUBLISHED — because it is the same fact from the reader's side: the
@@ -11157,15 +11300,6 @@ EOF
         # purpose: that one means "you re-ran and nothing needed to move",
         # this one means "your report moved and the thread did not".
         printf 'posted comment: NOTHING PUBLISHED %s (report changed, composed body did not — see stderr)\n' "$comment_url"
-    elif [[ "$comment_st" == edited ]]; then
-        printf 'posted comment: EDITED %s (composed body changed — the comment was updated in place)\n' "$comment_url"
-        _wrapup_print_published_body "${body:-}"
-    elif [[ "$comment_st" == updated-and-posted ]]; then
-        # #605: say plainly that BOTH things happened. The old line said
-        # `UPDATED` for a run that had published none of the caller's
-        # content, which is the exact claim a reporting path must never
-        # make falsely.
-        printf 'posted comment: NEW %s (--comment-body-file differed from the existing wrap-up comment; prior comment re-pointed to the new upload)\n' "$comment_url"
     elif [[ "$comment_st" == skipped ]]; then
         # your-org/nexus-code#815 (incidental) — this arm asserted a CAUSE it
         # had not established. `--no-comment` is the FIRST thing that sets
@@ -11209,9 +11343,9 @@ EOF
     elif [[ "$retain_st" == failed ]]; then
         printf 'retained window: FAILED\n'
     fi
-    # Spawn-skeptic request (Step 2b). Best-effort — a FAILED here does NOT
-    # flip the exit (the pending marker + orphan backstop still cover it),
-    # but it IS surfaced on stderr so the orchestrator can file it by hand.
+    # Spawn-skeptic request (Step 2b). A FAILED here FLIPS THE EXIT
+    # (your-org/nexus-code#1700; `skreq_st` above): the pending marker and the
+    # orphan backstop still cover it, but rc 0 told three callers it was filed.
     if [[ -n "$skreq_status" ]]; then
         case "$skreq_status" in
             filed*)   printf 'spawn-skeptic request: %s\n' "$skreq_status" ;;
@@ -11233,7 +11367,8 @@ EOF
     # requester would block forever on an answer that never landed.
     if [[ "$upload_st" == failed || "$comment_st" == failed \
           || "$rocket_st" == failed || "$log_st" == failed \
-          || "$channel_st" == failed || "${disp_st:-skipped}" == failed ]]; then
+          || "$channel_st" == failed || "${disp_st:-skipped}" == failed \
+          || "$skreq_st" == failed ]]; then
         {
             printf 'ng wrap-up: partial failure — retry the failed steps:\n'
             printf '%s' "$failure_detail"
@@ -11345,15 +11480,18 @@ EOF
             printf '  report cannot reach the thread through this path.\n'
             printf '  Three ways out, in order of preference:\n'
             printf '    1. edit the OPENING of `## Summary` — its FIRST SENTENCE, within the\n'
-            printf '       first 200 characters — then re-run wrap-up (it will edit the\n'
-            printf '       comment in place). Editing the Summary ANYWHERE ELSE is not\n'
+            printf '       first 200 characters — so the composed body differs, then re-run\n'
+            printf '       wrap-up: that posts a NEW comment and leaves the earlier one\n'
+            printf '       untouched (#1637). Editing the Summary ANYWHERE ELSE is not\n'
             printf '       enough and lands you right back here: the composed body is that\n'
             printf '       opening and nothing more, so a correction further down the\n'
             printf '       section leaves it byte-identical. Measured on this very verb\n'
             printf '       while writing it (your-org/nexus-code#1116);\n'
             printf '    2. pass --comment-body-file <path> to post the correction as a new\n'
             printf '       comment (a second verdict is new information, not a fixed link);\n'
-            printf '    3. say it yourself on the thread.\n'
+            printf '    3. post it yourself on the thread.\n'
+            printf '  The earlier comment was NOT re-pointed: its SHA-pinned link still cites\n'
+            printf '  the report as it was when that comment was posted (#1637).\n'
             printf '  Exit 3, not 1: no step failed, so re-running this command unchanged\n'
             printf '  will reproduce this outcome exactly. STEPS THAT ALREADY SUCCEEDED RUN\n'
             printf '  AGAIN — the upload, and the skeptic step (Step 0b), which ARMS. "No\n'
@@ -12516,7 +12654,11 @@ cmd_show() {
 _overview_number() {
     local cache="$STATE_DIR/overview-number"
     local pinned
-    pinned=$("$_cfg" github.overview_issue_number "" 2>/dev/null || true)
+    # #1650: the number is only meaningful against the repo it was pinned for,
+    # so it is read from the same tree as github.repo, and never against a
+    # $REPO the two roots disagree about.
+    _require_repo
+    pinned=$(_ng_cfg github.overview_issue_number "" 2>/dev/null || true)
     if [[ -n "$pinned" && "$pinned" =~ ^[0-9]+$ ]]; then
         printf '%s' "$pinned"
         return 0
@@ -12860,7 +13002,7 @@ _patch_issue_body() {
 # used on the write path.)
 _overview_number_cheap() {
     local pinned
-    pinned=$("$_cfg" github.overview_issue_number "" 2>/dev/null || true)
+    pinned=$(_ng_cfg github.overview_issue_number "" 2>/dev/null || true)
     if [[ -n "$pinned" && "$pinned" =~ ^[0-9]+$ ]]; then
         printf '%s' "$pinned"
     else
@@ -15421,6 +15563,9 @@ cmd_pane_state()       { _facade pane-state.sh       "$@"; }
 # polls a per-session spool; `add` drops a watch in, and the dispatcher
 # prints one line per terminal transition — delivered as a task notification.
 cmd_longjob()          { _facade longjob-watch.sh    "$@"; }
+# OpenAI Codex as a supervised co-worker: one bounded `codex exec` subtask
+# with verdict, events, final message, the diff and every other write (#1640).
+cmd_codex()            { _facade codex-run.sh        "$@"; }
 # "is this head green, and was it green the FIRST time?" (#749). `gh run list`
 # and the check-runs API show only the LATEST attempt, so a band that failed and
 # was re-run green is indistinguishable from one that passed first time. Exits
@@ -15436,6 +15581,28 @@ cmd_guards_for_diff()  { _facade guards-for-diff.sh   "$@"; }
 cmd_session_id()       { _facade window-session-id.sh "$@"; }
 # worker: pre-flight that a deliverable path is writable before compute
 cmd_write_probe()      { _facade write-probe.sh      "$@"; }
+# operator / orchestrator, after an install or restart: one read-only row per
+# setup check (cc, gh, config, transcripts); UNKNOWN is never PASS (#1722)
+cmd_doctor()           { _facade doctor.sh           "$@"; }
+# any agent, during a read-only/full-disk incident: is the tree writable, per
+# surface, and HOW is it failing (EROFS/ENOSPC/EACCES/HANG/MISSING) (#1724).
+# `status` (#1724 remainder) reads the watcher's degraded status file (kept
+# OUTSIDE the tree) and re-probes. enter/exit (relocation) are not built yet,
+# and saying so beats a verb that silently ignores its subcommand.
+# One named handler per sub-verb, called straight from its arm: the
+# test-ng-flag-order sweep finds sub-verbs as `name) <handler>` arms, and an arm
+# that opened with `shift;` was invisible to it (B-DOC).
+_degraded_probe()  { _facade degraded-probe.sh  "$@"; }
+_degraded_status() { _facade degraded-status.sh "$@"; }
+cmd_degraded() {
+    case "${1:-}" in
+        probe)  _degraded_probe "${@:2}" ;;
+        status) _degraded_status "${@:2}" ;;
+        enter|exit)
+            die "degraded $1: not implemented — only \`ng degraded probe\` and \`status\` exist (your-org/nexus-code#1724)" ;;
+        *)  die "usage: ng degraded probe [--timeout S] [--surface NAME=ABS_DIR]... | status [--timeout S]   # exit 0 all OK, 1 not OK / watcher degraded, 2 usage/refused path, 3 could not probe (#1724)" ;;
+    esac
+}
 # maintenance: roll pre-buffer reports into monthly reports/YYYY-MM/ dirs
 cmd_reports_roll()     { _facade reports-roll.sh     "$@"; }
 # worker: self-declare an async external wait (slurm/CI/long curl)
@@ -15502,6 +15669,16 @@ Task lifecycle & reports:
   longjob add <kind>:<target> …  wake THIS session when a long job (slurm /
                                  asyncrun / pid / file / cmd) ends or fails;
                                  also list|show|rm|status|events|await (#1535)
+  codex [run] --cd <root> …      run OpenAI Codex as a SUPERVISED co-worker on one
+                                 bounded subtask: verdict + events + final message
+                                 + diff + write list; --background for long runs (#1640)
+  degraded probe [--surface N=D] is the tree WRITABLE, per state surface, and how
+                                 is it failing: EROFS/ENOSPC/EACCES/HANG/MISSING;
+                                 exit 1 when any surface is not OK (#1724)
+  doctor [--quiet]               read-only setup check: cc / gh / config /
+                                 transcripts, PASS|WARN|FAIL|UNKNOWN (#1722)
+  degraded status                the watcher's degraded-mode status (kept outside
+                                 the tree: its notes, errno, delivery) + a probe
   reports-roll [--dry-run]       archive pre-buffer reports into reports/YYYY-MM/
   log-action <agent> --event …   append an action-log event
   fetch-asset <url>              fetch a user-attachments asset locally
@@ -15674,10 +15851,13 @@ main() {
         decision-answer)       cmd_decision_answer       "$@" ;;
         pane-state)            cmd_pane_state            "$@" ;;
         longjob)               cmd_longjob               "$@" ;;
+        codex)                 cmd_codex                 "$@" ;;
         ci-attempts)           cmd_ci_attempts           "$@" ;;
         guards-for-diff)       cmd_guards_for_diff       "$@" ;;
         session-id)            cmd_session_id            "$@" ;;
         write-probe)           cmd_write_probe           "$@" ;;
+        degraded)              cmd_degraded              "$@" ;;
+        doctor)                cmd_doctor                "$@" ;;
         declare-wait)          cmd_declare_wait          "$@" ;;
         declare-no-wait)       cmd_declare_no_wait       "$@" ;;
         paste-followup)        cmd_paste_followup        "$@" ;;

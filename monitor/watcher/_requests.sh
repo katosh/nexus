@@ -50,7 +50,37 @@ _requests_state_dir() {
     printf '.state'
 }
 
-_requests_dir()        { printf '%s/requests' "$(_requests_state_dir)"; }
+# The inbox location is resolved by the ONE shared resolver every reader and
+# writer uses (your-org/nexus-code#1723): NEXUS_REQUESTS_DIR, then the config
+# key monitor.requests.dir, then <state>/requests. On a refused value this
+# prints nothing, and the callers' `-d` test then skips the cycle; the refusal
+# itself is logged once by _requests_inbox_usable.
+if ! declare -F nexus_requests_dir >/dev/null 2>&1; then
+    # shellcheck source=../_requests_dir.sh
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_requests_dir.sh"
+fi
+_requests_dir()        { nexus_requests_dir "$(_requests_state_dir)" 2>/dev/null; }
+# _requests_inbox_usable <dir> — 0 when the claim/render may proceed. A
+# configured inbox that is missing (or a dangling symlink) is a silent zero
+# for every request filed elsewhere, so it is LOGGED, once per condition
+# rather than every ~10 s poll.
+_REQUESTS_INBOX_WARNED=""
+_requests_inbox_usable() {
+    local dir="$1" sd src msg
+    sd=$(_requests_state_dir)
+    if [[ -z "$dir" ]]; then
+        msg=$(nexus_requests_dir "$sd" 2>&1 >/dev/null)
+    else
+        src=$(nexus_requests_dir_source "$sd" 2>/dev/null) || src=default
+        msg=$(nexus_requests_dir_check "$dir" "$src" 2>&1) && { _REQUESTS_INBOX_WARNED=""; return 0; }
+    fi
+    if [[ "$_REQUESTS_INBOX_WARNED" != "$msg" ]]; then
+        _REQUESTS_INBOX_WARNED="$msg"
+        if declare -F log >/dev/null 2>&1; then log "requests: INBOX UNUSABLE — $msg"
+        else printf 'requests: INBOX UNUSABLE — %s\n' "$msg" >&2; fi
+    fi
+    return 1
+}
 _requests_emit_state() { printf '%s/requests-emit-state.tsv' "$(_requests_state_dir)"; }
 _requests_emit_state_lock() { printf '%s.lock' "$(_requests_emit_state)"; }
 
@@ -178,6 +208,7 @@ _requests_summary() {
 # client's fetch surface; see step 3).
 _requests_claim() {
     local dir; dir=$(_requests_dir)
+    _requests_inbox_usable "$dir" || return 0
     [[ -d "$dir" ]] || return 0
     local now maxage ret imaxage rret f id
     now=$(date +%s)

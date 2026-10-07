@@ -1183,13 +1183,24 @@ mkdir -p "$ROOT/wd"
     reg_line svc124  "$ROOT/wd" 'echo noop' 'exit 124'   # fast, says 124 itself
     reg_line svcok   "$ROOT/wd" 'echo noop' 'true'
 } > "$REG"
+# _hto=4 is CHOSEN, not measured-optimal (your-org/nexus-code#1738 item 4).
+# svc.sh decides "timed out" by `rc==124 && SECONDS - t0 >= bound`, and bash's
+# SECONDS is whole-second wall time: at a bound of 1 the svc124 control reads
+# UNKNOWN whenever its fork+exec merely CROSSES a second boundary, which a
+# CPU-stalled runner made happen (run 37245333580, bash 4.4 band, 76.88%
+# CPU-stall PSI). At 4 the control is misread only if `exit 124` takes > 3 s of
+# real time. Detection is preserved: svchung sleeps 30 s, so an unenforced
+# timeout still blows the elapsed ceiling below (bound + 14 s kill-grace/load
+# headroom = 18 s, the same 14 s headroom the 1 s bound had) and never renders
+# UNKNOWN. Keep `sleep` well above the ceiling if either number moves.
+_hto=4
 _t0=$SECONDS
-SVC_STATUS_HEALTH_TIMEOUT=1 run_svc status
+SVC_STATUS_HEALTH_TIMEOUT=$_hto run_svc status
 _el=$(( SECONDS - _t0 ))
-(( _el < 15 )) \
-    && pass "hung check: status returned within the bound (1s + kill grace), not after the 30 s check" \
+(( _el < _hto + 14 )) \
+    && pass "hung check: status returned within the bound (${_hto}s + kill grace), not after the 30 s check" \
     || fail "hung check: status took ${_el}s — the row is not bounded"
-grep -qE 'svchung +UNKNOWN .*did not finish within 1s' "$ROOT/out" \
+grep -qE "svchung +UNKNOWN .*did not finish within ${_hto}s" "$ROOT/out" \
     && pass "hung check: row renders UNKNOWN and names the bound" \
     || fail "hung row: $(grep svchung "$ROOT/out")"
 grep -qE 'svc124 +DOWN' "$ROOT/out" \

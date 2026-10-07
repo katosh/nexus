@@ -20,6 +20,21 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LINT="$HERE/lint-citations.py"
 PY="${PYTHON:-python3}"
+
+# --- the guard's population (your-org/nexus-code#1747) ----------------------
+# This suite declared none, so `guards-for-diff` could never select it. It
+# scans NO repo corpus: every check runs the lint over a fixture composed under
+# $TMP at runtime, or over the lint's own in-file PLANTS (`--selftest`). So the
+# files whose bytes reach its verdict are the lint and this suite (which
+# `gp_handle` adds) — that is the whole population, not a narrowing. NOT
+# describable as a path set and therefore not declared: the interpreter `$PY`
+# resolves to (the lint's `re` semantics are the interpreter's).
+#
+# PLACED HERE, before anything is printed: `gp_handle` EXITS when it handles
+# the flag, and anything printed before it would be read as a population row.
+. "$HERE/_guard_population.sh"
+gp_population() { printf '%s\n' "$LINT"; }
+gp_handle "$@"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 

@@ -1443,6 +1443,27 @@ fi
 # Historical name, kept for every existing caller. ONE implementation.
 _nexus_dir_writable() { nexus_dir_writable "$@"; }
 
+# Where Claude Code transcripts live (your-org/nexus-code#1720). The
+# orchestrator freshness / unresponsiveness probes below look under every
+# root `cc_transcript_roots` prints — $CLAUDE_CONFIG_DIR/projects as well as
+# <home>/.claude/projects — never at a hardcoded `$HOME/.claude/projects`.
+# Sourced the way `_fs_probe.sh` is above, with the same partial-tree
+# fallback: the same roots in the same order, minus the realpath dedup,
+# which only saves a repeated stat since every caller asks "under ANY root".
+if ! declare -F cc_transcript_roots >/dev/null 2>&1 \
+   && [[ -r "${BASH_SOURCE[0]%/*}/../_cc_transcript_roots.sh" ]]; then
+    # shellcheck source=monitor/_cc_transcript_roots.sh
+    source "${BASH_SOURCE[0]%/*}/../_cc_transcript_roots.sh"
+fi
+if ! declare -F cc_transcript_roots >/dev/null 2>&1; then
+    cc_transcript_roots() {
+        [[ -n "${NEXUS_CC_HOME:-}" ]]     && printf '%s\n' "$NEXUS_CC_HOME/projects"
+        [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] && printf '%s\n' "$CLAUDE_CONFIG_DIR/projects"
+        [[ -n "${1:-${HOME:-}}" ]]        && printf '%s\n' "${1:-$HOME}/.claude/projects"
+        return 0
+    }
+fi
+
 # _nexus_fs_evidence <path> [project_dir]
 #
 # Gather the observable facts that distinguish "the sandbox lost its
@@ -2018,7 +2039,7 @@ _supervisor_arm_emit_section() {
 # mark → stall-nag suppressed and retire held until staleness.
 #
 # `<src>` is the injector-identity hint (orchestrator-followup,
-# skeptic-nudge, unstick-permission, unstick-api-error,
+# skeptic-nudge, unstick-permission,
 # unstick-ratelimit, over-limit-wake, …).
 #
 # THE SRC TOKEN IS LOAD-BEARING, NOT PROVENANCE. This comment used to say
@@ -2584,20 +2605,26 @@ _orchestrator_unresponsive() {
     # unparseable pin / jsonl ⇒ fall through to "unresponsive" — at
     # this point we KNOW a paste landed > threshold ago AND we have
     # no evidence the orch processed it.
-    local sid slug jsonl jsonl_mtime
+    # Every transcript root is consulted (your-org/nexus-code#1720): a
+    # missing jsonl falls through to UNRESPONSIVE, so a lookup blind to
+    # $CLAUDE_CONFIG_DIR/projects is the false-DEAD direction. `home_dir`
+    # stays the fake-home seam: it replaces $HOME as the third root.
+    local sid slug jsonl jsonl_mtime root
     if [[ -s "$pin_file" ]]; then
         sid=$(head -n 1 "$pin_file" 2>/dev/null | tr -d '[:space:]')
     fi
     if [[ -n "${sid:-}" ]] \
        && [[ "$sid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
         slug=$(printf '%s' "$nexus_root" | sed 's|[^a-zA-Z0-9]|-|g')
-        jsonl="$home_dir/.claude/projects/$slug/$sid.jsonl"
-        if [[ -f "$jsonl" ]]; then
+        while IFS= read -r root; do
+            [[ -n "$root" ]] || continue
+            jsonl="$root/$slug/$sid.jsonl"
+            [[ -f "$jsonl" ]] || continue
             jsonl_mtime=$(date +%s -r "$jsonl" 2>/dev/null || echo 0)
             if [[ "$jsonl_mtime" =~ ^[0-9]+$ ]] && (( jsonl_mtime > last_paste_ts )); then
                 return 1
             fi
-        fi
+        done < <(cc_transcript_roots "$home_dir")
     fi
 
     printf 'unresponsive_age=%ds threshold=%ds last_paste_ts=%d' \
@@ -2716,9 +2743,11 @@ _orchestrator_refresh_pin() {
 
 # _orchestrator_jsonl_fresh <session_id> <freshness_s> <nexus_root> [home_dir]
 #
-# Returns 0 (fresh) when ~/.claude/projects/<slug>/<session_id>.jsonl
-# exists and has been written within `freshness_s`. Returns 1 (stale,
-# missing, or unreadable) otherwise.
+# Returns 0 (fresh) when <root>/<slug>/<session_id>.jsonl exists under
+# ANY root `cc_transcript_roots` prints ($CLAUDE_CONFIG_DIR/projects,
+# then <home_dir>/.claude/projects — your-org/nexus-code#1720) and has
+# been written within `freshness_s`. Returns 1 (stale, missing, or
+# unreadable) otherwise.
 #
 # `<slug>` is the Claude-Code project-slug encoding of `<nexus_root>`:
 # leading slash kept as '-', every non-alphanumeric (including '_'
@@ -2752,15 +2781,22 @@ _orchestrator_jsonl_fresh() {
     # UUID-shape guard mirrors orchestrator-session-pin.sh — protects
     # against a torn pin write seeding a path like .../.jsonl.
     [[ "$sid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || return 1
-    local slug jsonl mtime now
+    # Fresh under ANY transcript root is fresh (your-org/nexus-code#1720);
+    # `home_dir` replaces $HOME as the third root, so the fake-home seam
+    # still works.
+    local slug jsonl mtime now root
     slug=$(printf '%s' "$nexus_root" | sed 's|[^a-zA-Z0-9]|-|g')
-    jsonl="$home_dir/.claude/projects/$slug/$sid.jsonl"
-    [[ -f "$jsonl" ]] || return 1
-    mtime=$(date +%s -r "$jsonl" 2>/dev/null || echo 0)
-    [[ "$mtime" =~ ^[0-9]+$ ]] || return 1
-    (( mtime > 0 )) || return 1
     now=$(date +%s)
-    (( now - mtime <= freshness_s ))
+    while IFS= read -r root; do
+        [[ -n "$root" ]] || continue
+        jsonl="$root/$slug/$sid.jsonl"
+        [[ -f "$jsonl" ]] || continue
+        mtime=$(date +%s -r "$jsonl" 2>/dev/null || echo 0)
+        [[ "$mtime" =~ ^[0-9]+$ ]] || continue
+        (( mtime > 0 )) || continue
+        (( now - mtime <= freshness_s )) && return 0
+    done < <(cc_transcript_roots "$home_dir")
+    return 1
 }
 
 # _orchestrator_poll_refresh_pin <pin_file> <freshness_s> <nexus_root>

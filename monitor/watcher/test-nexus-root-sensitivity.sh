@@ -69,6 +69,17 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/nrs-test-XXXXXX") || exit 1
 trap 'rm -rf "$WORK"' EXIT
 export TMPDIR="$WORK"
 
+# A QUIET SOURCE ROOT FOR EVERY PROBE (your-org/nexus-code#1707). The probe's
+# source arm diffs NRS_SOURCE_ROOT (default: this checkout) and, since #1707,
+# counts a MODIFIED pre-existing file as LEAK-AT-SOURCE. This checkout's own
+# monitor/.state is written by whatever else runs beside this suite — a
+# parallel run-tests.sh band, CI's exported-root job — so probing against it
+# would blame those writers on the synthetic targets below. The cases that
+# exercise the source arm override this with their own planted root.
+export NRS_SOURCE_ROOT="$WORK/quietsrc"
+mkdir -p "$NRS_SOURCE_ROOT/monitor/.state" "$NRS_SOURCE_ROOT/reports"
+unset NRS_SOURCE_CONTENDED
+
 # PRE-RUN SWEEP (your-org/nexus-code#1511). Until #1511 the attribution block
 # below planted its `test-zz-attr-*.sh` fixtures INTO THE LIVE CHECKOUT at
 # $REPO/monitor/watcher/ and removed them from an EXIT trap — which does not
@@ -127,7 +138,7 @@ rerooter=$(mk_target rerooter \
     'exit 0')
 out=$(NRS_SOURCE_ROOT="$srcroot" "$TOOL" probe "$rerooter" 2>&1); rc=$?
 assert_contains "a re-rooted write into the SOURCE tree is LEAK-AT-SOURCE" "$out" "verdict=LEAK-AT-SOURCE"
-assert_contains "…and the new source path is named" "$out" "monitor/.state/heartbeat/w1.json"
+assert_contains "…and the new source path is named AS NEW, from an EMPTY before-snapshot (#1707)" "$out" "> NEW monitor/.state/heartbeat/w1.json"
 assert_not_contains "…and it is NOT reported hermetic" "$out" "verdict=hermetic"
 assert_eq "LEAK-AT-SOURCE GATES BY DEFAULT: exit 1 like LEAK (a detector that reports and never blocks is the #1400 shape)" "$rc" "1"
 assert_contains "…and it is listed under its own heading with the remedy" "$out" "WROTE INTO THE SOURCE CHECKOUT, not the decoy"
@@ -158,15 +169,93 @@ assert_contains "POTENCY: a marker WITHOUT a reason does not exempt — still LE
 assert_contains "…and the rejection says why" "$out" "marker REJECTED"
 assert_eq "…and it still exits 1" "$rc" "1"
 rm -rf "$srcroot/monitor/.state/heartbeat"
-# CONTROL: a pre-existing source-tree file that merely CHANGES is the watcher's
-# noise on a primary, not this suite's write — only NEW paths count.
+
+# ---------------------------------------------------------------------------
+echo "=== an APPEND to a PRE-EXISTING source file is LEAK-AT-SOURCE (#1707) ==="
+# The #1431 arm counted NEW paths only, so a suite appending to a file that
+# already existed read HERMETIC: a probe was sound only from a clean
+# monitor/.state. Measured on #1707: test-session-name-from-window.sh appended
+# 3 rows to an arming.log an earlier probe had created and read hermetic; from
+# a clean .state the same suite read LEAK-AT-SOURCE. This root is NOT clean.
 printf 'old\n' > "$srcroot/monitor/.state/action-log.jsonl"
 appender=$(mk_target appender \
     'echo "{\"event\":\"x\"}" >> "'"$srcroot"'/monitor/.state/action-log.jsonl"' \
     'echo "=== summary: 1 passed, 0 failed ==="' \
     'exit 0')
-out=$(NRS_SOURCE_ROOT="$srcroot" "$TOOL" probe "$appender" 2>&1)
-assert_not_contains "CONTROL: an append to an EXISTING source file is not LEAK-AT-SOURCE (primary noise)" "$out" "verdict=LEAK-AT-SOURCE"
+out=$(NRS_SOURCE_ROOT="$srcroot" "$TOOL" probe "$appender" 2>&1); rc=$?
+assert_contains "an append to an EXISTING source file on a non-clean .state is LEAK-AT-SOURCE" "$out" "verdict=LEAK-AT-SOURCE"
+assert_contains "…and the change is named with its growth" "$out" "> GREW +14B monitor/.state/action-log.jsonl"
+assert_eq "…and it gates (exit 1)" "$rc" "1"
+# The other shapes a pre-existing file can change by, each through the same arm.
+printf 'abc\n' > "$srcroot/monitor/.state/same.txt"
+printf 'x\n'   > "$srcroot/monitor/.state/swap.txt"
+printf 'x\n'   > "$srcroot/monitor/.state/gone.txt"
+shaper=$(mk_target shaper \
+    'S="'"$srcroot"'/monitor/.state"' \
+    'sleep 0.05; printf "xyz\n" > "$S/same.txt"' \
+    'printf "y\n" > "$S/swap.tmp" && mv "$S/swap.tmp" "$S/swap.txt"' \
+    'rm -f "$S/gone.txt"' \
+    'exit 0')
+out=$(NRS_SOURCE_ROOT="$srcroot" "$TOOL" probe "$shaper" 2>&1); rc=$?
+assert_contains "a SAME-SIZE in-place rewrite is caught (mtime moved)" "$out" "> REWRITTEN monitor/.state/same.txt"
+assert_contains "a tmp+mv REPLACEMENT of the same size is caught (inode moved)" "$out" "> REPLACED monitor/.state/swap.txt"
+assert_contains "a REMOVED pre-existing file is caught" "$out" "> REMOVED monitor/.state/gone.txt"
+assert_eq "…and all of them gate (exit 1)" "$rc" "1"
+
+# NEGATIVE: a suite that only READS the non-clean source tree stays hermetic.
+# Without this the arm above is satisfied by one that fires on any probe.
+reader=$(mk_target reader \
+    'cat "'"$srcroot"'/monitor/.state/action-log.jsonl" >/dev/null' \
+    'ls -la "'"$srcroot"'/monitor/.state" >/dev/null' \
+    'echo "=== summary: 1 passed, 0 failed ==="' \
+    'exit 0')
+out=$(NRS_SOURCE_ROOT="$srcroot" "$TOOL" probe "$reader" 2>&1); rc=$?
+assert_contains "NEGATIVE: a read-only suite over a NON-clean source root is hermetic" "$out" "verdict=hermetic"
+assert_eq "…and exits 0" "$rc" "0"
+
+echo "=== in a band, EVERY appender to one shared file is blamed, not just its creator (#1707) ==="
+# Each probe diffs its own before/after pair, so the change is attributed to
+# the suite that ran between them. The hermetic reader in the MIDDLE is the
+# control that attribution does not bleed from one suite to the next.
+rm -f "$srcroot/monitor/.state/shared.log"
+creator=$(mk_target creator 'echo row0 >> "'"$srcroot"'/monitor/.state/shared.log"' 'exit 0')
+app_a=$(mk_target app_a 'echo rowA >> "'"$srcroot"'/monitor/.state/shared.log"' 'exit 0')
+app_b=$(mk_target app_b 'echo rowB >> "'"$srcroot"'/monitor/.state/shared.log"' 'exit 0')
+out=$(NRS_SOURCE_ROOT="$srcroot" "$TOOL" band "$creator" "$app_a" "$reader" "$app_b" 2>&1); rc=$?
+_verdict_of() { awk -v s="--- $1" '$0==s {getline; sub(/^ *verdict=/,""); sub(/ .*/,""); print; exit}' <<<"$out"; }
+assert_eq "band: the CREATOR of the shared file is LEAK-AT-SOURCE" "$(_verdict_of "$creator")" "LEAK-AT-SOURCE"
+assert_eq "band: the FIRST appender is LEAK-AT-SOURCE too" "$(_verdict_of "$app_a")" "LEAK-AT-SOURCE"
+assert_eq "band: the read-only suite between them is hermetic (no bleed)" "$(_verdict_of "$reader")" "hermetic"
+assert_eq "band: the SECOND appender is LEAK-AT-SOURCE too" "$(_verdict_of "$app_b")" "LEAK-AT-SOURCE"
+assert_contains "band: the summary counts three source leaks" "$out" "leaked-at-source 3"
+assert_eq "band: exit 1" "$rc" "1"
+
+echo "=== a CONTENDED source root demotes modifications to UNATTRIBUTED, never NEW paths (#1707) ==="
+# A configured nexus (config/nexus.yml) is written by the watcher and every
+# agent while the probe runs, so a modified file there cannot be pinned on the
+# suite. It is printed, not gated — and a NEW path still gates.
+cont="$WORK/contended"; mkdir -p "$cont/monitor/.state" "$cont/config"; : > "$cont/config/nexus.yml"
+printf 'old\n' > "$cont/monitor/.state/action-log.jsonl"
+cappender=$(mk_target cappender 'echo more >> "'"$cont"'/monitor/.state/action-log.jsonl"' 'exit 0')
+out=$(NRS_SOURCE_ROOT="$cont" "$TOOL" probe "$cappender" 2>&1); rc=$?
+assert_not_contains "contended: an append is NOT LEAK-AT-SOURCE" "$out" "verdict=LEAK-AT-SOURCE"
+assert_contains "…it is printed UNATTRIBUTED (a demotion is not an absence)" "$out" "? GREW +5B monitor/.state/action-log.jsonl"
+assert_eq "…and does not gate (exit 0)" "$rc" "0"
+cnew=$(mk_target cnew 'echo x > "'"$cont"'/monitor/.state/brand-new.json"' 'exit 0')
+out=$(NRS_SOURCE_ROOT="$cont" "$TOOL" probe "$cnew" 2>&1); rc=$?
+assert_contains "contended: a NEW path still gates as LEAK-AT-SOURCE" "$out" "verdict=LEAK-AT-SOURCE"
+assert_eq "…exit 1" "$rc" "1"
+out=$(NRS_SOURCE_CONTENDED=0 NRS_SOURCE_ROOT="$cont" "$TOOL" probe "$cappender" 2>&1); rc=$?
+assert_contains "NRS_SOURCE_CONTENDED=0 overrides the discriminator: the append gates" "$out" "verdict=LEAK-AT-SOURCE"
+# From an EMPTY contended .state: the before-snapshot is empty, which is the
+# input that made the first cut of the change diff read every NEW path as
+# REMOVED — and in a contended root REMOVED is demoted, so a real new-path
+# leak read hermetic. Caught by a subject mutation, not by reading.
+cempty="$WORK/contended-empty"; mkdir -p "$cempty/monitor/.state" "$cempty/config"; : > "$cempty/config/nexus.yml"
+cnew2=$(mk_target cnew2 'mkdir -p "'"$cempty"'/monitor/.state/heartbeat"' 'echo x > "'"$cempty"'/monitor/.state/heartbeat/w1.json"' 'exit 0')
+out=$(NRS_SOURCE_ROOT="$cempty" "$TOOL" probe "$cnew2" 2>&1); rc=$?
+assert_contains "contended + EMPTY .state: a NEW path still gates as LEAK-AT-SOURCE" "$out" "verdict=LEAK-AT-SOURCE"
+assert_not_contains "…and is never misread as REMOVED" "$out" "REMOVED monitor/.state/heartbeat"
 
 # ---------------------------------------------------------------------------
 echo "=== a QUOTED marker is fixture DATA, not a declaration (#1454) ==="

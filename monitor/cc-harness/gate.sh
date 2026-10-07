@@ -89,6 +89,10 @@ else
     _gate_population_lib=0
 fi
 
+# `cc_tree_dirty_digest` for the tree stamp (your-org/nexus-code#1657).
+# shellcheck source=../_cc-hold-policy.sh
+[[ -r "$REPO_ROOT/monitor/_cc-hold-policy.sh" ]] && . "$REPO_ROOT/monitor/_cc-hold-policy.sh"
+
 # trash_path: rename-aside instead of unlink, so tearing down a throwaway
 # prefix never trips on a held-open inode (`.nfs`/EBUSY over NFS).
 # shellcheck source=../_trash.sh
@@ -258,7 +262,12 @@ fi
 # evidence, so prove the lint still fails on planted violations before
 # trusting its verdict on the real tree.
 echo "=== safety lint: tmux kill-server/kill-session must be socket-scoped ==="
-if ! _gate_run_teed "$GATE_LINT_TRANSCRIPT" "$_self_dir/lint-no-tmux-server-kill.sh" --selftest; then
+# The selftest runs with its MANIFEST RATCHET split out (your-org/nexus-code
+# #1657): sections 1-7 prove the detector still fires and stay a hard refusal;
+# the counted-exemption ratchet is checked below, after the scenario list is
+# known, where an exemption OUTSIDE the files this gate executes is recorded
+# as repo hygiene instead of refusing the candidate.
+if ! LINT_TMUX_SELFTEST_SKIP_MANIFEST=1 _gate_run_teed "$GATE_LINT_TRANSCRIPT" "$_self_dir/lint-no-tmux-server-kill.sh" --selftest; then
     echo "gate.sh: tmux-socket lint FAILED ITS OWN NEGATIVE CONTROL — refusing to gate." >&2
     exit 1
 fi
@@ -554,6 +563,19 @@ _gate_stamp_tree() {
     else
         dirty_tracked=0
     fi
+    # The DIGEST of the tracked edits (your-org/nexus-code#1657): lets the bump
+    # path accept a dirty gated tree when the LIVE clone carries byte-identical
+    # edits — the gate then ran exactly what production runs.
+    local dirty_digest="none"
+    if [[ "$dirty_tracked" == "1" ]]; then
+        if declare -F cc_tree_dirty_digest >/dev/null; then
+            dirty_digest=$(cc_tree_dirty_digest "$REPO_ROOT")
+        else
+            dirty_digest="unknown"
+        fi
+    elif [[ "$dirty_tracked" == "unknown" ]]; then
+        dirty_digest="unknown"
+    fi
     blob=$(_gate_git -C "$REPO_ROOT" rev-parse "HEAD:${GATE_TREE_SUBJECT_PATH}" 2>/dev/null)
     [[ "$blob" =~ ^[0-9a-f]{40}$ ]] || blob="none"
 
@@ -565,7 +587,7 @@ _gate_stamp_tree() {
     echo "    tracked: $dirty_tracked (tracked modifications only — the bump path keys on THIS)"
     echo "    untrack: $untracked (untracked porcelain entries — audit only, see #1320)"
     echo "    subject: ${GATE_TREE_SUBJECT_PATH}@$blob"
-    echo "=== gated-tree: head=$head ref=$ref dirty=$dirty dirty_tracked=$dirty_tracked untracked=$untracked subject_path=${GATE_TREE_SUBJECT_PATH} subject_blob=$blob ==="
+    echo "=== gated-tree: head=$head ref=$ref dirty=$dirty dirty_tracked=$dirty_tracked untracked=$untracked dirty_digest=$dirty_digest subject_path=${GATE_TREE_SUBJECT_PATH} subject_blob=$blob ==="
     # WHICH tracked files (your-org/nexus-code#1475). `dirty_tracked=1` alone
     # made the bump refusal say "Commit or stash" to an unattended routine
     # without naming a file, so every fire re-derived the same one-line
@@ -782,6 +804,11 @@ gate_prod_scenarios=(
         # verify window, a DROPPED Enter is recovered exactly once, and an
         # operator draft in the same window is not submitted.
         "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-respawn-verify.sh"
+        # THE SAME VERIFY WHEN THE PASTE RENDERS LATE (your-org/nexus-code#1715):
+        # the box reads blank at the verdict and our brief lands afterwards. It
+        # must be submitted once, never reported UNDELIVERED; an operator draft
+        # landing late instead must not be submitted.
+        "$REPO_ROOT/monitor/watcher/test-integration/test-realmodel-respawn-late-render.sh"
         # THE DANGEROUS-RM PROMPT (your-org/nexus-code#1632). Shown even under
         # --dangerously-skip-permissions (a bypass-immune check), auto-denied
         # after 2 minutes from 2.1.281, and DECIDED in production by the
@@ -800,6 +827,109 @@ if [[ -n "${CCH_GATE_SCENARIOS:-}" ]]; then
     echo "=== gate-population: EXECUTED list OVERRIDDEN by CCH_GATE_SCENARIOS (${#scenarios[@]} entries); the coverage boundary below still describes the PRODUCTION list (${#gate_prod_scenarios[@]} entries) ==="
 else
     scenarios=( "${gate_prod_scenarios[@]}" )
+fi
+
+# ---- the exemption ratchet: SAFETY vs HYGIENE (your-org/nexus-code#1657) --
+#
+# On 2026-09-27 the pragma count moved 2 -> 4 on dev (two Codex suites under
+# monitor/watcher/test-integration/, reviewed later by #1643) and this gate
+# REFUSED before any scenario, holding 2.1.283 — which had passed 12/12 the
+# day before — on a fact about two files this gate never executes. The
+# ratchet's job is to force REVIEW of a new exemption; this gate's job is the
+# candidate. So a moved count is split by WHERE the exemptions sit:
+#
+#   OUTSIDE the gate's execution — recorded `=== gate-hygiene: FAIL … ===`,
+#     and the scenarios run. A pragma'd file is OUTSIDE only when ALL hold:
+#       (a) it is a suite ENTRY POINT (`test-*.sh`): suites are run by a
+#           runner, and this gate runs no runner — only its named list;
+#       (b) it is not one of this gate's production scenarios;
+#       (c) no NON-suite shell file under monitor/ names its basename on a
+#           non-comment line (the gate's closure can only reach a suite by
+#           naming it: every file the gate runs is a non-suite or a named
+#           scenario, and a suite named only by other suites, manifests or
+#           comments is unreachable from it);
+#       (d) nothing in monitor/cc-harness/, the scenarios or their sourced
+#           test-integration helpers globs over `test-*` (which would reach a
+#           suite without naming it).
+#   INSIDE — everything else, including every file a check above could not
+#     classify: still a REFUSAL (exit 1). An unreviewed server kill in
+#     pane-state.sh, spawn-worker.sh, paste-followup.sh, ng, a hook or the
+#     harness would run under the scenarios, and that is sandbox safety.
+#
+# The skeptic of round 1 (F3) found the first cut's hand list — cc-harness/,
+# `_*.sh`, the scenarios — which classified pane-state.sh, spawn-worker.sh,
+# paste-followup.sh, ng and the hooks as OUTSIDE. This predicate is derived
+# instead: only the NARROW class above is outside, and the default is inside.
+# Both pragma kinds are counted (kill and shim-writer). RESIDUAL, stated: a
+# suite reached through a path built at runtime without its basename (e.g.
+# "test-codex-$x.sh") is not seen by (c); (d) refuses the glob form of that.
+GATE_EXEC_PRAGMAS_EXPECTED="${LINT_TMUX_EXPECTED_EXECUTED_PRAGMAS:-2}"
+GATE_EXEC_SHIMW_EXPECTED="${LINT_TMUX_EXPECTED_EXECUTED_SHIMW_PRAGMAS:-0}"
+gate_hygiene=""
+
+# _gate_suite_named_by_nonsuite <basename> — rc 0 iff a non-suite shell file
+# under monitor/ names <basename> on a non-comment line; rc 2 if the walk failed.
+_gate_suite_named_by_nonsuite() {
+    # Per FILE, not `find | xargs grep`: xargs exits 123 whenever ANY grep
+    # exits 1, so "no file names it" and "a grep failed" read identically —
+    # and the first cut of this predicate read the no-match case as a failure,
+    # i.e. INSIDE for every unreferenced suite. Here rc 1 is a clean miss and
+    # rc 2 is a real read error (→ rc 2, which the caller treats as INSIDE).
+    local b="$1" f r hits
+    while IFS= read -r -d '' f; do
+        hits=$(grep -F -- "$b" "$f" 2>/dev/null); r=$?
+        (( r == 2 )) && return 2
+        (( r == 0 )) && grep -qvE '^[[:space:]]*#' <<<"$hits" && return 0
+    done < <(find "$REPO_ROOT/monitor" -type f \( -name '*.sh' -o -name '*.bash' -o ! -name '*.*' \) \
+               ! -name 'test-*' ! -path '*/.state/*' ! -path '*/node_modules/*' -print0 2>/dev/null)
+    return 1
+}
+# _gate_closure_globs_suites — rc 0 iff a file the gate runs directly
+# (cc-harness/, the scenarios, test-integration/_*.sh helpers) globs `test-*`.
+_gate_closure_globs_suites() {
+    local f
+    for f in "$REPO_ROOT"/monitor/cc-harness/*.sh "$REPO_ROOT"/monitor/watcher/test-integration/_*.sh "${gate_prod_scenarios[@]}"; do
+        [[ -f "$f" ]] || continue
+        # gate.sh itself: its `test-*` patterns are THIS predicate's own find
+        # filter, and it reaches suites only through gate_prod_scenarios.
+        [[ "$f" -ef "$_self_dir/gate.sh" ]] && continue
+        grep -qE 'test-\*|test-\?' <<<"$(grep -vE '^[[:space:]]*#' "$f" 2>/dev/null)" && return 0
+    done
+    return 1
+}
+# _gate_pragma_file_outside <path> — rc 0 iff OUTSIDE by (a)-(d); rc 1 INSIDE.
+_gate_pragma_file_outside() {
+    local f="$1" b sc
+    b="${f##*/}"
+    [[ "$b" == test-*.sh ]] || return 1                                  # (a)
+    for sc in "${gate_prod_scenarios[@]}"; do [[ "$f" == "$sc" ]] && return 1; done   # (b)
+    _gate_suite_named_by_nonsuite "$b"; case $? in 1) ;; *) return 1 ;; esac          # (c)
+    _gate_closure_globs_suites && return 1                               # (d)
+    return 0
+}
+
+_gate_mf="${GATE_TRANSCRIPT_DIR:+$GATE_TRANSCRIPT_DIR/manifest.out}"
+[[ -n "$_gate_mf" ]] || _gate_mf=$(mktemp -t cc-gate-manifest-XXXXXX)
+if ! "$_self_dir/lint-no-tmux-server-kill.sh" --manifest-check > "$_gate_mf" 2>&1; then
+    _exec_pragmas=0; _exec_shimw=0; _pf_seen=0; _outside_list=""
+    while IFS=$'\t' read -r _pf _pc _ps; do
+        [[ -n "$_pf" && "$_pc" =~ ^[0-9]+$ ]] || continue
+        [[ "$_ps" =~ ^[0-9]+$ ]] || _ps=0
+        _pf_seen=1
+        if _gate_pragma_file_outside "$_pf"; then
+            _outside_list="${_outside_list:+$_outside_list,}${_pf#"$REPO_ROOT"/}"
+        else
+            _exec_pragmas=$(( _exec_pragmas + _pc )); _exec_shimw=$(( _exec_shimw + _ps ))
+        fi
+    done < <("$_self_dir/lint-no-tmux-server-kill.sh" --pragma-files "$REPO_ROOT/monitor" 2>/dev/null)
+    if (( ! _pf_seen )) || (( _exec_pragmas != GATE_EXEC_PRAGMAS_EXPECTED || _exec_shimw != GATE_EXEC_SHIMW_EXPECTED )); then
+        cat "$_gate_mf" 2>/dev/null
+        echo "gate.sh: tmux-socket lint exemption count CHANGED INSIDE the files this gate executes (executed-set pragmas kill=$_exec_pragmas/reviewed $GATE_EXEC_PRAGMAS_EXPECTED, shim-writer=$_exec_shimw/reviewed $GATE_EXEC_SHIMW_EXPECTED, pragma-file listing read=$_pf_seen) — an unreviewed kill exemption may reach the harness; refusing to gate (safety, not the candidate)." >&2
+        exit 1
+    fi
+    gate_hygiene="lint-no-tmux-server-kill-manifest"
+    echo "=== gate-hygiene: FAIL lint=lint-no-tmux-server-kill check=manifest executed_set_pragmas=$_exec_pragmas executed_set_shimw=$_exec_shimw (unchanged) outside=[$_outside_list] — the counted exemptions moved only in suites this gate never executes: repo hygiene, NOT a candidate finding and NOT a refusal; file it (#1657) ==="
+    sed 's/^/    /' "$_gate_mf" 2>/dev/null
 fi
 
 # CCH_GATE=1 makes a scenario's self-skip exit 77 (the SKIP sentinel)

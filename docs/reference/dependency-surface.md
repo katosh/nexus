@@ -495,13 +495,13 @@ The watcher's optional rate-limit probe (`RATELIMIT_PROBE=true`, default **off**
 
 | Interface | Where (`path:line`) | Purpose | Breakage signal |
 |---|---|---|---|
-| Pushover: POST https://api.pushover.net/1/messages.json (token, user, message, priority, sound) | `monitor/notify.sh:140-146` | Primary push channel | Pushover endpoint/path change; form-field rename; priority enum change |
-| Pushover priority scale 0 (routine) / 1 (emergency) + sound | `monitor/notify.sh:135-140` | Maps the nexus --priority tier to Pushover's scale | Pushover priority semantics change |
-| ntfy.sh: publish to https://ntfy.sh/<topic> (-d body, or -T file for image) | `monitor/notify.sh:156-182` | Fallback push channel when no Pushover creds | ntfy publish API change; topic-URL scheme change |
-| ntfy headers: Title, Priority (3 routine / 5 emergency), Message | `monitor/notify.sh:165` | ntfy carries title/priority/message via HTTP headers | ntfy header name/semantics change |
-| SMTP via python3 smtplib.SMTP(host, port, timeout=10).send_message() | `monitor/notify.sh:204-245` | Emergency email to the operator | smtplib API change (low); SMTP host/port reachability; EmailMessage MIME API change |
-| email.message.EmailMessage (set_content) | `monitor/notify.sh:205-219` | Compose the plaintext email body | stdlib email API change (very low churn) |
-| curl flags: -sS, -o /dev/null, -w '%{http_code}', --max-time, -F, -d, -T, -H | `monitor/notify.sh:145-146,177-182` | HTTP POST/PUT with status-code capture and per-call timeouts | curl `--write-out` token rename; flag-behavior change (BSD vs GNU curl) |
+| Pushover: POST https://api.pushover.net/1/messages.json (token, user, message, priority, sound) | `monitor/notify.sh:210-217` | Primary push channel | Pushover endpoint/path change; form-field rename; priority enum change |
+| Pushover priority scale 0 (routine) / 1 (emergency) + sound | `monitor/notify.sh:205-210` | Maps the nexus --priority tier to Pushover's scale | Pushover priority semantics change |
+| ntfy.sh: publish to https://ntfy.sh/<topic> (-d body, or -T file for image) | `monitor/notify.sh:227-253` | Fallback push channel when no Pushover creds | ntfy publish API change; topic-URL scheme change |
+| ntfy headers: Title, Priority (3 routine / 5 emergency), Message | `monitor/notify.sh:236` | ntfy carries title/priority/message via HTTP headers | ntfy header name/semantics change |
+| SMTP via python3 smtplib.SMTP(host, port, timeout=10).send_message(msg, from_addr, to_addrs) | `monitor/notify.sh:332-447` | Emergency email to the operator | smtplib API change (low); SMTP host/port reachability; EmailMessage MIME API change |
+| email.message.EmailMessage (set_content) | `monitor/notify.sh:333-405` | Compose the plaintext email body | stdlib email API change (very low churn) |
+| curl flags: -sS, -o /dev/null, -w '%{http_code}', --max-time, -F, -d, -T, -H | `monitor/notify.sh:216-217,248-253` | HTTP POST/PUT with status-code capture and per-call timeouts | curl `--write-out` token rename; flag-behavior change (BSD vs GNU curl) |
 | smee.io webhook relay channel (bot_webhook_url) | `config/nexus.example.yml (github.bot_webhook_url)`<br>`monitor/install-prompt.md:162-191` | GitHub App delivers webhooks to a smee.io channel; the watcher reads deliveries via the GitHub `/app/hook/deliveries` API (see gh/REST section), not smee directly | smee.io service outage/shutdown; channel-URL scheme change (install-time dependency) |
 
 !!! note "Notes"
@@ -526,7 +526,7 @@ The watcher's optional rate-limit probe (`RATELIMIT_PROBE=true`, default **off**
 | jq: . (identity/root) | `monitor/hooks/async-launch-detect.sh:466,471-472`<br>`monitor/declare-no-wait.sh:210-212` | Access root object in filter chains; used with field selection and object mutations | jq root object access changes |
 | jq: .field \| map(select(.condition)) | `monitor/hooks/async-launch-detect.sh:196` | Filter arrays by condition; used to idempotently insert external_waits entries | jq map/select behavior changes |
 | jq: complex filters (multiline) | `monitor/pane-state.sh:652`<br>`monitor/watcher/_github.sh:229` | Multi-line jq filter definitions for complex state extraction and JSON composition (test) | jq multiline filter parsing changes |
-| python3: interpreter | `config/load.sh:50`<br>`monitor/notify.sh:198`<br>`monitor/notify.sh:203` | Run embedded Python for YAML config parsing, email sending, and JSON processing | python3 not found on PATH or version < 3.6 |
+| python3: interpreter | `config/load.sh:50`<br>`monitor/notify.sh:325`<br>`monitor/notify.sh:331` | Run embedded Python for YAML config parsing, email sending, and JSON processing | python3 not found on PATH or version < 3.6 |
 | python3: yaml (pyyaml module) | `config/load.sh:52-57` | Parse nexus.yml config files; required for all nexus operations | pyyaml module missing or yaml.safe_load() behavior changes |
 | python3: json, sys modules | `monitor/watcher/test-spawn-worker.sh:343`<br>`monitor/watcher/test-spawn-worker.sh:351` | (test) Validate JSON parsing and verify settings file structure | python3 stdlib json/sys modules removed or changed |
 | node: >=18.0.0 | `monitor/install-claude-local.sh:45-54`<br>`package-lock.json:25` | Node.js runtime required to run npm and execute claude-code binary; version enforced as >=18 | node not on PATH, version < 18, or --version format changes |
@@ -580,7 +580,7 @@ The watcher's optional rate-limit probe (`RATELIMIT_PROBE=true`, default **off**
 | bash: printf -v (assign to variable) | `monitor/watcher/test-ng-reply-repo.sh:81-83`<br>`monitor/watcher/test-ng-react-repo.sh:147-149` | (test) Assign command output to variables without subshells | bash printf -v syntax changes |
 | bash: ${var%%pattern} (parameter expansion) | `monitor/install-claude-local.sh:51` | Extract major version number from 'v18.6.0' by removing everything after first dot | bash parameter expansion syntax changes |
 | bash: local -n (nameref/reference variables) | `monitor/watcher/_scheduler.sh:14 (comments indicate use)` | Pass array references to functions without copying; bash 4.3+ | bash local -n syntax changes or nameref behavior changes |
-| bash: here-documents with <<'MARKER' | `config/load.sh:52`<br>`monitor/notify.sh:203` | Embed Python/shell code in bash scripts with proper quoting; prevents variable expansion | bash here-doc quoting semantics change |
+| bash: here-documents with <<'MARKER' | `config/load.sh:52`<br>`monitor/notify.sh:331` | Embed Python/shell code in bash scripts with proper quoting; prevents variable expansion | bash here-doc quoting semantics change |
 | agent-sandbox: SANDBOX_ACTIVE and SANDBOX_PROJECT_DIR | `monitor/watcher/entry.sh:150`<br>`monitor/bootstrap-install.sh:115` | Detect if running inside agent-sandbox; required for safe filesystem isolation | agent-sandbox environment variables removed or set semantics change |
 | agent-sandbox: tmux new-session integration | `monitor/watcher/entry.sh:7`<br>`monitor/bootstrap-install.sh:5` | Launch watcher and bootstrap inside agent-sandbox-managed tmux sessions for isolation | agent-sandbox no longer manages tmux sessions or isolation boundary changes |
 | curl: -sS -X POST (HTTP POST with error reporting) | `monitor/mint-token.sh:176` | Exchange GitHub App JWT for installation token; silent but show server errors | curl -sS behavior changes, HTTP error codes change, or endpoint returns different format |

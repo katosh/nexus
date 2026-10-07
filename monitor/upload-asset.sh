@@ -50,6 +50,15 @@
 #                          [--repo-path <path>]         (override default placement, asset-repo-root-relative)
 #                          [--shape pin|latest]         (pin = blob/raw/<sha>/...; latest = blob/raw/main/...; default pin)
 #                          [--message <commit msg>]
+#                          [--replace]                  (overwrite a DIFFERENT asset already at the destination)
+#
+# Destination collisions (your-org/nexus-code#1639): the destination is derived
+# from the BASENAME, so two different files named `summary.md` for one issue
+# map to the same path. An existing destination holding DIFFERENT bytes at the
+# asset repo's synced HEAD is REFUSED (exit 5, no URL) unless --replace is
+# given. Identical bytes are not a collision (rc 0, the existing HEAD is
+# pinned). The check runs in the DRAIN, against the tree after the sync, and is
+# PER-REQUEST: a refused request is dropped from the batch; the others commit.
 #
 # Defaults:
 #   --asset-repo from config github.asset_repo, fallback github.repo (env: NEXUS_ASSET_REPO)
@@ -66,6 +75,12 @@
 #   1  bad usage
 #   2  mint-token.sh failed
 #   3  asset-repo clone/pull/push failed
+#   5  REFUSED: the destination path already holds a DIFFERENT asset at the
+#      asset repo's HEAD, and --replace was not given (your-org/nexus-code#1639).
+#      Nothing of THIS request was committed and no URL is printed; the
+#      message on stderr names the path, the commit that last wrote it, and
+#      both remedies (--repo-path <unique path> to keep both, --replace to
+#      overwrite deliberately). Other requests in the same batch are unaffected.
 #   7  REFUSED: the DESTINATION repository is wrong — either `--repo` named
 #      something other than the configured asset repo (that flag means the
 #      ASSET repo here and the ISSUE repo on every other `ng` verb), or the
@@ -142,6 +157,47 @@ _root_origin=""
 if [[ -n "${NEXUS_ROOT:-}" ]]; then
     _root_origin="\$NEXUS_ROOT=$NEXUS_ROOT"
     _nexus_root=$(nexus_primary_root "$NEXUS_ROOT") || _nexus_root=""
+    # THE ONE-TREE RULE (your-org/nexus-code#1651). An explicit NEXUS_ROOT must
+    # still RESOLVE (the fail-closed check below), but it no longer decides
+    # WHICH nexus on its own: `ng` keys on its own tree, and this script used to
+    # key on $NEXUS_ROOT first, so with NEXUS_ROOT at a foreign nexus `ng`
+    # refused a write while `ng upload` pushed to the foreign asset repo at
+    # rc 0. `nexus_config_root` is the shared answer: this script's own tree,
+    # unless that tree has no config of its own (then NEXUS_ROOT's), and a
+    # REFUSAL when both trees name different identities. NEXUS_CONFIG is an
+    # explicit opt-in and keeps the NEXUS_ROOT-first behaviour.
+    if [[ -n "$_nexus_root" && -z "${NEXUS_CONFIG:-}" ]]; then
+        _crc=0; _croot=$(nexus_config_root "$_script_dir/..") || _crc=$?
+        if (( _crc == 3 )); then
+            {
+                echo "upload-asset.sh: REFUSING — the nexus this asset belongs to is ambiguous."
+                echo "  $_croot"
+                echo "  Run the upload-asset.sh (or ng) of the nexus you mean, or fix NEXUS_ROOT"
+                echo "  (your-org/nexus-code#1651). Nothing was written."
+            } >&2
+            exit 4
+        elif (( _crc == 2 )); then
+            # This script's OWN tree has a nexus.yml that cannot be read. Using
+            # $NEXUS_ROOT's nexus instead is the broken-read-as-absent collapse
+            # (your-org/nexus-code#1652 item 3): refuse by name.
+            {
+                echo "upload-asset.sh: REFUSING — this tool's own nexus config is unreadable."
+                echo "  $_croot"
+                echo "  Fix that config/nexus.yml, or run the upload-asset.sh (or ng) of the nexus"
+                echo "  you mean (your-org/nexus-code#1652). Nothing was written."
+            } >&2
+            exit 4
+        elif (( _crc == 0 )) && [[ -n "$_croot" ]]; then
+            _root_origin="one-tree rule (script tree $_script_dir/.., \$NEXUS_ROOT=$NEXUS_ROOT)"
+            _nexus_root="$_croot"
+        else
+            # FAIL CLOSED: an rc the resolver does not define (it crashed) is no
+            # licence to keep $NEXUS_ROOT's answer — that is the #1651 defect.
+            echo "upload-asset.sh: REFUSING — the one-tree resolver failed (rc $_crc); cannot tell which nexus this asset belongs to. Nothing was written." >&2
+            exit 4
+        fi
+        unset _crc _croot
+    fi
 else
     _root_origin="script location ($_script_dir/..), \$NEXUS_ROOT unset"
     _nexus_root=$(nexus_primary_root "$_script_dir/..") || _nexus_root=""
@@ -215,6 +271,7 @@ ISSUE=""
 REPO_PATH=""
 SHAPE="pin"
 MESSAGE=""
+REPLACE=0
 ASSETS_DIR="$_nexus_root/assets"
 
 # your-org/nexus-code#575. The full header block is a ~60-line design document.
@@ -231,8 +288,10 @@ usage() {   # $1 = exit code (0 ⇒ explicit --help ⇒ full reference)
         cat >&2 <<'EOU'
 usage: upload-asset.sh <local-path> [--issue N] [--repo-path <path>]
                        [--shape pin|latest] [--message <msg>] [--asset-repo <owner/name>]
+                       [--replace]
 Run with --help for the full reference.
 Exit 1 is BAD USAGE — it is not an asset-repo failure (that is exit 3).
+Exit 5 is a DESTINATION COLLISION — pass --repo-path <unique path> or --replace.
 EOU
     fi
     exit "${1:-1}"
@@ -246,6 +305,7 @@ _argloop_prev_1=-1; while (( $# > 0 )); do (( $# != _argloop_prev_1 )) || _arglo
         --repo-path)   REPO_PATH="$2"; shift 2 ;;
         --shape)       SHAPE="$2"; shift 2 ;;
         --message)     MESSAGE="$2"; shift 2 ;;
+        --replace)     REPLACE=1; shift ;;
         -h|--help)     usage 0 ;;
         --)            shift; break ;;
         -*)            echo "unknown flag: $1" >&2; usage 1 ;;
@@ -501,7 +561,8 @@ _unstage_this_request() {
     # refusal both misreports (the upload did happen) and erases its own evidence
     # (the result file that proves it). Not established, not fixed here.
     rm -f "$REQ_BASE.req" "$REQ_BASE.req.tmp" "$REQ_BASE.blob" \
-          "$REQ_BASE.url" "$REQ_BASE.url.tmp" 2>/dev/null || true
+          "$REQ_BASE.url" "$REQ_BASE.url.tmp" \
+          "$REQ_BASE.refused" "$REQ_BASE.refused.tmp" 2>/dev/null || true
 }
 
 # Hard assertion. $1 = phase label, quoted into the diagnostic.
@@ -571,7 +632,9 @@ _assert_asset_tree_self_rooted() {
 #              would create. Then ONE push for the whole chain. Only AFTER
 #              the push succeeds, write each request's URL into its result
 #              file and remove its marker.
-#   4. COLLECT: read this request's own result file and print the URL.
+#   4. COLLECT: read this request's own result file and print the URL — or,
+#              if the manager REFUSED it (destination collision, exit 5), its
+#              `.refused` file, whose message goes to stderr.
 #
 # Reliability / failure modes:
 #   - Manager death (crash/SIGKILL/OOM) holding the lock: flock is
@@ -599,8 +662,9 @@ _assert_asset_tree_self_rooted() {
 # Dangling-SHA invariant: a URL is emitted only from a result file, a result
 # file is written only AFTER `git push` returns 0, and the SHA it pins is a
 # commit in the just-pushed chain. A URL can therefore never name a commit
-# absent from the remote. Worker-facing contract is unchanged:
-# `url=$(ng upload <file>)` — all coordination is internal, no new flags.
+# absent from the remote. Worker-facing contract: `url=$(ng upload <file>)` —
+# all coordination is internal. The one flag the staging model carries is
+# --replace (your-org/nexus-code#1639), recorded in the marker as `replace\t1`.
 # ---------------------------------------------------------------------------
 
 STAGING_DIR="${ASSETS_DIR}.staging"
@@ -783,6 +847,7 @@ cp "$LOCAL" "$REQ_BASE.blob"
     printf 'repo_path\t%s\n' "$REPO_PATH"
     printf 'shape\t%s\n'     "$SHAPE"
     printf 'message\t%s\n'   "$MESSAGE"
+    printf 'replace\t%s\n'   "$REPLACE"
 } > "$REQ_BASE.req.tmp"
 mv -f "$REQ_BASE.req.tmp" "$REQ_BASE.req"
 RESULT="$REQ_BASE.url"
@@ -854,36 +919,64 @@ shopt -s nullglob
 batch=( "$STAGING_DIR"/*.req )
 shopt -u nullglob
 
-declare -A _sha _rp _shape
+declare -A _sha _rp _shape _refused
 processed=()
 attempt=0
 backoff=1
 while :; do
     (( attempt > 0 )) && { sync_tree || { echo "asset-repo re-sync failed" >&2; exit 3; }; }
     processed=()
+    _refused=()          # re-decided on every attempt, against that attempt's synced tree
     made_commit=0
     for marker in "${batch[@]}"; do
         [[ -f "$marker" ]] || continue          # already drained by a prior manager
         reqid="$(basename "${marker%.req}")"
-        rp=""; shp="pin"; msg=""
+        rp=""; shp="pin"; msg=""; rpl=0
         while IFS=$'\t' read -r k v; do
             case "$k" in
                 repo_path) rp="$v" ;;
                 shape)     shp="$v" ;;
                 message)   msg="$v" ;;
+                replace)   rpl="$v" ;;     # absent key ⇒ 0 ⇒ refuse (fail closed)
             esac
         done < "$marker"
         [[ -n "$rp" ]] || { echo "upload-asset.sh: marker $marker missing repo_path; skipping" >&2; continue; }
         blob="${marker%.req}.blob"
         dest="$ASSETS_DIR/$rp"
         mkdir -p "$(dirname "$dest")"
-        # Basename-collision warning (your-org/your-nexus#236 B8): a distinct
-        # source with the same basename overwrites at HEAD. Per-request commits
-        # mean prior SHA-pinned URLs still resolve to their own content.
-        if [[ -e "$dest" ]] && ! cmp -s "$blob" "$dest"; then
-            echo "upload-asset.sh: WARNING: $rp already holds a different asset;" \
-                 "overwriting at HEAD (prior SHA-pinned URLs still resolve)." \
-                 "Pass --repo-path <unique> to keep both." >&2
+        # DESTINATION COLLISION (your-org/nexus-code#1639; was a stderr WARNING
+        # since your-org/your-nexus#236 B8). The destination derives from the
+        # basename, so a second `summary.md` for one issue lands on the first's
+        # path. A warning followed by `cp` at rc 0 was silent in practice: the
+        # SHA-pinned URLs kept resolving, but HEAD — every `--shape latest` link
+        # and anyone browsing the asset repo — showed the wrong artefact.
+        #
+        # The predicate is "the path exists at the SYNCED HEAD (which includes
+        # this batch's earlier commits) and the bytes differ". HEAD, not the
+        # working tree: an untracked leftover is not an asset anyone links to.
+        # After `reset --hard` the tracked working-tree file IS HEAD's content,
+        # so `cmp` against it is the byte comparison. Identical bytes fall
+        # through to the unchanged/skip-commit path below — not a collision.
+        #
+        # PER-REQUEST: the manager drains OTHER callers' requests too, so a
+        # refusal must not abort the batch. It is recorded here and finalised
+        # (`.refused` written, marker cleared) only once the batch's fate is
+        # known — an exit 3 below leaves it staged for re-drain like any other.
+        if [[ "$rpl" != 1 ]] \
+           && _git_assets cat-file -e "HEAD:${rp}" 2>/dev/null \
+           && ! cmp -s "$blob" "$dest"; then
+            last=$(_git_assets log -1 --format='%h %cI "%s"' -- "$rp" 2>/dev/null) || last=""
+            _refused["$reqid"]="$(
+                printf 'upload-asset.sh: REFUSED (exit 5) — %s already holds a DIFFERENT asset\n' "$rp"
+                printf '  in the asset repo (%s)%s.\n' "$REPO" "${last:+, last written by $last}"
+                printf '  Overwriting it would change what HEAD, every --shape latest link and\n'
+                printf '  anyone browsing the asset repo show (your-org/nexus-code#1639).\n'
+                printf '  Nothing was uploaded. Either:\n'
+                printf '    keep both   : re-run with --repo-path <unique path>\n'
+                printf '    overwrite   : re-run with --replace   (SHA-pinned URLs to the old bytes keep resolving)\n'
+            )"
+            echo "upload-asset.sh: request $reqid refused: $rp holds a different asset (no --replace)" >&2
+            continue
         fi
         cp "$blob" "$dest"
         if _git_assets check-ignore -q -- "$rp"; then
@@ -968,6 +1061,15 @@ for reqid in "${processed[@]}"; do
     mv -f "$STAGING_DIR/$reqid.url.tmp" "$STAGING_DIR/$reqid.url"
     rm -f "$STAGING_DIR/$reqid.req" "$STAGING_DIR/$reqid.blob"
 done
+# Refused requests (your-org/nexus-code#1639): publish the refusal atomically
+# and clear the marker + blob so no later manager re-drains them. Their owners
+# read the `.refused` file in COLLECT and exit 5. `${!_refused[@]}` on an empty
+# associative array is empty (not unbound) under `set -u` in bash >= 4.4.
+for reqid in "${!_refused[@]}"; do
+    printf '%s\n' "${_refused[$reqid]}" > "$STAGING_DIR/$reqid.refused.tmp"
+    mv -f "$STAGING_DIR/$reqid.refused.tmp" "$STAGING_DIR/$reqid.refused"
+    rm -f "$STAGING_DIR/$reqid.req" "$STAGING_DIR/$reqid.blob"
+done
 
 # Strip the credential from the remote url, then release the lock so the next
 # waiter can proceed immediately.
@@ -977,6 +1079,13 @@ flock -u "$_LOCK_FD" 2>/dev/null || true
 # --- 4. COLLECT this request's own result ----------------------------------
 # Guaranteed present now: either we drained our own marker above, or a prior
 # manager drained it before we acquired the lock and wrote our result then.
+# A REFUSAL is a result too (your-org/nexus-code#1639): message to stderr, NO
+# URL on stdout, exit 5.
+if [[ -f "$REQ_BASE.refused" ]]; then
+    cat "$REQ_BASE.refused" >&2
+    rm -f "$REQ_BASE.refused" "$RESULT"
+    exit 5
+fi
 [[ -f "$RESULT" ]] || {
     echo "upload-asset.sh: internal error — no result for $REQID after drain" >&2
     exit 3

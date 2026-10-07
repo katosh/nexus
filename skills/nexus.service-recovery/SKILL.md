@@ -10,6 +10,9 @@ TRIGGER when: an orchestrator emit carries a
 watcher's `service_health` task surfaced a `grace`, `recovering`,
 `emit-only`, `flapping`, or `recovered` condition.
 
+Registering, changing or removing a service (the row, its healthcheck,
+its URL) is `skills/nexus.services/SKILL.md`, not this skill.
+
 ## Why this protocol exists
 
 A user-facing service going down is an availability-and-trust

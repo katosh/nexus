@@ -109,6 +109,13 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # regardless of caller cwd. Mirrors monitor/upload-asset.sh:60-62.
 cd "$SCRIPT_DIR/.." || die "cannot cd to $SCRIPT_DIR/.."
 
+# The shared primary-root resolver and the one-tree rule. Absent = a broken
+# install: guessing whose credentials to mint is the #1651 defect, so refuse.
+[[ -r "$SCRIPT_DIR/_nexus-root.sh" ]] \
+    || die "cannot read $SCRIPT_DIR/_nexus-root.sh — the nexus-root resolver is missing (broken install; your-org/nexus-code#1651)"
+# shellcheck source=monitor/_nexus-root.sh
+source "$SCRIPT_DIR/_nexus-root.sh" || die "cannot source $SCRIPT_DIR/_nexus-root.sh"
+
 # Resolve config/nexus.yml strictly. NEVER falls back to
 # config/nexus.example.yml — see header for the identity-boundary
 # rationale.
@@ -119,9 +126,25 @@ _resolve_cfg() {
         printf '%s' "$NEXUS_CONFIG"
         return 0
     fi
-    local p
+    local p root rc=0
     if [[ -n "${NEXUS_ROOT:-}" ]]; then
-        p="$NEXUS_ROOT/config/nexus.yml"
+        # THE ONE-TREE RULE (your-org/nexus-code#1651), shared with `ng` and
+        # `upload-asset.sh`: the RAW $NEXUS_ROOT used to decide whose bot
+        # credentials were minted, not de-nested, while `ng` keyed on its own
+        # tree — so a foreign NEXUS_ROOT minted THAT nexus's token for a write
+        # `ng` itself refused. `nexus_config_root` answers: this script's own
+        # tree, unless it has no config of its own (then NEXUS_ROOT's), and a
+        # refusal when the two trees name different identities.
+        nexus_primary_root "$NEXUS_ROOT" >/dev/null \
+            || die "NEXUS_ROOT=$NEXUS_ROOT is not a directory; set it to the primary clone"
+        root=$(nexus_config_root "$SCRIPT_DIR/..") || rc=$?
+        (( rc == 3 )) && die "refusing to mint: the nexus is ambiguous — $root. Run the mint-token.sh of the nexus you mean, or fix NEXUS_ROOT (your-org/nexus-code#1651)."
+        # rc 2: this script's OWN tree has a nexus.yml that cannot be read.
+        # Minting NEXUS_ROOT's installation instead is the broken-read-as-absent
+        # collapse (your-org/nexus-code#1652 item 3), so refuse by name.
+        (( rc == 2 )) && die "refusing to mint: $root. Fix that config/nexus.yml, or run the mint-token.sh of the nexus you mean (your-org/nexus-code#1652)."
+        (( rc == 0 )) || die "cannot resolve the nexus root for $SCRIPT_DIR/.. (rc $rc)"
+        p="$root/config/nexus.yml"
         [[ -f "$p" ]] \
             || die "NEXUS_ROOT=$NEXUS_ROOT but $p does not exist; copy config/nexus.example.yml -> config/nexus.yml and edit"
         printf '%s' "$p"

@@ -157,8 +157,10 @@ r=$(env -i HOME="$WORK/home" PATH="/usr/bin:/bin" NEXUS_TMPDIR_BASE="$B" \
 _line='[ -z "\${TMPDIR:-}" ] && [ -f "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" ] && . "\$NEXUS_ROOT/monitor/shellenv/tmpdir.sh" || true'
 n_sw=$(grep -cxF -- "$_line" "$REPO_ROOT/monitor/spawn-worker.sh")
 n_rs=$(grep -cxF -- "$_line" "$REPO_ROOT/monitor/watcher/_respawn.sh")
-[[ "$n_sw" == 3 && "$n_rs" == 1 ]] && ok "every launcher sources tmpdir.sh (spawn-worker 3, respawn 1)" \
-    || bad "launcher sites: spawn-worker $n_sw (want 3), respawn $n_rs (want 1)"
+# spawn-worker has FIVE launchers since the Codex harness (#1640/#1642; reviewed
+# for #1643 — both Codex launchers carry this line in the same prelude position).
+[[ "$n_sw" == 5 && "$n_rs" == 1 ]] && ok "every launcher sources tmpdir.sh (spawn-worker 5, respawn 1)" \
+    || bad "launcher sites: spawn-worker $n_sw (want 5), respawn $n_rs (want 1)"
 B="$WORK/base-launcher-line"; mkdir -p "$B"
 _exec=${_line//\\\$/\$}
 r=$(env -i HOME="$WORK/home" PATH="/usr/bin:/bin" NEXUS_ROOT="$REPO_ROOT" NEXUS_TMPDIR_BASE="$B" \

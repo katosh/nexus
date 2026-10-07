@@ -93,12 +93,57 @@ HOOK_UPS="$CCH_DIR/hook-ups.sh";  write_journal_hook "$HOOK_UPS"  UserPromptSubm
 HOOK_STOP="$CCH_DIR/hook-stop.sh"; write_journal_hook "$HOOK_STOP" Stop
 HOOK_SF="$CCH_DIR/hook-sf.sh";     write_journal_hook "$HOOK_SF"   StopFailure
 
+# THE WRITER'S COMPLETION IS OBSERVED, NOT GUESSED (your-org/nexus-code#1688).
+# The REAL turn-failure-emit.sh runs unmodified — same stdin, same env, same
+# path, so its `_self_dir` resolution is production's — inside a pass-through
+# that appends `TurnFailureEmitDone\t<end>\t<rc>\t<start>` to the journal
+# AFTER the writer exits. The writer `mv`s its marker into place before it
+# exits, so once that line exists the marker's presence is a VERDICT, not a
+# sample: "done and no marker" is a writer defect, "not done yet" is a slow
+# host. The two red gates on #1688 ran a tree that sampled the marker ONCE
+# (pre-#1669); #1669's replacement, a FIXED 10 s poll, still could not tell
+# the two apart, and a writer slower than 10 s (bash + 4 jq + 2 tr, on a host
+# at load 40–60) would read "did not write" on a hook that works.
+HOOK_TF="$CCH_DIR/hook-tf.sh"
+cat > "$HOOK_TF" <<EOF
+#!/usr/bin/env bash
+t0=\$(date +%s.%N)
+$(printf '%q' "$REPO_ROOT/monitor/hooks/turn-failure-emit.sh")
+rc=\$?
+printf 'TurnFailureEmitDone\t%s\t%s\t%s\n' "\$(date +%s.%N)" "\$rc" "\$t0" >> $(printf '%q' "$JOURNAL_DIR/events.tsv")
+exit "\$rc"
+EOF
+chmod +x "$HOOK_TF"
+
+# THE CLEAR'S COMPLETION IS OBSERVED TOO (your-org/nexus-code#1732). The REAL
+# stamp-clear.sh is a SIBLING of the Stop journal hook exactly as the writer is
+# of the StopFailure one, so NC-1 cannot know the clear has run from the Stop
+# line alone. It used to sleep a FIXED 2 s and then read "marker survived a
+# successful turn" as a defect in the clear: the mirror image of the late
+# write #1669/#1688 fixed on the writer side, and the one sibling hook whose
+# completion this scenario still guessed. (Every #1732-family red ran
+# 9f0b719a, which predates both writer fixes; there that line was the LATE
+# WRITE landing after the clear.) The same pass-through journals
+# `StopClearDone` after the clear EXITS, so a surviving marker is a verdict
+# only once it has.
+HOOK_CLEAR="$CCH_DIR/hook-clear.sh"
+cat > "$HOOK_CLEAR" <<EOF
+#!/usr/bin/env bash
+t0=\$(date +%s.%N)
+$(printf '%q' "$REPO_ROOT/monitor/hooks/stamp-clear.sh") turn-failure
+rc=\$?
+printf 'StopClearDone\t%s\t%s\t%s\n' "\$(date +%s.%N)" "\$rc" "\$t0" >> $(printf '%q' "$JOURNAL_DIR/events.tsv")
+exit "\$rc"
+EOF
+chmod +x "$HOOK_CLEAR"
+
 # The REAL production writer runs beside the journal on StopFailure, and the
-# REAL clear on Stop — exactly the pair orchestrator-settings.json wires.
+# REAL clear on Stop — exactly the pair orchestrator-settings.json wires (each
+# through its completion journal above).
 SETTINGS="$CCH_DIR/settings-auth.json"
 jq -n --arg ups "$HOOK_UPS" --arg stop "$HOOK_STOP" --arg sf "$HOOK_SF" \
-      --arg tf "$REPO_ROOT/monitor/hooks/turn-failure-emit.sh" \
-      --arg clear "$REPO_ROOT/monitor/hooks/stamp-clear.sh turn-failure" '{hooks: {
+      --arg tf "$HOOK_TF" \
+      --arg clear "$HOOK_CLEAR" '{hooks: {
     UserPromptSubmit: [ { hooks: [ {type:"command", command:$ups} ] } ],
     Stop:             [ { hooks: [ {type:"command", command:$stop}, {type:"command", command:$clear} ] } ],
     StopFailure:      [ { hooks: [ {type:"command", command:$sf},   {type:"command", command:$tf} ] } ]
@@ -136,6 +181,45 @@ for attempt in 1 2; do
     sf_fired && break
     echo "    (attempt $attempt: StopFailure not yet journalled; retrying the prompt)"
 done
+
+# WAIT FOR THE WRITER, NOT FOR A GUESSED LATENCY (your-org/nexus-code#1669,
+# #1688). The journal hook and the REAL turn-failure-emit.sh are SIBLINGS in
+# one StopFailure group: they start together, and the writer lands its marker
+# after the journal line — 0.31–1.21 s on a quiet host (n=12, #1669), later
+# under load. #1669 replaced a single sample with a FIXED 10 s poll, unscaled
+# and blind to whether the writer was still running (#1688). The poll now ends
+# on the first of: a non-empty marker (the writer renames a temp file into
+# place, so non-empty is complete), or the writer's own completion line
+# (`tf_done`, journalled by $HOOK_TF after the writer EXITS). The ceiling is
+# 60 s UNLOADED through `th_deadline` — CHOSEN, ~50× the slowest quiet-host
+# landing, and a polled ceiling costs nothing on a green run. Reaching it
+# with the writer still running is reported as NOT A VERDICT on the hook.
+#
+# Deterministic reproduction of #1688, no host load: prepend to PATH a `jq`
+# shim that sleeps 4 s when NEXUS_ORCHESTRATOR_WINDOW=auth-probe (only the
+# REPL's hooks carry it) and then execs the real jq. The writer then takes
+# ~16 s; the fixed 10 s poll at 5dc308cf fails ARM A, this one passes.
+tf_done() { (( $(count_ev TurnFailureEmitDone) >= 1 )); }
+MARKER_WAIT_S=$(th_deadline 60)
+marker_waited=0
+if sf_fired; then
+    _mw_t0=$SECONDS
+    while :; do
+        [[ -s "$MARKER" ]] && break
+        tf_done && break
+        marker_waited=$(( SECONDS - _mw_t0 ))
+        (( marker_waited >= MARKER_WAIT_S )) && break
+        sleep 0.25
+    done
+    marker_waited=$(( SECONDS - _mw_t0 ))
+    tf_line=$(awk -F'\t' '$1=="TurnFailureEmitDone"{print; exit}' "$JOURNAL_DIR/events.tsv" 2>/dev/null)
+    if [[ -n "$tf_line" ]]; then
+        IFS=$'\t' read -r _ tf_end tf_rc tf_start <<<"$tf_line"
+        echo "        writer: exited rc=$tf_rc after $(awk -v a="$tf_start" -v b="$tf_end" 'BEGIN{printf "%.2f", b-a}') s; marker wait ${marker_waited} s after the journal saw StopFailure (ceiling ${MARKER_WAIT_S} s)"
+    else
+        echo "        writer: NOT YET EXITED after ${marker_waited} s (ceiling ${MARKER_WAIT_S} s)"
+    fi
+fi
 
 n_ups=$(count_ev UserPromptSubmit); n_stop=$(count_ev Stop); n_sf=$(count_ev StopFailure)
 echo "        journal: UserPromptSubmit=$n_ups Stop=$n_stop StopFailure=$n_sf"
@@ -193,14 +277,33 @@ if [[ -s "$MARKER" ]]; then
     assert_eq "marker recovery=operator (no in-band remedy)" "$m_rec" "operator"
     assert_eq "marker window is the orchestrator env (stamp_window)" "$m_win" "$WIN"
 else
-    echo "  FAIL: no marker — turn-failure-emit.sh did not write for NEXUS_ORCHESTRATOR_WINDOW (#1520 leg 1 still open)" >&2; FAIL=$((FAIL+1))
+    if tf_done; then
+        echo "  FAIL: no marker — turn-failure-emit.sh EXITED without writing for NEXUS_ORCHESTRATOR_WINDOW (a WRITER defect — window resolution, classifier or the write itself; see your-org/nexus-code#1520)" >&2; FAIL=$((FAIL+1))
+    else
+        echo "  FAIL: no marker — turn-failure-emit.sh had NOT EXITED after ${MARKER_WAIT_S} s (a slow host or a hung writer; NOT a verdict that it does not write, #1688)" >&2; FAIL=$((FAIL+1))
+    fi
 fi
 
 # ---- NC-1: a SUCCESSFUL turn fires Stop, not StopFailure, and CLEARS -----
 echo
 echo "--- NC-1: mock recovers → Stop fires, StopFailure does not, the marker is cleared ---"
 cch_control '{"mode":"text","text":"MOCK_RECOVERED_OK"}'
-sf_before=$(count_ev StopFailure); stop_before=$(count_ev Stop)
+# The marker must EXIST before the recovering turn is driven (#1669): a late
+# StopFailure write landing AFTER this turn's Stop clear would leave a marker
+# the clear never saw, and "marker survived a successful turn" would then
+# blame the clear for the writer's latency. ARM A already waited; this re-check
+# is what makes the ordering explicit rather than inherited. If the marker
+# never appeared, ARM A has FAILED on it, and the clear assertion below is
+# then vacuous — say so rather than let its PASS read as evidence.
+if [[ -s "$MARKER" ]]; then
+    nc1_marker_present=1
+else
+    for i in $(seq 1 $(( MARKER_WAIT_S * 4 ))); do [[ -s "$MARKER" ]] && break; tf_done && break; sleep 0.25; done
+    if [[ -s "$MARKER" ]]; then nc1_marker_present=1; else nc1_marker_present=0; fi
+fi
+(( nc1_marker_present )) \
+    || echo "    (NC-1: no marker to clear — ARM A failed on it; the clear assertion below cannot discriminate)"
+sf_before=$(count_ev StopFailure); stop_before=$(count_ev Stop); clear_before=$(count_ev StopClearDone)
 stop_fired() { (( $(count_ev Stop) > stop_before )); }
 for attempt in 1 2; do
     cch_send "$IDX" "and now?"
@@ -215,10 +318,28 @@ else
 fi
 sleep 2
 assert_eq "no NEW StopFailure on the successful turn" "$(( $(count_ev StopFailure) - sf_before ))" "0"
-if [[ ! -e "$MARKER" ]]; then
+# Wait for the clear's own completion line (#1732), on the same ceiling as the
+# writer's: the marker read below is a verdict only once the clear has EXITED.
+clear_done() { (( $(count_ev StopClearDone) > clear_before )); }
+if stop_fired; then
+    _cw_t0=$SECONDS
+    until clear_done || (( SECONDS - _cw_t0 >= MARKER_WAIT_S )); do sleep 0.25; done
+    cl_line=$(awk -F'\t' '$1=="StopClearDone"{l=$0} END{print l}' "$JOURNAL_DIR/events.tsv" 2>/dev/null)
+    if clear_done && [[ -n "$cl_line" ]]; then
+        IFS=$'\t' read -r _ cl_end cl_rc cl_start <<<"$cl_line"
+        echo "        clear: exited rc=$cl_rc after $(awk -v a="$cl_start" -v b="$cl_end" 'BEGIN{printf "%.2f", b-a}') s; waited $(( SECONDS - _cw_t0 )) s past the 2 s settle (ceiling ${MARKER_WAIT_S} s)"
+    else
+        echo "        clear: NOT YET EXITED after ${MARKER_WAIT_S} s"
+    fi
+fi
+if (( ! nc1_marker_present )); then
+    echo "  FAIL: NC-1 clear not testable — no marker existed before the successful turn" >&2; FAIL=$((FAIL+1))
+elif [[ ! -e "$MARKER" ]]; then
     echo "  PASS: the REAL Stop clear removed the marker (a successful turn ends the gate)"; PASS=$((PASS+1))
+elif clear_done; then
+    echo "  FAIL: marker survived a successful turn — the Stop clear EXITED and did not remove it (resolved a different path?)" >&2; FAIL=$((FAIL+1))
 else
-    echo "  FAIL: marker survived a successful turn — the Stop clear did not run or resolved a different path" >&2; FAIL=$((FAIL+1))
+    echo "  FAIL: marker survived a successful turn — the Stop clear had NOT EXITED after ${MARKER_WAIT_S} s (a slow host or a hung clear; NOT a verdict on the clear, #1732)" >&2; FAIL=$((FAIL+1))
 fi
 
 # ---- NC-2: the extractor is not vacuous ---------------------------------

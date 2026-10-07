@@ -40,6 +40,131 @@
 : "${FS_ESCALATED:=0}"        # 1 once this incident has been escalated
 : "${FS_CHANNELS:=}"          # escalation channels that actually delivered
 : "${FS_DEGRADED_CYCLES:=0}"
+# The repeating DEGRADED note (your-org/nexus-code#1724), in memory like the
+# rest: the next epoch a note is due, the current gap, and how many went out.
+: "${FS_NOTE_NEXT:=0}"
+: "${FS_NOTE_GAP:=0}"
+: "${FS_NOTE_COUNT:=0}"
+_FS_GUARD_MONITOR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)
+
+# ---------------------------------------------------------------------------
+# THE DEGRADED NOTE — the watcher keeps TALKING while it cannot operate
+# (your-org/nexus-code#1724). The one-shot escalation below fires at onset;
+# an 18 h incident then went silent for 18 h. Every degraded cycle now asks
+# whether a short note is due, on a DOUBLING backoff (first after
+# MONITOR_FS_DEGRADED_NOTE_BASE_SECONDS, default 300; capped at
+# MONITOR_FS_DEGRADED_NOTE_MAX_SECONDS, default 3600), so it never stops while
+# the condition holds and never floods (the #1713 lesson).
+#
+# WHERE IT GOES, and what it must never do. It is delivered through the SAME
+# paste path as every emit (`paste_to_target`): the typed/undecidable-input
+# refusal (an operator draft is never typed over), the overlay and dead-pane
+# refusals, the Enter handling and the submit receipt all apply. That path's
+# only writes (its per-target lock and the deferral counter) live under
+# $STATE_DIR, which is the very directory that failed, so for this one call
+# STATE_DIR points at a private run dir outside the tree. When the pane
+# refuses, NOTHING is typed: the note survives in the watcher log (a held fd)
+# and in the status file `ng degraded status` reads. There is no raw
+# `send-keys` fallback, on purpose.
+#
+# The status file lives in NEXUS_DEGRADED_RUNDIR (default
+# /tmp/nexus-degraded-<uid>, mode 0700): /tmp is never the detached mount, and
+# a sandbox restart wiping it loses only a live status, never a record.
+_fs_rundir_path() {   # -> the run dir's path; creates nothing (readers use this)
+    printf '%s' "${NEXUS_DEGRADED_RUNDIR:-/tmp/nexus-degraded-$(id -u 2>/dev/null || echo unknown)}"
+}
+_fs_status_path() {   # <state_dir> -> its status file's path; creates nothing
+    printf '%s/%s.status' "$(_fs_rundir_path)" "$(printf '%s' "${1:?}" | tr -c 'A-Za-z0-9._-' '_')"
+}
+_fs_rundir() {   # -> the run dir (created 0700), or rc 1
+    local d; d=$(_fs_rundir_path)
+    ( umask 077; mkdir -p "$d" ) 2>/dev/null
+    [[ -d "$d" && -w "$d" ]] || return 1
+    printf '%s' "$d"
+}
+_fs_status_file() {   # <state_dir> -> path of its status file (run dir created)
+    _fs_rundir >/dev/null || return 1
+    _fs_status_path "$1"
+}
+
+# _fs_note_due <now> — 0 when a note is due now; advances the backoff.
+_fs_note_due() {
+    local now="${1:?now}" base="${MONITOR_FS_DEGRADED_NOTE_BASE_SECONDS:-300}" cap="${MONITOR_FS_DEGRADED_NOTE_MAX_SECONDS:-3600}"
+    [[ "$base" =~ ^[0-9]+$ ]] && (( base > 0 )) || base=300
+    [[ "$cap" =~ ^[0-9]+$ ]] && (( cap >= base )) || cap=$(( base > 3600 ? base : 3600 ))
+    if (( FS_NOTE_NEXT == 0 )); then
+        FS_NOTE_GAP=$base; FS_NOTE_NEXT=$(( FS_ONSET + base ))
+    fi
+    (( now >= FS_NOTE_NEXT )) || return 1
+    FS_NOTE_GAP=$(( FS_NOTE_GAP * 2 )); (( FS_NOTE_GAP > cap )) && FS_NOTE_GAP=$cap
+    FS_NOTE_NEXT=$(( now + FS_NOTE_GAP ))
+    return 0
+}
+
+# _fs_probe_detail — "<VERDICT> <detail>" for $STATE_DIR from degraded-probe.sh
+# (EROFS / ENOSPC / EACCES / HANG / …), bounded; "UNKNOWN probe unavailable"
+# when the probe itself cannot run.
+_fs_probe_detail() {
+    local probe="$_FS_GUARD_MONITOR_DIR/degraded-probe.sh" row v d
+    [[ -r "$probe" ]] || { printf 'UNKNOWN degraded-probe.sh unavailable'; return 0; }
+    # CAPTURE, THEN MATCH: no early-exit reader on the producer's pipe (#682).
+    local raw line
+    raw=$(bash "$probe" --timeout "${MONITOR_FS_DEGRADED_PROBE_TIMEOUT:-3}" \
+            --surface "state=$STATE_DIR" 2>/dev/null)
+    row=""
+    while IFS= read -r line; do
+        [[ "$line" == "surface=state "* ]] && { row="$line"; break; }
+    done <<<"$raw"
+    v=$(sed -n 's/.* verdict=\([A-Z]*\).*/\1/p' <<<"$row")
+    d=$(sed -n 's/.* detail=//p' <<<"$row")
+    printf '%s %s' "${v:-UNKNOWN}" "${d:-no detail}"
+}
+
+# _fs_status_write <key=value>... — rewrite the status file (best-effort).
+_fs_status_write() {
+    local f; f=$(_fs_status_file "$STATE_DIR") || return 1
+    { printf '%s\n' "$@"; printf 'updated=%s\n' "$(date +%s 2>/dev/null)"; } > "$f.tmp" 2>/dev/null \
+        && mv -f "$f.tmp" "$f" 2>/dev/null
+}
+
+# _fs_note_deliver <text> — paste the note through paste_to_target with a
+# private STATE_DIR. Prints the delivery word; never types anything itself.
+_fs_note_deliver() {
+    local text="$1" fn="${FS_NOTE_PASTE_FN:-paste_to_target}" rd body rc=0
+    declare -F "$fn" >/dev/null 2>&1 || { printf 'not-delivered (no paste path loaded)'; return 0; }
+    [[ -n "${TARGET:-}" ]] || { printf 'not-delivered (no target)'; return 0; }
+    rd=$(_fs_rundir) || { printf 'not-delivered (no writable run dir)'; return 0; }
+    mkdir -p "$rd/paste-state" 2>/dev/null
+    body="$rd/note.$$.${RANDOM}.md"
+    { printf '%s\n' "$text"; printf -- '--- nexus-emit-sig %s %s ---\n' "$(date -Is)" "fsnote$$${RANDOM}"; } > "$body" 2>/dev/null \
+        || { printf 'not-delivered (cannot stage the body)'; return 0; }
+    STATE_DIR="$rd/paste-state" "$fn" "$TARGET" "$body" no-liveness-stamp; rc=$?
+    rm -f "$body" 2>/dev/null
+    case "$rc" in
+        0) printf 'delivered' ;;
+        7) printf 'refused (input box holds typed or undecidable text, or an overlay is up; nothing typed)' ;;
+        6) printf 'not-submitted (left for the operator; not re-pasted)' ;;
+        2) printf 'not-delivered (target window absent)' ;;
+        5) printf 'not-delivered (target is a dead pane)' ;;
+        4) printf 'unconfirmed (pasted and Enter sent; no receipt; not re-pasted)' ;;
+        *) printf 'not-delivered (paste rc %s; retried at the next note)' "$rc" ;;
+    esac
+}
+
+# _fs_degraded_note_tick <now> — called once per degraded cycle.
+_fs_degraded_note_tick() {
+    local now="${1:-$(date +%s)}" dur pd verdict detail text delivery
+    dur=$(( now - FS_ONSET )); (( dur < 0 )) && dur=0
+    _fs_note_due "$now" || return 0
+    FS_NOTE_COUNT=$(( FS_NOTE_COUNT + 1 ))
+    pd=$(_fs_probe_detail); verdict="${pd%% *}"; detail="${pd#* }"
+    text="[nexus watcher] DEGRADED for ${dur}s: cannot write ${STATE_DIR} (${verdict}: ${detail}). The loop is alive; the scheduler is suspended. Next note in ${FS_NOTE_GAP}s. Details: monitor/ng degraded status"
+    delivery=$(_fs_note_deliver "$text")
+    log "fs-guard: DEGRADED note #${FS_NOTE_COUNT} (${verdict}) — ${delivery}"
+    _fs_status_write mode=degraded "state_dir=$STATE_DIR" "onset=$FS_ONSET" \
+        "verdict=$verdict" "detail=$detail" "notes=$FS_NOTE_COUNT" "last_note=$now" \
+        "next_note=$FS_NOTE_NEXT" "delivery=$delivery" || true
+}
 
 # Escalate the read-only condition exactly ONCE per incident, over channels
 # that survive a read-only project FS, in preference order:
@@ -84,20 +209,15 @@ _fs_escalate_once() {
     fi
 
     # Only if EVERY out-of-band channel failed do we interrupt the
-    # orchestrator's pane. `paste_to_target` cannot help here — it stages the
-    # body through a file on the very filesystem that is read-only — so this
-    # is a literal, write-free send-keys.
-    if [[ -z "$oob" ]] && command -v tmux >/dev/null 2>&1; then
-        # `:=` — EXACTLY the window named $TARGET, or nothing
-        # (your-org/nexus-code#1524). A bare `-t "$TARGET"` falls back to a
-        # unique PREFIX match when the exact window is absent, so with the
-        # orchestrator gone this literal text and its Enter would land in
-        # `<TARGET>-sk` or `<TARGET>-skeptic` at rc 0. Measured on tmux 2.6:
-        # `:=name` acts on the exact window and fails rc 1 otherwise.
-        if tmux send-keys -t ":=${TARGET}" -l "$text" 2>/dev/null; then
-            tmux send-keys -t ":=${TARGET}" Enter 2>/dev/null || true
-            chans="${chans:+$chans,}tmux-paste"
-        fi
+    # orchestrator's pane — and through the SAME paste path as every emit,
+    # with its writes redirected off the read-only tree (_fs_note_deliver,
+    # your-org/nexus-code#1724). This used to be a raw `send-keys -l` + Enter,
+    # which typed over an operator draft and submitted it. A refusal now types
+    # nothing; the log line and `ng degraded status` carry the text.
+    if [[ -z "$oob" ]]; then
+        local _d; _d=$(_fs_note_deliver "$text")
+        [[ "$_d" == delivered ]] && chans="${chans:+$chans,}tmux-paste"
+        log "fs-guard: last-resort pane notice — ${_d}"
     fi
 
     FS_CHANNELS="${chans:-none}"
@@ -135,8 +255,11 @@ _fs_guard_tick() {
             else
                 log "fs-guard: recovery comment not posted (best-effort; the local trace stands)"
             fi
+            _fs_status_write mode=ok "state_dir=$STATE_DIR" "recovered=$now" \
+                "last_incident_seconds=$dur" "notes=$FS_NOTE_COUNT" || true
             FS_DEGRADED=0; FS_ESCALATED=0; FS_CHANNELS=''
             FS_DEGRADED_CYCLES=0; FS_ONSET=0
+            FS_NOTE_NEXT=0; FS_NOTE_GAP=0; FS_NOTE_COUNT=0
         fi
         FS_LAST_OK=$now
         return 0
@@ -146,12 +269,19 @@ _fs_guard_tick() {
         FS_DEGRADED=1
         FS_ONSET=$now
         FS_DEGRADED_CYCLES=0
+        FS_NOTE_NEXT=0; FS_NOTE_GAP=0; FS_NOTE_COUNT=0
         log "fs-guard: CRITICAL — the project FS is READ-ONLY (cannot write $STATE_DIR)."
         log "fs-guard: entering read-only DEGRADED mode. The loop stays alive; all project-tree writes are suspended."
         log "fs-guard: this cannot be repaired from inside the sandbox — it needs a restart from OUTSIDE. Never remount, bind, or unshare around it."
         _fs_escalate_once
     fi
     FS_DEGRADED_CYCLES=$(( FS_DEGRADED_CYCLES + 1 ))
+    if (( FS_DEGRADED_CYCLES == 1 )); then
+        _fs_status_write mode=degraded "state_dir=$STATE_DIR" "onset=$FS_ONSET" \
+            "notes=0" "next_note=$(( FS_ONSET + ${MONITOR_FS_DEGRADED_NOTE_BASE_SECONDS:-300} ))" \
+            "delivery=escalated once via [${FS_CHANNELS:-none}]" || true
+    fi
+    _fs_degraded_note_tick "$now"
     return 1
 }
 

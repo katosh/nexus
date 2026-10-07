@@ -43,7 +43,17 @@
 #                   authors the fix and opens the PR itself) or
 #                   ambiguity (rc 11 — the evaluator picks). NEVER
 #                   bumps.
-#   block           rule 5: record + notify; NEVER bumps.
+#   block           the COMPAT hold, the ONLY hold (your-org/nexus-code#1657):
+#                   requires --evidence gate:<scenario>|probe:<file>, --issue
+#                   <url|owner/repo#N> and --control '<baseline that passed>';
+#                   records `block` class=compat and exits 0. Without all
+#                   three it exits 12: `block-not-compat` (not a hold, retry)
+#                   when NO evidence field was given, a contract=incomplete
+#                   HOLD plus a defect when any was.
+#                   NEVER bumps either way.
+#   retry-now       schedule a re-evaluation on the next watcher tick
+#                   (--reason required; audit row `retry-requested`). The
+#                   supported replacement for hand-deleting last-fire-date.
 #   record-outcome  audit-trail writer for outcomes this script cannot
 #                   observe (e.g. the evaluator opened a compat PR).
 #                   Writes decisions.tsv (append) AND last-eval (OVERWRITE
@@ -127,17 +137,27 @@
 #       applied. Remedy: monitor/install-claude-local.sh (reinstalls the
 #       effective pin), confirm with `--version`, re-run the verb, and say
 #       in the report that the drift happened and what caused it.
+#   13  safe: REFUSED — a COMPAT hold on this candidate was recorded at this
+#       HEAD within GATE_EVIDENCE_MAX_AGE (#1657 round 2). Nothing applied,
+#       last-eval untouched (audit row `safe-refused-held`).
+#   12  block: the contract was NOT complete (#1657). With NO evidence field:
+#       recorded `block-not-compat` (not a hold, retry scheduled). With ANY
+#       evidence field: recorded as a COMPAT HOLD marked contract=incomplete
+#       plus a filed defect — a malformed hold never applies. Neither case is
+#       advice to run `safe`.
 #   10  compat-pr: no existing open compat PR (caller must open one)
 #   11  compat-pr: multiple open compat PRs (caller must pick + comment)
 #   21  safe: bumped, orchestrator restart NOT handed off (session pin
 #       stale/absent — a kill would cold-spawn and lose the conversation
 #       context, so we do not even detach the restart). Foreground
 #       pre-flight; the bump itself stands.
-#   30  safe: DEFERRED by the deployment gate (nexus-code#512) — an open
-#       PR touches the watcher restart path, or an open PR is under
-#       active review (both PROXY arms, both bounded; the live-window
-#       arms were removed 2026-09-12 — see the deployment-gate knob
-#       block). NOTHING was applied; the safe-to-bump verdict is
+#   30  safe: DEFERRED by the deployment gate (nexus-code#512). SINCE
+#       your-org/nexus-code#1657 NO ARM DEFERS: the live-window arms went
+#       2026-09-12, the restart-path arm 2026-09-25 and active review with
+#       #1657 — all three are RECORDED. The code stays reserved for a future
+#       deferring arm, which must go through `_gate_defer` (bounded). Old text:
+#       an open PR touched the watcher restart path, or an open PR was under
+#       active review. NOTHING was applied; the safe-to-bump verdict is
 #       recorded and the next daily fire retries. That is a complete
 #       result ONLY BECAUSE THE DEFERRAL NAMES A HAZARD — see the
 #       doctrine note on `_deployment_gate`. A 30 that repeats is not
@@ -310,6 +330,11 @@ source "$_self_dir/_cc-version.sh"
 source "$_self_dir/watcher/_cc_update.sh"
 # shellcheck source=watcher/_cc_auto_update.sh
 source "$_self_dir/watcher/_cc_auto_update.sh"
+# `cc_hold_class` / `cc_hold_schedule_retry` / `cc_hold_block_contract` — the
+# ONE COMPAT/NOT-COMPAT classifier (your-org/nexus-code#1657). Only a COMPAT
+# outcome holds an update; every other non-apply schedules a retry in hours.
+# shellcheck source=_cc-hold-policy.sh
+source "$_self_dir/_cc-hold-policy.sh"
 # `_ensure_service_log` (your-org/nexus-code#484).
 # shellcheck source=_log-mode.sh
 source "$_self_dir/_log-mode.sh"
@@ -766,6 +791,10 @@ record_outcome() {
         _same=$(awk -F'\t' -v d="$detail" '$3=="safe-refused"{r[++n]=$4} END{c=0; for(i=n;i>=1&&r[i]==d;i--)c++; print c+0}' "$AUTO_DIR/decisions.tsv" 2>/dev/null || echo 0)
         [[ "$_same" =~ ^[0-9]+$ ]] || _same=0
     fi
+    # The schedule row goes FIRST so the outcome row stays the LAST row this
+    # call appends: the record-outcome verb verifies its write by reading the
+    # ledger's tail (#1211), and a later reader's `tail -1` means "the outcome".
+    _record_retry_schedule "$candidate" "$decision" "$detail"
     _cc_auto_log_decision "$AUTO_DIR" "$candidate" "$decision" "$detail"
     if [[ "$decision" == "safe-refused" && "$detail" == "gate-evidence:gated-tree-dirty" ]]; then
         # NOT "a defect in the gate" (your-org/nexus-code#1475): this refusal is
@@ -796,6 +825,26 @@ record_outcome() {
             notify "cc-auto-update: $candidate evaluated SAFE but NOT applied ($detail) — a defect in the gate, not the candidate; the pin stays stale until someone looks (#1400)"
         fi
     fi
+}
+
+# _record_retry_schedule <candidate> <decision> [detail] — the NO-STANDING-HOLD
+# half of your-org/nexus-code#1657. Every outcome that did not apply and is not
+# a COMPAT hold schedules a re-evaluation within CC_AUTO_RETRY_SECONDS (the
+# watcher's tick honours `retry-at`); a COMPAT hold schedules a re-check that
+# fires once the live HEAD moves (the fix may have landed); an applied outcome
+# clears the schedule. Recorded as its own audit row so the ledger shows WHEN
+# the routine will look again, not only that it stopped.
+_record_retry_schedule() {
+    local candidate="$1" decision="$2" detail="${3:-}" head out
+    head=$(cc_repo_head "$NEXUS_ROOT")
+    out=$(cc_hold_schedule_retry "$AUTO_DIR" "$candidate" "$decision" "$detail" "$(date +%s)" "$head") || true
+    case "$out" in
+        retry-scheduled*|retry-schedule-FAILED*)
+            _cc_auto_log_decision "$AUTO_DIR" "$candidate" "retry-scheduled" \
+                "after=$decision class=$(cc_hold_class "$decision" "$detail") head=$head ${out#retry-scheduled }"
+            note "$decision is $(cc_hold_class "$decision" "$detail") — ${out} (#1657: only a COMPAT outcome holds; the routine looks again on its own)" ;;
+    esac
+    return 0
 }
 
 usage() {
@@ -1168,7 +1217,12 @@ _check_surface_evidence() {
                     return 1
                 fi
                 ok=0
+                # A scenario that is RED in this log pays for nothing: under
+                # a pre-existing-RED apply (#1657) the log is RED, and its red
+                # scenarios are UNMEASURED for the candidate.
+                local _red; _red=$(_gate_log_red_set "$gate_log")
                 for val in $scen; do
+                    grep -qxF -- "$val" <<<"$_red" && continue
                     grep -qF "$val" "$gate_log" 2>/dev/null && ok=1
                 done
                 if (( ok == 0 )); then
@@ -1293,6 +1347,111 @@ GATE_EVIDENCE_TRACKED=""
 # of your-org/nexus-code#1259.
 GATE_EVIDENCE_REFUSAL=""
 
+# _gate_log_red_set <file> — the scenario names a gate log reports as RED
+# (its `failed:` and `skipped:` lines; a skip is RED), one per line, sorted,
+# `.sh` and `[UNMEASURED]` tags stripped. Empty for a GREEN log.
+_gate_log_red_set() {
+    awk '
+        /^ *(failed|skipped): / {
+            for (i = 2; i <= NF; i++) {
+                if ($i == "—" || $i == "-") break
+                n = $i; sub(/\.sh$/, "", n); gsub(/\[[^]]*\]/, "", n)
+                if (n != "") print n
+            }
+        }' "$1" 2>/dev/null | sort -u
+}
+
+# _gate_log_versions <file> — the distinct versions the gate's
+# `    version: <v> (Claude Code)` stamps name, space-joined, sorted; empty when
+# the log carries none. One line per binary the gate ran.
+_gate_log_versions() {
+    awk '/^ *version: [0-9]+[.][0-9]+[.][0-9]+/ { v[$2] = 1 } END { for (k in v) print k }' "$1" 2>/dev/null \
+        | sort -u | paste -sd' ' -
+}
+
+# _gate_log_fail_sigs <file> — one `<scenario>\t<signature>` line per failing
+# assertion, inside the per-scenario blocks gate.sh prints (`--- <name>.sh ---`).
+# The signature is the assertion LABEL — the text of `FAIL: <label>` up to its
+# ` — ` detail — with digit runs folded to `#`, so a poll count or a duration
+# does not make one failure look like two. A red scenario whose block holds NO
+# `FAIL:` line (an rc-only red, a skip) gets the signature `<rc-only>`.
+_gate_log_fail_sigs() {
+    awk '
+        match($0, /^--- test-[A-Za-z0-9._-]+[.]sh ---$/) {
+            sc = $2; sub(/[.]sh$/, "", sc); next
+        }
+        sc != "" && /^ *FAIL: / {
+            l = $0; sub(/^ *FAIL: /, "", l); sub(/ — .*$/, "", l)
+            gsub(/[0-9]+/, "#", l); print sc "\t" l
+        }' "$1" 2>/dev/null | sort -u
+}
+
+# _gate_red_preexisting <candidate-log> <control-log> <candidate> — rc 0 iff
+# the candidate's RED is one the INSTALLED version shares on the SAME tree:
+#   · the control log is fresh, is a completed RED run (`=== GATE RED`), and
+#     names the effective (installed) version, never the candidate;
+#   · both logs carry the same `gated-tree:` head, both dirty_tracked=0 (or
+#     the same dirty digest);
+#   · the candidate's red set is NON-EMPTY and a SUBSET of the control's.
+# Sets GATE_RED_PREEXISTING to the shared names (comma list) on success.
+GATE_RED_PREEXISTING=""
+CONTROL_GATE_EVIDENCE=""
+_gate_red_preexisting() {
+    local cand="$1" ctl="$2" candidate="$3" eff age
+    [[ -f "$ctl" ]] || { note "control gate evidence missing: $ctl"; return 1; }
+    age=$(( $(date +%s) - $(stat -c %Y "$ctl" 2>/dev/null || echo 0) ))
+    (( age <= GATE_EVIDENCE_MAX_AGE )) || { note "control gate evidence is ${age}s old"; return 1; }
+    grep -q '^=== GATE RED' "$cand" || { note "candidate gate log is not a completed RED run (refused/unattributable runs are not comparable)"; return 1; }
+    grep -q '^=== GATE RED' "$ctl"  || { note "control gate log is not a completed RED run"; return 1; }
+    eff=$(cc_version_effective "$NEXUS_ROOT/package.json" "$PACKAGE" "$NEXUS_ROOT" 2>/dev/null) || eff=""
+    [[ -n "$eff" && "$eff" != "$candidate" ]] || { note "cannot resolve the installed version for the control"; return 1; }
+    # WHICH BINARY EACH LOG RAN — read from the gate's own `    version: <v>`
+    # stamps, never a substring (skeptic F1, #1657: a candidate log mentions
+    # older versions in prose — `class added in 2.1.281` — so `grep -F $eff`
+    # accepted the CANDIDATE's own log as its control, and a candidate RED was
+    # recorded as pre-existing and applied). Every stamp in the control must be
+    # the installed version, every stamp in the candidate log the candidate,
+    # and the two must be different files with different bytes.
+    local cv tv
+    cv=$(_gate_log_versions "$ctl"); tv=$(_gate_log_versions "$cand")
+    [[ "$cv" == "$eff" ]] || { note "control gate log did not run exactly the installed version $eff (its version stamps: ${cv:-none})"; return 1; }
+    [[ "$tv" == "$candidate" ]] || { note "candidate gate log did not run exactly $candidate (its version stamps: ${tv:-none})"; return 1; }
+    if [[ "$(readlink -f -- "$cand")" == "$(readlink -f -- "$ctl")" ]] || cmp -s -- "$cand" "$ctl"; then
+        note "the control gate log IS the candidate's gate log — a log cannot be its own control"; return 1
+    fi
+    local h1 h2 d1 d2
+    h1=$(_gate_log_tree_field "$cand" head); h2=$(_gate_log_tree_field "$ctl" head)
+    d1=$(_gate_log_tree_field "$cand" dirty_digest); d2=$(_gate_log_tree_field "$ctl" dirty_digest)
+    [[ "$h1" =~ ^[0-9a-f]{40}$ && "$h1" == "$h2" ]] || { note "control and candidate gates ran on different trees ($h2 vs $h1)"; return 1; }
+    [[ "$d1" == "$d2" ]] || { note "control and candidate gates ran on different tracked edits"; return 1; }
+    local cset
+    cset=$(_gate_log_red_set "$cand")
+    [[ -n "$cset" ]] || { note "candidate gate log names no red scenario"; return 1; }
+    # THE SAME ASSERTIONS MUST FAIL, NOT MERELY THE SAME SCENARIOS (#1657
+    # round 2). A candidate can break an already-red scenario in a NEW way; a
+    # scenario-name comparison would call that ours and apply it. Per red
+    # scenario, every failing-assertion signature of the candidate must also
+    # fail on the control; a red scenario with no FAIL line on the candidate
+    # must be rc-only on the control too. This ONE comparison also covers a
+    # candidate red on a scenario the control PASSES (its signatures are absent
+    # from the control's), so there is deliberately no second, scenario-name
+    # check: two guards for one property make each unkillable by mutation.
+    local csig ksig sc newsig=""
+    csig=$(_gate_log_fail_sigs "$cand"); ksig=$(_gate_log_fail_sigs "$ctl")
+    while IFS= read -r sc; do
+        [[ -n "$sc" ]] || continue
+        if ! grep -q "^${sc}"$'\t' <<<"$csig"; then csig+=$'\n'"${sc}"$'\t<rc-only>'; fi
+        if ! grep -q "^${sc}"$'\t' <<<"$ksig"; then ksig+=$'\n'"${sc}"$'\t<rc-only>'; fi
+    done <<<"$cset"
+    newsig=$(comm -23 <(grep . <<<"$csig" | sort -u) <(grep . <<<"$ksig" | sort -u))
+    if [[ -n "$newsig" ]]; then
+        note "candidate FAILS assertion(s) the installed version does not (scenario: assertion): $(tr '\n\t' '; ' <<<"$newsig")— CANDIDATE-ATTRIBUTED (COMPAT evidence: block --evidence gate:<scenario> --control '$eff: those assertions pass on the same tree'), not pre-existing"
+        return 1
+    fi
+    GATE_RED_PREEXISTING=$(paste -sd, <<<"$cset")
+    return 0
+}
+
 _check_gate_evidence() {
     local file="$1" candidate="$2"
     GATE_EVIDENCE_REFUSAL=""
@@ -1305,9 +1464,23 @@ _check_gate_evidence() {
         note "REFUSED: gate evidence is ${age}s old (> ${GATE_EVIDENCE_MAX_AGE}s) — re-run the gate"
         return 1
     fi
+    GATE_RED_PREEXISTING=""
     if ! grep -q 'GATE GREEN' "$file"; then
-        note "REFUSED: gate evidence does not contain 'GATE GREEN' — a red/absent gate never bumps"
-        return 1
+        # A RED THE INSTALLED VERSION SHARES IS NOT THE CANDIDATE'S
+        # (your-org/nexus-code#1657; 2.1.247: "NOT a candidate defect … 2.1.246
+        # control fails identically", and it still held the update). With a
+        # control gate log — the INSTALLED version, gated on the SAME tree, RED
+        # on a superset of the candidate's red scenarios — the red is ours and
+        # proceeds, recorded. What this does NOT cover, stated: a scenario red
+        # on both arms measures nothing about the candidate, so those
+        # scenarios are UNMEASURED for this bump (named on the row).
+        if [[ -n "${CONTROL_GATE_EVIDENCE:-}" ]] && _gate_red_preexisting "$file" "$CONTROL_GATE_EVIDENCE" "$candidate"; then
+            note "gate RED on $candidate is PRE-EXISTING: the installed version's control gate on the same tree is red on every scenario the candidate is red on (${GATE_RED_PREEXISTING}). Not a candidate finding — proceeding; those scenarios are UNMEASURED for this bump (#1657)."
+        else
+            note "REFUSED: gate evidence does not contain 'GATE GREEN' — a red/absent gate never bumps unless a control gate of the installed version on the same tree shares every red scenario (--control-gate-evidence)"
+            GATE_EVIDENCE_REFUSAL="gate-not-green"
+            return 1
+        fi
     fi
     if ! grep -qF "$candidate" "$file"; then
         note "REFUSED: gate evidence does not mention candidate $candidate — wrong gate run?"
@@ -1429,6 +1602,24 @@ _check_gate_evidence() {
         note "REFUSED: gate evidence carries no dirty_tracked= field — it predates your-org/nexus-code#1320 and never measured whether the TRACKED tree matched head=$stamp_head. Re-run monitor/cc-harness/gate.sh."
         GATE_EVIDENCE_REFUSAL="gated-tree-dirty-field-missing"
         return 1
+    fi
+    # A DIRTY GATED TREE WHOSE EDITS THE LIVE CLONE STILL CARRIES IS THE TREE
+    # PRODUCTION RUNS (your-org/nexus-code#1657). The refusal below exists
+    # because `head=` does not identify a dirty tree; the stamped digest of
+    # the tracked diff does. Equal digests (and equal heads, checked above)
+    # mean the gate measured exactly this clone, edits included — accept,
+    # recorded. Unequal or unknown digests still refuse (the retry re-gates).
+    local stamp_digest live_digest
+    stamp_digest=$(_gate_log_tree_field "$file" dirty_digest)
+    if [[ "$stamp_dirty" == "1" && "$stamp_digest" =~ ^[0-9a-f]{40}$ ]]; then
+        live_digest=$(cc_tree_dirty_digest "$NEXUS_ROOT")
+        if [[ "$live_digest" == "$stamp_digest" ]]; then
+            GATE_EVIDENCE_TRACKED=$(_gate_log_tracked_paths "$file")
+            note "gate evidence attributed to a DIRTY tree whose tracked edits the live clone still carries byte-for-byte (dirty_digest=$stamp_digest; ${GATE_EVIDENCE_TRACKED:-paths unnamed}) — the gate ran what production runs; accepting (#1657)"
+            _cc_auto_log_decision "$AUTO_DIR" "$candidate" "gated-tree-dirty-accepted" \
+                "dirty_digest=$stamp_digest head=$stamp_head tracked=${GATE_EVIDENCE_TRACKED:-unnamed}"
+            stamp_dirty=0
+        fi
     fi
     if [[ "$stamp_dirty" != "0" ]]; then
         # Name the FILES (your-org/nexus-code#1475): the cause is a local edit
@@ -2622,6 +2813,9 @@ _gate_file_defect() {
 # until its author opts in, so the permissive path can never be reached by
 # forgetting about it — the allowlist discipline in CLAUDE.md, applied to the
 # one verdict here that is permissive.
+# NO CALLER SINCE your-org/nexus-code#1657 (active review was the last arm).
+# Kept, with its streak cap and age bound, as the ONE path a future deferring
+# arm must take, so that arm is bounded the day it is added.
 _gate_defer() {
     local candidate="$1" detail="$2" msg="$3" overridable="${4:-0}" streak age
     _gate_defer_streak_bump   # NOT `$(…)` — the memo must land in THIS shell (#1602)
@@ -3015,13 +3209,21 @@ _deployment_gate() {
         (( age <= GATE_PR_ACTIVE_SECONDS )) \
             && active_prs="${active_prs:+$active_prs }PR${prn}(${age}s)"
     done <<<"$act_lines"
-    if [[ -n "$active_prs" ]]; then
-        if ! _gate_defer "$candidate" "pr-under-active-review=${active_prs// /,} pr_active_window=${GATE_PR_ACTIVE_SECONDS}s $ev" \
-            "open PR(s) on $GATE_REPO were touched within ${GATE_PR_ACTIVE_SECONDS}s ($active_prs) — a review may be in flight at a pinned ref; restarting now would break it" 1
-        then
-            return 1
-        fi
-    fi
+    # RECORDED, NOT A VETO (your-org/nexus-code#1657, operator 2026-09-27:
+    # "The cc-update should only be held if there is real concern nexus-code
+    # could not work anymore"). This was the LAST `_gate_defer` arm. A PR
+    # under review is not deployed and says nothing about the candidate, and a
+    # review in flight survives the bump: the bump restarts the watcher and the
+    # orchestrator, never a worker (operator 2026-09-12, measured in the knob
+    # block above), and a reviewer's pinned ref is a git ref, not a binary.
+    # Measured cost of the veto over 2026-08-27..09-27: 3 of the 12
+    # `safe-deferred` rows. The probe and the evidence stay on the row.
+    local _ap
+    for _ap in $active_prs; do
+        _cc_auto_log_decision "$AUTO_DIR" "$candidate" "pr-under-active-review-noted" \
+            "pr=$_ap window=${GATE_PR_ACTIVE_SECONDS}s"
+    done
+    [[ -n "$active_prs" ]] && note "deployment-gate: open PR(s) under active review ($active_prs) — NOTED, not a veto (#1657)"
 
     # 3. Live agent windows — ENUMERATED AND RECORDED, NOT GATED ON.
     #
@@ -3197,6 +3399,44 @@ _assert_live_tree() {
     return 1
 }
 
+# _cl_prior_refused_runs <candidate> — how many EARLIER runs refused this
+# candidate on changelog completeness: `safe-refused` rows with a
+# changelog-completeness detail, older than an hour, counted once per hour
+# bucket (one evaluator run's in-run retries collapse into one).
+_cl_prior_refused_runs() {
+    local candidate="$1" now; now=$(date +%s)
+    [[ -r "$AUTO_DIR/decisions.tsv" ]] || { printf '0\n'; return 0; }
+    awk -F'\t' -v c="$candidate" '$2==c && $3=="safe-refused" && $4 ~ /^changelog-completeness/ {print $1}' \
+        "$AUTO_DIR/decisions.tsv" 2>/dev/null \
+      | while IFS= read -r ts; do
+            e=$(date -d "$ts" +%s 2>/dev/null) || continue
+            (( now - e > 3600 )) && printf '%s\n' $(( e / 3600 ))
+        done | sort -u | awk 'END{print NR+0}'
+}
+
+# _safe_blocked_by_fresh_hold <candidate> — rc 0 iff last-eval is a COMPAT
+# hold (`cc_hold_is_hold`) for <candidate>, dated within GATE_EVIDENCE_MAX_AGE,
+# at the live HEAD it names (or naming none). Sets SAFE_HOLD_AGE/_DETAIL.
+SAFE_HOLD_AGE=""; SAFE_HOLD_DETAIL=""
+_safe_blocked_by_fresh_hold() {
+    local candidate="$1" f="$AUTO_DIR/last-eval" c d det dt ep age rh lh
+    [[ -f "$f" ]] || return 1
+    c=$(_cc_update_field "$f" candidate 2>/dev/null) || c=""
+    [[ "$c" == "$candidate" ]] || return 1
+    d=$(_cc_update_field "$f" decision 2>/dev/null) || d=""
+    det=$(_cc_update_field "$f" detail 2>/dev/null) || det=""
+    cc_hold_is_hold "$d" "$det" || return 1
+    dt=$(_cc_update_field "$f" date 2>/dev/null) || dt=""
+    ep=$(date -d "$dt" +%s 2>/dev/null) || return 1
+    age=$(( $(date +%s) - ep ))
+    (( age >= 0 && age <= GATE_EVIDENCE_MAX_AGE )) || return 1
+    rh=""; [[ "$det" =~ live_head=([0-9a-f]{40}) ]] && rh="${BASH_REMATCH[1]}"
+    lh=$(cc_repo_head "$NEXUS_ROOT")
+    if [[ -n "$rh" && "$lh" != "unknown" && "$rh" != "$lh" ]]; then return 1; fi
+    SAFE_HOLD_AGE="$age"; SAFE_HOLD_DETAIL="$det"
+    return 0
+}
+
 cmd_safe() {
     local candidate="" gate_evidence="" surfaces_clear=0
     local changelog_evidence="" changelog_ledger=""
@@ -3206,6 +3446,9 @@ cmd_safe() {
         case "$1" in
             --candidate)         candidate="$2"; shift 2 ;;
             --gate-evidence)     gate_evidence="$2"; shift 2 ;;
+            # The INSTALLED version's gate on the SAME tree, for a RED the
+            # candidate shares with it (#1657). See `_gate_red_preexisting`.
+            --control-gate-evidence) CONTROL_GATE_EVIDENCE="$2"; shift 2 ;;
             --surfaces-clear)    surfaces_clear=1; shift ;;
             --surface-evidence)  SURFACE_EVIDENCE+=("$2"); shift 2 ;;
             --negative-control)  NEGATIVE_CONTROLS+=("$2"); shift 2 ;;
@@ -3246,6 +3489,19 @@ cmd_safe() {
         exit 9
     fi
 
+    # A FRESH HOLD ON THIS CANDIDATE IS NOT OVERRIDDEN BY `safe` (#1657 round
+    # 2, skeptic F2). If `block` recorded a COMPAT hold for this candidate at
+    # this HEAD within the evidence window, the same evaluation — or a copied
+    # instruction — must not apply it next. Refused, exit 13, and NOT
+    # recorded as an outcome: last-eval keeps saying "held". The hold is lifted
+    # by the routine's own re-check (a new day, or the HEAD moving: the fix
+    # landed), never by the next command in the same run.
+    if _safe_blocked_by_fresh_hold "$candidate"; then
+        note "REFUSED: $candidate is on a COMPAT hold recorded $SAFE_HOLD_AGE s ago at this same HEAD ($SAFE_HOLD_DETAIL). A hold is lifted by the routine's re-check when the fix lands (HEAD moves) or at the next daily fire — not by \`safe\` in the same run."
+        _cc_auto_log_decision "$AUTO_DIR" "$candidate" "safe-refused-held" "age=${SAFE_HOLD_AGE}s ${SAFE_HOLD_DETAIL:0:200}"
+        exit 13
+    fi
+
     # Guards — every refusal leaves the pin untouched.
     if (( surfaces_clear != 1 )); then
         note "REFUSED: --surfaces-clear attestation missing. Pass it ONLY after the changelog review cleared the non-gate surfaces (GUIDE 2c VI-mode / 2d hooks+settings / 2e CLI flags)."
@@ -3267,6 +3523,10 @@ cmd_safe() {
     if ! _check_surface_evidence "$gate_evidence"; then
         record_outcome "$candidate" "safe-refused" "surface-evidence"
         exit 3
+    fi
+    if [[ -n "$GATE_RED_PREEXISTING" ]]; then
+        _cc_auto_log_decision "$AUTO_DIR" "$candidate" "gate-red-preexisting" \
+            "red=$GATE_RED_PREEXISTING control=$CONTROL_GATE_EVIDENCE unmeasured-for-candidate=$GATE_RED_PREEXISTING"
     fi
     # Append-only audit row (does NOT touch last-eval, which must keep
     # naming the terminal decision): what was claimed, per surface.
@@ -3300,6 +3560,28 @@ cmd_safe() {
     local cl_rc=0
     _check_changelog_completeness "$changelog_evidence" "$changelog_ledger" \
         "$effective" "$candidate" || cl_rc=$?
+    # BOUNDED, NOT STANDING (your-org/nexus-code#1657). An incomplete changelog
+    # read is not evidence that the candidate breaks nexus-code, so it may
+    # delay an update but never hold one. The refusal still fires — it is what
+    # makes the evaluator read every entry, and the changelog is where the
+    # 2.1.278 and 2.1.281 compat breaks were FOUND while the gate was GREEN —
+    # but once this candidate has been refused on the changelog in
+    # CC_AUTO_CHANGELOG_GAP_AFTER earlier RUNS (rows older than an hour, so an
+    # evaluator correcting its own ledger within one run does not count), the
+    # gap is RECORDED (`changelog-gap`) and the apply proceeds. A release the
+    # agent BLOCKED on evidence is a judgment, not a gap, and still refuses.
+    if (( cl_rc != 0 )) && [[ "$CHANGELOG_REFUSAL" != opaque-release-blocked=* ]]; then
+        local _gap_after="${CC_AUTO_CHANGELOG_GAP_AFTER:-2}" _prior
+        [[ "$_gap_after" =~ ^[0-9]+$ ]] || _gap_after=2
+        _prior=$(_cl_prior_refused_runs "$candidate")
+        if (( _prior >= _gap_after )); then
+            note "changelog accounting still incomplete for $candidate (${CHANGELOG_REFUSAL:-unspecified}) after $_prior earlier refused run(s) — RECORDING THE GAP AND PROCEEDING: an incomplete read is not evidence of incompatibility (#1657)"
+            _cc_auto_log_decision "$AUTO_DIR" "$candidate" "changelog-gap" \
+                "refusal=${CHANGELOG_REFUSAL:-unspecified} prior_refused_runs=$_prior gap_after=$_gap_after"
+            cl_rc=0
+            CHANGELOG_SUMMARY="GAP RECORDED: ${CHANGELOG_REFUSAL:-unspecified} (prior_refused_runs=$_prior); ${CHANGELOG_SUMMARY:-no summary}"
+        fi
+    fi
     if (( cl_rc == 2 )); then
         record_outcome "$candidate" "safe-refused" "changelog-completeness:${CHANGELOG_REFUSAL}"
         # The standing-omission mark counts UNDISPOSITIONED refusals only; a
@@ -4343,6 +4625,7 @@ cmd_compat_pr() {
             if ! _assert_live_tree compat-pr "$candidate"; then
                 _cc_auto_log_decision "$AUTO_DIR" "$candidate" "live-tree-drift" \
                     "verb=compat-pr $LIVE_TREE_DRIFT_DETAIL"
+                _record_retry_schedule "$candidate" "live-tree-drift" "verb=compat-pr"
                 exit 9
             fi
             local json n
@@ -4439,10 +4722,20 @@ cmd_compat_pr() {
 # candidate verdict — the third outcome, not collapsed into either.
 cmd_block() {
     local candidate="" reason="" gate_evidence=""
+    local evidence="" issue="" control=""
     while (( $# > 0 )); do
         case "$1" in
             --candidate)     candidate="$2"; shift 2 ;;
             --reason)        reason="$2"; shift 2 ;;
+            # THE COMPAT CONTRACT (your-org/nexus-code#1657). A block HOLDS the
+            # update only with all three: what failed on the candidate
+            # (gate:<scenario> | probe:<findings-file>), the issue the compat
+            # fix is tracked on, and the baseline on which the same check did
+            # NOT fail. Without them this verb records `block-not-compat`,
+            # schedules a retry within hours and exits 12 — never a hold.
+            --evidence)      evidence="$2"; shift 2 ;;
+            --issue)         issue="$2"; shift 2 ;;
+            --control)       control="$2"; shift 2 ;;
             # OPTIONAL, and DERIVED when omitted — see below. Not every
             # block comes from a gate RED (a changelog surface can block on
             # its own), so requiring it would force a fake argument on the
@@ -4461,6 +4754,7 @@ cmd_block() {
     if ! _assert_live_tree block "$candidate"; then
         _cc_auto_log_decision "$AUTO_DIR" "$candidate" "live-tree-drift" \
             "verb=block $LIVE_TREE_DRIFT_DETAIL reason=$reason"
+        _record_retry_schedule "$candidate" "live-tree-drift" "verb=block"
         exit 9
     fi
 
@@ -4528,6 +4822,11 @@ cmd_block() {
             record_outcome "$candidate" "block-unattributable" \
                 "gate-tree-unattributable reason=${why:-unspecified} live_head=$live_head live_ref=$live_ref gate_evidence=$gate_src detail=$reason"
             notify "cc-auto-update: $candidate gate RED is UNATTRIBUTABLE (${why:-unspecified}) — not recorded as a candidate block"
+            # NOT-COMPAT (#1657): the gate infrastructure failed, not the
+            # candidate. record_outcome above scheduled the retry; file OUR
+            # defect so it is fixed rather than re-met at every fire.
+            _gate_file_defect "$candidate" "gate-unattributable" \
+                "cc-harness gate on $live_head could not be attributed to a tree ($reason) — a gate-infrastructure defect, not a finding about $candidate; the update retries within ${CC_AUTO_RETRY_SECONDS}s" || true
             exit 3
         else
             gated_head=$(_gate_log_tree_field "$gate_evidence" head)
@@ -4538,6 +4837,11 @@ cmd_block() {
                 record_outcome "$candidate" "block-unattributable" \
                     "gate-tree-stamp-missing live_head=$live_head live_ref=$live_ref gate_evidence=$gate_src detail=$reason"
                 notify "cc-auto-update: $candidate gate RED carries no tree stamp — not recorded as a candidate block"
+                # NOT-COMPAT (#1657): the gate infrastructure failed, not the
+                # candidate. record_outcome above scheduled the retry; file OUR
+                # defect so it is fixed rather than re-met at every fire.
+                _gate_file_defect "$candidate" "gate-unattributable" \
+                    "cc-harness gate on $live_head could not be attributed to a tree ($reason) — a gate-infrastructure defect, not a finding about $candidate; the update retries within ${CC_AUTO_RETRY_SECONDS}s" || true
                 exit 3
             elif [[ "$gated_head" == "$live_head" ]]; then
                 attribution="gated-tree-is-live-clone"
@@ -4581,9 +4885,61 @@ cmd_block() {
     elif [[ "$drift" != "up-to-date" ]]; then
         note "NOTE: could not determine whether this clone is behind origin/$branch — 'could not look' is NOT 'current'."
     fi
-    note "BLOCK: candidate=$candidate reason=$reason $subject — NOT bumping; surfacing for the operator"
-    record_outcome "$candidate" "block" "$reason | $subject"
-    notify "cc-auto-update: $candidate BLOCKED ($reason) — operator attention needed"
+    # 4. THE COMPAT CONTRACT (your-org/nexus-code#1657). Only positive,
+    #    candidate-attributed evidence holds an update. "Residual
+    #    uncertainty", a quiet changelog, a probe that could not run, a RED
+    #    that the installed version shares — none of those says the candidate
+    #    breaks nexus-code, and all of them used to park the routine until an
+    #    operator stepped in (five `skipped-awaiting-operator` days after
+    #    2.1.278 alone). A block that cannot name WHAT failed, WHERE the fix
+    #    is tracked and WHICH baseline passed does not get a clean hold: with
+    #    NO evidence field it is `block-not-compat` (retry), with SOME it is a
+    #    HOLD marked contract=incomplete (see the fail direction below).
+    local missing=""
+    missing=$(cc_hold_block_contract "$evidence" "$issue" "$control")
+    # A `gate:<scenario>` claim is CHECKED against this run's gate log when
+    # there is one: the scenario must be on its `failed:` line. A claim the
+    # log contradicts is not evidence (it names a scenario that passed).
+    if [[ "$evidence" == gate:?* && -n "$gate_evidence" && -f "$gate_evidence" ]]; then
+        local _sc="${evidence#gate:}"; _sc="${_sc%.sh}"
+        if ! awk '/^ *failed: /{for(i=2;i<=NF;i++){n=$i; sub(/\.sh$/,"",n); if(n==s) f=1}} END{exit !f}' s="$_sc" "$gate_evidence"; then
+            missing="${missing:+$missing }evidence(scenario-not-failed-in-gate-log)"
+        fi
+    fi
+    # THE FAIL DIRECTION (#1657 round 2, skeptic F2). A block that carries ANY
+    # evidence field is an evaluator TRYING to hold: something it measured says
+    # the candidate breaks. If the contract is then incomplete or malformed —
+    # a copied template whose `# comment` ate the line continuation, a gate
+    # claim the log does not bear out, an unshaped issue — that is OUR defect
+    # in how the hold was written, never a reason to APPLY. It HOLDS
+    # (class=compat contract=incomplete), files a loud defect, and exits 12;
+    # the routine re-checks it like any COMPAT hold. 2.1.278 and 2.1.281 were
+    # probe-found with the gate GREEN: under the first cut of this contract a
+    # dropped --control turned that into "run safe now".
+    # Only a block with NO evidence field at all (the gate could not run, a
+    # refusal with nothing measured) is NOT-COMPAT: nothing says the candidate
+    # breaks anything, so it retries rather than holds.
+    if [[ -n "$missing" ]]; then
+        if [[ -n "$evidence$issue$control" ]]; then
+            note "COMPAT HOLD WITH AN INCOMPLETE CONTRACT: this block names evidence but lacks ${missing} (want --evidence gate:<scenario>|probe:<findings-file> --issue <url|owner/repo#N> --control '<baseline that passed>'). The update is HELD — a malformed hold never applies (#1657). Re-run block with the missing field(s); do NOT run \`safe\` for $candidate in this run. A defect is filed."
+            record_outcome "$candidate" "block" \
+                "class=compat contract=incomplete missing=${missing// /,} evidence=${evidence:-none} issue=${issue:-none} control=${control//$'\t'/ } | $reason | $subject"
+            _gate_file_defect "$candidate" "block-contract-incomplete-$candidate" \
+                "the cc-update evaluator recorded a COMPAT hold on $candidate with an incomplete contract (missing: $missing; evidence=${evidence:-none}; reason: $reason). The update is HELD; the hold's record needs its issue/control completed." || true
+            notify "cc-auto-update: $candidate HELD on evidence with an INCOMPLETE contract (missing: $missing) — held, defect filed"
+            exit 12
+        fi
+        note "NOT A COMPAT HOLD: this block names NO evidence (want --evidence gate:<scenario>|probe:<findings-file> --issue <url|owner/repo#N> --control '<baseline that passed>'). Nothing measured says $candidate breaks nexus-code, so nothing is held (#1657); recorded as block-not-compat, the routine re-evaluates within ${CC_AUTO_RETRY_SECONDS}s, and the defect that stopped the evaluation (a gate that could not run) is filed. If you DO have evidence the candidate breaks nexus-code, re-run block with it."
+        record_outcome "$candidate" "block-not-compat" \
+            "class=not-compat missing=${missing// /,} reason=$reason | $subject"
+        _gate_file_defect "$candidate" "block-not-compat-$candidate" \
+            "the cc-update evaluator could not complete a verdict on $candidate ($reason) and named no evidence of breakage. Not a candidate finding — the routine retries within ${CC_AUTO_RETRY_SECONDS}s." || true
+        exit 12
+    fi
+    note "BLOCK (COMPAT): candidate=$candidate evidence=$evidence issue=$issue control=$control reason=$reason $subject — NOT bumping; re-evaluated when the live HEAD moves and on every daily fire"
+    record_outcome "$candidate" "block" \
+        "class=compat evidence=$evidence issue=$issue control=${control//$'\t'/ } | $reason | $subject"
+    notify "cc-auto-update: $candidate held on a COMPAT failure ($evidence; fix tracked at $issue) — re-checked automatically when the fix lands"
     exit 0
 }
 
@@ -4595,6 +4951,31 @@ cmd_block() {
 # and is inert on a live watcher. Shell-portable by design: the
 # 2026-07-10 workaround (hand-sourcing _cc-version.sh for a pin revert)
 # silently no-op'd under zsh.
+
+# ---- verb: retry-now (your-org/nexus-code#1657) ---------------------------
+# The SUPPORTED way to make the routine re-evaluate before the next daily fire:
+# writes `retry-at` due now (manual=1, exempt from the per-day retry cap), so
+# the watcher's next cc_auto_update tick (~5 min) spawns the evaluator. Touches
+# no pin and no binary; the evaluation it triggers is the ordinary gated one.
+# Replaces hand-deleting `last-fire-date`, which also skipped the audit trail.
+cmd_retry_now() {
+    local candidate="-" reason=""
+    while (( $# > 0 )); do
+        case "$1" in
+            --candidate) candidate="$2"; shift 2 ;;
+            --reason)    reason="$2"; shift 2 ;;
+            *) note "retry-now: unknown arg $1"; exit 2 ;;
+        esac
+    done
+    [[ -n "$reason" ]] || { note "retry-now: --reason required (it is the audit row)"; exit 2; }
+    if ! cc_hold_request_retry "$AUTO_DIR" "$candidate" "$reason" "$(date +%s)"; then
+        note "retry-now: could NOT write $AUTO_DIR/retry-at — nothing scheduled"
+        exit 41
+    fi
+    _cc_auto_log_decision "$AUTO_DIR" "$candidate" "retry-requested" "reason=$reason by=${NEXUS_WORKER_WINDOW:-unknown}"
+    note "retry-now: re-evaluation scheduled for the next watcher tick (retry-at=now, manual). Watch $AUTO_DIR/decisions.tsv for a \`retry-fired\` then \`spawned\` row."
+    exit 0
+}
 
 cmd_hold() {
     local reason="" ttl="" until_version=""
@@ -4905,6 +5286,7 @@ case "$verb" in
     hold)                 cmd_hold "$@" ;;
     unhold)               cmd_unhold "$@" ;;
     hold-status)          cmd_hold_status "$@" ;;
+    retry-now)            cmd_retry_now "$@" ;;
     rollback)             cmd_rollback "$@" ;;
     *)                    usage ;;
 esac

@@ -46,6 +46,9 @@ must=(
   # and its expiry is a RE-ARM instruction, not an answer about the condition.
   'at most 30 minutes'
   'means RE-ARM, not "done"'
+  # your-org/nexus-code#1685: a run_in_background call is stopped at its own
+  # Bash `timeout` (2.1.285+); the stop notice is RE-ARM, not a verdict.
+  'background time limit'
   # your-org/nexus-code#1533: sandbox-notify delivers one bit.
   'ATTENTION, not content'
 )

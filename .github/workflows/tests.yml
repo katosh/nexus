@@ -292,7 +292,16 @@ jobs:
     # re-consumes it in weeks; the durable fixes are the band-cost items there.
     # The band itself is bounded BELOW this by `ci-diag-budget.sh --run-bound`,
     # so a band that outgrows it ends as an explicit NO VERDICT, not a cancel.
-    timeout-minutes: 60
+    #
+    # 90, was 60 (<your-org>/nexus-code#1703; the #1474 item-18 stopgap, consumed
+    # as predicted). Measured on the bash cell over the last five runs that
+    # executed: 49.4, 59.6, 59.7, 60.0 and 56.0 min. On dev 8e580b1b
+    # (run 36799007596) the run-bound fired with 467 of 496 suites measured,
+    # so EVERY unit cell ended NO VERDICT and dev had no baseline at all. The
+    # need is ~60-65 min; 90 is ~1.4x. The cost is up to 30 runner-min per cell
+    # per run, so up to 120 across the four band jobs. Still a stopgap: the
+    # durable fix is sharding the band, filed separately.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -305,7 +314,7 @@ jobs:
       # `timeout-minutes` above, in seconds. The diagnostics budget is DERIVED
       # from the job's remaining time against this (<your-org>/nexus-code#1442);
       # test-ci-diag-budget.sh asserts the two never drift apart.
-      JOB_CEILING_S: "3600"
+      JOB_CEILING_S: "5400"
       # tmux derives an unpinned pane's shell from $SHELL (<your-org>/nexus-code
       # #555). Pointing it at the matrix shell exercises the login-shell axis
       # for every fixture that does NOT pin its own (the ones that DO, via
@@ -724,11 +733,12 @@ jobs:
     # elapsed time against this ceiling at the end of the suite step, so the
     # next squeeze is visible before it cancels anything (#1388 option 3).
     #
-    # 60, was 45 (<your-org>/nexus-code#1474 item 18) — the same stopgap as the
-    # `unit` cells, and the band is bounded below it the same way.
-    timeout-minutes: 60
+    # 90, was 60, was 45 (<your-org>/nexus-code#1703, #1474 item 18) — the same
+    # stopgap as the `unit` cells, raised with them for the same measured
+    # reason, and the band is bounded below it the same way.
+    timeout-minutes: 90
     env:
-      JOB_CEILING_S: "3600"   # = timeout-minutes, in seconds (#1442)
+      JOB_CEILING_S: "5400"   # = timeout-minutes, in seconds (#1442)
     steps:
       # THE JOB'S OWN CLOCK, recorded FIRST (<your-org>/nexus-code#1442, #1443).
       # `$SECONDS` restarts at zero in every step, so nothing inside a later
@@ -1060,15 +1070,33 @@ jobs:
   # which is a vacuous gate wearing a green.
   #
   # 30 minutes: the gate measured 17m49s (job 100555852533), 17.2m (run
-  # 33702867331) and ~18m on the runs where it completed, so 30 is ~1.7x the
+  # 33702867331) and ~18m on the runs where it completed, so 30 was ~1.7x the
   # measured cost. It prints its elapsed time against this ceiling at the end,
   # so growth is seen as a number before it is seen as a `cancelled`.
+  #
+  # SHARDED, <your-org>/nexus-code#1703. That margin is gone: the population grew
+  # from 124 suites (bbf8fa86) to 146 (3d022b09), and the serial band was
+  # cancelled at 30 min on dev and on PR runs alike, having printed NOTHING,
+  # because its per-suite section is buffered until the loop ends. Raising the
+  # ceiling was rejected: the unit band's own timings for these 146 suites sum
+  # to 65-73 min with each capped at the probe timeout, which no single job
+  # fits with honest headroom. So the population is split into 4 disjoint
+  # slices, one per matrix cell (`band --shard K/4`, a byte-sorted round-robin;
+  # test-nrs-population.sh asserts the slices partition the population), and
+  # each probe now prints a `[i/n] <secs> <verdict> <suite>` line as it ends,
+  # so a cell killed at its ceiling still says where its time went.
   # ---------------------------------------------------------------------------
   inherited-root-gate:
-    name: fixture-band decoy gate (NEXUS_ROOT exported per suite)
+    name: fixture-band decoy gate ${{ matrix.shard }}/4 (NEXUS_ROOT exported per suite)
     if: github.event_name != 'pull_request' || github.event.action != 'edited' || github.event.changes.base.ref.from
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in step with the `/4` in the gate step below;
+        # test-nrs-population.sh pins the two together.
+        shard: [1, 2, 3, 4]
     env:
       JOB_CEILING_S: "1800"   # = timeout-minutes, in seconds (#1442)
     steps:
@@ -1106,7 +1134,7 @@ jobs:
         run: |
           set -uo pipefail
           rc=0
-          bash monitor/nexus-root-sensitivity.sh band --timeout 300 || rc=$?
+          bash monitor/nexus-root-sensitivity.sh band --timeout 300 --shard "${{ matrix.shard }}/4" || rc=$?
           # LEGIBLE BEFORE IT CAN BE KILLED (#1443 remedy 1; #1388 option 3):
           # the gate's own duration, beside its ceiling, on every run.
           bash monitor/watcher/ci-diag-budget.sh --elapsed "$JOB_CEILING_S" "$JOB_START_S"
@@ -1142,9 +1170,10 @@ jobs:
     runs-on: ubuntu-latest
     # 60, was 45 (<your-org>/nexus-code#1474 item 18) — the same stopgap as the
     # `unit` cells, and the band is bounded below it the same way.
-    timeout-minutes: 60
+    # 90, was 60: the same measured reason as the `unit` cells (#1703).
+    timeout-minutes: 90
     env:
-      JOB_CEILING_S: "3600"   # = timeout-minutes, in seconds (#1442)
+      JOB_CEILING_S: "5400"   # = timeout-minutes, in seconds (#1442)
     steps:
       # THE JOB'S OWN CLOCK, recorded FIRST (<your-org>/nexus-code#1442, #1443).
       # `$SECONDS` restarts at zero in every step, so nothing inside a later

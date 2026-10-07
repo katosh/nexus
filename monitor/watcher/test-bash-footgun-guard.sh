@@ -1327,11 +1327,11 @@ rm -f "$_ucw_conf"
 # workers wedged >5h, panes reading working-background throughout.
 echo '=== #1446: existence-query | head WARNS ==='
 win eqh-grep
-run '{"tool_name":"Bash","tool_input":{"command":"grep -raIl PR_22049 /shared/your-lab-m/metx_liver_met/ | head -5"}}'
+run '{"tool_name":"Bash","tool_input":{"command":"grep -raIl SAMPLE_X /data/proj-v2/ | head -5"}}'
 assert_ctx "grep -r … | head (the 49m45s instance) WARNS" "AN EXISTENCE QUERY PIPED INTO"
 assert_ctx "  …and the message names the reports/ silent zero and its remedy" "monitor/ng report-grep"
 win eqh-reports
-run '{"tool_name":"Bash","tool_input":{"command":"grep -raIl '"'"'X18527\\|X40917'"'"' work/ reports/ | head -20"}}'
+run '{"tool_name":"Bash","tool_input":{"command":"grep -raIl '"'"'SAMPLE_A\\|SAMPLE_B'"'"' work/ reports/ | head -20"}}'
 assert_ctx "the 2h48m instance over reports/ WARNS" "AN EXISTENCE QUERY PIPED INTO"
 win eqh-find
 run '{"tool_name":"Bash","tool_input":{"command":"find /shared/your-lab-m/user/operator -maxdepth 6 -name '"'"'*.gmt'"'"' | head -3"}}'

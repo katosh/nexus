@@ -18,6 +18,8 @@
 #     silences the built-in npm auto-updater + its "Auto-update failed"
 #     banner — irrelevant to the project-local pin managed by the
 #     cc-update loop, see skills/nexus.cc-update/GUIDE.md)
+#   - permissions.defaultMode == "bypassPermissions" in EVERY
+#     monitor/*-settings.json (your-org/nexus-code#1687; see the block below)
 #   - syncClaudeAiSkills == false, syncClaudeAiPlugins == false
 #     (your-org/nexus-code#1600). Since 2.1.275 Claude Code syncs the skills
 #     and plugins enabled on a signed-in claude.ai account into every session,
@@ -123,6 +125,35 @@ assert_eq "orchestrator StopFailure runs turn-failure-emit.sh (exactly once)" "$
 assert_eq "orchestrator Stop clears the turn-failure stamp (exactly once)"     "$orch_stop_tf" "1"
 assert_eq "orchestrator StopFailure still runs over-limit-emit.sh (rate_limit stays that hook's)" "$orch_sf_ol" "1"
 assert_eq "positive control: the worker file wires the same writer"           "$wrk_sf_tf" "1"
+
+# ---- permissions.defaultMode suppresses the auto-mode offer (#1687) -----
+#
+# Claude Code 2.1.285 shows a one-time "Make auto mode your default permission
+# mode?" select when user-scope `permissions.defaultMode` is set and is not
+# `auto` — UNLESS a flag/project/local/policy settings source sets ANY
+# `defaultMode` (read from the 2.1.285 bundle: `shouldShowAutoDefaultNudge`).
+# A paste + Enter into it accepts "Yes" and REWRITES the operator's user-scope
+# defaultMode to `auto`. Every launcher passes one of these files as
+# `--settings` (flagSettings), so setting the key here suppresses the offer for
+# every nexus agent; `bypassPermissions` is the value the launchers' own
+# `--dangerously-skip-permissions` already selects, so the startup mode is
+# unchanged (measured: `⏵⏵ bypass permissions on` in the footer, both files).
+#
+# POPULATION is the depth-1 glob, not the two names above: a third tracked
+# `*-settings.json` added for a new launcher must carry the key too. The
+# untracked overlays are `*.local.json` and are deliberately not matched —
+# they may override the value on purpose. Floor of 2 so an empty glob cannot
+# pass as "every file checked".
+echo "=== every monitor/*-settings.json sets permissions.defaultMode (your-org/nexus-code#1687) ==="
+_dm_n=0
+for SETTINGS in "$_repo_root"/monitor/*-settings.json; do
+    [[ -f "$SETTINGS" ]] || continue
+    _dm_n=$(( _dm_n + 1 ))
+    dm=$(jq -r '.permissions.defaultMode // "<absent>"' "$SETTINGS")
+    assert_eq "$(basename "$SETTINGS"): permissions.defaultMode is bypassPermissions" "$dm" "bypassPermissions"
+done
+assert_eq "population floor: at least the two launcher settings files were checked" \
+    "$(( _dm_n >= 2 ))" "1"
 
 # ---- Summary -----------------------------------------------------------
 echo

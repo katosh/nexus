@@ -862,7 +862,10 @@ are `3` tmux/paste failure and `5` nudge skipped — both `nudge`'s — and `6`,
 The await budget is 900 s against the Bash tool's 600 s foreground ceiling,
 so `await` runs BACKGROUNDED, and BACKGROUNDED means **the Bash tool's
 `run_in_background` option**: the harness re-invokes you when the job exits,
-which is what makes the typed rc above actionable. Alternatively a
+which is what makes the typed rc above actionable (its Bash `timeout` must
+exceed the await budget: the 30-min default covers 900 s, so raise it only
+with `await_timeout_seconds`, and read a harness stop notice as re-enter;
+`#1685`). Alternatively a
 `Monitor` until-loop, for a condition rather than a job. It does **not**
 mean `monitor/async-run.sh` — that launcher RETAINS the rc and re-invokes
 nobody, so an await run through it expires correctly (rc 4, retained) into

@@ -235,7 +235,11 @@ assert_empty "no launcher still gates the guard on plain [ -x ] with no else" "$
 skipped=$(grep -n 'Absent helper (older checkout)' "$SPAWNER" "$RESPAWN" || true)
 assert_empty "the 'absent helper → skipped' contract is gone from both files" "$skipped"
 n_sites=$(grep -c '^\$SHIM_GUARD_BLOCK$' "$SPAWNER" || true)
-assert_eq "all three spawn-worker launchers emit the block" "$n_sites" "3"
+# FIVE launchers since the Codex harness (#1640/#1642): claude resume, claude
+# loop, claude direct, codex resume, codex direct. REVIEWED for #1643: both
+# Codex launchers carry the same executable prelude as the claude direct one
+# (exports, locals-env, TMPDIR, nproc ceiling, this block) — only the exec differs.
+assert_eq "all five spawn-worker launchers emit the block" "$n_sites" "5"
 n_root=$(grep -c '^export NEXUS_ROOT="\$NEXUS_ROOT"$' "$SPAWNER" || true)
 n_code=$(grep -c '^export NEXUS_SPAWN_CODE_ROOT="\$NEXUS_SPAWN_CODE_ROOT"$' "$SPAWNER" || true)
 assert_eq "every launcher exporting NEXUS_ROOT also exports the code root" \

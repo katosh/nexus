@@ -1037,7 +1037,160 @@ if [[ "$discovered" == "$recorded" ]]; then
     # 98482eed (HEAD checked, `status --porcelain --ignored` empty): base 238 —
     # equal to the pin committed at that ref — and head 240 with the bundle's
     # registry rows committed: TWO added, ZERO removed.
-    _TGFD_POP_EXPECTED=240
+    # +5 for test-codex-run.sh and test-codex-run-real.sh (your-org/nexus-code
+    # #1640, skeptic F5 — populations declared instead of declares-none): the
+    # two suite paths and the three subjects no other row named,
+    # monitor/codex-run.sh, monitor/_codex.sh and
+    # monitor/codex-harness/mock-responses.py. MEASURED as a SET DIFFERENCE
+    # (`comm -3` of the two sorted `--population` emits) against a detached base
+    # worktree at origin/dev 739e76b5 (its HEAD checked): base 240 — equal to
+    # the pin committed at that ref — head 245 with everything STAGED: FIVE
+    # added, ZERO removed. Selection rate over the last 120 first-parent commits
+    # of 739e76b5: 96/120 with the base set and 96/120 with the head set.
+    # +8 for the four layer-2 codex suites (#1640, skeptic F5): the suite
+    # paths test-codex-worker.sh, test-pane-state-codex.sh,
+    # test-integration/test-codex-worker-e2e.sh and
+    # test-integration/test-codex-busy-phases.sh, and the four subjects no
+    # other row named, monitor/codex-hook.sh, monitor/harness/codex.sh,
+    # monitor/_pane-state-codex.sh and monitor/_spawn-codex.sh. MEASURED as a
+    # SET DIFFERENCE against the layer-1 tree (245, equal to its pin): head 253
+    # with everything STAGED: EIGHT added, ZERO removed. Selection rate over the
+    # last 120 first-parent commits of 739e76b5: 96/120 with the head set.
+    # +4 for test-cc-hold-policy.sh's row (your-org/nexus-code#1657, declaring
+    # at birth): its own suite path and three paths no other row named,
+    # monitor/_cc-hold-policy.sh, the 30-day replay fixture
+    # monitor/watcher/fixtures/cc-hold-replay-2026-08-27_09-27.tsv and
+    # monitor/cc-harness/lint-no-tmux-server-kill.sh. MEASURED as a SET
+    # DIFFERENCE (`comm -3` of the two sorted `--population` emits) against a
+    # detached base worktree at origin/dev e081ab45 (HEAD checked): base 253 —
+    # equal to the pin committed at that ref — head 257 with everything STAGED:
+    # FOUR added, ZERO removed. Selection rate over the last 120 first-parent
+    # commits of e081ab45 (0 empty): 96/120 base, 96/120 head.
+    # +1 for test-operator-alert-property.sh's row (your-org/nexus-code#1653,
+    # declaring at birth): its own suite path; its one subject,
+    # monitor/watcher/_operator_alert.sh, was already in the set. MEASURED as
+    # a SET DIFFERENCE (`comm -3` of the two sorted `--population` emits)
+    # against a detached base worktree at origin/dev 7e7e3e6d (HEAD checked,
+    # `status --porcelain --ignored` empty): base 257 — equal to the pin
+    # committed at that ref — head 258 with the merge STAGED: ONE added, ZERO removed.
+    # Selection rate over the last 120 first-parent commits of 7e7e3e6d:
+    # 96/120 with the base set and 96/120 with the head set. (First measured on 07fc9d7d: 253 -> 254, 97/120 base and
+    # head; re-measured here after merging #1657's +4.)
+    # +6 for the mail-policy suites (your-org/nexus-code#1663, declaring at
+    # birth): test-mail-path-lint.sh and test-notify-mail-policy.sh (their own
+    # suite paths) and four paths no other row named, monitor/notify.sh,
+    # config/load.sh, monitor/watcher/mail-path-lint.allow and
+    # docs/reference/dependency-surface.md. MEASURED as a SET DIFFERENCE
+    # (`comm -3` of the two sorted `--population` emits) against a detached base
+    # worktree at origin/dev 7e7e3e6d (HEAD checked, status clean): base 257 —
+    # equal to the pin committed at that ref — head 263 in a detached worktree
+    # at 84018e9a (rows committed): SIX added, ZERO removed. Selection rate over
+    # the last 120 first-parent commits of 7e7e3e6d (0 empty): 96/120 base,
+    # 96/120 head.
+    # Re-measured AFTER merging dev 3ef093b3 (#1656) into the mail-policy
+    # branch: `comm -3` of the sorted `--population` emits, detached worktree at
+    # 3ef093b3 (HEAD checked, status clean) 258 — equal to its committed pin —
+    # against the merge resolution STAGED, 264: the same SIX mail-policy paths
+    # added, ZERO removed. Selection rate over the last 120 first-parent commits
+    # of 3ef093b3 (0 empty): 95/120 base, 95/120 head.
+    # +3 for test-bootstrap-recover-followup.sh's row (your-org/nexus-code#1665,
+    # declaring at birth): its own suite path and the two subjects no other row
+    # named, monitor/bootstrap-recover.sh and monitor/_autocontinue_plan.sh.
+    # MEASURED as a SET DIFFERENCE (`comm -3` of the two sorted `--population`
+    # emits) against a detached base worktree at origin/dev e8f6c896 (HEAD
+    # checked, clean): base 264 — equal to the pin committed at that ref — head
+    # 267 with the merge STAGED: THREE added, ZERO removed. Selection rate
+    # over the last 120 first-parent commits of e8f6c896 (0 empty): 96/120
+    # base, 96/120 head.
+    # +4 for test-labsh-pin.sh's row (your-org/nexus-code#1676/#1677, declaring
+    # via its in-file _subjects list): its own suite path plus three paths no
+    # other row named — monitor/labsh-uvx-shim/uvx, monitor/labsh-uvx-shim/bash_env.sh
+    # and monitor/labsh-supervised.sh (its other subjects were already members).
+    # MEASURED as a SET DIFFERENCE (`comm -3` of the two sorted `--population`
+    # emits) against a detached base worktree at origin/dev eb6b1994 (HEAD
+    # checked, `status --porcelain --ignored` empty): base 267 — equal to the
+    # pin committed at that ref — head 271 on the merged tree dev eb6b1994 +
+    # 6a3d9345 (160bc0ac, committed): FOUR added, ZERO removed. Selection rate
+    # over the last 120 first-parent commits of eb6b1994 (0 empty): 95/120
+    # base, 97/120 head.
+    # +5 at bundle-0929 (your-org/nexus-code#1670 item 4, #1671), both suites
+    # declaring at birth: test-cc-harness-teardown-remnant.sh with two paths no
+    # other row named, monitor/cc-harness/_lib.sh and monitor/_trash.sh; and
+    # test-agents-md-guard.sh with monitor/_agents-md-guard.sh. MEASURED as a
+    # SET DIFFERENCE (`comm -3` of the two sorted `--population` emits) against
+    # a detached base worktree at origin/dev 33a44f48 (HEAD checked,
+    # `status --porcelain --ignored` empty): base 264 — equal to the pin
+    # committed at that ref — head 269 with the rows STAGED: FIVE added, ZERO
+    # removed. Selection rate over first-parent commits NOT re-measured here.
+    # Re-measured AFTER merging origin/dev eb6b1994 (#1665's +3) into
+    # bundle-0929: `comm -3` of the sorted `--population` emits, detached
+    # worktree at eb6b1994 (HEAD checked, `status --porcelain --ignored` empty)
+    # 267, equal to its committed pin, against the merge resolution STAGED,
+    # 272: the same FIVE bundle paths added, ZERO removed.
+    # Re-measured AFTER merging origin/dev 16fca961 (#1677's +4) into
+    # bundle-0929: `comm -3` of the sorted `--population` emits, detached
+    # worktree at 16fca961 (HEAD checked, `status --porcelain --ignored` empty)
+    # 271, equal to its committed pin, against the merge resolution STAGED,
+    # 276: the same FIVE bundle paths added, ZERO removed.
+    # +1 at bundle-0930 for test-test-fence-state.sh's row (your-org/nexus-code#1680,
+    # declaring at birth): its own suite path; its five subjects were already
+    # members. MEASURED as a SET DIFFERENCE (`comm -3` of the two sorted
+    # `--population` emits) against a detached base worktree at origin/dev
+    # 5dc308cf (HEAD checked, `status --porcelain --ignored` empty): base 276 —
+    # equal to the pin committed at that ref — head 277 with the rows COMMITTED:
+    # ONE added, ZERO removed. Selection rate over the last 120 first-parent
+    # commits of 5dc308cf: 95/120 base, 95/120 head.
+    # +3 for test-uv-builds-gc.sh's row (your-org/nexus-code#1686, declaring
+    # at birth via its in-file _subjects list): its own suite path,
+    # monitor/uv-builds-gc.sh, and monitor/_labsh_build_evidence.sh, which no
+    # other row's rendered population named. MEASURED as a SET DIFFERENCE
+    # (`comm -3` of the two sorted `--population` emits) against a detached
+    # base worktree at origin/dev 8e580b1b (HEAD checked, `status --porcelain
+    # --ignored` empty): base 276, equal to the pin committed at that ref; head
+    # 279 with the rows STAGED: THREE added, ZERO removed. Selection rate over
+    # the last 120 first-parent commits of 8e580b1b (0 empty): 96/120 base,
+    # 96/120 head.
+    # Re-measured AFTER merging origin/dev 3d022b09 (#1702's +1) into
+    # labsh-reap-verify: `comm -3` of the sorted `--population` emits, detached
+    # worktree at 3d022b09 (HEAD checked, `status --porcelain --ignored` empty)
+    # 277, equal to its committed pin, against the merge resolution STAGED,
+    # 280: the same THREE paths added, ZERO removed. Selection rate over the
+    # last 120 first-parent commits of 3d022b09 (0 empty): 96/120 base,
+    # 96/120 head.
+    # +3 for test-full-state-actionable-backoff.sh's row (your-org/nexus-code#1736,
+    # declaring at birth via its in-file _subjects list): its own suite path,
+    # monitor/watcher/main.sh and monitor/watcher/_emit_dedup.sh, which no other
+    # row's rendered population named (_config.sh and config/load.sh already
+    # were). MEASURED as a SET DIFFERENCE (`comm -13` of the two sorted
+    # `--population` emits) against a detached base worktree at origin/dev
+    # 78e59f60 (HEAD checked, `status --porcelain` showing only the copied
+    # suite, untracked and so outside every ls-files population): base 280,
+    # equal to the pin committed at that ref; head 283 with the rows COMMITTED:
+    # THREE added, ZERO removed. Selection rate over the last 120 first-parent
+    # commits of 78e59f60 (0 empty): 94/120 base, 99/120 head. The +5 are
+    # commits touching main.sh, which a watcher-gate guard SHOULD select.
+    # +10 for your-org/nexus-code#1747: five lint suites taught gp_population
+    # (test-textguard-lint, test-uncounted-abort-lint,
+    # test-tmuxwrap-lint-conformance, test-lint-citations, test-lint-workflows)
+    # plus the new ratchet test-lint-suites-declare-population.sh — six suite
+    # paths — and four sentinels no other row named: lint-citations.py,
+    # _tmux_kill_scan.awk, tmuxwrap-conformance-rows.txt and
+    # test-integration/test-realmodel-auth-failure-hooks.sh. MEASURED as a SET
+    # DIFFERENCE (`comm` of the sorted `--population` emits) in the bundle-1006a
+    # worktree on 88c5bf81: 283 with the five suites' discovery paths removed
+    # (equal to the pin committed at that ref), 293 with the rows written: TEN
+    # added, ZERO removed. Selection rate over the last 120 first-parent commits
+    # of 88c5bf81 (0 empty): 100/120 base, 100/120 head.
+    # +2 for test-requests-dir.sh's row (your-org/nexus-code#1723, declaring via
+    # its in-file _rd_corpus enumerator): its own suite path and
+    # monitor/_requests_dir.sh, the one sentinel no other row named (ng,
+    # nexus-reply-watch and watcher/_requests.sh already were). MEASURED as a
+    # SET DIFFERENCE (`comm -3` of the sorted `--population` emits) in the
+    # bundle-1006a worktree: 293 with the suite's discovery path removed (equal
+    # to the pin above), 294 with the suite declaring and no row, 295 with the
+    # row written: TWO added, ZERO removed. Selection rate over the last 120
+    # first-parent commits of 88c5bf81 (0 empty): 100/120 base, 100/120 head.
+    _TGFD_POP_EXPECTED=295
     _n_pop=$( gp_render "" 2>/dev/null | sort -u | "$REAL_GREP" -c . )
     _n_nosent=$(
         gp_population() { printf '%s\n' "$INDEX" "$PROTO" "$MANIFEST"

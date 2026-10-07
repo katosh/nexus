@@ -32,8 +32,21 @@
 #     looking.
 #
 # Usage:
-#   monitor/grep-delegation-arms.sh [--snapshot <file>] [--manifest <file>] [--quiet]
+#   monitor/grep-delegation-arms.sh [--snapshot <file> [--cc-version <v>]] [--manifest <file>] [--quiet]
 #   monitor/grep-delegation-arms.sh --print-arms [--snapshot <file>]
+#
+# WHICH VERSION THE ARMS ARE FILED UNDER (your-org/nexus-code#1670). A snapshot
+# file carries no Claude Code version, so the version is a SEPARATE input:
+#   * no --snapshot   the newest discovered snapshot, filed under the LIVE
+#                     binary's `claude --version` (the harness that wrote it);
+#   * --snapshot F    the file's build is NOT knowable from the live binary —
+#                     an evaluator hands in a CANDIDATE's snapshot while the
+#                     live binary is still the old build. The version is
+#                     `unknown (snapshot)` unless --cc-version names it, and an
+#                     unknown version matches no ARMS row (exit 4). It used to
+#                     be labelled — and compared — as the live binary's
+#                     version, so a candidate snapshot was reviewed against the
+#                     wrong row under the wrong name.
 #
 # Exit codes:
 #   0  every documented dependency still holds, and the live arms match a
@@ -44,7 +57,8 @@
 #   3  NOT APPLICABLE — no snapshot `grep` function on this host (a plain bash
 #      login, CI, another harness). Not a failure and not a clearance.
 #   4  UNREVIEWED — the dependencies hold, but the live arm set is not the one
-#      recorded for this Claude Code version (or the version is unrecorded).
+#      recorded for this Claude Code version (or the version is unrecorded,
+#      or unknown — a --snapshot without --cc-version).
 #      This is the bump signal.
 
 set -uo pipefail
@@ -52,6 +66,7 @@ set -uo pipefail
 _self_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 MANIFEST="$_self_dir/grep-delegation-arms.manifest"
 SNAPSHOT=""
+CC_VERSION_ARG=""
 QUIET=0
 PRINT_ARMS=0
 
@@ -59,6 +74,8 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --snapshot)   SNAPSHOT="${2-}"; shift 2 || { echo "--snapshot needs a path" >&2; exit 2; } ;;
         --manifest)   MANIFEST="${2-}"; shift 2 || { echo "--manifest needs a path" >&2; exit 2; } ;;
+        --cc-version) CC_VERSION_ARG="${2-}"; shift 2 || { echo "--cc-version needs a version" >&2; exit 2; }
+                      [ -n "$CC_VERSION_ARG" ] || { echo "--cc-version needs a non-empty version" >&2; exit 2; } ;;
         --quiet)      QUIET=1; shift ;;
         --print-arms) PRINT_ARMS=1; shift ;;
         -h|--help)    sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 2 ;;
@@ -92,6 +109,8 @@ _find_snapshot() {
     return 1
 }
 
+SNAPSHOT_GIVEN=0
+[ -n "$SNAPSHOT" ] && SNAPSHOT_GIVEN=1
 if [ -z "$SNAPSHOT" ]; then
     SNAPSHOT=$(_find_snapshot) || {
         say "grep-delegation-arms: NOT APPLICABLE — no shell snapshot defining a \`grep\` function."
@@ -142,13 +161,26 @@ if [ "$PRINT_ARMS" -eq 1 ]; then printf '%s\n' "$ARMS"; exit 0; fi
 # pipefail the substitution's status can be 141 at the moment the value was
 # obtained correctly. monitor/watcher/early-exit-readers.sh flags exactly this,
 # and flagged this line (`awk-exit prod 1`) before it shipped.
-_cc_raw=$(claude --version 2>/dev/null) || _cc_raw=''
-CC_VERSION=${_cc_raw%% *}
-[ -n "$CC_VERSION" ] || CC_VERSION="<unknown>"
+#
+# The live binary speaks only for a DISCOVERED snapshot — one its own harness
+# wrote. A --snapshot file may be any build's (#1670), so there the version is
+# what --cc-version says, or explicitly unknown — never the live binary's.
+# The unknown sentinels contain a space and so can never equal an ARMS row's
+# version column (a single TAB-free token), i.e. they cannot select a record.
+if [ -n "$CC_VERSION_ARG" ]; then
+    CC_VERSION="$CC_VERSION_ARG"; CC_VERSION_SRC="--cc-version"
+elif [ "$SNAPSHOT_GIVEN" -eq 1 ]; then
+    CC_VERSION="unknown (snapshot)"; CC_VERSION_SRC="--snapshot carries no version; pass --cc-version"
+else
+    _cc_raw=$(claude --version 2>/dev/null) || _cc_raw=''
+    CC_VERSION=${_cc_raw%% *}
+    [ -n "$CC_VERSION" ] || CC_VERSION="unknown (live binary unreadable)"
+    CC_VERSION_SRC="live binary"
+fi
 
 say "grep-delegation-arms (your-org/nexus-code#1234)"
 say "  snapshot   : $SNAPSHOT"
-say "  cc version : $CC_VERSION"
+say "  cc version : $CC_VERSION   [$CC_VERSION_SRC]"
 say "  live arms  : $ARMS"
 
 # --- evaluate the documented dependencies ----------------------------------
@@ -169,10 +201,12 @@ _is_delegated() {   # <argument> -> 0 when the live arms would delegate it
 broken=0
 checked=0
 recorded_arms=""
+same_arms_versions=""
 while IFS=$'\t' read -r kind a b c; do
     case "${kind:-}" in
         ARMS)
             [ "$a" = "$CC_VERSION" ] && recorded_arms="$b"
+            [ "$b" = "$ARMS" ] && same_arms_versions+="${same_arms_versions:+ }$a"
             ;;
         DELEGATES|REACHES)
             checked=$(( checked + 1 ))
@@ -204,8 +238,17 @@ if [ "$broken" -gt 0 ]; then
 fi
 say "  dependencies: $checked checked, all hold"
 
+if [ -z "$recorded_arms" ] && [ "$CC_VERSION" = "unknown (snapshot)" ]; then
+    say "  REVIEW: the snapshot's Claude Code build is unknown, so it cannot be compared"
+    say "  against an ARMS record. Re-run with --cc-version <the build that wrote it>."
+    [ -n "$same_arms_versions" ] && \
+        say "  (the same arm set is recorded for: $same_arms_versions — information, not a review)"
+    exit 4
+fi
 if [ -z "$recorded_arms" ]; then
     say "  REVIEW: cc $CC_VERSION has no ARMS record in $(basename "$MANIFEST")."
+    [ -n "$same_arms_versions" ] && \
+        say "  (the same arm set is recorded for: $same_arms_versions — information, not a review)"
     say "  Every documented dependency still holds, so nothing is broken — but the arm"
     say "  set for this build has not been reviewed. Add an ARMS row, and see"
     say "  skills/nexus.cc-update/GUIDE.md's collision analysis."

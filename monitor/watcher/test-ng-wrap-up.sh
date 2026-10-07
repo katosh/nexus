@@ -160,7 +160,7 @@ rm -rf "$_ng_pin_decoy"
 # The spawn-skeptic request-filing step (your-org/nexus-code#545) shells out
 # to $_script_dir/request-channel.sh (+ its libs). Provide the REAL scripts
 # in the fake monitor dir so cmd_wrap_up can file a request into $STATE_DIR.
-for _dep in request-channel.sh _channel_lib.sh _fm_lib.sh; do
+for _dep in request-channel.sh _channel_lib.sh _fm_lib.sh _requests_dir.sh; do
     cp "$_test_dir/../$_dep" "$FAKE_NEXUS/monitor/$_dep"
 done
 chmod +x "$FAKE_NEXUS/monitor/request-channel.sh"
@@ -169,7 +169,10 @@ chmod +x "$FAKE_NEXUS/monitor/request-channel.sh"
 cat > "$FAKE_NEXUS/config/load.sh" <<'STUB'
 #!/usr/bin/env bash
 case "${1:-}" in
-    github.repo)        printf '%s' "${TEST_DEFAULT_REPO:-default-org/default-repo}" ;;
+    # TEST_NO_DEFAULT_REPO=1 (your-org/nexus-code#1700): the nexus has NO
+    # `github.repo`, so a wrap-up without --repo has no repo to resolve at all.
+    github.repo)        [[ "${TEST_NO_DEFAULT_REPO:-0}" == 1 ]] && exit 2
+                        printf '%s' "${TEST_DEFAULT_REPO:-default-org/default-repo}" ;;
     github.user_login)  printf '%s' "${TEST_DEFAULT_USER:-test-user}" ;;
     *) exit 2 ;;
 esac
@@ -199,6 +202,7 @@ ISSUE=""
 while (( \$# > 0 )); do
     case "\$1" in
         --issue)     ISSUE="\$2"; shift 2 ;;
+        --replace)   shift ;;   # #1639: a boolean flag; \`shift 2\` would spin on it
         --*)         shift 2 ;;
         *)           [[ -z "\$LOCAL" ]] && LOCAL="\$1"; shift ;;
     esac
@@ -462,7 +466,7 @@ run_ng() {
 _require_fn() { declare -F "$1" >/dev/null 2>&1 || { printf 'REFUSED: helper %s is called by this suite and defined nowhere (your-org/nexus-code#1432)\n' "$1" >&2; exit 97; }; }
 reset_mocks() {
     unset MOCK_UPLOAD_FAIL MOCK_UPLOAD_SHA MOCK_COMMENT_FAIL MOCK_ROCKET_FAIL
-    unset MOCK_COMMENT_MOVING MOCK_PATCH_FAIL_MATCH
+    unset MOCK_COMMENT_MOVING MOCK_COMMENT_MULTI
     # #771 — the live-skeptic fixtures. `rm -rf $STATE_DIR` below already
     # drops the provenance records; these two must be cleared explicitly or
     # a window list leaks into the next case and makes it pass for the
@@ -470,6 +474,7 @@ reset_mocks() {
     unset MOCK_TMUX_WINDOW_ROWS MOCK_PANE_STATE MOCK_TMUX_BLIND
     rm -rf "$STATE_DIR"
     rm -f "$COMMENT_STORE" "$COMMENT_SEQ"
+    rm -rf "$COMMENT_STORE.d"
 }
 _require_fn reset_mocks
 
@@ -630,6 +635,10 @@ assert_contains "upload-asset.sh called with --issue 42" "$upload_args" \
                 "--issue 42"
 assert_contains "upload-asset.sh called with the report" "$upload_args" \
                 "$(basename "$REPORT")"
+# your-org/nexus-code#1639/#1637: wrap-up re-uploads its OWN report to the same
+# path on every re-run, so it must say so, or upload-asset.sh refuses (exit 5).
+assert_contains "upload-asset.sh called with --replace (#1639)" "$upload_args" \
+                "--replace"
 
 # Side-effect: gh POSTed the comment to the right repo.
 gh_calls=$(<"$GH_CAPTURE")
@@ -1349,7 +1358,14 @@ assert_contains  "hand-off ran: comment POSTed"             "$gh_calls" \
 # comment record: POST persists the body to $COMMENT_STORE; GET/PATCH
 # on /issues/comments/1234 read/mutate it (PATCH bumps updated_at).
 # MOCK_COMMENT_MOVING=1 bumps updated_at on every GET, simulating a
-# comment under sustained concurrent edits (the CAS must fail loud).
+# comment under sustained concurrent edits.
+# MOCK_COMMENT_MULTI=1 (your-org/nexus-code#1637) switches to a MULTI-comment
+# store: each POST creates a NEW comment id (1234, 1235, …) in
+# $COMMENT_STORE.d/<id>.json and GET/PATCH address that id, so a test can
+# assert the EARLIER comment survives byte-for-byte beside the later one. The
+# PATCH arm stays live in both modes on purpose: a mutant that edits a prior
+# comment must actually change the store, or the byte-identity assertions
+# could not see it.
 cat > "$STUB_DIR/gh" <<STUB
 #!/usr/bin/env bash
 printf '%s\\n' "\$*" >> "$GH_CAPTURE"
@@ -1357,12 +1373,19 @@ if [[ "\${1:-}" != "api" ]]; then exit 0; fi
 endpoint=""
 method="GET"
 body_json=""
+jqf=""
 shift
 while (( \$# > 0 )); do
     case "\$1" in
         --input)  body_json=\$(cat); shift 2 ;;
         -X)       method="\$2"; shift 2 ;;
-        -H|-f)    shift 2 ;;
+        # #1637: model gh's \`-f body=<text>\` and \`--jq <filter>\` too, so an
+        # in-place edit spelled \`api -X PATCH … -f body=… --jq .html_url\`
+        # (the natural way to reintroduce the defect) really edits the store.
+        -f)       case "\$2" in body=*) body_json=\$(jq -n --arg b "\${2#body=}" '{body:\$b}') ;; esac
+                  shift 2 ;;
+        --jq)     jqf="\$2"; shift 2 ;;
+        -H)       shift 2 ;;
         --)       shift; break ;;
         /*)       endpoint="\$1"; shift ;;
         *)        shift ;;
@@ -1381,22 +1404,26 @@ case "\$endpoint" in
         fi
         printf '{"id":99999,"content":"rocket"}' ;;
     */issues/comments/*)
+        if [[ "\${MOCK_COMMENT_MULTI:-0}" == "1" ]]; then
+            cid="\${endpoint##*/}"
+            f="$COMMENT_STORE.d/\$cid.json"
+            if [[ ! -f "\$f" ]]; then
+                echo '{"message":"Not Found"}' >&2; exit 1
+            fi
+            if [[ "\$method" == "PATCH" ]]; then
+                new_body=\$(jq -r '.body' <<<"\$body_json")
+                ts=\$(_bump)
+                jq --arg b "\$new_body" --arg t "\$ts" '.body=\$b | .updated_at=\$t' "\$f" > "\$f.tmp" \\
+                    && mv "\$f.tmp" "\$f"
+            fi
+            jq --arg u "https://mock.example/issuecomment-\$cid" '. + {html_url:\$u}' "\$f" \\
+                | jq -r "\${jqf:-.}"
+            exit 0
+        fi
         if [[ ! -f "$COMMENT_STORE" ]]; then
             echo '{"message":"Not Found"}' >&2; exit 1
         fi
         if [[ "\$method" == "PATCH" ]]; then
-            # your-org/nexus-code#940 — fail the PATCH that CARRIES a given
-            # string, so a test can target the IN-PLACE EDIT specifically. The
-            # edited arm issues two PATCHes: (1) the re-point, which rewrites
-            # only the asset link, and (2) the body edit, which carries the new
-            # content. Matching on CONTENT rather than on a PATCH ORDINAL is
-            # deliberate: an ordinal silently retargets the moment the re-point
-            # retries its CAS or an earlier step PATCHes — measured, the ordinal
-            # form let the edit succeed and the failure branch went undriven.
-            if [[ -n "\${MOCK_PATCH_FAIL_MATCH:-}" ]] \\
-               && [[ "\$body_json" == *"\${MOCK_PATCH_FAIL_MATCH}"* ]]; then
-                echo '{"message":"mock comment PATCH 422"}' >&2; exit 1
-            fi
             new_body=\$(jq -r '.body' <<<"\$body_json")
             ts=\$(_bump)
             jq --arg b "\$new_body" --arg t "\$ts" \\
@@ -1413,6 +1440,15 @@ case "\$endpoint" in
             echo '{"message":"mock comment POST 422"}' >&2; exit 1
         fi
         posted=\$(jq -r '.body' <<<"\$body_json")
+        if [[ "\${MOCK_COMMENT_MULTI:-0}" == "1" ]]; then
+            mkdir -p "$COMMENT_STORE.d"
+            n=\$(find "$COMMENT_STORE.d" -name '*.json' | wc -l)
+            cid=\$(( 1234 + n ))
+            jq -n --arg b "\$posted" --arg t "2026-07-15T12:00:00Z" \\
+                '{body:\$b, updated_at:\$t}' > "$COMMENT_STORE.d/\$cid.json"
+            printf '{"html_url":"https://mock.example/issuecomment-%s"}' "\$cid"
+            exit 0
+        fi
         jq -n --arg b "\$posted" --arg t "2026-07-15T12:00:00Z" \\
             '{body:\$b, updated_at:\$t}' > "$COMMENT_STORE"
         printf '{"html_url":"https://mock.example/issuecomment-1234"}' ;;
@@ -1423,10 +1459,17 @@ STUB
 chmod +x "$STUB_DIR/gh"
 
 comment_store_body() { jq -r '.body' "$COMMENT_STORE" 2>/dev/null; }
+# MOCK_COMMENT_MULTI=1 store (#1637): one comment's body by id; the raw JSON
+# file's bytes for a byte-for-byte "left untouched" check; and the count.
+comment_body_id()  { jq -r '.body' "$COMMENT_STORE.d/$1.json" 2>/dev/null; }
+comment_raw_id()   { cat "$COMMENT_STORE.d/$1.json" 2>/dev/null; }
+comment_count()    { find "$COMMENT_STORE.d" -name '*.json' 2>/dev/null | wc -l | tr -d ' '; }
+# Every PATCH to ANY issue comment the run issued. #1637: wrap-up issues none.
+patch_calls()      { grep -cE -- '-X PATCH [^ ]*/issues/comments/[0-9]+' "$GH_CAPTURE" || true; }
 
 # ---- Test 31: post-once idempotency — a clean re-run does not duplicate
-#      the link comment (B15 / your-nexus#236) and, post-#524, re-points
-#      it at the fresh upload instead of silently REUSING the stale link.
+#      the link comment (B15 / your-nexus#236), and (#1637) does not touch
+#      it either: no re-point, no PATCH of any kind.
 #      State (the action-log) persists across run_ng; only reset_mocks
 #      wipes it, so the two runs below share the log the guard reads. ----
 echo '=== post-once: re-running wrap-up updates the prior comment, no duplicate POST ==='
@@ -1439,15 +1482,16 @@ gh_calls=$(<"$GH_CAPTURE")
 assert_contains "first run POSTs to the comments endpoint" "$gh_calls" \
                 "/repos/override-org/override-repo/issues/42/comments"
 # Second wrap-up for the SAME issue+report+repo. Must NOT re-POST.
-# (Same MOCK_UPLOAD_SHA → the link already points at this blob → the
-# re-point is a no-op UPDATE, still reported as such.)
+# (Same MOCK_UPLOAD_SHA → the link did not move → nothing to publish.)
 run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
 assert_eq       "re-run exits 0"                      "$rc" "0"
-assert_contains "re-run re-points (not blind-reuses) the prior comment" "$stdout" \
-                "posted comment: unchanged https://mock.example/issuecomment-1234"
+assert_contains "re-run reports the prior comment as unchanged (#1637 wording)" "$stdout" \
+                "posted comment: unchanged https://mock.example/issuecomment-1234 (identical to the earlier wrap-up comment; nothing to publish)"
+assert_not_contains "#1637 the 'link re-pointed' wording is gone" "$stdout" "re-pointed"
 gh_calls=$(<"$GH_CAPTURE")
 assert_not_contains "re-run does NOT POST a duplicate comment" "$gh_calls" \
                     "/repos/override-org/override-repo/issues/42/comments"
+assert_eq "#1637 re-run issues NO PATCH to any comment" "$(patch_calls)" "0"
 
 # ---- Test 32: the other-nexus scenario — a partial failure (rocket) makes the
 #      worker re-run the WHOLE verb (the only retry surface); the comment
@@ -1467,9 +1511,8 @@ assert_contains "first run POSTs the comment"         "$gh_calls" \
                 "/issues/42/comments"
 unset MOCK_ROCKET_FAIL
 # Worker retries the whole verb. Rocket now succeeds. The re-uploaded
-# blob keeps the same mock SHA, so the link comment needs no PATCH —
-# but the retry must still go through the post-once UPDATE path, not
-# a blind reuse.
+# blob keeps the same mock SHA and the body is identical, so the retry
+# posts nothing and (#1637) edits nothing.
 run_ng stdout stderr rc wrap-up 42 "$REPORT" \
     --trigger-comment 7777 --repo override-org/override-repo
 assert_eq       "retry exits 0"                       "$rc" "0"
@@ -1482,6 +1525,7 @@ assert_not_contains "retry does NOT duplicate the comment" "$gh_calls" \
                     "/issues/42/comments"
 assert_contains "retry DID re-attempt the rocket"     "$gh_calls" \
                 "/issues/comments/7777/reactions"
+assert_eq "#1637 retry issues NO PATCH to any comment" "$(patch_calls)" "0"
 
 # ---- Test 33: the guard is scoped to (issue, report, repo) — a DIFFERENT
 #      report under the same issue still posts a fresh comment. Guards
@@ -1500,15 +1544,15 @@ gh_calls=$(<"$GH_CAPTURE")
 assert_contains "second report DID POST (not deduped)" "$gh_calls" \
                 "/issues/42/comments"
 
-# ---- Test 34 (LOAD-BEARING, #524 defect 2): a re-wrap after correcting
-#      the report re-uploads to a NEW blob; the post-once path must
-#      re-point the existing link comment's asset URL at that new blob.
-#      Pre-#524 behaviour: print "REUSED", never touch the comment —
-#      the thread keeps linking the PRE-correction report while the
-#      verb reports success (the #523 incident). RED on old code:
-#      the UPDATED line is absent and the stored comment still carries
-#      the stale SHA. -----------------------------------------------------
-echo '=== re-wrap after correction → link comment PATCHed to the NEW blob ==='
+# ---- Test 34 (LOAD-BEARING): a re-wrap after correcting the report OUTSIDE
+#      `## Summary` re-uploads to a NEW blob while the composed body is
+#      byte-identical. #524 answered by RE-POINTING the existing comment's
+#      link at the new blob; your-org/nexus-code#1637 retired that: the
+#      earlier comment's SHA-pinned link already cites the report as it was
+#      when the comment was posted, and re-pointing rewrote what it cited.
+#      Contract now: NOTHING PUBLISHED, exit 3 (#862), the earlier comment
+#      byte-identical, and no PATCH. ------------------------------------------
+echo '=== re-wrap after an out-of-Summary correction → nothing published, earlier comment untouched ==='
 reset_mocks
 export MOCK_UPLOAD_SHA="aaaa1111beforefix"
 run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
@@ -1563,14 +1607,17 @@ assert_contains "stderr DISCLOSES the false-alarm mode"              "$stderr" \
                 "FALSE ALARM MODE"
 assert_contains "stderr names the concurrent-upload cause of a false alarm" "$stderr" \
                 "concurrent upload from another"
+# #1637: the remedy no longer promises an in-place edit.
+assert_contains "#1637 stderr's remedy says a re-run posts a NEW comment" "$stderr" \
+                "that posts a NEW comment and leaves the earlier one"
+assert_not_contains "#1637 stderr no longer promises an in-place edit" "$stderr" "comment in place"
 store_body=$(comment_store_body)
-assert_contains "link comment NOW points at the corrected blob" "$store_body" \
-                "https://github.com/asset-org/assets/raw/bbbb2222corrected/assets/42/$(basename "$REPORT")"
-assert_not_contains "STALE blob URL is gone from the link comment" "$store_body" \
-                    "aaaa1111beforefix"
+assert_contains "#1637 the earlier comment STILL cites the v1 blob it was posted about" "$store_body" \
+                "https://github.com/asset-org/assets/raw/aaaa1111beforefix/assets/42/$(basename "$REPORT")"
+assert_not_contains "#1637 …and was NOT re-pointed to the new blob" "$store_body" \
+                    "bbbb2222corrected"
 gh_calls=$(<"$GH_CAPTURE")
-assert_contains "re-point went through PATCH on the comment" "$gh_calls" \
-                "-X PATCH /repos/override-org/override-repo/issues/comments/1234"
+assert_eq "#1637 NO PATCH to any comment" "$(patch_calls)" "0"
 assert_not_contains "no duplicate link comment POSTed"  "$gh_calls" \
                     "/issues/42/comments"
 # The action log records the outcome so a THIRD wrap-up keys off it.
@@ -1587,90 +1634,114 @@ assert_contains "log records comment=nothing-published on the re-wrap" "$log_lin
 assert_not_contains "log does NOT record the re-wrap as a plain update" "$log_lines" \
                 '"comment":"updated"'
 
-# ---- Test 35: re-point under sustained concurrent edits → the CAS
-#      refuses and the wrap-up FAILS LOUDLY instead of clobbering
-#      (defect 1's fail-loud contract, exercised through the defect-2
-#      path that now depends on it). --------------------------------------
-echo '=== re-wrap while the comment keeps moving → loud failure, no clobber ==='
+# ---- Test 35 (was: re-point under sustained concurrent edits → CAS failure).
+#      #1637 removed every write to a prior comment, so there is no CAS left
+#      to exercise. What remains worth pinning is the property the CAS was
+#      protecting: a comment someone else is editing is never clobbered.
+#      Now that holds by construction — wrap-up only READS it. ------------
+echo '=== re-wrap while the earlier comment keeps moving → it is only read, never written ==='
 reset_mocks
 export MOCK_UPLOAD_SHA="cccc3333firstpass"
 run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
 assert_eq       "first wrap-up exits 0"                "$rc" "0"
+before_raw=$(<"$COMMENT_STORE")
 export MOCK_UPLOAD_SHA="dddd4444secondpass"
 export MOCK_COMMENT_MOVING=1
 run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
 unset MOCK_COMMENT_MOVING MOCK_UPLOAD_SHA
-assert_eq       "re-wrap exits 1 when the comment keeps moving" "$rc" "1"
-assert_contains "stdout reports the comment step FAILED" "$stdout" \
-                "posted comment: FAILED"
-assert_contains "stderr names the re-point failure"     "$stderr" \
+assert_eq       "#1637 re-wrap exits 3 (link moved, body identical — #862), not a CAS failure" "$rc" "3"
+assert_not_contains "#1637 no 're-point' failure is reported" "$stderr" \
                 "re-point of prior link comment"
 store_body=$(comment_store_body)
 assert_contains "contended comment NOT clobbered (v1 link intact)" "$store_body" \
                 "cccc3333firstpass"
-gh_calls=$(<"$GH_CAPTURE")
-assert_not_contains "no PATCH landed on the moving comment" "$gh_calls" \
-                    "-X PATCH /repos/override-org/override-repo/issues/comments/1234"
+assert_eq "#1637 the moving comment's BODY is byte-identical" \
+          "$(jq -r .body <<<"$before_raw")" "$store_body"
+assert_eq "#1637 no PATCH landed on the moving comment" "$(patch_calls)" "0"
 
-# ---- your-org/nexus-code#940: the `comment_st=edited` arm --------------------
+# ---- your-org/nexus-code#1637: a later wrap-up NEVER edits an earlier one ----
 #
-# #656 added an in-place EDIT for the case where the COMPOSED body itself
-# changed (not just the asset link, which Test 34 covers and which normalises
-# away). `grep -n 'EDITED|comment_st=edited|composed body changed'` over this
-# file returned EMPTY, so the arm was asserted nowhere — and the #656/#873
-# "they compose to cover the whole case" claim rested on it.
+# History: #656/#940 made a CHANGED composed body EDIT the earlier comment in
+# place (`comment=edited`), and #605 made a changed --comment-body-file
+# re-point the earlier comment's link AND post a new one
+# (`updated-and-posted`). Both mutated a historical record: observed, a
+# skeptic's first-pass CHECK verdict was rewritten to CREDIBLE on re-check,
+# erasing the CHECK from the thread. Contract now: different content → a NEW
+# comment carrying `Supersedes the earlier wrap-up comment: <url>`
+# (`comment=posted-new`); the earlier comment byte-identical; zero PATCH.
 #
-# THESE ASSERT WHAT THE ARM DOES, NOT THAT IT EXISTS. A test that greps `ng`
-# for the string `comment_st=edited` would be a PRESENCE test — the same defect
-# #885 names on this same PR — and would pass against an arm that PATCHes
-# nothing. So: the stored comment must actually CARRY the new content, the
-# discriminator must show the arm staying shut when the body is unchanged, and
-# the failure direction must be loud.
-echo '=== re-wrap whose COMPOSED BODY changed → comment EDITED in place (#940) ==='
-reset_mocks
+# These run on the MULTI-comment store (MOCK_COMMENT_MULTI=1): the default
+# store holds ONE comment and a second POST overwrites it, so "both bodies
+# remain" would be unobservable there.
+#
 # THE DRIVER IS AN EDIT TO THE REPORT, NOT A DIFFERENT REPORT. The prior-comment
-# lookup keys on the report BASENAME (`_wrapup_prior_comment_url "$issue"
-# "$basename" "$target"`), so a different filename finds no prior comment and
-# takes the fresh-POST path — measured: the first draft of this test did exactly
-# that, published the content by POST, and would have been read as the edit arm
-# working. The composed body is `## <title>\n\n<summary>\n\nFull report: <url>`
-# drawn from the report itself, so CORRECTING THE REPORT is what changes it —
-# which is also the real-world case #656 was filed for.
+# lookup keys on the report BASENAME, so a different filename finds no prior
+# comment and takes the plain fresh-POST path. Only the Summary's FIRST
+# sentence reaches the composed body (`_wrapup_report_summary`), so that is the
+# sentence the edits below change.
+echo '=== #1637 REGRESSION: CHECK then CREDIBLE on one issue → both comments survive, zero PATCH ==='
+reset_mocks
+write_report "$REPORT"
+export MOCK_COMMENT_MULTI=1
+perl -0pi -e 's/Implemented ng wrap-up so workers can hand off in one verb\./Verdict: CHECK, two findings need a fix before merge./' "$REPORT"
+grep -q 'Verdict: CHECK' "$REPORT" || { echo "FAIL: could not stage the CHECK verdict" >&2; exit 1; }
+export MOCK_UPLOAD_SHA="1637aaaacheckpass"
 run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
-assert_eq "first wrap-up exits 0" "$rc" "0"
-# PRECONDITION, checked: `_wrapup_report_summary` joins the section, truncates
-# to 200 chars and cuts at the first SAFE sentence boundary, so only the FIRST
-# sentence reaches the comment. (This comment used to say "the LAST sentence
-# boundary", which was never what the code did — the very doc-vs-rule gap
-# your-org/nexus-code#1114 is about. Corrected with that fix.) Correcting any later sentence changes the report
-# and NOT the composed body — measured; the first draft did that and the edit
-# arm never fired.
-assert_contains "the comment carries the ORIGINAL first sentence" "$(comment_store_body)" \
-                "Implemented ng wrap-up so workers can hand off in one verb."
-# The worker materially corrects the report, same path, same basename.
-perl -0pi -e 's/Implemented ng wrap-up so workers can hand off in one verb\./CORRECTED: the earlier summary overstated the scope./' "$REPORT"
-grep -q 'CORRECTED: the earlier summary' "$REPORT" \
-    || { echo "FAIL: could not stage the report correction" >&2; exit 1; }
-: > "$GH_CAPTURE"
+assert_eq "#1637 first (CHECK) wrap-up exits 0" "$rc" "0"
+assert_contains "#1637 first wrap-up posted comment 1234" "$stdout" \
+                "posted comment: https://mock.example/issuecomment-1234"
+first_raw=$(comment_raw_id 1234)
+assert_contains "#1637 comment 1234 carries the CHECK verdict" "$(comment_body_id 1234)" "Verdict: CHECK"
+# The skeptic re-checks: the report is corrected and re-wrapped, same path.
+perl -0pi -e 's/Verdict: CHECK, two findings need a fix before merge\./Verdict: CREDIBLE, both findings are fixed./' "$REPORT"
+grep -q 'Verdict: CREDIBLE' "$REPORT" || { echo "FAIL: could not stage the CREDIBLE verdict" >&2; exit 1; }
+export MOCK_UPLOAD_SHA="1637bbbbcrediblepass"
 run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
-assert_eq "re-wrap after correcting the report exits 0" "$rc" "0"
-store_body=$(comment_store_body)
-assert_contains "#940 the comment now CARRIES the correction — it is published, not dropped" \
-                "$store_body" "CORRECTED: the earlier summary overstated the scope."
-assert_not_contains "#940 …and the superseded summary is gone from it" \
-                    "$store_body" "Implemented ng wrap-up so workers can hand off in one verb."
-gh_calls=$(<"$GH_CAPTURE")
-assert_contains "#940 the correction went through PATCH on the EXISTING comment" "$gh_calls" \
-                "-X PATCH /repos/override-org/override-repo/issues/comments/1234"
-assert_not_contains "#940 …and did NOT post a duplicate comment" "$gh_calls" \
-                    "/issues/42/comments"
-assert_contains "#940 the action log records comment=edited" "$(<"$STATE_DIR/action-log.jsonl")" \
-                '"comment":"edited"'
+assert_eq "#1637 second (CREDIBLE) wrap-up exits 0" "$rc" "0"
+assert_eq "#1637 second wrap-up issued ZERO PATCH" "$(patch_calls)" "0"
+assert_contains "#1637 second wrap-up POSTed a new comment" "$(<"$GH_CAPTURE")" \
+                "/repos/override-org/override-repo/issues/42/comments"
+assert_eq "#1637 BOTH comments exist in the store" "$(comment_count)" "2"
+assert_eq "#1637 the CHECK comment (1234) is BYTE-IDENTICAL after the second wrap-up" \
+          "$(comment_raw_id 1234)" "$first_raw"
+assert_contains "#1637 …it still says CHECK" "$(comment_body_id 1234)" "Verdict: CHECK"
+assert_not_contains "#1637 …and was not rewritten to CREDIBLE" "$(comment_body_id 1234)" "CREDIBLE"
+assert_contains "#1637 …and still cites the blob it was posted about" "$(comment_body_id 1234)" \
+                "1637aaaacheckpass"
+assert_contains "#1637 the NEW comment (1235) carries CREDIBLE" "$(comment_body_id 1235)" \
+                "Verdict: CREDIBLE"
+assert_contains "#1637 …cites the NEW blob" "$(comment_body_id 1235)" "1637bbbbcrediblepass"
+assert_contains "#1637 …and links the earlier comment on its own line" "$(comment_body_id 1235)" \
+                "Supersedes the earlier wrap-up comment: https://mock.example/issuecomment-1234"
+assert_contains "#1637 stdout names the NEW comment and the untouched earlier one" "$stdout" \
+                "posted comment: NEW https://mock.example/issuecomment-1235 (content differs from the earlier wrap-up comment https://mock.example/issuecomment-1234, which was left untouched)"
+assert_contains "#1637 stdout prints the published body" "$stdout" "Verdict: CREDIBLE"
+log_lines=$(<"$STATE_DIR/action-log.jsonl")
+assert_contains "#1637 the action log records comment=posted-new" "$log_lines" '"comment":"posted-new"'
+assert_contains "#1637 …with the NEW comment's url" "$log_lines" \
+                '"comment-url":"https://mock.example/issuecomment-1235"'
+assert_not_contains "#1637 no retired token is produced (edited)" "$log_lines" '"comment":"edited"'
+assert_not_contains "#1637 no retired token is produced (updated-and-posted)" "$log_lines" \
+                    '"comment":"updated-and-posted"'
 
-echo '=== DISCRIMINATOR: an unchanged composed body must NOT take the edit arm ==='
-# Without this, the assertions above pass just as well against an `ng` that
-# edits on EVERY re-wrap — making them a test of "a PATCH happened", not of
-# "the body changed, so it was republished".
+echo '=== #1637 DISCRIMINATOR: an IDENTICAL re-run after a posted-new posts NOTHING ==='
+# The new comment ends in a `Supersedes …` line the composed body does not
+# carry. Without normalising it away every re-run would compare unequal and
+# post again — a duplicate on every retry, the B15 symptom.
+second_raw=$(comment_raw_id 1235)
+run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
+unset MOCK_UPLOAD_SHA
+assert_eq "#1637 identical re-run exits 0" "$rc" "0"
+assert_contains "#1637 identical re-run reports unchanged against the LATEST comment" "$stdout" \
+                "posted comment: unchanged https://mock.example/issuecomment-1235"
+assert_not_contains "#1637 identical re-run POSTs nothing" "$(<"$GH_CAPTURE")" \
+                    "/issues/42/comments"
+assert_eq "#1637 identical re-run PATCHes nothing" "$(patch_calls)" "0"
+assert_eq "#1637 still exactly two comments" "$(comment_count)" "2"
+assert_eq "#1637 both comments byte-identical after the identical re-run" \
+          "$(comment_raw_id 1234)$(comment_raw_id 1235)" "$first_raw$second_raw"
+
+echo '=== DISCRIMINATOR: an unchanged composed body with a MOVED link posts nothing and edits nothing ==='
 reset_mocks
 write_report "$REPORT"
 export MOCK_UPLOAD_SHA="eeee5555firstpass"
@@ -1678,53 +1749,39 @@ run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
 export MOCK_UPLOAD_SHA="ffff6666secondpass"
 run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
 unset MOCK_UPLOAD_SHA
-# RE-SPELLED AT THE B1 BUNDLE SEAM, not weakened. This block's SUBJECT — stated
-# in its own heading above — is that an unchanged composed body must not take
-# the EDIT arm, and the `assert_not_contains "edited"` below is what carries it.
-# It is untouched and still passes.
-#
-# What changed underneath it is the NAME and EXIT CODE of the state this
-# scenario lands in. your-org/nexus-code#862 (in #873) split the old `updated`
-# in two, and this fixture drives the new half by construction: it moves
-# MOCK_UPLOAD_SHA between the two runs, so the asset link moves while the
-# composed body stays byte-identical. #862 calls that `nothing-published` and
-# exits 3 ON PURPOSE — its argument is that the old exit-0 `updated` was
-# "truthful and useless", because the report moved, the thread did not, and
-# nobody was told. `updated`/rc 0 still exists; it is now the case where the
-# link did NOT move.
-#
-# So #940's expectation here was incidental to its purpose and #862 is the
-# later, deliberate treatment of the same state. Asserting the state by name
-# rather than just the rc, since `3` alone would also match an unrelated
-# failure path.
+# The asset link moved while the composed body stayed byte-identical: that is
+# #862's `nothing-published`, exit 3 — and since #1637 the earlier comment is
+# NOT re-pointed on the way.
 assert_eq "same-report re-wrap exits 3 (#862: the asset link moved, the thread did not)" "$rc" "3"
-assert_contains "#940 DISCRIMINATOR: an asset-link-only change logs comment=nothing-published (#862)" \
+assert_contains "DISCRIMINATOR: an asset-link-only change logs comment=nothing-published (#862)" \
                 "$(<"$STATE_DIR/action-log.jsonl")" '"comment":"nothing-published"'
-assert_not_contains "#940 DISCRIMINATOR: …and NOT comment=edited" \
-                    "$(<"$STATE_DIR/action-log.jsonl")" '"comment":"edited"'
+assert_not_contains "#1637 DISCRIMINATOR: …and NOT comment=posted-new" \
+                    "$(<"$STATE_DIR/action-log.jsonl")" '"comment":"posted-new"'
+assert_eq "#1637 DISCRIMINATOR: no PATCH" "$(patch_calls)" "0"
+assert_contains "#1637 DISCRIMINATOR: the earlier comment still cites its own blob" \
+                "$(comment_store_body)" "eeee5555firstpass"
 
-echo '=== the in-place edit FAILS → loud, non-zero, and no false success (#940) ==='
-# The arm's own comment says failure here is loud "because reporting success for
-# a correction that did not publish is the defect being fixed". That sentence
-# was unasserted. `MOCK_PATCH_FAIL_MATCH` fails the PATCH carrying the new content, while the
-# re-point (PATCH 1) succeed — the exact state the branch exists for.
+echo '=== #1637: the NEW comment POST fails → loud, non-zero, earlier comment untouched ==='
 reset_mocks
 write_report "$REPORT"
+export MOCK_COMMENT_MULTI=1
 run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
 assert_eq "first wrap-up exits 0" "$rc" "0"
+first_raw=$(comment_raw_id 1234)
 perl -0pi -e 's/Implemented ng wrap-up so workers can hand off in one verb\./CORRECTED: this correction must not be reported as published./' "$REPORT"
 grep -q 'must not be reported as published' "$REPORT" \
-    || { echo "FAIL: could not stage the second correction" >&2; exit 1; }
-export MOCK_PATCH_FAIL_MATCH="must not be reported as published"
+    || { echo "FAIL: could not stage the correction" >&2; exit 1; }
+export MOCK_COMMENT_FAIL=1
 run_ng stdout stderr rc wrap-up 42 "$REPORT" --repo override-org/override-repo
-unset MOCK_PATCH_FAIL_MATCH
-assert_eq "#940 a failed in-place edit exits NON-ZERO" "$rc" "1"
-assert_contains "#940 …and says the correction is NOT published" "$stderr$stdout" \
-                "composed body changed but the in-place edit FAILED"
-assert_not_contains "#940 …and does not claim the comment was edited" \
-                    "$(<"$STATE_DIR/action-log.jsonl")" '"comment":"edited"'
-assert_not_contains "#940 …and the unpublished correction is NOT in the comment" \
-                    "$(comment_store_body)" "must not be reported as published"
+unset MOCK_COMMENT_FAIL
+assert_eq "#1637 a failed POST of the new content exits NON-ZERO" "$rc" "1"
+assert_contains "#1637 …and says the new content is NOT published" "$stderr$stdout" \
+                "POST of the NEW comment failed — the new content is NOT published"
+assert_not_contains "#1637 …and does not log posted-new" \
+                    "$(<"$STATE_DIR/action-log.jsonl")" '"comment":"posted-new"'
+assert_eq "#1637 …the earlier comment is byte-identical" "$(comment_raw_id 1234)" "$first_raw"
+assert_eq "#1637 …and no PATCH was attempted as a fallback" "$(patch_calls)" "0"
+unset MOCK_COMMENT_MULTI
 # Leave the fixture as every later test expects to find it.
 write_report "$REPORT"
 
@@ -3033,6 +3090,8 @@ assert_eq       "NO request filed without a source window" "$(count_spawn_reqs)"
 #      orchestrator whether the PR is mergeable, and it is exactly the
 #      one post-once dropped: it found the earlier comment, re-pointed
 #      its asset link, exited 0, and printed a line reading `UPDATED`.
+#      (#1637 then removed the re-point itself: the earlier comment is a
+#      historical record and must survive the second verdict byte-for-byte.)
 #      The verdict was published nowhere. It only surfaced because that
 #      skeptic read the comment back; an agent trusting the exit code —
 #      the reasonable thing to do — would have reported publishing a
@@ -3040,47 +3099,72 @@ assert_eq       "NO request filed without a source window" "$(count_spawn_reqs)"
 #
 #      RED on old code: `store_body` still holds the FIRST body and the
 #      second is nowhere. -------------------------------------------------
-echo '=== #605: a DIFFERING --comment-body-file on a repeat wrap-up is published ==='
+echo '=== #605/#1637: a DIFFERING --comment-body-file is published as a NEW comment; the first stays byte-identical ==='
 reset_mocks
+export MOCK_COMMENT_MULTI=1
 BODY_A="$FAKE_NEXUS/body-a.md"
 BODY_B="$FAKE_NEXUS/body-b.md"
 printf 'VERDICT ROUND ONE: suspect — three findings, one merge-blocking.\n\nFull report: {{REPORT_URL}}\n' > "$BODY_A"
 printf 'VERDICT ROUND TWO: credible — fixes verified, mergeable as it stands.\n\nFull report: {{REPORT_URL}}\n' > "$BODY_B"
 
+export MOCK_UPLOAD_SHA="605aaaaroundone"
 run_ng stdout stderr rc wrap-up 42 "$REPORT" \
     --repo override-org/override-repo --comment-body-file "$BODY_A"
 assert_eq       "#605 first wrap-up exits 0"            "$rc" "0"
-assert_contains "#605 round-one verdict IS published"   "$(comment_store_body)" \
+assert_contains "#605 round-one verdict IS published"   "$(comment_body_id 1234)" \
                 "VERDICT ROUND ONE"
+first_raw=$(comment_raw_id 1234)
 
-# The second verdict. Different content, same issue + report.
+# The second verdict. Different content, same issue + report; the report was
+# re-uploaded, so the asset link moves too (the #1640 instance: the FIRST
+# comment's "Full report" link was silently re-pointed to the new report).
+export MOCK_UPLOAD_SHA="605bbbbroundtwo"
 run_ng stdout stderr rc wrap-up 42 "$REPORT" \
     --repo override-org/override-repo --comment-body-file "$BODY_B"
+unset MOCK_UPLOAD_SHA
 assert_eq       "#605 repeat wrap-up exits 0"           "$rc" "0"
 gh_calls=$(<"$GH_CAPTURE")
 assert_contains "#605 the SECOND verdict is POSTed, not dropped" "$gh_calls" \
                 "/repos/override-org/override-repo/issues/42/comments"
 assert_contains "#605 stdout says a NEW comment was posted, not 'UPDATED'" \
-                "$stdout" "posted comment: NEW"
+                "$stdout" "posted comment: NEW https://mock.example/issuecomment-1235"
 assert_not_contains "#605 stdout does NOT claim UPDATED for a run that published new content" \
                 "$stdout" "posted comment: UPDATED"
+assert_eq "#1637 the repeat wrap-up issued ZERO PATCH" "$(patch_calls)" "0"
+assert_eq "#1637 the FIRST verdict comment is byte-identical (body AND link)" \
+          "$(comment_raw_id 1234)" "$first_raw"
+assert_contains "#1637 …its Full report link still cites round one's blob" \
+                "$(comment_body_id 1234)" "Full report: https://github.com/asset-org/assets/raw/605aaaaroundone/"
+assert_not_contains "#1637 …and was NOT re-pointed to round two's" \
+                "$(comment_body_id 1234)" "605bbbbroundtwo"
+assert_contains "#1637 the NEW comment carries round two and its own blob" \
+                "$(comment_body_id 1235)" "VERDICT ROUND TWO"
+assert_contains "#1637 …links round two's blob" "$(comment_body_id 1235)" "605bbbbroundtwo"
+assert_contains "#1637 …and supersedes the first by url" "$(comment_body_id 1235)" \
+                "Supersedes the earlier wrap-up comment: https://mock.example/issuecomment-1234"
+assert_contains "#1637 the action log records comment=posted-new" \
+                "$(<"$STATE_DIR/action-log.jsonl")" '"comment":"posted-new"'
 
 # NEGATIVE CONTROL — the post-once guarantee must SURVIVE. An identical
-# body on a re-run is a genuine idempotent retry and must still take the
-# re-point path, or this fix would trade a dropped verdict for a
-# duplicate-comment flood on every wrap-up retry.
+# body on a re-run is a genuine idempotent retry and must post NOTHING,
+# or this fix would trade a dropped verdict for a duplicate-comment flood
+# on every wrap-up retry.
 reset_mocks
+export MOCK_COMMENT_MULTI=1
 run_ng stdout stderr rc wrap-up 42 "$REPORT" \
     --repo override-org/override-repo --comment-body-file "$BODY_A"
 assert_eq       "#605 CONTROL: first run exits 0"       "$rc" "0"
 run_ng stdout stderr rc wrap-up 42 "$REPORT" \
     --repo override-org/override-repo --comment-body-file "$BODY_A"
 assert_eq       "#605 CONTROL: identical-body re-run exits 0" "$rc" "0"
-assert_contains "#605 CONTROL: an IDENTICAL body still takes the re-point path" \
-                "$stdout" "posted comment: unchanged"
+assert_contains "#605 CONTROL: an IDENTICAL body posts nothing (unchanged)" \
+                "$stdout" "posted comment: unchanged https://mock.example/issuecomment-1234"
 gh_calls=$(<"$GH_CAPTURE")
 assert_not_contains "#605 CONTROL: no duplicate comment POSTed on a true retry" \
                 "$gh_calls" "/repos/override-org/override-repo/issues/42/comments"
+assert_eq "#605 CONTROL: no PATCH on a true retry" "$(patch_calls)" "0"
+assert_eq "#605 CONTROL: still one comment" "$(comment_count)" "1"
+unset MOCK_COMMENT_MULTI
 
 # ===========================================================================
 # your-org/nexus-code#984 — a re-publication of an ALREADY-VALIDATED report
@@ -4796,6 +4880,278 @@ assert_eq       "#1608 success exits 0" "$rc" "0"
 assert_contains "#1608 the published body is shown" "$stdout" "--- published comment body ---"
 assert_contains "#1608 …and it is the composed teaser" "$stdout" \
                 "  | Implemented ng wrap-up so workers can hand off in one verb."
+
+# ── your-org/nexus-code#1700: a DEFAULTED repo must not silently skip a REQUIRED review ──
+#
+# Three project workers ran `ng wrap-up 90001 <report> --skeptic-decision
+# require` without `--repo`. The repo resolved to the nexus's `github.repo`
+# (`_resolve_repo write` never takes a cwd origin as a write default — a
+# foreign one is refused, #108), the #1491 pre-flight confirmed the issue
+# exists there, the report uploaded and the link comment LANDED on that thread
+# — and then the #1346 arm refused to file the spawn-skeptic request because
+# the repo was "only" the default. The wrap-up exited 0. Every visible artefact
+# said the hand-off happened; the review the spawn mode REQUIRED was filed by
+# nobody, and only the workers noticing a stderr line rescued it.
+#
+# The cases below pin both halves: a defaulted repo that resolves FILES (from
+# the nexus root, and from a nested project repo whose origin IS github.repo),
+# and a repo that cannot be resolved fails the WHOLE wrap-up, non-zero, before
+# anything is posted. A filing that does not happen is never rc 0.
+#
+# THIS SECTION INSTALLS ITS OWN `gh` STUB. The #1491 section above documents
+# why: a section that leans on a stub installed elsewhere tests whatever the
+# preceding section left behind. `gh issue view` (the filing step's
+# best-effort ref probe) is modelled too, so no case here can reach GitHub.
+cat > "$STUB_DIR/gh" <<STUB
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$GH_CAPTURE"
+if [[ "\${1:-}" == "issue" && "\${2:-}" == "view" ]]; then
+    if [[ " \${MOCK_ISSUE_404:-} " == *" \${3:-} "* ]]; then
+        echo 'GraphQL: Could not resolve to an issue or pull request with the number of '"\${3:-}" >&2
+        exit 1
+    fi
+    printf '{"number":%s}' "\${3:-0}"
+    exit 0
+fi
+if [[ "\${1:-}" != "api" ]]; then exit 0; fi
+endpoint=""
+shift
+while (( \$# > 0 )); do
+    case "\$1" in
+        --input)  cat >/dev/null; shift 2 ;;
+        -X|-H|-f) shift 2 ;;
+        --)       shift; break ;;
+        /*)       endpoint="\$1"; shift ;;
+        *)        shift ;;
+    esac
+done
+case "\$endpoint" in
+    */issues/*/comments)           printf '{"html_url":"https://mock.example/cmt-1700"}' ;;
+    */issues/comments/*/reactions) printf '{"id":111,"content":"rocket"}' ;;
+    */issues/[0-9]*)
+        if [[ "\$endpoint" =~ ^/repos/[^/]+/[^/]+/issues/[0-9]+\$ ]]; then
+            _pn="\${endpoint##*/}"
+            if [[ " \${MOCK_ISSUE_404:-} " == *" \$_pn "* ]]; then
+                echo 'gh: Not Found (HTTP 404)' >&2
+                exit 1
+            fi
+            printf '%s' "\$_pn"
+        else
+            printf '{}'
+        fi
+        ;;
+    *)                             printf '{}' ;;
+esac
+exit 0
+STUB
+chmod +x "$STUB_DIR/gh"
+_p1700() { "$STUB_DIR/gh" "$@" >/dev/null 2>&1; printf '%s' "$?"; }
+assert_eq "#1700 STUB PRECONDITION: \`gh issue view\` answers not-found for a 404'd number" \
+    "$(MOCK_ISSUE_404=4999 _p1700 issue view 4999 --repo o/r --json number)" "1"
+assert_eq "#1700 STUB PRECONDITION: …and 0 for one it is not told to 404" \
+    "$(MOCK_ISSUE_404=4999 _p1700 issue view 90001 --repo o/r --json number)" "0"
+
+# Fixture: a NESTED project repo under the fake nexus's work/, whose origin is
+# the nexus's own github.repo — the nested-project shape (`work/proj-v2`, its
+# remote a your-nexus branch). And a second one with a FOREIGN origin.
+_d1700_here=$PWD
+_d1700_nested="$FAKE_NEXUS/work/proj-nested"
+_d1700_foreign="$FAKE_NEXUS/work/proj-foreign"
+for _d in "$_d1700_nested" "$_d1700_foreign"; do
+    mkdir -p "$_d"
+    git -C "$_d" init -q 2>/dev/null
+done
+git -C "$_d1700_nested"  remote add origin https://github.com/default-org/default-repo.git
+git -C "$_d1700_foreign" remote add origin https://github.com/other-org/other-repo.git
+# FIXTURE PRECONDITION (#1429): each fixture must be its OWN repository root,
+# or every git question below is answered about an enclosing repo.
+for _d in "$_d1700_nested" "$_d1700_foreign"; do
+    [[ -n "$_d" && "$(git -C "$_d" rev-parse --show-toplevel 2>/dev/null)" -ef "$_d" ]] \
+        || { printf 'REFUSED: #1700 fixture %s is not its own repository root\n' "$_d" >&2; exit 97; }
+done
+_c1700_posted() {   # 1 iff the run POSTed a link comment
+    grep -qF -- "/comments" "$GH_CAPTURE" && printf 1 || printf 0
+}
+
+echo '=== #1700: defaulted repo, cwd = NESTED repo whose origin is github.repo → request FILED ==='
+reset_mocks
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="w1700-nested"
+cd "$_d1700_nested" || exit 97
+run_ng stdout stderr rc wrap-up 90001 "$REPORT" \
+    --skeptic-decision require --skeptic-rationale "touched shared infra"
+cd "$_d1700_here" || exit 97
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+assert_eq       "#1700 nested cwd: wrap-up exits 0"                 "$rc" "0"
+assert_eq       "#1700 nested cwd: …the link comment was posted"    "$(_c1700_posted)" "1"
+assert_contains "#1700 nested cwd: …AND the spawn-skeptic request is FILED" "$stdout" \
+                "spawn-skeptic request: filed "
+assert_eq       "#1700 nested cwd: …exactly one request"            "$(count_spawn_reqs)" "1"
+assert_not_contains "#1700 nested cwd: …and no defaulted-repo refusal" "$stderr" \
+                "REFUSING to file the spawn-skeptic request"
+_b1700=$(spawn_req_body)
+assert_contains "#1700 the pointer names the nexus's github.repo"   "$_b1700" \
+                "issue: default-org/default-repo#90001"
+assert_contains "#1700 …and says the repo was DEFAULTED, corroborated by the comment" "$_b1700" \
+                "issue-repo-source: defaulted (github.repo); the link comment landed on default-org/default-repo#90001 in this run"
+
+echo '=== #1700: defaulted repo, cwd = the nexus ROOT (the measured shape) → request FILED ==='
+reset_mocks
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="w1700-root"
+cd "$FAKE_NEXUS" || exit 97
+run_ng stdout stderr rc wrap-up 90001 "$REPORT" \
+    --skeptic-decision require --skeptic-rationale "touched shared infra"
+cd "$_d1700_here" || exit 97
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+assert_eq       "#1700 root cwd: wrap-up exits 0"                   "$rc" "0"
+assert_contains "#1700 root cwd: …and the request is FILED"         "$stdout" \
+                "spawn-skeptic request: filed "
+assert_eq       "#1700 root cwd: …exactly one request"              "$(count_spawn_reqs)" "1"
+
+echo '=== #1700/#1709 NEG: --no-comment + issue ABSENT → refused BEFORE ANY WRITE, NON-ZERO ==='
+# #1700 caught this case only at the filing step, AFTER the marker arm, the
+# upload and the trigger rocket (rc 1, but three writes already made). #1709
+# moves the #1491 issue pre-flight in front of --no-comment too, so the refusal
+# precedes every write. --trigger-comment is passed so a rocket WOULD be
+# attempted if any write path were reached; the assertions below cover each
+# write channel this fixture can observe: the upload stub, every non-GET `gh`
+# call, the skeptic pending dir, and the request inbox.
+_c1709_writes() {   # non-GET gh calls (POST/PATCH/DELETE or a reactions endpoint)
+    grep -cE -- '-X (POST|PATCH|PUT|DELETE)|/reactions' "$GH_CAPTURE" || true
+}
+_c1709_pending() {  # files under the skeptic pending dir
+    bash -c 'shopt -s nullglob dotglob; a=("$1"/*); echo "${#a[@]}"' _ "$STATE_DIR/skeptic/pending"
+}
+# #1717: the probe keys on the RESOLVED target being github.repo, not on
+# `--repo` being omitted — so the same refusal holds when the caller NAMES
+# github.repo, in any letter case (GitHub resolves owner/name that way).
+# Red on 0f79440f for both explicit arms: they filed at rc 0.
+for _c1709 in defaulted explicit-home explicit-home-case; do
+    reset_mocks
+    export MOCK_TMUX=1 MOCK_TMUX_WINDOW="w1709-$_c1709" MOCK_ISSUE_404="4999"
+    case "$_c1709" in
+        explicit-home)      _c1709_repo=(--repo default-org/default-repo); _c1709_t=default-org/default-repo ;;
+        explicit-home-case) _c1709_repo=(--repo Default-Org/Default-Repo); _c1709_t=Default-Org/Default-Repo ;;
+        *)                  _c1709_repo=();                                _c1709_t=default-org/default-repo ;;
+    esac
+    cd "$FAKE_NEXUS" || exit 97
+    run_ng stdout stderr rc wrap-up 4999 "$REPORT" --no-comment "${_c1709_repo[@]}" \
+        --trigger-comment 777 \
+        --skeptic-decision require --skeptic-rationale "touched shared infra"
+    cd "$_d1700_here" || exit 97
+    unset MOCK_TMUX MOCK_TMUX_WINDOW MOCK_ISSUE_404
+    assert_eq       "#1709 NEG absent ($_c1709 repo): exits NON-ZERO (1)"           "$rc" "1"
+    assert_contains "#1709 NEG absent ($_c1709 repo): …refused by the issue pre-flight" "$stderr" \
+                    "REFUSED — issue #4999 does not exist on \`$_c1709_t\`"
+    assert_contains "#1709 NEG absent ($_c1709 repo): …worded for --no-comment" "$stderr" \
+                    "wrap-up would hand off (--no-comment: you reply there yourself)"
+    # POSITIVE CONTROL on the instrument: the probe itself must be in the
+    # capture, or an empty capture would pass every "no write" line below.
+    assert_contains "#1709 NEG absent ($_c1709 repo): …the probe GET is in the capture (instrument live)" \
+                    "$(<"$GH_CAPTURE")" "/repos/$_c1709_t/issues/4999"
+    assert_eq       "#1709 NEG absent ($_c1709 repo): …NOTHING uploaded"            "$(<"$UPLOAD_CAPTURE")" ""
+    assert_eq       "#1709 NEG absent ($_c1709 repo): …NO gh write (comment/rocket/PATCH)" "$(_c1709_writes)" "0"
+    assert_eq       "#1709 NEG absent ($_c1709 repo): …NO skeptic marker armed"     "$(_c1709_pending)" "0"
+    assert_eq       "#1709 NEG absent ($_c1709 repo): …no spawn-skeptic request"    "$(count_spawn_reqs)" "0"
+done
+# CONTROL — an EXPLICIT --repo under --no-comment is NOT probed and NOT refused.
+# The probe runs under the bot token, which 404s on any repo the installation
+# cannot see, so refusing here would block a legitimate hand-off to a repo the
+# bot is not installed on. The explicit repo stays the caller's assertion; the
+# filing step annotates the pointer with what the operator's `gh` sees.
+reset_mocks
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="w1709-explicit" MOCK_ISSUE_404="4999"
+cd "$FAKE_NEXUS" || exit 97
+run_ng stdout stderr rc wrap-up 4999 "$REPORT" --no-comment --repo other-org/uninstalled \
+    --skeptic-decision require --skeptic-rationale "touched shared infra"
+cd "$_d1700_here" || exit 97
+unset MOCK_TMUX MOCK_TMUX_WINDOW MOCK_ISSUE_404
+assert_eq           "#1709 CONTROL explicit repo + --no-comment: NOT refused (rc 0)" "$rc" "0"
+assert_not_contains "#1709 CONTROL …the bot-token probe did not run" \
+                    "$(<"$GH_CAPTURE")" "/repos/other-org/uninstalled/issues/4999"
+assert_contains     "#1709 CONTROL …and the filed pointer says it does not resolve" \
+                    "$(spawn_req_body)" "issue-ref: DOES NOT RESOLVE"
+# CONTROL for the case above: the same run with the issue PRESENT files. Without
+# it, the NEG is satisfied by a step that refuses every --no-comment wrap-up.
+reset_mocks
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="w1700-present"
+cd "$FAKE_NEXUS" || exit 97
+run_ng stdout stderr rc wrap-up 4999 "$REPORT" --no-comment \
+    --skeptic-decision require --skeptic-rationale "touched shared infra"
+cd "$_d1700_here" || exit 97
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+assert_eq       "#1700 CONTROL present + --no-comment: exits 0"     "$rc" "0"
+assert_eq       "#1700 CONTROL present + --no-comment: …and files"  "$(count_spawn_reqs)" "1"
+assert_eq       "#1709 CONTROL …and the pending-dir instrument SEES the armed marker" \
+                "$(( $(_c1709_pending) > 0 ? 1 : 0 ))" "1"
+assert_contains "#1700 CONTROL …and records that the probe, not a comment, corroborated it" \
+                "$(spawn_req_body)" "issue-repo-source: defaulted (github.repo); confirmed to exist there at filing time"
+
+echo '=== #1700 NEG (b): NO github.repo and no --repo → non-zero BEFORE anything is posted ==='
+reset_mocks
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="w1700-unres" TEST_NO_DEFAULT_REPO=1
+cd "$FAKE_NEXUS" || exit 97
+run_ng stdout stderr rc wrap-up 90001 "$REPORT" \
+    --skeptic-decision require --skeptic-rationale "touched shared infra"
+cd "$_d1700_here" || exit 97
+unset MOCK_TMUX MOCK_TMUX_WINDOW TEST_NO_DEFAULT_REPO
+assert_eq       "#1700 NEG unresolvable: exits NON-ZERO"            "$(( rc != 0 ? 1 : 0 ))" "1"
+assert_eq       "#1700 NEG unresolvable: …NOTHING uploaded"         "$(<"$UPLOAD_CAPTURE")" ""
+assert_eq       "#1700 NEG unresolvable: …NO comment posted"        "$(_c1700_posted)" "0"
+assert_eq       "#1700 NEG unresolvable: …no request filed"         "$(count_spawn_reqs)" "0"
+assert_contains "#1700 NEG unresolvable: …and it names the missing repo" "$stderr" "no --repo"
+
+echo '=== #1700 NEG (a): a FOREIGN cwd origin is never the default → non-zero BEFORE posting ==='
+reset_mocks
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW="w1700-foreign"
+cd "$_d1700_foreign" || exit 97
+run_ng stdout stderr rc wrap-up 90001 "$REPORT" \
+    --skeptic-decision require --skeptic-rationale "touched shared infra"
+cd "$_d1700_here" || exit 97
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+assert_eq       "#1700 NEG foreign origin: exits NON-ZERO"          "$(( rc != 0 ? 1 : 0 ))" "1"
+assert_eq       "#1700 NEG foreign origin: …NOTHING uploaded"       "$(<"$UPLOAD_CAPTURE")" ""
+assert_eq       "#1700 NEG foreign origin: …NO comment posted"      "$(_c1700_posted)" "0"
+assert_not_contains "#1700 NEG foreign origin: …and it never targets the cwd origin" \
+                "$(<"$GH_CAPTURE")" "other-org/other-repo"
+
+echo '=== #1719: a REQUIRE whose pending marker cannot be written STOPS at exit 4 and never says "marker is set" ==='
+# The read-only-mount shape (your-nexus#386): the marker and ledger writes
+# failed with EROFS while the output said the gate was armed. A pending dir
+# the run cannot write stands in for the RO mount; chmod is undone below so the
+# rest of the suite (and reset_mocks' rm -rf) is unaffected.
+reset_mocks
+R1719="$FAKE_NEXUS/reports/nexus_2026-10-05_120000_n1719.md"
+write_report "$R1719"
+mkdir -p "$STATE_DIR/windows" "$STATE_DIR/skeptic/pending"
+cat > "$STATE_DIR/windows/n1719w.json" <<EOF
+{ "window": "n1719w", "kind": "task", "skeptic_mode": "require", "skeptic_depth": 0, "skeptic_role": false }
+EOF
+K1719=$(wk_encode n1719w)
+export MOCK_TMUX=1 MOCK_TMUX_WINDOW=n1719w
+: > "$UPLOAD_CAPTURE"; : > "$GH_CAPTURE"
+chmod 555 "$STATE_DIR/skeptic/pending"
+if [[ -w "$STATE_DIR/skeptic/pending" ]]; then
+    # Root (or an ACL) ignores the mode bits; the arm below would not exercise
+    # the failure, so say so instead of reading a pass into it.
+    echo "  FAIL: #1719 fixture: the pending dir is still writable after chmod 555 — cannot simulate EROFS here" >&2; FAIL=$((FAIL+1))
+fi
+run_ng stdout stderr rc wrap-up 42 "$R1719" --repo override-org/override-repo
+chmod 755 "$STATE_DIR/skeptic/pending"
+assert_eq           "#1719 unwritable marker → exit 4 (gate NOT armed), never 0" "$rc" "4"
+assert_contains     "#1719 …stderr says the gate could not be armed" "$stderr" "THE GATE COULD NOT BE ARMED"
+assert_contains     "#1719 …and names the marker path"           "$stderr" "skeptic/pending/$K1719"
+assert_not_contains "#1719 …stdout NEVER claims the marker is set" "$stdout" "A skeptic-pending marker is set"
+assert_no_file      "#1719 …and indeed no marker exists"         "$STATE_DIR/skeptic/pending/$K1719"
+assert_eq           "#1719 …NOTHING uploaded (stopped before Step 1)" "$(<"$UPLOAD_CAPTURE")" ""
+assert_not_contains "#1719 …NO comment posted"                    "$(<"$GH_CAPTURE")" "/issues/42/comments"
+# NEGATIVE CONTROL: the same wrap-up with the dir writable arms and says so.
+: > "$UPLOAD_CAPTURE"; : > "$GH_CAPTURE"
+run_ng stdout stderr rc wrap-up 42 "$R1719" --repo override-org/override-repo
+unset MOCK_TMUX MOCK_TMUX_WINDOW
+assert_eq           "#1719 CONTROL: writable → exit 0"            "$rc" "0"
+assert_file_exists  "#1719 CONTROL: …the marker IS armed"         "$STATE_DIR/skeptic/pending/$K1719"
+assert_contains     "#1719 CONTROL: …and the claim is made, truthfully" "$stdout" "A skeptic-pending marker is set"
+assert_not_contains "#1719 CONTROL: …with no arming warning"      "$stderr" "GATE COULD NOT BE ARMED"
 
 echo
 echo "=== summary: $PASS passed, $FAIL failed ==="

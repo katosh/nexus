@@ -146,10 +146,30 @@ MONITOR_FULL_STATE_SAFETY_FLOOR_SECONDS="${MONITOR_FULL_STATE_SAFETY_FLOOR_SECON
 # deliberate quiet-night behaviour the operator asked for). The ceiling is
 # intentionally NOT raised in lockstep: raising it would ARM the probe
 # longer, the opposite of the deep-idle stand-down this backoff wants.
+#
+# Default raised 7200 → 86400 (your-org/nexus-code#1736, operator
+# 2026-10-04: "we should not waste tokens at all if everything is calm").
+# With base 900 the rungs are 900, 1800, …, 57600, then the 86400 cap
+# once the board has been actionably unchanged for 32 h (115200 s). The
+# cap is exact (#659). Same CLAMP-SAFE argument as above: the clamp reads
+# the base floor, and past stale_paste_ceiling the dead-threshold probe
+# stands down (_orchestrator_liveness.sh, `paste-too-stale`). The trade,
+# stated: on a board calm for a day, a wedged orchestrator is noticed at
+# the next heartbeat, up to 24 h later, or at the next actionable event.
 MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED="${MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED:-$("$_cfg" monitor.full_state.idle_backoff_enabled true)}"
 case "$MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED" in true|false) ;; *) MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED=true ;; esac
-MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS="${MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS:-$("$_cfg" monitor.full_state.idle_backoff_max_seconds 7200)}"
-[[ "$MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=7200
+MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS="${MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS:-$("$_cfg" monitor.full_state.idle_backoff_max_seconds 86400)}"
+[[ "$MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS=86400
+# A pane-state READ FAILED row that persists this many CONSECUTIVE full-state
+# polls is ACTIONABLE (your-org/nexus-code#1738 F2): it emits at once and
+# snaps the backoff back, instead of waiting for a heartbeat up to 24 h away.
+# Below it, a READ FAILED row is churn and projects as `live`. CHOSEN 3: one
+# poll is MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS (600 s), so 3 is ~20-30 min
+# of an instrument failing on the same window every time it was asked, long
+# enough that a render-budget timeout under a load spike (one or two polls)
+# does not page anyone, short enough to be an operator's same-session problem.
+MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS="${MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS:-$("$_cfg" monitor.full_state.read_failed_persist_polls 3)}"
+[[ "$MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS" =~ ^[1-9][0-9]*$ ]] || MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS=3
 # --- Discriminating emit-noise reduction knobs (watcher-emit-noise) ------
 # Three narrowly-scoped, individually-reversible suppressions of emit
 # CLASSES that wake the orchestrator with nothing actionable. Each
@@ -897,10 +917,12 @@ MONITOR_SERVICE_HEALTH_FLAP_CEILING="${MONITOR_SERVICE_HEALTH_FLAP_CEILING:-$("$
 # cold JupyterLab env build (CPython + jupyterlab + extensions onto the NFS uv
 # cache) blocks the healthcheck for minutes (~615s observed); the watcher
 # defers to the supervisor for the life of that build so it can't kill it
-# mid-flight (your-org/nexus-code#326 follow-up), but caps the defer here so a
-# pathological wedged build is still recoverable. Default 1800 (30 min) — well
-# above the observed build and the supervisor's 900s START_GRACE, so a genuine
-# cold build never trips it. 0 disables the cold-build defer entirely. Env:
+# mid-flight (your-org/nexus-code#326 follow-up). Measured on the BUILD's own
+# age (never the incident's): inside it the build is protected; past it, only
+# while it is still making progress, up to LABSH_COLD_BUILD_HARD_CAP (7200s) —
+# the shared verdict `labsh_build_release` (your-org/nexus-code#1676; a
+# load-100 build took >30 min, so an absolute 1800s bound killed every rebuild).
+# Default 1800. 0 disables the cold-build defer entirely. Env:
 # MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS.
 MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS="${MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS:-$("$_cfg" monitor.service_health.cold_build_ceiling_seconds 1800)}"
 [[ "$MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS" =~ ^[0-9]+$ ]] || MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS=1800
@@ -987,6 +1009,7 @@ export MONITOR_REQUESTS_ENABLED MONITOR_REQUESTS_REEMIT_COOLDOWN_SECONDS \
        MONITOR_REQUESTS_MAX_PER_EMIT MONITOR_REQUESTS_FAIRNESS \
        MONITOR_REQUESTS_MAX_AGE_SECONDS MONITOR_REQUESTS_RETENTION_SECONDS
 export MONITOR_FULL_STATE_IDLE_BACKOFF_ENABLED MONITOR_FULL_STATE_IDLE_BACKOFF_MAX_SECONDS \
+       MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS \
        MONITOR_FULL_STATE_RESTAT_WINDOWS MONITOR_FULL_STATE_RESET_STAMP_ON_EMIT \
        MONITOR_PENDING_SKIP_DEAD_WINDOWS
 export MONITOR_IDLE_THRESHOLD_SECONDS MONITOR_IDLE_CLOSE_HOURS MONITOR_IDLE_POOL_SPAWN_GRACE_SECONDS MONITOR_FULL_STATE_EMIT_INTERVAL_SECONDS MONITOR_FULL_STATE_SAFETY_FLOOR_SECONDS MONITOR_HEARTBEAT_STALENESS_SECONDS MONITOR_NOTIFICATIONS_LOG_MAX_BYTES \
@@ -1051,7 +1074,6 @@ RATELIMIT_PROBE="${MONITOR_RATELIMIT_PROBE:-$("$_cfg" monitor.watcher.ratelimit_
 RATELIMIT_HEURISTIC_MIN="${MONITOR_RATELIMIT_HEURISTIC_MIN:-$("$_cfg" monitor.watcher.ratelimit_heuristic_minutes 30)}"
 RATELIMIT_ACK_TIMEOUT_S="${MONITOR_RATELIMIT_ACK_TIMEOUT_S:-$("$_cfg" monitor.watcher.ratelimit_ack_timeout_s 60)}"
 PROBE_MODEL="${MONITOR_PROBE_MODEL:-$("$_cfg" monitor.watcher.probe_model claude-haiku-4-5-20251001)}"
-API_ERROR_BACKOFF_MIN="${MONITOR_API_ERROR_BACKOFF_MIN:-$("$_cfg" monitor.watcher.api_error_backoff_minutes 30)}"
 # AskUserQuestion / chip-bar dialog handling (Case D — dialog-guard).
 # Layer A1 (the `PreToolUse` matcher in
 # `monitor/orchestrator-settings.json`) blocks the orchestrator from

@@ -56,6 +56,12 @@
 
 ARMS	2.1.246	-*-filter*|-*-pager*|-*-view*|-*-format-open*|-*-config*|---*|-@*|-*-save-config*|-[Zz]*|-[!-]*[Zz]*|--null|--null-data
 ARMS	2.1.280	-*-filter*|-*-pager*|-*-view*|-*-format-open*|-*-config*|---*|-@*|-*-save-config*|-[Zz]*|-[!-]*[Zz]*|--null|--null-data
+# 2.1.281-2.1.284: each measured 2026-09-29 from the shell snapshot that build
+# itself wrote, booted under monitor/cc-harness against the mock (your-org/nexus-code#1670).
+ARMS	2.1.281	-*-filter*|-*-pager*|-*-view*|-*-format-open*|-*-config*|---*|-@*|-*-save-config*|-[Zz]*|-[!-]*[Zz]*|--null|--null-data
+ARMS	2.1.282	-*-filter*|-*-pager*|-*-view*|-*-format-open*|-*-config*|---*|-@*|-*-save-config*|-[Zz]*|-[!-]*[Zz]*|--null|--null-data
+ARMS	2.1.283	-*-filter*|-*-pager*|-*-view*|-*-format-open*|-*-config*|---*|-@*|-*-save-config*|-[Zz]*|-[!-]*[Zz]*|--null|--null-data
+ARMS	2.1.284	-*-filter*|-*-pager*|-*-view*|-*-format-open*|-*-config*|---*|-@*|-*-save-config*|-[Zz]*|-[!-]*[Zz]*|--null|--null-data
 
 DELEGATES	---	DASH-PATTERN-OPTION	Mode 1 (`grep -vF '---'`) is LOUD only because a `---`-leading argument is handed to GNU grep. Under the embedded ugrep it is SILENT (rc 0-1, empty stderr) — Mode 1 BECOMES Mode 2. If this stops being delegated, that entry's "at least Mode 1 is loud" reading is false on this harness, which is the entry's own dangerous direction.
 REACHES	^\+\+\+	GREP-BRE-DIALECT	The entry's LOUD half is that a bare `grep -c '^\+\+\+'` is rejected by ugrep (invalid syntax, rc 2) while `command grep` silently keeps 1 line of 4. If this pattern started being delegated, the bare call would become the silent wrong answer too and the entry's contrast would be gone.

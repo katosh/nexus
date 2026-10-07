@@ -58,6 +58,9 @@
 #         a failed attempt).
 #    R9.  WIRING: a NOT-due tick (before fire time) still reconciles —
 #         proving it runs ahead of the daily-due gate.
+#    R10-R13. #1670: the INSTALLED binary must report the pin before a
+#         hand-off (mid-install defers, no cooldown, logged once); an
+#         unreadable/empty --version defers; default path control fires.
 #   apply: safe branch (the restart is now DETACHED — `safe` bumps then
 #   hands the idle-wait → kill off to the `restart-orchestrator` verb)
 #    12.  full safe run, INLINE detach (CC_AUTO_RESTART_INLINE=1): pin
@@ -368,8 +371,11 @@ _cc_auto_window_alive() { (( _WINDOW_ALIVE == 1 )); }
 tmux() { return 1; }
 
 run_tick() {
-    # run_tick <root> <fetch> — wraps the standard arg shape.
-    _cc_auto_update_tick "$1" "$1/monitor/.state" "$PKG" "04:00" "$2" 5
+    # run_tick <root> <fetch> — wraps the standard arg shape. RUN_TICK_FIRE
+    # overrides the fire time for the few ticks that must run at the REAL
+    # clock (#1703): with the fixed 04:00, a real-now tick before 04:00 local
+    # (CI's UTC night) is simply not due, and nothing fires or skips.
+    _cc_auto_update_tick "$1" "$1/monitor/.state" "$PKG" "${RUN_TICK_FIRE:-04:00}" "$2" 5
 }
 
 # ===== trigger / scheduling ================================================
@@ -873,17 +879,30 @@ NEXUS_TEST_NOW=$(epoch_at 05:00) run_tick "$ROOT" fetch_ok
 CC_AUTO_PANE_STATE_CMD=""
 _WINDOW_ALIVE=0
 
-# 11. awaiting-operator guard
+# 11. the COMPAT-hold guard (was: awaiting-operator). your-org/nexus-code#1657:
+#     a COMPAT block is skipped only on the DAY it was recorded (at an
+#     unchanged HEAD); the NEXT day it is re-evaluated — the old guard skipped
+#     it until a newer release appeared, which cost three operator-less days
+#     after the 2.1.278 block.
 ROOT="$WORK/r11"; make_root "$ROOT" "2.1.150"
 SPAWN_LOG="$ROOT/spawned.log"; make_spawn_stub "$ROOT/spawn" "$SPAWN_LOG"
 CC_AUTO_SPAWN_CMD="$ROOT/spawn"
 auto="$ROOT/monitor/.state/cc-auto-update"; mkdir -p "$auto"
-printf 'candidate=2.1.160\ndecision=block\ndate=x\ndetail=red gate\n' > "$auto/last-eval"
+printf 'candidate=2.1.160\ndecision=block\ndate=%sT04:30:00\ndetail=red gate\n' "$DAY" > "$auto/last-eval"
 FETCH_VERSION="2.1.160"
 NEXUS_TEST_NOW=$(epoch_at 05:00) run_tick "$ROOT" fetch_ok
-[[ ! -e "$SPAWN_LOG" ]] && grep -q "skipped-awaiting-operator" "$auto/decisions.tsv" 2>/dev/null \
-    && pass "blocked candidate not re-evaluated daily" \
-    || fail "awaiting-operator guard failed"
+[[ ! -e "$SPAWN_LOG" ]] && grep -q "skipped-compat-hold-same-day" "$auto/decisions.tsv" 2>/dev/null \
+    && pass "a COMPAT-blocked candidate is not re-fired the SAME day" \
+    || fail "same-day COMPAT-hold guard failed"
+# …and the NEXT day it IS re-evaluated (#1657: no state waits for an operator)
+printf 'candidate=2.1.160\ndecision=block\ndate=2026-06-11T04:30:00\ndetail=red gate\n' > "$auto/last-eval"
+rm -f "$auto/last-fire-date"
+NEXUS_TEST_NOW=$(epoch_at 05:00) run_tick "$ROOT" fetch_ok
+[[ -e "$SPAWN_LOG" ]] \
+    && pass "#1657 a COMPAT block from YESTERDAY is re-evaluated today (was skipped until a newer release)" \
+    || fail "#1657 yesterday's block still suppressed today's fire"
+rm -f "$SPAWN_LOG"
+printf 'candidate=2.1.160\ndecision=block\ndate=%sT04:30:00\ndetail=red gate\n' "$DAY" > "$auto/last-eval"
 # a NEWER candidate re-arms
 rm -f "$auto/last-fire-date"
 FETCH_VERSION="2.1.161"
@@ -922,12 +941,16 @@ fi
 [[ "$(awk -F'\t' '$2=="2.1.160" && $3=="block" && $4=="red gate"' "$auto/decisions.tsv" 2>/dev/null | wc -l)" == 1 ]] \
     && pass "#1211 …and exactly ONE decisions.tsv row was appended" \
     || fail "#1211 decisions.tsv row count wrong: $(cat "$auto/decisions.tsv" 2>/dev/null)"
-# The verb-written block SUPPRESSES the next fire for the same candidate.
+# The verb-written block SUPPRESSES a SAME-DAY re-fire for the same candidate
+# (#1657: the verb stamps the real date, so the tick runs at the real now).
+# Fire time 00:00, because the real now may be BEFORE 04:00 local and a tick
+# that is not due neither spawns nor skips — both #1211 assertions then fail
+# on the clock, not on the guard (#1703: CI ran this at 01:08 UTC).
 FETCH_VERSION="2.1.160"
-NEXUS_TEST_NOW=$(epoch_at 05:00) run_tick "$ROOT" fetch_ok
-if [[ ! -e "$SPAWN_LOG" ]] && grep -qF "skipped-awaiting-operator" "$auto/decisions.tsv" 2>/dev/null \
-        && grep -qF "last-eval=block" <<<"$(grep -F "skipped-awaiting-operator" "$auto/decisions.tsv")"; then
-    pass "#1211 a verb-written decision=block for the CURRENT candidate suppresses the next fire (skipped-awaiting-operator)"
+RUN_TICK_FIRE=00:00 NEXUS_TEST_NOW=$(date +%s) run_tick "$ROOT" fetch_ok
+if [[ ! -e "$SPAWN_LOG" ]] && grep -qF "skipped-compat-hold-same-day" "$auto/decisions.tsv" 2>/dev/null \
+        && grep -qF "last-eval=block" <<<"$(grep -F "skipped-compat-hold-same-day" "$auto/decisions.tsv")"; then
+    pass "#1211 a verb-written decision=block for the CURRENT candidate suppresses a same-day re-fire (skipped-compat-hold-same-day)"
 else
     fail "#1211 verb-written block did not suppress: spawned=$([[ -e "$SPAWN_LOG" ]] && echo yes || echo no) rows=$(cut -f3,4 "$auto/decisions.tsv" 2>/dev/null | tr '\n' ' ')"
 fi
@@ -941,9 +964,9 @@ out=$(env NEXUS_ROOT="$ROOT" NEXUS_WORKER_WINDOW=cc-auto-update \
 (( rc == 0 )) && [[ "$out" == *"decision=block-surfaced"* ]] \
     && pass "#1211 CONTROL: record-outcome block-surfaced writes and says so" \
     || fail "#1211 CONTROL: block-surfaced rc=$rc out=[$out]"
-_skips_before=$(grep -cF "skipped-awaiting-operator" "$auto/decisions.tsv" 2>/dev/null) || _skips_before=0
-NEXUS_TEST_NOW=$(epoch_at 05:00) run_tick "$ROOT" fetch_ok
-_skips_after=$(grep -cF "skipped-awaiting-operator" "$auto/decisions.tsv" 2>/dev/null) || _skips_after=0
+_skips_before=$(grep -cF "skipped-compat-hold-same-day" "$auto/decisions.tsv" 2>/dev/null) || _skips_before=0
+RUN_TICK_FIRE=00:00 NEXUS_TEST_NOW=$(date +%s) run_tick "$ROOT" fetch_ok
+_skips_after=$(grep -cF "skipped-compat-hold-same-day" "$auto/decisions.tsv" 2>/dev/null) || _skips_after=0
 if [[ -e "$SPAWN_LOG" ]] && (( _skips_after == _skips_before )); then
     pass "#1211 CONTROL: decision=block-surfaced for the same candidate does NOT suppress the fire (spawned, no skip row)"
 else
@@ -1137,6 +1160,66 @@ if [[ -f "$ROOT/apply.log" ]] \
 else
     fail "reconcile not wired ahead of the due gate: apply=$(cat "$ROOT/apply.log" 2>/dev/null) spawn=$( [[ -e $SPAWN_LOG ]] && echo yes || echo no )"
 fi
+
+# R10-R13. your-org/nexus-code#1670 item 5: THE INSTALLED BINARY, NOT THE PIN.
+#     `safe` writes the pin BEFORE the install swaps the binary in, so for the
+#     install's duration running < pin while node_modules still holds the OLD
+#     build. The reconcile must DEFER (no hand-off, no cooldown stamp) until
+#     the installed binary's own --version reports the pin; an unreadable or
+#     empty --version must compare equal to NOTHING (FALLBACK-COLLAPSE).
+#     make_root's node_modules stub FOLLOWS the pin (a consistent tree), so
+#     each case points CC_AUTO_CLAUDE_BIN at a stub whose answer it controls.
+fixed_claude() {   # <path> <stdout> [rc]
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" %q\nexit %s\n' "$2" "${3:-0}" > "$1"
+    chmod +x "$1"
+}
+ROOT="$WORK/rec10"; make_reconcile_root "$ROOT" "2.1.186" "2.1.195" "2.1.186"
+auto="$ROOT/monitor/.state/cc-auto-update"
+fixed_claude "$ROOT/claude-old" "2.1.186 (Claude Code)"
+_saved_log=$(declare -f log 2>/dev/null || true)
+log() { printf '%s\n' "$*" >> "$ROOT/tick.log"; }
+CC_AUTO_CLAUDE_BIN="$ROOT/claude-old" reconcile "$ROOT"
+CC_AUTO_CLAUDE_BIN="$ROOT/claude-old" reconcile "$ROOT"
+unset -f log; [[ -n "$_saved_log" ]] && eval "$_saved_log"
+[[ ! -e "$ROOT/apply.log" ]] \
+    && pass "#1670 R10 pin=new, installed binary=OLD (mid-install) -> NO restart hand-off" \
+    || fail "#1670 R10 reconcile fired while the installed binary was still the old build: $(cat "$ROOT/apply.log")"
+[[ ! -e "$auto/reconcile.last" ]] \
+    && pass "#1670 R10 …and the deferral stamps NO cooldown (the next tick retries)" \
+    || fail "#1670 R10 a deferral stamped the 30-min cooldown"
+[[ "$(grep -c 'NOT reconciled yet' "$ROOT/tick.log" 2>/dev/null)" == 1 ]] \
+    && pass "#1670 R10 …and it is logged ONCE per (installed, pin) pair, not per tick" \
+    || fail "#1670 R10 deferral log lines: $(grep -c 'NOT reconciled yet' "$ROOT/tick.log" 2>/dev/null)"
+! grep -q $'\treconcile-' "$auto/decisions.tsv" 2>/dev/null \
+    && pass "#1670 R10 …with no decisions.tsv row (column 3 SELECTS in _cc-hold-policy.sh)" \
+    || fail "#1670 R10 a deferral wrote a decisions.tsv row"
+# R11. the install lands: the SAME root, installed binary now = the pin -> fires.
+fixed_claude "$ROOT/claude-new" "2.1.195 (Claude Code)"
+CC_AUTO_CLAUDE_BIN="$ROOT/claude-new" reconcile "$ROOT"
+[[ -f "$ROOT/apply.log" ]] && grep -q "restart-orchestrator --candidate 2.1.195 --sid $RSID" "$ROOT/apply.log" \
+    && pass "#1670 R11 installed binary = pin -> the restart proceeds on the next tick" \
+    || fail "#1670 R11 reconcile did not fire once the installed binary matched the pin"
+# R12. FALLBACK-COLLAPSE: unreadable / empty / non-version output never proceeds.
+for _variant in empty garbage rc1 absent; do
+    ROOT="$WORK/rec12-$_variant"; make_reconcile_root "$ROOT" "2.1.186" "2.1.195" "2.1.186"
+    case "$_variant" in
+        empty)   fixed_claude "$ROOT/claude-x" "" ;;
+        garbage) fixed_claude "$ROOT/claude-x" "Claude Code (unknown)" ;;
+        rc1)     fixed_claude "$ROOT/claude-x" "" 1 ;;
+        absent)  : ;;
+    esac
+    CC_AUTO_CLAUDE_BIN="$ROOT/claude-x" reconcile "$ROOT"
+    [[ ! -e "$ROOT/apply.log" ]] \
+        && pass "#1670 R12 installed --version $_variant -> defers (compares equal to nothing)" \
+        || fail "#1670 R12 installed --version $_variant -> FIRED: $(cat "$ROOT/apply.log")"
+done
+# R13. CONTROL, the default path: no CC_AUTO_CLAUDE_BIN -> node_modules/.bin/claude
+#      (make_root's pin-following stub, i.e. the install has landed) -> fires.
+ROOT="$WORK/rec13"; make_reconcile_root "$ROOT" "2.1.186" "2.1.195" "2.1.186"
+( unset CC_AUTO_CLAUDE_BIN; reconcile "$ROOT" )
+[[ -f "$ROOT/apply.log" ]] && grep -q "restart-orchestrator --candidate 2.1.195" "$ROOT/apply.log" \
+    && pass "#1670 R13 CONTROL default path: node_modules/.bin/claude reports the pin -> fires" \
+    || fail "#1670 R13 default-path reconcile did not fire with a consistent tree"
 
 # ===== apply: safe branch ==================================================
 
@@ -4372,11 +4455,13 @@ printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" 503 "%s"\n' "$(date -Is -d '6
 chmod +x "$ROOT/gate-prs" "$ROOT/gate-act"
 rc=$(gate_run "$ROOT" CC_AUTO_GATE_PR_CMD="$ROOT/gate-prs" CC_AUTO_GATE_PR_ACTIVITY_CMD="$ROOT/gate-act")
 auto="$ROOT/monitor/.state/cc-auto-update"
-(( rc == 30 )) && gate_unmutated "$ROOT" && grep -q $'\tsafe-deferred\tpr-under-active-review=PR503' "$auto/decisions.tsv" \
+# #1657: arm 2b is a RECORD now, the last deferring arm gone — the fresh PR
+# is noted twice (restart path + active review) and the bump APPLIES.
+(( rc == 0 )) && ! grep -q $'\tsafe-deferred\t' "$auto/decisions.tsv" \
+   && grep -q $'\tpr-under-active-review-noted\tpr=PR503' "$auto/decisions.tsv" \
    && grep -q $'\trestart-path-pr-noted\tpr=PR503 activity=live' "$auto/decisions.tsv" \
-   && ! grep -q "deferred-pending" "$auto/decisions.tsv" \
-    && pass "#1526 G1c: a restart-path PR touched 60 s ago defers via ARM 2b (pr-under-active-review), the restart-path hit only noted" \
-    || fail "#1526 G1c: fresh restart-path PR — wrong arm or no defer (rc=$rc): $(grep safe-deferred "$auto/decisions.tsv" 2>/dev/null | tail -1 | cut -f4 | cut -c1-120)"
+    && pass "#1657 G1c: a restart-path PR touched 60 s ago → APPLIES; noted as live restart-path AND as under active review, no deferral" \
+    || fail "#1657 G1c: fresh restart-path PR still deferred or unrecorded (rc=$rc): $(cut -f3,4 "$auto/decisions.tsv" 2>/dev/null | grep -i 'noted\|deferred' | tail -2 | tr '\n' ' ')"
 # G1d. The activity probe failing: the hit's age is unknown, so it is recorded
 #      LIVE (never guessed stale) — and, with no veto, nothing defers. Arm 2b
 #      degrades to UNMEASURED on the same failure and continues (#1492).
@@ -4410,9 +4495,12 @@ printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" 991 "%s"\n' "$(date -Is -d '6
 chmod +x "$ROOT/gate-prs" "$ROOT/gate-act"
 rc=$(gate_run "$ROOT" CC_AUTO_GATE_PR_CMD="$ROOT/gate-prs" CC_AUTO_GATE_PR_ACTIVITY_CMD="$ROOT/gate-act")
 auto="$ROOT/monitor/.state/cc-auto-update"
-(( rc == 30 )) && gate_unmutated "$ROOT" && grep -q "pr-under-active-review=PR991" "$auto/decisions.tsv" \
-    && pass "#1113: a PR under active review defers even at ZERO restart-path hits" \
-    || fail "#1113: an actively-reviewed PR cleared the gate (rc=$rc): $(grep safe-deferred "$auto/decisions.tsv" 2>/dev/null | tail -1)"
+# #1657: RECORDED, not a veto — the probe still reads the timestamp (Q8 is
+# its potency control), and a live review is written down, never deferred on.
+(( rc == 0 )) && grep -q $'\tpr-under-active-review-noted\tpr=PR991' "$auto/decisions.tsv" \
+   && ! grep -q $'\tsafe-deferred\t' "$auto/decisions.tsv" \
+    && pass "#1657: a PR under active review (zero restart-path hits) is RECORDED and the bump applies" \
+    || fail "#1657: active review deferred or went unrecorded (rc=$rc): $(grep -E 'safe-deferred|noted' "$auto/decisions.tsv" 2>/dev/null | tail -1)"
 
 # Q8. POTENCY CONTROL — the same PR, same zero path hits, updated ten days
 #      ago, clears. Without this G8 would pass for an arm that always defers.
@@ -4422,8 +4510,9 @@ printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" 991 "%s"\n' "$(date -Is -d '1
 chmod +x "$ROOT/gate-prs" "$ROOT/gate-act"
 rc=$(gate_run "$ROOT" CC_AUTO_GATE_PR_CMD="$ROOT/gate-prs" CC_AUTO_GATE_PR_ACTIVITY_CMD="$ROOT/gate-act" CC_AUTO_RESTART_INLINE=1)
 (( rc == 0 )) && [[ "$(cat "$ROOT/monitor/.state/cc-version-local" 2>/dev/null)" == "2.1.160" ]] \
-    && pass "#1113 potency: a dormant PR does not defer — the arm reads the timestamp" \
-    || fail "#1113: the active-review arm defers unconditionally (rc=$rc)"
+   && ! grep -q 'pr-under-active-review-noted' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv" 2>/dev/null \
+    && pass "#1113/#1657 potency: a dormant PR is NOT recorded as under review — the arm reads the timestamp" \
+    || fail "#1113/#1657: the active-review arm records every open PR regardless of age (rc=$rc)"
 
 # Q9. …and its two failure modes. A probe that FAILS, and a timestamp that
 #     does not parse, are both "could not establish that nobody is
@@ -4895,8 +4984,10 @@ printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" 991 "not-a-timestamp"\n' > "$
 chmod +x "$ROOT/gate-act"
 rc=$(gate_run "$ROOT" CC_AUTO_GATE_PR_ACTIVITY_CMD="$ROOT/gate-act")
 auto="$ROOT/monitor/.state/cc-auto-update"
-(( rc == 30 )) && grep -q "unparseable-ts" "$auto/decisions.tsv" \
-    && pass "#1113: an unparseable updated-at is not 'old' — it defers, and says so" \
+# #1657: still never read as "old" — it is RECORDED as under review with the
+# reason — but recording is all the arm does now; the bump applies.
+(( rc == 0 )) && grep -q $'\tpr-under-active-review-noted\tpr=PR991(unparseable-ts)' "$auto/decisions.tsv" \
+    && pass "#1113/#1657: an unparseable updated-at is not 'old' — it is recorded as under review (unparseable-ts), and the bump applies" \
     || fail "#1113: an unparseable timestamp was treated as dormant (rc=$rc)"
 
 # Q10. A GATE THAT NEVER CLEARS IS A ROUTINE THAT SILENTLY STOPPED. The
@@ -4919,9 +5010,11 @@ for i in 1 2; do rc=$(gate_run "$ROOT" CC_AUTO_GATE_PR_CMD="$ROOT/q10-pr" CC_AUT
     && pass "#1113: two deferrals are routine — no escalation" \
     || fail "#1113: escalated below the threshold (an alert that always fires is not read)"
 rc=$(gate_run "$ROOT" CC_AUTO_GATE_PR_CMD="$ROOT/q10-pr" CC_AUTO_GATE_PR_ACTIVITY_CMD="$ROOT/q10-act" CC_AUTO_GATE_DEFER_STREAK_ALERT=3 CC_AUTO_GATE_DEFER_STREAK_CAP=0)
-grep -q "deployment-gate-defer-escalation" "$auto/decisions.tsv" && grep -q "streak=3" "$auto/decisions.tsv" \
-    && pass "#1113: three deferrals in a row escalate, with the streak in the row" \
-    || fail "#1113: a gate stuck shut for three fires said nothing"
+# #1657: the gate can no longer be "stuck shut" — the fires that used to build
+# this streak all apply, so there is no streak and nothing to escalate.
+! grep -q $'\tsafe-deferred\t' "$auto/decisions.tsv" && [[ ! -f "$auto/gate-defer-streak" ]] \
+    && pass "#1113/#1657: three fires with a live PR under review never defer, so no streak builds and nothing escalates" \
+    || fail "#1113/#1657: a live PR still deferred or started a streak"
 # …and the streak resets on a clear, so the alert is about NOW. The PR arm is
 # withdrawn (probe reports no PRs); the idle board is left in place because
 # under D13 it is recorded, not gated on.
@@ -4980,43 +5073,26 @@ gate_seed_streak() {   # $1=root  $2=streak value
     printf '%s\n' "$2" > "$1/monitor/.state/cc-auto-update/gate-defer-streak"
 }
 
-# O1. Under the cap the proxy arm still vetoes — the bound is a bound, not an
-#     off switch. Four fires at cap=5 must all defer and mutate nothing.
-ROOT="$WORK/o1"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
-make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
+# O0. #1657 — NO DEFERRING ARM IS LEFT, so the bounded-deferral cases that
+#     drove the streak/cap/age override through ARM 2b (O1, O1b, O2, O4, O5,
+#     O5b, O5d, O6, O8, O9a-c, O10) have no input that reaches them and were
+#     removed with the arm. The bound's PIECES stay pinned below (O5c/O5e read
+#     the streak files, O7/O7b clear on delivery), because `_gate_defer` stays
+#     the one path any FUTURE deferring arm must take — so it is bounded the
+#     day it is used. What replaces them is this: the input that used to defer
+#     (a PR touched "now") applies on EVERY fire and never starts a streak.
+ROOT="$WORK/o0"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_restart_pr "$ROOT"
 auto="$ROOT/monitor/.state/cc-auto-update"
-o1ok=1
+o0_ok=1
 for i in 1 2 3 4; do
-    rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=5)
-    (( rc == 30 )) && gate_unmutated "$ROOT" || o1ok=0
+    rm -f "$ROOT/monitor/.state/cc-version-local"
+    rc=$(gate_run_proxy "$ROOT" CC_AUTO_RESTART_INLINE=1)
+    (( rc == 0 )) && [[ "$(cat "$ROOT/monitor/.state/cc-version-local" 2>/dev/null)" == "2.1.160" ]] || o0_ok=0
 done
-(( o1ok == 1 )) && ! grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
-    && pass "#1492 O1: under the cap a proxy arm still DEFERS (4 fires, nothing bumped, no override row)" \
-    || fail "#1492 O1: the bound fired early or the gate mutated below the cap (rc=$rc)"
-# …and the counter those four fires left is 4: one bump per fire ACROSS fires.
-# The companion of O10 below (your-org/nexus-code#1602), which pins one bump
-# per fire WITHIN a fire — a fix that memoised too hard (never re-reading the
-# file) would pass O10 and fail here.
-[[ "$(tr -dc '0-9' < "$auto/gate-defer-streak" 2>/dev/null)" == 4 ]] \
-    && pass "#1602 O1b: four single-defer fires leave the streak at exactly 4 — one bump per fire across fires" \
-    || fail "#1602 O1b: four single-defer fires left streak=$(cat "$auto/gate-defer-streak" 2>/dev/null || echo absent), expected 4"
-
-# O2. At the cap the proxy arm's veto expires. Until 2026-09-12 the DIRECT
-#     board-not-quiet arm ran after it and still deferred (the load-bearing
-#     "override is not proceed" case). D13 removed the board arms, so the
-#     override is now followed by no arm and the gate CLEARS — while the busy
-#     windows are still written to the record. The contract "override means
-#     this arm's veto expired, evaluation continues" is unchanged; what
-#     changed is that nothing remains to continue into. FAILS on the
-#     pre-change tree (rc 30 there).
-make_gate_pane_stub "$ROOT" busy
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=5 CC_AUTO_RESTART_INLINE=1)
-(( rc == 0 )) && gate_applied "$ROOT" \
-    && grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
-    && ! grep -q "board-not-quiet" "$auto/decisions.tsv" \
-    && [[ "$(gate_row "$ROOT")" == *"w1=busy"* ]] \
-    && pass "D13 O2: an expired PROXY veto CLEARS the gate (rc=0, pin moved) — the busy windows are RECORDED, no board arm defers" \
-    || fail "D13 O2: expired proxy veto did not clear, or the record lost the busy windows (rc=$rc): $(gate_row "$ROOT")"
+(( o0_ok )) && [[ ! -f "$auto/gate-defer-streak" ]] && ! grep -q $'\tsafe-deferred\t' "$auto/decisions.tsv" \
+   && [[ "$(grep -c $'\tpr-under-active-review-noted\t' "$auto/decisions.tsv")" == 4 ]] \
+    && pass "#1657 O0: a PR under active review applies on all 4 fires — no deferral, no streak, one noted row per fire" \
+    || fail "#1657 O0: an active review still deferred or started a streak (last rc=$rc; streak=$(cat "$auto/gate-defer-streak" 2>/dev/null || echo absent))"
 
 # O3. A busy board ALONE never defers (D13). Until 2026-09-12 this case pinned
 #     the opposite — the direct arm was never overridable, so three fires at
@@ -5039,110 +5115,6 @@ done
     && ! grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
     && pass "D13 O3: a busy board alone never defers — 3 fires, 3 applies, busy windows recorded, no deferral and no override row" \
     || fail "D13 O3: a busy board still deferred or the record is wrong (last rc=$rc): $(grep -E 'safe-deferred|defer-override' "$auto/decisions.tsv" | tail -1)"
-
-# O4. The AGE bound trips independently of the streak — a slow fire cadence
-#     must not make the bound unreachable. Streak cap disabled (0).
-ROOT="$WORK/o4"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
-make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
-auto="$ROOT/monitor/.state/cc-auto-update"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=86400)
-(( rc == 30 )) || fail "#1492 O4 setup: first fire should defer (rc=$rc)"
-# Backdate the streak start past the age bound. 90000 s is CHOSEN, not a default
-# and not derived from anything the gate ships: it is the bound (86400) plus a
-# 3600 s margin, and THAT MARGIN IS THIS CASE'S CLOCK RESOLUTION — it detects a
-# clock error larger than an hour and no smaller one. Stated because the number
-# was recoverable only by subtracting two literals a reader had to notice were
-# related (rtev skeptic, delta 6), and because a value nobody chose deliberately
-# is the one nobody re-derives. Widening the margin buys sensitivity to smaller
-# clock errors and costs nothing here; narrowing it toward 86400 sharpens this
-# case AND silently weakens the claim recorded on O5 below, so the two move
-# together.
-printf '%s\n' "$(( $(date +%s) - 90000 ))" > "$auto/gate-defer-streak-since"
-rm -f "$ROOT/monitor/.state/cc-version-local"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=86400 CC_AUTO_RESTART_INLINE=1)
-# THE ASSERTION IS THE OUTCOME, NOT THE ROW. An earlier draft of this case
-# checked only that `deployment-gate-defer-override` appeared in decisions.tsv
-# — and a mutant whose override RETURNED 1 still wrote that row, so the case
-# passed while the veto had not expired at all. That is the same defect this
-# worker flagged in #1498's case 13c (assert the property, not a proxy for
-# it), committed here in the test written to demonstrate it. The property is
-# that the gate CLEARED: rc 0 and the pin actually moved.
-(( rc == 0 )) && [[ -f "$ROOT/monitor/.state/cc-version-local" ]] \
-    && grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
-    && pass "#1492 O4: the AGE bound expires a proxy veto with the streak cap disabled — the gate CLEARED (rc=0, pin moved)" \
-    || fail "#1492 O4: a proxy arm held past its age bound (rc=$rc)"
-
-# O5. AN UNREADABLE AGE MUST NOT TRIP THE OVERRIDE. "I could not tell how long
-#     this has been blocked" is not "long enough" — the same rule this gate
-#     already applies to an unparseable PR timestamp.
-#
-#     THE BOUND MUST BE ONE THE WALL CLOCK CANNOT REACH (your-org/nexus-code#1570).
-#     This case ran at MAX_AGE_SECONDS=1, fired the gate twice and read only the
-#     SECOND rc. `_gate_defer` stamps `-since` with one `date +%s` and reads the
-#     age with another; when a second boundary falls between the two, the FIRST
-#     fire sees age=1 >= 1 and the override trips — CORRECTLY, the streak is one
-#     second old. The pin moves, the second fire is an already-pinned no-op at
-#     rc 0, and this case printed "opened the hatch" about a path it never
-#     reached: a red meaning "the safety override opened", in the dangerous
-#     direction, from a test parameter. Measured at d58bc49a, load ~27/36:
-#       * the subject's own bump+age pair, 2000 fresh streaks: age>=1 in 17
-#         (0.85%) — so roughly one execution in 120 went red by itself;
-#       * skewing the age reader's clock by 1 s (`mutation-gate.sh --subject`,
-#         prediction registered first) flips EXACTLY this case, with that
-#         message, and nothing else among 359 assertions.
-#     86400 is CHOSEN, not inherited: it is O4's bound, and no run of this suite
-#     lasts a day.
-#     AND WHAT STILL CONSTRAINS THE CLOCK AFTER THIS CHANGE IS O4, NOT THIS CASE
-#     (rtev skeptic, delta 6 — the claim was right, the stated grounds did not
-#     reach it). Raising this bound 1 -> 86400 removes O5 from the clock axis
-#     entirely: its asserted path plants `not-an-epoch`, whose empty digit string
-#     fails `_gate_defer_streak_age`'s shape check and RETURNS BEFORE `now` is
-#     ever read, so no clock skew reaches it at any magnitude. The mutation
-#     evidence cited for "no potency lost" (a `tr` axis kill, and a 1 s skew
-#     surviving) does not speak to the clock either. O4 does, with the 3600 s
-#     resolution named above. So: tighten O4's back-date toward its bound and
-#     this suite's clock coverage degrades with nothing else moving — which is
-#     exactly the coupling a correct claim with the wrong grounds would have
-#     hidden. Nothing is relaxed by it — a defect that reads garbage as a
-#     number yields an epoch near 0, an age near 1.8e9 s, and trips any bound.
-#     And the first fire is now ASSERTED, as O4's is, so a setup that did not
-#     defer is reported as setup and never again as the hatch opening.
-ROOT="$WORK/o5"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
-make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
-auto="$ROOT/monitor/.state/cc-auto-update"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=86400)
-(( rc == 30 )) || fail "#1492 O5 setup: first fire should defer (rc=$rc)"
-printf 'not-an-epoch\n' > "$auto/gate-defer-streak-since"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=86400)
-# THE MESSAGE REPORTS WHAT WAS OBSERVED. The old text named a cause ("'could not
-# tell' became 'long enough'") that this arm cannot establish: rc alone does not
-# say WHICH fire cleared the gate, and that is how #1570 read as a product
-# regression for a day.
-(( rc == 30 )) && gate_unmutated "$ROOT" \
-    && ! grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
-    && pass "#1492 O5: an unreadable streak age does NOT trip the override — it defers (rc=30)" \
-    || fail "#1492 O5: the gate did not defer on an unreadable streak age (rc=$rc; override row: $(grep -c 'deployment-gate-defer-override' "$auto/decisions.tsv" 2>/dev/null || true); -since now: $(cut -c1-40 "$auto/gate-defer-streak-since" 2>/dev/null | tr -d '\n'))"
-
-# O5b. A DATE-ONLY STAMP DOES NOT TRIP THE OVERRIDE (your-org/nexus-code#1603).
-#      End to end, because the issue's trip was DERIVED (the age the function
-#      returned vs the bound), not demonstrated. `tr -dc '0-9'` used to launder
-#      `2026-09-19` into the epoch 20260919 (1970-08-23), an age of ~56 years
-#      that clears the production bound: the second fire overrode and the pin
-#      moved. Same shape as O5, so it inherits O5's reasoning about the bound
-#      (86400, which no run reaches); only the planted bytes differ, and they
-#      are the one input O5's `not-an-epoch` could never have caught — it has
-#      no digits to launder.
-ROOT="$WORK/o5b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
-make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
-auto="$ROOT/monitor/.state/cc-auto-update"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=86400)
-(( rc == 30 )) || fail "#1603 O5b setup: first fire should defer (rc=$rc)"
-printf '2026-09-19\n' > "$auto/gate-defer-streak-since"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=0 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=86400)
-(( rc == 30 )) && gate_unmutated "$ROOT" \
-    && ! grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
-    && pass "#1603 O5b: a date-only streak stamp does NOT trip the override — it defers (rc=30)" \
-    || fail "#1603 O5b: a date-only streak stamp opened the override (rc=$rc; override rows: $(grep -c 'deployment-gate-defer-override' "$auto/decisions.tsv" 2>/dev/null || true))"
 
 # O5c. THE AGE READER, ROW BY ROW (your-org/nexus-code#1603). Every row of the
 #      issue's measured table plus the edges the fix adds, driven through the
@@ -5197,25 +5169,6 @@ not-an-epoch\n|a non-numeric stamp
 O5C
 fi
 
-# O5d. A DATE-ONLY STREAK COUNT DOES NOT TRIP THE OVERRIDE (your-org/nexus-code#1603,
-#      skeptic item 7 on #1626). The age stamp stopped laundering its bytes;
-#      its sibling, the COUNT, still read through `tr -dc '0-9'`, so a
-#      hand-typed `2026-09-19` in `gate-defer-streak` became 20260919 — at or
-#      above any cap — and the next deferral overrode. End to end at the
-#      production-shaped cap 3, with no `-since` (the bump writes a fresh one,
-#      so the AGE bound cannot be what fires). O2 is the positive control: a
-#      REAL streak at the cap does override.
-ROOT="$WORK/o5d"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
-make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
-auto="$ROOT/monitor/.state/cc-auto-update"
-gate_seed_streak "$ROOT" "2026-09-19"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=3)
-(( rc == 30 )) && gate_unmutated "$ROOT" \
-    && ! grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
-    && [[ "$(cat "$auto/gate-defer-streak" 2>/dev/null)" == 1 ]] \
-    && pass "#1603 O5d: a date-only streak COUNT does NOT trip the override — it defers and restarts the streak at 1" \
-    || fail "#1603 O5d: a date-only streak count opened the override or kept its value (rc=$rc; streak now: $(cat "$auto/gate-defer-streak" 2>/dev/null || echo absent))"
-
 # O5e. THE COUNT READER, ROW BY ROW — the O5c method, on
 #      `_gate_defer_streak_bump` extracted from $APPLY. The answer is the
 #      streak the bump RECORDS for this fire: a readable count N gives N+1;
@@ -5259,57 +5212,6 @@ not-a-count\n|a non-numeric count
 |an empty file
 O5E_BAD
 fi
-
-# O10. ONE BUMP PER GATE RUN, WITHIN A FIRE (your-org/nexus-code#1602). The
-#      memo in `_gate_defer_streak_bump` was assigned inside `$(…)`, so it
-#      never reached the parent and the SECOND `_gate_defer` of a fire bumped
-#      again. Two defers in one fire WERE reachable here: both proxy arms hit
-#      (restart-path PR 991 and active-review PR 991). SINCE THE #1526
-#      FOLLOW-UP THEY ARE NOT: the restart-path arm records and never calls
-#      `_gate_defer`, so 2b is the only deferring arm and one fire can bump at
-#      most once by construction. The memo fix stays; this case now pins the
-#      reachable shape — seed 2, cap 3: exactly ONE override row, at streak=3,
-#      and the restart-path hit only NOTED. If a second deferring arm is ever
-#      added, restore the two-row form.
-ROOT="$WORK/o10"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
-make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
-auto="$ROOT/monitor/.state/cc-auto-update"
-gate_seed_streak "$ROOT" 2
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=3 CC_AUTO_RESTART_INLINE=1)
-o10_rows=$(grep -F 'deployment-gate-defer-override' "$auto/decisions.tsv" 2>/dev/null)
-o10_n=$(grep -c . <<<"$o10_rows")
-o10_3=$(grep -c 'streak=3 ' <<<"$o10_rows")
-(( rc == 0 )) && [[ -n "$o10_rows" ]] && (( o10_n == 1 && o10_3 == 1 )) \
-    && grep -q $'\trestart-path-pr-noted\tpr=PR991' "$auto/decisions.tsv" \
-    && pass "#1602/#1526 O10: one deferring arm per fire now — ONE override row at streak=3 from a seed of 2; the restart-path hit only noted" \
-    || fail "#1602/#1526 O10: expected rc 0 and 1 override row at streak=3; got rc=$rc rows=$o10_n at-3=$o10_3: $(tr '\n' ' ' <<<"$o10_rows")"
-
-# O6. THE STREAK IS GLOBAL, NOT PER-ARM — pin the consequence, since it is the
-#     one that surprises. A streak earned on ANOTHER arm expires the
-#     ACTIVE-REVIEW arm on that arm's FIRST EVER fire. (The seed below stood
-#     for restart-path deferrals; since the #1526 follow-up that arm no longer
-#     defers, so the seed stands for whatever produced the streak — the file
-#     carries no arm, which is the property pinned.) Deliberate (the board
-#     demonstrably hops between arms and a per-arm counter would never reach a
-#     cap) but untested until the w231sk skeptic pass asked for it: a doctrine
-#     that is per-arm and a counter that is global is exactly the kind of
-#     mismatch that is obvious only once someone writes the cross-arm case.
-ROOT="$WORK/o6"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
-make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
-auto="$ROOT/monitor/.state/cc-auto-update"
-# Seed the streak to cap-1 as a PRECONDITION; O1 pins that real fires produce it.
-gate_seed_streak "$ROOT" 2
-o6_pre=$(tr -dc '0-9' < "$auto/gate-defer-streak" 2>/dev/null)
-# Now retire that arm and present a DIFFERENT proxy arm (active-review) for the
-# first time: no restart-path hit, one PR touched inside the activity window.
-printf '#!/usr/bin/env bash\nprintf "%%s\\t%%s\\n" 991 "docs/unrelated.md"\n' > "$ROOT/gate-pr"
-chmod +x "$ROOT/gate-pr"
-rm -f "$ROOT/monitor/.state/cc-version-local"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=3 CC_AUTO_RESTART_INLINE=1)
-(( rc == 0 )) && [[ -f "$ROOT/monitor/.state/cc-version-local" ]] \
-    && grep -q "deployment-gate-defer-override" "$auto/decisions.tsv" \
-    && pass "#1492 O6: the streak is GLOBAL — a seeded streak of 2 expires the active-review arm on its first fire (pre-streak=$o6_pre, rc=0, pin moved)" \
-    || fail "#1492 O6: cross-arm streak behaviour is not what the doctrine says (pre-streak=$o6_pre rc=$rc)"
 
 # O7. A PIN THAT MOVES ENDS THE STREAK, WHICHEVER PATH MOVED IT. `--no-restart`
 #     SKIPS the gate, so it also skips _deployment_gate's own streak clear —
@@ -5358,61 +5260,6 @@ o7b_post=$(tr -dc '0-9' < "$auto/gate-defer-streak" 2>/dev/null)
 (( o7brc != 0 )) && [[ "$o7b_post" == "$o7b_pre" ]] \
     && pass "#1492 O7b: a --no-restart run that FAILED to deliver (rc=$o7brc) leaves the streak intact ($o7b_pre) — cleared on delivery, not on intent" \
     || fail "#1492 O7b: a failed bump changed the streak ($o7b_pre -> ${o7b_post:-cleared}, rc=$o7brc) — the escalation counter reset having delivered nothing"
-
-# O8. AN UNREACHABLE BOUND MUST BE VISIBLE FROM THE LEDGER ALONE. w231sk's F4
-#     was that the cap shipped at a value the recorded streak distribution could
-#     never reach, and finding that out required reading the code and the ledger
-#     TOGETHER. Defaulting the cap to the alert threshold also means somebody
-#     raising the alert to quieten notifications silently pushes the bound out —
-#     the fix for "cannot fire" has a setting that makes it not fire. Defended
-#     by observability, so the observability is what gets pinned: every deferral
-#     row carries the bound's own parameters beside the streak, making
-#     "cap unreachable" a one-line comparison in decisions.tsv.
-ROOT="$WORK/o8"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
-make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
-auto="$ROOT/monitor/.state/cc-auto-update"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=99 CC_AUTO_GATE_DEFER_MAX_AGE_SECONDS=99999)
-o8row=$(grep 'safe-deferred' "$auto/decisions.tsv" 2>/dev/null | tail -1)
-[[ "$o8row" == *"gate_defer_streak=1"* && "$o8row" == *"defer_cap=99"* \
-   && "$o8row" == *"defer_max_age=99999s"* && "$o8row" == *"overridable=1"* ]] \
-    && pass "#1492 O8: a deferral row carries the bound's own parameters (streak=1 vs defer_cap=99) — an unreachable cap is visible from decisions.tsv alone" \
-    || fail "#1492 O8: the deferral row does not carry defer_cap/defer_max_age/overridable — an unreachable bound is only findable by reading the source. row: $o8row"
-
-# O9. THE CAP'S OWN DEFAULT AND FLOOR — the headline change of two consecutive
-#     rounds, and until now exercised by NO test (w231sk round 2, R2: a mutant
-#     flipping the default to a literal 99 was noticed by 0 of 277 cases).
-#     Both failed shapes are pinned so neither can return:
-#       (a) DEFAULT: unset -> 3, calibrated, not a hunch;
-#       (b) INDEPENDENCE: the NOTIFICATION threshold must not move the cap —
-#           R1, where ALERT=1 collapsed the cap to 1 and expired every proxy
-#           veto on its FIRST deferral, i.e. zero delay;
-#       (c) FLOOR: a configured 1 is RAISED to 2 and SAYS SO in the row.
-ROOT="$WORK/o9a"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
-make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
-auto="$ROOT/monitor/.state/cc-auto-update"
-rc=$(gate_run_proxy "$ROOT")
-o9row=$(grep 'safe-deferred' "$auto/decisions.tsv" 2>/dev/null | tail -1)
-[[ "$o9row" == *"defer_cap=3"* ]] \
-    && pass "#1492 O9a: with nothing configured the cap defaults to 3, calibrated against the recorded streak distribution" \
-    || fail "#1492 O9a: the default cap is not 3. row: $o9row"
-
-ROOT="$WORK/o9b"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
-make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
-auto="$ROOT/monitor/.state/cc-auto-update"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_ALERT=1)
-o9brow=$(grep 'safe-deferred' "$auto/decisions.tsv" 2>/dev/null | tail -1)
-(( rc == 30 )) && gate_unmutated "$ROOT" && [[ "$o9brow" == *"defer_cap=3"* ]] \
-    && pass "#1492 O9b (R1): a NOTIFICATION threshold of 1 does NOT move the safety cap — still 3, and the first deferral still DEFERS (rc=30)" \
-    || fail "#1492 O9b (R1): the alert threshold moved the cap — asking for more information disabled the veto (rc=$rc). row: $o9brow"
-
-ROOT="$WORK/o9c"; make_apply_root "$ROOT" "2.1.150" "2.1.160"; make_gate_tmux "$ROOT"
-make_gate_pane_stub "$ROOT" absent; make_gate_restart_pr "$ROOT"
-auto="$ROOT/monitor/.state/cc-auto-update"
-rc=$(gate_run_proxy "$ROOT" CC_AUTO_GATE_DEFER_STREAK_CAP=1)
-o9crow=$(grep 'safe-deferred' "$auto/decisions.tsv" 2>/dev/null | tail -1)
-(( rc == 30 )) && [[ "$o9crow" == *"defer_cap=2"* && "$o9crow" == *"defer_cap_clamped=1"* ]] \
-    && pass "#1492 O9c: a configured cap of 1 is RAISED to the floor of 2 and the clamp is RECORDED (defer_cap_clamped=1) — clamped loudly, not silently" \
-    || fail "#1492 O9c: a cap of 1 was honoured or clamped silently — zero delay is not a bound. row: $o9crow"
 
 # G4. post-restart invariant: TWO live watcher groups for this root after
 #     the restart → rc 31, orchestrator restart NOT handed off (no kill).
@@ -5499,12 +5346,21 @@ rc=$?
 
 # ===== apply: block branch =================================================
 
+# THE COMPAT CONTRACT (your-org/nexus-code#1657). A `block` HOLDS only with
+# candidate-attributed evidence, the fix's issue and a passing control; without
+# them it is `block-not-compat` (exit 12). The cases below test what a RECORDED
+# hold carries, so they pass the contract; test-cc-hold-policy.sh owns the
+# contract itself (with, without, and each part missing).
+COMPAT_FINDINGS="$WORK/compat-findings.md"
+printf 'measured on the candidate; the installed version passes\n' > "$COMPAT_FINDINGS"
+COMPAT_ARGS=(--evidence "probe:$COMPAT_FINDINGS" --issue your-org/nexus-code#1 --control "installed version passes")
+
 echo "== apply: block =="
 
 # 24. block records + the daily guard then skips
 ROOT="$WORK/b24"; make_root "$ROOT" "2.1.150"
 env NEXUS_ROOT="$ROOT" bash "$APPLY" block \
-    --candidate 2.1.160 --reason "gate RED: test-realmodel-idle-busy" >/dev/null 2>&1
+    --candidate 2.1.160 --reason "gate RED: test-realmodel-idle-busy" "${COMPAT_ARGS[@]}" >/dev/null 2>&1
 rc=$?
 auto="$ROOT/monitor/.state/cc-auto-update"
 if (( rc == 0 )) && grep -q $'\tblock\t' "$auto/decisions.tsv" \
@@ -5588,7 +5444,7 @@ rc=$?
 #     — and an audit-only `live-tree-drift` row so the refusal is on the record.
 ROOT="$WORK/d4"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 printf '#!/usr/bin/env bash\necho "2.1.160 (Claude Code)"\n' > "$ROOT/claude"; chmod +x "$ROOT/claude"
-env $(apply_env "$ROOT") bash "$APPLY" block --candidate 2.1.160 --reason "gate RED: something" > "$ROOT/out.log" 2>&1
+env $(apply_env "$ROOT") bash "$APPLY" block --candidate 2.1.160 --reason "gate RED: something" "${COMPAT_ARGS[@]}" > "$ROOT/out.log" 2>&1
 rc=$?; auto="$ROOT/monitor/.state/cc-auto-update"
 if (( rc == 9 )) && ! grep -q $'\tblock\t' "$auto/decisions.tsv" 2>/dev/null \
    && [[ ! -e "$auto/last-eval" ]] && grep -q $'\tlive-tree-drift\t' "$auto/decisions.tsv" 2>/dev/null; then
@@ -5603,7 +5459,7 @@ _cc_auto_last_eval_skip "$auto" "2.1.160" \
 # D5. CONTROL for D4: the identical block call on a CONSISTENT tree records
 #     the block (rc 0). Proves D4's refusal is the drift, not the fixture.
 ROOT="$WORK/d5"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
-env $(apply_env "$ROOT") bash "$APPLY" block --candidate 2.1.160 --reason "gate RED: something" > "$ROOT/out.log" 2>&1
+env $(apply_env "$ROOT") bash "$APPLY" block --candidate 2.1.160 --reason "gate RED: something" "${COMPAT_ARGS[@]}" > "$ROOT/out.log" 2>&1
 rc=$?; auto="$ROOT/monitor/.state/cc-auto-update"
 (( rc == 0 )) && grep -q $'\tblock\t' "$auto/decisions.tsv" 2>/dev/null \
     && [[ "$(_cc_update_field "$auto/last-eval" decision 2>/dev/null)" == "block" ]] \
@@ -6176,7 +6032,7 @@ fi
 #      names the tree the verdict was formed on.
 ROOT="$WORK/t1259d"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 env $(apply_env "$ROOT") bash "$APPLY" block --candidate 2.1.160 \
-    --reason "trust dialog rows still absent" > "$ROOT/out.log" 2>&1
+    --reason "trust dialog rows still absent" "${COMPAT_ARGS[@]}" > "$ROOT/out.log" 2>&1
 rc=$?
 auto="$ROOT/monitor/.state/cc-auto-update"
 row=$(grep $'\tblock\t' "$auto/decisions.tsv" 2>/dev/null | tail -1)
@@ -6199,7 +6055,7 @@ fi
 ROOT="$WORK/t1259e"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 _restamp "$ROOT" UNATTRIBUTABLE
 env $(apply_env "$ROOT") bash "$APPLY" block --candidate 2.1.160 \
-    --reason "gate RED 6/7" --gate-evidence "$ROOT/gate.log" > "$ROOT/out.log" 2>&1
+    --reason "gate RED 6/7" --gate-evidence "$ROOT/gate.log" "${COMPAT_ARGS[@]}" > "$ROOT/out.log" 2>&1
 rc=$?
 auto="$ROOT/monitor/.state/cc-auto-update"
 if (( rc == 3 )) && grep -q $'\tblock-unattributable\t' "$auto/decisions.tsv" 2>/dev/null \
@@ -6218,7 +6074,7 @@ fi
 #      the false block had no way to express.
 ROOT="$WORK/t1259f"; make_apply_root "$ROOT" "2.1.150" "2.1.160"
 env $(apply_env "$ROOT") bash "$APPLY" block --candidate 2.1.160 \
-    --reason "gate RED 6/7" --gate-evidence "$ROOT/gate.log" > "$ROOT/out.log" 2>&1
+    --reason "gate RED 6/7" --gate-evidence "$ROOT/gate.log" "${COMPAT_ARGS[@]}" > "$ROOT/out.log" 2>&1
 rc=$?
 auto="$ROOT/monitor/.state/cc-auto-update"
 row=$(grep $'\tblock\t' "$auto/decisions.tsv" 2>/dev/null | tail -1)
@@ -6232,7 +6088,7 @@ fi
 # audit trail could not express.
 _restamp "$ROOT" "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 env $(apply_env "$ROOT") bash "$APPLY" block --candidate 2.1.160 \
-    --reason "gate RED 6/7" --gate-evidence "$ROOT/gate.log" > "$ROOT/out2.log" 2>&1
+    --reason "gate RED 6/7" --gate-evidence "$ROOT/gate.log" "${COMPAT_ARGS[@]}" > "$ROOT/out2.log" 2>&1
 row2=$(grep $'\tblock\t' "$auto/decisions.tsv" 2>/dev/null | tail -1)
 if [[ "$row2" == *"attribution=gated-tree-DIFFERS-from-live-clone"* ]] \
    && grep -q 'the drift figures above describe the LIVE CLONE' "$ROOT/out2.log"; then
@@ -6264,7 +6120,7 @@ _prod_block() {
     local c="$2"
     local why="$3"
     env $(apply_env "$r") bash "$APPLY" block --candidate "$c" --reason "$why" \
-        > "$r/prod.log" 2>&1
+        "${COMPAT_ARGS[@]}" > "$r/prod.log" 2>&1
 }
 
 # (t7) THE PRODUCTION SHAPE reaches the third outcome, via the conventional
@@ -6505,8 +6361,11 @@ h1438_pr_stubs "$ROOT"
 env $(apply_env "$ROOT") CC_AUTO_TMUX="$ROOT/tmux" CC_AUTO_GATE_PR_CMD="$ROOT/h1438-pr" CC_AUTO_GATE_PR_ACTIVITY_CMD="$ROOT/h1438-act" \
     bash "$APPLY" safe --candidate 2.1.160 --gate-evidence "$ROOT/gate.log" --surfaces-clear $SURF_OK $(cl_ok) --no-orchestrator-restart > "$ROOT/out.log" 2>&1
 rc=$?
-if (( rc == 30 )) && [[ ! -f "$ROOT/monitor/.state/cc-version-local" ]]; then
-    pass "#1438 gate × --no-orchestrator-restart: the gate STAYS (rc 30, no pin) — a watcher restart is still a restart"
+# #1657: the gate has no deferring arm left, so "the gate STAYS" is observed as
+# the gate having RUN (its record rows), not as a deferral.
+if (( rc == 0 )) && grep -q $'\tdeployment-gate\t' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv" 2>/dev/null \
+   && grep -q $'\tpr-under-active-review-noted\tpr=PR991' "$ROOT/monitor/.state/cc-auto-update/decisions.tsv" 2>/dev/null; then
+    pass "#1438/#1657 gate × --no-orchestrator-restart: the gate STILL RUNS (its rows are written) — a watcher restart is still a restart; nothing defers"
 else
     fail "#1438 gate × --no-orchestrator-restart wrong (rc=$rc)"
 fi

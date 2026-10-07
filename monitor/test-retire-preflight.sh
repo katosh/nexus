@@ -1302,9 +1302,14 @@ _sk1190_plant() {
     bash -c 'exec bash "$1/skeptic-channel.sh" await "${@:2}"' _ "$_sk1190_dir" "$@" \
         >/dev/null 2>&1 </dev/null &
     _p=$!
+    # ANCHORED on the exec'd argv. The `bash -c 'exec …'` wrapper's own argv
+    # ALSO contains `skeptic-channel.sh` and `await`, so an unanchored
+    # `*skeptic-channel.sh*await*` returned before the exec landed, and the
+    # non-vacuity checks below then read the WRAPPER's argv. Measured: 33 of
+    # 200 plants at load 40 under the old pattern, 0 of 200 anchored.
     for _i in 1 2 3 4 5 6 7 8 9 10; do
         case "$(ps -o args= -p "$_p" 2>/dev/null)" in
-            *skeptic-channel.sh*await*) printf '%s' "$_p"; return 0 ;;
+            "bash $_sk1190_dir/skeptic-channel.sh await"*) printf '%s' "$_p"; return 0 ;;
         esac
         sleep 0.2
     done

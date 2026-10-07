@@ -4,7 +4,10 @@
 # #1026).
 #
 # Usage:  bash monitor/watcher/textguard-lint.sh [<repo-root>] [--rule R1|R2|R3]
+#         bash monitor/watcher/textguard-lint.sh --files [<repo-root>]
 #   prints one `<rule>\t<file>:<line>\t<text>` row per site; exit 1 if any.
+#   --files prints the POPULATION instead — one repo-relative path per line,
+#   every file the scan reads — and exits 0 (your-org/nexus-code#1747).
 #
 # ---------------------------------------------------------------------------
 # THE THESIS
@@ -110,10 +113,17 @@
 # "No member found" is a claim about THIS SEARCH, not about the population.
 set -uo pipefail
 
-ROOT="${1:-}"; RULE=""
+# `--files` prints the POPULATION — so the guard's `gp_population` can forward
+# to it instead of keeping a second copy of the selection below
+# (your-org/nexus-code#1747; the device is count-fallback-lint.sh's, #1494).
+# Before it existed test-textguard-lint.sh declared no population, so
+# `guards-for-diff` could never select it, and that invisibility shipped a CI
+# red on PR #1745.
+ROOT=""; RULE=""; MODE=scan   # ROOT from the positional only: `${1:-}` would take `--files` as a root
 while (( $# > 0 )); do
     case "$1" in
         --rule) RULE="${2:-}"; shift 2 ;;
+        --files) MODE=files; shift ;;
         -*)     printf 'textguard-lint: unknown option: %s\n' "$1" >&2; exit 2 ;;
         *)      ROOT="$1"; shift ;;
     esac
@@ -133,15 +143,30 @@ roots=( "$ROOT/monitor" )
 [[ -d "$ROOT/.github" ]] && roots+=( "$ROOT/.github" )
 [[ -d "$ROOT/skills"  ]] && roots+=( "$ROOT/skills"  )
 
+# THE SELECTION, factored out so `--files` and the scan cannot disagree: ONE
+# predicate with two consumers. A `gp_population` that re-stated this `case`
+# would be a second implementation of the population, and it would drift.
+_tgl_selected0() {   # -> NUL-separated selected paths
+    local f
+    while IFS= read -r -d '' f; do
+        case "$f" in */.git/*) continue ;; esac
+        case "${f##*/}" in
+            *.sh|ng|sandbox-notify) ;;
+            *) continue ;;
+        esac
+        printf '%s\0' "$f"
+    done < <(find "${roots[@]}" -type f -print0)
+}
+
+if [[ "$MODE" == files ]]; then
+    _tgl_selected0 | while IFS= read -r -d '' f; do printf '%s\n' "${f#"$ROOT"/}"; done
+    exit 0
+fi
+
 hits=0
 emit() { printf '%s\t%s:%s\n' "$1" "$2" "$3"; hits=$(( hits + 1 )); }
 
 while IFS= read -r -d '' f; do
-    case "$f" in */.git/*) continue ;; esac
-    case "${f##*/}" in
-        *.sh|ng|sandbox-notify) ;;
-        *) continue ;;
-    esac
 
     # ---- R1: line-unit census with a nonzero equality ---------------------
     # The target must be provably a TRACKED SOURCE file. `$SVC_CALLS`,
@@ -222,7 +247,7 @@ while IFS= read -r -d '' f; do
             done <<< "$mint"
         fi
     fi
-done < <(find "${roots[@]}" -type f -print0)
+done < <(_tgl_selected0)
 
 if (( hits > 0 )); then
     printf '\ntextguard-lint: %d site(s).\n' "$hits" >&2

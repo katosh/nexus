@@ -286,7 +286,7 @@ else
         say "push:        ok"
         delivered=1
     else
-        say "push:        FAILED — $PUSH_BIN exited nonzero (2=no backend configured, 3=all configured backends failed):"
+        say "push:        FAILED — $PUSH_BIN exited nonzero (2=no backend configured, 3=all configured backends failed, 5/6=email refused by the mail policy):"
         printf '%s\n' "$push_err" | sed 's/^/    /' >&2
     fi
 fi

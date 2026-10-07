@@ -60,6 +60,75 @@ detect (watcher) → inform (emit) → evaluate (you, this guide)
 Never `npm install`-bump the pin off the back of the emit alone. The
 emit is an *advisory*; the gate is the *authority*.
 
+## The hold policy — the default is to UPDATE (<your-org>/nexus-code#1657)
+
+Operator, 2026-09-27: *"The cc-update should only be held if there is real
+concern nexus-code could not work anymore … In other cases it is actually more
+costly if we cannot update and all users are stuck on older cc and model
+selection."* "Gated" above means *nothing updates blindly*; it does **not**
+mean *anything uncertain holds*. Measured over 2026-08-27..09-27: 25
+evaluations, 5 real compat holds (2.1.250/251/252, 2.1.278, 2.1.281) and
+roughly four times as many non-apply rows that said nothing about the
+candidate (12 `safe-deferred`, 8 `safe-refused`, 5 `skipped-awaiting-operator`,
+2 blocks that were not the candidate's).
+
+One classifier decides, `monitor/_cc-hold-policy.sh:cc_hold_class`:
+
+| class | what it is | what happens |
+|---|---|---|
+| **COMPAT** | a gate scenario or a probe fails **on the candidate**, and passes on the installed version (the control); the fix is tracked on an issue | **hold.** `apply.sh block --evidence … --issue … --control …`. Re-evaluated automatically when the live HEAD moves (the fix landed) and on every daily fire. No operator step. |
+| **NOT-COMPAT** | everything else that did not apply: a deferral, a refused apply (gate evidence, changelog accounting, live-tree drift), a gate that refused or could not be attributed, a block without candidate-attributed evidence | **never holds.** `retry-at` re-fires the evaluator within `CC_AUTO_RETRY_SECONDS` (3 h, at most `CC_AUTO_RETRY_MAX_PER_DAY` = 4 a day); the cause is OUR defect and is filed. |
+| APPLIED / AUDIT | the bump landed / an intermediate row | clears / leaves the schedule |
+
+What changed in code, so the next reader does not rediscover it:
+
+- **The deployment gate has no deferring arm.** Active review joined the
+  restart-path PR arm (#1526 follow-up) and the board arms (2026-09-12) as a
+  RECORD (`pr-under-active-review-noted`).
+- **A gate RED the installed version shares is not the candidate's.** Run the
+  control gate (`gate.sh --version <installed>`) on the same tree and pass it as
+  `safe --control-gate-evidence`; the shared red scenarios are recorded as
+  UNMEASURED for this bump (`gate-red-preexisting`) and cannot pay a `gate`
+  surface label. The control must be a DIFFERENT run whose `version:` stamps
+  are all the installed version, on the same tree, and the candidate must fail
+  no assertion the control does not (per scenario, digit runs folded). A NEW
+  failing assertion inside an already-red scenario is candidate-attributed:
+  that is COMPAT evidence, and `safe` refuses (round 2, skeptic F1).
+- **A malformed hold HOLDS.** A `block` carrying ANY evidence field whose
+  contract is incomplete (a dropped `--issue`/`--control`, a gate claim the
+  log does not bear out) is recorded as a COMPAT hold marked
+  `contract=incomplete`, exit 12, with a filed defect — never applied. Only a
+  block with no evidence field at all is `block-not-compat`. `safe` refuses a
+  candidate held at this HEAD within the evidence window (exit 13). Never
+  follow a `block` with `safe` (round 2, skeptic F2).
+- **A dirty gated tree is accepted when the live clone carries the same
+  tracked edits** (`dirty_digest=` on the tree stamp; `gated-tree-dirty-accepted`).
+- **The gate's exemption ratchet is routed, not dropped.** The tmux-lint
+  manifest count is checked after the scenario list is known; a count that
+  moved only OUTSIDE the files the gate executes is `=== gate-hygiene: FAIL …`
+  and the scenarios run (2.1.283 was refused before any scenario on
+  2026-09-27 for two exemptions in suites the gate never runs). "Outside" is
+  DERIVED and narrow: a `test-*.sh` suite that is not a gate scenario, that no
+  non-suite shell file under `monitor/` names on a code line, with no harness
+  file globbing `test-*`. Everything else — pane-state.sh, spawn-worker.sh,
+  paste-followup.sh, ng, the hooks, the harness — is INSIDE and still
+  refuses, for both kill and shim-writer pragmas: that is sandbox safety
+  (round 2, skeptic F3).
+- **Changelog completeness is bounded.** It still refuses, because it is what
+  makes the evaluator read every entry — and the changelog is where 2.1.278's
+  and 2.1.281's breaks were found while the gate was GREEN. After
+  `CC_AUTO_CHANGELOG_GAP_AFTER` (2) earlier refused runs of the same
+  candidate, the gap is recorded (`changelog-gap`) and the apply proceeds.
+- **Guard 4 no longer waits for an operator.** It skips only a COMPAT hold, only
+  on the day it was recorded, only at an unchanged HEAD.
+- **`apply.sh retry-now --reason …`** is the supported "look again now".
+- **The shared floor tracks the verified cc**: see "Floor vs local pin" below.
+
+What did NOT change: a COMPAT failure still holds; a candidate still needs a
+GREEN gate (or a control-shared RED) and a read changelog; the evaluator still
+never touches remote nexus-code (#1529). The control gate runs the INSTALLED
+binary on the SAME live tree — not another tree.
+
 ## What is REVERSIBLE and what is NOT — read this before you defer anything
 
 **OPERATOR DIRECTIVE, `<your-org>/nexus-code#1492` (<operator>, 2026-09-08):**
@@ -1601,6 +1670,18 @@ The classifier greps raw ANSI off the live pane. Current signatures
   TUI's, so it rots on a different schedule and is the one most likely
   to survive a TUI release; (a) and (b) are the TUI's. Check all three.
   Carried as the FIELD `auth=expired`.
+  **The strings are only a PREFILTER since `<your-org>/nexus-code#1659`**:
+  a pane merely QUOTING them (the orchestrator discussing an expiry) used
+  to raise the label. The evidence is now the RENDER — a `●`/spinner glyph
+  and the text after it painted in ONE non-default foreground, with the
+  string inside that same-fg leading run (assistant prose paints text in
+  the default fg; user messages and code blocks carry no such glyph), and
+  a live-spinner row (`… (`, token counter, `esc to interrupt`) refused.
+  So a release that paints the error TEXT in the default fg, drops the
+  leading glyph, or changes the retry row's suffix to `(` returns
+  `none` just as a reword does. Re-capture both renders on the candidate
+  (monitor/cc-harness, mock 401 `authentication_error`) and check
+  `…/auth-expired-*-realmodel-284.ansi` still describe them.
 - **`_detect_queued_message`** — the literal `Press up to edit queued
   messages`, which Claude Code paints IN PLACE OF the input row while a
   turn is in flight with text submitted behind it. Note the ASCII space,
@@ -1717,12 +1798,11 @@ The auto-unstick state machine matches literal dialog text:
   left on its menu and logged `cascade-refused`), never a wrong Enter;
   the pane-state side still keys on the two literals alone, so a pane
   that merely QUOTES them reads `blocked overlay=rate-limit`.
-- **Case C (api-error chip)** — a two-`grep -F` AND on
-  `API Error: {"type":"error"` and `"Internal server error"`. These are
-  a RENDERED API-error payload, i.e. bytes the candidate composes: a
-  change to the chip's framing, or to the inner message text, silently
-  stops the auto-retry and the pane sits wedged on an error nothing
-  clears. Not covered by any gate scenario.
+- **Case C — retired** (<your-org>/nexus-code#1670): nothing in
+  `_unstick.sh` keys on the API-error render any more, so there is no
+  Case C row to re-check. A failed turn is the `StopFailure` hook's
+  (`turn-failure-emit.sh`), whose payload fields — not the render — are
+  what a candidate must preserve.
 
 **What the gate covers here, precisely.** `test-realmodel-blocked-question.sh`
 drives a live AskUserQuestion overlay and asserts `_has_blocked_overlay`,
@@ -2242,6 +2322,12 @@ One command, and it is the only surface here whose drift invalidates
 monitor/grep-delegation-arms.sh          # 0 reviewed · 1 BROKEN · 3 N/A · 4 unreviewed
 ```
 
+For a CANDIDATE's snapshot (booted under the harness, so the live binary is
+still the old build) name its build: `--snapshot <file> --cc-version <candidate>`.
+A snapshot file carries no version, and without `--cc-version` the tool says
+`unknown (snapshot)` and exits 4 rather than filing the arms under the live
+binary's version (<your-org>/nexus-code#1670).
+
 **What it is about.** Claude Code's shell snapshot installs `grep` as a shell
 FUNCTION running ugrep embedded in the `claude` executable — except that it
 opens with a loop whose `case` arms hand certain ARGUMENTS to `command grep`
@@ -2299,14 +2385,17 @@ FOUR harness contracts, all EXPERIMENTAL or undocumented:
   passes (it pins the key explicitly) — so CHECK THE ENV by hand:
   `printenv CLAUDE_CODE_SESSION_ID` in a candidate session.
 - **The host's per-monitor OUTPUT LIMITS** (skeptic F1/F4 on `#1535`): a
-  token bucket `pce(dce=10, Ate=2000)` — 10 batches, refill one per 2000 ms,
-  consumed per 200 ms batch (`mIs=200`) — whose empty-bucket arm DISCARDS the
-  batch and later delivers only `[plugin monitor "…" suppressed N events]`;
-  a per-line cut `bVe=500` and a per-batch cut `ylr=3000`. The dispatcher
-  paces emits ≥ 2500 ms apart (`EMIT_MIN_GAP_MS`) and composes lines ≤ 480
-  chars head-first. A release that tightens either constant silently
-  re-opens both holes; a release that loosens them costs nothing. Re-read
-  the constants from the candidate's strings (`dce=`, `Ate=`, `bVe=`).
+  token bucket of capacity 10 batches, refill one per 2000 ms, consumed per
+  200 ms batch — whose empty-bucket arm DISCARDS the batch and later delivers
+  only `[plugin monitor "…" suppressed N events]`; a per-line cut of 500 and
+  a per-batch cut of 3000 (the same on 2.1.272, .283, .287, .288, .289).
+  The dispatcher paces emits ≥ 2500 ms apart (`EMIT_MIN_GAP_MS`) and
+  composes lines ≤ 480 chars head-first. A release that tightens either constant silently
+  re-opens both holes; a release that loosens them costs nothing. Minified
+  names move every build, so never grep for them: run
+  `monitor/cc-harness/probe-2g-limits.py <claude.exe> <label>`, which matches
+  by structure (`#1734`); rc 3 means UNRESOLVED, so record the 2g limits as
+  unverified, never as unchanged.
 - **The footer token `· N monitor ·` / `N monitor still running`** —
   `pane-state.sh:_footer_handle_counts` reads it, and
   `_longjob_dispatcher_discount` subtracts the idle dispatcher's handle
@@ -2524,8 +2613,8 @@ Combine the gate result with the changelog review:
 | Verdict | When | Action |
 |---|---|---|
 | **safe to bump** | gate GREEN **and** every surface key (`2a 2b 2c-paste 2c-vi 2d 2e`) carries an honest evidence class (no unsubstantiated `empirical`) **and** `2b`/`2c-paste`/`2c-vi`/`2d` are each cleared by `gate`, `empirical` or `reachability` — **never** by `source-inspection` and never by changelog silence (see "Silence is not clearance") **and** every changelog entry of every release in the delta is dispositioned **and** every OPAQUE release (published, no section) carries your `--opaque-disposition <v>=accepted:<reason>` judgment (see "Dispositioning an OPAQUE release", Step 1 — accept unless you have EVIDENCE it breaks the nexus) **and** the live tree equals the effective pin (below) | proceed to Step 5 |
-| **needs manual review** | gate GREEN but changelog flags VI-mode / hook / settings / CLI changes (2c/2d/2e), **or** a minor/major version jump, **or** any of 2b/2c/2d rests on `source-inspection` (an opaque release is NOT a needs-review trigger on its own: you judge it and record `accepted`/`blocked`, `#1526`) | do the targeted manual check for the flagged surface; if it holds, bump; if uncertain, surface on `<your-org>/nexus-code` with the specifics (never the asset repo) |
-| **block** | gate RED, **or** a confirmed contract break you can't mitigate, **or** EVIDENCE that an opaque release breaks the nexus (`--opaque-disposition <v>=blocked:<evidence>`) | do NOT bump. Fix the affected `_detect_*` / dialog signature / hook first (capture a fresh fixture), land that, re-gate. Surface the blocker on `<your-org>/nexus-code` (issue or `cc-compat` PR), never the asset repo. |
+| **needs manual review** | gate GREEN but changelog flags VI-mode / hook / settings / CLI changes (2c/2d/2e), **or** a minor/major version jump, **or** any of 2b/2c/2d rests on `source-inspection` (an opaque release is NOT a needs-review trigger on its own: you judge it and record `accepted`/`blocked`, `#1526`) | do the targeted manual check for the flagged surface. If it shows a break on the candidate that the installed version does not have → **block** (COMPAT). Otherwise **bump**, with the surface labelled honestly: an uncertain or undrivable check is recorded, it does not hold the update (#1657). |
+| **block** (COMPAT — the only hold) | a gate scenario or probe that fails on the candidate **and passes on the installed version** (a RED the control shares is NOT a block — `safe --control-gate-evidence`), **or** EVIDENCE that an opaque release breaks the nexus (`--opaque-disposition <v>=blocked:<evidence>`) | do NOT bump: `apply.sh block --evidence gate:<scenario>\|probe:<file> --issue <url> --control '<installed>: passed'`. Fix the affected `_detect_*` / dialog signature / hook (capture a fresh fixture) in a separate worker. The routine re-gates by itself when the live HEAD moves and daily. Surface on `<your-org>/nexus-code`, never the asset repo. |
 
 **Clone freshness is NOT a verdict input** (operator directive,
 `<your-org>/nexus-code#1475`, 2026-09-06: *"The update should not depend on
@@ -2742,7 +2831,7 @@ printf '%s\n' "<candidate>" > monitor/.state/cc-version-local
 monitor/install-claude-local.sh
 # 3. NO commit, NO push, NO package.json edit. The version lives in
 #    gitignored local state; nothing goes to the shared repo. (Floor
-#    advances are a SEPARATE, deliberate maintainer PR — see "Floor vs
+#    advances are proposed by monitor/cc-floor.sh as a bot PR — see "Floor vs
 #    local pin" in the Notes below.)
 # 4. restart the watcher so it loads the new binary. This restart IS
 #    manual: the version-aware auto-restart (_version_restart.sh) hashes
@@ -3050,8 +3139,22 @@ inner mechanism, not a substitute for it.
   and does NOT track each ~daily release. Your gated bump (Step 5)
   advances only the **operator-local pin**
   (`monitor/.state/cc-version-local`, gitignored); it never touches the
-  floor. The maintainer raising the floor is a **separate, deliberate
-  PR** on `<your-org>/nexus-code`, out of scope for this routine.
+  floor directly. **The floor now TRACKS the verified cc** (operator,
+  2026-09-27, #1657: *"whenever we make an update to dev, we should make the
+  current cc the new floor"*): at most hourly, when the integration branch
+  moved or a newer version was gate-verified here, the watcher tick runs
+  `monitor/cc-floor.sh propose --if-base-moved`, which opens ONE bot PR
+  (`cc-floor/<version>`) raising `package.json` to the version this nexus
+  runs **and** applied through the gate (a `safe-bumped*` row), superseding
+  older `cc-floor/*` PRs for STRICTLY LOWER versions only; with a HIGHER one
+  open it stands down, and it never re-opens a version whose PR a human
+  closed unmerged; a branch left by a cut-off run is resumed rather than
+  re-written (round 2, skeptic F5). It never lowers the floor, never touches
+  `package-lock.json`, and never checks anything out (API only, #1529). An
+  operator pulling the integration branch therefore reads a floor that some
+  nexus has gate-verified and can update to at their next convenience; their
+  own routine still gates it on their host. Disable with
+  `monitor.cc_auto_update.floor_propose: false`.
   `monitor/_cc-version.sh` is the single resolver
   (`effective = local-pin else floor`); both `install-claude-local.sh`
   and the watcher gate baseline read it.

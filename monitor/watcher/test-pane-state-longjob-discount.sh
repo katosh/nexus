@@ -38,12 +38,12 @@ SID="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 HB="$NEXUS_STATE_DIR/heartbeat/ljw.json"
 jq -n --arg s "$SID" --argjson now "$NOW" '{window:"ljw", session_id:$s, state:"idle", last_activity:$now, external_waits:[]}' > "$HB"
 MYST=$(awk '{print $22}' /proc/$$/stat)
-ledger() {   # <key> <last_poll> <active> [<pid> <pid_start> <window>]
+ledger() {   # <key> <last_poll> <active> [<pid> <pid_start> <window> <service> <muted>]
     # Defaults to THIS suite's own live pid + kernel start-time, so the liveness
     # gate (skeptic F2) is satisfied by a real process, never by a planted number.
     mkdir -p "$NEXUS_STATE_DIR/longjob/$1"
-    jq -n --argjson lp "$2" --argjson a "$3" --argjson pid "${4:-$$}" --arg ps "${5:-$MYST}" --arg w "${6:-ljw}" --arg svc "${7:-polling}" \
-        '{version:2, pid:$pid, pid_start:$ps, last_poll:$lp, poll_seconds:20, service:$svc, active:$a, muted:0, window:$w}' > "$NEXUS_STATE_DIR/longjob/$1/dispatcher.json"
+    jq -n --argjson lp "$2" --argjson a "$3" --argjson pid "${4:-$$}" --arg ps "${5:-$MYST}" --arg w "${6:-ljw}" --arg svc "${7:-polling}" --argjson mu "${8:-0}" \
+        '{version:2, pid:$pid, pid_start:$ps, last_poll:$lp, poll_seconds:20, service:$svc, active:$a, muted:$mu, window:$w}' > "$NEXUS_STATE_DIR/longjob/$1/dispatcher.json"
     rm -rf "$NEXUS_STATE_DIR/longjob/$1/watches"; mkdir -p "$NEXUS_STATE_DIR/longjob/$1/watches"
 }
 spec() {   # <key> <id> <retired:true|false> — a watch spec in the spool, the honest source of `active`
@@ -69,6 +69,20 @@ ledger "sid-$SID" $(( NOW - 10 )) 0; spec "sid-$SID" j1 true
 echo "=== C1: a fresh, live, NOT-SERVING ledger (kill switch) must NOT discount ==="
 ledger "sid-$SID" $(( NOW - 10 )) 0 $$ "$MYST" ljw disabled
 [[ "$(state_of)" == working-background ]] && ok "C1: service=disabled → NOT discounted (a handle the dispatcher is not accounting for stays a handle)" || bad "C1: $(state_of)"
+
+echo "=== #1638: a MUTED dispatcher with ZERO live watches holds nothing → idle ==="
+# `muted` is reached only after the live/owned/fresh/serving tests pass, so a
+# muted dispatcher is an armed one whose event cap is spent. Pre-fix only the
+# literal `armed` was discounted, so this pane read working-background for ever
+# and retire-window refused a finished worker (16 h, nichecompass).
+# PREDICTED FLIP for "discount only `armed`": the first row goes
+# working-background; the two controls below it do not move.
+ledger "sid-$SID" $(( NOW - 10 )) 0 $$ "$MYST" ljw polling 1
+[[ "$(state_of)" == idle ]] && ok "#1638: muted, 0 active watches → idle (same as armed, 0 active)" || bad "#1638 muted/0: $(state_of)"
+ledger "sid-$SID" $(( NOW - 10 )) 1 $$ "$MYST" ljw polling 1; spec "sid-$SID" j1 false
+[[ "$(state_of)" == working-background ]] && ok "#1638 control: muted WITH a live watch → working-background (not discounted; a muted watch wakes nobody, so it is not the armed self-waking hold either)" || bad "#1638 muted/1: $(state_of)"
+ledger "sid-$SID" $(( NOW - 10000 )) 0 $$ "$MYST" ljw polling 1
+[[ "$(state_of)" == working-background ]] && ok "#1638 control: a STALE ledger with muted=1 reads stale, not muted → NOT discounted" || bad "#1638 muted stale: $(state_of)"
 
 echo "=== stale ledger, active=0 → working-background (a stopped dispatcher is not silence) ==="
 ledger "sid-$SID" $(( NOW - 10000 )) 0
@@ -210,6 +224,11 @@ if (( _pt_ok == 1 )); then
     [[ "$out" == state=idle* && "$out" == *" bg_longjob=1"* && "$out" != *"bg_shells="* && "$out" != *"bg_cpu="* ]] \
         && ok "#1546: the idle line the exclusion DECIDED carries bg_longjob=1 — and no bg_shells=/bg_cpu= (nothing for a reader keyed on those to select)" \
         || bad "#1546 idle record: $out"
+    ledger "sid-$SID" $(( NOW - 10 )) 0 "$_pt_d1" "$_pt_s1" ljw polling 1
+    out=$(_pt_run "$_pt_c1")
+    [[ "$out" == state=idle* && "$out" == *" bg_longjob=1"* ]] \
+        && ok "#1638 PRODUCTION SHAPE: the same grandchild dispatcher MUTED with 0 active → its root excluded from the census → idle bg_longjob=1" \
+        || bad "#1638 tree muted/0: $out"
     ledger "sid-$SID" $(( NOW - 10 )) 0 "$$" "$MYST"
     out=$(_pt_run "$_pt_c1")
     [[ "$out" == state=working-background* && "$out" == *"bg_shells=1"* && "$out" == *"bg_longjob=0"* ]] \
@@ -407,7 +426,7 @@ if (( _pt_ok == 1 )); then
     #
     # PREDICTED FLIP SET for "delete the born_ticks loop from _pane_longjob_root":
     # E1 and E1b and S-old go `idle`. MUST NOT FLIP: E2 (an exec'd dispatcher
-    # with NO pre-exec child stays `idle`), S-young, S-legacy, and K1 above (a
+    # with NO pre-exec child stays `idle`), S-old control, S-young, S-legacy, and K1 above (a
     # ledger with no `born_ticks` at all is read as it always was).
     _LJ="$REPO_ROOT/monitor/longjob-watch.sh"
     _lj_case() {   # <sid> <payload> → sets _lj_claude, _lj_hb, _lj_now; rc 1 when the dispatcher never armed
@@ -487,16 +506,45 @@ if (( _pt_ok == 1 )); then
     else
         bad "#1627: the first real dispatcher never armed — the case is unmeasured"
     fi
-    # The READER alone, on the K1 tree (wrapper → fake dispatcher → a `sleep 1`
-    # it re-forks), with a PLANTED born_ticks: independent of the real script's
-    # timing, and the only way to stage "older" deterministically.
+    # The READER alone, with a PLANTED born_ticks: independent of the real
+    # script's timing, and the only way to stage "older" deterministically.
     jq -n --arg s "$SID" --argjson now "$NOW" '{window:"ljw", session_id:$s, state:"idle", last_activity:$now, external_waits:[]}' > "$HB"
-    _lj_plant() { ledger "sid-$SID" $(( NOW - 10 )) 0 "$_pt_d1" "$_pt_s1"; jq --arg bt "$1" '.born_ticks=$bt' "$NEXUS_STATE_DIR/longjob/sid-$SID/dispatcher.json" > "$WORK/l.tmp" && mv "$WORK/l.tmp" "$NEXUS_STATE_DIR/longjob/sid-$SID/dispatcher.json"; }
-    _lj_plant 4611686018427387904
-    out=$(_pt_run "$_pt_c1")
-    [[ "$out" == state=working-background* && "$out" == *"bg_longjob=0"* ]] \
-        && ok "#1565 S-old: born_ticks LATER than every child's start (each child predates the dispatcher's birth) → nothing excluded → working-background" \
-        || bad "#1565 S-old: $out"
+    _lj_plant() {   # <born_ticks> [<dispatcher pid> <its start ticks>] — default: the K1 dispatcher
+        ledger "sid-$SID" $(( NOW - 10 )) 0 "${2:-$_pt_d1}" "${3:-$_pt_s1}"
+        jq --arg bt "$1" '.born_ticks=$bt' "$NEXUS_STATE_DIR/longjob/sid-$SID/dispatcher.json" > "$WORK/l.tmp" && mv "$WORK/l.tmp" "$NEXUS_STATE_DIR/longjob/sid-$SID/dispatcher.json"
+    }
+    # S-old NEEDS A CHILD THAT EXISTS AT THE READ (#1703). On the K1 tree the
+    # dispatcher's only child is the `sleep 1` it re-forks, and between one
+    # sleep's reap and the next fork it has NO child: the born_ticks loop has
+    # nothing to refuse on, the root is excluded, and the read is `idle` —
+    # correctly, for that instant. Measured on the K1 tree with S-old's plant:
+    # 1 `idle` in 47 reads on an unloaded host; once in CI (zsh, jobs 4). So
+    # S-old reads a tree whose dispatcher ALSO holds a persistent `sleep 300`,
+    # forked by the dispatcher itself, and the control below it plants
+    # born_ticks one tick BEFORE that child's start — the same tree reads idle,
+    # so the S-old row's verdict is the born_ticks comparison, not the tree.
+    _PT_DISP_HELD='bash -c "bash -c \"sleep 300 & while :; do sleep 1; done\" ; true"'
+    _pt_spawn "$_PT_DISP_HELD & sleep 240"; _pt_c9="$_pt_claude"; _pt_h9=""
+    if _pt_d9=$(_pt_find_disp "$_pt_c9"); then
+        for _i in $(seq 1 80); do
+            for _k in $(pgrep -P "$_pt_d9" -x sleep 2>/dev/null); do [[ "$( { tr '\0' ' ' < "/proc/$_k/cmdline"; } 2>/dev/null )" == "sleep 300 " ]] && _pt_h9="$_k"; done
+            [[ -n "$_pt_h9" ]] && break; sleep 0.25
+        done
+    fi
+    if [[ -n "$_pt_h9" ]]; then
+        _lj_plant 4611686018427387904 "$_pt_d9" "$(_pt_st "$_pt_d9")"
+        out=$(_pt_run "$_pt_c9")
+        [[ "$out" == state=working-background* && "$out" == *"bg_longjob=0"* ]] \
+            && ok "#1565 S-old: born_ticks LATER than every child's start (each child predates the dispatcher's birth) → nothing excluded → working-background" \
+            || bad "#1565 S-old: $out"
+        _lj_plant "$(( $(_pt_st "$_pt_h9") - 1 ))" "$_pt_d9" "$(_pt_st "$_pt_d9")"
+        out=$(_pt_run "$_pt_c9")
+        [[ "$out" == state=idle* && "$out" == *" bg_longjob=1"* ]] \
+            && ok "#1565 S-old control: the SAME tree, born_ticks one tick before the held child's start → every child younger → idle (the S-old verdict is the comparison)" \
+            || bad "#1565 S-old control: $out"
+    else
+        bad "#1565 S-old: the held-child rig did not come up — the case is unmeasured"
+    fi
     _lj_plant "$_pt_s1"
     out=$(_pt_run "$_pt_c1")
     [[ "$out" == state=idle* && "$out" == *" bg_longjob=1"* ]] \
@@ -545,6 +593,89 @@ printf '{"hook_event_name":"PostToolUse","session_id":"%s","tool_name":"Bash","t
     | MONITOR_LONGJOB_AUTO_WATCH=false bash "$HOOK" >/dev/null 2>&1
 [[ ! -f "$NEXUS_STATE_DIR/longjob/sid-$SID/watches/auto-slurm-4444.json" ]] && ok "MONITOR_LONGJOB_AUTO_WATCH=false → no auto watch (the knob selects)" || bad "knob off still watched"
 [[ "$(jq -r '.external_waits[] | select(.id=="4444") | .kind' "$HB")" == slurm ]] && ok "…while the hook's own wait is still declared (the knob is the watch's, not the hook's)" || bad "hook wait lost when knob off"
+
+echo "=== #1727: job id 0 is never armed, and an unarmed launch is NEVER SILENT ==="
+# `jid=$(sbatch --parsable j.sh); echo $?` printed `0`; the `--parsable` row's
+# id field took it as the job id, the hook armed `auto-slurm-0`, and
+# `sacct -j 0` answered about unrelated jobs for ~9.5 h. And when no id was
+# parsed the hook said nothing at all. Every case below runs against an ARMED
+# ledger (fresh poll, this suite's own live pid), so `add` itself returns 0 for
+# a legitimate id — the control that makes "stdout empty" mean "armed".
+_h1727() {   # <cmd> <stdout> [dismissed-id] → H_OUT (hook stdout), H_RC
+    jq -n --arg s "$SID" --arg d "${3:-}" '{window:"ljw", session_id:$s, state:"busy", external_waits:[],
+        dismissed_waits:(if $d == "" then [] else [{kind:"slurm", id:$d}] end)}' > "$HB"
+    H_OUT=$(jq -nc --arg s "$SID" --arg c "$1" --arg o "$2" \
+        '{hook_event_name:"PostToolUse",session_id:$s,tool_name:"Bash",tool_input:{command:$c},tool_response:{stdout:$o}}' \
+        | MONITOR_LONGJOB_AUTO_WATCH=true bash "$HOOK" 2>/dev/null); H_RC=$?
+}
+_na_ctx() { jq -r 'select(.hookSpecificOutput.hookEventName == "PostToolUse") | .hookSpecificOutput.additionalContext' <<<"$H_OUT" 2>/dev/null; }
+W1727="$NEXUS_STATE_DIR/longjob/sid-$SID/watches"
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'sbatch j.sh' 'Submitted batch job 123456'
+[[ -f "$W1727/auto-slurm-123456.json" && $H_RC -eq 0 ]] && ok "#1727 CONTROL: a legit id (123456) is still armed as auto-slurm-123456" || bad "#1727 control: legit id not armed (rc=$H_RC): $(ls "$W1727" 2>&1)"
+[[ -z "$H_OUT" ]] && ok "#1727 CONTROL: the ARMED case prints nothing" || bad "#1727 control: armed case printed: $H_OUT"
+
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'J=$(sbatch --parsable j.sh); echo $?' '0'
+(( H_RC == 0 )) && ok "#1727 the hook exits 0 on the \$(…) + echo \$? call (never blocks the sbatch)" || bad "#1727 rc=$H_RC"
+[[ ! -e "$W1727/auto-slurm-0.json" ]] && ok "#1727 \`J=\$(sbatch --parsable j.sh); echo \$?\` → NO auto-slurm-0 watch" || bad "#1727 auto-slurm-0 was armed"
+[[ -z "$(jq -r '.external_waits[] | select(.kind=="slurm" and .id=="0") | .id' "$HB")" ]] && ok "#1727 …and no slurm:0 wait is recorded for the orphan-async resolver either" || bad "#1727 slurm:0 wait recorded: $(cat "$HB")"
+_c=$(_na_ctx)
+[[ "$_c" == "longjob NOT ARMED"*"ng longjob add slurm:<id>"*"ARMED"* ]] && ok "#1727 …and the hook prints a PostToolUse additionalContext: longjob NOT ARMED + the arming command" || bad "#1727 no NOT ARMED notice: '$H_OUT'"
+
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'J=$(sbatch --parsable j.sh); echo $J' '123457'
+[[ ! -e "$W1727/auto-slurm-123457.json" && "$(_na_ctx)" == *"inside \$(…)"* ]] && ok "#1727 a bare number inside a \$(…) submission is not trusted even when it looks real — NOT ARMED names why (declared cost)" || bad "#1727 subst distrust: $(ls "$W1727" 2>&1) out=$H_OUT"
+
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'sbatch --parsable j.sh' '0'
+[[ ! -e "$W1727/auto-slurm-0.json" && "$(_na_ctx)" == *"refused job id(s) 0"* ]] && ok "#1727 a bare \`0\` from a NON-substituted --parsable call is refused by the job-id predicate and named" || bad "#1727 predicate: $(ls "$W1727" 2>&1) out=$H_OUT"
+
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'sbatch --parsable j.sh' ''
+[[ "$(_na_ctx)" == "longjob NOT ARMED"*"no job id could be read"* ]] && ok "#1727 empty stdout (no id parsed) → NOT ARMED, not silence" || bad "#1727 empty stdout silent: '$H_OUT'"
+
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'sbatch run.sh' 'Submitted batch job 123458' 123458
+[[ -z "$H_OUT" && ! -e "$W1727/auto-slurm-123458.json" ]] && ok "#1727 a DISMISSED job stays silent (declare-no-wait is deliberate)" || bad "#1727 dismissed: out=$H_OUT"
+
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 $'sbatch a.sh; sbatch b.sh\nsbatch c.sh | tee sub.log' $'Submitted batch job 123460\nSubmitted batch job 123461\nSubmitted batch job 123462'
+[[ -f "$W1727/auto-slurm-123460.json" && -f "$W1727/auto-slurm-123461.json" && -f "$W1727/auto-slurm-123462.json" && -z "$H_OUT" ]] \
+    && ok "#1727 CONTROL: a multi-sbatch call (incl. \`sbatch … | tee\`) arms every id and prints nothing" || bad "#1727 multi: $(ls "$W1727" 2>&1) out=$H_OUT"
+
+ledger "sid-$SID" "$(( $(date +%s) - 100000 ))" 0
+_h1727 'sbatch j.sh' 'Submitted batch job 123459'
+[[ "$(_na_ctx)" == *"job(s) 123459: "*"rc=3"*"NOT ARMED"* ]] && ok "#1727 a recorded watch whose dispatcher is NOT ARMED (stale ledger, add rc 3) is reported, not swallowed" || bad "#1727 add rc 3 silent: '$H_OUT'"
+
+# ONLY THE ID SBATCH ITSELF PRINTS MAY ARM (#1727 core). The proj-overlay2
+# shape: a NON-substituted `sbatch --parsable` beside `grep -c` lines whose bare
+# `1`s were read as the job id (slurm:1).
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'sbatch --parsable j.sh; grep -c a f; grep -c b f' $'123470\n1\n1'
+[[ ! -e "$W1727/auto-slurm-1.json" && ! -e "$W1727/auto-slurm-123470.json" ]] && ok "#1727 core: sbatch --parsable beside two grep -c lines arms NOTHING (no slurm:1)" || bad "#1727 core: armed from a count: $(ls "$W1727" 2>&1)"
+[[ "$(_na_ctx)" == *"other commands beside sbatch --parsable"* ]] && ok "#1727 core: …and NOT ARMED names why (other commands may have printed the number)" || bad "#1727 core: notice: '$H_OUT'"
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'sbatch --parsable j.sh; grep -c x f' '1'
+[[ ! -e "$W1727/auto-slurm-1.json" ]] && ok "#1727 core: a FAILED sbatch beside one grep -c (stdout just '1') arms nothing" || bad "#1727 core: slurm:1 armed from a lone count"
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'cd /x && sbatch --parsable j.sh | tee sub.log' '123471'
+[[ -f "$W1727/auto-slurm-123471.json" && -z "$H_OUT" ]] && ok "#1727 core CONTROL: cd && sbatch --parsable | tee still arms its id silently" || bad "#1727 core control tee: $(ls "$W1727" 2>&1) out=$H_OUT"
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'for f in a b; do sbatch --parsable "$f"; done' $'123472\n123473'
+[[ -f "$W1727/auto-slurm-123472.json" && -f "$W1727/auto-slurm-123473.json" && -z "$H_OUT" ]] && ok "#1727 core CONTROL: a for-loop of --parsable submissions arms every id" || bad "#1727 core control loop: $(ls "$W1727" 2>&1) out=$H_OUT"
+
+# FD REDIRECTIONS AND env ASSIGNMENTS ARE NOT COMMANDS (ncbundle17-sk, PR 1745):
+# the `&` in `2>&1` once split off a segment `1`, and `env A=1` left `A=1`.
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'sbatch --parsable j.sh 2>&1' '123480'
+[[ -f "$W1727/auto-slurm-123480.json" && -z "$H_OUT" ]] && ok "#1727 core CONTROL: sbatch --parsable … 2>&1 still arms" || bad "#1727 core 2>&1: $(ls "$W1727" 2>&1) out=$H_OUT"
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'sbatch --parsable j.sh 2>&1 | tee sub.log' '123481'
+[[ -f "$W1727/auto-slurm-123481.json" && -z "$H_OUT" ]] && ok "#1727 core CONTROL: … 2>&1 | tee still arms" || bad "#1727 core 2>&1|tee: $(ls "$W1727" 2>&1) out=$H_OUT"
+ledger "sid-$SID" "$(date +%s)" 0
+_h1727 'env A=1 sbatch --parsable j.sh' '123482'
+[[ -f "$W1727/auto-slurm-123482.json" && -z "$H_OUT" ]] && ok "#1727 core CONTROL: env A=1 sbatch --parsable still arms" || bad "#1727 core env A=1: $(ls "$W1727" 2>&1) out=$H_OUT"
 
 echo; echo "=== summary: $PASS passed, $FAIL failed ==="
 (( FAIL == 0 )) && { echo "ALL TESTS PASSED"; exit 0; }; exit 1

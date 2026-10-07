@@ -52,3 +52,8 @@
 # written down. Only column 4 is corrected; nothing else in the row changed.
 sync	2026-08-25	e256d4a	7e132e36	first sync recorded here; anchors recovered from the sync report (MIRROR_HEAD_AFTER corrected 2026-09-18 from c696071, which was that commit's parent)
 sync	2026-09-17	4825e3e1	a76b8b8c	promotion sync: main fast-forwarded to this source sha the same night; MIRROR_HEAD_AFTER read off the live mirror after the push, not recovered from a report
+# 2026-09-27 correction: the first push of this sync (db6283b8) carried a neutral
+# commit identity. By operator decision it was replaced, via force-with-lease pinned
+# to db6283b8, with 2038899c: same tree 541c7988, same parent cb9b546d, operator
+# identity. The fork had not fetched db6283b8. Column 4 and the note changed.
+sync	2026-09-27	739e76b5	2038899c	sync of source 739e76b5 (ports mirror fix cb9b546d as f40921e9, genericizes review-flagged example values); merge base scrub_old(4825e3e1), 0 conflicts; operator commit identity; MIRROR_HEAD_AFTER read off the live mirror after the push (MIRROR_HEAD_AFTER corrected 2026-09-27 from db6283b8, see comment above)

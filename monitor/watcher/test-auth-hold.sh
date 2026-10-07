@@ -92,7 +92,13 @@ gp_population() {
         "$FIX/blocked-login-method-realmodel-268.ansi" \
         "$FIX/blocked-login-signin-realmodel-268.ansi" \
         "$FIX/auth-expired-retrying-realmodel-268.ansi" \
-        "$FIX/auth-expired-terminal-realmodel-268.ansi"
+        "$FIX/auth-expired-terminal-realmodel-268.ansi" \
+        "$FIX/auth-expired-terminal-quoted-above-realmodel-284.ansi" \
+        "$FIX/auth-expired-retrying-realmodel-284.ansi" \
+        "$FIX/idle-auth-quoted-prose-realmodel-284.ansi" \
+        "$FIX/idle-auth-quoted-code-block-realmodel-284.ansi" \
+        "$FIX/idle-auth-quoted-user-msg-realmodel-284.ansi" \
+        "$FIX/busy-auth-quoted-spinner-todo-synthetic.ansi"
 }
 gp_handle "$@"
 
@@ -179,6 +185,9 @@ _ps_fixtures_required=(
     auth-expired-retrying-realmodel-268 auth-expired-terminal-realmodel-268
     idle-empty-post-turn-realmodel blocked-workspace-trust-realmodel
     blocked-unnamed-dialog-synthetic blocked-askuq-synthetic
+    auth-expired-terminal-quoted-above-realmodel-284 auth-expired-retrying-realmodel-284
+    idle-auth-quoted-prose-realmodel-284 idle-auth-quoted-code-block-realmodel-284
+    idle-auth-quoted-user-msg-realmodel-284 busy-auth-quoted-spinner-todo-synthetic
 )
 for _f in "${_ps_fixtures_required[@]}"; do
     [[ -r "$FIX/$_f.ansi" ]] || env_fail "fixture missing or unreadable: $FIX/$_f.ansi"
@@ -272,6 +281,53 @@ assert_eq "A/neg workspace-trust overlay unchanged" \
     "$(ovl_of blocked-workspace-trust-realmodel)" workspace-trust
 assert_eq "A/neg unnamed dialog overlay unchanged" \
     "$(ovl_of blocked-unnamed-dialog-synthetic)" dialog
+
+echo "== A2. #1659: a pane QUOTING the strings is not a logged-out pane =="
+
+# your-org/nexus-code#1659. `_detect_auth_expired` was a plain string match, so
+# the orchestrator DISCUSSING an expiry raised `auth=expired` twice on
+# 2026-09-27 (each raise emailed the operator and switched off the liveness
+# remedies). Every fixture here is a real 2.1.284 render except the spinner one,
+# which is one word away from a real frame.
+#
+# NON-VACUITY FIRST: each quoted fixture must actually CONTAIN the strings in
+# its plain text, or an `auth=` of '' below would prove nothing. Read through a
+# local strip rather than the classifier, so the check cannot agree with itself.
+_a2_plain() { sed -E $'s/\x1b\\[[0-9;?]*[a-zA-Z]//g' "$FIX/$1.ansi"; }
+for f in idle-auth-quoted-prose-realmodel-284 idle-auth-quoted-code-block-realmodel-284 \
+         idle-auth-quoted-user-msg-realmodel-284; do
+    for needle in 'please run /login' 'login expired' 'token has expired'; do
+        if grep -qiF -e "$needle" <<<"$(_a2_plain "$f")"; then
+            pass "A2/precondition $f contains '$needle'"
+        else
+            fail "A2/precondition $f does NOT contain '$needle' — the auth='' assertion below would be vacuous"
+        fi
+    done
+done
+if grep -qiF -e 'login expired' <<<"$(_a2_plain busy-auth-quoted-spinner-todo-synthetic)"; then
+    pass "A2/precondition busy-auth-quoted-spinner-todo-synthetic contains 'login expired' on its spinner row"
+else
+    fail "A2/precondition the spinner fixture lost its 'login expired' todo text — vacuous"
+fi
+
+for f in idle-auth-quoted-prose-realmodel-284 idle-auth-quoted-code-block-realmodel-284 \
+         idle-auth-quoted-user-msg-realmodel-284 busy-auth-quoted-spinner-todo-synthetic; do
+    assert_eq "A2/#1659 $f carries NO auth= (the transcript QUOTES the strings; the harness did not render them)" \
+        "$(auth_of "$f")" ""
+done
+assert_eq "A2/#1659 quoted prose still classifies idle" "$(state_of idle-auth-quoted-prose-realmodel-284)" idle
+assert_eq "A2/#1659 quoted spinner-todo still classifies busy" "$(state_of busy-auth-quoted-spinner-todo-synthetic)" busy
+
+# TRUE POSITIVES ON THE CURRENT BUILD, with the quoted transcript ABOVE the real
+# render in the same frame: the label must survive the discriminator.
+assert_eq "A2/#1659 real 2.1.284 terminal render below quoted text → auth=expired" \
+    "$(auth_of auth-expired-terminal-quoted-above-realmodel-284)" expired
+assert_eq "A2/#1659 real 2.1.284 terminal render state" \
+    "$(state_of auth-expired-terminal-quoted-above-realmodel-284)" idle
+assert_eq "A2/#1659 real 2.1.284 mid-retry render → auth=expired" \
+    "$(auth_of auth-expired-retrying-realmodel-284)" expired
+assert_eq "A2/#1659 real 2.1.284 mid-retry render state" \
+    "$(state_of auth-expired-retrying-realmodel-284)" busy
 
 echo "== B. POSITIVE CONTROL: an UNRECOGNISED login surface must not read 'no login' =="
 
@@ -1320,7 +1376,10 @@ rm -f "$STATE_DIR/turn-failure/orchestrator.json"
 #        epoch falls back to freshness  (skeptic oplivesk F3)
 # I(F5) 7  first-seen recorded, ceiling fails open, logged, raw sensor still
 #        true, first-seen removed, alert text x2  (skeptic oplivesk F5)
-EXPECTED=164
+# A2 20  #1659: 10 non-vacuity preconditions (3 fixtures x 3 strings + the
+#        spinner todo), 4 quoted fixtures carry no auth=, 2 quoted states,
+#        2 real-2.1.284 true positives x auth/state
+EXPECTED=184
 if (( PASS + FAIL != EXPECTED )); then
     printf '  FAIL: ASSERTION COUNT MISMATCH — %d ran, %d expected. An assertion did not execute.\n' \
         "$(( PASS + FAIL ))" "$EXPECTED" >&2

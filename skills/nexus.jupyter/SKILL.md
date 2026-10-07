@@ -201,6 +201,10 @@ never sees. (Tests/fixtures override via `NEXUS_SERVICES_REGISTRY`
 | `<project>/.jupyter/labsh-service.opts` | persisted extra `labsh start` args (`--ip`, `--https`) |
 | `<project>/.jupyter/labsh-service.log` | supervisor log; jupyter's own stdout is `.jupyter/labsh.bg.log` — `svc.sh logs` tails both |
 | `monitor/services.registry` | the service row (operator-local, gitignored) |
+| `monitor/labsh-pin.sh` + `labsh-uvx-shim/uvx` | pins the SERVER env's resolution to the last env that served healthy, so a restart reuses the cached env instead of a >30-min cold rebuild (<your-org>/nexus-code#1676). `labsh-pin.sh status` shows it; `labsh-pin.sh refresh` builds the current release set in the background, smoke-tests it, and swaps the pin (the supervisor does this weekly, `LABSH_SVC_REPIN_DAYS`); the next restart picks it up warm. `LABSH_SVC_PIN=0` starts unpinned |
+| `<project>/.jupyter/labsh-server.pin` | the frozen server-env requirements; `.prev` = the pin a refresh replaced, `.bad` = a pin a start could not resolve against (quarantined) |
+| `_labsh_build_evidence.sh` `labsh_build_release` | the ONE verdict on whether a cold build in flight may be killed — used by svc.sh's guard, the watcher and the supervisor's reaper. Protected inside the ceiling (1800 s), then only while still making progress, released when stalled 600 s or past the 7200 s hard cap |
+| `monitor/uv-builds-gc.sh` | reaps the half-built `builds-v0/.tmp*` dirs a KILLED cold build leaves in the uv cache (<your-org>/nexus-code#1686; `uv cache prune` does not touch them). DRY RUN unless `--yes`; keeps anything younger than 24 h, newer than a live uv builder or cache-lock holder, held open (cwd/fd/map) by a live process, or targeted by `environments-v2`. Reports `du` (upper bound) and `freed` (link-count-1 bytes, lower bound) per dir. Slow on NFS: run under `ng longjob run` |
 
 Troubleshooting starts with `monitor/svc.sh logs <name>` (tails the
 supervisor log and jupyter's own stdout together); `monitor/svc.sh

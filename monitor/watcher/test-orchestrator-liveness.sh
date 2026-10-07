@@ -1442,6 +1442,41 @@ verdict=$(_orchestrator_liveness_decide "$HB" "$PR" "$LP" "$PIN" "$US" "$RS" 120
 unset -f _auth_hold_active _auth_hold_probe
 unset TARGET STATE_DIR
 
+# --- 1720: signals 3 & 4 are read under $CLAUDE_CONFIG_DIR/projects too ---
+#
+# your-org/nexus-code#1720. With CLAUDE_CONFIG_DIR set, Claude Code writes the
+# session jsonl and its tool-results/ under <cfg>/projects/<slug>/, which in
+# agent-sandbox can be a REAL directory, not a symlink to ~/.claude/projects.
+# Pre-fix both witnesses were read only under <home_dir>/.claude/projects, so
+# a live orchestrator's post-paste writes were invisible. The explicit
+# home_dir (the fake-home seam) has NO projects dir here.
+
+reset_world
+now=$(date +%s)
+write_paste_ts "$LP" "$(( now - 350 ))"
+printf '%s\n' "$VALID_SID" > "$PIN"
+CFG_HOME_1720="$WORK/home-1720"
+CFG_DIR_1720="$WORK/cfg-1720"
+mkdir -p "$CFG_HOME_1720" "$CFG_DIR_1720/projects/$(slug_of "$FAKE_NEXUS_ROOT")"
+cfg_jsonl_1720="$CFG_DIR_1720/projects/$(slug_of "$FAKE_NEXUS_ROOT")/$VALID_SID.jsonl"
+printf '{"type":"assistant"}\n' > "$cfg_jsonl_1720"
+touch -d "30 seconds ago" "$cfg_jsonl_1720"
+if ( unset NEXUS_CC_HOME; CLAUDE_CONFIG_DIR="$CFG_DIR_1720" HOME="$CFG_HOME_1720" \
+     _orchestrator_pasted_without_response "$HB" "$PR" "$LP" "$PIN" "$FAKE_NEXUS_ROOT" "$CFG_HOME_1720" ); then
+    fail "1720: post-paste jsonl under \$CLAUDE_CONFIG_DIR/projects unseen — read as pasted-without-response (rc=0)"
+else
+    pass "1720: post-paste jsonl ONLY under \$CLAUDE_CONFIG_DIR/projects → responded (rc=1)"
+fi
+# Control: the same jsonl back-dated BEFORE the paste → no response seen.
+touch -d "400 seconds ago" "$cfg_jsonl_1720"
+if ( unset NEXUS_CC_HOME; CLAUDE_CONFIG_DIR="$CFG_DIR_1720" HOME="$CFG_HOME_1720" \
+     _orchestrator_pasted_without_response "$HB" "$PR" "$LP" "$PIN" "$FAKE_NEXUS_ROOT" "$CFG_HOME_1720" ); then
+    pass "1720 control: a PRE-paste jsonl under \$CLAUDE_CONFIG_DIR/projects is not a response (rc=0)"
+else
+    fail "1720 control: a pre-paste jsonl read as a response (rc=1)"
+fi
+rm -rf "$CFG_DIR_1720" "$CFG_HOME_1720"
+
 # --- summary -------------------------------------------------------------
 
 echo

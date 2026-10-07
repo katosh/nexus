@@ -65,6 +65,23 @@ _respawn_dir=${_respawn_dir:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/nu
 # when `pd_paste_file` is not defined, rather than hand-rolling a second site.
 # shellcheck source=../_paste-deliver.sh
 [[ -r "$_respawn_dir/../_paste-deliver.sh" ]] && source "$_respawn_dir/../_paste-deliver.sh"
+# Where Claude Code transcripts live (your-org/nexus-code#1720): the resume
+# decider and the target-absent liveness veto look under EVERY root
+# `cc_transcript_roots` prints — $CLAUDE_CONFIG_DIR/projects as well as
+# $HOME/.claude/projects — never at a hardcoded `$HOME/.claude/projects`.
+# shellcheck source=../_cc_transcript_roots.sh
+[[ -r "$_respawn_dir/../_cc_transcript_roots.sh" ]] && source "$_respawn_dir/../_cc_transcript_roots.sh"
+if ! declare -F cc_transcript_roots >/dev/null 2>&1; then
+    # Partial tree (a fixture that copied this file without monitor/): the
+    # same roots in the same order, without the realpath dedup — which only
+    # saves a repeated stat, since every caller asks "found under ANY root".
+    cc_transcript_roots() {
+        [[ -n "${NEXUS_CC_HOME:-}" ]]     && printf '%s\n' "$NEXUS_CC_HOME/projects"
+        [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] && printf '%s\n' "$CLAUDE_CONFIG_DIR/projects"
+        [[ -n "${1:-${HOME:-}}" ]]        && printf '%s\n' "${1:-$HOME}/.claude/projects"
+        return 0
+    }
+fi
 if ! declare -F _tmux_pane_is_dead >/dev/null 2>&1; then
     # FAIL-CLOSED FALLBACK (#745). Without the real predicate we cannot
     # tell a live pane from a corpse, and a paste into a corpse kills the
@@ -423,11 +440,16 @@ _respawn_verify_target_absent() {
         done
         # Pinned-session jsonl: any write after the streak started is
         # positive evidence of a live orchestrator process.
+        # Every transcript root is consulted (your-org/nexus-code#1720):
+        # with CLAUDE_CONFIG_DIR set Claude Code writes under IT, and a
+        # `$HOME`-only lookup lost this veto — the false-dead direction.
         if [[ -n "$pinned" && -n "${NEXUS_ROOT:-}" ]]; then
-            local slug jsonl
+            local slug jsonl root
             slug="${NEXUS_ROOT//[^a-zA-Z0-9-]/-}"
-            jsonl="${HOME}/.claude/projects/${slug}/${pinned}.jsonl"
-            if [[ -f "$jsonl" ]]; then
+            while IFS= read -r root; do
+                [[ -n "$root" ]] || continue
+                jsonl="${root}/${slug}/${pinned}.jsonl"
+                [[ -f "$jsonl" ]] || continue
                 mtime=$(date +%s -r "$jsonl" 2>/dev/null || echo 0)
                 [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
                 if (( mtime > streak_start )); then
@@ -435,7 +457,7 @@ _respawn_verify_target_absent() {
                         "$pinned" "$mtime" "$streak_start"
                     return 1
                 fi
-            fi
+            done < <(cc_transcript_roots)
         fi
     fi
 
@@ -597,13 +619,22 @@ _respawn_choose_resume_mode() {
         # doesn't fail the regex.
         pinned_sid="${pinned_sid//[[:space:]]/}"
         if [[ "$pinned_sid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
-            local slug proj_dir
+            # Found under ANY transcript root is found
+            # (your-org/nexus-code#1720). A `$HOME/.claude/projects`-only
+            # lookup answered `fresh` for EVERY boot and respawn of an
+            # operator whose `$CLAUDE_CONFIG_DIR/projects` is a real
+            # directory rather than a symlink to it — at rc 0, silently.
+            # The set is a superset of the old single root, so nothing that
+            # resumed before stops resuming.
+            local slug root
             slug="${nexus_root//[^a-zA-Z0-9-]/-}"
-            proj_dir="$HOME/.claude/projects/${slug}"
-            if [[ -f "$proj_dir/$pinned_sid.jsonl" ]]; then
-                printf 'resume\t%s\n' "$pinned_sid"
-                return 0
-            fi
+            while IFS= read -r root; do
+                [[ -n "$root" ]] || continue
+                if [[ -f "$root/${slug}/$pinned_sid.jsonl" ]]; then
+                    printf 'resume\t%s\n' "$pinned_sid"
+                    return 0
+                fi
+            done < <(cc_transcript_roots)
         fi
     fi
     printf 'fresh\t\n'
@@ -1056,11 +1087,40 @@ _respawn_wait_for_input_ready() {
     local target="$1" budget_s="$2" poll_s="$3" pane_state_bin="$4"
     local max_dismiss="${5:-5}"
     local log_fn="${6:-:}"
-    local deadline state dismiss_count
+    # 7th arg: STABLE READS (your-org/nexus-code#1715, fifth instance). 0 = the
+    # legacy gate (`empty|idle` on one read). N > 0 is the RESUME gate: a pane
+    # still restoring a transcript is NOT ready, and `empty` ("could not tell")
+    # is not evidence that it has finished. Ready = a POSITIVE prompt state
+    # (idle, working-background, working-self-paced) with nothing typed in the
+    # box (input blank, ghost or absent) on N CONSECUTIVE reads whose
+    # content_hash is UNCHANGED — the screen has stopped redrawing, which is the
+    # observable sign that the restored transcript has rendered. Measured
+    # 2026-10-02 17:19: a paste made on `state=empty` 13 s into a resume was
+    # lost (the restore render clearing the box is INFERRED); nothing ran it.
+    local stable_n="${7:-0}"
+    [[ "$stable_n" =~ ^[0-9]+$ ]] || stable_n=0
+    local deadline state dismiss_count raw inp hash prev_hash="" streak=0
     deadline=$(( $(date +%s) + budget_s ))
     dismiss_count=0
     while (( $(date +%s) < deadline )); do
-        state=$(_respawn_probe_state "$target" "$pane_state_bin" 2>/dev/null || true)
+        if (( stable_n > 0 )); then
+            raw=$(_respawn_probe_raw "$target" "$pane_state_bin" 2>/dev/null || true)
+            state=$(_respawn_field "$raw" state); inp=$(_respawn_field "$raw" input); hash=$(_respawn_field "$raw" content_hash)
+            case "$state" in
+                idle|working-background|working-self-paced)
+                    if [[ "$inp" == blank || "$inp" == ghost || -z "$inp" ]]; then
+                        if (( streak > 0 )) && [[ "$hash" == "$prev_hash" ]]; then streak=$(( streak + 1 )); else streak=1; fi
+                        prev_hash="$hash"
+                        if (( streak >= stable_n )); then printf '%s' "$state"; return 0; fi
+                        sleep "$poll_s"; continue
+                    fi
+                    ;;
+            esac
+            streak=0; prev_hash=""
+            if [[ "$state" != blocked ]]; then sleep "$poll_s"; continue; fi
+        else
+            state=$(_respawn_probe_state "$target" "$pane_state_bin" 2>/dev/null || true)
+        fi
         case "$state" in
             empty|idle)
                 printf '%s' "$state"
@@ -1110,7 +1170,17 @@ _respawn_wait_for_submit_evidence() {
     local target="$1" budget_s="$2" pane_state_bin="$3"
     local deadline state
     deadline=$(( $(date +%s) + budget_s ))
-    while (( $(date +%s) < deadline )); do
+    # PROBE FIRST, TEST THE DEADLINE AFTER (#1703). The deadline is in WHOLE
+    # seconds, so a 1 s budget is "until the next second boundary": when that
+    # boundary passes between the two `date` forks above and below — likelier
+    # the slower a fork is — a deadline-first loop ran ZERO probes and returned
+    # an empty state. The caller then asked `_respawn_box_is_brief`, which read
+    # the pane as `busy` (the turn WAS running) and so "nothing of ours in the
+    # box", and reported a delivered brief UNDELIVERED (rc 4). Measured: PR CI
+    # run 36840086024, test-spawn-fresh-orchestrator.sh Test 4 at PSI 66%, and
+    # deterministically at FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS=0. A verify
+    # that never looked is not a verify that saw nothing.
+    while :; do
         state=$(_respawn_probe_state "$target" "$pane_state_bin" 2>/dev/null || true)
         case "$state" in
             busy)
@@ -1118,6 +1188,7 @@ _respawn_wait_for_submit_evidence() {
                 return 0
                 ;;
         esac
+        (( $(date +%s) < deadline )) || break
         sleep 0.5
     done
     printf '%s' "${state:-}"
@@ -1202,9 +1273,17 @@ _respawn_paste_prompt_file() {
     if ! pd_paste_file ":=${target}" "${norm:-$prompt_file}" "$buf"; then
         rc=1
     else
-        sleep 0.1
-        if ! tmux send-keys -t ":=${target}" Enter 2>/dev/null; then
-            rc=1
+        # NO BLIND ENTER ON A RE-PASTE (your-org/nexus-code#1715, skeptic F1):
+        # a re-paste happens 30-45 s after an UNDELIVERED — exactly when an
+        # operator reacts — and the only clearance before this Enter would be a
+        # pane reading seconds stale under load, so text typed in that gap would
+        # be submitted WITH the brief. _RESPAWN_NO_BLIND_ENTER=1 skips it; the
+        # caller's first Enter is then the pd_box_is_ours equality.
+        if [[ "${_RESPAWN_NO_BLIND_ENTER:-0}" != 1 ]]; then
+            sleep 0.1
+            if ! tmux send-keys -t ":=${target}" Enter 2>/dev/null; then
+                rc=1
+            fi
         fi
     fi
     # THE VERIFY STAGE NEEDS THE BYTES THAT WERE PASTED (your-org/nexus-code#1596):
@@ -1249,8 +1328,51 @@ _respawn_field() {
 #   2. the input box's content IS the brief that was pasted (`pd_box_is_ours`).
 # (1) alone is a shape every typed draft has. Everything else — idle, `input=?`,
 # no `input=` field, an unreadable pane, a missing primitive, a box holding
-# somebody else's text or paste — is rc 1: NO Enter.
+# somebody else's text or paste — is rc 1: NO Enter. In `strict` mode an
+# INDETERMINATE reading (`empty`, `unknown`, unreadable) is rc 2: NO Enter, and
+# the caller keeps looking rather than giving up (your-org/nexus-code#1674).
 # Sets _RESPAWN_BOX_WHY for the log line.
+# _respawn_box_may_still_render — rc 0 iff the reading _respawn_box_is_brief
+# last took (_RESPAWN_BOX_ST / _RESPAWN_BOX_INP) is one where our paste may yet
+# render into the box (your-org/nexus-code#1715): a blank or ghost box on a pane
+# that is neither running nor showing an overlay, or POSITIVELY typed text that
+# the equality did not (yet) accept. `input=?` (undecidable, read as a draft),
+# `busy` and `blocked` are not. An ALLOWLIST: anything else stops the wait.
+_respawn_box_may_still_render() {
+    case "${_RESPAWN_BOX_ST:-}" in busy|blocked|"") return 1 ;; esac
+    case "${_RESPAWN_BOX_INP:-}" in
+        blank|ghost) return 0 ;;
+        typed)       [[ "$_RESPAWN_BOX_ST" == user-typing ]] ;;
+        *)           return 1 ;;
+    esac
+}
+
+# _respawn_box_row <target> — the input row as the log shows it: the LAST row
+# starting with the prompt glyph (the row pd_box_is_ours reads), ASCII-projected
+# and cut to 80 bytes, quoted; '<unreadable>' when the pane cannot be captured.
+# For DIAGNOSIS only (skeptic F2): no decision reads it.
+_respawn_box_row() {
+    local cap row
+    cap=$(tmux capture-pane -p -t ":=${1}" -S -40 2>/dev/null) || { printf "'<unreadable>'"; return 0; }
+    row=$(printf '%s\n' "$cap" | LC_ALL=C awk 'index($0, "\342\235\257") == 1 { r = $0 } END { printf "%s", r }' \
+        | LC_ALL=C sed -e 's/[\x80-\xff]//g' -e 's/[[:space:]]*$//' | LC_ALL=C cut -c1-80)
+    printf "'%s'" "$row"
+}
+
+# _respawn_brief_lost <target> <pane_state_bin> — rc 0 iff a FRESH probe shows
+# the box POSITIVELY EMPTY (input blank or ghost) on a pane at a prompt state
+# that is running nothing of ours (idle, working-background, working-self-paced)
+# — the only reading on which a re-paste cannot land on an operator's draft
+# (your-org/nexus-code#1715). `empty`/`unknown` ("could not tell"), busy, an
+# overlay, typed text and `input=?` are all NO. An allowlist.
+_respawn_brief_lost() {
+    local raw st inp
+    raw=$(_respawn_probe_raw "$1" "$2" 2>/dev/null || true)
+    st=$(_respawn_field "$raw" state); inp=$(_respawn_field "$raw" input)
+    case "$st" in idle|working-background|working-self-paced) ;; *) return 1 ;; esac
+    [[ "$inp" == blank || "$inp" == ghost ]]
+}
+
 _respawn_box_is_brief() {
     local target="$1" bin="$2" file="${3:-}" mode="${4:-first}" raw st inp
     _RESPAWN_BOX_WHY=""
@@ -1259,6 +1381,9 @@ _respawn_box_is_brief() {
     # on the line, so a trailing `refined_state=…` would answer for `state`
     # (#1295 review; the same reader as monitor/_paste-deliver.sh:_pd_field).
     st=$(_respawn_field "$raw" state); inp=$(_respawn_field "$raw" input)
+    # The reading this verdict rests on, for the caller's late-render wait
+    # (your-org/nexus-code#1715). Globals, like _RESPAWN_BOX_WHY.
+    _RESPAWN_BOX_ST="$st"; _RESPAWN_BOX_INP="$inp"
 
     # ORDER IS THE DESIGN. The state token gates FIRST and the equality decides
     # INSIDE it — the same shape `pd_submit` uses, deliberately, because a
@@ -1302,10 +1427,21 @@ _respawn_box_is_brief() {
     #    verify budget would be submitted by this ONE Enter. That was the base
     #    behaviour for EVERY state; here it is narrowed to "nothing is known",
     #    and STRICT mode (the loop) refuses it outright.
+    #
+    #    STRICT mode returns 2, NOT 1, for this arm (your-org/nexus-code#1674):
+    #    "no Enter now" must not mean "stop looking". Measured on the real 2.1.284
+    #    with an 839 MB `--resume`: an Enter sent before the resumed TUI has drawn
+    #    its input box is LOST, the pasted bytes appear in the box as typed text
+    #    ~10 s later, the pane reads `empty` at 3 s and `user-typing input=typed`
+    #    from ~12 s on, and nothing submits the brief (340 s observed). The loop
+    #    used to treat that `empty` as a refusal and break — seconds before its
+    #    own Enter condition would have held (live board, 2026-09-29 13:15:00;
+    #    the operator pressed Enter by hand at 13:15:29). rc 2 = keep polling,
+    #    press nothing; the Enter still needs the equality below.
     if [[ -z "$st" || "$st" == empty || "$st" == unknown ]]; then
         if [[ "$mode" == strict ]]; then
-            _RESPAWN_BOX_WHY="state='${st:-<unreadable>}' is INDETERMINATE — one Enter was already spent on that reading; a LOOP needs the positive equality"
-            return 1
+            _RESPAWN_BOX_WHY="state='${st:-<unreadable>}' is INDETERMINATE (a resumed pane may still be loading) — no Enter on it; waiting for the box to read as the brief"
+            return 2
         fi
         _RESPAWN_BOX_WHY="state='${st:-<unreadable>}' is INDETERMINATE (not 'the box is clear') — pressing ONE Enter, the pre-#1596 behaviour narrowed to no-evidence"
         return 0
@@ -1642,7 +1778,12 @@ _respawn_orchestrator() {
     fi
 
     local pane_state_bin="${PANE_STATE_BIN:-$NEXUS_ROOT/monitor/pane-state.sh}"
-    local readiness_budget="${FRESH_SPAWN_READINESS_BUDGET_SECONDS:-30}"
+    # A RESUME restores a transcript before its box is usable, so its default
+    # budget is longer (120 s, chosen; skeptic F3: a large restore under load
+    # outlasted 60) and its gate needs STABLE reads (#1715).
+    local readiness_budget="${FRESH_SPAWN_READINESS_BUDGET_SECONDS:-$([[ "$mode" == resume ]] && echo 120 || echo 30)}"
+    local readiness_stable=0
+    [[ "$mode" == resume ]] && readiness_stable="${FRESH_SPAWN_RESUME_STABLE_READS:-3}"
     local readiness_poll="${FRESH_SPAWN_READINESS_POLL_SECONDS:-1}"
     local post_paste_verify="${FRESH_SPAWN_POST_PASTE_VERIFY_SECONDS:-3}"
     local legacy_wait="${FRESH_SPAWN_CLAUDE_WAIT_SECONDS:-5}"
@@ -1651,8 +1792,8 @@ _respawn_orchestrator() {
     # Readiness probe (pane-state-driven) or legacy fixed sleep.
     if [[ -x "$pane_state_bin" ]]; then
         local observed
-        if observed=$(_respawn_wait_for_input_ready "$target" "$readiness_budget" "$readiness_poll" "$pane_state_bin" "$max_dismiss" "$log_fn"); then
-            "$log_fn" "input-ready probe: state=${observed} (budget=${readiness_budget}s)"
+        if observed=$(_respawn_wait_for_input_ready "$target" "$readiness_budget" "$readiness_poll" "$pane_state_bin" "$max_dismiss" "$log_fn" "$readiness_stable"); then
+            "$log_fn" "input-ready probe: state=${observed} (budget=${readiness_budget}s$( (( readiness_stable > 0 )) && printf '; resume gate: %s stable reads' "$readiness_stable"))"
         else
             "$log_fn" "input-ready probe timed out after ${readiness_budget}s (last state='${observed:-unknown}'); attempting paste anyway"
         fi
@@ -1661,8 +1802,28 @@ _respawn_orchestrator() {
         sleep "$legacy_wait"
     fi
 
+    # BOUNDED RE-PASTE WHEN OUR BYTES ARE GONE (your-org/nexus-code#1715, fifth
+    # instance, 2026-10-02 17:19): the brief was pasted into a resume that was
+    # still restoring, the box later read empty (the restore render clearing it
+    # is INFERRED — the pane was not captured), no turn ever ran, and every path
+    # ended UNDELIVERED. When the verify ends UNDELIVERED and a FRESH probe shows
+    # the box POSITIVELY empty on a pane running nothing (_respawn_brief_lost),
+    # re-gate on stable reads and paste again, up to FRESH_SPAWN_REPASTE_ATTEMPTS
+    # pastes in all (3, chosen). Never into a box holding text, so an operator
+    # draft is never pasted over or submitted; every Enter stays behind the same
+    # equality. STATED RESIDUAL: "no turn started" is read as "no `busy` was ever
+    # observed"; a turn that ran AND finished between two probes would be re-sent
+    # once — a duplicate brief, the recoverable direction, against a lost one.
+    local _rp_attempt=1 _rp_max="${FRESH_SPAWN_REPASTE_ATTEMPTS:-3}"
+    [[ "$_rp_max" =~ ^[0-9]+$ ]] && (( _rp_max >= 1 )) || _rp_max=3
     local paste_rc=0
     local _RESPAWN_KEEP_PASTED=1 _RESPAWN_PASTED_FILE="" _RESPAWN_PASTED_IS_TEMP=0 _RESPAWN_BOX_WHY=""
+    while :; do
+    paste_rc=0
+    # Attempt 1 keeps the paste's own Enter (the #1591 contract); a RE-paste does
+    # not — its first Enter must be the equality (skeptic F1).
+    local _RESPAWN_NO_BLIND_ENTER=0
+    (( _rp_attempt > 1 )) && _RESPAWN_NO_BLIND_ENTER=1
     _respawn_paste_prompt_file "$target" "$prompt_file" || paste_rc=1
 
     # Post-paste verify: state=busy confirms the Enter submitted. If not
@@ -1678,11 +1839,13 @@ _respawn_orchestrator() {
     # transcript was measured ignoring Enter for longer than the 3 s verify
     # window (2026-09-11: both the first Enter and the retry 2 s later left the
     # brief in the box; an Enter ~5.5 min later submitted it). So while that
-    # evidence holds, Enter is re-sent every
-    # FRESH_SPAWN_SUBMIT_TYPED_RETRY_INTERVAL_SECONDS (default 5) until
-    # FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS (default 60) runs out. Both
-    # defaults are CHOSEN, not measured: the incident shows 2 s was too short
-    # and gives no upper bound, because nobody pressed Enter in between. 0
+    # evidence holds, Enter is re-sent after
+    # FRESH_SPAWN_SUBMIT_TYPED_RETRY_INTERVAL_SECONDS (default 5), the interval
+    # doubling to FRESH_SPAWN_SUBMIT_TYPED_RETRY_INTERVAL_MAX_SECONDS (30), until
+    # FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS (default 120; was 60 before
+    # your-org/nexus-code#1715's third instance) runs out. All three defaults
+    # are CHOSEN, not measured: the incidents show 2 s and 5 s were too short
+    # and give no upper bound, because nobody pressed Enter in between. 0
     # disables the typed-retry.
     #
     # EVERY RETRY ENTER HERE IS AN EQUALITY (your-org/nexus-code#1596). This stage
@@ -1705,31 +1868,146 @@ _respawn_orchestrator() {
     # ACCEPTED RESIDUAL, inherited from pd_box_is_ours and stated there: an
     # operator draft that is itself an 8+ character prefix of the brief's first
     # line, or an operator paste with exactly the brief's line-break count.
+    #
+    # A BLANK BOX AT THE VERIFY IS NOT YET A VERDICT (your-org/nexus-code#1715).
+    # A resumed TUI can draw the paste AFTER the 3 s verify: on the live board
+    # 2026-10-01 09:00:54 the pane read `working-background input=blank`, the
+    # brief was reported UNDELIVERED, and it rendered moments later as
+    # `[Pasted text #N +K lines]` — which the #1674 draft gate then read as an
+    # OPERATOR's typed text, refusing every later paste behind it. The paste's
+    # own Enter had landed on the then-empty box and done nothing. So while the
+    # box POSITIVELY reads blank or ghost (nothing typed, nothing running, no
+    # overlay), keep looking for up to FRESH_SPAWN_LATE_RENDER_SECONDS (default
+    # 30, a value WE CHOSE: the incident's render landed within ~2 s of the
+    # verify, and the budget is paid only on the respawn path, where the
+    # typed-retry already spends up to 60). NO NEW ENTER CONDITION: the wait
+    # ends on `busy` (submitted), on the STRICT box check passing — the same
+    # `pd_box_is_ours` equality against the bytes we pasted that every Enter
+    # here already requires — or on any refusal that is not "still blank"
+    # (typed text that is not ours, `input=?`, an overlay), which is reported
+    # UNDELIVERED exactly as before and presses nothing. An operator draft
+    # therefore cannot be submitted by this wait; it only changes WHEN the
+    # watcher stops looking. Residual, stated: a render later than the verify
+    # plus this budget is still UNDELIVERED, and its chip is then deferred by
+    # the #1674 gate as before. 0 disables the wait.
+    #
+    # TYPED-BUT-NOT-OURS IS NOT YET A VERDICT EITHER (#1715, second instance).
+    # spawn-fresh-orchestrator's full-stack recovery (2026-10-01 11:31:42, a
+    # 101-line situation report) read `user-typing input=typed` at the verify
+    # and the equality said "not the brief"; the operator later found the
+    # brief's chip in the box and sent it by hand. What the box held at that
+    # instant was not captured, so the cause is NOT established — a transient
+    # render is the reading this change bets on. The wait therefore also covers
+    # a TYPED box that fails the equality: it keeps looking, and the ONLY way
+    # out to an Enter is still the equality, so an operator draft is waited on
+    # and then reported UNDELIVERED exactly as before — never submitted. Its
+    # cost is the budget, paid once per respawn whose box holds a real draft.
     if (( paste_rc == 0 )) && [[ -x "$pane_state_bin" ]]; then
-        local submit_state
+        local submit_state _lr_rc=0 _lr_submitted=0
         if submit_state=$(_respawn_wait_for_submit_evidence "$target" "$post_paste_verify" "$pane_state_bin"); then
             "$log_fn" "post-paste verify: state=${submit_state} — turn submitted"
         else
-            if ! _respawn_box_is_brief "$target" "$pane_state_bin" "$_RESPAWN_PASTED_FILE"; then
-                "$log_fn" "post-paste verify: no submit-evidence after ${post_paste_verify}s (last state='${submit_state:-unknown}'); NO retry Enter — ${_RESPAWN_BOX_WHY}; reporting UNDELIVERED (rc 4)"
+            _RESPAWN_BOX_ST=""; _RESPAWN_BOX_INP=""
+            # On a RE-paste the first check is STRICT: an INDETERMINATE pane gets
+            # no Enter (rc 2 waits), so no Enter here rests on anything but the
+            # equality (skeptic F1).
+            local _first_mode=first _first_rc=0
+            (( _rp_attempt > 1 )) && _first_mode=strict
+            _respawn_box_is_brief "$target" "$pane_state_bin" "$_RESPAWN_PASTED_FILE" "$_first_mode" || _first_rc=$?
+            (( _first_rc != 0 )) && _lr_rc=1
+            local late_budget="${FRESH_SPAWN_LATE_RENDER_SECONDS:-30}"
+            [[ "$late_budget" =~ ^[0-9]+$ ]] || late_budget=30
+            if (( _lr_rc != 0 && late_budget > 0 )) && { (( _first_rc == 2 )) || _respawn_box_may_still_render; }; then
+                "$log_fn" "post-paste verify: no submit-evidence after ${post_paste_verify}s and the box reads state='${_RESPAWN_BOX_ST}' input='${_RESPAWN_BOX_INP}' — waiting up to ${late_budget}s for a LATE render of our paste before any verdict (your-org/nexus-code#1715)"
+                local _lr_deadline=$(( $(date +%s) + late_budget )) _lr_raw _lr_st _lr_brc
+                while (( $(date +%s) < _lr_deadline )); do
+                    _lr_raw=$(_respawn_probe_raw "$target" "$pane_state_bin" 2>/dev/null || true)
+                    _lr_st=$(_respawn_field "$_lr_raw" state)
+                    if [[ "$_lr_st" == busy ]]; then _lr_submitted=1; submit_state=busy; break; fi
+                    _respawn_box_is_brief "$target" "$pane_state_bin" "$_RESPAWN_PASTED_FILE" strict; _lr_brc=$?
+                    if (( _lr_brc == 0 )); then _lr_rc=0; break; fi
+                    if (( _lr_brc == 2 )) || _respawn_box_may_still_render; then
+                        sleep 1; continue          # not (yet) the brief, or indeterminate: look again
+                    fi
+                    break                          # a refusal that is not "still blank": the verdict stands
+                done
+                if (( _lr_submitted )); then
+                    "$log_fn" "post-paste verify: state=busy during the late-render wait — turn submitted (your-org/nexus-code#1715)"
+                elif (( _lr_rc == 0 )); then
+                    "$log_fn" "post-paste verify: our paste RENDERED late and the box IS the brief (pd_box_is_ours) — proceeding to the guarded Enter (your-org/nexus-code#1715)"
+                fi
+            fi
+            if (( _lr_submitted )); then
+                :
+            elif (( _lr_rc != 0 )); then
+                "$log_fn" "post-paste verify: no submit-evidence after ${post_paste_verify}s (last state='${submit_state:-unknown}'); NO retry Enter — ${_RESPAWN_BOX_WHY}; box: $(_respawn_box_row "$target"); reporting UNDELIVERED (rc 4)"
                 paste_rc=1
             elif tmux send-keys -t ":=${target}" Enter 2>/dev/null; then
-                "$log_fn" "post-paste verify: no submit-evidence after ${post_paste_verify}s (last state='${submit_state:-unknown}'); the brief is IN the input box, unsubmitted; retrying Enter once"
+                # The reason this Enter was allowed, as the check stated it (skeptic
+                # F2: this line used to claim "the brief is IN the input box" also
+                # when the INDETERMINATE arm allowed it), plus what the box showed.
+                "$log_fn" "post-paste verify: no submit-evidence after ${post_paste_verify}s (last state='${submit_state:-unknown}'); ${_RESPAWN_BOX_WHY:-the brief is IN the input box (pd_box_is_ours)}, unsubmitted; box: $(_respawn_box_row "$target"); retrying Enter once"
                 local retry_state typed_submitted=0 typed_n=0
                 if ! retry_state=$(_respawn_wait_for_submit_evidence "$target" "$post_paste_verify" "$pane_state_bin"); then
-                    local typed_budget="${FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS:-60}"
+                    # BOUNDED BUT PERSISTENT (your-org/nexus-code#1715, third
+                    # instance, 2026-10-02 10:56:32): a resumed TUI restoring a
+                    # large transcript under load dropped the retry Enter, and a
+                    # box that WAS the brief read "not shown to be the brief" five
+                    # seconds later — while it redrew — and this loop STOPPED on
+                    # that one reading. So: the budget is 120 s (was 60), the
+                    # Enter interval BACKS OFF from FRESH_SPAWN_SUBMIT_TYPED_RETRY_
+                    # INTERVAL_SECONDS (5) doubling to a 30 s cap, and a reading
+                    # that may still become the brief (_respawn_box_may_still_render)
+                    # is looked at again rather than final. Every Enter still
+                    # needs the equality against the bytes WE pasted, at that
+                    # instant; an operator draft is waited on, never submitted.
+                    # 120 and 30 are values WE CHOSE: the incident shows 5 s was
+                    # too short and gives no upper bound.
+                    local typed_budget="${FRESH_SPAWN_SUBMIT_TYPED_RETRY_BUDGET_SECONDS:-120}"
                     local typed_interval="${FRESH_SPAWN_SUBMIT_TYPED_RETRY_INTERVAL_SECONDS:-5}"
-                    [[ "$typed_budget" =~ ^[0-9]+$ ]] || typed_budget=60
+                    local typed_interval_max="${FRESH_SPAWN_SUBMIT_TYPED_RETRY_INTERVAL_MAX_SECONDS:-30}"
+                    [[ "$typed_budget" =~ ^[0-9]+$ ]] || typed_budget=120
                     [[ "$typed_interval" =~ ^[0-9]+$ ]] && (( typed_interval > 0 )) || typed_interval=5
+                    [[ "$typed_interval_max" =~ ^[0-9]+$ ]] && (( typed_interval_max >= typed_interval )) || typed_interval_max=$typed_interval
                     local typed_deadline=$(( $(date +%s) + typed_budget ))
-                    local typed_raw typed_input
+                    local typed_raw typed_input _rb_rc _rb_waited=0 _rb_flicker=0 _rb_blank_since=0
+                    # A box that reads EMPTY for this long after our bytes were seen
+                    # in it has LOST them (#1715, fifth instance): stop waiting for
+                    # them to come back and let the re-paste below decide. 15 s, chosen.
+                    local lost_s="${FRESH_SPAWN_LOST_PASTE_SECONDS:-15}"
+                    [[ "$lost_s" =~ ^[0-9]+$ ]] || lost_s=15
                     while (( $(date +%s) < typed_deadline )); do
                         typed_raw=$(_respawn_probe_raw "$target" "$pane_state_bin" 2>/dev/null || true)
                         retry_state=$(_respawn_field "$typed_raw" state)
                         [[ "$retry_state" == busy ]] && { typed_submitted=1; break; }
                         # The EQUALITY, re-established before EVERY Enter: a box
                         # that was the brief five seconds ago may be a draft now.
-                        if ! _respawn_box_is_brief "$target" "$pane_state_bin" "$_RESPAWN_PASTED_FILE" strict; then
+                        _respawn_box_is_brief "$target" "$pane_state_bin" "$_RESPAWN_PASTED_FILE" strict; _rb_rc=$?
+                        if (( _rb_rc == 2 )); then
+                            # INDETERMINATE: a still-loading resumed pane (#1674).
+                            # No Enter; look again. Logged once, not per poll.
+                            (( _rb_waited++ == 0 )) && "$log_fn" "post-paste verify: ${_RESPAWN_BOX_WHY} (budget ${typed_budget}s)"
+                            sleep 1
+                            continue
+                        fi
+                        if (( _rb_rc != 0 )) && _respawn_box_may_still_render; then
+                            # Not the brief at THIS instant, but a reading the brief
+                            # may yet return to (a redraw, #1715): no Enter; look
+                            # again. Logged once, not per poll.
+                            if [[ "$_RESPAWN_BOX_INP" == blank || "$_RESPAWN_BOX_INP" == ghost ]]; then
+                                (( _rb_blank_since > 0 )) || _rb_blank_since=$(date +%s)
+                                if (( $(date +%s) - _rb_blank_since >= lost_s )); then
+                                    "$log_fn" "post-paste verify: the box has read EMPTY for ${lost_s}s after holding our brief — our bytes are GONE; no Enter (your-org/nexus-code#1715)"
+                                    break
+                                fi
+                            else
+                                _rb_blank_since=0
+                            fi
+                            (( _rb_flicker++ == 0 )) && "$log_fn" "post-paste verify: ${_RESPAWN_BOX_WHY} — no Enter on it; looking again within the ${typed_budget}s budget (your-org/nexus-code#1715)"
+                            sleep 1
+                            continue
+                        fi
+                        if (( _rb_rc != 0 )); then
                             "$log_fn" "post-paste verify: typed-retry stopped — ${_RESPAWN_BOX_WHY}"
                             break
                         fi
@@ -1740,6 +2018,7 @@ _respawn_orchestrator() {
                         if retry_state=$(_respawn_wait_for_submit_evidence "$target" "$typed_interval" "$pane_state_bin"); then
                             typed_submitted=1; break
                         fi
+                        typed_interval=$(( typed_interval * 2 )); (( typed_interval > typed_interval_max )) && typed_interval=$typed_interval_max
                     done
                 fi
                 if [[ "$retry_state" == busy ]] && (( typed_n == 0 )); then
@@ -1778,7 +2057,7 @@ _respawn_orchestrator() {
                     # comment above stays: the fix is not more retries, it is
                     # that exhausting them must be REPORTED. (#1073: verify the
                     # property, not the mechanism.)
-                    "$log_fn" "post-paste verify (after retry): still no submit-evidence (last state='${retry_state:-unknown}'); reporting UNDELIVERED (rc 4)"
+                    "$log_fn" "post-paste verify (after retry): still no submit-evidence (last state='${retry_state:-unknown}'); box: $(_respawn_box_row "$target"); reporting UNDELIVERED (rc 4)"
                     paste_rc=1
                 fi
             else
@@ -1788,6 +2067,20 @@ _respawn_orchestrator() {
         fi
     fi
 
+    if (( paste_rc != 0 && _rp_attempt < _rp_max )) && [[ -x "$pane_state_bin" ]] && _respawn_brief_lost "$target" "$pane_state_bin"; then
+        _rp_attempt=$(( _rp_attempt + 1 ))
+        "$log_fn" "post-paste verify: the brief is NOT in the box and no turn ran — RE-PASTING after a stable-prompt gate (attempt ${_rp_attempt}/${_rp_max}; your-org/nexus-code#1715)"
+        (( _RESPAWN_PASTED_IS_TEMP )) && [[ -n "$_RESPAWN_PASTED_FILE" ]] && rm -f "$_RESPAWN_PASTED_FILE"
+        _RESPAWN_PASTED_FILE=""; _RESPAWN_PASTED_IS_TEMP=0
+        local _rp_obs
+        if ! _rp_obs=$(_respawn_wait_for_input_ready "$target" "$readiness_budget" "$readiness_poll" "$pane_state_bin" "$max_dismiss" "$log_fn" "${FRESH_SPAWN_RESUME_STABLE_READS:-3}"); then
+            "$log_fn" "post-paste verify: no stable empty prompt within ${readiness_budget}s (last state='${_rp_obs:-unknown}') — NOT re-pasting into a pane that is not ready; reporting UNDELIVERED (rc 4)"
+            break
+        fi
+        continue
+    fi
+    break
+    done
     (( _RESPAWN_PASTED_IS_TEMP )) && [[ -n "$_RESPAWN_PASTED_FILE" ]] && rm -f "$_RESPAWN_PASTED_FILE"
     # Released only once the verify has finished with the box (#1539 above).
     [[ -n "$_rpl_fd" ]] && exec {_rpl_fd}>&-

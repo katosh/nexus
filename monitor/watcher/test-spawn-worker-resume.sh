@@ -104,6 +104,11 @@ cp "$_test_dir/../_fm_lib.sh" "$FAKE_NEXUS/monitor/_fm_lib.sh"
 # `windows/<key>.json` and the skeptic markers, so it refuses rather than
 # writing under a key the readers will not look at.
 cp "$_test_dir/../_bookkeeping.sh" "$FAKE_NEXUS/monitor/_bookkeeping.sh"
+# The one-session-one-process guards (exit 26 / 27) live in this library,
+# sourced from spawn-worker.sh's OWN directory. Without it staged every
+# resume would print "guards are NOT checked" and the guard cases below
+# would pass on the fallback stubs rather than on the guard.
+cp "$_test_dir/../_autocontinue_plan.sh" "$FAKE_NEXUS/monitor/_autocontinue_plan.sh"
 mkdir -p "$FAKE_NEXUS/node_modules/.bin"
 cat > "$FAKE_NEXUS/node_modules/.bin/claude" <<'CLAUDE_STUB'
 #!/bin/bash
@@ -665,6 +670,139 @@ fi
 log_contents=$(cat "$STUB_LOG")
 assert_contains "spawn action-log event carries the session-id extra" \
                 "$log_contents" "--extra session-id="
+
+# ---- Test 14: one session, one process (the 2026-09-27 restart) --------
+#
+# After a --continue restart, recovery resumes the prior workers AFTER it
+# spawns the orchestrator; the orchestrator, seeing no windows, resumed three
+# of them by hand in parallel with recovery. Two guards, two instruments:
+#   exit 26 — a LIVE process already holds the session id (Claude Code's
+#             ~/.claude/sessions/<pid>.json registry, pid + procStart);
+#   exit 27 — an ACTIVE auto-continue plan lists the window as pending.
+# Each is shown to REFUSE, to be overridden by --replace, and to stand down
+# for the case it must not block (stale registry entry; recovery's own
+# token; a finished plan; a dead plan owner).
+
+# Hermetic: every agent shell exports CLAUDE_CONFIG_DIR, which OUTRANKS the
+# fake $HOME in the registry path — measured, with it set these cases read
+# the operator's LIVE registry and passed or failed on whatever was running.
+unset CLAUDE_CONFIG_DIR NEXUS_CC_SESSIONS_DIR
+SESS_DIR="$HOME/.claude/sessions"
+mkdir -p "$SESS_DIR"
+_starttime() { local st; st=$(cat "/proc/$1/stat"); st="${st##*) }"; set -- $st; printf '%s' "${20}"; }
+_reset_resume_case() { : > "$STUB_LOG"; rm -f "$SPAWN_TMP"/spawn-launcher-$WIN.*.sh; }
+_resume_explicit() {  # extra args pass through
+    STUB_TMUX_PANE_PATH="$WORKDIR" "$SCRIPT" --resume "$UUID_REPORT" -n "$WIN" -c "$WORKDIR" "$@" 2>&1
+}
+
+sleep 120 & HOLDER_PID=$!
+HOLDER_START=$(_starttime "$HOLDER_PID")
+printf '{"pid":%s,"sessionId":"%s","procStart":"%s","name":"%s","tmux":"0:@42.%%42","pidDomain":"linux:x:%s"}\n' \
+    "$HOLDER_PID" "$UUID_REPORT" "$HOLDER_START" "$WIN" "$(readlink /proc/self/ns/pid)" \
+    > "$SESS_DIR/$HOLDER_PID.json"
+
+echo '=== exit 26: a live process holds the session ==='
+_reset_resume_case
+out=$(_resume_explicit); rc=$?
+assert_eq       "resume of a live-held session exits 26"      "$rc" "26"
+assert_contains "refusal names the holder pid"                "$out" "pid=$HOLDER_PID"
+assert_contains "refusal says it would run twice"             "$out" "two panes"
+assert_not_contains "no window created on refusal"            "$(cat "$STUB_LOG")" "new-window"
+
+echo '=== --replace overrides exit 26, loudly ==='
+_reset_resume_case
+out=$(_resume_explicit --replace); rc=$?
+assert_eq       "--replace resumes anyway (exit 0)"           "$rc" "0"
+assert_contains "--replace warns the holder is live"          "$out" "WARNING session $UUID_REPORT is held by a live process"
+assert_contains "--replace really spawned"                    "$(cat "$STUB_LOG")" "new-window"
+
+echo '=== a STALE registry entry (holder dead) does not block ==='
+kill "$HOLDER_PID" 2>/dev/null; wait "$HOLDER_PID" 2>/dev/null
+_reset_resume_case
+out=$(_resume_explicit); rc=$?
+assert_eq       "dead holder → resume proceeds (exit 0)"      "$rc" "0"
+assert_not_contains "no live-holder refusal"                  "$out" "ALREADY HELD"
+
+echo '=== a registry entry from ANOTHER pid namespace does not block ==='
+# Isolate the case: the dead holder's JSON from the case above must not be
+# the thing this case reads (skeptic, #1660 m1: it was, so a liveness mutant
+# flipped THIS case too).
+rm -f "$SESS_DIR"/*.json
+sleep 120 & NS_PID=$!
+printf '{"pid":%s,"sessionId":"%s","procStart":"%s","pidDomain":"linux:x:pid:[1]"}\n' \
+    "$NS_PID" "$UUID_REPORT" "$(_starttime "$NS_PID")" > "$SESS_DIR/$NS_PID.json"
+_reset_resume_case
+out=$(_resume_explicit); rc=$?
+assert_eq       "foreign-namespace entry → proceeds (exit 0)" "$rc" "0"
+kill "$NS_PID" 2>/dev/null; wait "$NS_PID" 2>/dev/null
+rm -f "$SESS_DIR"/*.json
+
+echo '=== no registry at all → CANNOT TELL, warn and proceed ==='
+mv "$SESS_DIR" "$SESS_DIR.off"
+_reset_resume_case
+out=$(_resume_explicit); rc=$?
+assert_eq       "absent registry → proceeds (exit 0)"         "$rc" "0"
+assert_contains "absent registry is stated, not read as 'not held'" "$out" "could not determine whether a live process holds"
+mv "$SESS_DIR.off" "$SESS_DIR"
+
+PLAN="$FAKE_NEXUS/monitor/.state/auto-continue-plan.tsv"
+sleep 120 & OWNER_PID=$!
+OWNER_START=$(_starttime "$OWNER_PID")
+_write_plan() {  # _write_plan <state> <row-status> [owner-start]
+    printf '#owner\t%s\t%s\ttok-123\t%s\t%s\tcontinue\n%s\t%s\t%s\t%s\n' \
+        "$OWNER_PID" "${3:-$OWNER_START}" "$(date +%s)" "$1" "$WIN" "$UUID_REPORT" "$2" "$(date +%s)" > "$PLAN"
+}
+
+echo '=== exit 27: recovery is about to auto-continue this window ==='
+_write_plan running pending
+_reset_resume_case
+out=$(_resume_explicit); rc=$?
+assert_eq       "hand resume of a pending auto-continue exits 27" "$rc" "27"
+assert_contains "refusal names the window"                    "$out" "auto-continuing '$WIN'"
+assert_not_contains "no window created on the exit-27 refusal" "$(cat "$STUB_LOG")" "new-window"
+
+echo '=== exit 27 also matches by SESSION ID under another -n ==='
+_reset_resume_case
+out=$(STUB_TMUX_PANE_PATH="$WORKDIR" "$SCRIPT" --resume "$UUID_REPORT" -n other-name -c "$WORKDIR" 2>&1); rc=$?
+assert_eq       "same session under another window name exits 27" "$rc" "27"
+
+echo '=== recovery carries the plan token → exempt ==='
+_reset_resume_case
+out=$(NEXUS_AUTOCONTINUE_TOKEN=tok-123 _resume_explicit); rc=$?
+assert_eq       "recovery's own resume proceeds (exit 0)"     "$rc" "0"
+_reset_resume_case
+out=$(NEXUS_AUTOCONTINUE_TOKEN=wrong _resume_explicit); rc=$?
+assert_eq       "a WRONG token is not an exemption (exit 27)" "$rc" "27"
+
+echo '=== --replace overrides exit 27 ==='
+_reset_resume_case
+out=$(_resume_explicit --replace); rc=$?
+assert_eq       "--replace resumes a pending window (exit 0)" "$rc" "0"
+
+echo '=== the plan stands down: row resumed, plan done, owner dead, owner recycled ==='
+_write_plan running resumed
+_reset_resume_case; out=$(_resume_explicit); rc=$?
+assert_eq       "row no longer pending → proceeds"            "$rc" "0"
+_write_plan done pending
+_reset_resume_case; out=$(_resume_explicit); rc=$?
+assert_eq       "plan marked done → proceeds"                 "$rc" "0"
+_write_plan running pending 1
+_reset_resume_case; out=$(_resume_explicit); rc=$?
+assert_eq       "owner pid alive but start time differs (recycled) → proceeds" "$rc" "0"
+kill "$OWNER_PID" 2>/dev/null; wait "$OWNER_PID" 2>/dev/null
+_write_plan running pending
+_reset_resume_case; out=$(_resume_explicit); rc=$?
+assert_eq       "owner process gone → a dead recovery blocks nothing" "$rc" "0"
+
+echo '=== an unreadable plan is CANNOT TELL → refuse (exit 27), --replace overrides ==='
+printf 'garbage\n' > "$PLAN"
+_reset_resume_case; out=$(_resume_explicit); rc=$?
+assert_eq       "garbled plan → exit 27"                      "$rc" "27"
+assert_contains "garbled plan says it cannot tell"            "$out" "cannot tell"
+_reset_resume_case; out=$(_resume_explicit --replace); rc=$?
+assert_eq       "garbled plan + --replace → exit 0"           "$rc" "0"
+rm -f "$PLAN"
+_reset_resume_case
 
 # ---- summary ----------------------------------------------------------
 

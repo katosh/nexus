@@ -91,6 +91,13 @@ key="MOCK_PANE_STATE_${win//[^a-zA-Z0-9_]/_}"
 reset_key="MOCK_PANE_RESET_AT_${win//[^a-zA-Z0-9_]/_}"
 state="${!key:-busy}"
 reset_at="${!reset_key:-}"
+# THE REAL PRECEDENCE (pane-state.sh step 1b): an unexpired hook stamp
+# `$STATE_DIR/over-limit/<window-name>.json` answers `over-limit` BEFORE the
+# pane is read. Opt-in per index via MOCK_PANE_NAME_<idx> (#1741 S2 rows).
+name_key="MOCK_PANE_NAME_${win//[^a-zA-Z0-9_]/_}"
+if [[ -n "${!name_key:-}" && -f "${STATE_DIR:-.}/over-limit/${!name_key}.json" ]]; then
+    state=over-limit
+fi
 if [[ -n "$reset_at" ]]; then
     printf 'state=%s active=0 window=%s name=stub reset_at=%s\n' \
         "$state" "$win" "$reset_at"
@@ -864,5 +871,96 @@ assert_eq "…and NEVER stores 'unknown' — an absent row and a stored unknown 
 STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_drop "wkey"
 assert_eq "…and drops cleanly, so dead keys cannot accumulate" \
     "$(STATE_DIR="$WORK_OL_SIDECAR" _over_limit_flavour_get wkey)" ""
+
+# ---- RESET EVENTS (your-org/nexus-code#1739) --------------------------------
+echo '=== #1739/#1741 S2: a credential change releases EVERY row; any other source touches NONE ==='
+reset_state
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+    $(( NOW + 21000 )) $(( NOW - 600 )) $(( NOW + 21835 )) 0
+synth_row "w1" "w1" "worker" "3am_America/Los_Angeles" \
+    $(( NOW + 21000 )) $(( NOW - 600 )) $(( NOW + 600 )) 1
+synth_row "w2" "w2" "worker" "3am_America/Los_Angeles" \
+    $(( NOW - 60 )) $(( NOW - 600 )) $(( NOW - 5 )) 2
+before=$(cat "$(_over_limit_state_path)")
+n=$(_over_limit_expedite_all over-limit-resumed:x)
+assert_eq "R39-ol.other.count: a non-credential event changes no row" "$n" "0"
+assert_eq "R39-ol.other.bytes: the state file is byte-identical" "$(cat "$(_over_limit_state_path)")" "$before"
+n=$(_over_limit_expedite_all credential-change)
+assert_eq "R39-ol.count: all three rows released (2 clocks moved, 3 attempt caps)" "$n" "3"
+na_o=$(_over_limit_load_next_attempt "_orchestrator"); na_1=$(_over_limit_load_next_attempt "w1"); na_2=$(_over_limit_load_next_attempt "w2")
+assert_eq "R39-ol.now: the 21835 s orchestrator wake is now due" "$(( na_o <= $(date +%s) ))" "1"
+assert_eq "R39-ol.worker: the worker wake is now due" "$(( na_1 <= $(date +%s) ))" "1"
+assert_eq "R39-ol.due: the already-due row kept its own next_attempt" "$na_2" "$(( NOW - 5 ))"
+assert_eq "R39-ol.attempts: every row sits one short of the cap" \
+    "$(awk -F'\t' '{print $8}' "$(_over_limit_state_path)" | sort -u | paste -sd, -)" "3"
+assert_contains "R39-ol.log: each expedite is logged with its source" "$(cat "$LOG_LOG")" "wake expedited by reset event (credential-change)"
+
+echo '=== #1739: a BUSY resumption raises a reset event; an IDLE one does not ==='
+r39_signals=()
+_unstick_reset_event_signal() { r39_signals+=("$1"); }
+reset_state
+export MOCK_TMUX_WINDOWS="orchestrator|2"
+export MOCK_PANE_STATE_2=busy MOCK_PANE_RESET_AT_2=''
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+    $(( NOW + 600 )) $(( NOW - 1800 )) $(( NOW - 1 )) 1
+_over_limit_process_wakes "orchestrator"
+assert_eq "R39-ol.busy: busy resumption signalled once, naming the window" "${r39_signals[*]:-}" "over-limit-resumed:orchestrator"
+r39_signals=()
+reset_state
+export MOCK_PANE_STATE_2=idle
+synth_row "_orchestrator" "orchestrator" "orchestrator" "3am_America/Los_Angeles" \
+    $(( NOW + 600 )) $(( NOW - 1800 )) $(( NOW - 1 )) 1
+_over_limit_process_wakes "orchestrator"
+assert_eq "R39-ol.idle: an idle resumption is not evidence of quota" "${r39_signals[*]:-}" ""
+unset -f _unstick_reset_event_signal
+unset MOCK_PANE_STATE_2 MOCK_PANE_RESET_AT_2 MOCK_TMUX_WINDOWS
+
+
+# ---- #1741 S2: a credential change must RESUME the row, not just move its clock --
+s2_setup() { # <pane-state behind the stamp>
+    reset_state
+    rm -rf "$STATE_DIR/over-limit"; mkdir -p "$STATE_DIR/over-limit"
+    printf '{"reset_at":"3am_America/Los_Angeles"}\n' > "$STATE_DIR/over-limit/w1.json"
+    export MOCK_TMUX_WINDOWS="orchestrator|2"$'\n'"w1|7"
+    export MOCK_PANE_NAME_7=w1 MOCK_PANE_STATE_7="$1" MOCK_PANE_RESET_AT_7=''
+    export MOCK_PANE_STATE_2=idle
+    synth_row "w1" "w1" "worker" "3am_America/Los_Angeles" \
+        $(( NOW + 21000 )) $(( NOW - 600 )) $(( NOW + 21835 )) 0
+}
+s2_paste() { awk -F'\t' '$1=="w1"' "$PASTE_LOG" | wc -l | tr -d ' '; }
+s2_row()   { _over_limit_load "w1" >/dev/null && echo present || echo dropped; }
+
+echo '=== #1741 S2: credential change, live pane behind the stamp → RESUMED in one wake ==='
+s2_setup idle
+_over_limit_expedite_all credential-change >/dev/null
+_over_limit_process_wakes "orchestrator"
+assert_eq "S2-live.resumed: brief pasted once" "$(s2_paste)" "1"
+assert_eq "S2-live.dropped: row dropped" "$(s2_row)" "dropped"
+assert_contains "S2-live.path: through the RESUME path, not a fail-open" "$(cat "$LOG_LOG")" "over-limit: 'w1' resumed"
+assert_eq "S2-live.audit: the stamp is kept, renamed" \
+    "$(ls "$STATE_DIR/over-limit" | grep -c '^w1\.json\.released-credential-change\.')" "1"
+
+echo '=== #1741 S2: credential change, banner STILL rendered → fails open on THIS wake, no 7-min backoff ==='
+s2_setup over-limit
+_over_limit_expedite_all credential-change >/dev/null
+_over_limit_process_wakes "orchestrator"
+assert_eq "S2-banner.pasted: the wake brief is pasted now" "$(s2_paste)" "1"
+assert_eq "S2-banner.dropped: row dropped" "$(s2_row)" "dropped"
+assert_contains "S2-banner.path: via the fail-open probe" "$(cat "$LOG_LOG")" "max wake attempts"
+
+echo '=== #1741 S2: a NON-credential event never burns a valid stamp toward an early fail-open ==='
+s2_setup idle
+_over_limit_expedite_all over-limit-resumed:orchestrator >/dev/null
+for _ in 1 2 3 4 5; do _over_limit_process_wakes "orchestrator"; done   # five wakes: the old burn-down needed four
+assert_eq "S2-false.stamp: the valid stamp is still in place" \
+    "$([[ -f "$STATE_DIR/over-limit/w1.json" ]] && echo kept || echo gone)" "kept"
+assert_eq "S2-false.nopaste: nothing pasted" "$(s2_paste)" "0"
+assert_eq "S2-false.held: the row is held, not dropped" "$(s2_row)" "present"
+assert_eq "S2-false.clock: its wake is still the original, hours out" \
+    "$(_over_limit_load_next_attempt w1)" "$(( NOW + 21835 ))"
+assert_eq "S2-false.attempts: no attempt consumed" \
+    "$(_over_limit_load w1 | awk -F'\t' '{print $8}')" "0"
+unset MOCK_PANE_NAME_7 MOCK_PANE_STATE_7 MOCK_PANE_RESET_AT_7 MOCK_PANE_STATE_2 MOCK_TMUX_WINDOWS
+rm -rf "$STATE_DIR/over-limit"
 
 th_summary_and_exit

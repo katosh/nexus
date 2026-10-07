@@ -93,6 +93,11 @@ _cc_auto_module_dir="${BASH_SOURCE[0]%/*}"
 [[ "$_cc_auto_module_dir" == "${BASH_SOURCE[0]}" ]] && _cc_auto_module_dir=.
 # shellcheck source=../_log-mode.sh
 source "$_cc_auto_module_dir/../_log-mode.sh"
+# The COMPAT/NOT-COMPAT classifier and the retry schedule (your-org/nexus-code
+# #1657): only a COMPAT outcome holds an update, and nothing waits for an
+# operator.
+# shellcheck source=../_cc-hold-policy.sh
+source "$_cc_auto_module_dir/../_cc-hold-policy.sh"
 unset _cc_auto_module_dir
 
 # Evaluator window name. Fixed so the window-alive guard and
@@ -242,18 +247,37 @@ _cc_auto_surface_safe_refused() {
 # non-zero (do not skip). The last-eval file is written by
 # cc-auto-update-apply.sh's outcome recorder in the same key=value
 # shape _cc_update_field parses.
+#
+# NARROWED (your-org/nexus-code#1657). This guard used to skip a blocked
+# candidate on EVERY later day until a newer release appeared — "awaiting the
+# operator". After the 2.1.278 compat block that meant three days of
+# `skipped-awaiting-operator` while the fix was being written, and the
+# operator stepping in by hand. Now nothing waits for an operator:
+#   · only a COMPAT outcome (`cc_hold_class`) can skip at all — a
+#     NOT-COMPAT one (block-not-compat, block-unattributable, …) never does;
+#   · a COMPAT hold is skipped only on the SAME DAY it was recorded, and only
+#     while the live HEAD is still the one it was measured at (`[head]`). A
+#     new day re-evaluates it regardless; a moved HEAD (the fix may have
+#     landed) re-evaluates it at once.
 _cc_auto_last_eval_skip() {
     local dir="${1:?dir required}" candidate="${2:?candidate required}"
+    local now="${3:-$(date +%s)}" live_head="${4:-unknown}"
     local f="$dir/last-eval"
     [[ -f "$f" ]] || return 1
-    local last decision
+    local last decision detail date_s rec_day today rec_head
     last=$(_cc_update_field "$f" candidate 2>/dev/null || true)
     [[ "$last" == "$candidate" ]] || return 1
     decision=$(_cc_update_field "$f" decision 2>/dev/null || true)
-    case "$decision" in
-        block|compat-pr-opened|compat-pr-commented) return 0 ;;
-        *) return 1 ;;
-    esac
+    detail=$(_cc_update_field "$f" detail 2>/dev/null || true)
+    cc_hold_is_hold "$decision" "$detail" || return 1
+    date_s=$(_cc_update_field "$f" date 2>/dev/null || true)
+    rec_day=$(date -d "$date_s" +%F 2>/dev/null) || return 1
+    today=$(date -d "@$now" +%F 2>/dev/null || date +%F)
+    [[ "$rec_day" == "$today" ]] || return 1
+    rec_head=""
+    [[ "$detail" =~ live_head=([0-9a-f]{40}) ]] && rec_head="${BASH_REMATCH[1]}"
+    [[ -n "$rec_head" && "$live_head" != "unknown" && "$rec_head" != "$live_head" ]] && return 1
+    return 0
 }
 
 # _cc_auto_window_alive <window>
@@ -656,6 +680,10 @@ _cc_auto_write_restart_outcome() {
 #     pid, the armed marker, or a live watchdog window (the running
 #     version stays old until the respawn stamps the new one, so without
 #     this every tick in that window would re-fire);
+#   - the INSTALLED binary (`node_modules/.bin/claude --version`) does not
+#     yet report the pin, or cannot be read (your-org/nexus-code#1670): the
+#     pin is written before the install lands, so this DEFERS to the next
+#     tick without stamping the cooldown;
 #   - we are inside the post-attempt COOLDOWN. The cooldown bounds retries
 #     after ANY attempt, so a FAILED one (stale-pin abort, watchdog-spawn
 #     failure) retries slowly instead of every tick. A SUCCESS heals the
@@ -755,6 +783,54 @@ _cc_auto_reconcile_pending_restart() {
         (( now - mt < cooldown )) && return 0
     fi
 
+    # 6b. THE BINARY ON DISK MUST ALREADY BE THE ONE WE RESTART ONTO
+    #     (your-org/nexus-code#1670 item 5). Step 1 reads the PIN, and
+    #     `safe` writes the pin BEFORE `install-claude-local.sh` swaps the
+    #     binary in — so for the install's duration "running < pin" is true
+    #     while node_modules still holds the OLD build, or none at all (the
+    #     old install moved aside). Measured on the 2026-09-27 bump: pin
+    #     written 04:27:23, `reconcile-fired` 04:27:25, install done ~04:27:30.
+    #     A hand-off fired then meets an absent or half-installed binary at
+    #     the watchdog spawn, aborts, and leaves the split behind a
+    #     30-minute cooldown.
+    #
+    #     So the installed binary's own `--version` must report the pin
+    #     before we fire. DEFER, not abort: return BEFORE the cooldown stamp
+    #     below, so the next tick (the cc_auto cadence, ~5 min) retries.
+    #     FAIL CLOSED: an unreadable, empty or malformed `--version` is
+    #     compared to nothing — it is SHAPE-validated to X.Y.Z first and
+    #     otherwise defers (CLAUDE.md FALLBACK-COLLAPSE: a sentinel must not
+    #     be able to compare equal). This is a pure tightening: the only
+    #     restart it removes is one whose target binary is not on disk yet.
+    #
+    #     Logged to the watcher log ONCE per (installed, pin) pair, not per
+    #     tick; deliberately NO decisions.tsv row — column 3 of that file
+    #     SELECTS (monitor/_cc-hold-policy.sh classifies every word), and a
+    #     new token there would be a behavioural change to the hold policy.
+    #
+    #     CHOSEN bound: `timeout 20` on `--version`. A healthy binary answers
+    #     in well under a second; 20 s tolerates a loaded shared host, and a
+    #     hung half-installed binary cannot stall the watcher tick for
+    #     longer. The wrapper's own statuses (124/137) are not read — only
+    #     the parsed version is, and an expired call parses to nothing,
+    #     which defers.
+    local installed_bin="${CC_AUTO_CLAUDE_BIN:-$nexus_root/node_modules/.bin/claude}"
+    local installed_raw="" installed=""
+    installed_raw=$(timeout 20 "$installed_bin" --version 2>/dev/null < /dev/null) || installed_raw=""
+    installed=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$installed_raw" | sed -n 1p)
+    if [[ ! "$installed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || "$installed" != "$effective" ]]; then
+        local dmark="$auto_dir/reconcile-deferred.last"
+        local dkey="installed=${installed:-unreadable} effective=$effective"
+        if [[ "$(cat "$dmark" 2>/dev/null)" != "$dkey" ]]; then
+            mkdir -p "$auto_dir" 2>/dev/null || true
+            printf '%s\n' "$dkey" > "$dmark" 2>/dev/null || true
+            declare -F log >/dev/null 2>&1 \
+                && log "cc-auto-update: version-split (running=$running pin=$effective) NOT reconciled yet — $installed_bin reports '${installed:-<unreadable>}', not the pin; deferring (no cooldown) until the installed binary is the pin (your-org/nexus-code#1670)"
+        fi
+        return 0
+    fi
+    rm -f "$auto_dir/reconcile-deferred.last" 2>/dev/null || true
+
     # 7. Fire. Stamp the cooldown BEFORE launching (a partially-failed
     #    launch must not re-fire next tick), audit + log + notify, then hand
     #    off to the SAME detached watchdog-mediated `restart-orchestrator`
@@ -817,7 +893,46 @@ _cc_auto_update_tick() {
     # cadence, ~5 min by default) heals the split promptly instead.
     _cc_auto_reconcile_pending_restart "$nexus_root" "$state_dir" "$package" "$now"
 
-    _cc_auto_due "$now" "$fire_time" "$stamp" || return 0
+    # THE FLOOR TRACKS THE VERIFIED CC (your-org/nexus-code#1657). At most
+    # hourly, and a no-op unless the integration branch moved or a newer
+    # version was gate-verified here since the last check: propose raising the
+    # shared package.json floor to the version this nexus runs and verified
+    # (`monitor/cc-floor.sh`; one bot PR, never lowers, no checkout). Bounded
+    # by a timeout and never fails the tick.
+    local _fl_stamp="$auto_dir/cc-floor-last-check" _fl_age=999999
+    [[ -f "$_fl_stamp" ]] && _fl_age=$(( now - $(stat -c %Y "$_fl_stamp" 2>/dev/null || echo 0) ))
+    if (( _fl_age >= ${CC_AUTO_FLOOR_CHECK_SECONDS:-3600} )) && [[ -x "${CC_AUTO_FLOOR_CMD:-$nexus_root/monitor/cc-floor.sh}" ]]; then
+        : > "$_fl_stamp" 2>/dev/null || true
+        local _fl_out
+        _fl_out=$(timeout 90 "${CC_AUTO_FLOOR_CMD:-$nexus_root/monitor/cc-floor.sh}" propose --if-base-moved 2>&1 < /dev/null) || true
+        case "$_fl_out" in
+            *"proposed: "*|*"already proposed"*) declare -F log >/dev/null 2>&1 && log "cc-auto-update: ${_fl_out##*$'\n'}" ;;
+        esac
+    fi
+
+    # THE RETRY PATH (your-org/nexus-code#1657). The daily fire is no longer
+    # the only fire: an outcome that did not apply and is not a COMPAT hold
+    # wrote `retry-at` (apply.sh's record_outcome), and a COMPAT hold wrote a
+    # re-check that fires once the live HEAD moves. Bounded per day
+    # (CC_AUTO_RETRY_MAX_PER_DAY) so a persistent cause costs a fixed number
+    # of evaluations; the daily fire resets nothing and is never suppressed.
+    local live_head retry_fire=0 retry_why retry_rc=0
+    live_head=$(cc_repo_head "$nexus_root")
+    if ! _cc_auto_due "$now" "$fire_time" "$stamp"; then
+        retry_why=$(cc_hold_retry_due "$auto_dir" "$now" "$live_head") || retry_rc=$?
+        case "$retry_rc" in
+            0) retry_fire=1 ;;
+            3) # exhausted for today: said ONCE per day, then the daily fire
+               # takes over tomorrow.
+               if [[ ! -f "$auto_dir/retry-exhausted-$(_cc_auto_day "$now")" ]]; then
+                   : > "$auto_dir/retry-exhausted-$(_cc_auto_day "$now")" 2>/dev/null || true
+                   _cc_auto_log_decision "$auto_dir" "-" "retry-exhausted" "$retry_why"
+                   declare -F log >/dev/null 2>&1 && log "cc-auto-update: $retry_why — the next daily fire re-evaluates"
+               fi
+               return 0 ;;
+            *) return 0 ;;
+        esac
+    fi
     today=$(_cc_auto_day "$now")
 
     # Guard 2 — one evaluator at a time. A still-live evaluator window
@@ -911,6 +1026,14 @@ _cc_auto_update_tick() {
     fi
     _cc_auto_skip_streak_clear "$auto_dir"
 
+    if (( retry_fire )); then
+        # Consumed only once Guard 2 let the fire through, so a live
+        # evaluator postpones a retry instead of eating it.
+        cc_hold_retry_consume "$auto_dir" "$now"
+        _cc_auto_log_decision "$auto_dir" "-" "retry-fired" "$retry_why"
+        declare -F log >/dev/null 2>&1 && log "cc-auto-update: retry fire ($retry_why)"
+    fi
+
     # Fresh registry decide at fire time (don't trust a possibly-24h-old
     # cc_version_check signal). Reuses _cc_update_decide wholesale, so
     # the shared cc-update-available signal file is maintained with the
@@ -972,12 +1095,12 @@ _cc_auto_update_tick() {
 
     # Guard 4 — candidate already surfaced to the operator (block or
     # compat-pr outcome). A newer candidate falls through and re-arms.
-    if _cc_auto_last_eval_skip "$auto_dir" "$candidate"; then
+    if _cc_auto_last_eval_skip "$auto_dir" "$candidate" "$now" "$live_head"; then
         _cc_auto_stamp "$stamp" "$now"
-        _cc_auto_log_decision "$auto_dir" "$candidate" "skipped-awaiting-operator" \
-            "last-eval=$(_cc_update_field "$auto_dir/last-eval" decision 2>/dev/null || echo '?')"
+        _cc_auto_log_decision "$auto_dir" "$candidate" "skipped-compat-hold-same-day" \
+            "last-eval=$(_cc_update_field "$auto_dir/last-eval" decision 2>/dev/null || echo '?') live_head=$live_head"
         declare -F log >/dev/null 2>&1 \
-            && log "cc-auto-update: candidate $candidate already surfaced (awaiting operator); skipping re-eval"
+            && log "cc-auto-update: candidate $candidate is on a COMPAT hold recorded today at this same HEAD; re-evaluated when the HEAD moves or at the next daily fire (#1657)"
         return 0
     fi
 

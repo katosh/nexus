@@ -75,6 +75,14 @@
 #  24.  --no-orchestrator and --services-only both skip the orchestrator
 #       step (the latter because the orchestrator is the per-turn
 #       caller); workers still recover.
+#  (25-38: cold boot, the auto-continue plan — see each case's header.)
+#  39.  A WRAPPED worker with follow-up live (dispatched after its wrap-up)
+#       is resumed on --continue, and the plan's 5th column plus the
+#       rendered brief say WHY: active vs follow-up. A wrapped-and-idle
+#       worker is not. The predicate's signal-by-signal cases live in
+#       test-bootstrap-recover-followup.sh.
+#  40.  The machine-input half of the follow-up predicate is read BEFORE
+#       the watcher relaunch prunes it.
 #
 # Run: bash monitor/watcher/test-bootstrap-recover.sh
 # Expected: ALL TESTS PASSED, exit 0.
@@ -133,6 +141,7 @@ if [ "\$dry" = 1 ]; then
     exit "\$rc"
 fi
 echo "WORKER \$*" >> "$ROOT/order.log"
+echo "\${NEXUS_AUTOCONTINUE_TOKEN:-<none>}" >> "$ROOT/spawn-worker.tokens"
 echo "\$*" >> "$SPAWN_CALLS"
 [ -f "$ROOT/spawn-worker.creates-window" ] && tmux new-window -n "\$2"
 rc=0
@@ -181,6 +190,10 @@ build_case() {
     # nothing, and a missing one would leave the cold-boot path calling
     # undefined functions.
     cp "$_real_test_dir/../_dropped_manifest.sh" "$ROOT/monitor/_dropped_manifest.sh"
+    # …and ../_autocontinue_plan.sh, the plan a --continue recovery writes
+    # before the orchestrator spawn (the 2026-09-27 restart). Missing, every
+    # ac_* call is rc 127 and the plan is silently never written.
+    cp "$_real_test_dir/../_autocontinue_plan.sh" "$ROOT/monitor/_autocontinue_plan.sh"
     # bootstrap-recover.sh sources watcher/_version_restart.sh for
     # `_version_record_service_running` (issue #186). It was never staged:
     # every case ran with the source FAILING and the helper undefined, so
@@ -1348,10 +1361,12 @@ if [[ "$(tmux_windows)" == *w-alpha* ]] && [[ "$(tmux_windows)" == *w-beta* ]] \
 else
     fail "continue-boot windows='$(tmux_windows)' calls=$(cat "$SPAWN_CALLS" 2>/dev/null) err=$(cat "$ROOT/err")"
 fi
+# The resolver DOES run on a continue boot now, and on purpose: it supplies
+# the session ids of the auto-continue plan the orchestrator's brief renders
+# (the 2026-09-27 restart). What must stay absent is the cold-boot state.
 if [[ -f "$ROOT/monitor/.state/last-snapshot.txt" ]] \
-   && [[ ! -s "$(manifest_path)" ]] \
-   && [[ ! -f "$SPAWN_DRY_CALLS" ]]; then
-    pass "--continue: snapshot left in place, no manifest, resolver never run"
+   && [[ ! -s "$(manifest_path)" ]]; then
+    pass "--continue: snapshot left in place, no dropped-worker manifest"
 else
     fail "continue-boot touched cold-boot state: snap=$([[ -f "$ROOT/monitor/.state/last-snapshot.txt" ]] && echo kept || echo gone) man=$(cat "$(manifest_path)" 2>/dev/null | head -1)"
 fi
@@ -1660,6 +1675,299 @@ if [[ "$(tmux_windows)" == *w-alive* ]]; then
     pass "the live worker was left ALONE — declining to resurrect is not terminating"
 else
     fail "live worker vanished: $(tmux_windows)"
+fi
+cleanup_case
+
+# --- Case 35: a --continue recovery announces its workers BEFORE the orchestrator ---
+# The 2026-09-27 restart: the orchestrator's brief is composed the moment it
+# is spawned, which is BEFORE recovery resumes any worker. The plan must
+# therefore already exist when spawn-fresh-orchestrator runs, name every
+# worker it is about to resume with its session id, and be finished after.
+echo '=== case 35: --continue — plan written before the orchestrator spawn, finished after ==='
+build_case 35
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha w-beta
+log_event spawn w-alpha
+log_event spawn w-beta
+seed_boot_intent continue
+cat > "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh" <<SO
+#!/usr/bin/env bash
+echo "ORCH \$*" >> "$ROOT/order.log"
+cp "$ROOT/monitor/.state/auto-continue-plan.tsv" "$ROOT/plan-at-orch-spawn" 2>/dev/null || true
+exit 0
+SO
+chmod +x "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh"
+run_recover
+PLAN35="$ROOT/monitor/.state/auto-continue-plan.tsv"
+AT_SPAWN="$ROOT/plan-at-orch-spawn"
+if [[ -f "$AT_SPAWN" ]] \
+   && grep -qP '^w-alpha\tsid-w-alpha\tpending\t' "$AT_SPAWN" \
+   && grep -qP '^w-beta\tsid-w-beta\tpending\t' "$AT_SPAWN" \
+   && grep -qP '^#owner\t[0-9]+\t[0-9]+\t\S+\t[0-9]+\trunning\tcontinue$' "$AT_SPAWN"; then
+    pass "plan EXISTED at orchestrator spawn: both workers pending with session ids, boot=continue"
+else
+    fail "plan at orchestrator spawn: $(cat "$AT_SPAWN" 2>/dev/null || echo ABSENT) err=$(grep -i plan "$ROOT/err")"
+fi
+if grep -qP '^#owner\t.*\tdone\tcontinue$' "$PLAN35" \
+   && grep -qP '^w-alpha\tsid-w-alpha\tresumed\t' "$PLAN35" \
+   && grep -qP '^w-beta\tsid-w-beta\tresumed\t' "$PLAN35"; then
+    pass "plan finished after the walk: rows resumed, owner line done"
+else
+    fail "final plan: $(cat "$PLAN35" 2>/dev/null)"
+fi
+tok35=$(awk -F'\t' 'NR==1{print $4}' "$PLAN35" 2>/dev/null)
+if [[ -n "$tok35" ]] && [[ "$(sort -u "$ROOT/spawn-worker.tokens" 2>/dev/null)" == "$tok35" ]]; then
+    pass "recovery's own resumes carried the plan token (its exemption from exit 27)"
+else
+    fail "tokens seen by spawn-worker: $(cat "$ROOT/spawn-worker.tokens" 2>/dev/null) want $tok35"
+fi
+# The walk resumed EXACTLY the set the plan announced — one candidate list.
+if [[ "$(grep -c -- '--resume w-' "$SPAWN_CALLS" 2>/dev/null)" == 2 ]]; then
+    pass "the walk resumed exactly the planned set (no second, divergent candidate list)"
+else
+    fail "resume calls: $(cat "$SPAWN_CALLS" 2>/dev/null)"
+fi
+cleanup_case
+
+# --- Case 36: nothing to resume → no plan (the per-turn refresh stays silent) ---
+echo '=== case 36: every candidate already alive — no plan written ==='
+build_case 36
+seed_healthy_watcher
+seed_snapshot w-alpha
+log_event spawn w-alpha
+echo w-alpha >> "$WINDOWS"
+run_recover --services-only
+if [[ ! -e "$ROOT/monitor/.state/auto-continue-plan.tsv" ]]; then
+    pass "no pending worker → no plan file (brief unchanged)"
+else
+    fail "plan written with nothing pending: $(cat "$ROOT/monitor/.state/auto-continue-plan.tsv")"
+fi
+cleanup_case
+
+# --- Case 37: plan and walk use ONE cap rule (skeptic F2 on #1660) ----------
+# cap=2, w-alpha alive, w-beta and w-gamma dead. The walk counts EVERY
+# candidate it reaches toward the cap, alive or not, so it resumes w-beta and
+# stops at w-gamma. The plan must say exactly that: w-beta pending, w-gamma
+# over-cap. Before the fix the plan skipped alive windows before counting and
+# promised w-gamma as pending too — a worker the walk never resumed.
+echo '=== case 37: cap — the plan applies the same cap rule as the walk; over-cap rows are recorded ==='
+build_case 37
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha w-beta w-gamma
+log_event spawn w-alpha
+log_event spawn w-beta
+log_event spawn w-gamma
+echo w-alpha >> "$WINDOWS"
+seed_boot_intent continue
+cat > "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh" <<SO
+#!/usr/bin/env bash
+cp "$ROOT/monitor/.state/auto-continue-plan.tsv" "$ROOT/plan-at-orch-spawn" 2>/dev/null || true
+exit 0
+SO
+chmod +x "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh"
+RECOVER_MAX_WORKERS=2 run_recover
+PLAN37="$ROOT/monitor/.state/auto-continue-plan.tsv"
+if grep -qP '^w-beta\tsid-w-beta\tpending\t' "$ROOT/plan-at-orch-spawn" \
+   && grep -qP '^w-gamma\t-\tover-cap:2\t' "$ROOT/plan-at-orch-spawn" \
+   && ! grep -qP '^w-alpha\t' "$ROOT/plan-at-orch-spawn"; then
+    pass "plan at spawn: w-beta pending, w-gamma over-cap, alive w-alpha not listed"
+else
+    fail "plan at spawn: $(cat "$ROOT/plan-at-orch-spawn" 2>/dev/null)"
+fi
+if grep -qx -- '--resume w-beta' "$SPAWN_CALLS" 2>/dev/null \
+   && ! grep -q -- '--resume w-gamma' "$SPAWN_CALLS" 2>/dev/null; then
+    pass "walk resumed exactly the promised w-beta and stopped at the cap before w-gamma"
+else
+    fail "resume calls: $(cat "$SPAWN_CALLS" 2>/dev/null)"
+fi
+if ! grep -qP '\tpending\t' "$PLAN37" && grep -qP '^w-gamma\t-\tover-cap:2\t' "$PLAN37"; then
+    pass "final plan: no row left pending, w-gamma recorded over-cap"
+else
+    fail "final plan: $(cat "$PLAN37")"
+fi
+cleanup_case
+
+# --- Case 37b: the skeptic's exact F2 reproduction (probe case 37) ----------
+# cap=1, w-alpha alive, w-beta dead. The walk counts w-alpha and stops, so
+# w-beta is NOT resumed. Before the fix the brief said w-beta "pending, its
+# window will appear"; now it must say w-beta is NOT auto-continued, even
+# though nothing at all is pending.
+echo '=== case 37b: cap=1 with the only dead worker past the cap — named, never promised ==='
+build_case 37b
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-alpha w-beta
+log_event spawn w-alpha
+log_event spawn w-beta
+echo w-alpha >> "$WINDOWS"
+seed_boot_intent continue
+cat > "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh" <<SO
+#!/usr/bin/env bash
+cp "$ROOT/monitor/.state/auto-continue-plan.tsv" "$ROOT/plan-at-orch-spawn" 2>/dev/null || true
+exit 0
+SO
+chmod +x "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh"
+RECOVER_MAX_WORKERS=1 run_recover
+if grep -qP '^w-beta\t-\tover-cap:1\t' "$ROOT/plan-at-orch-spawn" 2>/dev/null \
+   && ! grep -qP '\tpending\t' "$ROOT/plan-at-orch-spawn"; then
+    pass "w-beta is in the plan at spawn as over-cap:1, and nothing is promised pending"
+else
+    fail "plan at spawn: $(cat "$ROOT/plan-at-orch-spawn" 2>/dev/null || echo ABSENT)"
+fi
+if ! grep -q -- '--resume w-beta' "$SPAWN_CALLS" 2>/dev/null \
+   && grep -q "worker 'w-beta': NOT respawned — sanity cap" "$ROOT/err"; then
+    pass "the walk did not resume w-beta, exactly as the plan said"
+else
+    fail "calls=$(cat "$SPAWN_CALLS" 2>/dev/null)"
+fi
+# Render what the BRIEF saw: the at-spawn snapshot, re-owned by a live
+# process so it reads as active (the real owner, recovery, has exited).
+mkdir -p "$ROOT/at-spawn"
+sleep 60 & OWN37b=$!
+_st=$(cat "/proc/$OWN37b/stat"); _st="${_st##*) }"; set -- $_st; START37b="${20}"; set --
+awk -F'\t' -v OFS='\t' -v p="$OWN37b" -v t="$START37b" 'NR==1{$2=p; $3=t} {print}' \
+    "$ROOT/plan-at-orch-spawn" > "$ROOT/at-spawn/auto-continue-plan.tsv"
+render37b=$(PATH="$BIN:$PATH" bash -c 'source "$1"; ac_plan_render "$2"' _ "$ROOT/monitor/_autocontinue_plan.sh" "$ROOT/at-spawn")
+kill "$OWN37b" 2>/dev/null; wait "$OWN37b" 2>/dev/null
+if grep -qF -- '- `w-beta`: session `-` — **NOT auto-continued**: past recovery' <<<"$render37b" \
+   && grep -qF -- 'recover.max_workers=1' <<<"$render37b" \
+   && ! grep -qF -- '**pending**' <<<"$render37b"; then
+    pass "the brief at spawn names w-beta NOT auto-continued with the cap as the reason, and promises nothing"
+else
+    fail "rendered at spawn: $render37b"
+fi
+cleanup_case
+
+# --- Case 38: a concurrent recovery never replaces a live plan (skeptic F1) --
+# A plan owned by ANOTHER live process lists w-alpha pending. This recovery
+# must not overwrite it, must not resume w-alpha (the owner is doing it), and
+# must not mark it done.
+echo '=== case 38: a second recovery leaves a live plan and its pending windows alone ==='
+build_case 38
+seed_healthy_watcher
+seed_snapshot w-alpha
+log_event spawn w-alpha
+sleep 120 & OWN38=$!
+_st38=$(cat "/proc/$OWN38/stat"); _st38="${_st38##*) }"; set -- $_st38; START38="${20}"; set --
+printf '#owner\t%s\t%s\ttok-A\t1\trunning\tcontinue\nw-alpha\tsid-A\tpending\t1\n' "$OWN38" "$START38" \
+    > "$ROOT/monitor/.state/auto-continue-plan.tsv"
+before38=$(cat "$ROOT/monitor/.state/auto-continue-plan.tsv")
+run_recover --services-only
+if [[ "$(cat "$ROOT/monitor/.state/auto-continue-plan.tsv")" == "$before38" ]]; then
+    pass "the live plan is byte-identical: not replaced, not finished"
+else
+    fail "plan changed: $(cat "$ROOT/monitor/.state/auto-continue-plan.tsv")"
+fi
+if ! grep -q -- '--resume w-alpha' "$SPAWN_CALLS" 2>/dev/null \
+   && grep -q "concurrent recovery is auto-continuing it" "$ROOT/err"; then
+    pass "the second recovery left w-alpha to the owner, and said so"
+else
+    fail "calls=$(cat "$SPAWN_CALLS" 2>/dev/null) err=$(grep -i concurrent "$ROOT/err")"
+fi
+# The library half: a non-owner token can neither update a row nor finish.
+lib_rc38=$(bash -c 'source "$1"; ac_plan_set_status "$2" w-alpha resumed tok-B; r1=$?; ac_plan_finish "$2" tok-B; r2=$?; echo "$r1 $r2"' \
+    _ "$ROOT/monitor/_autocontinue_plan.sh" "$ROOT/monitor/.state")
+after38=$(cat "$ROOT/monitor/.state/auto-continue-plan.tsv")
+if [[ "$lib_rc38" == "2 2" && "$after38" == "$before38" ]]; then
+    pass "a stale owner: set_status and finish are refused with rc 2 and write nothing"
+else
+    fail "non-owner write: rcs='$lib_rc38' plan=$after38"
+fi
+kill "$OWN38" 2>/dev/null; wait "$OWN38" 2>/dev/null
+cleanup_case
+
+# --- Case 39: the brief names WHY each worker is resumed ----------------------
+# The 2026-09-28 17:05 restart: two wrapped workers with follow-up in flight
+# were dropped. Now they are candidates, and the plan the orchestrator's brief
+# renders carries a 5th column saying why — so "it wrapped" is not read as
+# "it is done", and an active worker is told apart from a follow-up one.
+echo '=== case 39: --continue — follow-up worker resumed, plan and brief carry the why ==='
+build_case 39
+seed_healthy_watcher
+worker_respawns_create_windows
+seed_snapshot w-act w-fu w-done
+log_event spawn w-act
+log_event spawn w-fu
+log_event wrap-up w-fu
+log_event paste-followup w-fu ',"rc":"0"'
+log_event spawn w-done
+log_event wrap-up w-done
+seed_boot_intent continue
+cat > "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh" <<SO
+#!/usr/bin/env bash
+echo "ORCH \$*" >> "$ROOT/order.log"
+cp "$ROOT/monitor/.state/auto-continue-plan.tsv" "$ROOT/plan-at-orch-spawn" 2>/dev/null || true
+exit 0
+SO
+chmod +x "$ROOT/monitor/watcher/spawn-fresh-orchestrator.sh"
+run_recover
+AT39="$ROOT/plan-at-orch-spawn"
+if [[ -f "$AT39" ]] \
+   && grep -qP '^w-act\tsid-w-act\tpending\t[0-9]+\tactive$' "$AT39" \
+   && grep -qP '^w-fu\tsid-w-fu\tpending\t[0-9]+\tfollow-up:dispatched$' "$AT39" \
+   && ! grep -q '^w-done' "$AT39"; then
+    pass "plan at orchestrator spawn: active + follow-up pending with their why; wrapped-and-idle absent"
+else
+    fail "plan at orchestrator spawn: $(cat "$AT39" 2>/dev/null || echo ABSENT) err=$(grep -E 'w-(act|fu|done)' "$ROOT/err")"
+fi
+calls39=$(cat "$SPAWN_CALLS" 2>/dev/null)
+if grep -q -- '--resume w-act' <<<"$calls39" && grep -q -- '--resume w-fu' <<<"$calls39" \
+   && ! grep -q -- '--resume w-done' <<<"$calls39"; then
+    pass "walk resumed w-act and w-fu, not w-done"
+else
+    fail "resume calls: [$calls39]"
+fi
+# Render the plan AS IT STOOD at the orchestrator spawn (owner alive, rows
+# pending), the way spawn-fresh-orchestrator.sh composes the brief.
+mkdir -p "$ROOT/at-spawn39"
+awk -F'\t' -v OFS='\t' -v p="$$" 'NR == 1 { $2 = p; $3 = "X"; $6 = "running" } { print }' "$AT39" \
+    > "$ROOT/at-spawn39/auto-continue-plan.tsv"
+st39=$(awk '{print $22}' "/proc/$$/stat" 2>/dev/null)
+sed -i "1s/\tX\t/\t$st39\t/" "$ROOT/at-spawn39/auto-continue-plan.tsv"
+brief39=$(PATH="$BIN:$PATH" bash -c 'source "$1"; ac_plan_render "$2"' _ "$ROOT/monitor/_autocontinue_plan.sh" "$ROOT/at-spawn39")
+if grep -qF '`w-fu`: session `sid-w-fu`' <<<"$brief39" \
+   && grep -qF '(why: wrapped, but follow-up live: dispatched)' <<<"$brief39" \
+   && grep -qF '(why: active, interrupted mid-task)' <<<"$brief39"; then
+    pass "brief names why: active vs wrapped-but-follow-up-live"
+else
+    fail "brief: $brief39"
+fi
+cleanup_case
+
+# --- Case 40: machine-input captured BEFORE the watcher relaunch -------------
+# The watcher's first cycle prunes machine-input.tsv rows for windows not in
+# tmux — at a restart, every not-yet-respawned worker. A worker whose only
+# follow-up evidence is a machine-input stamp (an `ng send --stamp-only`
+# delivery, which logs no action-log event) must still be resumed. The
+# launcher stub DELETES the ledger when the watcher is relaunched, modelling
+# that prune; recovery must already have read it.
+echo '=== case 40: follow-up evidence captured before the watcher relaunch prunes it ==='
+build_case 40
+worker_respawns_create_windows
+seed_snapshot w-stamped
+log_event spawn w-stamped
+log_event wrap-up w-stamped
+# One stamp an hour after log_event's fixed 12:00 wrap-up.
+printf 'w-stamped\t%s000000\tpaste-followup\t\n' \
+    "$(( $(date -d '2026-06-10T12:00:00-07:00' +%s) + 3600 ))" \
+    > "$ROOT/monitor/.state/machine-input.tsv"
+printf '#!/usr/bin/env bash\necho called >> "%s"\nrm -f "%s"\n' \
+    "$LAUNCHER_CALLS" "$ROOT/monitor/.state/machine-input.tsv" \
+    > "$ROOT/monitor/watcher/launcher.sh"
+chmod +x "$ROOT/monitor/watcher/launcher.sh"
+run_recover
+if [[ -f "$LAUNCHER_CALLS" ]] && [[ ! -e "$ROOT/monitor/.state/machine-input.tsv" ]]; then
+    pass "precondition: the watcher was relaunched and the ledger pruned"
+else
+    fail "precondition not met: launcher=$(cat "$LAUNCHER_CALLS" 2>/dev/null) mi=$(ls "$ROOT/monitor/.state/machine-input.tsv" 2>&1)"
+fi
+if grep -q -- '--resume w-stamped' "$SPAWN_CALLS" 2>/dev/null \
+   && grep -qF "worker 'w-stamped': wrapped BUT follow-up live (delivered)" "$ROOT/err"; then
+    pass "w-stamped resumed on the stamp read before the prune"
+else
+    fail "calls=$(cat "$SPAWN_CALLS" 2>/dev/null) err=$(grep -E 'w-stamped|machine' "$ROOT/err")"
 fi
 cleanup_case
 

@@ -65,6 +65,12 @@
 #       with the LITERAL state word ([replying]/[failing]); excluded from every
 #       other stable-state selector; the --state enum itself is unchanged
 #       (--state replying → rc1); fetch status still maps them to `claimed`.
+#   22. MINT/VALIDATE ROUND-TRIP (your-org/nexus-code#1699): every id `file`
+#       prints — for slugs carrying `.`, `/`, spaces, `%`, UTF-8, a leading
+#       `-`, `..` — matches the id alphabet and is ACCEPTED by `show`, `ack`
+#       and `reply` (a `%2E` id used to be refused by all of them). An
+#       already-valid slug is minted UNCHANGED (identity), and two slugs that
+#       map to the same stem in one second get DISTINCT ids, both addressable.
 #
 # Concurrency / crash seams (all fire ONCE; mirror CHAN_TS_OVERRIDE):
 #   CHAN_TRANSITION_RACE_HOOK      resolve↔claim
@@ -644,6 +650,51 @@ lst1=$("$RC" fetch "$li1" status --principal remote-mia)
 assert_eq "21: fetch status on .replying still reports claimed" "$lst1" "claimed"
 lst2=$("$RC" fetch "$li2" status --principal remote-mia)
 assert_eq "21: fetch status on .failing still reports claimed"  "$lst2" "claimed"
+
+echo "== 22. every id \`file\` prints is accepted by show/ack/reply (#1699) =="
+# The property, not one example: the slugs are chosen to exercise every class
+# of byte the old `%XX` mint produced — punctuation, path separators, space,
+# the escape character itself, multibyte UTF-8, and option-shaped / traversal-
+# shaped text. Each is filed twice: once acked, once replied.
+_rt_slugs=( 'proj-S0.2' 'a/b' 'has space' '100%' 'é✓ü' '-lead' '..' '../escape' 'a.b.c_d-e' )
+_rt_i=0
+for _rt_s in "${_rt_slugs[@]}"; do
+    _rt_i=$((_rt_i + 1))
+    _rt_a=$("$RC" file --origin w --kind question --slug "$_rt_s" --message body); _rt_arc=$?
+    assert_rc "22.$_rt_i file --slug $(printf '%q' "$_rt_s") → rc0" "$_rt_arc" "0"
+    [[ "$_rt_a" =~ ^[A-Za-z0-9_-]+$ ]]
+    assert_rc "22.$_rt_i minted id is inside the id alphabet: $_rt_a" "$?" "0"
+    assert_file "22.$_rt_i printed id == on-disk stem" "$REQ/$_rt_a.new.md"
+    "$RC" show "$_rt_a" >/dev/null 2>&1
+    assert_rc "22.$_rt_i show accepts the printed id" "$?" "0"
+    _claim "$_rt_a"
+    "$RC" ack "$_rt_a" >/dev/null 2>&1
+    assert_rc "22.$_rt_i ack accepts the printed id → rc0" "$?" "0"
+    assert_file "22.$_rt_i ack → .done" "$REQ/$_rt_a.done.md"
+
+    _rt_r=$("$RC" file --origin w --kind question --slug "$_rt_s" --reply required --message body)
+    _claim "$_rt_r"
+    "$RC" reply "$_rt_r" --message "answered" >/dev/null 2>&1
+    assert_rc "22.$_rt_i reply accepts the printed id → rc0" "$?" "0"
+    assert_file "22.$_rt_i reply → .replied" "$REQ/$_rt_r.replied.md"
+done
+# The observed id, byte for byte: the dot is spelled inside the alphabet.
+export CHAN_TS_OVERRIDE=20260930T212144Z
+_rt_obs=$("$RC" file --origin proj-port-cc --kind spawn-skeptic --slug 'proj-S0.2' --message body)
+# Identity on an already-valid slug: no existing id shape moves.
+_rt_id=$("$RC" file --origin w --kind question --slug 'keep_me-AS-is' --message body)
+# Two slugs that map to one stem in one second: distinct ids, never a shared file.
+_rt_c1=$("$RC" file --origin w --kind question --slug 'a.b'   --message one)
+_rt_c2=$("$RC" file --origin w --kind question --slug 'a_2Eb' --message two)
+unset CHAN_TS_OVERRIDE
+assert_eq "22: observed slug proj-S0.2 mints an addressable id" "$_rt_obs" "20260930T212144Z-proj-port-cc-proj-S0_2E2"
+assert_eq "22: an already-valid slug is minted unchanged"      "$_rt_id"  "20260930T212144Z-w-keep_me-AS-is"
+assert_eq "22: a.b maps to a_2Eb"                              "$_rt_c1" "20260930T212144Z-w-a_2Eb"
+assert_eq "22: literal a_2Eb in the same second is disambiguated" "$_rt_c2" "20260930T212144Z-w-a_2Eb-01"
+assert_contains "22: first filer's body intact"  "$("$RC" show "$_rt_c1")" "one"
+assert_contains "22: second filer's body intact" "$("$RC" show "$_rt_c2")" "two"
+"$RC" ack "$_rt_obs" >/dev/null 2>&1
+assert_rc "22: ack accepts the observed-shape id" "$?" "0"
 
 echo
 if (( FAIL == 0 )); then echo "ALL TESTS PASSED ($PASS)"; exit 0

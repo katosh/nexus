@@ -307,14 +307,42 @@ CD="$ROOT/cd"; mkdir -p "$CD"
 plant_cd() { local d="$CD/$1"; mkdir -p -- "$d/sub"; head -c 4096 /dev/zero > "$d/sub/payload.bin"; old "$d"; }
 plant_cd olay-guard-deadbeef
 : > "$CD/inuse"   # an EMPTY, readable in-use list: an UNREADABLE one is the reaper's own refusal fixture (line 83)
-timeout 5 "$GUARD" --check-daemon --root "$CD" --interval-seconds 1 --inuse-file "$CD/inuse" >/dev/null 2>&1 || true
-assert_eq "#1441: --check-daemon looped for 5s and the reapable dir SURVIVED (read-only)" \
-    "$([[ -d "$CD/olay-guard-deadbeef" ]] && echo present || echo gone)" "present"
+# Wait on COMPLETED PASSES, never on a wall-clock budget (#1703). Both arms
+# used to be `timeout 5 <daemon>`, and the 5 s held the guard's STARTUP too —
+# one config/load.sh spawn per knob, measured ~4 s of the 5 on an unloaded
+# host. On a loaded runner the reaper was killed before its first pass, so
+# POTENCY read "present"; and the read-only arm passed VACUOUSLY in exactly the
+# same runs, since a loop that never ran a --check cannot have reaped.
+# _await_passes <counter-cmd> <want> <guard args…>: run the daemon until
+# <counter-cmd> prints >= <want> (a pass the guard itself recorded) or the
+# ceiling passes; prints the final count. A polled wait this generous needs
+# no th_deadline scaling.
+_await_passes() {
+    local counter="$1" want="$2" pid n=0 i; shift 2
+    "$GUARD" "$@" >/dev/null 2>&1 &
+    pid=$!
+    for (( i = 0; i < 600; i++ )); do   # 600 x 0.2 s = 120 s ceiling
+        n=$($counter); [ "$n" -ge "$want" ] && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.2
+    done
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null   # our un-waited child: its pid cannot have been recycled
+    printf '%s' "$($counter)"
+}
+_cd_samples() { local n; n=$(wc -l < "$NEXUS_STATE_DIR/tmpfs-guard.samples" 2>/dev/null) || n=0; printf '%s' "${n:-0}"; }
+_cd_reaps()   { local n; n=$(grep -cF "root=$CD older_than_h=" "$NEXUS_STATE_DIR/tmpfs-guard.log" 2>/dev/null) || n=0; printf '%s' "${n:-0}"; }
+# Every --check pass appends one sample line, so TWO new lines = it LOOPED twice.
+_s0=$(_cd_samples)
+_s1=$(_await_passes _cd_samples $(( _s0 + 2 )) --check-daemon --root "$CD" --interval-seconds 1 --inuse-file "$CD/inuse")
+assert_eq "#1441: --check-daemon ran >=2 passes and the reapable dir SURVIVED (read-only)" \
+    "$(( _s1 - _s0 >= 2 ? 2 : _s1 - _s0 ))/$([[ -d "$CD/olay-guard-deadbeef" ]] && echo present || echo gone)" "2/present"
 # POTENCY: the deleting half removes the same plant, so the survival above is
-# a property of the mode, not of the plant being unreapable.
-timeout 5 "$GUARD" --daemon --root "$CD" --interval-seconds 1 --inuse-file "$CD/inuse" --trash-days 1 >/dev/null 2>&1 || true
+# a property of the mode, not of the plant being unreapable. One finished pass
+# is the "reap summary: … root=$CD …" line the reaper logs.
+_r0=$(_cd_reaps)
+_r1=$(_await_passes _cd_reaps $(( _r0 + 1 )) --daemon --root "$CD" --interval-seconds 1 --inuse-file "$CD/inuse" --trash-days 1)
 assert_eq "#1441 POTENCY: --daemon on the same plant REAPS it" \
-    "$([[ -d "$CD/olay-guard-deadbeef" ]] && echo present || echo gone)" "gone"
+    "$(( _r1 > _r0 ? 1 : 0 ))/$([[ -d "$CD/olay-guard-deadbeef" ]] && echo present || echo gone)" "1/gone"
 _reg="$REPO_ROOT/monitor/services.registry.example"
 _chk=$(grep -c $'^tmpfs-check\t.*--check-daemon\t.*\temit-only$' "$_reg")
 _reap_live=$(grep -c $'^tmpfs-reap\t' "$_reg"); _reap_comment=$(grep -c $'^# tmpfs-reap\t.*--daemon' "$_reg")

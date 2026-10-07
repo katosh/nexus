@@ -40,6 +40,29 @@ _test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$_test_dir/.." && pwd)
 SHIM_DIR="$REPO_ROOT/tmuxwrap"
 AWK_SCAN="$REPO_ROOT/cc-harness/_tmux_kill_scan.awk"
+# The table lives in a .txt fixture, NOT inline — see section (1) below.
+ROWS_FIXTURE="$REPO_ROOT/cc-harness/fixtures/tmuxwrap-conformance-rows.txt"
+
+# --- the guard's population (your-org/nexus-code#1747) ----------------------
+# This suite declared none, so `guards-for-diff` could never select it. It has
+# no corpus enumerator: it reads a FIXED set of files, named by the variables
+# above that every assertion below drives — the runtime shim, the corpus
+# lint's awk scanner, the conformance-row table — plus the helper library it
+# sources. Declared through those same variables, never a retyped list, so a
+# rename moves the population with the code. NOT describable as a path set and
+# therefore not declared: the in-file tmux STUB stands in for the real tmux,
+# so no installed binary's version reaches the verdict; `awk` and the coreutils
+# on PATH do.
+#
+# PLACED HERE, before the precondition checks print anything: `gp_handle` EXITS
+# when it handles the flag, and anything printed before it would be read as a
+# row. It also refuses a declared path that does not exist, so a missing shim
+# or table fails the probe loudly rather than shrinking the population.
+. "$_test_dir/../_guard_population.sh"
+gp_population() {
+    printf '%s\n' "$SHIM_DIR/tmux" "$AWK_SCAN" "$ROWS_FIXTURE" "$_test_dir/_test_helpers.sh"
+}
+gp_handle "$@"
 
 [[ -x "$SHIM_DIR/tmux" ]] || { echo "FAIL: $SHIM_DIR/tmux missing" >&2; echo FAILED; exit 1; }
 [[ -r "$AWK_SCAN"      ]] || { echo "FAIL: $AWK_SCAN missing"      >&2; echo FAILED; exit 1; }
@@ -122,8 +145,8 @@ echo "=== (1) SUPERSET: on the BOARD socket, everything the lint flags is refuse
 # The table lives in a .txt fixture, NOT inline: its rows are literal tmux
 # command lines, and a shell file carrying them is read by
 # lint-no-tmux-server-kill.sh as a corpus of real calls. Same reason the lint
-# keeps its own incident fixture out of tree.
-ROWS_FIXTURE="$REPO_ROOT/cc-harness/fixtures/tmuxwrap-conformance-rows.txt"
+# keeps its own incident fixture out of tree. ($ROWS_FIXTURE is defined at the
+# top, beside the other subjects, so the population declaration can name it.)
 [[ -r "$ROWS_FIXTURE" ]] || { echo "FAIL: missing $ROWS_FIXTURE" >&2; echo FAILED; exit 1; }
 
 # Non-vacuity floor: an empty or unreadable table would make every assertion

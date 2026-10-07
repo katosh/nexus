@@ -96,6 +96,11 @@ SB=$(mktemp -d)
 # Pinned ONCE for every child; no case asserts on the ledger's location.
 export NEXUS_NOTIFY_STATE_DIR="$SB/notify-state"
 mkdir -p "$NEXUS_NOTIFY_STATE_DIR"
+# Same axis, same shape (#1703): where a real `gh` resolves (host only, not CI)
+# the ghwrap shim's capability probe caches under
+# `$NEXUS_ROOT/monitor/.state/gh-capable.d` — the checkout again. Measured
+# LEAK-AT-SOURCE by `probe` here once the arming-log leak below was pinned.
+export NEXUS_GH_CAPABLE_CACHE="$SB/gh-capable.d"
 # A native-compinit ~/.zshrc dumps to $ZDOTDIR/.zcompdump; the positive case
 # uses the repo shellenv as ZDOTDIR, so clean any dump the probe leaves (it is
 # gitignored at runtime — this keeps the test tree pristine).
@@ -724,8 +729,11 @@ fi
 # Link 3 — the orchestrator's launcher is composed by a real function, so
 # assert against the COMPOSED TEXT rather than against _respawn.sh's source.
 L9="$SB/wiring-launcher.sh"
+# NEXUS_STATE_DIR pinned (#1703): `$REPO_ROOT` is passed as the nexus root, and
+# the composer resolves its state dir from it, so the longjob arming row
+# (_longjob-plugin.sh) otherwise lands in the SOURCE checkout's monitor/.state.
 ( set +u
-  CLAUDE_BIN=/bin/true
+  CLAUDE_BIN=/bin/true; export NEXUS_STATE_DIR="$SB/state-wiring"
   . "$REPO_ROOT/monitor/watcher/_respawn.sh"
   _respawn_compose_launcher "$L9" "$REPO_ROOT" "" "" "orchestrator" "" ) >/dev/null 2>&1
 if [[ -s "$L9" ]] && grep -q 'assert-shims-wrapped.sh' "$L9"; then

@@ -109,7 +109,7 @@ run_sut() {   # <args…> ; sets rc/out/err
 rc=0; out=""; err=""
 
 echo '=== the four outcomes, driven by planted snapshots ==='
-run_sut --snapshot "$SNAP_OK" --manifest "$MAN_OK"
+run_sut --snapshot "$SNAP_OK" --cc-version fixture-1.0.0 --manifest "$MAN_OK"
 assert_eq       "recorded version + matching arms + deps hold -> 0" "$rc" "0"
 assert_contains "…and it says so"                                   "$out" "all hold"
 
@@ -120,11 +120,9 @@ assert_contains "…and it refuses to read as a clearance"                 "$out
 run_sut --snapshot "$SNAP_NOCASE" --manifest "$MAN_OK"
 assert_eq "a grep function with no delegation case -> 3" "$rc" "3"
 
-mk_claude unrecorded-9.9.9
-run_sut --snapshot "$SNAP_OK" --manifest "$MAN_OK"
+run_sut --snapshot "$SNAP_OK" --cc-version unrecorded-9.9.9 --manifest "$MAN_OK"
 assert_eq       "an UNRECORDED cc version -> UNREVIEWED (4), not a failure" "$rc" "4"
 assert_contains "…and it points at the cc-update gate"                      "$out" "nexus.cc-update"
-mk_claude fixture-1.0.0
 
 echo '=== a BROKEN dependency is the ONE failure, and it names the entry ==='
 run_sut --snapshot "$SNAP_NODASH" --manifest "$MAN_OK"
@@ -140,7 +138,7 @@ echo '=== the check EVALUATES the arms; it does not string-compare them ==='
 # The whole design rests on this: a reworded but equivalent arm set must NOT be
 # a failure, or the tool is a text diff of somebody else's binary and every
 # harmless upstream reformatting is a false red.
-run_sut --snapshot "$SNAP_REWORDED" --manifest "$MAN_OK"
+run_sut --snapshot "$SNAP_REWORDED" --cc-version fixture-1.0.0 --manifest "$MAN_OK"
 assert_eq       "reordered but equivalent arms: dependencies still hold" \
     "$( (( rc == 1 )) && echo broken || echo hold )" "hold"
 assert_eq       "…reported as UNREVIEWED (4), not BROKEN"       "$rc" "4"
@@ -151,6 +149,33 @@ echo '=== a manifest with no dependencies REFUSES rather than passing vacuously 
 run_sut --snapshot "$SNAP_OK" --manifest "$MAN_EMPTY"
 assert_eq       "no DELEGATES/REACHES rows -> usage refusal (2)" "$rc" "2"
 assert_contains "…saying a green would assert nothing"           "$err" "would assert nothing"
+
+echo '=== #1670: a --snapshot is NEVER filed under the LIVE binary's version ==='
+# A snapshot file carries no version. The live stub below reports a version the
+# manifest HAS recorded with these exact arms, so the pre-#1670 tool labelled a
+# handed-in snapshot `fixture-1.0.0` and returned a clean 0 — reviewing a
+# candidate's arms against the wrong row, under the wrong name.
+mk_claude fixture-1.0.0
+run_sut --snapshot "$SNAP_OK" --manifest "$MAN_OK"
+assert_not_contains "--snapshot, no --cc-version: NOT labelled with the live binary's version" \
+    "$out" "cc version : fixture-1.0.0"
+assert_contains     "…it says the snapshot's version is unknown"          "$out" "cc version : unknown (snapshot)"
+assert_eq           "…and an unknown version selects no record -> 4"      "$rc" "4"
+assert_contains     "…naming the remedy"                                  "$out" "--cc-version"
+run_sut --snapshot "$SNAP_OK" --cc-version given-2.0.0 --manifest "$MAN_OK"
+assert_contains     "--cc-version labels the snapshot, whatever the live binary says" \
+    "$out" "cc version : given-2.0.0"
+run_sut --snapshot "$SNAP_OK" --cc-version "" --manifest "$MAN_OK"
+assert_eq           "an EMPTY --cc-version is a usage error, not 'unknown'" "$rc" "2"
+# NON-FLIP CONTROL: a DISCOVERED snapshot was written by the live harness, so
+# the live binary still names it.
+DISC_HOME="$WORK/home"; mkdir -p "$DISC_HOME/.claude/shell-snapshots"
+cp "$SNAP_OK" "$DISC_HOME/.claude/shell-snapshots/snapshot-zsh-1-fixture.sh"
+d_out=$(env -u BASH_ENV HOME="$DISC_HOME" CLAUDE_CONFIG_DIR="" PATH="$BIN:$PATH" \
+    bash "$SUT" --manifest "$MAN_OK" 2>&1); d_rc=$?
+assert_contains     "discovered snapshot: still labelled with the live binary's version" \
+    "$d_out" "cc version : fixture-1.0.0"
+assert_eq           "…and still compared against its record -> 0"          "$d_rc" "0"
 
 echo '=== the REAL manifest is well-formed and its citations exist ==='
 # A citation that names a CLAUDE.md block which is not there is its own defect,
@@ -185,7 +210,7 @@ assert_eq "live harness: the tool did not refuse (usage/manifest error)" \
     "$( (( live_rc == 2 )) && echo refused || echo ran )" "ran"
 
 # ---- assertion-count guard -----------------------------------------------
-EXPECTED_ASSERTIONS=23
+EXPECTED_ASSERTIONS=31
 TOTAL=$(( PASS + FAIL ))
 assert_eq "assertion TOTAL matches the expected total" "$TOTAL" "$EXPECTED_ASSERTIONS"
 

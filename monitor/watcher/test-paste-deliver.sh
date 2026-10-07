@@ -118,6 +118,18 @@ state() {
     local m; m=$(cat "$D/mode" 2>/dev/null)
     if [[ "$m" == preblocked ]] || [[ "$m" == blocked && $enters -ge 1 ]]; then put pane-state "state=blocked active=0 overlay=permission"
     elif [[ "$m" == qmark && -n "$box" ]]; then put pane-state "state=user-typing active=0 input=?"
+    # An OPERATOR DRAFT already in the box when the paste arrives
+    # (your-org/nexus-code#1674): `draft` reads as typed text, `draftq` as the
+    # undecidable `input=?`. `ghost` is an autosuggest over an EMPTY box.
+    elif [[ "$m" == draftq && -n "$box" ]]; then put pane-state "state=user-typing active=0 input=?"
+    # …and the same draft typed ahead into a MID-TURN worker, as a hook-fresh
+    # pane now reports it (your-org/nexus-code#1683 F1): the state is the hook's
+    # `busy`, the box is read off the capture. `busyblank` is its control: a
+    # mid-turn pane whose box is EMPTY must still be pasted into.
+    elif [[ "$m" == busydraft && -n "$box" ]]; then put pane-state "state=busy active=0 input=typed"
+    elif [[ "$m" == busydraftq && -n "$box" ]]; then put pane-state "state=busy active=0 input=?"
+    elif [[ "$m" == busyblank && -z "$box" ]]; then put pane-state "state=busy active=0 input=blank"
+    elif [[ "$m" == ghost && -z "$box" ]]; then put pane-state "state=autosuggest-only active=0 input=ghost"
     # A box the READER misses (your-org/nexus-code#1604): the body sits in the box
     # and pane-state says idle/blank — the general shape of the measured 2.1.278
     # blank-first-line misread, keyed on the misread and not on how it arises
@@ -162,6 +174,19 @@ show() {
     fi
     printf '\r\n\342\235\257\302\240%s\r\n' "$out"
     [[ -n "$rest" ]] && printf '  %s\r\n' "${rest//$'\n'/$'\r\n'  }"
+    # AN OPERATOR CONTINUATION ROW below our box content (your-org/nexus-code#1729):
+    # shift+Enter after our chip or line, then text — an indented row under the
+    # glyph row, which the next Enter would submit WITH ours. Drawn only; the
+    # fake's own box does not carry it, so a submit records only our bytes and
+    # the assertions key on the ENTER that must not be sent.
+    case "$m" in *cont*) printf '  operator continuation text\r\n' ;; esac
+    # …and the box's BOTTOM BORDER with a footer under it, as the real 2.1.273
+    # draws it (fixtures/pasted-multiline-chip-realmodel-273.ansi): a full row of
+    # U+2500, then hint text that is NOT input.
+    case "$m" in *border*)
+        printf '%s\r\n' "$(printf '\342\224\200%.0s' $(seq 1 60))"
+        printf '  -- INSERT -- footer hint text\r\n' ;;
+    esac
     return 0
 }
 record() {   # $1 = submission | enqueue
@@ -209,7 +234,7 @@ enter() {
                 if [[ "$m" == typeafter-fast ]]; then sleep 0.3; else sleep 1.6; fi
                 box="half-typed operator draft"; show
             elif [[ -n "$box" ]]; then record submission; fi ;;
-        hold|busy-hold|hold-collapse|hold-foreign-queued|hold-foreign-compact|transienthold)
+        hold|busy-hold|hold-collapse|hold-foreign-queued|hold-foreign-compact|transienthold|hold-chipcont|hold-chipborder|hold-chipcontborder|hold-textcont)
             if [[ "$box" == *"$ZW"* || "$box" == *"$SH"* ]]; then
                 box="${box//$ZW/}"; box="${box//$SH/}"
                 # A REAL hold whose pane reads `busy` for 0.4 s after the cleaning
@@ -238,6 +263,7 @@ enter() {
     esac
     state
 }
+case "$(cat "$D/mode" 2>/dev/null)" in draft|draftq|busydraft|busydraftq) box="when we restart the emit gets stuck until I enter it "; show ;; esac
 printf '\033[?2004h'; state; printf 'RDY\r\n'
 while IFS= read -r -s -N1 ch; do
     if [[ -n "$pend" || "$ch" == $'\033' ]]; then
@@ -349,6 +375,18 @@ _drv_env() {
     . "$MON/_pane-live.sh"; . "$MON/_tmux-window.sh"
     [[ -r "$MON/_submit_evidence.sh" ]] && . "$MON/_submit_evidence.sh"
     (( HAVE_PD )) && . "$MON/_paste-deliver.sh"
+    # The draft-deferral counter (your-org/nexus-code#1683 F2), when the subject
+    # has one, with the operator alert replaced by a RECORDER: `raise` makes the
+    # key standing, `standing` answers from that, every call is logged.
+    [[ -r "$MON/watcher/_paste_deferral.sh" ]] && . "$MON/watcher/_paste_deferral.sh"
+    _operator_alert() {
+        printf '%s\n' "$*" >> "$D/alerts"
+        case "${1:-}" in
+            raise)    : > "$D/alert-standing" ;;
+            standing) [[ -e "$D/alert-standing" ]]; return ;;
+        esac
+        return 0
+    }
     eval "$(sed -n '/^_respawn_read_pin_sid() {/,/^}/p' "$MON/watcher/_respawn.sh")"
 }
 drive() {   # drive E|W|U|R <file>   (W = E through paste_with_retry)
@@ -556,6 +594,96 @@ row_open preblocked && { body "$D/b" "E-preblocked plain ascii body"; drive E "$
     eq E-preblocked.enters "…and no Enter is pressed" "$(enters)" 0
     if (( HAVE_PD )); then eq E-preblocked.rc "…reported as rc 7: the ORCHESTRATOR is on an overlay, not a watcher paste fault (F7)" "$ROW_RC" 7
     else na E-preblocked.rc "needs the primitive"; fi; row_close; }
+# An OPERATOR DRAFT is ALREADY in the box (your-org/nexus-code#1674). Measured on
+# the live board 2026-09-29 13:16:02: the emit was pasted INTO the operator's
+# half-typed message and the first Enter sent it mid-word. Nothing may be
+# pasted and no Enter pressed — with the box read as typed text, and with it
+# read as the undecidable `input=?`.
+if row_open draft; then body "$D/b" "E-draft plain ascii body"; drive E "$D/b"
+    eq E-draft.pastes "an operator draft in the box: NOTHING is pasted into it (#1674)" "$(pastes)" 0
+    eq E-draft.enters "…no Enter is pressed" "$(enters)" 0
+    eq E-draft.rec "…and the draft is NOT submitted" "$(subs)" 0
+    if (( HAVE_PD )); then eq E-draft.rc "…reported rc 7: a fact about the pane, not a watcher paste fault" "$ROW_RC" 7
+    else na E-draft.rc "needs the primitive"; fi; row_close
+else fail E-draft.rig "rig: row_open draft failed (ROW_RC=$ROW_RC) — this row did NOT run"; fi
+if row_open draftq; then body "$D/b" "E-draftq plain ascii body"; drive E "$D/b"
+    eq E-draftq.pastes "a box reading input=? is a draft (#626): NOTHING is pasted (#1674)" "$(pastes)" 0
+    eq E-draftq.rec "…and it is NOT submitted" "$(subs)" 0; row_close
+else fail E-draftq.rig "rig: row_open draftq failed (ROW_RC=$ROW_RC) — this row did NOT run"; fi
+# NEGATIVE: a GHOST over an empty box is NOT a draft — the gate must not make an
+# autosuggest block delivery.
+if row_open ghost; then body "$D/b" "E-ghost plain ascii body"; drive E "$D/b"
+    eq E-ghost.rc "a ghost/autosuggest is not a draft: the emit is delivered" "$ROW_RC" 0
+    eq E-ghost.rec "…exactly one submission" "$(subs)" 1; row_close
+else fail E-ghost.rig "rig: row_open ghost failed (ROW_RC=$ROW_RC) — this row did NOT run"; fi
+# THE SAME DRAFT, TYPED AHEAD INTO A MID-TURN PANE (your-org/nexus-code#1683
+# F1). The gate read only `user-typing`, so a `busy` pane — which is what every
+# hook-carrying worker reads while its heartbeat is fresh — was pasted into.
+if row_open busydraft; then body "$D/b" "E-busydraft plain ascii body"; drive E "$D/b"
+    eq E-busydraft.pastes "a draft typed into a MID-TURN pane (busy input=typed): NOTHING is pasted (#1683)" "$(pastes)" 0
+    eq E-busydraft.rec "…and the draft is NOT submitted" "$(subs)" 0
+    if (( HAVE_PD )); then eq E-busydraft.rc "…reported rc 7, as for an idle-box draft" "$ROW_RC" 7
+    else na E-busydraft.rc "needs the primitive"; fi; row_close
+else fail E-busydraft.rig "rig: row_open busydraft failed (ROW_RC=$ROW_RC) — this row did NOT run"; fi
+if row_open busydraftq; then body "$D/b" "E-busydraftq plain ascii body"; drive E "$D/b"
+    eq E-busydraftq.pastes "a mid-turn box reading input=? is a draft (#626): NOTHING is pasted (#1683)" "$(pastes)" 0
+    eq E-busydraftq.rec "…and it is NOT submitted" "$(subs)" 0; row_close
+else fail E-busydraftq.rig "rig: row_open busydraftq failed (ROW_RC=$ROW_RC) — this row did NOT run"; fi
+# NEGATIVE: a mid-turn pane with an EMPTY box is not a draft — reading the box on
+# a busy pane must not make `busy` itself refuse.
+if row_open busyblank; then body "$D/b" "E-busyblank plain ascii body"; drive E "$D/b"
+    eq E-busyblank.rc "a mid-turn pane with an empty box (busy input=blank): the emit is delivered" "$ROW_RC" 0
+    eq E-busyblank.rec "…exactly one submission" "$(subs)" 1; row_close
+else fail E-busyblank.rig "rig: row_open busyblank failed (ROW_RC=$ROW_RC) — this row did NOT run"; fi
+if row_open busydraft; then printf 'U-busydraft please continue with the task' > "$D/b"; drive U "$D/b"
+    eq U-busydraft.pastes "unstick into a mid-turn draft: NOTHING is pasted (#1683)" "$(pastes)" 0
+    eq U-busydraft.rec "…and it is NOT submitted" "$(subs)" 0; row_close
+else fail U-busydraft.rig "rig: row_open busydraft failed (ROW_RC=$ROW_RC) — this row did NOT run"; fi
+# A DRAFT THAT STAYS (your-org/nexus-code#1683 F2). rc 7 used to be neither
+# counted nor surfaced, so a draft left in the box — or a stranded emit of ours —
+# withheld every later emit in silence. Now: a per-target run count, an operator
+# alert once the run is long enough in BOTH count and age, and a reset + clear
+# on the next delivery. Thresholds are set per drive so both gates are exercised.
+_dfr_count() { cut -f1 "$D/state/paste-deferral/orchestrator" 2>/dev/null || echo none; }
+_dfr_n()     { [[ -e "$D/alerts" ]] || { echo 0; return; }; command grep -c -F -e "$1" "$D/alerts"; }
+if (( HAVE_PD )); then
+    if row_open draft; then
+        body "$D/b" "D-defer plain ascii body"
+        MONITOR_PASTE_DEFERRAL_ALERT_COUNT=2 MONITOR_PASTE_DEFERRAL_ALERT_SECONDS=3600 drive E "$D/b"
+        eq D-defer1.count "one draft deferral is COUNTED for the target (#1683)" "$(_dfr_count)" 1
+        MONITOR_PASTE_DEFERRAL_ALERT_COUNT=2 MONITOR_PASTE_DEFERRAL_ALERT_SECONDS=3600 drive E "$D/b"
+        eq D-defer2.count "…a second in a row makes the run 2" "$(_dfr_count)" 2
+        eq D-defer2.quiet "…count reached but the run is YOUNGER than the age threshold: no alert" "$(_dfr_n 'raise paste-draft-deferred:orchestrator')" 0
+        MONITOR_PASTE_DEFERRAL_ALERT_COUNT=2 MONITOR_PASTE_DEFERRAL_ALERT_SECONDS=0 drive E "$D/b"
+        eq D-defer3.count "…a third makes it 3" "$(_dfr_count)" 3
+        eq D-defer3.raise "…and past BOTH thresholds the operator alert is RAISED, once, at warning" "$(_dfr_n 'raise paste-draft-deferred:orchestrator warning')" 1
+        eq D-defer.pastes "…while nothing was ever pasted into the draft" "$(pastes)" 0
+        _dfr_saved="$WORK/dfr-saved"; mkdir -p "$_dfr_saved"
+        cp "$D/state/paste-deferral/orchestrator" "$_dfr_saved/count" 2>/dev/null
+        cp "$D/alert-standing" "$_dfr_saved/standing" 2>/dev/null
+        row_close
+    else fail D-defer.rig "rig: row_open draft failed (ROW_RC=$ROW_RC) — this row did NOT run"; fi
+    if row_open normal; then
+        mkdir -p "$D/state/paste-deferral"
+        cp "$_dfr_saved/count" "$D/state/paste-deferral/orchestrator" 2>/dev/null
+        cp "$_dfr_saved/standing" "$D/alert-standing" 2>/dev/null
+        body "$D/b" "D-reset plain ascii body"; drive E "$D/b"
+        eq D-reset.rc "the box is clear again: the emit is delivered" "$ROW_RC" 0
+        eq D-reset.count "…and the delivery RESETS the run" "$(_dfr_count)" none
+        eq D-reset.clear "…and CLEARS the standing alert" "$(_dfr_n 'clear paste-draft-deferred:orchestrator')" 1
+        row_close
+    else fail D-reset.rig "rig: row_open normal failed (ROW_RC=$ROW_RC) — this row did NOT run"; fi
+else
+    na D-defer "needs the primitive (no occupied-before-paste without it)"
+fi
+
+# The unstick path goes through the same primitive.
+if row_open draft; then printf 'U-draft please continue with the task' > "$D/b"; drive U "$D/b"
+    eq U-draft.pastes "unstick into an operator draft: NOTHING is pasted (#1674)" "$(pastes)" 0
+    eq U-draft.rec "…and it is NOT submitted" "$(subs)" 0
+    if (( HAVE_PD )); then eq U-draft.rc "…reported not delivered (rc 1)" "$ROW_RC" 1
+    else na U-draft.rc "needs the primitive"; fi; row_close
+else fail U-draft.rig "rig: row_open draft failed (ROW_RC=$ROW_RC) — this row did NOT run"; fi
 
 # THE PRODUCTION SHAPE. A real emit collapses to a placeholder, so while it is
 # held its trailer is NOT on the pane: the pre-fix function returned 4, and
@@ -638,6 +766,35 @@ row_open hold && { printf 'U-tabline naïve a%sb %s%s end' "$ZWSP" "$(printf 'co
     honest U-tabline.honest "a held single-line payload that collapses only BY ITS TABS is not reported delivered while held"
     eq U-tabline.rec '…and is recovered: the placeholder IS ours, because the binary counts a TAB as four' "$(subs)" 1
     eq U-tabline.enters "…by exactly one extra Enter" "$(enters)" 2; row_close; }
+# ---- your-org/nexus-code#1729: the WHOLE input region, not the glyph row -----
+# OUR held chip (or line) with an OPERATOR continuation row under it: the glyph
+# row alone still reads as ours, so the old equality admitted it and the retry
+# Enter submitted the operator's text together with our payload. Nothing but
+# ours may be in the region between the glyph row and the bottom border.
+_U1729_LONG() { printf 'U-%s naïve a%sb %s end' "$1" "$ZWSP" "$(printf 'padding-%.0s' $(seq 1 110))"; }
+if (( HAVE_PD )); then
+    row_open hold-chipcont && { _U1729_LONG chipcont > "$D/b"; drive U "$D/b"
+        honest U-chipcont.honest "our held chip with an operator continuation row is not reported delivered"
+        eq U-chipcont.enters "…and earns NO retry Enter: the region below the chip is not ours" "$(enters)" 1
+        eq U-chipcont.rec "…so the operator's continuation is NEVER submitted with our chip" "$(subs)" 0; row_close; }
+    # CONTROL for the border detection: the chip alone, with the bottom border and a
+    # FOOTER below it. The footer is not input — a region running to the end of the
+    # capture would refuse this, so it is what proves the border is found.
+    row_open hold-chipborder && { _U1729_LONG chipborder > "$D/b"; drive U "$D/b"
+        eq U-chipborder.rec "CONTROL: our chip alone above the border (footer below) is still recovered" "$(subs)" 1
+        eq U-chipborder.enters "CONTROL: …by exactly one extra Enter" "$(enters)" 2; row_close; }
+    row_open hold-chipcontborder && { _U1729_LONG chipcontborder > "$D/b"; drive U "$D/b"
+        eq U-chipcontborder.enters "an operator row ABOVE the border, under our chip, earns NO retry Enter" "$(enters)" 1
+        eq U-chipcontborder.rec "…and nothing is submitted" "$(subs)" 0; row_close; }
+    row_open hold-textcont && { printf 'U-textcont naïve a%sb continue' "$ZWSP" > "$D/b"; drive U "$D/b"
+        eq U-textcont.enters "our held TEXT line with an operator continuation row earns NO retry Enter" "$(enters)" 1
+        eq U-textcont.rec "…and nothing is submitted" "$(subs)" 0; row_close; }
+else
+    for _id in U-chipcont.honest U-chipcont.enters U-chipcont.rec U-chipborder.rec U-chipborder.enters \
+               U-chipcontborder.enters U-chipcontborder.rec U-textcont.enters U-textcont.rec; do
+        na "$_id" "needs the primitive"
+    done
+fi
 # The same, through pd_deliver's DERIVED needle (no caller-supplied trailer here).
 # ---- your-org/nexus-code#1597: a first line the equality could not read ------
 # Row ids are the prediction file's, written before these rows or the fix. What
@@ -873,8 +1030,12 @@ printf '== %s n/a ==\n' "$NA"
 # subshell; only an exact count makes a VANISHED assertion redden. The total is
 # a property of the SUBJECT: a tree with no primitive answers n/a for the rows
 # that need one (73 counted), and the two code-point-table rows need python3.
-EXPECTED_ASSERTIONS=145
-(( HAVE_PD )) || EXPECTED_ASSERTIONS=100
+# The #1674 draft/ghost rows add 11, of which 2 need the primitive: 145 -> 156,
+# 100 -> 109. The #1683 F1 mid-turn rows add 9, of which 1 needs it: 156 -> 165,
+# 109 -> 117. The #1683 F2 deferral rows add 9, all needing it: 165 -> 174.
+# The #1729 input-region rows add 9, all needing it: 174 -> 183.
+EXPECTED_ASSERTIONS=183
+(( HAVE_PD )) || EXPECTED_ASSERTIONS=117
 if (( HAVE_PD )) && ! command -v python3 >/dev/null 2>&1; then EXPECTED_ASSERTIONS=$(( EXPECTED_ASSERTIONS - 2 )); fi
 TOTAL_ASSERTIONS=$(( ${PASS:-0} + ${FAIL:-0} ))
 # ONE physical line, deliberately: the summary-honesty classifier reads

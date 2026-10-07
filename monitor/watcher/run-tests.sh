@@ -1923,19 +1923,25 @@ run_one() {
     else
         _rt_tt="$_rt_tmp"
     fi
+    # THE TEST FENCE (your-org/nexus-code#1680): the suite's scratch root is
+    # the only place a primary-root resolver (monitor/_nexus-root.sh,
+    # spawn-worker.sh) may de-nest to. A tree under test that sits in some
+    # nexus's work/ — every secondary clone an agent runs a band from — then
+    # resolves to ITSELF, as it does in CI, instead of to the operator's
+    # primary, whose production state its fixtures would otherwise write.
     if [[ "${PER_TEST_TIMEOUT:-0}" =~ ^[0-9]+$ ]] && (( ${PER_TEST_TIMEOUT:-0} > 0 )); then
         # Hard per-test ceiling (#499). TERM first so the test's own EXIT
         # trap can reap its fixture processes; KILL 15 s later if it
         # ignores that. rc=124 is timeout's TERM verdict, 137 the
         # KILL escalation — both are TIMEOUT, never a pass.
         NEXUS_TEST_SUITE="$suite_tag" TMPDIR="$_rt_tmp" TMUX_TMPDIR="$_rt_tt" \
-        env "${_rt_scrub[@]}" \
+        NEXUS_TEST_FENCE="$_rt_tmp" env "${_rt_scrub[@]}" \
         timeout -k 15 "$PER_TEST_TIMEOUT" "${TEST_INTERPRETER:-bash}" "$test_path" \
             </dev/null >"$log_base.out" 2>"$log_base.err"
         rc=$?
     else
         NEXUS_TEST_SUITE="$suite_tag" TMPDIR="$_rt_tmp" TMUX_TMPDIR="$_rt_tt" \
-        env "${_rt_scrub[@]}" \
+        NEXUS_TEST_FENCE="$_rt_tmp" env "${_rt_scrub[@]}" \
         "${TEST_INTERPRETER:-bash}" "$test_path" </dev/null >"$log_base.out" 2>"$log_base.err"
         rc=$?
     fi

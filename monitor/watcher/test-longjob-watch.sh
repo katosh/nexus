@@ -61,16 +61,25 @@ SPOOL="$NEXUS_STATE_DIR/longjob/t1"
 STUB="$WORK/stub"; mkdir -p "$STUB"
 cat > "$STUB/sacct" <<'EOF'
 #!/usr/bin/env bash
-# emits the contents of $LJ_SACCT_FILE (one "State|ExitCode" line, or empty)
+# emits the contents of $LJ_SACCT_FILE (one "State|ExitCode" line, or empty);
+# every call also appends its argv to $LJ_SACCT_CALLS, so a case can assert
+# that sacct was NEVER asked (your-org/nexus-code#1727).
+[[ -n "${LJ_SACCT_CALLS:-}" ]] && printf '%s\n' "$*" >> "$LJ_SACCT_CALLS"
 [[ -f "${LJ_SACCT_FILE:-}" ]] && cat "$LJ_SACCT_FILE"; exit 0
 EOF
 cat > "$STUB/squeue" <<'EOF'
 #!/usr/bin/env bash
+# $LJ_SQUEUE_FILE holds `squeue -u … -o '%i %T'` rows ("<id> <STATE>").
+# A `-j` query returns EMPTY at rc 0 for a job that IS queued: that is the
+# sandbox's measured behaviour on ~25% of calls (your-org/nexus-code#1744),
+# made deterministic here so a probe still asking `-j` cannot pass.
+for a in "$@"; do case "$a" in -j|-j*|--job*|--jobs*) exit 0 ;; esac; done
 [[ -f "${LJ_SQUEUE_FILE:-}" ]] && cat "$LJ_SQUEUE_FILE"; exit 0
 EOF
 chmod +x "$STUB/sacct" "$STUB/squeue"
 export PATH="$STUB:$PATH"
 export LJ_SACCT_FILE="$WORK/sacct.out" LJ_SQUEUE_FILE="$WORK/squeue.out"
+export LJ_SACCT_CALLS="$WORK/sacct.calls"
 
 # ---- fixture NEXUS_ROOT with a stub async-run.sh ------------------------------
 FROOT="$WORK/froot"; mkdir -p "$FROOT/monitor"
@@ -110,10 +119,41 @@ for pair in 'COMPLETED|0:0=done' 'FAILED|1:0=failed' 'TIMEOUT|0:0=failed' 'OUT_O
 done
 : > "$LJ_SACCT_FILE"
 got=$(probe slurm:12345); [[ "$got" == unknown\|*"no accounting row"* ]] && ok "no sacct row and no squeue row → unknown (never running)" || bad "empty sacct: $got"
-printf 'PENDING\n' > "$LJ_SQUEUE_FILE"
+printf '12345 PENDING\n' > "$LJ_SQUEUE_FILE"
 got=$(probe slurm:12345); [[ "$got" == pending\|*squeue* ]] && ok "no sacct row but squeue PENDING → pending (second source consulted)" || bad "squeue fallback: $got"
+# #1744: the second source is `squeue -u` filtered by id, never `squeue -j`.
+printf '99 RUNNING\n123450 RUNNING\n12345_[3-9] PENDING\n12345_1 RUNNING\n' > "$LJ_SQUEUE_FILE"
+got=$(probe slurm:12345); [[ "$got" == pending\|*squeue* ]] && ok "#1744: an array parent's pending remainder is found in squeue -u output" || bad "#1744 array parent: $got"
+got=$(probe slurm:1234); [[ "$got" == unknown\|* ]] && ok "#1744: id 1234 is NOT a prefix match for 123450 / 12345_* (exact id or <id>_/<id>+ only)" || bad "#1744 prefix collision: $got"
+printf '77 RUNNING\n12345 RUNNING\n' > "$LJ_SQUEUE_FILE"
+got=$(probe slurm:12345); [[ "$got" == running\|*squeue* ]] && ok "#1744: a job on a later squeue -u row is found (filter, not head -1)" || bad "#1744 later row: $got"
 : > "$LJ_SQUEUE_FILE"
 got=$(probe slurm:abc); [[ "$got" == unknown\|* ]] && ok "a non-numeric slurm target → unknown" || bad "bad jobid: $got"
+
+echo "=== #1727: job id 0 is not a job — never polled, never added ==="
+# `sacct -j 0` answers about UNRELATED jobs, so a watch on slurm:0 never reached
+# a verdict about the submitted one (~9.5 h stall). The sacct stub logs every
+# call; the legit-id row beside it is the potency control for that log.
+: > "$LJ_SACCT_CALLS"; : > "$LJ_SACCT_FILE"
+got=$(probe slurm:0)
+[[ "$got" == unknown\|*"not a Slurm job id"* ]] && ok "#1727 probe slurm:0 → unknown (not a Slurm job id)" || bad "#1727 probe slurm:0: $got"
+[[ ! -s "$LJ_SACCT_CALLS" ]] && ok "#1727 probe slurm:0 never runs sacct" || bad "#1727 sacct was polled for job 0: $(cat "$LJ_SACCT_CALLS")"
+: > "$LJ_SACCT_CALLS"
+probe slurm:123456 >/dev/null
+[[ "$(grep -o -e '-j 123456' "$LJ_SACCT_CALLS" | wc -l | tr -d ' ')" == 1 ]] && ok "#1727 CONTROL: probe slurm:123456 polls sacct exactly once (the call log is live)" || bad "#1727 sacct log control: $(cat "$LJ_SACCT_CALLS")"
+for _bad_id in 0 007 0_1; do
+    _o=$("$LJ" add "slurm:$_bad_id" --id "w1727-bad" --no-first-probe 2>&1); _rc=$?
+    [[ $_rc -eq 2 && "$_o" == *"positive Slurm job id"* && ! -e "$SPOOL/watches/w1727-bad.json" ]] \
+        && ok "#1727 add slurm:$_bad_id is refused with a clear message (rc 2, no spec written)" || bad "#1727 add slurm:$_bad_id rc=$_rc: $_o"
+    rm -f "$SPOOL/watches/w1727-bad.json"   # a wrongly accepted add must not cascade into later status/active counts
+done
+for _good_id in 123456 123456_3 123456_0 123456+0 123456.0; do
+    _o=$("$LJ" add "slurm:$_good_id" --id "w1727-ok" --no-declare --no-first-probe 2>&1); _rc=$?
+    [[ ( $_rc -eq 0 || $_rc -eq 3 ) && -f "$SPOOL/watches/w1727-ok.json" ]] \
+        && ok "#1727 CONTROL: add slurm:$_good_id is accepted (rc $_rc, spec written)" || bad "#1727 legit id $_good_id refused rc=$_rc: $_o"
+    rm -f "$SPOOL/watches/w1727-ok.json"
+done
+: > "$LJ_SACCT_CALLS"
 
 echo "=== #1629: a Slurm ARRAY is a SET — terminal only when EVERY task is ==="
 # sacct -X prints one row per array task; the probe used to read the FIRST row
@@ -197,10 +237,29 @@ out=$("$LJ" add file:"$WORK/w1" --id w1 --interval 5 --desc "the w1 file" 2>&1);
 "$LJ" add cmd:"test -e $WORK/w2 && exit 0; exit 1" --id w2 --interval 5 --notify transitions >/dev/null
 "$LJ" add cmd:"test -e $WORK/w3 && exit 0; exit 1" --id w3 --interval 5 >/dev/null
 "$LJ" add slurm:777 --id w4 --interval 5 --unknown-max 2 >/dev/null
-"$LJ" add cmd:'exit 1' --id w5 --interval 5 --ttl 1 >/dev/null
+# w5's TTL is 4 s, not 1 (bundle-1005a): at 1 s a dispatcher poll landing
+# between this `add` and the `status` below retired w5 first, and a loaded CI
+# runner read `active_watches=4` (PR 1745, bash jobs-4 cell, a 684 s run). 4 s
+# still expires inside the `sleep 10` that follows, which is what w5 tests.
+"$LJ" add cmd:'exit 1' --id w5 --interval 5 --ttl 4 >/dev/null
 out=$("$LJ" status); [[ "$out" == *"dispatcher=armed"* && "$out" == *"active_watches=5"* ]] && ok "status: armed, 5 active" || bad "status armed: $out"
 sleep 10                             # first poll: w2/w3 pending→running (w2 prints, w3 does not), w4 unknown #1, w5 expired — five probes plus one paced print
 [[ "$(jq -r '.retired_reason' "$SPOOL/watches/w5.json")" == expired ]] && ok "w5 retired: expired" || bad "w5 not yet expired"
+# F1 below needs w1 and w2 to go terminal in ONE pass, so the two touches must
+# land BETWEEN passes. A pass probes in file order (w1 before w2); a touch that
+# lands MID-pass, after w1's probe and before w2's, makes w2 DONE one pass
+# AHEAD of w1 — measured on CI as `w1@…938 w2@…933` (#1703), and reproduced
+# with a slow probe sorted between them. So wait for the dispatcher's
+# pass-END ledger write (note exactly "ok"; mid-pass writes say "mid-pass"),
+# after which it sleeps poll_seconds (5) before the next pass starts.
+lp0=$(jq -r '.last_poll // 0' "$SPOOL/dispatcher.json" 2>/dev/null); [[ "$lp0" =~ ^[0-9]+$ ]] || lp0=0
+edge=0
+for _ in $(seq 1 150); do
+    read -r lp note < <(jq -r '"\(.last_poll) \(.note)"' "$SPOOL/dispatcher.json" 2>/dev/null) || true
+    [[ "${note:-}" == ok && "${lp:-0}" =~ ^[0-9]+$ ]] && (( lp > lp0 )) && { edge=1; break; }
+    sleep 0.2
+done
+(( edge )) || bad "no pass-end ledger write within 30 s: the w1/w2 touches below may land mid-pass (F1 would then be a rig failure, not a pacing one)"
 touch "$WORK/w1"; touch "$WORK/w2"
 sleep 7                              # second poll: w1 done, w2 done, w4 unknown #2 → UNKNOWN
 sleep 6                              # third poll: settle
@@ -400,6 +459,36 @@ export NEXUS_LONGJOB_KEY="t6"
 # THIS copy and the suite stayed green — because nothing drove it. Now it does.
 "$LJ" add cmd:'exit 3' --id aw4 --interval 1 --unknown-max 2 >/dev/null 2>&1
 "$LJ" await aw4 --timeout 20 >/dev/null; rc=$?; (( rc == 3 )) && ok "await → 3 after unknown_max consecutive unknown probes (parked, never 0 and never a hang)" || bad "await unknown rc=$rc"
+
+echo "=== #1685: the fallback fits the harness's background time limit (default 30 min, ceiling 2 h) ==="
+# Claude Code 2.1.285+ STOPS a run_in_background call at the call's own
+# `timeout` and hands the agent a stop notice instead of await's typed rc. The
+# printed fallback must therefore carry a Bash `timeout` that covers --timeout,
+# fit the DEFAULT when the agent sets nothing, and refuse what no call can hold.
+export NEXUS_LONGJOB_KEY="t1685"
+LJ0=(env -u BASH_DEFAULT_TIMEOUT_MS -u BASH_MAX_TIMEOUT_MS "$LJ")   # the host defaults, whatever this shell carries
+out=$("${LJ0[@]}" add file:"$WORK/never1685" --id fb1685 2>&1); rc=$?
+ms=$(sed -n 's/.*run_in_background: true AND timeout: \([0-9][0-9]*\).*/\1/;T;p;q' <<<"$out")   # first match; no early-exit reader
+s=$(sed -n 's/.*await fb1685 --timeout \([0-9][0-9]*\).*/\1/;T;p;q' <<<"$out")
+if (( rc == 3 )) && [[ "$ms" =~ ^[0-9]+$ && "$s" =~ ^[0-9]+$ ]] && (( ms > s * 1000 && ms <= 1800000 )); then
+    ok "#1685: NOT-ARMED prints a runnable await (--timeout $s) with a Bash timeout ($ms ms) above it and within the 30-min default"
+else bad "#1685: NOT-ARMED fallback lacks a covering Bash timeout: rc=$rc ms='$ms' s='$s' out=$out"; fi
+[[ "$out" == *"<status>killed</status>"* && "$out" == *"ng longjob"* ]] && ok "#1685: …and says a harness STOP notice is not a verdict, and that past the ceiling the route is ng longjob" || bad "#1685: stop-notice / ng longjob guidance missing: $out"
+"${LJ0[@]}" rm fb1685 >/dev/null
+"${LJ0[@]}" add cmd:'exit 0' --id dn1685 --interval 1 >/dev/null 2>&1
+amax=$(( 7200 - MONITOR_LONGJOB_PROBE_TIMEOUT_SECONDS - 30 ))   # ceiling less one probe's slack
+out=$("${LJ0[@]}" await dn1685 --timeout $(( amax + 1 )) 2>&1); rc=$?
+(( rc == 2 )) && [[ "$out" == *"ng longjob"* ]] && ok "#1685: await --timeout $(( amax + 1 )) (past what one 2-h call can hold) → rc 2, routed to ng longjob" || bad "#1685: over-ceiling await: rc=$rc $out"
+# Potency controls: the refusal is a BOUNDARY, not a blanket — the largest
+# holdable value is accepted, and a raised BASH_MAX_TIMEOUT_MS raises it.
+"${LJ0[@]}" await dn1685 --timeout "$amax" >/dev/null 2>&1; rc=$?; (( rc == 0 )) && ok "#1685: await --timeout $amax (ceiling less slack) is accepted" || bad "#1685: boundary await rc=$rc"
+env -u BASH_DEFAULT_TIMEOUT_MS BASH_MAX_TIMEOUT_MS=14400000 "$LJ" await dn1685 --timeout 7200 >/dev/null 2>&1; rc=$?; (( rc == 0 )) && ok "#1685: BASH_MAX_TIMEOUT_MS=4h raises the cap (7200 accepted)" || bad "#1685: raised-ceiling await rc=$rc"
+# The printed Bash timeout leaves slack for ONE probe, so await must not sleep
+# a whole --interval past its deadline: a 2-s await on a 60-s interval ends in
+# seconds with rc 4, not after 60 s (the outer 30 s bound reads 124 if it does).
+"${LJ0[@]}" add file:"$WORK/never1685b" --id sl1685 --interval 60 >/dev/null 2>&1
+timeout 30 "${LJ0[@]}" await sl1685 --timeout 2 >/dev/null 2>&1; rc=$?
+(( rc == 4 )) && ok "#1685: await never sleeps past its deadline (rc 4 within the bound, interval 60 s)" || bad "#1685: await overslept its deadline: rc=$rc (124 = still sleeping at 30 s)"
 
 echo "=== D1: a paced burst keeps the ledger ARMED mid-pass (a healthy dispatcher must never read stale) ==="
 # COVERED SHAPE: the paced-burst pass (emits make the pass long). The

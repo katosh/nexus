@@ -84,6 +84,7 @@ A skill's audience is the second column in the table below.
 | [`nexus.self-fix`](#nexusself-fix) | orchestrator + maintainers | Editing the nexus itself — watcher, monitor scripts, skills, CLAUDE.md |
 | [`nexus.dashboard`](#nexusdashboard) | orchestrator | Overview-issue identity block (`ng nexus-identity`) + formalized dashboard schema (`ng dashboard scaffold`/`validate`) |
 | [`nexus.skeptic`](#nexusskeptic) | orchestrator + skeptic | Independent adversarial validation of a worker's result; three spawn modes (`require`/`auto`/`deny`), wrap-up enforcement, worker↔skeptic channel + nudge, bounded recursion |
+| [`nexus.services`](#nexusservices) | any agent registering a service | The one how-to for a PERMANENT service in the cockpit: when to register, the registry row and URL convention (`.deploy/endpoint`), healthcheck design, supervision, auto-deploy companions, verification, removal |
 | [`nexus.service-recovery`](#nexusservice-recovery) | orchestrator | Response protocol for a watcher `--- service health ---` emit: restore first, dispatch a reversible root-cause fix, open an incident via `ng service-incident`, close the loop |
 | [`nexus.watcher`](#nexuswatcher) | orchestrator | Operating & diagnosing the watcher: liveness by the UP/BUSY/WEDGED/DOWN verdict over the heartbeat/progress/cycle triple (not `watcher.log` mtime, and **not** the heartbeat alone), the supervisor's silent self-heal, recovery recipes by failure signature (wedge / stale-lock / decapitation-duplicate), phantom-window auto-resurrection, eligible-comment eyes-ack + stale-eyes re-emit, CC-banner vs gated cc-update |
 | [`nexus.jupyter`](#nexusjupyter) | orchestrator | JupyterLab-as-a-service: one-command activation (`monitor/jupyter-up.sh`), work-root session with all project kernels, supervised auto-revival via `services.registry` |
@@ -95,6 +96,7 @@ A skill's audience is the second column in the table below.
 | [`nexus.ci-triage`](#nexusci-triage) | worker + orchestrator | A PR's CI has gone RED and you do not yet know whether the base or your diff caused it: check `dev` in isolation first (a unique per-caller worktree), what a worktree's missing gitignored/untracked files hide, why `ci-signal` green is not merge clearance |
 | [`nexus.claims`](#nexusclaims) | worker + orchestrator + skeptic | You are about to PUBLISH A CHECKABLE CLAIM — a count, a `path:line`, a timeline across refs, a set membership — and the enumeration behind it has to be able to say which direction it errs in |
 | [`nexus.longjob`](#nexuslongjob) | worker + orchestrator | A computation will OUTLIVE the 30-minute `Monitor` cap and you need to be WOKEN when it ends, fails, or hits a custom event — `ng longjob run -- <cmd>`, auto-watched `sbatch`, `add slurm:\|asyncrun:\|pid:\|file:\|cmd:`, and what happens when the watch does NOT fire |
+| [`nexus.codex`](#nexuscodex) | worker + orchestrator | OpenAI Codex: a supervised co-worker for a BOUNDED subtask (`ng codex run`, exit 7 = indeterminate, the diff plus the list of writes outside it, why never a raw `codex exec`), or a first-class worker (`spawn-worker.sh --harness codex`) |
 | [`nexus.cc-update`](#nexuscc-update) | orchestrator | Evaluating a candidate Claude Code release before bumping the pin. Ships as `GUIDE.md` (not an auto-loaded `SKILL.md`) — referenced by path so it never distracts workers |
 
 ## `nexus.tmux-spawn`
@@ -371,6 +373,24 @@ nudge, and bounded recursion so a skeptic-of-a-skeptic chain terminates.
 inherits its own blind spots. An adversarial second agent, briefed to
 disprove rather than confirm, catches the errors the author cannot see.
 
+## `nexus.services`
+
+→ [`skills/nexus.services/SKILL.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.services/SKILL.md)
+
+**Audience:** any agent adding, changing or removing a long-running
+service; the orchestrator when it reviews one.
+
+**Trigger:** a row is about to go into `monitor/services.registry`, or
+`svc.sh status` printed `WARN service … probes HTTP but shows no URL`.
+
+**What it covers:** the procedure the registry's column reference
+(`monitor/services.registry.example`) does not give: register only
+PERMANENT services, the row, the cockpit URL convention
+(`<workdir>/.deploy/endpoint`), healthcheck design (identity, not
+liveness), supervision via `svc.sh`, the staged-build/atomic-swap
+auto-deploy companion, network exposure, a verification checklist and
+clean removal.
+
 ## `nexus.service-recovery`
 
 → [`skills/nexus.service-recovery/SKILL.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.service-recovery/SKILL.md)
@@ -612,6 +632,36 @@ what survives a respawn (the spool, keyed on the session id) and what does
 not (the dispatcher process), the fallback wake (`await` under
 `run_in_background`) for an unarmed session, and the host's rollout flag
 (`tengu_amber_sentinel`) that decides whether plugin monitors arm at all.
+
+## `nexus.codex`
+
+→ [`skills/nexus.codex/SKILL.md`](https://github.com/<your-org>/nexus-code/blob/main/skills/nexus.codex/SKILL.md)
+
+**Audience:** a Claude Code worker that wants a second, independent
+implementation or review, or a bounded mechanical edit it will verify
+itself.
+
+**Trigger:** you are about to run `codex exec`, or to hand work to OpenAI
+Codex in any form.
+
+**What it covers:** `ng codex run` (`monitor/codex-run.sh`): the typed
+verdict (`completed`, `turn-failed`, `timeout`, `unavailable`, `workdir`,
+and `indeterminate` when no terminal event was seen), the artefacts it
+leaves (events, final message, a before/after diff of the non-ignored tree
+through a private index, plus every other write it can see: gitignored files
+and `--also-watch` dirs, with commands.txt for the rest), `--background` via `ng longjob`, the measured traps of a raw
+`codex exec` (it appends inherited stdin, ignores `OPENAI_API_KEY`, and its
+own bubblewrap sandbox cannot run a command inside this nexus's kernel
+sandbox), the pinned install in its own package root (`codex-cli/`), the
+model default, and the mock Responses backend for testing against the real
+binary. The worker stays the owner of the report, wrap-up and skeptic
+contract. Layer 2, for the orchestrator: `spawn-worker.sh --harness codex`
+runs a Codex TUI as a first-class worker — persisted folder trust, the TUI's
+one-time `codex login`, Codex hooks feeding the nexus heartbeat and
+submit-stamp, pane-state's Codex classifier, `ng send` through
+`monitor/harness/codex.sh`, `codex resume`, and what a Codex worker does NOT
+get (no `SendMessage`, no wake, and the Claude PreToolUse guard scripts are
+not wired, although Codex has the hook).
 
 ## `nexus.claims`
 

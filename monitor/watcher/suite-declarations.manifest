@@ -30,10 +30,11 @@
 # and `gp_population()`), so this file and guards-for-diff cannot disagree
 # about who declares.
 #
-# unreviewed-ceiling: 375
+# unreviewed-ceiling: 370
 #
 # ── ROWS  suite|status|reason ─────────────────────────────────────────────────
 monitor/cc-harness/test-cc-harness-gate-coverage-trackedness.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
+monitor/cc-harness/test-probe-2g-limits.sh|declares-none|reviewed 2026-10-05 (your-org/nexus-code#1734): a unit test of monitor/cc-harness/probe-2g-limits.py over SYNTHETIC fixtures it builds in a temp dir, plus one read of the OUTPUT LIMITS bullet in skills/nexus.cc-update/GUIDE.md; no repo-wide population, and it never reads a real claude binary
 monitor/test-bookkeeping-contract.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/test-ci-head-attempts.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/test-ci-signal-step-contract.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
@@ -41,8 +42,6 @@ monitor/test-ci-trigger-audit.sh|unreviewed|census at dev 2a299572 (2026-09-06);
 monitor/test-coldbuild-guard.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/test-interactive-sessions.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/test-interpreter-parity.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
-monitor/test-lint-citations.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
-monitor/test-lint-workflows.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/test-ng-cross-surface.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/test-obligations.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/test-paste-followup-confirm.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
@@ -111,6 +110,8 @@ monitor/watcher/test-cross-repo-mention-filter.sh|unreviewed|census at dev 2a299
 monitor/watcher/test-decision-gate-states.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-declare-no-wait.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-declare-wait.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
+monitor/watcher/test-degraded-probe.sh|declares-none|reviewed 2026-10-05 (your-org/nexus-code#1724): a unit test of monitor/degraded-probe.sh over surface directories it creates in a temp dir, plus a fake nexus root for the default-surface selection; no repo-wide population
+monitor/watcher/test-doctor.sh|declares-none|reviewed 2026-10-06 (your-org/nexus-code#1722): drives monitor/doctor.sh against a FIXTURE nexus it builds in a temp dir (stub gh/claude installs, a fixture config and transcript root), never the real tree; no repo-wide population
 monitor/watcher/test-deliveries-event-prefilter.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-deliveries-mention.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-deliveries-race.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
@@ -141,6 +142,7 @@ monitor/watcher/test-force-push-check.sh|unreviewed|census at dev 2a299572 (2026
 monitor/watcher/test-force-push-over-report-caveat.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-fork-headroom-guard.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-fs-guard.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
+monitor/watcher/test-fs-degraded-note.sh|declares-none|reviewed 2026-10-06 (your-org/nexus-code#1724): drives monitor/watcher/_fs_guard.sh, the real paste path in monitor/watcher/main.sh + monitor/_paste-deliver.sh, and monitor/degraded-status.sh with stubs and fixture dirs it creates in a temp dir only; no repo-wide population
 monitor/watcher/test-full-state-clock-only-change.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-full-state-emit-noise.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-full-state-idle-backoff.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
@@ -183,6 +185,7 @@ monitor/watcher/test-integration/test-realmodel-overlimit.sh|unreviewed|census a
 monitor/watcher/test-integration/test-realmodel-paste-held.sh|declares-none|reviewed 2026-09-19 (your-org/nexus-code#1591): a real-binary scenario, no repo-wide population — it evals two named functions out of monitor/watcher/main.sh and monitor/watcher/_respawn.sh, sources monitor/_paste-deliver.sh and drives them into the cc-harness; gated by RUN_CC_HARNESS and enrolled in monitor/cc-harness/gate-coverage.tsv, which is the index that speaks for it
 monitor/watcher/test-integration/test-realmodel-pretooluse-hook.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-integration/test-realmodel-respawn-verify.sh|declares-none|reviewed 2026-09-22 (your-org/nexus-code#1622): a real-binary scenario, no repo-wide population — it sources monitor/watcher/_respawn.sh and drives `_respawn_orchestrator` into the cc-harness; gated by RUN_CC_HARNESS and enrolled in monitor/cc-harness/gate-coverage.tsv, which is the index that speaks for it
+monitor/watcher/test-integration/test-realmodel-respawn-late-render.sh|declares-none|reviewed 2026-10-01 (your-org/nexus-code#1715): a real-binary scenario, no repo-wide population — it sources monitor/watcher/_respawn.sh and drives `_respawn_orchestrator` into the cc-harness with the paste DEFERRED at the transport; gated by RUN_CC_HARNESS and enrolled in monitor/cc-harness/gate-coverage.tsv, which is the index that speaks for it
 monitor/watcher/test-integration/test-realmodel-auth-failure-hooks.sh|declares-none|a RUN_CC_HARNESS-gated real-binary scenario (your-org/nexus-code#1548 F1, #1520): it reads the claude binary, the mock backend and its own journal hooks, and drives the REAL turn-failure-emit.sh / stamp-clear.sh / _cause_classify.sh; registered in monitor/cc-harness/gate-coverage.tsv, which is the index for realmodel scenarios, and deliberately not in the guards-for-diff index a gated suite cannot answer on a runner without the binary
 monitor/watcher/test-integration/test-realmodel-trust-dialog.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-integration/test-realmodel-trust-sandboxed-env.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
@@ -381,21 +384,19 @@ monitor/watcher/test-stub-claude-classifier-sigpipe.sh|unreviewed|census at dev 
 monitor/watcher/test-supervisor-liveness.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-svc-orphan-reconcile.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-svc-orphans.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
+monitor/watcher/test-svc-url-warning.sh|declares-none|reviewed 2026-10-05 (your-org/nexus-code#1742): drives monitor/svc.sh status end to end over a fixture registry it builds in a temp dir, with a private TMUX_TMPDIR; no repo-wide population
 monitor/watcher/test-svc.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-target-absent.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-target-config.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-target-window-live.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-task-registration-table.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
-monitor/watcher/test-textguard-lint.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-tmpfs-guard.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-tmux-fixture-shell-parity.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-tmux-lookup-sigpipe.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-tmux-shim.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
-monitor/watcher/test-tmuxwrap-lint-conformance.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-trash-install.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-trust-config-clobber-mechanism.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-turn-failure-emit.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
-monitor/watcher/test-uncounted-abort-lint.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-unstick.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-upload-asset-bootstrap.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
 monitor/watcher/test-upload-asset-concurrency.sh|unreviewed|census at dev 2a299572 (2026-09-06); not yet asked what it reads
@@ -425,3 +426,5 @@ monitor/watcher/test-longjob-plugin-arming.sh|declares-none|drives monitor/_long
 monitor/watcher/test-pane-state-longjob-discount.sh|declares-none|fixture-driven pane-state.sh discount + the launch hook's auto-watch; fixed inputs, no population (#1535)
 monitor/watcher/test-integration/test-realmodel-longjob-wake.sh|declares-none|cc-harness scenario (EXEMPT in gate-coverage.tsv, self-skips under the mock backend); drives the real binary, reads no population (#1535)
 monitor/watcher/test-watcher-supervise-probe.sh|declares-none|reviewed 2026-09-25 by its author (your-org/nexus-code#1532): a unit and end-to-end suite over stub tick/revive scripts and a hermetic NEXUS_STATE_DIR with its own dispatcher child; it walks no repo-wide population, so enrolling it would declare none
+monitor/watcher/test-prelude-render-deadline.sh|declares-none|reviewed 2026-10-01 by bundle-1001c (your-org/nexus-code#1698, reopened): a unit suite over monitor/watcher/_idle_probe.sh (render_idle_prelude's render deadline, the time-sliced pane-state.sh fork, the unprobed count) against a fixture state dir, a stubbed tmux and a stubbed pane-state.sh; it walks no repo-wide population, so enrolling it would declare none
+monitor/watcher/test-prelude-sweep-reuse.sh|declares-none|reviewed 2026-09-30 by the bundle-0930 integration pass (your-org/nexus-code#1698): a unit suite over monitor/watcher/_idle_probe.sh and _pane_cache.sh (render_idle_prelude, the recorder sweep marker, the per-sweep knob memo) against a fixture state dir and a stubbed pane-state.sh it counts forks of; it walks no repo-wide population, so enrolling it would declare none

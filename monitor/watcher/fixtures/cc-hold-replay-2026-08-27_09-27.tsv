@@ -1,0 +1,62 @@
+# Replay of the cc auto-update ledger, 2026-08-27 .. 2026-09-27, through the
+# your-org/nexus-code#1657 hold policy. ONE ROW PER FIRE DAY: the day's final
+# outcome under the OLD code, and the STRUCTURED FACTS that outcome carried.
+# Source: the primary clone's monitor/.state/cc-auto-update/decisions.tsv (145
+# rows in the window) and the gate logs / findings files beside it.
+#
+# ROUND 2 (skeptic F4): the first cut SUPPLIED an issue and a control for all
+# five holds, and no historical row carries both. The block facts below now
+# carry ONLY what exists, each field with its SOURCE in the last column:
+#   evidence  the scenario a row names (its gate-2.1.x.log `failed:` line), or
+#             the findings file a row cites (findings-2.1.x.md);
+#   issue     only when THAT DAY's row names it (250/251/252 name none; the
+#             #1112 link arrived in a later correction row and is NOT used);
+#   control   only when that day's row or findings text states a baseline that
+#             passed (250: "2.1.247 GREEN 7/7" in the row, gate-2.1.247-0828.log
+#             GREEN 7/7; 278: "2.1.273 … 27/27 arms pass" in its findings).
+# So 2.1.278 holds on a COMPLETE contract, and 250/251/252/281 hold through
+# the FAIL DIRECTION — evidence named, contract incomplete → hold + defect —
+# never through a field the replay invented. `-` means the source has none.
+#
+# facts vocabulary (what test-cc-hold-policy.sh feeds to the REAL functions):
+#   block:<evidence>|<issue>|<control>        a block the evaluator recorded
+#   control-shared:<control-log>              the evaluator judged the RED not
+#                                             the candidate's (the installed
+#                                             version fails identically): the
+#                                             new path is safe --control-gate-evidence
+#   deferred:<arm> refused:<reason> skipped-after:<compat> unattributable:<cause>
+#   applied  no-fire
+#
+# day	candidate	old	facts	expect_new	source
+2026-08-27	2.1.247	block	control-shared:gate-2.1.246-CONTROL.log	apply	row: "gate RED 6/7 — NOT a candidate defect … 2.1.246 control fails identically"
+2026-08-28	2.1.250	block	block:gate:test-realmodel-trust-dialog|-|2.1.247 GREEN 7/7 on d8534d32 (4-run bisect)	hold-incomplete	evidence: gate-2.1.250.log failed: test-realmodel-trust-dialog.sh; control: the row ("2.1.247 GREEN 7/7") and gate-2.1.247-0828.log GREEN 7/7; issue: none in the row
+2026-08-29	2.1.251	block	block:gate:test-realmodel-trust-dialog|-|-	hold-incomplete	evidence: gate-2.1.251.log failed: test-realmodel-trust-dialog.sh; issue: none in the row; control: none stated
+2026-08-30	2.1.251	skipped-awaiting-operator	skipped-after:compat	reeval-hold	"last-eval=block"
+2026-08-31	2.1.251	skipped-awaiting-operator	skipped-after:compat	reeval-hold	"last-eval=block"
+2026-09-01	2.1.252	block	block:gate:test-realmodel-trust-dialog|-|-	hold-incomplete	evidence: gate-2.1.252.log failed: test-realmodel-trust-dialog.sh; issue: none in the 04:07 row (#1112 only in the 04:12 correction); control: none stated
+2026-09-02	2.1.258	safe-refused	refused:gated-tree-dirty	retry	"gate-evidence:gated-tree-dirty"
+2026-09-03	2.1.259	applied	applied	apply	"safe-refused gated-tree-dirty, changelog-completeness, safe-deferred ×2, then forced at 11:59"
+2026-09-04	2.1.260	safe-deferred	deferred:restart-path-pr	apply	"deferred-pending-PR1009"
+2026-09-05	2.1.261	applied	applied	apply	"safe-refused changelog-completeness (fixed in-run), then safe-bumped-restart-handoff"
+2026-09-06	2.1.263	no-outcome	no-fire	no-fire	"spawned; no verdict row that day (reconcile rows for 2.1.261)"
+2026-09-07	2.1.263	safe-deferred	deferred:active-review	apply	"pr-under-active-review=PR1481(4718s)"
+2026-09-08	2.1.263	safe-deferred	deferred:board-not-quiet	apply	"board-not-quiet=[w226=busy,•bell=unreadable]"
+2026-09-09	2.1.266	safe-deferred	deferred:restart-path-pr	apply	"deferred-pending-PR1502"
+2026-09-10	2.1.267	safe-deferred	deferred:active-review	apply	"pr-under-active-review=PR1506(2212s)"
+2026-09-11	2.1.268	applied	applied	apply	"safe-bumped-restart-handoff"
+2026-09-12	2.1.269	safe-deferred	deferred:board-not-quiet	apply	"board-not-quiet=[w237=idle,w238=working-background]"
+2026-09-13	2.1.270	applied	applied	apply	"safe-bumped-restart-handoff"
+2026-09-14	-	no-fire	no-fire	no-fire	"(no row)"
+2026-09-15	2.1.272	applied	applied	apply	"safe-bumped-restart-handoff"
+2026-09-16	2.1.273	applied	applied	apply	"safe-bumped-restart-handoff"
+2026-09-17	2.1.274	safe-deferred	deferred:restart-path-pr	apply	"deferred-pending-PR1541"
+2026-09-18	2.1.276	safe-deferred	deferred:restart-path-pr	apply	"deferred-pending-PR1566"
+2026-09-19	2.1.278	block	block:probe:findings-2.1.278.md|https://github.com/your-org/nexus-code/issues/1591|2.1.273: 27/27 arms pass, the raw U+200B reaches the mock	hold	evidence: findings-2.1.278.md; issue: the row (…/issues/1591); control: findings-2.1.278.md line 7 ("2.1.273 sends the identical paste on the first Enter: 27/27 arms pass")
+2026-09-20	2.1.278	skipped-awaiting-operator	skipped-after:compat	reeval-hold	"last-eval=block"
+2026-09-21	2.1.278	skipped-awaiting-operator	skipped-after:compat	reeval-hold	"last-eval=block"
+2026-09-22	2.1.280	applied	applied	apply	"skipped-awaiting-operator 04:03, operator intervened; safe-refused tree-mismatch 11:23, then safe-bumped-restart-handoff 11:31"
+2026-09-23	-	no-fire	no-fire	no-fire	"(no row)"
+2026-09-24	2.1.281	block	block:probe:findings-2.1.281.md|https://github.com/your-org/nexus-code/issues/1632|-	hold-incomplete	evidence: findings-2.1.281.md; issue: the row (…/issues/1632); control: none stated (the findings measure 2.1.281 only)
+2026-09-25	2.1.282	safe-deferred	deferred:restart-path-pr	apply	"deferred-pending-PR1634"
+2026-09-26	2.1.283	safe-deferred	deferred:restart-path-pr	apply	"deferred-pending-PR1635"
+2026-09-27	2.1.283	block-unattributable	unattributable:gate-manifest-outside-executed-set	apply	"gate-tree-stamp-missing … lint-no-tmux-server-kill pragma manifest 2->4 … not a candidate finding"

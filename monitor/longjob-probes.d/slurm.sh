@@ -13,7 +13,8 @@
 #   an EMIT (your-org/nexus-code#1535) — never silence. A probe that cannot
 #   answer must say so rather than guess in either direction.
 #
-# Subject target: a Slurm job id (`123`, `123_4`, `123+1`).
+# Subject target: a Slurm job id (`123`, `123_4`, `123+1`) — the shape is
+# `lj_slurm_jobid_valid` below, and `0` is not one.
 #
 # STATE VOCABULARY — read from `man sacct` "JOB STATE CODES" on slurm 25.11.5
 # (2026-09-15), NOT from memory. `sacct --helpstates` is not whitelisted by the
@@ -48,9 +49,39 @@
 # COMPLETED -> done. A single-row job prints exactly what it printed before.
 # Classified inline (no `$(…)` per row): an array can have thousands of tasks.
 
+# THE ONE JOB-ID SHAPE (your-org/nexus-code#1727). `lj_slurm_jobid_valid` is
+# the single predicate behind all three places a Slurm id is accepted: this
+# probe, `longjob-watch.sh add slurm:<id>`, and the auto-arm loop in
+# `monitor/hooks/async-launch-detect.sh` (both SOURCE this file for it, so the
+# three cannot drift apart). It used to be three copies of `^[0-9][0-9_.+]*$`,
+# which accepts `0`: a `jid=$(sbatch --parsable …); echo $?` call printed `0`,
+# the hook armed `auto-slurm-0`, and `sacct -j 0` answered with UNRELATED jobs,
+# so the watch never reached a verdict about the job that was submitted — a
+# ~9.5 h stall, measured. Slurm never assigns job id 0, and no real id has a
+# leading zero.
+#
+# Accepted: a POSITIVE integer with no leading zero, optionally ONE array
+# (`_N`) or het (`+N`) component, optionally ONE numeric step (`.N`) —
+# `123456`, `123456_3`, `123456+0`, `123456.0`. The component numbers
+# may be 0 (array tasks and het components start at 0). Every accepted string
+# was also accepted by the old pattern: this only narrows.
+LJ_SLURM_JOBID_ERE='^[1-9][0-9]*([_+][0-9]+)?([.][0-9]+)?$'
+lj_slurm_jobid_valid() { [[ "${1:-}" =~ $LJ_SLURM_JOBID_ERE ]]; }
+
+# lj_slurm_squeue_state <id> — the queue state of <id> from `squeue -u`,
+# empty when the job is not listed (or squeue failed). `-u` and never `-j`:
+# see the call site (your-org/nexus-code#1744). LJ_SQUEUE_USER is a test seam.
+lj_slurm_squeue_state() {
+    local target="$1" user="${LJ_SQUEUE_USER:-${USER:-$(id -un 2>/dev/null)}}"
+    [[ -n "$user" ]] || return 0
+    squeue -u "$user" -h -o '%i %T' 2>/dev/null | awk -v t="$target" '
+        $1 == t || index($1, t "_") == 1 || index($1, t "+") == 1 { print $2; exit }'
+}
+
 lj_probe_main() {
     local target="$1"
-    [[ "$target" =~ ^[0-9][0-9_.+]*$ ]] || { printf 'unknown|not a Slurm job id: %s' "$target"; return 0; }
+    # Refused BEFORE `sacct` runs: `sacct -j 0` is not a question about any job.
+    lj_slurm_jobid_valid "$target" || { printf 'unknown|not a Slurm job id: %s (never polled)' "$target"; return 0; }
     command -v sacct >/dev/null 2>&1 || { printf 'unknown|sacct not on PATH'; return 0; }
     local out rc state exit_code
     out=$(sacct -X -n -P -o State,ExitCode -j "$target" 2>/dev/null); rc=$?
@@ -62,7 +93,14 @@ lj_probe_main() {
     if [[ -z "$out" ]]; then
         local sq
         if command -v squeue >/dev/null 2>&1; then
-            sq=$(squeue -j "$target" -h -o '%T' 2>/dev/null | head -1) || sq=""
+            # NEVER `squeue -j <id>` (your-org/nexus-code#1744): in this
+            # sandbox it returns EMPTY at rc 0 for a job that IS queued on
+            # ~25% of calls, in bursts, while the unfiltered `squeue -u` lists
+            # the job on 40/40. Ask for OUR jobs and filter by id here. The id
+            # matches exactly, or as the parent of an array task (`<id>_N`,
+            # `<id>_[..]`) or a het component (`<id>+N`). An empty answer
+            # still maps to `unknown` below, never to done.
+            sq=$(lj_slurm_squeue_state "$target")
             if [[ -n "$sq" ]]; then
                 case "${sq%% *}" in
                     PENDING|CONFIGURING|REQUEUED|RESV_DEL_HOLD) printf 'pending|squeue %s (not yet in accounting)' "$sq"; return 0 ;;

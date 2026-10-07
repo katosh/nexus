@@ -54,6 +54,8 @@
 #                            time): restarting discards the build and starts the
 #                            clock over, which is what makes a slow bring-up
 #                            look like a crash loop. Also via SVC_FORCE=1.
+#                            A refusal exits 75 (not 1), so a caller can tell
+#                            "deliberately not done" from "tried and failed".
 #   svc.sh orphans           READ-ONLY: list supervisor processes with ppid 1
 #                            whose source path no registry row names, or which
 #                            run from outside $NEXUS_ROOT (a retired clone, an
@@ -492,6 +494,64 @@ svc_endpoint() {
         return
     fi
     printf '%s' '-'
+}
+
+# svc_detail_url <workdir> <health> <up> — the URL cell's derivation, the ONE
+# place it is computed: a SERVING labsh JupyterLab shows its tokened URL
+# (svc_jupyter_url), everything else the healthcheck/declared endpoint
+# (svc_endpoint). The status table renders it, and svc_url_warnings asks it,
+# so the two cannot disagree (the #1742 WARN once fired on a jupyterlab row
+# whose cell showed a URL, because it asked svc_endpoint alone).
+svc_detail_url() {
+    local workdir="$1" health="$2" up="${3:-}" detail=""
+    [[ "$up" == UP || "$up" == DEGRADED ]] && detail=$(svc_jupyter_url "$workdir")
+    [[ -n "$detail" ]] || detail=$(svc_endpoint "$health" "$workdir")
+    printf '%s' "$detail"
+}
+
+# svc_health_is_http <workdir> <health> — does this row's healthcheck probe an
+# HTTP endpoint? (your-org/nexus-code#1742.) The URL cell above is derived from
+# the healthcheck TEXT or from `<workdir>/.deploy/endpoint`; a service whose
+# healthcheck is a SCRIPT that curls a port and that declares no endpoint
+# rendered `-` with nothing telling its author either convention existed — the
+# 2026-10-05 `tools/healthcheck.sh` row on :8774. So: true when the healthcheck
+# text, or the first 64 KiB of the script it names (resolved against the
+# workdir when relative), carries curl/wget, an http(s) URL, or an HTTP request
+# line (`HTTP/1.`, what a hand-written probe sends over /dev/tcp). A bare
+# `/dev/tcp/` connect is NOT HTTP: it is how a TCP port check is written, and
+# counting it warned on nexus-remote-ssh, an SSH service. A
+# heuristic over SOURCE TEXT, and it errs toward SILENCE: a probe written in
+# another language, or one that builds its URL at runtime, reads as not-HTTP and
+# earns no warning. It only ever ADDS a warning; nothing here changes what is
+# probed or rendered.
+svc_health_is_http() {
+    local workdir="${1:-}" health="${2:-}" re='(^|[^A-Za-z0-9_-])(curl|wget)([^A-Za-z0-9_-]|$)|https?://|HTTP/1\.'
+    [[ "$health" =~ $re ]] && return 0
+    local first="${health%%[[:space:]]*}"
+    [[ -n "$first" ]] || return 1
+    [[ "$first" == /* ]] || first="$workdir/$first"
+    [[ -f "$first" && -r "$first" ]] || return 1
+    # CAPTURE, THEN MATCH: `head | grep -q` exits at the match and can SIGPIPE
+    # the producer, which under pipefail reads as no-match (#622).
+    local body
+    body=$(head -c 65536 -- "$first" 2>/dev/null) || return 1
+    [[ "$body" =~ $re ]]
+}
+
+# svc_url_warnings — one line per registered service whose healthcheck probes
+# HTTP but whose URL cell would render `-` (#1742). Printed by `svc.sh status`
+# on STDERR, so the table and its exit code are unchanged. The cell is asked of
+# svc_detail_url, the same derivation the table uses, as it renders a SERVING
+# row (`UP`): the question is "does this service have a URL anyone can show",
+# not "is it up right now" — the table already says that.
+svc_url_warnings() {
+    local i
+    for (( i=1; i<=SVC_N; i++ )); do
+        svc_health_is_http "${SVC_WORKDIR[$i]}" "${SVC_HEALTH[$i]}" || continue
+        [[ "$(svc_detail_url "${SVC_WORKDIR[$i]}" "${SVC_HEALTH[$i]}" UP)" == '-' ]] || continue
+        printf 'svc.sh: WARN service %s probes HTTP but shows no URL: write its URL (one line, e.g. http://localhost:PORT/) to %s/.deploy/endpoint, or name the URL in the healthcheck column (skills/nexus.services/SKILL.md; your-org/nexus-code#1742)\n' \
+            "${SVC_NAME[$i]}" "${SVC_WORKDIR[$i]}"
+    done
 }
 
 # Compact age: 45s / 12m / 3h.
@@ -1039,8 +1099,11 @@ render_status() {
         # derived endpoint. Keyed on the raw healthcheck, not the possibly
         # degraded STATUS word — a DEGRADED service is still serving, and
         # withholding its URL would help nobody.
-        [[ "$up" == UP || "$up" == DEGRADED ]] && detail=$(svc_jupyter_url "$workdir")
-        [[ -n "$detail" ]] || detail=$(svc_endpoint "$health" "$workdir")
+        # A non-serving row keeps a detail already set above (a hung check's
+        # "did not finish within" note); a serving one always shows its URL.
+        if [[ "$up" == UP || "$up" == DEGRADED || -z "$detail" ]]; then
+            detail=$(svc_detail_url "$workdir" "$health" "$up")
+        fi
         gut=' '; [[ "$SVC_FOLLOW" == "$name" ]] && gut='>'
         format_row "$gut" "$i" "$name" "$upc" "$up" "$supc" "$sup" "$detail"
         R_TXT[$i]="$ROW"
@@ -1326,6 +1389,7 @@ _orchestrator_redirect() {
 cmd_status() {
     load_services
     render_status
+    svc_url_warnings >&2
     (( SVC_FS_OK )) || return 1
     # Non-zero on duplicate / decapitated watcher groups (nexus-code#491)
     # so scripts and supervisors can KEY on the anomaly instead of
@@ -1520,6 +1584,32 @@ _svc_reconcile_orphan() {
 # KILL after 5 s, then drop the pidfile. A passing healthcheck after
 # that is loudly flagged — a daemonizing child (e.g. nginx) can escape
 # the group and needs its own shutdown.
+# SEED THE SERVER-ENV PIN FROM A HEALTHY SERVER WE ARE ABOUT TO STOP
+# (your-org/nexus-code#1692). The pin (#1676/#1677) is captured by the
+# supervisor after a healthy start — so the FIRST start under code carrying the
+# pin feature is always unpinned, and a pull that changes labsh-supervised.sh
+# triggers exactly that start through the version-aware restart. Measured on
+# the deploy of #1677: the healthy server was stopped at 11:15:17 and the
+# relaunch resolved unpinned against an index with ONE new release
+# (charset-normalizer 3.5.1→3.5.2) — a ~30-min cold build of the env that was
+# serving warm a moment earlier. svc.sh is invoked FRESH from disk, so it runs
+# the new code even while the OLD supervisor is being replaced: capture here,
+# from the still-running server, and the relaunch is pinned to the env that
+# was just serving. Best-effort and BOUNDED: it never blocks or fails the stop.
+_seed_labsh_pin() {
+    local name="$1" workdir="$2" launch="$3" health="$4" tool="$_script_dir/labsh-pin.sh"
+    [[ "$launch" == *labsh-supervised.sh* ]] || return 0
+    [[ -x "$tool" && -d "$workdir/.jupyter" ]] || return 0
+    [[ -s "$workdir/.jupyter/labsh-server.pin" ]] && return 0
+    _recover_service_healthy "$workdir" "$health" || return 0
+    if timeout -k 5 60 "$tool" capture "$workdir" >/dev/null 2>&1; then
+        echo "[svc] $name: seeded the server-env pin from the running healthy server before stopping it — the relaunch resolves to the SAME env (warm)" >&2
+    else
+        echo "[svc] $name: could not seed a server-env pin before the stop (see $workdir/.jupyter/labsh-pin.log) — the relaunch runs unpinned" >&2
+    fi
+    return 0
+}
+
 _stop_service() {
     local name="$1" workdir="$2" launch="$3" health="$4"
     local pf pid i
@@ -1550,6 +1640,7 @@ _stop_service() {
         return 0
     fi
     read -r pid < "$pf" 2>/dev/null
+    _seed_labsh_pin "$name" "$workdir" "$launch" "$health"
     echo "[svc] $name: stopping supervisor pid $pid (TERM to its process group)" >&2
     kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
     for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -1701,17 +1792,21 @@ _restart_watcher() {
 # REFUSED. A guard against an operator footgun that becomes a footgun. Two
 # bounds now stop that:
 #
-#   1. AGE CAP. Past the ceiling a "build" is pathological BY DEFINITION, not
-#      in flight. The cap is the MINIMUM of the watcher's ceiling and the
-#      supervisor's reap budget, so this guard can never outlast the layer that
-#      is about to act — they cannot drift into a deadlock.
-#   2. PROGRESS. A build is protected only while it is MOVING. We sample a
-#      monotone counter (CPU time + bytes written + build-log growth) across
-#      calls; a build that has not advanced it for LABSH_BUILD_STALL_SECONDS is
-#      presumed wedged and released early.
+#   1. AGE. Up to the SOFT ceiling (the MINIMUM of the watcher's ceiling and
+#      the supervisor's reap budget, so this guard never outlasts the layer
+#      about to act) a build is protected unconditionally. Past it, a build is
+#      protected ONLY while it is MOVING (2). Past the HARD cap
+#      (LABSH_COLD_BUILD_HARD_CAP, default 7200s) it is released regardless.
+#      The soft ceiling used to be a hard one: "past 1800s ⇒ pathological BY
+#      DEFINITION". That definition was false — on 2026-09-29 a build on a
+#      load-100 node was still progressing at 30 min and was killed there, by
+#      this layer's siblings using the same number (your-org/nexus-code#1676).
+#   2. PROGRESS. A monotone counter (CPU time + bytes written + build-log
+#      growth) sampled across calls; a build that has not advanced it for
+#      LABSH_BUILD_STALL_SECONDS is presumed wedged and released.
 #
 # On AMBIGUITY (counters unreadable, no prior sample) we protect — but that
-# protection is hard-bounded by the age cap, so the worst case is a bounded
+# protection is hard-bounded by the hard cap, so the worst case is a bounded
 # delay of automated recovery, never a permanent refusal.
 #
 # NOTE the stall window must be generous: a HEALTHY build on this NFS cache was
@@ -1720,7 +1815,7 @@ _restart_watcher() {
 # progressing. Calling that "wedged" is precisely the mistake this guard exists
 # to prevent, so the default is 600s — ~6.7x the longest stall actually observed.
 
-# The age cap: never outlast the layer that is about to act on this build.
+# The SOFT ceiling: never outlast the layer that is about to act on this build.
 _coldbuild_cap() {
     local watcher_ceiling=1800 reap_budget="${LABSH_COLD_BUILD_BUDGET:-1800}" cap
     if [[ -n "${MONITOR_SERVICE_HEALTH_COLD_BUILD_CEILING_SECONDS:-}" ]]; then
@@ -1737,67 +1832,28 @@ _coldbuild_cap() {
     printf '%s' "$cap"
 }
 
-# A monotone progress counter for a live build: CPU consumed + bytes written +
-# build-log growth. Any increase is forward motion. Prints nothing and fails if
-# it cannot be read (⇒ caller treats as "cannot establish a stall").
-_coldbuild_progress() {
-    local pid="$1" workdir="$2" stat rest ticks=0 wchar=0 bg=0
-    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
-    rest=${stat#*") "}                        # drop "pid (comm) " — comm may hold spaces
-    # shellcheck disable=SC2086
-    set -- $rest                              # ${12}=utime, ${13}=stime (fields 14/15 overall)
-    # ${12} NOT $12 — the latter is ${1}2, i.e. the state char with a "2" glued on.
-    [[ "${12:-}" =~ ^[0-9]+$ && "${13:-}" =~ ^[0-9]+$ ]] || return 1
-    ticks=$(( ${12} + ${13} ))
-    wchar=$(awk '/^wchar/{print $2; exit}' "/proc/$pid/io" 2>/dev/null)
-    [[ "$wchar" =~ ^[0-9]+$ ]] || wchar=0
-    bg=$(stat -c %s "$workdir/.jupyter/labsh.bg.log" 2>/dev/null)
-    [[ "$bg" =~ ^[0-9]+$ ]] || bg=0
-    printf '%s' $(( ticks + wchar + bg ))
-}
+# Forward progress, the stall window and the hard cap are decided by ONE shared
+# predicate, `labsh_build_release` in _labsh_build_evidence.sh — the same one
+# the watcher's service-health defer and the supervisor's stale-build reaper
+# consult (your-org/nexus-code#1676). This guard used to carry its own
+# progress sampler and an AGE-ONLY cap; on 2026-09-29 every layer killed
+# still-progressing builds at their 1800s bound on a load-100 node, and the
+# next build started from zero. The cap computed above is now the SOFT ceiling:
+# past it a build must be seen MOVING to stay protected.
 
-# True iff the build has PROVABLY made no forward progress for >= the stall
-# window. Samples persist across invocations under STATE_DIR. Unprovable ⇒ 1
-# (not stalled ⇒ keep protecting, bounded by the age cap).
-_coldbuild_stalled() {
-    local name="$1" pid="$2" workdir="$3"
-    local stall="${LABSH_BUILD_STALL_SECONDS:-600}"
-    local f="$STATE_DIR/service-health/$name.buildprogress"
-    local now cur prev_pid prev_ts prev_cur
-
-    [[ "$stall" =~ ^[0-9]+$ ]] && (( stall > 0 )) || return 1
-    cur=$(_coldbuild_progress "$pid" "$workdir") || return 1
-    now=$(date +%s 2>/dev/null) || return 1
-    mkdir -p "$(dirname "$f")" 2>/dev/null || return 1
-
-    # `< "$f"` on a missing file is a REDIRECT failure: bash reports it itself
-    # ("No such file or directory") and the `2>/dev/null` on `read` is applied
-    # too late to suppress it. On every first-sight refusal that leaked a raw
-    # shell error into the operator's face. Test for readability first.
-    if [[ -r "$f" ]]; then
-        read -r prev_pid prev_ts prev_cur < "$f" || true
-    fi
-
-    # A different pid, an unreadable sample, or forward motion ⇒ re-baseline.
-    if [[ "${prev_pid:-}" != "$pid" ]] \
-       || [[ ! "${prev_ts:-}"  =~ ^[0-9]+$ ]] \
-       || [[ ! "${prev_cur:-}" =~ ^[0-9]+$ ]] \
-       || (( cur > prev_cur )); then
-        printf '%s %s %s\n' "$pid" "$now" "$cur" > "$f" 2>/dev/null || true
-        return 1
-    fi
-
-    # Same pid, counter has not advanced since prev_ts. Deliberately do NOT
-    # refresh the timestamp — the stall is measured from when motion stopped.
-    (( now - prev_ts >= stall ))
-}
+# Exit status of a REFUSAL. Distinct from 1 (a failed stop/start) so a caller
+# can tell "not done, deliberately, because a build is in flight" from "tried
+# and failed": the watcher must not count a refusal as a restart attempt
+# toward its flap ceiling (it did, 2026-09-29: attempt 1/3 was a refusal).
+SVC_COLDBUILD_REFUSED_RC=75
 
 _coldbuild_guard() {
-    local name="$1" workdir="$2" launch="$3" ev pid age mins cap stall
+    local name="$1" workdir="$2" launch="$3" ev pid age mins cap stall hard verdict
 
     (( SVC_FORCE )) && return 0
     [[ "$launch" == *labsh-supervised.sh* ]] || return 0
     declare -F labsh_build_in_progress >/dev/null || return 0
+    declare -F labsh_build_release >/dev/null || return 0
 
     ev=$(labsh_build_in_progress "$workdir") || return 0
     pid="${ev%% *}"; age="${ev##* }"
@@ -1805,22 +1861,12 @@ _coldbuild_guard() {
     mins=$(( age / 60 ))
     cap=$(_coldbuild_cap)
     stall="${LABSH_BUILD_STALL_SECONDS:-600}"
+    hard="${LABSH_COLD_BUILD_HARD_CAP:-7200}"
 
-    # cap 0 ⇒ the watcher's cold-build defer is disabled outright. If the layer
-    # that owns the policy will not defer, this guard must not defer either.
-    (( cap == 0 )) && return 0
-
-    # (1) past the cap it is pathological BY DEFINITION — let it be killed.
-    if (( cap > 0 && age >= cap )); then
-        echo "svc.sh: '$name' has a labsh build (pid $pid) running ${mins}m (${age}s) — at or past the ${cap}s cold-build ceiling." >&2
-        echo "svc.sh: a build this old is presumed WEDGED, not in flight. Allowing the restart so recovery can proceed." >&2
-        return 0
-    fi
-
-    # (2) alive but not MOVING for the whole stall window ⇒ presumed wedged.
-    if _coldbuild_stalled "$name" "$pid" "$workdir"; then
-        echo "svc.sh: '$name' has a labsh build (pid $pid, ${mins}m old) that has made NO forward progress" >&2
-        echo "svc.sh: (no CPU, no bytes written, no log growth) for >= ${stall}s — presumed wedged. Allowing the restart." >&2
+    # RELEASED (defer disabled, stalled, or past the hard cap) ⇒ allow, and say why.
+    if verdict=$(labsh_build_release "$pid" "$age" "$workdir" "$cap"); then
+        echo "svc.sh: '$name' has a labsh build (pid $pid): ${verdict#* }." >&2
+        echo "svc.sh: allowing the restart so recovery can proceed." >&2
         return 0
     fi
 
@@ -1828,28 +1874,27 @@ _coldbuild_guard() {
 svc.sh: REFUSING to stop '$name' — a labsh cold build is in flight AND PROGRESSING.
 
   build pid $pid, running ${mins}m (${age}s); no URL bound yet.
-  A cold uvx bring-up takes ~19 min on this NFS cache (measured 2026-07-13:
-  15m24s to link 96 packages + ~2min to import and bind).
+  (${verdict#* })
+  A cold uvx bring-up takes ~19 min on this NFS cache when the node is quiet
+  (measured 2026-07-13) and well over 30 min at load ~100 (2026-09-29).
 
-  Stopping now DISCARDS that build and starts the ~19-minute clock over from
-  zero. Repeating it is what turns a slow bring-up into an apparent crash loop.
+  Stopping now DISCARDS that build and starts the clock over from zero.
+  Repeating it is what turns a slow bring-up into an apparent crash loop.
 
-  This refusal is BOUNDED. It lifts when EITHER:
+  This refusal is BOUNDED. Past the ${cap}s ceiling it lifts as soon as EITHER:
     - the build stops making progress (no CPU, no bytes written, no log growth)
-      for ${stall}s — note this is only re-checked when someone calls svc.sh
-      again, so it will not fire on its own while nothing is trying to stop it; or
-    - the build is ${cap}s old, at which point it is presumed wedged.
+      for ${stall}s — re-checked on every call, by this command, the watcher
+      and the supervisor, which share one progress sample; or
+    - the build is ${hard}s old (hard cap), at which point it is released.
 
-  The watcher (policy auto-restart) forces a restart through this guard once the
-  service has been unhealthy past its cold-build ceiling, so a WEDGED build is
-  recovered without you. A build that is merely SLOW is what this refusal
-  protects — and it will bind on its own.
+  The watcher (policy auto-restart) applies the SAME verdict, so it will not
+  restart a build that is merely slow, and will restart a wedged one without you.
 
   Watch it instead:  tail -f $workdir/.jupyter/labsh.bg.log
   Override now:      svc.sh --force restart $name
                      (or SVC_FORCE=1 svc.sh restart $name)
 EOF
-    return 1
+    return "$SVC_COLDBUILD_REFUSED_RC"
 }
 
 cmd_stop() {
@@ -1860,7 +1905,7 @@ cmd_stop() {
     esac
     svc_require "$name"
     _coldbuild_guard "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
-        "${SVC_LAUNCH[$REG_I]}" || return 1
+        "${SVC_LAUNCH[$REG_I]}" || return
     _stop_service "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
         "${SVC_LAUNCH[$REG_I]}" "${SVC_HEALTH[$REG_I]}"
 }
@@ -1898,7 +1943,7 @@ cmd_restart() {
     # would also swallow a guard refusal, so the guard cannot live only there.
     svc_require "$name"
     _coldbuild_guard "${SVC_NAME[$REG_I]}" "${SVC_WORKDIR[$REG_I]}" \
-        "${SVC_LAUNCH[$REG_I]}" || return 1
+        "${SVC_LAUNCH[$REG_I]}" || return
     _record_restart_marker "$name"
     # ORPHAN PATH FIRST (your-org/nexus-code#606). The plain stop→start
     # sequence cannot reconcile an orphan: `stop` has no live supervisor to

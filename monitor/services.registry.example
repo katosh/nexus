@@ -3,7 +3,9 @@
 #
 # Copy this file to `monitor/services.registry` (operator-local,
 # gitignored) and list the long-running infra services your deployment
-# expects to be up. On a restart the orchestrator runs
+# expects to be up. THE PROCEDURE for adding, verifying and removing a
+# service is skills/nexus.services/SKILL.md; this file is the column
+# reference it points at. On a restart the orchestrator runs
 # `bootstrap-recover.sh`, which relaunches each registered service that
 # is BOTH unhealthy AND has no tmux window. Adding a new service is a
 # one-line edit here — no code change.

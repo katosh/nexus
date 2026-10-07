@@ -53,7 +53,9 @@ you. What each one is for:
 When adding a new long-running helper program, don't add a new
 startup command: register it in `monitor/services.registry` and
 `bootstrap-recover.sh` (and therefore the one command above) will
-own its launch and recovery.
+own its launch and recovery. The procedure (when to register, the row,
+the URL convention, healthcheck design, verification, removal) is
+`skills/nexus.services/SKILL.md`.
 
 ## Architecture
 
@@ -373,10 +375,19 @@ Three pieces:
    qualifies iff it is not infra (`orchestrator`, `services`,
    `watcher`, registry-named legacy service windows are excluded), it
    has a `spawn` event in `.state/action-log.jsonl` (recovery only owns
-   nexus-spawned workers), AND **either** that `spawn` is its latest
-   lifecycle event (active — abruptly interrupted) **or** the window is
-   **operator-engaged** (<your-org>/<your-nexus>#202). A later `wrap-up` /
-   `window-close` normally retires a window (the orchestrator owns
+   nexus-spawned workers), its latest lifecycle event is NOT
+   `window-close` (a closed window is terminal, never resurrected), AND
+   it is **active** (that `spawn` is its latest lifecycle event —
+   abruptly interrupted), **operator-engaged** (<your-org>/<your-nexus>#202)
+   or **follow-up-live** (<your-org>/nexus-code#1665): it WRAPPED, but was
+   dispatched to (`paste-followup`, or a machine-input stamp) or held
+   (`window-retain` with a non-`wrap-up-*` reason) after that wrap-up, or
+   is in an open skeptic pairing (live require-marker, a skeptic owing a
+   verdict, an open spawn-skeptic request, or an open ROUND: a
+   non-`credible` verdict whose skeptic owes the re-review or whose target
+   owes the fix); an `ng skeptic close` at or after the last dispatch, or a
+   `credible` verdict, ends it, and an unreadable source counts as live. The recovery brief names which of the three applies to each
+   worker. A `wrap-up` otherwise retires a window (the orchestrator owns
    continuations of wrapped work), BUT a window the operator is driving
    must survive a restart even if it wrapped: recovery consults the
    watcher's own authoritative engagement mark (`_openg_marked` over
@@ -730,8 +741,8 @@ leader pid.
     the paste and `monitor.watcher.paste_response_grace_seconds`
     (default 120) has elapsed. The state machine stamps an
     `unresponsive-since` marker and lets the standard
-    `detect_and_unstick` loop probe cases A–D (permission
-    Enter, rate-limit cascade, api-error Enter, AskUQ chip-bar
+    `detect_and_unstick` loop probe its cases (permission
+    prompt surfaced, rate-limit cascade, AskUQ chip-bar
     Escape) for up to
     `monitor.watcher.unstick_window_seconds` (default 150).
   - **Re-submit rescue** when the unstick window exhausts —
@@ -1529,8 +1540,8 @@ instead of eight.
 | `ng reply <issue> [--repo <owner/name>] [--body-file <path>]` | Post a comment (body from `--body-file` or stdin). `--repo` overrides the cwd-derived target (useful when running from a worktree whose `origin` points at the code repo, not the issue repo). | comment URL |
 | `ng close <issue> [--comment <text>]` | Optional comment, then close. | `CLOSED` |
 | `ng issue <issue>` | One-line issue summary. | `#<n> state=<STATE> title=<title>` |
-| `ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin\|latest] [--message <msg>]` | Thin shim over `monitor/upload-asset.sh` — commit a local file (image or report markdown) to the asset repo's `main` branch under `assets/...` and print a SHA-pinned URL suitable for embedding. `--issue N` routes under `assets/N/`; sources under `reports/` auto-cluster to `assets/reports/`; everything else lands at `assets/general/`. `.md`/`.ipynb` get a `blob/<sha>/` URL (renderable page); other extensions get `raw/<sha>/` (embed-friendly). | asset URL pinned to post-push SHA |
-| `ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--comment-body-file <path> \| --no-comment] [--retain <reason> \| --no-retain]` | The universal end-of-task hand-off, folded into one verb: (1) upload the report via `ng upload --issue N`; (2) post a comment on `<issue>` — templated body by default (title from H1, one-sentence summary from `## Summary` or first 200 chars), bespoke when `--comment-body-file` is set (substitutes `{{REPORT_URL}}` token, else appends `Full report: <URL>` footer), skipped when `--no-comment` is set; (3) rocket-react `--trigger-comment` if supplied; (4) `log-action monitor --event wrap-up`; (5) `log-action monitor --event window-retain` for the source tmux window so the watcher mutes the wrapped row for `monitor.retain_ttl_seconds` (default 24 h) — auto-tagged `wrap-up-<YYYY-MM-DD>` unless `--retain <reason>` overrides; `--no-retain` opts out (close-immediately). Step 5 is silently skipped off-tmux and its failure does not flip exit. (6) when the source window carries a live operator-engagement mark, prints the interactive-wrap clarification: staying engaged is the DEFAULT (follow-up inquiries expected); `ng engaged-done` is the explicit finished-signal. Exit 0 only when every attempted hand-off step (1–4) succeeds; on partial failure exits **1** and prints which steps ok/failed on stderr so the caller can retry. **Exit 3 (<your-org>/nexus-code#862) is NOT a partial failure and must not be retried**: every step succeeded and nothing was published — the report changed (its asset link moved) while the composed body, which quotes `## Summary` alone, is byte-identical to the comment already posted. Re-running reproduces it exactly; only the caller can resolve it (edit `## Summary` in place, pass `--comment-body-file`, or post it manually). The action log records `comment=nothing-published` for this case. | per-step status lines on stdout |
+| `ng upload <local-path> [--issue N] [--repo-path <path>] [--shape pin\|latest] [--message <msg>] [--replace]` | Thin shim over `monitor/upload-asset.sh` — commit a local file (image or report markdown) to the asset repo's `main` branch under `assets/...` and print a SHA-pinned URL suitable for embedding. `--issue N` routes under `assets/N/`; sources under `reports/` auto-cluster to `assets/reports/`; everything else lands at `assets/general/`. `.md`/`.ipynb` get a `blob/<sha>/` URL (renderable page); other extensions get `raw/<sha>/` (embed-friendly). The destination derives from the basename, so a destination that already holds a DIFFERENT asset at the asset repo's HEAD is **refused at exit 5** with no URL (<your-org>/nexus-code#1639): pass `--repo-path <unique path>` to keep both, or `--replace` to overwrite deliberately (SHA-pinned URLs to the old bytes keep resolving). Identical bytes are not a collision. | asset URL pinned to post-push SHA |
+| `ng wrap-up <issue> <report-path> [--trigger-comment <id>] [--repo <owner/name>] [--comment-body-file <path> \| --no-comment] [--retain <reason> \| --no-retain]` | The universal end-of-task hand-off, folded into one verb: (1) upload the report via `ng upload --issue N`; (2) post a comment on `<issue>` — templated body by default (title from H1, one-sentence summary from `## Summary` or first 200 chars), bespoke when `--comment-body-file` is set (substitutes `{{REPORT_URL}}` token, else appends `Full report: <URL>` footer), skipped when `--no-comment` is set. Post-once: a re-run for the same issue + report compares its body with the earlier wrap-up comment (ignoring only the asset-link move); identical posts nothing, different POSTs a NEW comment ending `Supersedes the earlier wrap-up comment: <url>` (`comment=posted-new`). An earlier comment is NEVER edited or re-pointed — it is a historical record whose SHA-pinned link already cites the report as it was (<your-org>/nexus-code#1637). Step (1) passes `--replace`, since a re-run legitimately re-uploads its own report (#1639); (3) rocket-react `--trigger-comment` if supplied; (4) `log-action monitor --event wrap-up`; (5) `log-action monitor --event window-retain` for the source tmux window so the watcher mutes the wrapped row for `monitor.retain_ttl_seconds` (default 24 h) — auto-tagged `wrap-up-<YYYY-MM-DD>` unless `--retain <reason>` overrides; `--no-retain` opts out (close-immediately). Step 5 is silently skipped off-tmux and its failure does not flip exit. (6) when the source window carries a live operator-engagement mark, prints the interactive-wrap clarification: staying engaged is the DEFAULT (follow-up inquiries expected); `ng engaged-done` is the explicit finished-signal. Exit 0 only when every attempted hand-off step (1–4) succeeds; on partial failure exits **1** and prints which steps ok/failed on stderr so the caller can retry. **Exit 3 (<your-org>/nexus-code#862) is NOT a partial failure and must not be retried**: every step succeeded and nothing was published — the report changed (its asset link moved) while the composed body, which quotes `## Summary` alone, is byte-identical to the comment already posted. Re-running reproduces it exactly; only the caller can resolve it (edit the opening of `## Summary` so the composed body differs and re-run — that posts a NEW comment and leaves the earlier one untouched — pass `--comment-body-file`, or post it manually). The action log records `comment=nothing-published` for this case. | per-step status lines on stdout |
 | `ng engaged-done [--window <name>]` | The interactive session's explicit FINISHED-signal (the <your-org>/<your-nexus>#205 state-machine follow-up). Appends an `engaged-done` action-log event for the calling pane's window (or `--window`); the watcher treats it as the engagement-mark invalidation, dropping the window back to the typical wrapped-window cleanup path. A later operator prompt re-engages — the release is never a lock-out. | confirmation line |
 | `ng dashboard get` | Fetch the overview issue body and emit only the content between `<!-- NEXUS_DASHBOARD_START -->` / `<!-- NEXUS_DASHBOARD_END -->`. Caches to `.state/dashboard.md`. | dashboard middle |
 | `ng dashboard put [--body-file <path>\|-]` | Re-fetch the body, splice the new middle in (preserving the static prose around the markers), PATCH, then **verify with an INDEPENDENT GET** (the PATCH response echoes what you SENT, so it cannot see a server-side swallow; it is compared separately to catch corruption on our side). Refuses a body containing a marker (`#959`), a live body without exactly one marker pair (`#1118`/`#1058`), and anything over GitHub's 262,144-byte cap. Cache + freshness stamp are written **only after verification**. rc 4 = could not verify (distinct from failed). Section-schema check stays **warn-only**, now searched across the whole issue body. | issue URL |
@@ -1748,9 +1759,11 @@ prefix).
 
 **Email (emergency only)**
 
-- **Recipient**: `notifications.email.address`
-  (env override: `$NEXUS_EMAIL_TO`). `notifications.email.probe_address`
-  is a disposable alias used only for probes.
+- **Recipient**: `notifications.email.address`. `$NEXUS_EMAIL_TO` may
+  only NARROW it: equal to that address, or empty for no email. Any other
+  value is refused at rc 5 and never redirects. `notifications.email.probe_address`
+  is a disposable alias used only for probes (reserved; not consumed).
+- **Mail policy** (operator rule, 2026-09-28, <your-org>/nexus-code#1663): the nexus emails **only the operator** and **never as the operator**. `notify.sh` refuses (rc 5) any recipient that is not exactly `notifications.email.address` in the PRIMARY nexus's own `config/nexus.yml` (resolved by the one-tree rule, `monitor/_nexus-root.sh`; `NEXUS_CONFIG` or `NEXUS_ROOT` naming another recipient is refused, never followed). No address configured means no email at rc 0, with the push backends unaffected. and refuses (rc 6) a sender that would carry the operator's address, local part or login. The envelope sender and recipient are set explicitly: `nexus-monitor@<host>` and the operator alone. Every message carries `Auto-Submitted: auto-generated` and a footer naming the host. `notify.sh` is the only file allowed to send mail, and `monitor/watcher/mail-path-lint.sh` enforces that.
 - **Relay**: `notifications.email.smtp_host` / `.smtp_port`
   (env override: `$NEXUS_SMTP_HOST` / `$NEXUS_SMTP_PORT`). Must
   accept mail from the cluster host without authentication.
@@ -2634,7 +2647,7 @@ monitor/watcher/test-integration/test-jupyter-service-real.sh`
 | `boot-recover.session-start-hook.json` | Ready-to-merge Claude Code `SessionStart` (matcher `resume`) hook snippet that fires `boot-recover.sh` when the orchestrator session is brought back at boot | yes |
 | `watcher/_lib.sh`            | Shared watcher helpers: heartbeat/lock parsers, liveness probe (`_watcher_alive`), PID-identity check (`_watcher_pid_is_live_watcher`, immunises lock/pid checks against post-restart PID reuse), emit classifier (`_classify_diff`) | yes |
 | `watcher/_github.sh`         | `snapshot_github` + helpers — three-source union (issues, PR conversation, PR review threads); honours `processed-comments.txt` dedup | yes |
-| `watcher/_unstick.sh`        | Auto-unstick library: case A (permission prompt → refused + surfaced as a pending decision, #1599) + case B (rate-limit cascade + Anthropic API probe + orchestrator ack) + case C (api-error chip Enter) + case D (AskUserQuestion chip-bar Escape + meta-paste, the orchestrator-paste safety net — see `monitor.watcher.on_dialog`) + case W (worker-blocked-question relay: non-target AskUQ overlay → grace → synthesized `blocked_question` pending-decision; never touches the pane — see `monitor.watcher.worker_askuq_grace_seconds`) | yes |
+| `watcher/_unstick.sh`        | Auto-unstick library (case C, the API-error Enter, retired in #1670): case A (permission prompt → refused + surfaced as a pending decision, #1599) + case B (rate-limit cascade + Anthropic API probe + orchestrator ack) + case D (AskUserQuestion chip-bar Escape + meta-paste, the orchestrator-paste safety net — see `monitor.watcher.on_dialog`) + case W (worker-blocked-question relay: non-target AskUQ overlay → grace → synthesized `blocked_question` pending-decision; never touches the pane — see `monitor.watcher.worker_askuq_grace_seconds`) | yes |
 | `watcher/_orchestrator_liveness.sh` | Orchestrator-liveness state machine (issue #164). Hook-driven heartbeat compared against last-paste timestamp; sequences grace + unstick-window + dead-threshold budgets before escalating to fresh-spawn. Replaces the #157 binary `unresponsive_age > threshold` check. | yes |
 | `watcher/_config.sh`         | Watcher config resolution — the env → config → default lookup block for every knob (extracted from `main.sh`, issue 180 seam S1). NOT side-effect-free: sourcing runs the ~50 `config/load.sh` lookups; `main.sh` sources it once, after the early pidfile publish | yes |
 | `watcher/_emit_filters.sh`   | Emit-stream filters composing the bulk of `_gh_filter_dedup_pipeline`: manual suppression (`ng suppress-emit`), processed-comments live re-check, per-comment emit cooldown, cross-source id dedup (extracted from `main.sh`, issue 180 seam S2) | yes |
@@ -2851,7 +2864,7 @@ bash -c "grep -ohE '\"\\\$_cfg\" [a-z][a-z0-9_.]+' monitor/watcher/_config.sh | 
 | `MONITOR_RATELIMIT_ACK_TIMEOUT_S` | `monitor.watcher.ratelimit_ack_timeout_s` | seconds to wait for the orchestrator's `ratelimit-resume-ack` action-log entry after a cascade (default 60). |
 | `MONITOR_PROBE_MODEL`         | `monitor.watcher.probe_model`             | model id for the probe (default `claude-haiku-4-5-20251001` — cheapest current model). |
 | `MONITOR_ORCH_PASTE_RESPONSE_GRACE_S` | `monitor.watcher.paste_response_grace_seconds` | Grace window (s) after a successful paste-to-orchestrator before the #164 state machine declares pasted-without-response. Default 120 (raised from 60 after the 2026-05-29..31 false-positive respawns; healthy heavy turns ran ~90-180 s). Multi-step tool turns can legitimately consume this time. Also the response window granted to the re-submit rescue. |
-| `MONITOR_ORCH_UNSTICK_WINDOW_S` | `monitor.watcher.unstick_window_seconds`      | Budget (s) for `_unstick.sh` cases A-D to bump the orchestrator heartbeat once the state machine is in the pasted-without-response state. Default 150 (lowered from 180 alongside the grace raise so `grace + unstick_window < dead_threshold` keeps a re-submit verification window before the deadline). |
+| `MONITOR_ORCH_UNSTICK_WINDOW_S` | `monitor.watcher.unstick_window_seconds`      | Budget (s) for `_unstick.sh` cases to bump the orchestrator heartbeat once the state machine is in the pasted-without-response state. Default 150 (lowered from 180 alongside the grace raise so `grace + unstick_window < dead_threshold` keeps a re-submit verification window before the deadline). |
 | `MONITOR_ORCH_DEAD_THRESHOLD_S` | `monitor.watcher.orchestrator_dead_threshold_seconds` | Hard floor (s): respawn the orchestrator if no heartbeat at all post-paste, including through the unstick window and the re-submit rescue. Default 300. Must satisfy `paste_response_grace + unstick_window < dead_threshold` (startup WARN otherwise) so the rescue always fires before the cap. Subsumes the legacy `MONITOR_ORCH_UNRESPONSIVE_THRESHOLD_S` (which seeds this default for one release). |
 | `MONITOR_ORCH_LIVENESS_LOG_THROTTLE_S` | `monitor.watcher.liveness_log_throttle_seconds` | Minimum spacing (s) between `waiting` verdict log lines from the orchestrator-liveness task. State entries, transitions, and re-submit / respawn events always log. Default 30. |
 | `MONITOR_ORCH_STALE_PASTE_CEILING_S` | `monitor.watcher.stale_paste_ceiling_seconds` | Upper bound (s) on how old the last paste-to-orchestrator may be and still serve as evidence of wedging. Once `now - last_paste >= ceiling`, the #164 state machine returns healthy `paste-too-stale` instead of escalating via the dead-threshold cap — a quiet workspace with no eligible pastes for half an hour is not the same as a wedged orchestrator. Default 1800. Must satisfy `dead_threshold < stale_paste_ceiling` (otherwise the ceiling masks the wedge detector inside the in-window range and respawns never fire). Any fresh paste resets `last_paste_ts`, so the ceiling never hides a real wedge. |
@@ -2870,6 +2883,6 @@ bash -c "grep -ohE '\"\\\$_cfg\" [a-z][a-z0-9_.]+' monitor/watcher/_config.sh | 
 | `NEXUS_PUSHOVER_USER_KEY_FILE`| `notifications.pushover.user_key_path`    | Pushover user key file                 |
 | `NEXUS_PUSHOVER_APP_TOKEN_FILE` | `notifications.pushover.app_token_path` | Pushover app token file                |
 | `NEXUS_NOTIFY_TOKEN`          | `notifications.ntfy.topic_url_path`       | ntfy topic URL file                    |
-| `NEXUS_EMAIL_TO`              | `notifications.email.address`             | emergency email recipient              |
+| `NEXUS_EMAIL_TO`              | `notifications.email.address`             | narrowing only: the same address or empty (never redirects) |
 | `NEXUS_SMTP_HOST` / `NEXUS_SMTP_PORT` | `notifications.email.smtp_host` / `.smtp_port` | outbound SMTP relay  |
 | `NEXUS_ASSET_REPO`            | (upload-asset.sh only)                    | repo for `upload-asset.sh` commits     |

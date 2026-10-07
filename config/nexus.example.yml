@@ -474,8 +474,22 @@ monitor:
     # probe longer — the opposite of the deep-idle stand-down this backoff
     # wants); the only trade is a longer wedge-detection stand-down window
     # on a deep-idle night (~1 h → ~2 h worst case).
+    #
+    # Default raised 7200 → 86400 (<your-org>/nexus-code#1736): a calm board
+    # should cost no tokens. Rungs …→28800→57600, then the 86400 cap once
+    # the board has been actionably unchanged for 32 h. "Unchanged" means
+    # the ACTIONABLE projection: worker busy/idle flips do not reset it.
+    # Same clamp argument; the trade is that wedge detection on a board
+    # calm for a day waits for the next heartbeat (up to 24 h) or event.
     idle_backoff_enabled: true
-    idle_backoff_max_seconds: 7200
+    idle_backoff_max_seconds: 86400
+    # A pane-state READ FAILED row ("could not determine") that persists
+    # this many CONSECUTIVE full-state polls (one per
+    # full_state_emit_interval, 600 s) emits at once and snaps the backoff
+    # back (<your-org>/nexus-code#1738). Fewer polls is churn and does not
+    # reset the backoff. Default 3, chosen: ~20-30 min. Env:
+    # MONITOR_FULL_STATE_READ_FAILED_PERSIST_POLLS.
+    read_failed_persist_polls: 3
     # Discriminating emit-noise reduction (watcher-emit-noise). Three
     # narrowly-scoped, individually-reversible suppressions of emit CLASSES
     # that wake the orchestrator with nothing actionable. Each defaults ON
@@ -1239,7 +1253,7 @@ monitor:
   # jsonl-mtime fallback) is past the last-paste epoch, the
   # orchestrator reacted; healthy. Otherwise the state machine
   # waits out `paste_response_grace_seconds` (120), then gives
-  # `unstick_window_seconds` (150) for cases A-D in `_unstick.sh`
+  # `unstick_window_seconds` (150) for the cases in `_unstick.sh`
   # to recover the wedge, then re-pastes the pending emit body
   # once (re-submit rescue — a dropped Enter on an alive pane is
   # rescued by a re-paste, not a respawn), and only escalates to
@@ -1465,6 +1479,14 @@ monitor:
   #
   # See `snapshot_bot_mentions` in `monitor/watcher/_mentions.sh`.
   bot_mentions_enabled: true
+  # OpenAI Codex as a co-worker / alternative harness (<your-org>/nexus-code#1640).
+  # model: the model `ng codex` and Codex workers use when none is given.
+  # CHOSEN default, not an upstream one: gpt-6-astra is the bundled
+  # catalogue's frontier model ("the most demanding work"); gpt-6-sol is its
+  # cheaper "workhorse model for coding". List what the installed CLI knows:
+  #   codex-cli/node_modules/.bin/codex debug models </dev/null
+  codex:
+    model: gpt-6-astra
   mentions:
     connect_timeout_seconds: 5
     max_time_seconds: 20
@@ -1906,12 +1928,10 @@ monitor:
     # prompt is also handled: every stuck non-watcher window gets
     # an Enter + "please continue" follow-up once the limit has
     # reset, and the orchestrator gets a separate heads-up paste.
-    # The transient API-error chip (case C — Claude Code's per-turn
-    # `"Internal server error"` wedge) is handled too: a single Enter
-    # nudges the failed turn into retry, with a per-fingerprint
-    # backoff (api_error_backoff_minutes) so a chronically broken
-    # endpoint isn't hammered. Set to false to opt out of all three
-    # branches.
+    # (Case C, an API-error Enter-nudge, was retired in
+    # <your-org>/nexus-code#1670 together with api_error_backoff_minutes;
+    # a turn killed by an API error is reported by the StopFailure
+    # hook.) Set to false to opt out of these branches.
     auto_unstick: true
 
     # Worker-blocked-question relay (case W — <your-org>/<your-nexus>
@@ -1951,19 +1971,6 @@ monitor:
     # poll-interval round-trip plus a small margin.
     ratelimit_ack_timeout_s: 60
 
-    # Case C (transient API-error wedge) backoff window in minutes.
-    # When Claude Code's input prompt wedges on a per-turn API failure
-    # — most commonly an `"Internal server error"` / `type=api_error`
-    # response — the watcher sends Enter to nudge the failed turn
-    # into retry. The same fingerprint (request_id + message)
-    # reappearing within this many minutes is logged as
-    # `case=C action=skip-backoff` and skipped, so a chronically
-    # broken endpoint isn't hammered. Distinct fingerprints and
-    # same-fingerprint reappearances after the window elapses re-fire
-    # the Enter. Default 30. Set to 0 to disable backoff (every
-    # detection acts).
-    api_error_backoff_minutes: 30
-
     # Orchestrator-liveness state machine (issue #164). Replaces
     # the binary `unresponsive_age > threshold` rule from #157
     # with a three-knob model — see the
@@ -1981,9 +1988,9 @@ monitor:
     #     the response window granted to the re-submit rescue.
     #
     #   unstick_window_seconds — once in the pasted-without-
-    #     response state, total budget for cases A-D in
-    #     `monitor/watcher/_unstick.sh` (permission Enter, rate-
-    #     limit cascade, api-error Enter, AskUQ chip-bar Escape)
+    #     response state, total budget for the cases in
+    #     `monitor/watcher/_unstick.sh` (permission prompt surfaced,
+    #     rate-limit cascade, AskUQ chip-bar Escape)
     #     to bump the heartbeat before the state machine fires the
     #     one-shot re-submit rescue (re-paste of the pending emit
     #     body). Default 150 — lowered from 180 alongside the

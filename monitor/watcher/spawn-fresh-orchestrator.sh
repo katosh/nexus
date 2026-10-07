@@ -94,6 +94,14 @@ source "$_monitor_dir/_log-mode.sh"
 # shellcheck source=../_dropped_manifest.sh
 source "$_monitor_dir/_dropped_manifest.sh"
 
+# Auto-continue plan (the 2026-09-27 restart). Recovery spawns us BEFORE it
+# resumes the prior workers, so at the moment this brief is composed their
+# windows do not exist yet. Without the plan the brief showed an empty board
+# and the orchestrator resumed three workers by hand, racing recovery.
+# Side-effect-free on source.
+# shellcheck source=../_autocontinue_plan.sh
+source "$_monitor_dir/_autocontinue_plan.sh"
+
 NEXUS_ROOT="${NEXUS_ROOT:-$_nexus_root_default}"
 TARGET=""
 REASON=""
@@ -210,6 +218,11 @@ log() {
 _compose_situation_report() {
     local now_iso
     now_iso=$(date -Is)
+    # Render the auto-continue section ONCE, up front, so the worker list
+    # below and the first-checks list agree with it. Empty when no
+    # recovery is resuming workers right now: the report is then unchanged.
+    local ac_section=""
+    ac_section=$(ac_plan_render "$STATE_DIR" 2>/dev/null) || ac_section=""
     if (( COLD == 1 )); then
         printf 'You are the nexus orchestrator. This is a **recovery spawn** — your prior session was unrecoverable or could not be positively identified, so you were started fresh (no `--resume`, no `--continue`). You have NO resumed conversation context.\n'
         printf '\n'
@@ -227,6 +240,12 @@ _compose_situation_report() {
     [[ -n "$PREVIOUS_SID" ]] && printf -- '- Previous orchestrator session-id: %s\n' "$PREVIOUS_SID"
     printf -- '- Nexus root: %s\n' "$NEXUS_ROOT"
     printf '\n'
+
+    # Before everything else a recovering orchestrator reads: it decides
+    # whether an empty board means "gone" or "queued".
+    if [[ -n "$ac_section" ]]; then
+        printf '%s\n\n' "$ac_section"
+    fi
 
     printf '## Current tmux windows\n\n'
     printf '```\n'
@@ -272,6 +291,14 @@ _compose_situation_report() {
                 printf -- '- %s — no matching report under reports/\n' "$w"
             fi
         done <<< "$windows"
+        # The 11:49 board held one bare `bash` window, which is listed above
+        # as a "worker" — so the empty-board line below never printed there
+        # (skeptic minor on #1660). Whenever a plan is active, say it here too.
+        if [[ -n "$ac_section" ]]; then
+            printf -- '- (workers in the auto-continue section that are missing here are QUEUED, not gone)\n'
+        fi
+    elif [[ -n "$ac_section" ]]; then
+        printf '(no worker windows in tmux YET: they are being auto-continued, see the section above. Not gone.)\n'
     else
         printf '(no worker windows currently in tmux)\n'
     fi
@@ -340,11 +367,17 @@ _compose_situation_report() {
 
     if (( COLD == 1 )); then
         printf '## First actions\n\n'
+        if [[ -n "$ac_section" ]]; then
+            printf '0. Do NOT `spawn-worker.sh --resume` any worker listed under "Worker auto-continue": recovery is doing it.\n'
+        fi
         printf '1. Run `monitor/watcher/bootstrap.sh` to verify watcher health and ingest missed diffs.\n'
         printf '2. Run `monitor/ng dashboard get` to see current operator-visible state.\n'
         printf '3. Resume the routine per `monitor/agent-prompt.md`.\n'
     else
         printf '## Suggested first checks\n\n'
+        if [[ -n "$ac_section" ]]; then
+            printf '0. Do NOT `spawn-worker.sh --resume` any worker listed under "Worker auto-continue": recovery is doing it. Re-check with `monitor/_autocontinue_plan.sh status` before acting on a worker you think is missing.\n'
+        fi
         printf '1. Confirm your last in-flight delegation: `tmux list-windows` vs. the worker section above.\n'
         printf '2. If something stalled while you were down, `monitor/ng dashboard get` for the current state.\n'
         printf '3. Resume the routine per `monitor/agent-prompt.md`.\n'
@@ -355,7 +388,27 @@ _compose_situation_report() {
 # manifest. `_compose_situation_report > file` redirects but does NOT
 # subshell, so the assignment is visible here.
 MANIFEST_IN_REPORT=0
-_compose_situation_report > "$REPORT_FILE"
+# THE BRIEF MUST NOT DEPEND ON A PROJECT-TREE WRITE (your-org/nexus-code#1715).
+# REPORT_FILE lives in the state dir, which is exactly what goes READ-ONLY in the
+# incidents that end in a recovery respawn (your-nexus#386: seven times since
+# 09-28). A failed `> "$REPORT_FILE"` used to leave the PREVIOUS report — or
+# nothing — as the prompt file, so the respawn pasted a stale brief (or none).
+# So the report is composed under ${TMPDIR:-/tmp} (writable through those
+# incidents) and COPIED to REPORT_FILE as the on-disk record; when that copy
+# fails, the brief is pasted from the temp file and the log says where it is.
+# The verify's equality then compares against the bytes actually pasted.
+_report_tmp=$(mktemp "${TMPDIR:-/tmp}/orchestrator-fresh-spawn.report.XXXXXX" 2>/dev/null) || _report_tmp=""
+if [[ -n "$_report_tmp" ]]; then
+    _compose_situation_report > "$_report_tmp"
+    if { cp -- "$_report_tmp" "$REPORT_FILE"; } 2>/dev/null; then
+        rm -f "$_report_tmp"
+    else
+        log "situation report could NOT be written to $REPORT_FILE (read-only state dir?); pasting it from $_report_tmp instead — the brief must not depend on a tree write (your-org/nexus-code#1715)"
+        REPORT_FILE="$_report_tmp"
+    fi
+else
+    _compose_situation_report > "$REPORT_FILE"
+fi
 
 # Issue #161: route through the shared `_respawn_orchestrator` helper.
 # Single surface for: --continue default, --settings handling, dialog
